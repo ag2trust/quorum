@@ -131,10 +131,13 @@ failure class):
 ## Data model (6 tables)
 
 ### `agents` — identity + presence
-`id` TEXT PK · `first_seen` INTEGER NOT NULL · `last_seen` INTEGER NOT NULL (heartbeat) ·
-`meta` TEXT (json). Presence is **derived** for *display only* (`online` if `last_seen`
-within the online window, default 5 min; else `offline`). Presence does **not** drive claim
-eviction in v1 (lease-only — see Lease semantics).
+`id` TEXT PK · `first_seen` INTEGER NOT NULL · `last_seen` INTEGER NOT NULL. **No
+registration and no metadata in v1** — an agent row is auto-created/updated by
+`agents::touch(id, now)`, called as a side-effect of **every write-taking command**
+(`claim`/`renew`/`release`/`post`/`task-*`/`read --ack-through`). **Pure reads do not bump
+presence** (keeps the lock-free read path). Presence is **derived** for *display only*
+(`online` if `now - last_seen < online window`, default 5 min; else `offline`) and does
+**not** drive claim eviction in v1 (lease-only — see Lease semantics).
 
 ### `messages` — the broadcast feed (replaces #1455)
 `seq` INTEGER PK AUTOINCREMENT (monotonic; cursor basis) · `ts` · `author` · `topic`
@@ -184,7 +187,7 @@ command's txn pathologically long). `quorum sweep` does an unbounded sweep +
 | claims | 45 min lease | yes (`renew`, ~every 15 min) |
 | done tasks | swept 7d after `done` | n/a |
 | errors | 7d | n/a |
-| presence (display) | `offline` after 30 min stale | via `heartbeat` |
+| presence (display) | `offline` once `last_seen` older than online window (default 5 min) | via any write (implicit `touch`) |
 
 ## Lease & staleness (successor to "tiebreak by comment id")
 
@@ -218,10 +221,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 `2` usage/argument error · `3` internal / DB / migration error.
 
 ### Identity / presence
-- `quorum register --agent <id> [--meta-stdin]`
-- `quorum heartbeat --agent <id>` (highest-frequency write; recommended interval ≥ 60s; it
-  is loss-tolerant)
-- `quorum roster` → agents with derived online/offline (read-filtered)
+- *(no `register`, no `heartbeat` in v1)* — agents are auto-created and their `last_seen`
+  bumped implicitly by every write-taking command.
+- `quorum roster` → agents with derived online/offline
 
 ### Feed (at-least-once delivery)
 - `quorum post --agent <id> --kind <k> [--topic <t>] [--ttl <d>] (--body-stdin | --body-file <p> | --json-stdin)` → `{seq, expires_at}`
@@ -310,8 +312,9 @@ Tests:
 ## Decisions & non-goals
 
 - **Trusted-local, no rate limit** — a looping agent could spam `post`; deliberate for v1.
-- **Single-writer throughput ceiling** — fine for a handful of agents; widen heartbeat
-  interval if scaled to dozens. `busy_timeout` is not a fairness guarantee.
+- **Single-writer throughput ceiling** — fine for a handful of agents. Implicit presence
+  piggybacks on writes that already happen (no dedicated heartbeat write stream).
+  `busy_timeout` is not a fairness guarantee.
 - **Config handling:** missing file → built-in defaults (don't fail); malformed → **fail
   loud** (exit 3); `init` writes a default file.
 - **Orphan temp files** from a crash between writing `--body-file` and invoking `quorum` are

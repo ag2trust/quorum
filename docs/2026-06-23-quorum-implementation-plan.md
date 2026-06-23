@@ -48,7 +48,7 @@ pub mod error;      // QuorumError, exit_code()
 pub mod db;         // open(), SCHEMA_VERSION, migrate(), pragmas
 pub mod sweep;      // sweep_on_write(), sweep_all()
 pub mod errlog;     // log_error()
-pub mod agents;     // register(), heartbeat(), roster()
+pub mod agents;     // touch() [implicit presence], roster() — no register/heartbeat in v1
 pub mod claims;     // claim(), release(), renew(), list()
 pub mod tasks;      // create(), claim(), update(), list(), get()
 pub mod feed;       // post(), read(), peek()
@@ -373,34 +373,42 @@ and one DB), PRAGMAs, refuse-newer.
 
 ---
 
-# Phase 2 — Identity & presence (`feat/02-identity`)
+# Phase 2 — Implicit presence + `roster` (`feat/02-presence`)
 
-**Deliverable:** `register`, `heartbeat`, `roster` end-to-end.
+**Deliverable:** the `agents::touch` helper (auto-create + bump `last_seen`, called by every
+write-taking command in later phases) and a read-only `roster`. **No `register`/`heartbeat`
+in v1** — presence is implicit and display-only.
 
 ### Task 2.1: `agents` core ops (TDD)
 **Files:** Create `quorum-core/src/agents.rs`; modify `lib.rs`.
-**Produces:** `agents::register(&Connection, id, meta: Option<&str>, now)`;
-`agents::heartbeat(&Connection, id, now) -> Result<()>` (errors if unknown? no — upsert
-`last_seen`, create if absent for robustness); `agents::roster(&Connection, now,
-online_window) -> Result<Vec<AgentView>>` where `AgentView { id, last_seen, online: bool }`.
+**Produces:** `agents::touch(tx: &Transaction, id, now) -> Result<()>` (called *inside* a
+caller's existing `BEGIN IMMEDIATE` txn — not its own — so presence is part of the same
+atomic write); `agents::roster(&Connection, now, online_window) -> Result<Vec<AgentView>>`
+where `AgentView { id, last_seen, online: bool }`.
 
-- [ ] **Step 1: Failing tests:** register then roster shows `online=true` when `now -
-  last_seen < window`; an agent with stale `last_seen` shows `online=false`.
-- [ ] **Step 2:** Implement with `INSERT ... ON CONFLICT(id) DO UPDATE SET last_seen=...`
-  inside `BEGIN IMMEDIATE`; `roster` computes `online = (now - last_seen) < window` in the
-  SELECT (no write).
+- [ ] **Step 1: Failing tests:** `touch("A", now)` then `roster` shows `A` `online=true` when
+  `now - last_seen < window`; a stale `last_seen` shows `online=false`; a second `touch`
+  updates `last_seen` (not `first_seen`).
+- [ ] **Step 2:** Implement `touch` as `INSERT INTO agents(id,first_seen,last_seen)
+  VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen`. `roster` computes
+  `online = (now - last_seen) < window` in the SELECT (no write).
 - [ ] **Step 3: Run** tests. PASS.
-- [ ] **Step 4: Commit** `feat: agents register/heartbeat/roster core`.
+- [ ] **Step 4: Commit** `feat: agents touch (implicit presence) + roster`.
+
+> **Cross-phase rule:** every write-taking CLI command in Phases 3–5 calls `agents::touch`
+> **and** `sweep::sweep_on_write` inside its `BEGIN IMMEDIATE` txn, before the domain write.
+> Pure reads (`read` w/o ack, `peek`, `roster`, `claims`, `task-list`, `status`) do neither.
 
 ### Task 2.2: CLI wiring (TDD integration)
-**Files:** modify `cli.rs`, `main.rs`; create `quorum/tests/cli_identity.rs`.
-- [ ] **Step 1: Failing test:** `register --agent A` then `roster` JSON contains `A` with
-  `online:true`; `--meta-stdin` stores piped JSON.
-- [ ] **Step 2:** Add subcommands `Register{agent, meta_stdin}`, `Heartbeat{agent}`,
-  `Roster`. Use `input::read_text(Stdin)` for `--meta-stdin`. Each mutation calls
-  `sweep::sweep_on_write` first. Emit results via `output::emit`.
+**Files:** modify `cli.rs`, `main.rs`; create `quorum/tests/cli_presence.rs`.
+- [ ] **Step 1: Failing test:** there is no write command yet, so drive presence through a
+  trivial seam — a hidden `quorum __touch --agent A` test-only subcommand (or call
+  `agents::touch` via a `#[cfg(test)]` path), then `roster` JSON contains `A` `online:true`.
+  Prefer: defer the integration assertion to Phase 3 (claim bumps presence) and here test
+  `roster` returns `[]` on an empty DB + the core `touch`/`roster` unit tests from 2.1.
+- [ ] **Step 2:** Add subcommand `Roster` only. Emit via `output::emit`.
 - [ ] **Step 3: Run** tests. PASS.
-- [ ] **Step 4: Commit** `feat: quorum register/heartbeat/roster`.
+- [ ] **Step 4: Commit** `feat: quorum roster`.
 
 ---
 

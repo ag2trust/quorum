@@ -136,6 +136,10 @@ A short or "all-green" test summary may be RTK hiding the failures.
   default `cargo test` run.
 - `read --ack-through` is a **write** (it advances the cursor), so it takes the write lock
   like everything else — it is not a "pure read." Plain `read`/`peek` without ack are reads.
+- **Presence is implicit and display-only.** There is no `heartbeat` or `register` command in
+  v1. Every write-taking command calls `agents::touch` (auto-create + bump `last_seen`) inside
+  its txn; pure reads do not. `online` is derived (`now - last_seen < window`) and never drives
+  eviction (claims are lease-only).
 - A normal "lost the race" (exit 1) is **not** a failure — don't log it to `errors`, don't
   treat exit 1 as a crash in scripts/tests.
 - After a long laptop sleep, leases and messages with past `expires_at` vanish at once
