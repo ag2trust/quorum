@@ -41,14 +41,11 @@ pub fn roster(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<Age
         Ok(AgentView {
             id: r.get(0)?,
             last_seen: r.get(1)?,
+            // column 2 is the derived 0/1 of `(now - last_seen) < window`, not a stored column
             online: r.get::<_, i64>(2)? != 0,
         })
     })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[cfg(test)]
