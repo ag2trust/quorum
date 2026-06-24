@@ -2,6 +2,7 @@
 //! which matches our usage-error exit code.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
@@ -52,5 +53,62 @@ pub enum Command {
     Claims {
         #[arg(long)]
         target: Option<String>,
+    },
+    /// Create a new open task. Body (free text) via --body-stdin or --body-file.
+    TaskCreate {
+        #[arg(long = "created-by")]
+        created_by: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        priority: Option<i64>,
+        /// JSON array of labels, e.g. '["ui","p1"]'.
+        #[arg(long)]
+        labels: Option<String>,
+        /// JSON of external refs, e.g. '{"pr":2459}'.
+        #[arg(long)]
+        refs: Option<String>,
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+    },
+    /// Atomically claim a task (a specific --task-id, or the highest-priority open task).
+    TaskClaim {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: Option<i64>,
+    },
+    /// Update a task you are assigned to.
+    TaskUpdate {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: i64,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+        #[arg(long)]
+        refs: Option<String>,
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+    },
+    /// List tasks, optionally filtered by status/label/assignee.
+    TaskList {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+    },
+    /// Fetch a single task by id.
+    TaskGet {
+        #[arg(long = "task-id")]
+        task_id: i64,
     },
 }
