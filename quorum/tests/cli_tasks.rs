@@ -70,6 +70,95 @@ fn create_claim_update_flow() {
 }
 
 #[test]
+fn normal_misses_do_not_log_errors() {
+    let home = tempfile::tempdir().unwrap();
+    // claim with nothing open → exit 1
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A"])
+        .assert()
+        .code(1);
+    // create + claim, then a non-assignee update → exit 1
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "B",
+            "--task-id",
+            "1",
+            "--status",
+            "done",
+        ])
+        .assert()
+        .code(1);
+    // none of those normal misses are errors
+    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "normal exit-1 misses must not log errors");
+}
+
+#[test]
+fn assignee_can_hand_off_task() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    // A reassigns to B...
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--assignee",
+            "B",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"assignee\":\"B\""));
+    // ...now B can update, A cannot
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "B",
+            "--task-id",
+            "1",
+            "--status",
+            "done",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "open",
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
 fn concurrent_task_claim_one_winner() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
