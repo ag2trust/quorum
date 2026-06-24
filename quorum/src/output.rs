@@ -5,7 +5,6 @@ use quorum_core::error::QuorumError;
 use serde::Serialize;
 
 /// Print a value as a single line of JSON to stdout.
-#[allow(dead_code)] // wired into init + every command in later phases
 pub fn emit<T: Serialize>(v: &T) {
     // Serialization of our own owned types cannot fail; fall back defensively.
     match serde_json::to_string(v) {

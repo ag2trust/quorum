@@ -84,14 +84,14 @@ pub type Result<T> = std::result::Result<T, QuorumError>;
 
 Each phase below is one local "PR." Execute it like this:
 
-1. `git switch -c feat/NN-slug` from up-to-date `master`.
+1. `git switch -c feat/NN-slug` from up-to-date `main` (this repo's base branch is `main`).
 2. Implement the phase's tasks (TDD, frequent commits).
 3. Run `rtk proxy cargo test` + `rtk proxy cargo clippy --all-targets -- -D warnings` +
    `cargo fmt --all --check`; paste real output as the phase's verification evidence.
-4. **Dispatch a review sub-agent** with the branch diff (`git diff master...HEAD`) and the
+4. **Dispatch a review sub-agent** with the branch diff (`git diff main...HEAD`) and the
    spec; it returns BLOCKER/SHOULD-FIX/NICE findings.
 5. Address BLOCKER/SHOULD-FIX with fix commits; re-run checks.
-6. `git switch master && git merge --no-ff feat/NN-slug -m "merge: NN-slug (reviewed)"`.
+6. `git switch main && git merge --no-ff feat/NN-slug -m "merge: NN-slug (reviewed)"`.
 7. Next phase.
 
 ---

@@ -145,6 +145,12 @@ A short or "all-green" test summary may be RTK hiding the failures.
 - After a long laptop sleep, leases and messages with past `expires_at` vanish at once
   (read-filter). Expected behavior, not a bug.
 - Config: missing file → built-in defaults (don't fail); malformed → fail loud (exit 3).
+- **WAL setup under concurrent first-creation needs care** (cost a flaky test to find): set
+  `busy_timeout` *before* the `journal_mode=WAL` switch, AND retry the WAL switch on transient
+  `SQLITE_BUSY`/`SQLITE_LOCKED` — the busy-timeout handler does **not** cover journal-mode
+  changes, so N processes creating the DB at once can fail the switch even with the timeout
+  set. WAL is persistent, so the race only exists on the very first switch (`db.rs::set_journal_wal`).
+  Always stress concurrency tests in a loop (`for i in $(seq 1 12)`); a single green run hides flakiness.
 
 ## Where to read next
 
