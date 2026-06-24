@@ -18,4 +18,6 @@ pub struct Cli {
 pub enum Command {
     /// Create ~/.quorum/, the database, and run migrations (idempotent).
     Init,
+    /// List known agents with derived online/offline presence.
+    Roster,
 }
