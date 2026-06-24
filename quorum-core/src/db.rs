@@ -4,7 +4,7 @@
 //! [`migrate`] before use, so any short-lived `quorum` process self-heals the schema.
 
 use crate::error::{QuorumError, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, Error as SqlErr, ErrorCode};
 use std::path::Path;
 
 /// Schema version this binary understands. Bump when adding a migration.
@@ -15,12 +15,32 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Apply the mandatory per-connection PRAGMAs (see design spec §Concurrency & atomicity).
 pub fn apply_pragmas(conn: &Connection) -> Result<()> {
-    // journal_mode=WAL returns the applied mode as a row, so it can't go through the
-    // no-result `pragma_update` path.
-    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_row| Ok(()))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // busy_timeout MUST be first so every subsequent lock acquisition honors it.
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    set_journal_wal(conn)?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
+}
+
+/// Switch the database to WAL mode, retrying briefly on transient lock contention.
+///
+/// Switching journal mode requires that no other connection is mid-switch, and the SQLite
+/// busy-timeout handler does NOT cover journal-mode changes — so under concurrent
+/// first-creation the switch can return `SQLITE_BUSY`/`SQLITE_LOCKED` even with the timeout
+/// set. WAL is persistent on the file, so this race exists only on the very first switch;
+/// a bounded retry resolves it. Subsequent opens see WAL already set (a no-op, no lock).
+fn set_journal_wal(conn: &Connection) -> Result<()> {
+    for _ in 0..100 {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+            Ok(_) => {} // not yet WAL (another switch in flight) — retry
+            Err(SqlErr::SqliteFailure(e, _))
+                if matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {}
+            Err(e) => return Err(e.into()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(QuorumError::Busy)
 }
 
 /// Open the store at `path`, applying PRAGMAs and running migrations. The returned

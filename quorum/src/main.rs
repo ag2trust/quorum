@@ -4,15 +4,26 @@
 //! exits with a stable code: 0 success · 1 clean "didn't get it"/not-holder · 2 usage/bad
 //! input · 3 internal/DB/migration error.
 
+mod cli;
 mod input;
 mod output;
+mod paths;
 
+use clap::Parser;
 use quorum_core::error::Result;
 
 /// Dispatch a single command, returning the success exit code (0, or 1 for a clean miss).
-/// Replaced by clap dispatch in later phases.
 fn run() -> Result<i32> {
-    Ok(0)
+    let cli = cli::Cli::parse();
+    match cli.command {
+        cli::Command::Init => {
+            paths::ensure_home()?;
+            let db = paths::db_path()?;
+            quorum_core::db::open(&db)?;
+            output::emit(&serde_json::json!({ "ok": true, "db": db.to_string_lossy() }));
+            Ok(0)
+        }
+    }
 }
 
 fn main() {
