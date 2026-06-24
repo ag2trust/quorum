@@ -59,4 +59,19 @@ mod tests {
         let s = "héllo \"world\"\n`$x` 'mixed'\n";
         assert_eq!(validate(s.as_bytes().to_vec()).unwrap(), s);
     }
+
+    #[test]
+    fn read_text_file_arm_roundtrips_and_rejects_nul() {
+        use std::io::Write;
+        // valid file → byte-exact round-trip
+        let mut ok = tempfile::NamedTempFile::new().unwrap();
+        ok.write_all("h\u{e9}llo\n`$x`\n".as_bytes()).unwrap();
+        let got = read_text(TextSource::File(ok.path().to_path_buf())).unwrap();
+        assert_eq!(got, "héllo\n`$x`\n");
+
+        // file containing NUL → BadInput
+        let mut bad = tempfile::NamedTempFile::new().unwrap();
+        bad.write_all(&[b'a', 0, b'b']).unwrap();
+        assert!(read_text(TextSource::File(bad.path().to_path_buf())).is_err());
+    }
 }

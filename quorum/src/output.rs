@@ -10,7 +10,10 @@ pub fn emit<T: Serialize>(v: &T) {
     // Serialization of our own owned types cannot fail; fall back defensively.
     match serde_json::to_string(v) {
         Ok(s) => println!("{s}"),
-        Err(e) => eprintln!("{{\"error\":\"serialize: {e}\"}}"),
+        Err(e) => eprintln!(
+            "{}",
+            serde_json::json!({ "error": format!("serialize: {e}") })
+        ),
     }
 }
 
