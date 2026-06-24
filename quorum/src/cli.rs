@@ -151,4 +151,16 @@ pub enum Command {
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Health snapshot. --json for machine output; --watch to refresh continuously.
+    Status {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Reclaim all expired rows and checkpoint the WAL.
+    Sweep,
+    /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
+    #[command(name = "help-agent")]
+    HelpAgent,
 }

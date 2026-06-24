@@ -4,7 +4,9 @@
 //! exits with a stable code: 0 success · 1 clean "didn't get it"/not-holder · 2 usage/bad
 //! input · 3 internal/DB/migration error.
 
+mod cheatsheet;
 mod cli;
+mod config;
 mod input;
 mod output;
 mod paths;
@@ -12,11 +14,6 @@ mod paths;
 use clap::Parser;
 use quorum_core::claims::{ClaimOutcome, ClaimSelector};
 use quorum_core::error::{QuorumError, Result};
-
-/// Default message TTL (48h) when `--ttl` is omitted.
-const DEFAULT_MESSAGE_TTL: i64 = 48 * 3600;
-/// Default page size for `read`/`peek`.
-const DEFAULT_READ_LIMIT: i64 = 100;
 
 fn run() -> Result<i32> {
     let cli = cli::Cli::parse();
@@ -48,6 +45,48 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Post { .. } => "post",
         cli::Command::Read { .. } => "read",
         cli::Command::Peek { .. } => "peek",
+        cli::Command::Status { .. } => "status",
+        cli::Command::Sweep => "sweep",
+        cli::Command::HelpAgent => "help-agent",
+    }
+}
+
+/// Render a stats snapshot as a compact human-readable table.
+fn print_status_table(s: &quorum_core::stats::Stats) {
+    println!(
+        "agents     : {} online / {} total",
+        s.agents_online, s.agents_total
+    );
+    println!("messages   : {} live", s.messages_live);
+    println!("claims     : {} active", s.claims_active);
+    let tasks = if s.tasks.is_empty() {
+        "none".to_string()
+    } else {
+        s.tasks
+            .iter()
+            .map(|t| format!("{}={}", t.status, t.count))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!("tasks      : {tasks}");
+    println!("errors     : {} live", s.errors_live);
+    for e in &s.last_errors {
+        println!("  [{}] {}: {}", e.ts, e.source, e.detail);
+    }
+}
+
+/// `status --watch`: re-render every ~1.5s. Opens a FRESH short-lived connection per tick and
+/// closes it — never holds a transaction across ticks, which would pin the WAL (see CLAUDE.md).
+fn watch_status(online_window: i64) -> Result<()> {
+    loop {
+        let now = quorum_core::clock::now();
+        let conn = quorum_core::db::open(&paths::db_path()?)?;
+        let s = quorum_core::stats::stats(&conn, now, online_window)?;
+        drop(conn); // close before sleeping; do not hold across ticks
+        print!("\x1b[2J\x1b[H"); // clear screen + home
+        print_status_table(&s);
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
     }
 }
 
@@ -69,6 +108,12 @@ fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<O
         (false, Some(p)) => Ok(Some(input::read_text(input::TextSource::File(p))?)),
         (false, None) => Ok(None),
     }
+}
+
+/// Load config from the standard path. Called lazily, only by commands that read its fields,
+/// so a malformed config never breaks recovery (`help-agent`) or maintenance (`sweep`/`init`).
+fn load_cfg() -> Result<config::Config> {
+    config::load(&paths::config_path()?)
 }
 
 fn best_effort_errlog(source: &str, detail: &str) {
@@ -110,13 +155,19 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             paths::ensure_home()?;
             let db = paths::db_path()?;
             quorum_core::db::open(&db)?;
+            // Write a default config if absent (don't clobber an existing one).
+            let cfg_path = paths::config_path()?;
+            if !cfg_path.exists() {
+                std::fs::write(&cfg_path, config::DEFAULT_TOML)
+                    .map_err(|e| QuorumError::Io(e.to_string()))?;
+            }
             output::emit(&serde_json::json!({ "ok": true, "db": db.to_string_lossy() }));
             Ok(0)
         }
         cli::Command::Roster => {
+            let cfg = load_cfg()?;
             let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let agents =
-                quorum_core::agents::roster(&conn, now, quorum_core::agents::ONLINE_WINDOW_SECS)?;
+            let agents = quorum_core::agents::roster(&conn, now, cfg.online_window_secs)?;
             output::emit(&agents);
             Ok(0)
         }
@@ -277,7 +328,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             })?;
             let ttl = match ttl {
                 Some(s) => parse_ttl(&s)?,
-                None => DEFAULT_MESSAGE_TTL,
+                None => load_cfg()?.message_ttl_secs,
             };
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let r = quorum_core::feed::post(
@@ -300,13 +351,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             limit,
         } => {
             check_nonneg("--limit", limit)?;
+            let read_limit = load_cfg()?.read_limit;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::read(
                 &mut conn,
                 &agent,
                 topic.as_deref(),
                 ack_through,
-                limit.unwrap_or(DEFAULT_READ_LIMIT),
+                limit.unwrap_or(read_limit),
                 now,
             )?;
             output::emit(&msgs);
@@ -319,15 +371,42 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         } => {
             check_nonneg("--limit", limit)?;
             check_nonneg("--since", since)?;
+            let read_limit = load_cfg()?.read_limit;
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::peek(
                 &conn,
                 topic.as_deref(),
                 since,
-                limit.unwrap_or(DEFAULT_READ_LIMIT),
+                limit.unwrap_or(read_limit),
                 now,
             )?;
             output::emit(&msgs);
+            Ok(0)
+        }
+        cli::Command::Status { json, watch } => {
+            let cfg = load_cfg()?;
+            if watch {
+                watch_status(cfg.online_window_secs)?;
+                Ok(0) // unreachable in practice (loop until interrupted)
+            } else {
+                let conn = quorum_core::db::open(&paths::db_path()?)?;
+                let s = quorum_core::stats::stats(&conn, now, cfg.online_window_secs)?;
+                if json {
+                    output::emit(&s);
+                } else {
+                    print_status_table(&s);
+                }
+                Ok(0)
+            }
+        }
+        cli::Command::Sweep => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            quorum_core::sweep::sweep_all(&conn, now)?;
+            output::emit(&serde_json::json!({ "ok": true }));
+            Ok(0)
+        }
+        cli::Command::HelpAgent => {
+            print!("{}", cheatsheet::CHEATSHEET);
             Ok(0)
         }
     }
