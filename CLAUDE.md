@@ -42,7 +42,7 @@ established it.
 1. **Atomic claim = partial unique index, not application logic.**
    `UNIQUE(target) WHERE active = 1`, with `active INTEGER NOT NULL DEFAULT 0` (a NULL falls
    *out* of the partial index and silently disables protection). Claims/tasks are won inside
-   a single `BEGIN IMMEDIATE` transaction. **Empirically proven:** 30 concurrent processes →
+   a single `BEGIN IMMEDIATE` transaction. **Empirically proven:** the committed canary races 20 concurrent processes →
    exactly one winner. The N-process claim-race test is the canary — if it ever flakes, stop
    and find out why before anything else.
 2. **Mandatory PRAGMAs, per connection:** `journal_mode=WAL`, `synchronous=NORMAL`,
@@ -82,7 +82,7 @@ established it.
 
 ```bash
 cargo build --release            # produces target/release/quorum
-cargo test                       # 72 tests across 11 suites; includes the N-process claim race
+cargo test                       # 72 tests; includes the N-process claim race canary
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 quorum init                      # create ~/.quorum/, DB, default config

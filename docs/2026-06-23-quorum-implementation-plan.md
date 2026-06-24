@@ -537,7 +537,7 @@ Option<i64>, now) -> Result<Option<Task>>` (None = nothing claimable / already t
 
 # Phase 6 — Ops & polish (`feat/06-ops`)
 
-**Deliverable:** `status [--watch]`, `sweep`, `help --agent`, config loading.
+**Deliverable:** `status [--watch]`, `sweep`, `help-agent`, config loading.
 
 ### Task 6.1: `status` snapshot (TDD)
 **Produces:** `quorum-core` read-only `stats(&Connection, now) -> Stats` (agents
@@ -556,12 +556,12 @@ total/online, messages live, active claims, tasks by status, error count + last 
   1–2s }. Never hold a connection across iterations.
 - [ ] **Step 3:** Commit `feat: status --watch (fresh per-tick)`.
 
-### Task 6.3: `sweep`, `help --agent`, config (TDD)
-- [ ] `sweep` → `sweep_all` + checkpoint; test it truncates a grown WAL. `help --agent` →
+### Task 6.3: `sweep`, `help-agent`, config (TDD)
+- [ ] `sweep` → `sweep_all` + checkpoint; test it truncates a grown WAL. `help-agent` →
   prints the command list + heredoc text-safety pattern + exit-code table (static string;
   test it contains `--body-stdin` and `exit`). Config: `config::load(path) -> Config`
   (missing → defaults; malformed → `QuorumError` exit 3); test both. Commit
-  `feat: sweep + help --agent + config`.
+  `feat: sweep + help-agent + config`.
 
 ---
 
@@ -588,5 +588,5 @@ total/online, messages live, active claims, tasks by status, error count + last 
 - lease-only reap-on-claim + holder-eviction → 3.1/3.2 ✅
 - monotonic cursor + at-least-once → 5.1 ✅
 - text safety (stdin/file/json, param binding, UTF-8/NUL reject) → 0.3 + 5.2 ✅
-- status[/watch] (fresh per tick), sweep, help --agent, config → Phase 6 ✅
+- status[/watch] (fresh per tick), sweep, help-agent, config → Phase 6 ✅
 - N-process race canary + WAL-health + concurrent-init tests → 3.4 / 6.2 / 1.4 ✅
