@@ -1,0 +1,322 @@
+//! Atomic claims — the load-bearing concurrency primitive.
+//!
+//! A claim grants exclusive hold of a `target` (e.g. `pr#2459`) for a lease. Exactly one
+//! holder per target is guaranteed by the partial unique index `UNIQUE(target) WHERE
+//! active=1`, enforced inside a `BEGIN IMMEDIATE` transaction — so N concurrent processes
+//! racing the same target produce exactly one winner.
+//!
+//! Eviction is lease-only: a claim dies when `expires_at < now`. The next `claim` on that
+//! target reaps the dead row inside its own transaction before inserting (self-healing).
+
+use crate::error::{QuorumError, Result};
+use crate::sweep::SWEEP_LIMIT;
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+use serde::Serialize;
+
+/// An active claim.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Claim {
+    pub id: i64,
+    pub target: String,
+    pub holder: String,
+    pub expires_at: i64,
+}
+
+/// Result of attempting a [`claim`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    Won(Claim),
+    Lost { holder: String, expires_at: i64 },
+}
+
+/// How to identify a claim to release.
+pub enum ClaimSelector {
+    Target(String),
+    Id(i64),
+}
+
+/// Outcome of a [`release`].
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ReleaseOutcome {
+    /// True if an active claim was actually deactivated; false if there was nothing to release
+    /// (idempotent — already expired/released/never held).
+    pub released: bool,
+}
+
+fn begin(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sql_err)
+}
+
+/// Map a raw SQLite error: a post-timeout BUSY becomes [`QuorumError::Busy`] (exit 3 +
+/// errlog at the CLI boundary); anything else stays a generic DB error.
+fn map_sql_err(e: rusqlite::Error) -> QuorumError {
+    if let rusqlite::Error::SqliteFailure(f, _) = &e {
+        if f.code == ErrorCode::DatabaseBusy {
+            return QuorumError::Busy;
+        }
+    }
+    QuorumError::Db(e)
+}
+
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
+}
+
+/// Atomically claim `target` for `agent` with a `ttl`-second lease.
+///
+/// Inside one `BEGIN IMMEDIATE` transaction: bump presence, sweep, reap an expired holder on
+/// this target, then insert. Returns [`ClaimOutcome::Won`] for the single winner, or
+/// [`ClaimOutcome::Lost`] (with the live holder) for everyone else — Lost is NOT an error.
+pub fn claim(
+    conn: &mut Connection,
+    agent: &str,
+    target: &str,
+    ttl: i64,
+    now: i64,
+) -> Result<ClaimOutcome> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    // Reap an expired holder on this target so its dead row stops blocking the unique index.
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at < ?2",
+        params![target, now],
+    )?;
+    let expires_at = now + ttl;
+    let ins = tx.execute(
+        "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+        params![target, agent, now, expires_at],
+    );
+    match ins {
+        Ok(_) => {
+            let id = tx.last_insert_rowid();
+            tx.commit().map_err(map_sql_err)?;
+            Ok(ClaimOutcome::Won(Claim {
+                id,
+                target: target.to_string(),
+                holder: agent.to_string(),
+                expires_at,
+            }))
+        }
+        Err(ref e) if is_unique_violation(e) => {
+            // A live holder exists. Read it (still holding the write lock → no race).
+            let (holder, exp): (String, i64) = tx.query_row(
+                "SELECT holder, expires_at FROM claims WHERE target=?1 AND active=1 AND expires_at > ?2",
+                params![target, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            // Commit the presence/sweep work; the lost claim is not an error.
+            tx.commit().map_err(map_sql_err)?;
+            Ok(ClaimOutcome::Lost {
+                holder,
+                expires_at: exp,
+            })
+        }
+        Err(e) => Err(map_sql_err(e)),
+    }
+}
+
+/// Release a claim. Fails loud ([`QuorumError::NotHolder`]) if a different agent holds the
+/// live claim; idempotent (`released: false`) if there's nothing active to release.
+pub fn release(
+    conn: &mut Connection,
+    agent: &str,
+    sel: &ClaimSelector,
+    now: i64,
+) -> Result<ReleaseOutcome> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let found: Option<(i64, String)> = match sel {
+        ClaimSelector::Target(t) => tx
+            .query_row(
+                "SELECT id, holder FROM claims WHERE target=?1 AND active=1 AND expires_at > ?2",
+                params![t, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+        ClaimSelector::Id(id) => tx
+            .query_row(
+                "SELECT id, holder FROM claims WHERE id=?1 AND active=1 AND expires_at > ?2",
+                params![id, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?,
+    };
+    match found {
+        None => {
+            tx.commit().map_err(map_sql_err)?;
+            Ok(ReleaseOutcome { released: false })
+        }
+        Some((_, holder)) if holder != agent => {
+            tx.commit().map_err(map_sql_err)?;
+            Err(QuorumError::NotHolder)
+        }
+        Some((id, _)) => {
+            tx.execute("UPDATE claims SET active=0 WHERE id=?1", params![id])?;
+            tx.commit().map_err(map_sql_err)?;
+            Ok(ReleaseOutcome { released: true })
+        }
+    }
+}
+
+/// Extend a claim's lease. Fails loud if `agent` is not the current active, unexpired holder.
+pub fn renew(
+    conn: &mut Connection,
+    agent: &str,
+    claim_id: i64,
+    ttl: i64,
+    now: i64,
+) -> Result<Claim> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let n = tx.execute(
+        "UPDATE claims SET expires_at=?1 WHERE id=?2 AND holder=?3 AND active=1 AND expires_at > ?4",
+        params![now + ttl, claim_id, agent, now],
+    )?;
+    if n == 0 {
+        tx.commit().map_err(map_sql_err)?;
+        return Err(QuorumError::NotHolder);
+    }
+    let claim = tx.query_row(
+        "SELECT id, target, holder, expires_at FROM claims WHERE id=?1",
+        params![claim_id],
+        |r| {
+            Ok(Claim {
+                id: r.get(0)?,
+                target: r.get(1)?,
+                holder: r.get(2)?,
+                expires_at: r.get(3)?,
+            })
+        },
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(claim)
+}
+
+/// List active, unexpired claims, optionally filtered to one target. Read-only.
+pub fn list(conn: &Connection, target: Option<&str>, now: i64) -> Result<Vec<Claim>> {
+    let map = |r: &rusqlite::Row| {
+        Ok(Claim {
+            id: r.get(0)?,
+            target: r.get(1)?,
+            holder: r.get(2)?,
+            expires_at: r.get(3)?,
+        })
+    };
+    let claims = match target {
+        Some(t) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, target, holder, expires_at FROM claims
+                 WHERE target=?1 AND active=1 AND expires_at > ?2 ORDER BY target",
+            )?;
+            let v = stmt
+                .query_map(params![t, now], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT id, target, holder, expires_at FROM claims
+                 WHERE active=1 AND expires_at > ?1 ORDER BY target",
+            )?;
+            let v = stmt
+                .query_map(params![now], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            v
+        }
+    };
+    Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_tmp() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = crate::db::open(&dir.path().join("q.db")).unwrap();
+        (dir, c)
+    }
+
+    #[test]
+    fn first_claim_wins_second_loses() {
+        let (_d, mut c) = open_tmp();
+        let won = claim(&mut c, "A", "pr#1", 100, 1000).unwrap();
+        assert!(matches!(won, ClaimOutcome::Won(_)));
+        let lost = claim(&mut c, "B", "pr#1", 100, 1000).unwrap();
+        assert_eq!(
+            lost,
+            ClaimOutcome::Lost {
+                holder: "A".into(),
+                expires_at: 1100
+            }
+        );
+    }
+
+    #[test]
+    fn reap_on_claim_after_expiry() {
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#1", 100, 1000).unwrap(); // expires at 1100
+        let won = claim(&mut c, "B", "pr#1", 100, 2000).unwrap(); // past expiry → reaped
+        assert!(matches!(won, ClaimOutcome::Won(c) if c.holder == "B"));
+    }
+
+    #[test]
+    fn claim_bumps_presence() {
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#1", 100, 1000).unwrap();
+        let r = crate::agents::roster(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, "A");
+    }
+
+    #[test]
+    fn release_by_holder_then_reclaimable() {
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#1", 100, 1000).unwrap();
+        let out = release(&mut c, "A", &ClaimSelector::Target("pr#1".into()), 1000).unwrap();
+        assert!(out.released);
+        let won = claim(&mut c, "B", "pr#1", 100, 1000).unwrap();
+        assert!(matches!(won, ClaimOutcome::Won(_)));
+    }
+
+    #[test]
+    fn release_by_nonholder_fails_loud() {
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#1", 100, 1000).unwrap();
+        let err = release(&mut c, "B", &ClaimSelector::Target("pr#1".into()), 1000).unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn release_nothing_is_idempotent() {
+        let (_d, mut c) = open_tmp();
+        let out = release(&mut c, "A", &ClaimSelector::Target("pr#1".into()), 1000).unwrap();
+        assert!(!out.released);
+    }
+
+    #[test]
+    fn renew_extends_and_guards_holder() {
+        let (_d, mut c) = open_tmp();
+        let won = claim(&mut c, "A", "pr#1", 100, 1000).unwrap();
+        let id = match won {
+            ClaimOutcome::Won(c) => c.id,
+            _ => unreachable!(),
+        };
+        let renewed = renew(&mut c, "A", id, 500, 1050).unwrap();
+        assert_eq!(renewed.expires_at, 1550);
+        let err = renew(&mut c, "B", id, 500, 1050).unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn list_hides_expired() {
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#1", 100, 1000).unwrap(); // expires 1100
+        assert_eq!(list(&c, None, 1050).unwrap().len(), 1);
+        assert_eq!(list(&c, None, 2000).unwrap().len(), 0);
+    }
+}
