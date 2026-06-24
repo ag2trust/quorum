@@ -110,6 +110,12 @@ fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<O
     }
 }
 
+/// Load config from the standard path. Called lazily, only by commands that read its fields,
+/// so a malformed config never breaks recovery (`help-agent`) or maintenance (`sweep`/`init`).
+fn load_cfg() -> Result<config::Config> {
+    config::load(&paths::config_path()?)
+}
+
 fn best_effort_errlog(source: &str, detail: &str) {
     if let Ok(db) = paths::db_path() {
         if let Ok(conn) = quorum_core::db::open(&db) {
@@ -144,7 +150,6 @@ fn parse_ttl(s: &str) -> Result<i64> {
 
 fn dispatch(cmd: cli::Command) -> Result<i32> {
     let now = quorum_core::clock::now();
-    let cfg = config::load(&paths::config_path()?)?;
     match cmd {
         cli::Command::Init => {
             paths::ensure_home()?;
@@ -160,6 +165,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             Ok(0)
         }
         cli::Command::Roster => {
+            let cfg = load_cfg()?;
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let agents = quorum_core::agents::roster(&conn, now, cfg.online_window_secs)?;
             output::emit(&agents);
@@ -322,7 +328,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             })?;
             let ttl = match ttl {
                 Some(s) => parse_ttl(&s)?,
-                None => cfg.message_ttl_secs,
+                None => load_cfg()?.message_ttl_secs,
             };
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let r = quorum_core::feed::post(
@@ -345,13 +351,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             limit,
         } => {
             check_nonneg("--limit", limit)?;
+            let read_limit = load_cfg()?.read_limit;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::read(
                 &mut conn,
                 &agent,
                 topic.as_deref(),
                 ack_through,
-                limit.unwrap_or(cfg.read_limit),
+                limit.unwrap_or(read_limit),
                 now,
             )?;
             output::emit(&msgs);
@@ -364,18 +371,20 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         } => {
             check_nonneg("--limit", limit)?;
             check_nonneg("--since", since)?;
+            let read_limit = load_cfg()?.read_limit;
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::peek(
                 &conn,
                 topic.as_deref(),
                 since,
-                limit.unwrap_or(cfg.read_limit),
+                limit.unwrap_or(read_limit),
                 now,
             )?;
             output::emit(&msgs);
             Ok(0)
         }
         cli::Command::Status { json, watch } => {
+            let cfg = load_cfg()?;
             if watch {
                 watch_status(cfg.online_window_secs)?;
                 Ok(0) // unreachable in practice (loop until interrupted)

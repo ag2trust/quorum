@@ -61,6 +61,19 @@ fn help_agent_lists_commands_and_safety() {
 }
 
 #[test]
+fn help_agent_works_despite_malformed_config() {
+    // help-agent is the recovery command — it must work even when config is broken.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    std::fs::write(home.path().join("config.toml"), "= not valid =").unwrap();
+    quorum(home.path())
+        .arg("help-agent")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("EXIT CODES"));
+}
+
+#[test]
 fn malformed_config_fails_loud() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path()).arg("init").assert().success();
