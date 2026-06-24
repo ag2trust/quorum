@@ -1,7 +1,8 @@
 # Quorum — Design Spec
 
 **Date:** 2026-06-23
-**Status:** Approved (v1) · CLI-first / daemon-less · reviewed (2 rounds)
+**Status:** Implemented (v1) · CLI-first / daemon-less · design reviewed (2 rounds) + every
+phase sub-agent-reviewed · 72 tests green
 **Repo:** `~/dev/quorum`
 
 ## Principle (north star)
@@ -52,10 +53,10 @@ review stay on GitHub** — inherently tied to git/GitHub and out of scope.
 | To operate | nothing | daemon, port, launchd, per-agent MCP config |
 | Atomicity | free (SQLite cross-process locking) | same, but mediated by the daemon |
 | Context cost | zero until invoked | ~all tool schemas loaded every turn |
-| Discovery | `--help` / `quorum help --agent` + CLAUDE.md | auto-listed typed tools |
+| Discovery | `--help` / `quorum help-agent` + CLAUDE.md | auto-listed typed tools |
 | Failure modes | fewer (no daemon to be down) | daemon down ⇒ agents blocked |
 
-The only real loss is auto tool-discovery, mitigated by `quorum help --agent` + a CLAUDE.md
+The only real loss is auto tool-discovery, mitigated by `quorum help-agent` + a CLAUDE.md
 snippet. **Not a one-way door:** an MCP shim over the same `quorum-core` lib can be added
 later if discovery ever proves worth the weight.
 
@@ -259,7 +260,7 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;
   sweep-on-write covers normal use)
 - `quorum init` → create `~/.quorum/`, DB, default config; open + migrate (idempotent)
-- `quorum help --agent` → one-call cheat-sheet: full command list + the heredoc text-safety
+- `quorum help-agent` → one-call cheat-sheet: full command list + the heredoc text-safety
   pattern + the exit-code table, as a single blob for an agent to re-orient
 
 ## Text safety (quotes / newlines / special chars)
@@ -287,7 +288,7 @@ Single Cargo crate (workspace-ready) in `~/dev/quorum`:
 - `quorum-core` (lib): store + domain logic + PRAGMA setup + migrations; fully testable
   without any I/O harness. A future MCP shim wraps this.
 - `quorum` (bin): clap arg parsing, stdin/file input, JSON output, exit-code mapping,
-  `status`/`watch`/`sweep`/`help --agent`.
+  `status`/`watch`/`sweep`/`help-agent`.
 
 Tests:
 1. **Cross-process claim race** — the proven shell loop: spawn N concurrent `quorum claim
