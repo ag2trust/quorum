@@ -226,6 +226,9 @@ mod tests {
         let (_d, mut c) = open_tmp();
         post(&mut c, "A", "info", None, "soon", None, 10, 100).unwrap(); // expires 110
         assert_eq!(read(&mut c, "B", None, None, 10, 105).unwrap().len(), 1);
+        // exact boundary: dead iff expires_at <= now, so now==110 is invisible
+        assert_eq!(read(&mut c, "B", None, None, 10, 109).unwrap().len(), 1);
+        assert_eq!(read(&mut c, "B", None, None, 10, 110).unwrap().len(), 0);
         assert_eq!(read(&mut c, "B", None, None, 10, 200).unwrap().len(), 0);
     }
 

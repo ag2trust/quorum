@@ -51,6 +51,14 @@ fn command_source(cmd: &cli::Command) -> &'static str {
     }
 }
 
+/// Reject a negative numeric flag value (fail loud per the input-validation principle).
+fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
+    match v {
+        Some(n) if n < 0 => Err(QuorumError::Usage(format!("{flag} must be >= 0"))),
+        _ => Ok(()),
+    }
+}
+
 /// Resolve an optional free-text body from `--body-stdin` / `--body-file` (at most one).
 fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<Option<String>> {
     match (stdin, file) {
@@ -291,6 +299,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             ack_through,
             limit,
         } => {
+            check_nonneg("--limit", limit)?;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::read(
                 &mut conn,
@@ -308,6 +317,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             since,
             limit,
         } => {
+            check_nonneg("--limit", limit)?;
+            check_nonneg("--since", since)?;
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::peek(
                 &conn,

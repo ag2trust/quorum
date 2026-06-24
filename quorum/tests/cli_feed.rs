@@ -4,6 +4,7 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use std::io::Write;
+use std::process::{Command as Proc, Stdio};
 
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
@@ -86,4 +87,52 @@ fn post_without_body_is_usage_error() {
         .args(["post", "--agent", "A", "--kind", "info"])
         .assert()
         .code(2);
+}
+
+#[test]
+fn negative_limit_is_usage_error() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["read", "--agent", "A", "--limit", "-1"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn concurrent_acks_leave_cursor_at_max() {
+    // Project bar: stress concurrency, don't trust single-threaded green. N processes ack
+    // out-of-order values; the monotonic MAX upsert must leave the cursor at the largest.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+
+    let bin = assert_cmd::cargo::cargo_bin("quorum");
+    let acks = [3i64, 1, 9, 2, 7, 4, 10, 5, 8, 6];
+    let children: Vec<_> = acks
+        .iter()
+        .map(|a| {
+            Proc::new(&bin)
+                .env("QUORUM_HOME", home.path())
+                .args(["read", "--agent", "B", "--ack-through", &a.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for c in children {
+        c.wait_with_output().unwrap();
+    }
+
+    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let last: i64 = conn
+        .query_row(
+            "SELECT last_seq FROM cursors WHERE agent_id='B' AND topic='hub'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        last, 10,
+        "cursor must settle at the max ack despite concurrency"
+    );
 }
