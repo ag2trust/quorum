@@ -66,7 +66,9 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(jm.to_lowercase(), "wal");
-        let bt: i64 = c.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        let bt: i64 = c
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(bt, 5000);
     }
 
@@ -97,7 +99,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
-        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
     }
 
