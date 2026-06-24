@@ -111,4 +111,44 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
     },
+    /// Post a message to the feed. Body (free text) via --body-stdin or --body-file.
+    Post {
+        #[arg(long)]
+        agent: String,
+        /// One of: info, request, claim, done, hello, critical.
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        topic: Option<String>,
+        /// Message TTL, e.g. 48h, 2h, 30m. Defaults to 48h.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// JSON of external refs.
+        #[arg(long)]
+        refs: Option<String>,
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+    },
+    /// Read new messages since your cursor; --ack-through advances the cursor.
+    Read {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        topic: Option<String>,
+        #[arg(long = "ack-through")]
+        ack_through: Option<i64>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Inspect messages without touching any cursor.
+    Peek {
+        #[arg(long)]
+        topic: Option<String>,
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
 }

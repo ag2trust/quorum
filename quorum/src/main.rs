@@ -13,6 +13,11 @@ use clap::Parser;
 use quorum_core::claims::{ClaimOutcome, ClaimSelector};
 use quorum_core::error::{QuorumError, Result};
 
+/// Default message TTL (48h) when `--ttl` is omitted.
+const DEFAULT_MESSAGE_TTL: i64 = 48 * 3600;
+/// Default page size for `read`/`peek`.
+const DEFAULT_READ_LIMIT: i64 = 100;
+
 fn run() -> Result<i32> {
     let cli = cli::Cli::parse();
     let source = command_source(&cli.command);
@@ -40,6 +45,17 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::TaskUpdate { .. } => "task-update",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
+        cli::Command::Post { .. } => "post",
+        cli::Command::Read { .. } => "read",
+        cli::Command::Peek { .. } => "peek",
+    }
+}
+
+/// Reject a negative numeric flag value (fail loud per the input-validation principle).
+fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
+    match v {
+        Some(n) if n < 0 => Err(QuorumError::Usage(format!("{flag} must be >= 0"))),
+        _ => Ok(()),
     }
 }
 
@@ -246,6 +262,73 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     Ok(1)
                 }
             }
+        }
+        cli::Command::Post {
+            agent,
+            kind,
+            topic,
+            ttl,
+            refs,
+            body_stdin,
+            body_file,
+        } => {
+            let body = read_optional_body(body_stdin, body_file)?.ok_or_else(|| {
+                QuorumError::Usage("post requires --body-stdin or --body-file".into())
+            })?;
+            let ttl = match ttl {
+                Some(s) => parse_ttl(&s)?,
+                None => DEFAULT_MESSAGE_TTL,
+            };
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let r = quorum_core::feed::post(
+                &mut conn,
+                &agent,
+                &kind,
+                topic.as_deref(),
+                &body,
+                refs.as_deref(),
+                ttl,
+                now,
+            )?;
+            output::emit(&r);
+            Ok(0)
+        }
+        cli::Command::Read {
+            agent,
+            topic,
+            ack_through,
+            limit,
+        } => {
+            check_nonneg("--limit", limit)?;
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let msgs = quorum_core::feed::read(
+                &mut conn,
+                &agent,
+                topic.as_deref(),
+                ack_through,
+                limit.unwrap_or(DEFAULT_READ_LIMIT),
+                now,
+            )?;
+            output::emit(&msgs);
+            Ok(0)
+        }
+        cli::Command::Peek {
+            topic,
+            since,
+            limit,
+        } => {
+            check_nonneg("--limit", limit)?;
+            check_nonneg("--since", since)?;
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let msgs = quorum_core::feed::peek(
+                &conn,
+                topic.as_deref(),
+                since,
+                limit.unwrap_or(DEFAULT_READ_LIMIT),
+                now,
+            )?;
+            output::emit(&msgs);
+            Ok(0)
         }
     }
 }
