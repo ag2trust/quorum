@@ -35,6 +35,23 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Release { .. } => "release",
         cli::Command::Renew { .. } => "renew",
         cli::Command::Claims { .. } => "claims",
+        cli::Command::TaskCreate { .. } => "task-create",
+        cli::Command::TaskClaim { .. } => "task-claim",
+        cli::Command::TaskUpdate { .. } => "task-update",
+        cli::Command::TaskList { .. } => "task-list",
+        cli::Command::TaskGet { .. } => "task-get",
+    }
+}
+
+/// Resolve an optional free-text body from `--body-stdin` / `--body-file` (at most one).
+fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<Option<String>> {
+    match (stdin, file) {
+        (true, Some(_)) => Err(QuorumError::Usage(
+            "use only one of --body-stdin / --body-file".into(),
+        )),
+        (true, None) => Ok(Some(input::read_text(input::TextSource::Stdin)?)),
+        (false, Some(p)) => Ok(Some(input::read_text(input::TextSource::File(p))?)),
+        (false, None) => Ok(None),
     }
 }
 
@@ -141,6 +158,94 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let list = quorum_core::claims::list(&conn, target.as_deref(), now)?;
             output::emit(&list);
             Ok(0)
+        }
+        cli::Command::TaskCreate {
+            created_by,
+            title,
+            priority,
+            labels,
+            refs,
+            body_stdin,
+            body_file,
+        } => {
+            let body = read_optional_body(body_stdin, body_file)?;
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let id = quorum_core::tasks::create(
+                &mut conn,
+                &created_by,
+                &title,
+                body.as_deref(),
+                priority.unwrap_or(0),
+                labels.as_deref(),
+                refs.as_deref(),
+                now,
+            )?;
+            output::emit(&serde_json::json!({ "id": id }));
+            Ok(0)
+        }
+        cli::Command::TaskClaim { agent, task_id } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            match quorum_core::tasks::claim(&mut conn, &agent, task_id, now)? {
+                Some(t) => {
+                    output::emit(&t);
+                    Ok(0)
+                }
+                None => {
+                    output::emit(
+                        &serde_json::json!({ "ok": false, "reason": "no claimable task" }),
+                    );
+                    Ok(1)
+                }
+            }
+        }
+        cli::Command::TaskUpdate {
+            agent,
+            task_id,
+            status,
+            assignee,
+            refs,
+            body_stdin,
+            body_file,
+        } => {
+            let body = read_optional_body(body_stdin, body_file)?;
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let fields = quorum_core::tasks::TaskUpdate {
+                status: status.as_deref(),
+                body: body.as_deref(),
+                refs: refs.as_deref(),
+                assignee: assignee.as_deref(),
+            };
+            let t = quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?;
+            output::emit(&t);
+            Ok(0)
+        }
+        cli::Command::TaskList {
+            status,
+            label,
+            assignee,
+        } => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let list = quorum_core::tasks::list(
+                &conn,
+                status.as_deref(),
+                label.as_deref(),
+                assignee.as_deref(),
+            )?;
+            output::emit(&list);
+            Ok(0)
+        }
+        cli::Command::TaskGet { task_id } => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            match quorum_core::tasks::get(&conn, task_id)? {
+                Some(t) => {
+                    output::emit(&t);
+                    Ok(0)
+                }
+                None => {
+                    output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
+                    Ok(1)
+                }
+            }
         }
     }
 }

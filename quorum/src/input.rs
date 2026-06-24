@@ -10,13 +10,11 @@ use std::io::Read;
 use std::path::PathBuf;
 
 /// Where a free-text payload comes from.
-#[allow(dead_code)] // wired into post/task-create/* in later phases
 pub enum TextSource {
     Stdin,
     File(PathBuf),
 }
 
-#[allow(dead_code)] // exercised by tests + read_text; goes live when commands wire input
 fn validate(bytes: Vec<u8>) -> Result<String> {
     if bytes.contains(&0) {
         return Err(QuorumError::BadInput("embedded NUL byte".into()));
@@ -25,7 +23,6 @@ fn validate(bytes: Vec<u8>) -> Result<String> {
 }
 
 /// Read and validate a free-text payload from the given source.
-#[allow(dead_code)] // wired into post/task-create/* in later phases
 pub fn read_text(src: TextSource) -> Result<String> {
     let bytes = match src {
         TextSource::Stdin => {
