@@ -9,5 +9,6 @@ pub mod db;
 pub mod errlog;
 pub mod error;
 pub mod feed;
+pub mod stats;
 pub mod sweep;
 pub mod tasks;

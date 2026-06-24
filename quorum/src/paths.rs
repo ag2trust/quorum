@@ -19,6 +19,11 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(home_dir()?.join("quorum.db"))
 }
 
+/// Path to the optional config file.
+pub fn config_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join("config.toml"))
+}
+
 /// Create the home directory if absent; returns its path.
 pub fn ensure_home() -> Result<PathBuf> {
     let h = home_dir()?;
