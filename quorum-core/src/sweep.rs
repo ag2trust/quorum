@@ -26,6 +26,8 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
 pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "messages", now, limit)?;
     delete_bounded(conn, "errors", now, limit)?;
+    // Deletes expired claims of any `active` value: an expired `active=1` row is already
+    // logically dead (the read-filter hid it), and removing it just frees the partial index.
     delete_bounded(conn, "claims", now, limit)?;
     conn.execute(
         "DELETE FROM tasks WHERE rowid IN \

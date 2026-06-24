@@ -32,7 +32,7 @@ fn concurrent_init_is_safe() {
     // N separate processes running `init` at once must all succeed against one DB —
     // migration runs under BEGIN IMMEDIATE, so first-runs serialize safely.
     let home = tempfile::tempdir().unwrap();
-    let handles: Vec<_> = (0..4)
+    let handles: Vec<_> = (0..8)
         .map(|_| {
             let p = home.path().to_path_buf();
             std::thread::spawn(move || {
