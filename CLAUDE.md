@@ -82,12 +82,16 @@ established it.
 
 ```bash
 cargo build --release            # produces target/release/quorum
-cargo test                       # unit + integration; includes the N-process claim race
+cargo test                       # 72 tests across 11 suites; includes the N-process claim race
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 quorum init                      # create ~/.quorum/, DB, default config
-quorum help --agent              # one-call cheat-sheet for agents
+quorum help-agent                # one-call cheat-sheet for agents
 ```
+
+Verified end-to-end (release binary): `init` → `claim` → `task-create`/`task-claim` →
+`post`/`read` → `status` all return clean JSON / the status table, exit 0. See `README.md`
+for the captured session.
 
 ## Engineering practices (inherited from the parent project, trimmed to what fits Quorum)
 
