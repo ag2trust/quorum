@@ -11,6 +11,9 @@ use rusqlite::{params, Connection};
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// Max rows reclaimed per table by an opportunistic sweep-on-write.
+pub const SWEEP_LIMIT: usize = 100;
+
 fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Result<()> {
     // `table` is always a string literal from this module — never user input.
     let sql = format!(
