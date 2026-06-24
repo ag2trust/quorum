@@ -35,9 +35,8 @@ pub fn touch(conn: &Connection, id: &str, now: i64) -> Result<()> {
 
 /// All agents with derived online/offline, ordered by id. Read-only (no presence bump).
 pub fn roster(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, last_seen, (?1 - last_seen) < ?2 AS online FROM agents ORDER BY id",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT id, last_seen, (?1 - last_seen) < ?2 AS online FROM agents ORDER BY id")?;
     let rows = stmt.query_map(params![now, online_window], |r| {
         Ok(AgentView {
             id: r.get(0)?,

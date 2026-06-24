@@ -23,6 +23,17 @@ fn run() -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true, "db": db.to_string_lossy() }));
             Ok(0)
         }
+        cli::Command::Roster => {
+            // Read-only: no presence bump, no sweep.
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let agents = quorum_core::agents::roster(
+                &conn,
+                quorum_core::clock::now(),
+                quorum_core::agents::ONLINE_WINDOW_SECS,
+            )?;
+            output::emit(&agents);
+            Ok(0)
+        }
     }
 }
 
