@@ -322,4 +322,6 @@ Tests:
   the agent's responsibility.
 - **Out of scope (YAGNI, v1):** auth · multi-machine · web UI · daemon/HTTP/MCP server ·
   message editing · threads beyond `topic` · PR/review mirroring · cross-repo bus ·
-  presence-based claim eviction · arbitrary-byte (BLOB) payloads.
+  presence-based claim eviction · arbitrary-byte (BLOB) payloads · **agent-name uniqueness
+  enforcement** (v1 is caller-owned first-use-wins; same id silently merges — a v2 could
+  reject re-use of an active name from a different session, or hand out names itself).

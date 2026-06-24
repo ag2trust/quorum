@@ -165,6 +165,26 @@ A short or "all-green" test summary may be RTK hiding the failures.
   `ConstraintViolation`, when detecting a lost claim — so a future CHECK/NOT NULL violation fails
   loud instead of being misread as a lost race.
 
+## Design notes & known limitations (v1)
+
+Intentional behaviors and known gaps — not bugs, but write them down so they're not
+rediscovered:
+
+- **Agent names are caller-owned, first-use-wins.** There is no `register` and no name
+  generator: `--agent <id>` is any free-form string, auto-created on first write. Uniqueness is
+  the PK only — two sessions that pick the same id are treated as **one** agent and silently
+  merge. Distinct-name discipline lives in the *caller's* convention, not the tool. (v2
+  consideration: optionally enforce uniqueness / hand out names.)
+- **Presence = "participated recently", not "succeeded recently".** Any *write-taking* command
+  bumps `last_seen` **before** its outcome — so a lost `task-claim` or a not-holder `release`
+  (both exit 1) still mark the agent online, because they took the write lock and ran `touch`.
+  A *pre-write* usage error (e.g. invalid `--kind`, exit 2) does NOT register the agent. So:
+  write-taking-any-outcome → online; usage/bad-input-rejected-pre-write → no trace.
+- **Test gaps:** no property/fuzz tests; the name-collision merge is untested; `status --watch`
+  (infinite loop) is only structurally verified, not run; renew-vs-claim concurrency is covered
+  deterministically but not as a multi-process stress (claims has the 20-process canary,
+  task-claim a 12-process one).
+
 ## Where to read next
 
 - **Design of record:** `docs/2026-06-23-quorum-design.md`
