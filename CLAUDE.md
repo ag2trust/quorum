@@ -151,6 +151,15 @@ A short or "all-green" test summary may be RTK hiding the failures.
   changes, so N processes creating the DB at once can fail the switch even with the timeout
   set. WAL is persistent, so the race only exists on the very first switch (`db.rs::set_journal_wal`).
   Always stress concurrency tests in a loop (`for i in $(seq 1 12)`); a single green run hides flakiness.
+- **Expiry boundary must be consistent everywhere: a claim/row is DEAD iff `expires_at <= now`,
+  LIVE iff `expires_at > now`.** A reviewer caught reap using `< now` while the read-filter used
+  `> now`: at exactly `now == expires_at` the corpse blocked the unique index but was invisible to
+  the re-SELECT → `QueryReturnedNoRows` → errlog'd exit 3 for a routine claim. Keep reap (`<=`),
+  read-filter (`>`), and release/renew holder-checks (`>`) all agreeing on this boundary. The race
+  canary now also asserts `errors` count == 0.
+- Match the **extended** SQLite code (`SQLITE_CONSTRAINT_UNIQUE`), not the primary
+  `ConstraintViolation`, when detecting a lost claim — so a future CHECK/NOT NULL violation fails
+  loud instead of being misread as a lost race.
 
 ## Where to read next
 

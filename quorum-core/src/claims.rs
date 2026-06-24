@@ -60,7 +60,12 @@ fn map_sql_err(e: rusqlite::Error) -> QuorumError {
 }
 
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
-    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
+    // Match only the UNIQUE *extended* code. All NOT NULL columns are always supplied, so the
+    // only constraint an INSERT can hit today is the partial unique index — but matching the
+    // extended code means any future CHECK/NOT NULL violation fails loud (exit 3) instead of
+    // being misread as a lost race.
+    matches!(e, rusqlite::Error::SqliteFailure(f, _)
+        if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
 }
 
 /// Atomically claim `target` for `agent` with a `ttl`-second lease.
@@ -75,46 +80,67 @@ pub fn claim(
     ttl: i64,
     now: i64,
 ) -> Result<ClaimOutcome> {
-    let tx = begin(conn)?;
-    crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    // Reap an expired holder on this target so its dead row stops blocking the unique index.
-    tx.execute(
-        "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at < ?2",
-        params![target, now],
-    )?;
-    let expires_at = now + ttl;
-    let ins = tx.execute(
-        "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
-        params![target, agent, now, expires_at],
-    );
-    match ins {
-        Ok(_) => {
-            let id = tx.last_insert_rowid();
-            tx.commit().map_err(map_sql_err)?;
-            Ok(ClaimOutcome::Won(Claim {
-                id,
-                target: target.to_string(),
-                holder: agent.to_string(),
-                expires_at,
-            }))
+    // Bounded retry: a unique violation normally means a *live* holder (→ Lost). The only way
+    // the re-SELECT finds no live holder is a boundary corpse reap should have cleared; retry
+    // then wins. With reap using `<= now` this is unreachable, but the retry keeps any future
+    // boundary slip from surfacing as an errlog'd exit 3.
+    for _ in 0..3 {
+        let tx = begin(conn)?;
+        crate::agents::touch(&tx, agent, now)?;
+        crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+        // A claim is dead iff `expires_at <= now` (consistent with the read-filter's
+        // `expires_at > now`). Reap the dead holder so its row stops blocking the unique index.
+        tx.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at <= ?2",
+            params![target, now],
+        )?;
+        let expires_at = now + ttl;
+        let ins = tx.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+            params![target, agent, now, expires_at],
+        );
+        match ins {
+            Ok(_) => {
+                let id = tx.last_insert_rowid();
+                tx.commit().map_err(map_sql_err)?;
+                return Ok(ClaimOutcome::Won(Claim {
+                    id,
+                    target: target.to_string(),
+                    holder: agent.to_string(),
+                    expires_at,
+                }));
+            }
+            Err(ref e) if is_unique_violation(e) => {
+                // Read the live holder (still holding the write lock → no race).
+                let live: Option<(String, i64)> = tx
+                    .query_row(
+                        "SELECT holder, expires_at FROM claims
+                         WHERE target=?1 AND active=1 AND expires_at > ?2",
+                        params![target, now],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                match live {
+                    Some((holder, exp)) => {
+                        // Commit the presence/sweep work; a lost claim is not an error.
+                        tx.commit().map_err(map_sql_err)?;
+                        return Ok(ClaimOutcome::Lost {
+                            holder,
+                            expires_at: exp,
+                        });
+                    }
+                    None => {
+                        // Boundary corpse blocked the index but is already dead per the
+                        // read-filter. Roll back and retry; reap clears it next pass.
+                        drop(tx);
+                        continue;
+                    }
+                }
+            }
+            Err(e) => return Err(map_sql_err(e)),
         }
-        Err(ref e) if is_unique_violation(e) => {
-            // A live holder exists. Read it (still holding the write lock → no race).
-            let (holder, exp): (String, i64) = tx.query_row(
-                "SELECT holder, expires_at FROM claims WHERE target=?1 AND active=1 AND expires_at > ?2",
-                params![target, now],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            // Commit the presence/sweep work; the lost claim is not an error.
-            tx.commit().map_err(map_sql_err)?;
-            Ok(ClaimOutcome::Lost {
-                holder,
-                expires_at: exp,
-            })
-        }
-        Err(e) => Err(map_sql_err(e)),
     }
+    Err(QuorumError::Busy)
 }
 
 /// Release a claim. Fails loud ([`QuorumError::NotHolder`]) if a different agent holds the
@@ -262,6 +288,32 @@ mod tests {
         claim(&mut c, "A", "pr#1", 100, 1000).unwrap(); // expires at 1100
         let won = claim(&mut c, "B", "pr#1", 100, 2000).unwrap(); // past expiry → reaped
         assert!(matches!(won, ClaimOutcome::Won(c) if c.holder == "B"));
+    }
+
+    #[test]
+    fn claim_at_exact_expiry_boundary_wins() {
+        // Regression for the now == expires_at boundary: dead iff expires_at <= now, so the
+        // new claimant must WIN (never become an errlog'd exit 3).
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#1", 100, 1000).unwrap(); // expires at 1100
+        let won = claim(&mut c, "B", "pr#1", 100, 1100).unwrap(); // now == 1100 == expiry
+        assert!(matches!(won, ClaimOutcome::Won(cl) if cl.holder == "B"));
+    }
+
+    #[test]
+    fn expired_holder_cannot_renew_and_loses_target() {
+        let (_d, mut c) = open_tmp();
+        let won = claim(&mut c, "A", "pr#1", 100, 1000).unwrap(); // expires 1100
+        let id = match won {
+            ClaimOutcome::Won(cl) => cl.id,
+            _ => unreachable!(),
+        };
+        // Past expiry, A cannot renew its dead lease...
+        let err = renew(&mut c, "A", id, 100, 1200).unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
+        // ...and B reaps + wins the target.
+        let won_b = claim(&mut c, "B", "pr#1", 100, 1200).unwrap();
+        assert!(matches!(won_b, ClaimOutcome::Won(cl) if cl.holder == "B"));
     }
 
     #[test]

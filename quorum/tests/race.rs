@@ -59,4 +59,10 @@ fn n_processes_exactly_one_winner() {
         )
         .unwrap();
     assert_eq!(active, 1, "exactly one active claim row");
+
+    // A normal race must never log an error (guards the boundary-corpse → exit-3 regression).
+    let errs: i64 = conn
+        .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(errs, 0, "a normal race must not log any errors");
 }

@@ -49,6 +49,8 @@ fn best_effort_errlog(source: &str, detail: &str) {
 /// Parse a duration like `45m`, `1h`, `30s`, `2d`, or bare seconds, into seconds.
 fn parse_ttl(s: &str) -> Result<i64> {
     let s = s.trim();
+    // The suffix arms only match 1-byte ASCII units, so `s[..len-1]` always lands on a char
+    // boundary (a multi-byte suffix falls through to the `_` arm and is never sliced).
     let (num, mult) = match s.chars().last() {
         Some('s') => (&s[..s.len() - 1], 1),
         Some('m') => (&s[..s.len() - 1], 60),
