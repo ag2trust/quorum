@@ -62,6 +62,25 @@ pub struct Task {
     pub ready: bool,
 }
 
+/// One append-only breadcrumb attached to a task. Ordered by `id` (= insertion order).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Note {
+    pub id: i64,
+    pub ts: i64,
+    pub agent: String,
+    pub body: String,
+}
+
+/// A task plus its notes, returned by [`get_with_notes`] (used by the CLI `task-get`). The
+/// `Task` fields are inlined into the JSON output so it stays a single flat object plus a
+/// `notes` array — easy for an agent to read in one go.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TaskDetail {
+    #[serde(flatten)]
+    pub task: Task,
+    pub notes: Vec<Note>,
+}
+
 /// Fields a [`update`] may change. `None` leaves the field untouched.
 ///
 /// Note: there is no `assignee` field — reassignment is intentionally not a `task-update`
@@ -498,6 +517,67 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Task>> {
         t.ready = compute_ready(conn, &t.depends_on)?;
     }
     Ok(task)
+}
+
+/// Fetch a single task and its append-only note history (oldest first).
+pub fn get_with_notes(conn: &Connection, id: i64) -> Result<Option<TaskDetail>> {
+    let Some(task) = get(conn, id)? else {
+        return Ok(None);
+    };
+    let notes = notes_for(conn, id)?;
+    Ok(Some(TaskDetail { task, notes }))
+}
+
+/// Append a breadcrumb to `task_id`. Returns the new note's id, or `None` if the task does
+/// not exist (mapped to a clean exit 1 by the CLI, matching `task-get` semantics). Notes are
+/// append-only — there is no edit/delete. Any agent may add a note: notes are public
+/// context for whoever picks the task up next, so the assignee guard from [`update`] does
+/// not apply.
+pub fn add_note(
+    conn: &mut Connection,
+    agent: &str,
+    task_id: i64,
+    body: &str,
+    now: i64,
+) -> Result<Option<i64>> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    // Verify the task exists *inside the transaction* so it can't disappear between the
+    // check and the INSERT. SQLite has no FK enforced here (v1 invariant: no FKs), so this
+    // is the load-bearing existence check.
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+        params![task_id],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        tx.commit()?;
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
+        params![task_id, now, agent, body],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(Some(id))
+}
+
+fn notes_for(conn: &Connection, task_id: i64) -> Result<Vec<Note>> {
+    let mut stmt = conn
+        .prepare("SELECT id, ts, agent, body FROM task_notes WHERE task_id=?1 ORDER BY id ASC")?;
+    let notes = stmt
+        .query_map(params![task_id], |r| {
+            Ok(Note {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                agent: r.get(2)?,
+                body: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(notes)
 }
 
 #[cfg(test)]
@@ -1217,5 +1297,94 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(t.id, want, "claim must pick the labeled+ready task");
+    }
+
+    // -- Task notes (issue #3) -----------------------------------------------------------
+
+    #[test]
+    fn add_note_appends_and_get_with_notes_returns_in_order() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        let n1 = add_note(&mut c, "A", id, "first crumb", 1100)
+            .unwrap()
+            .unwrap();
+        let n2 = add_note(&mut c, "B", id, "second crumb", 1200)
+            .unwrap()
+            .unwrap();
+        assert!(n2 > n1);
+
+        let detail = get_with_notes(&c, id).unwrap().unwrap();
+        assert_eq!(detail.notes.len(), 2);
+        assert_eq!(detail.notes[0].agent, "A");
+        assert_eq!(detail.notes[0].body, "first crumb");
+        assert_eq!(detail.notes[0].ts, 1100);
+        assert_eq!(detail.notes[1].agent, "B");
+        assert_eq!(detail.notes[1].body, "second crumb");
+        assert_eq!(detail.notes[1].ts, 1200);
+    }
+
+    #[test]
+    fn add_note_on_missing_task_returns_none() {
+        let (_d, mut c) = open_tmp();
+        assert!(add_note(&mut c, "A", 9999, "into the void", 1000)
+            .unwrap()
+            .is_none());
+        // and nothing was inserted
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM task_notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn notes_preserve_byte_exact_body() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        let body = "héllo \"world\"\n`$x`\nmultiline\n";
+        add_note(&mut c, "A", id, body, 1100).unwrap().unwrap();
+        let detail = get_with_notes(&c, id).unwrap().unwrap();
+        assert_eq!(detail.notes[0].body, body);
+    }
+
+    #[test]
+    fn anyone_can_add_a_note_no_assignee_guard() {
+        // Notes are public breadcrumbs — the assignee restriction from `update` does NOT
+        // apply, so a non-assignee agent can append. (Differentiates the contract clearly:
+        // `update` mutates the task; `add_note` annotates it.)
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        // B is not the assignee but can still leave a note
+        let nid = add_note(&mut c, "B", id, "from a watcher", 1100)
+            .unwrap()
+            .unwrap();
+        assert!(nid > 0);
+    }
+
+    #[test]
+    fn notes_are_not_swept_when_other_rows_expire() {
+        // Notes have no expires_at column — the sweeper's TTL pass cannot evict them.
+        // Verify by running a sweep at a far-future `now` and seeing the note persist.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        add_note(&mut c, "A", id, "durable", 1100).unwrap().unwrap();
+        crate::sweep::sweep_all(&c, 9_999_999).unwrap();
+        let detail = get_with_notes(&c, id).unwrap().unwrap();
+        assert_eq!(detail.notes.len(), 1);
+        assert_eq!(detail.notes[0].body, "durable");
+    }
+
+    #[test]
+    fn task_without_notes_yields_empty_notes_array() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        let detail = get_with_notes(&c, id).unwrap().unwrap();
+        assert!(detail.notes.is_empty());
+    }
+
+    #[test]
+    fn get_with_notes_on_missing_task_is_none() {
+        let (_d, c) = open_tmp();
+        assert!(get_with_notes(&c, 9999).unwrap().is_none());
     }
 }

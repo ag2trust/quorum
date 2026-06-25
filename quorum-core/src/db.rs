@@ -8,7 +8,7 @@ use rusqlite::{Connection, Error as SqlErr, ErrorCode};
 use std::path::Path;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The full schema. Every statement is idempotent (`IF NOT EXISTS`).
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -131,7 +131,14 @@ mod tests {
         }
         let c = open(&p).unwrap(); // second open must not error
         for t in [
-            "agents", "messages", "cursors", "claims", "tasks", "errors", "events",
+            "agents",
+            "messages",
+            "cursors",
+            "claims",
+            "tasks",
+            "errors",
+            "events",
+            "task_notes",
         ] {
             let n: i64 = c
                 .query_row(
@@ -306,6 +313,54 @@ mod tests {
             .unwrap();
         assert_eq!(title, "pre-existing");
         assert!(deps.is_none());
+    }
+
+    #[test]
+    fn migrates_v4_to_v5_adds_task_notes_table() {
+        // Simulate a v4 DB (events + depends_on present, but task_notes absent,
+        // user_version=4) with a pre-existing task; re-open and verify the new table is
+        // created without losing data.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL, body TEXT,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    labels TEXT, assignee TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    refs TEXT,
+                    depends_on TEXT
+                 );
+                 INSERT INTO tasks(title, status, priority, created_by, created_at, updated_at)
+                 VALUES ('pre-notes', 'open', 0, 'boss', 1, 1);
+                 PRAGMA user_version = 4;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // task_notes table now exists and is empty.
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM task_notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // existing task still there
+        let title: String = c
+            .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "pre-notes");
     }
 
     #[test]

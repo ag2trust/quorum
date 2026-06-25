@@ -82,7 +82,7 @@ established it.
 
 ```bash
 cargo build --release            # produces target/release/quorum
-cargo test                       # 108 tests; includes the N-process claim race canary
+cargo test                       # 142 tests; includes the N-process claim race canary
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 quorum init                      # create ~/.quorum/, DB, default config

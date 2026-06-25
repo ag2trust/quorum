@@ -82,3 +82,15 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_subject_seq ON events(subject, seq);
 CREATE INDEX IF NOT EXISTS events_expires    ON events(expires_at);
+
+-- Append-only breadcrumbs attached to a task. No edit/delete in v1 (read-only history).
+-- Sweeper does NOT TTL these — they're durable context for the next picker-upper after the
+-- assignee is lost. Ordered by `id` (= monotonic insertion order); ts/agent are reported.
+CREATE TABLE IF NOT EXISTS task_notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    ts          INTEGER NOT NULL,
+    agent       TEXT NOT NULL,
+    body        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_notes_task_id ON task_notes(task_id, id);
