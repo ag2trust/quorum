@@ -318,6 +318,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent,
             kind,
             topic,
+            to,
             ttl,
             refs,
             body_stdin,
@@ -338,6 +339,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 topic.as_deref(),
                 &body,
                 refs.as_deref(),
+                to.as_deref(),
                 ttl,
                 now,
             )?;
@@ -349,8 +351,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             topic,
             ack_through,
             limit,
+            direct,
+            broadcasts,
         } => {
             check_nonneg("--limit", limit)?;
+            // clap's `conflicts_with` already rejects --direct + --broadcasts at parse time;
+            // this match is the in-code projection to the core filter enum.
+            let filter = match (direct, broadcasts) {
+                (true, false) => quorum_core::feed::ReadFilter::Direct,
+                (false, true) => quorum_core::feed::ReadFilter::Broadcasts,
+                _ => quorum_core::feed::ReadFilter::All,
+            };
             let read_limit = load_cfg()?.read_limit;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::read(
@@ -358,6 +369,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 &agent,
                 topic.as_deref(),
                 ack_through,
+                filter,
                 limit.unwrap_or(read_limit),
                 now,
             )?;
