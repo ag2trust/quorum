@@ -133,6 +133,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             // --task-id both gate on every dep being `closed`.
             conn.execute("ALTER TABLE tasks ADD COLUMN depends_on TEXT", [])?;
         }
+        // v5 = control table addition (issue #6 emergency stop). New CREATE TABLE in
+        // SCHEMA_SQL handles it on fresh DBs and upgrades alike — no ALTER needed.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -315,6 +317,70 @@ mod tests {
         let c = open(&p).unwrap();
         assert!(column_exists(&c, "messages", "recipient").unwrap());
         assert!(column_exists(&c, "tasks", "depends_on").unwrap());
+        // v5 control table is created via SCHEMA_SQL on every open — verify it exists.
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='control'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "control table missing");
+    }
+
+    #[test]
+    fn migrates_v4_to_v5_adds_control_table_without_disturbing_existing_rows() {
+        // Simulate a v4 DB (depends_on present, no control table, user_version=4) with a
+        // seeded task + message; re-open and verify the control table is created and the
+        // existing rows are preserved.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL, author TEXT NOT NULL, topic TEXT NOT NULL,
+                    kind TEXT NOT NULL, body TEXT NOT NULL, refs TEXT,
+                    expires_at INTEGER NOT NULL, recipient TEXT
+                 );
+                 CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                    created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT
+                 );
+                 INSERT INTO messages(ts, author, topic, kind, body, expires_at)
+                 VALUES (1, 'A', 'hub', 'info', 'pre-control', 9999);
+                 INSERT INTO tasks(title, status, priority, created_by, created_at, updated_at)
+                 VALUES ('pre-control-task', 'open', 0, 'boss', 1, 1);
+                 PRAGMA user_version = 4;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // control table now exists and starts empty.
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM control", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // Pre-existing rows untouched.
+        let body: String = c
+            .query_row("SELECT body FROM messages WHERE seq=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body, "pre-control");
+        let title: String = c
+            .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "pre-control-task");
     }
 
     #[test]

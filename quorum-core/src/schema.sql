@@ -94,3 +94,14 @@ CREATE TABLE IF NOT EXISTS task_notes (
     body        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS task_notes_task_id ON task_notes(task_id, id);
+
+-- Non-expiring control state — the emergency stop primitive (issue #6). One row per scope:
+-- `global` (every agent halts) or `agent:<id>` (only that agent). Both can coexist; an agent
+-- is stopped if either applies to it. **No expires_at column** — stops live until someone
+-- explicitly `resume`s them, by design. The sweeper does NOT touch this table.
+CREATE TABLE IF NOT EXISTS control (
+    scope   TEXT PRIMARY KEY,
+    reason  TEXT NOT NULL,
+    by      TEXT NOT NULL,
+    since   INTEGER NOT NULL
+);

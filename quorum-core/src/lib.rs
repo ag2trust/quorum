@@ -5,6 +5,7 @@
 pub mod agents;
 pub mod claims;
 pub mod clock;
+pub mod control;
 pub mod db;
 pub mod errlog;
 pub mod error;
