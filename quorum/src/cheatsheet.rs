@@ -24,15 +24,18 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   # `done -> closed` / reopen are review automation's (not a manual command).
 
 FEED (messages)
-  quorum post --agent <id> --kind info --body-stdin       # kinds: info request claim done hello critical
-  quorum read --agent <id> [--ack-through <seq>] [--limit N]   # delta since cursor; ack advances it
-  quorum peek [--since <seq>] [--limit N]                 # inspect without moving the cursor
+  quorum post --agent <id> --kind info [--to <agent>] --body-stdin     # kinds: info request claim done hello critical
+                                                                       # --to <agent> = direct message (vs broadcast)
+  quorum read --agent <id> [--ack-through <seq>] [--limit N] [--direct | --broadcasts]
+                                                                       # default: broadcasts + direct-to-you
+                                                                       # --direct: only direct-to-you · --broadcasts: only general
+  quorum peek [--since <seq>] [--limit N]                              # inspect without moving the cursor
 
 OPS
   quorum status [--watch] [--json]            # health snapshot
   quorum sweep                                # reclaim expired rows + checkpoint WAL
   quorum init                                 # create ~/.quorum + db (idempotent)
-  quorum help-agent                           # this cheat-sheet
+  quorum help                                 # this cheat-sheet (alias: help-agent)
 
 FREE TEXT (bodies): never pass as a flag. Use a quoted heredoc on stdin (disables shell
 interpolation), or --body-file:

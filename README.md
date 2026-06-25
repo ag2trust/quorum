@@ -34,7 +34,8 @@ is the `.db` file. Inspect it anytime with `sqlite3 ~/.quorum/quorum.db`.
 
 ## Commands
 
-Run `quorum help-agent` for a one-screen cheat-sheet. Output is JSON by default (only
+Run `quorum help` for a one-screen cheat-sheet (`help-agent` is a back-compat alias).
+Output is JSON by default (only
 `status` prints a human table). Free text (message/task bodies) is passed via stdin or a
 file, never a flag.
 
@@ -80,7 +81,7 @@ only status an agent sets. The reviewer (review automation) drives `done → clo
 returns the task to `open` and posts a `reclaimed` event — so work never strands. Give-up is
 `task-release` (→ `open`); hand-off is release + re-claim. `task-cancel` (creator **or**
 assignee) is a terminal won't-do.
-| Ops | `status [--watch] [--json]` · `sweep` · `init` · `help-agent` |
+| Ops | `status [--watch] [--json]` · `sweep` · `init` · `help` (alias: `help-agent`) |
 
 ### Free text safely
 

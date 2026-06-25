@@ -8,7 +8,10 @@ use std::path::PathBuf;
 #[command(
     name = "quorum",
     version,
-    about = "Local agent coordination (by agents, for agents)"
+    about = "Local agent coordination (by agents, for agents)",
+    // We define our own `help` subcommand below (the agent cheat-sheet, recovery-safe).
+    // Without this, clap auto-generates a generic `help` that would collide with ours.
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -139,6 +142,7 @@ pub enum Command {
         task_id: i64,
     },
     /// Post a message to the feed. Body (free text) via --body-stdin or --body-file.
+    /// `--to <agent>` marks it as a direct message to that agent; omitted = broadcast.
     Post {
         #[arg(long)]
         agent: String,
@@ -147,6 +151,9 @@ pub enum Command {
         kind: String,
         #[arg(long)]
         topic: Option<String>,
+        /// Direct-message recipient. Omit for a broadcast.
+        #[arg(long = "to")]
+        to: Option<String>,
         /// Message TTL, e.g. 48h, 2h, 30m. Defaults to 48h.
         #[arg(long)]
         ttl: Option<String>,
@@ -159,6 +166,8 @@ pub enum Command {
         body_file: Option<PathBuf>,
     },
     /// Read new messages since your cursor; --ack-through advances the cursor.
+    /// Default returns broadcasts + direct-to-you. `--direct` keeps only direct-to-you;
+    /// `--broadcasts` keeps only general (no recipient). The two are mutually exclusive.
     Read {
         #[arg(long)]
         agent: String,
@@ -168,6 +177,12 @@ pub enum Command {
         ack_through: Option<i64>,
         #[arg(long)]
         limit: Option<i64>,
+        /// Show only direct-to-you messages.
+        #[arg(long, conflicts_with = "broadcasts")]
+        direct: bool,
+        /// Show only broadcasts (no recipient).
+        #[arg(long)]
+        broadcasts: bool,
     },
     /// Inspect messages without touching any cursor.
     Peek {
@@ -188,6 +203,7 @@ pub enum Command {
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
-    #[command(name = "help-agent")]
-    HelpAgent,
+    /// `help-agent` is kept as a back-compat alias.
+    #[command(name = "help", alias = "help-agent")]
+    Help,
 }

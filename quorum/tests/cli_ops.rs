@@ -1,5 +1,5 @@
-//! Integration tests for ops commands: status, sweep, help-agent, config handling, and the
-//! WAL-health property (short-lived connections self-checkpoint).
+//! Integration tests for ops commands: status, sweep, help (and the help-agent alias),
+//! config handling, and the WAL-health property (short-lived connections self-checkpoint).
 
 use assert_cmd::Command;
 
@@ -50,9 +50,9 @@ fn sweep_runs() {
 }
 
 #[test]
-fn help_agent_lists_commands_and_safety() {
+fn help_lists_commands_and_safety() {
     quorum(tempfile::tempdir().unwrap().path())
-        .arg("help-agent")
+        .arg("help")
         .assert()
         .success()
         .stdout(predicates::str::contains("--body-stdin"))
@@ -61,16 +61,40 @@ fn help_agent_lists_commands_and_safety() {
 }
 
 #[test]
-fn help_agent_works_despite_malformed_config() {
-    // help-agent is the recovery command — it must work even when config is broken.
-    let home = tempfile::tempdir().unwrap();
-    quorum(home.path()).arg("init").assert().success();
-    std::fs::write(home.path().join("config.toml"), "= not valid =").unwrap();
-    quorum(home.path())
+fn help_agent_alias_still_works() {
+    // `help-agent` was the v1 spelling; keep it as a back-compat alias so existing
+    // agent prompts/scripts/cheatsheets continue to work after the rename.
+    quorum(tempfile::tempdir().unwrap().path())
         .arg("help-agent")
         .assert()
         .success()
         .stdout(predicates::str::contains("EXIT CODES"));
+}
+
+#[test]
+fn help_works_despite_malformed_config() {
+    // help is the recovery command — it must work even when config is broken
+    // (and without ~/.quorum existing at all).
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    std::fs::write(home.path().join("config.toml"), "= not valid =").unwrap();
+    quorum(home.path())
+        .arg("help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("EXIT CODES"));
+}
+
+#[test]
+fn help_works_with_no_quorum_home() {
+    // Acceptance: no ~/.quorum at all — help must still print without touching disk.
+    let home = tempfile::tempdir().unwrap();
+    // do NOT run `init`; QUORUM_HOME points at an empty dir
+    quorum(home.path())
+        .arg("help")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("quorum claim"));
 }
 
 #[test]

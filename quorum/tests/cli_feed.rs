@@ -99,6 +99,67 @@ fn negative_limit_is_usage_error() {
 }
 
 #[test]
+fn direct_messages_visible_only_to_recipient() {
+    let home = tempfile::tempdir().unwrap();
+
+    // A broadcast + a direct-to-B + a direct-to-C
+    quorum(home.path())
+        .args(["post", "--agent", "A", "--kind", "info"])
+        .arg("--body-stdin")
+        .write_stdin("bcast\n")
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["post", "--agent", "A", "--kind", "info", "--to", "B"])
+        .arg("--body-stdin")
+        .write_stdin("hi B\n")
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["post", "--agent", "A", "--kind", "info", "--to", "C"])
+        .arg("--body-stdin")
+        .write_stdin("hi C\n")
+        .assert()
+        .success();
+
+    // B's default read sees broadcast + hi B, NOT hi C.
+    quorum(home.path())
+        .args(["read", "--agent", "B"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("bcast"))
+        .stdout(predicates::str::contains("hi B"))
+        .stdout(predicates::str::contains("hi C").not());
+
+    // B's --direct sees only hi B.
+    quorum(home.path())
+        .args(["read", "--agent", "B", "--direct"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("hi B"))
+        .stdout(predicates::str::contains("bcast").not())
+        .stdout(predicates::str::contains("hi C").not());
+
+    // --broadcasts sees only bcast, regardless of agent.
+    quorum(home.path())
+        .args(["read", "--agent", "B", "--broadcasts"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("bcast"))
+        .stdout(predicates::str::contains("hi B").not())
+        .stdout(predicates::str::contains("hi C").not());
+}
+
+#[test]
+fn direct_and_broadcasts_are_mutually_exclusive() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["read", "--agent", "B", "--direct", "--broadcasts"])
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn concurrent_acks_leave_cursor_at_max() {
     // Project bar: stress concurrency, don't trust single-threaded green. N processes ack
     // out-of-order values; the monotonic MAX upsert must leave the cursor at the largest.

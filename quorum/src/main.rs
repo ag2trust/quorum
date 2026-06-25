@@ -50,7 +50,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Peek { .. } => "peek",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
-        cli::Command::HelpAgent => "help-agent",
+        cli::Command::Help => "help",
     }
 }
 
@@ -114,7 +114,7 @@ fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<O
 }
 
 /// Load config from the standard path. Called lazily, only by commands that read its fields,
-/// so a malformed config never breaks recovery (`help-agent`) or maintenance (`sweep`/`init`).
+/// so a malformed config never breaks recovery (`help`) or maintenance (`sweep`/`init`).
 fn load_cfg() -> Result<config::Config> {
     config::load(&paths::config_path()?)
 }
@@ -353,6 +353,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent,
             kind,
             topic,
+            to,
             ttl,
             refs,
             body_stdin,
@@ -373,6 +374,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 topic.as_deref(),
                 &body,
                 refs.as_deref(),
+                to.as_deref(),
                 ttl,
                 now,
             )?;
@@ -384,8 +386,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             topic,
             ack_through,
             limit,
+            direct,
+            broadcasts,
         } => {
             check_nonneg("--limit", limit)?;
+            // clap's `conflicts_with` already rejects --direct + --broadcasts at parse time;
+            // this match is the in-code projection to the core filter enum.
+            let filter = match (direct, broadcasts) {
+                (true, false) => quorum_core::feed::ReadFilter::Direct,
+                (false, true) => quorum_core::feed::ReadFilter::Broadcasts,
+                _ => quorum_core::feed::ReadFilter::All,
+            };
             let read_limit = load_cfg()?.read_limit;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let msgs = quorum_core::feed::read(
@@ -393,6 +404,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 &agent,
                 topic.as_deref(),
                 ack_through,
+                filter,
                 limit.unwrap_or(read_limit),
                 now,
             )?;
@@ -440,7 +452,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true }));
             Ok(0)
         }
-        cli::Command::HelpAgent => {
+        cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);
             Ok(0)
         }

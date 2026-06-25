@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS messages (
     kind        TEXT NOT NULL,
     body        TEXT NOT NULL,
     refs        TEXT,
-    expires_at  INTEGER NOT NULL
+    expires_at  INTEGER NOT NULL,
+    recipient   TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_topic_seq ON messages(topic, seq);
 CREATE INDEX IF NOT EXISTS messages_expires  ON messages(expires_at);
