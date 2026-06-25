@@ -416,6 +416,13 @@ pub fn renew(conn: &mut Connection, agent: &str, id: i64, ttl: i64, now: i64) ->
         row_to_task,
     )?;
     task.ready = compute_ready(&tx, &task.depends_on)?;
+    crate::events::emit(
+        &tx,
+        "task_renewed",
+        &lease_target(id),
+        &format!("renewed by {agent}"),
+        now,
+    )?;
     tx.commit()?;
     Ok(task)
 }
@@ -951,6 +958,18 @@ mod tests {
             renew(&mut c, "A", id, 100, 1100).unwrap_err(),
             QuorumError::NotHolder
         ));
+    }
+
+    #[test]
+    fn renew_emits_task_renewed_event() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+        renew(&mut c, "A", id, 200, 1050).unwrap();
+        let evs = crate::events::list(&c, 0, Some(&format!("task#{id}")), 10, 1050).unwrap();
+        let renewed: Vec<_> = evs.iter().filter(|e| e.kind == "task_renewed").collect();
+        assert_eq!(renewed.len(), 1);
+        assert!(renewed[0].body.contains("renewed by A"));
     }
 
     #[test]
