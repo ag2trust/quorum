@@ -50,14 +50,16 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64) -> Result<()> {
             "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
             params![target],
         )?;
-        let prev_json = match prev {
-            Some(a) => format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")),
-            None => "null".to_string(),
-        };
-        let body = format!(
-            "{{\"event\":\"reclaimed\",\"task\":{id},\"prev_assignee\":{prev_json},\
-             \"status\":\"open\",\"reason\":\"lease lapsed\"}}"
-        );
+        // Build the event body with serde_json so any value (incl. control chars in a
+        // free-form agent id) is escaped correctly — never hand-rolled JSON.
+        let body = serde_json::json!({
+            "event": "reclaimed",
+            "task": id,
+            "prev_assignee": prev,
+            "status": "open",
+            "reason": "lease lapsed",
+        })
+        .to_string();
         conn.execute(
             "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at)
              VALUES (?1, 'quorum', 'hub', 'info', ?2, NULL, ?3)",
