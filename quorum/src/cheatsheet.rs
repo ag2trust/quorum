@@ -11,12 +11,17 @@ CLAIMS (atomic locks)
   quorum release --agent <id> (--target <t> | --claim-id <n>)
   quorum claims [--target <t>]
 
-TASKS (work queue)
-  quorum task-create --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--body-stdin]
-  quorum task-claim  --agent <id> [--task-id <n>]      # no id = highest-priority open; exit 1 = none
-  quorum task-update --agent <id> --task-id <n> [--status <s>] [--assignee <id>]
+TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
+  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--body-stdin]
+  quorum task-claim   --agent <id> [--task-id <n>] [--ttl 1h]  # no id = highest-priority open; takes a lease; exit 1 = none
+  quorum task-renew   --agent <id> --task-id <n> [--ttl 1h]    # extend your lease on long work
+  quorum task-update  --agent <id> --task-id <n> --status done # the only status an agent sets (assignee-only)
+  quorum task-release --agent <id> --task-id <n>               # give up -> open (hand-off = release + re-claim)
+  quorum task-cancel  --agent <id> --task-id <n>               # terminal won't-do (creator OR assignee)
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>]
   quorum task-get  --task-id <n>
+  # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
+  # `done -> closed` / reopen are review automation's (not a manual command).
 
 FEED (messages)
   quorum post --agent <id> --kind info --body-stdin       # kinds: info request claim done hello critical

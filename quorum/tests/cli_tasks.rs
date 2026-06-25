@@ -30,7 +30,7 @@ fn create_claim_update_flow() {
         .success()
         .stdout(predicates::str::contains("\"assignee\":\"A\""));
 
-    // update by assignee
+    // update by assignee: the executor submits `done`
     quorum(home.path())
         .args([
             "task-update",
@@ -39,11 +39,11 @@ fn create_claim_update_flow() {
             "--task-id",
             "1",
             "--status",
-            "in_progress",
+            "done",
         ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("\"status\":\"in_progress\""));
+        .stdout(predicates::str::contains("\"status\":\"done\""));
 
     // update by non-assignee fails loud (exit 1)
     quorum(home.path())
@@ -107,7 +107,8 @@ fn normal_misses_do_not_log_errors() {
 }
 
 #[test]
-fn assignee_can_hand_off_task() {
+fn release_then_reclaim_hands_off_task() {
+    // Hand-off under the lease model: the holder releases (→ open), then another agent claims.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "x"])
@@ -117,21 +118,24 @@ fn assignee_can_hand_off_task() {
         .args(["task-claim", "--agent", "A", "--task-id", "1"])
         .assert()
         .success();
-    // A reassigns to B...
+    // A gives it up → back to open, assignee cleared.
     quorum(home.path())
-        .args([
-            "task-update",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--assignee",
-            "B",
-        ])
+        .args(["task-release", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"open\""))
+        .stdout(predicates::str::contains("\"assignee\":null"));
+    // A no longer holds it → a second release is a clean miss (exit 1).
+    quorum(home.path())
+        .args(["task-release", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .code(1);
+    // B claims the now-open task and submits done; A (not assignee) cannot.
+    quorum(home.path())
+        .args(["task-claim", "--agent", "B", "--task-id", "1"])
         .assert()
         .success()
         .stdout(predicates::str::contains("\"assignee\":\"B\""));
-    // ...now B can update, A cannot
     quorum(home.path())
         .args([
             "task-update",
@@ -152,10 +156,106 @@ fn assignee_can_hand_off_task() {
             "--task-id",
             "1",
             "--status",
-            "open",
+            "done",
         ])
         .assert()
         .code(1);
+}
+
+#[test]
+fn renew_and_cancel_lifecycle() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--ttl",
+            "1h",
+        ])
+        .assert()
+        .success();
+    // Holder renews; a non-holder cannot.
+    quorum(home.path())
+        .args(["task-renew", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-renew", "--agent", "B", "--task-id", "1"])
+        .assert()
+        .code(1);
+    // A stranger (neither creator nor assignee) cannot cancel...
+    quorum(home.path())
+        .args(["task-cancel", "--agent", "C", "--task-id", "1"])
+        .assert()
+        .code(1);
+    // ...but the creator can. Terminal → a second cancel is a clean miss.
+    quorum(home.path())
+        .args(["task-cancel", "--agent", "boss", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"cancelled\""));
+    quorum(home.path())
+        .args(["task-cancel", "--agent", "boss", "--task-id", "1"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn reaper_reclaims_lapsed_lease_via_cli() {
+    // End-to-end (real binary, real clock): a claimed task whose lease lapses is returned to
+    // `open` by the next write's sweep-on-write reaper, with a `reclaimed` event on the feed.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--ttl",
+            "1s",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"claimed\""));
+    // Let the 1s lease lapse, then make any write to trigger sweep-on-write.
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "y"])
+        .assert()
+        .success();
+    // Task 1 is back to open, assignee cleared.
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"open\""))
+        .stdout(predicates::str::contains("\"assignee\":null"));
+    // A reclaimed event was posted to the feed by the reaper.
+    // (body is JSON-inside-JSON, so assert on quote-free substrings that survive escaping)
+    quorum(home.path())
+        .args(["peek"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("reclaimed"))
+        .stdout(predicates::str::contains("lease lapsed"));
+    // No errors logged (reaping is normal operation).
+    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0, "reaping must not log errors");
 }
 
 #[test]
