@@ -93,3 +93,48 @@ fn release_requires_exactly_one_selector() {
         .assert()
         .code(2);
 }
+
+#[test]
+fn renew_output_matches_claim_won_shape() {
+    let home = tempfile::tempdir().unwrap();
+    // claim emits {ok:true, claim_id:...}
+    let claim_out = quorum(home.path())
+        .args(["claim", "--agent", "A", "--target", "pr#7", "--ttl", "1h"])
+        .output()
+        .unwrap()
+        .stdout;
+    let claim_json: serde_json::Value = serde_json::from_slice(&claim_out).unwrap();
+    assert_eq!(claim_json["ok"], true);
+    assert!(claim_json["claim_id"].is_number());
+
+    let claim_id = claim_json["claim_id"].to_string();
+
+    // renew must emit the same shape: {ok:true, claim_id:...}
+    let renew_out = quorum(home.path())
+        .args([
+            "renew",
+            "--agent",
+            "A",
+            "--claim-id",
+            &claim_id,
+            "--ttl",
+            "2h",
+        ])
+        .output()
+        .unwrap()
+        .stdout;
+    let renew_json: serde_json::Value = serde_json::from_slice(&renew_out).unwrap();
+    assert_eq!(renew_json["ok"], true, "renew must emit ok:true");
+    assert_eq!(
+        renew_json["claim_id"], claim_json["claim_id"],
+        "renew must emit claim_id, not id"
+    );
+    assert!(renew_json["target"].is_string());
+    assert!(renew_json["holder"].is_string());
+    assert!(renew_json["expires_at"].is_number());
+    // The old field name 'id' must NOT appear.
+    assert!(
+        renew_json.get("id").is_none(),
+        "renew must not emit bare 'id'"
+    );
+}
