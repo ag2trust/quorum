@@ -51,7 +51,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_by  TEXT NOT NULL,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL,
-    refs        TEXT
+    refs        TEXT,
+    -- JSON array of task ids this task depends on; NULL = no deps. Claim auto-pick + explicit
+    -- --task-id both gate on every listed dep being status='closed' (reviewed + finalized).
+    -- Validated at create-time, so reads never fault on bad JSON.
+    depends_on  TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 

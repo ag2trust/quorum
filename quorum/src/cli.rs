@@ -71,6 +71,11 @@ pub enum Command {
         /// JSON of external refs, e.g. '{"pr":2459}'.
         #[arg(long)]
         refs: Option<String>,
+        /// JSON array of task ids this task depends on, e.g. '[1,3]'. Claim (auto-pick AND
+        /// explicit --task-id) skips this task until every listed dep is `closed` (reviewed
+        /// + finalized). Validated as a JSON array of ints at create — malformed exits 2.
+        #[arg(long = "depends-on")]
+        depends_on: Option<String>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]

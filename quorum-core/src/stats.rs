@@ -108,7 +108,7 @@ mod tests {
                                                                                            // a claim
         crate::claims::claim(&mut c, "A", "pr#1", 1000, 100).unwrap();
         // a task
-        crate::tasks::create(&mut c, "A", "t", None, 0, None, None, 100).unwrap();
+        crate::tasks::create(&mut c, "A", "t", None, 0, None, None, None, 100).unwrap();
 
         // now=500 is past the 300s online window (last_seen=100) and past the dead msg's expiry
         let s = stats(&c, 500, crate::agents::ONLINE_WINDOW_SECS).unwrap();

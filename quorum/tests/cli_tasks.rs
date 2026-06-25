@@ -420,3 +420,129 @@ fn concurrent_match_label_claim_one_winner() {
         "label-filtered claim must still grant to exactly one process"
     );
 }
+
+// -- task dependencies (issue #2) ---------------------------------------------------------
+
+#[test]
+fn task_create_rejects_malformed_depends_on() {
+    // Cobble-x7M's blocking finding on #18 v1, asserted at the CLI boundary: a typo like
+    // `"1,2"` (no brackets) MUST exit non-zero AND not create the row. Otherwise the bad
+    // row would poison every subsequent task-list/task-get/task-cancel.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "bad",
+            "--depends-on",
+            "1,2",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("depends-on"));
+    // task-list still works (proves the queue isn't poisoned) and shows no rows.
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("[]"));
+}
+
+#[test]
+fn depends_on_gates_claim_end_to_end() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "dep"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "dependent",
+            "--depends-on",
+            "[1]",
+        ])
+        .assert()
+        .success();
+
+    // Auto-pick claims the dep (id 1); dependent stays gated.
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"id\":1"));
+
+    // No more claimable tasks: dependent is gated, dep is claimed.
+    quorum(home.path())
+        .args(["task-claim", "--agent", "B"])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("no claimable task"));
+
+    // Even an explicit --task-id can't pull the gated dependent.
+    quorum(home.path())
+        .args(["task-claim", "--agent", "B", "--task-id", "2"])
+        .assert()
+        .code(1);
+
+    // Submitting dep as `done` is NOT enough — gate is on `closed` per #9/#10 alignment.
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "done",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "B"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn task_get_surfaces_depends_on_and_ready() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "dep"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "dependent",
+            "--depends-on",
+            "[1]",
+        ])
+        .assert()
+        .success();
+
+    // No-deps task → ready=true, depends_on=null.
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"ready\":true"))
+        .stdout(predicates::str::contains("\"depends_on\":null"));
+
+    // With unmet dep → ready=false, depends_on="[1]".
+    quorum(home.path())
+        .args(["task-get", "--task-id", "2"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"ready\":false"))
+        .stdout(predicates::str::contains("\"depends_on\":\"[1]\""));
+}

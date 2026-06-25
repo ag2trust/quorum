@@ -12,7 +12,10 @@ CLAIMS (atomic locks)
   quorum claims [--target <t>]
 
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
-  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--body-stdin]
+  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--body-stdin]
+                                                               # --depends-on gates the claim: dependent stays unclaimable
+                                                               # until every listed task is `closed` (#2 alignment).
+                                                               # Malformed JSON → exit 2 at create (never poisons reads).
   quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable

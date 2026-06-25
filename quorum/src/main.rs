@@ -237,6 +237,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             labels,
             refs,
             body_stdin,
+            depends_on,
             body_file,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
@@ -249,6 +250,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 priority.unwrap_or(0),
                 labels.as_deref(),
                 refs.as_deref(),
+                depends_on.as_deref(),
                 now,
             )?;
             output::emit(&serde_json::json!({ "id": id }));
