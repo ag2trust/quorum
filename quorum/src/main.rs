@@ -47,7 +47,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Peek { .. } => "peek",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
-        cli::Command::HelpAgent => "help-agent",
+        cli::Command::Help => "help",
     }
 }
 
@@ -111,7 +111,7 @@ fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<O
 }
 
 /// Load config from the standard path. Called lazily, only by commands that read its fields,
-/// so a malformed config never breaks recovery (`help-agent`) or maintenance (`sweep`/`init`).
+/// so a malformed config never breaks recovery (`help`) or maintenance (`sweep`/`init`).
 fn load_cfg() -> Result<config::Config> {
     config::load(&paths::config_path()?)
 }
@@ -405,7 +405,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true }));
             Ok(0)
         }
-        cli::Command::HelpAgent => {
+        cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);
             Ok(0)
         }
