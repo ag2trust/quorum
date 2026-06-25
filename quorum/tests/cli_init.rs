@@ -31,22 +31,31 @@ fn init_is_idempotent() {
 fn concurrent_init_is_safe() {
     // N separate processes running `init` at once must all succeed against one DB —
     // migration runs under BEGIN IMMEDIATE, so first-runs serialize safely.
-    let home = tempfile::tempdir().unwrap();
-    let handles: Vec<_> = (0..8)
-        .map(|_| {
-            let p = home.path().to_path_buf();
-            std::thread::spawn(move || {
-                Command::cargo_bin("quorum")
-                    .unwrap()
-                    .env("QUORUM_HOME", &p)
-                    .arg("init")
-                    .assert()
-                    .success();
+    //
+    // Loop-stressed per quorum CLAUDE.md ("Always stress concurrency tests in a loop;
+    // a single green run hides flakiness"). The first-creation WAL-switch race is the
+    // documented flaky path (busy_timeout doesn't cover journal-mode changes — see
+    // `db::set_journal_wal`), so a single round can pass while the bounded retry is
+    // silently broken. Each iteration uses a fresh tempdir so every round re-races the
+    // initial WAL switch from scratch (a reused DB would already be in WAL, no race).
+    for _ in 0..12 {
+        let home = tempfile::tempdir().unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let p = home.path().to_path_buf();
+                std::thread::spawn(move || {
+                    Command::cargo_bin("quorum")
+                        .unwrap()
+                        .env("QUORUM_HOME", &p)
+                        .arg("init")
+                        .assert()
+                        .success();
+                })
             })
-        })
-        .collect();
-    for h in handles {
-        h.join().unwrap();
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(home.path().join("quorum.db").exists());
     }
-    assert!(home.path().join("quorum.db").exists());
 }

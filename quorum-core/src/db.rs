@@ -30,7 +30,19 @@ pub fn apply_pragmas(conn: &Connection) -> Result<()> {
 /// set. WAL is persistent on the file, so this race exists only on the very first switch;
 /// a bounded retry resolves it. Subsequent opens see WAL already set (a no-op, no lock).
 fn set_journal_wal(conn: &Connection) -> Result<()> {
-    for _ in 0..100 {
+    set_journal_wal_with(conn, 100, std::time::Duration::from_millis(20))
+}
+
+/// Inner: parameterized retry. Production uses (100, 20ms) → ~2s budget. Tests use tiny
+/// values to deterministically hit the `Err(Busy)` exhaustion branch in <50ms without
+/// changing the runtime semantics — extracting the constants is the smallest refactor that
+/// makes the exhaustion path reachable from a unit test.
+fn set_journal_wal_with(
+    conn: &Connection,
+    max_retries: usize,
+    sleep: std::time::Duration,
+) -> Result<()> {
+    for _ in 0..max_retries {
         match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
             Ok(_) => {} // not yet WAL (another switch in flight) — retry
@@ -38,7 +50,7 @@ fn set_journal_wal(conn: &Connection) -> Result<()> {
                 if matches!(e.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {}
             Err(e) => return Err(e.into()),
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(sleep);
     }
     Err(QuorumError::Busy)
 }
@@ -361,6 +373,40 @@ mod tests {
             .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "pre-notes");
+    }
+
+    #[test]
+    fn set_journal_wal_returns_busy_when_lock_held() {
+        // Exercises the previously-untested exhaustion branch (`db.rs::set_journal_wal_with`
+        // returning `Err(QuorumError::Busy)`). A held EXCLUSIVE transaction on a second
+        // connection blocks the WAL switch on the first, so the bounded retry loop drains
+        // and returns `Err(Busy)` — the contract the production set_journal_wal relies on
+        // when the 100×20ms budget is exceeded under genuinely-pathological contention.
+        //
+        // Uses a 3×1ms retry budget so the test runs in <50ms. Production semantics are
+        // unchanged — set_journal_wal still calls set_journal_wal_with(100, 20ms).
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+
+        // Conn A: hold an EXCLUSIVE transaction. busy_timeout=0 so the BEGIN is immediate.
+        let conn_a = Connection::open(&p).unwrap();
+        conn_a.pragma_update(None, "busy_timeout", 0).unwrap();
+        conn_a.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+        // Conn B: tries to switch to WAL — can't acquire the exclusive lock A holds, every
+        // retry sees BUSY/LOCKED, exhausts the budget, returns Err(Busy).
+        let conn_b = Connection::open(&p).unwrap();
+        conn_b.pragma_update(None, "busy_timeout", 0).unwrap();
+        let result = set_journal_wal_with(&conn_b, 3, Duration::from_millis(1));
+
+        // Cleanup: release A's lock so tempdir drops cleanly.
+        let _ = conn_a.execute_batch("COMMIT");
+
+        match result {
+            Err(QuorumError::Busy) => {} // expected — the contract this test pins
+            other => panic!("expected Err(QuorumError::Busy), got {other:?}"),
+        }
     }
 
     #[test]
