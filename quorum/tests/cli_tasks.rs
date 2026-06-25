@@ -2,6 +2,7 @@
 //! property and the body-via-stdin text path.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use std::process::{Command as Proc, Stdio};
 
 fn quorum(home: &std::path::Path) -> Command {
@@ -242,14 +243,20 @@ fn reaper_reclaims_lapsed_lease_via_cli() {
         .success()
         .stdout(predicates::str::contains("\"status\":\"open\""))
         .stdout(predicates::str::contains("\"assignee\":null"));
-    // A reclaimed event was posted to the feed by the reaper.
-    // (body is JSON-inside-JSON, so assert on quote-free substrings that survive escaping)
+    // A `task_reclaimed` event was posted to the EVENT LOG by the reaper (not the message
+    // feed — events live separate from messaging per issue #4).
+    quorum(home.path())
+        .args(["log", "--refs", "task#1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"kind\":\"task_reclaimed\""))
+        .stdout(predicates::str::contains("lease lapsed"));
+    // And the message feed is NOT polluted with auto-events.
     quorum(home.path())
         .args(["peek"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("reclaimed"))
-        .stdout(predicates::str::contains("lease lapsed"));
+        .stdout(predicates::str::contains("reclaimed").not());
     // No errors logged (reaping is normal operation).
     let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
     let n: i64 = conn

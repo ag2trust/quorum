@@ -63,3 +63,18 @@ CREATE TABLE IF NOT EXISTS errors (
     expires_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS errors_expires ON errors(expires_at);
+
+-- Automatic state-change events. Distinct from `messages` so the agent-to-agent feed isn't
+-- drowned by routine state ticks. Auto-emitted from inside each mutator's transaction so an
+-- event never disagrees with the state it describes (Atomic > all). TTL'd like everything
+-- else; not part of the messaging channel — read via `quorum log`.
+CREATE TABLE IF NOT EXISTS events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_subject_seq ON events(subject, seq);
+CREATE INDEX IF NOT EXISTS events_expires    ON events(expires_at);

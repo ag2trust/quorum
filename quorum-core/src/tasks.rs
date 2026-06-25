@@ -109,6 +109,11 @@ pub fn create(
         params![title, body, priority, labels, created_by, now, refs],
     )?;
     let id = tx.last_insert_rowid();
+    let body_str = match labels {
+        Some(l) => format!("created (prio {priority}, labels {l})"),
+        None => format!("created (prio {priority})"),
+    };
+    crate::events::emit(&tx, "task_created", &lease_target(id), &body_str, now)?;
     tx.commit()?;
     Ok(id)
 }
@@ -167,6 +172,13 @@ pub fn claim(
             "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
             params![target, agent, now, now + ttl],
         )?;
+        crate::events::emit(
+            &tx,
+            "task_claimed",
+            &target,
+            &format!("taken by {agent}"),
+            now,
+        )?;
     }
     tx.commit()?;
     Ok(task)
@@ -218,6 +230,13 @@ pub fn update(
     // task and so a future reopen (#10) can take a fresh lease without a stale-row collision.
     if fields.status == Some("done") {
         deactivate_lease(&tx, id, now)?;
+        crate::events::emit(
+            &tx,
+            "task_done",
+            &lease_target(id),
+            &format!("done by {agent}"),
+            now,
+        )?;
     }
     let task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
@@ -245,6 +264,13 @@ pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<
         return Err(QuorumError::NotHolder);
     }
     deactivate_lease(&tx, id, now)?;
+    crate::events::emit(
+        &tx,
+        "task_released",
+        &lease_target(id),
+        &format!("released by {agent}"),
+        now,
+    )?;
     let task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -301,6 +327,13 @@ pub fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<T
         return Err(QuorumError::NotHolder);
     }
     deactivate_lease(&tx, id, now)?;
+    crate::events::emit(
+        &tx,
+        "task_cancelled",
+        &lease_target(id),
+        &format!("cancelled by {agent}"),
+        now,
+    )?;
     let task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],

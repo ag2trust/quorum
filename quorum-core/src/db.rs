@@ -8,7 +8,7 @@ use rusqlite::{Connection, Error as SqlErr, ErrorCode};
 use std::path::Path;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The full schema. Every statement is idempotent (`IF NOT EXISTS`).
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -123,7 +123,9 @@ mod tests {
             let _ = open(&p).unwrap();
         }
         let c = open(&p).unwrap(); // second open must not error
-        for t in ["agents", "messages", "cursors", "claims", "tasks", "errors"] {
+        for t in [
+            "agents", "messages", "cursors", "claims", "tasks", "errors", "events",
+        ] {
             let n: i64 = c
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -193,6 +195,52 @@ mod tests {
             .unwrap();
         assert_eq!(body, "pre-migration");
         assert!(recipient.is_none());
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_adds_events_table() {
+        // Simulate a v2 DB (pre-events) with the v2 messages shape, then re-open and verify
+        // the new `events` table is created without losing any existing rows.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    author TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    refs TEXT,
+                    expires_at INTEGER NOT NULL,
+                    recipient TEXT
+                 );
+                 INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at)
+                 VALUES (1, 'A', 'hub', 'info', 'pre-events', NULL, 9999);
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // events table exists and is empty
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // existing message still there
+        let body: String = c
+            .query_row("SELECT body FROM messages WHERE seq=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body, "pre-events");
     }
 
     #[test]

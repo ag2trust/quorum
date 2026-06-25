@@ -8,6 +8,7 @@ pub mod clock;
 pub mod db;
 pub mod errlog;
 pub mod error;
+pub mod events;
 pub mod feed;
 pub mod stats;
 pub mod sweep;

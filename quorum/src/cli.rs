@@ -193,6 +193,17 @@ pub enum Command {
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Read the auto-emitted state-change event log (separate from the message feed).
+    /// `--since <seq>` returns events strictly after a seq; `--refs <subject>` filters by
+    /// the entity (e.g. `task#42`, `pr#2459`).
+    Log {
+        #[arg(long)]
+        since: Option<i64>,
+        #[arg(long = "refs")]
+        refs: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
     /// Health snapshot. --json for machine output; --watch to refresh continuously.
     Status {
         #[arg(long)]
