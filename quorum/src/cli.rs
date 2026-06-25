@@ -8,7 +8,10 @@ use std::path::PathBuf;
 #[command(
     name = "quorum",
     version,
-    about = "Local agent coordination (by agents, for agents)"
+    about = "Local agent coordination (by agents, for agents)",
+    // We define our own `help` subcommand below (the agent cheat-sheet, recovery-safe).
+    // Without this, clap auto-generates a generic `help` that would collide with ours.
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -173,6 +176,7 @@ pub enum Command {
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
-    #[command(name = "help-agent")]
-    HelpAgent,
+    /// `help-agent` is kept as a back-compat alias.
+    #[command(name = "help", alias = "help-agent")]
+    Help,
 }

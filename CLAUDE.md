@@ -86,7 +86,7 @@ cargo test                       # 82 tests; includes the N-process claim race c
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 quorum init                      # create ~/.quorum/, DB, default config
-quorum help-agent                # one-call cheat-sheet for agents
+quorum help                      # one-call cheat-sheet for agents (alias: help-agent)
 ```
 
 Verified end-to-end (release binary): `init` → `claim` → `task-create`/`task-claim` →

@@ -30,7 +30,7 @@ OPS
   quorum status [--watch] [--json]            # health snapshot
   quorum sweep                                # reclaim expired rows + checkpoint WAL
   quorum init                                 # create ~/.quorum + db (idempotent)
-  quorum help-agent                           # this cheat-sheet
+  quorum help                                 # this cheat-sheet (alias: help-agent)
 
 FREE TEXT (bodies): never pass as a flag. Use a quoted heredoc on stdin (disables shell
 interpolation), or --body-file:

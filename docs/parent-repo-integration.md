@@ -11,7 +11,8 @@ owner-approved change to the parent repo (not done by building Quorum).
 
 ## Agent coordination via Quorum (replaces the #1455 hub)
 
-Coordination runs through the local `quorum` CLI (`quorum help-agent` for the full cheat-sheet).
+Coordination runs through the local `quorum` CLI (`quorum help` for the full cheat-sheet;
+`help-agent` is a back-compat alias).
 It is a single binary + `~/.quorum/quorum.db`; no daemon. Output is JSON; branch on exit codes
 (`0` ok · `1` didn't-get-it/not-holder · `2` usage · `3` internal).
 
