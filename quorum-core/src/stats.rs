@@ -103,9 +103,9 @@ mod tests {
     fn counts_exclude_expired_and_stale() {
         let (_d, mut c) = open_tmp();
         // a live + an expired message
-        crate::feed::post(&mut c, "A", "info", None, "live", None, 1000, 100).unwrap();
-        crate::feed::post(&mut c, "A", "info", None, "dead", None, 5, 100).unwrap(); // expires 105
-                                                                                     // a claim
+        crate::feed::post(&mut c, "A", "info", None, "live", None, None, 1000, 100).unwrap();
+        crate::feed::post(&mut c, "A", "info", None, "dead", None, None, 5, 100).unwrap(); // expires 105
+                                                                                           // a claim
         crate::claims::claim(&mut c, "A", "pr#1", 1000, 100).unwrap();
         // a task
         crate::tasks::create(&mut c, "A", "t", None, 0, None, None, 100).unwrap();

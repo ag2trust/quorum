@@ -112,6 +112,7 @@ pub enum Command {
         task_id: i64,
     },
     /// Post a message to the feed. Body (free text) via --body-stdin or --body-file.
+    /// `--to <agent>` marks it as a direct message to that agent; omitted = broadcast.
     Post {
         #[arg(long)]
         agent: String,
@@ -120,6 +121,9 @@ pub enum Command {
         kind: String,
         #[arg(long)]
         topic: Option<String>,
+        /// Direct-message recipient. Omit for a broadcast.
+        #[arg(long = "to")]
+        to: Option<String>,
         /// Message TTL, e.g. 48h, 2h, 30m. Defaults to 48h.
         #[arg(long)]
         ttl: Option<String>,
@@ -132,6 +136,8 @@ pub enum Command {
         body_file: Option<PathBuf>,
     },
     /// Read new messages since your cursor; --ack-through advances the cursor.
+    /// Default returns broadcasts + direct-to-you. `--direct` keeps only direct-to-you;
+    /// `--broadcasts` keeps only general (no recipient). The two are mutually exclusive.
     Read {
         #[arg(long)]
         agent: String,
@@ -141,6 +147,12 @@ pub enum Command {
         ack_through: Option<i64>,
         #[arg(long)]
         limit: Option<i64>,
+        /// Show only direct-to-you messages.
+        #[arg(long, conflicts_with = "broadcasts")]
+        direct: bool,
+        /// Show only broadcasts (no recipient).
+        #[arg(long)]
+        broadcasts: bool,
     },
     /// Inspect messages without touching any cursor.
     Peek {
