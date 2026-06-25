@@ -256,6 +256,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::TaskClaim {
             agent,
             task_id,
+            match_label,
             ttl,
         } => {
             let ttl = match ttl {
@@ -263,7 +264,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 None => load_cfg()?.task_lease_ttl_secs,
             };
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::claim(&mut conn, &agent, task_id, ttl, now)? {
+            let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
+            match quorum_core::tasks::claim(&mut conn, &agent, task_id, &labels, ttl, now)? {
                 Some(t) => {
                     output::emit(&t);
                     Ok(0)

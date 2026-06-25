@@ -114,16 +114,22 @@ pub fn create(
 }
 
 /// Atomically claim a task and take a renewable `ttl`-second lease on it. With `task_id`,
-/// claims that specific open task; without, claims the highest-priority open task. Returns
-/// `None` if nothing claimable (already taken / none open).
+/// claims that specific open task; without, claims the highest-priority open task whose
+/// `labels` contain every label in `match_labels` (empty slice = no label filter, current
+/// behaviour). Returns `None` if nothing claimable (already taken / none open / no match).
 ///
 /// The guarded `UPDATE ... WHERE status='open'` is the single-winner gate; the lease row
 /// (`target='task#<id>'`) is written in the same transaction so claim + lease are atomic. The
 /// lease lets a lost agent's task be reaped back to `open` (see `sweep::reap_lapsed_tasks`).
+///
+/// `match_labels` is intentionally AND-only and exact-match (no expression grammar) — quorum
+/// stays agnostic to what a label means; pattern is `%"<label>"%` against the JSON-array
+/// `labels` column, identical to [`list`].
 pub fn claim(
     conn: &mut Connection,
     agent: &str,
     task_id: Option<i64>,
+    match_labels: &[&str],
     ttl: i64,
     now: i64,
 ) -> Result<Option<Task>> {
@@ -141,18 +147,29 @@ pub fn claim(
                 row_to_task,
             )
             .optional()?,
-        None => tx
-            .query_row(
-                &format!(
-                    "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
-                     WHERE id=(SELECT id FROM tasks WHERE status='open'
-                               ORDER BY priority DESC, id ASC LIMIT 1)
-                     RETURNING {COLS}"
-                ),
-                params![agent, now],
-                row_to_task,
-            )
-            .optional()?,
+        None => {
+            // Build the open-task selector with one `AND labels LIKE ?N` per match-label.
+            // Patterns are bound as parameters; only the placeholders are interpolated into SQL
+            // (count-based, derived from match_labels.len() — no value reaches SQL as a string).
+            let mut selector = String::from("SELECT id FROM tasks WHERE status='open'");
+            for i in 0..match_labels.len() {
+                // Params are 1-indexed; ?1 = agent, ?2 = now, so label params start at ?3.
+                use std::fmt::Write as _;
+                let _ = write!(selector, " AND labels LIKE ?{}", i + 3);
+            }
+            selector.push_str(" ORDER BY priority DESC, id ASC LIMIT 1");
+            let sql = format!(
+                "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
+                 WHERE id=({selector}) RETURNING {COLS}"
+            );
+            let label_pats: Vec<String> =
+                match_labels.iter().map(|l| format!("%\"{l}\"%")).collect();
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&agent, &now];
+            for p in &label_pats {
+                bind.push(p);
+            }
+            tx.query_row(&sql, &bind[..], row_to_task).optional()?
+        }
     };
     if let Some(t) = &task {
         // Take the lease in the same txn. Reap a dead lease first (a reopened task may carry a
@@ -390,7 +407,9 @@ mod tests {
     fn create_then_claim_sets_assignee_and_lease() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "fix bug", None, 0, None, None, 1000).unwrap();
-        let t = claim(&mut c, "A", Some(id), TTL, 1000).unwrap().unwrap();
+        let t = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
         assert_eq!(t.status, "claimed");
         assert_eq!(t.assignee.as_deref(), Some("A"));
         // The claim took a renewable lease on task#<id>.
@@ -401,8 +420,12 @@ mod tests {
     fn second_claim_of_same_task_is_none() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        assert!(claim(&mut c, "A", Some(id), TTL, 1000).unwrap().is_some());
-        assert!(claim(&mut c, "B", Some(id), TTL, 1000).unwrap().is_none());
+        assert!(claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .is_some());
+        assert!(claim(&mut c, "B", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -410,21 +433,153 @@ mod tests {
         let (_d, mut c) = open_tmp();
         create(&mut c, "boss", "low", None, 1, None, None, 1000).unwrap();
         create(&mut c, "boss", "high", None, 9, None, None, 1000).unwrap();
-        let t = claim(&mut c, "A", None, TTL, 1000).unwrap().unwrap();
+        let t = claim(&mut c, "A", None, &[], TTL, 1000).unwrap().unwrap();
         assert_eq!(t.title, "high");
     }
 
     #[test]
     fn claim_nothing_open_is_none() {
         let (_d, mut c) = open_tmp();
-        assert!(claim(&mut c, "A", None, TTL, 1000).unwrap().is_none());
+        assert!(claim(&mut c, "A", None, &[], TTL, 1000).unwrap().is_none());
+    }
+
+    // -- --match-label (issue #1) -----------------------------------------------------------
+
+    #[test]
+    fn match_label_filters_to_matching_task() {
+        let (_d, mut c) = open_tmp();
+        // Two open tasks; the higher-priority one lacks the requested label.
+        create(
+            &mut c,
+            "boss",
+            "high-no-label",
+            None,
+            9,
+            Some(r#"["tier:opus-46"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        let want = create(
+            &mut c,
+            "boss",
+            "low-with-label",
+            None,
+            1,
+            Some(r#"["tier:opus-47","lang:rust"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        let t = claim(&mut c, "A", None, &["tier:opus-47"], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, want);
+        assert_eq!(t.title, "low-with-label");
+    }
+
+    #[test]
+    fn match_label_no_match_is_none_not_error() {
+        let (_d, mut c) = open_tmp();
+        create(
+            &mut c,
+            "boss",
+            "rust",
+            None,
+            5,
+            Some(r#"["lang:rust"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        // Requesting a label nothing carries → clean None (caller exits 1), not an error.
+        assert!(claim(&mut c, "A", None, &["lang:python"], TTL, 1000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn match_label_is_and_across_repeats() {
+        let (_d, mut c) = open_tmp();
+        // Only one task carries BOTH labels; AND must skip the singletons.
+        create(
+            &mut c,
+            "boss",
+            "rust-only",
+            None,
+            9,
+            Some(r#"["lang:rust"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        create(
+            &mut c,
+            "boss",
+            "tier-only",
+            None,
+            9,
+            Some(r#"["tier:opus-47"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        let want = create(
+            &mut c,
+            "boss",
+            "rust-and-tier",
+            None,
+            5,
+            Some(r#"["lang:rust","tier:opus-47"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        let t = claim(&mut c, "A", None, &["lang:rust", "tier:opus-47"], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, want);
+    }
+
+    #[test]
+    fn match_label_picks_highest_priority_among_matches() {
+        let (_d, mut c) = open_tmp();
+        // Three matching tasks at different priorities; claim must pick the top.
+        create(&mut c, "boss", "low", None, 1, Some(r#"["k"]"#), None, 1000).unwrap();
+        let want = create(
+            &mut c,
+            "boss",
+            "high",
+            None,
+            9,
+            Some(r#"["k"]"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        create(&mut c, "boss", "mid", None, 5, Some(r#"["k"]"#), None, 1000).unwrap();
+        let t = claim(&mut c, "A", None, &["k"], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, want);
+    }
+
+    #[test]
+    fn match_label_takes_lease_just_like_unfiltered_claim() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, Some(r#"["k"]"#), None, 1000).unwrap();
+        let t = claim(&mut c, "A", None, &["k"], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, id);
+        assert!(has_live_lease(&c, id, 1000));
     }
 
     #[test]
     fn update_by_assignee_sets_done_and_drops_lease() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let t = update(
             &mut c,
             "A",
@@ -446,7 +601,7 @@ mod tests {
     fn update_by_nonassignee_fails_loud() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let err = update(
             &mut c,
             "B",
@@ -465,7 +620,7 @@ mod tests {
     fn update_rejects_invalid_status() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let err = update(
             &mut c,
             "A",
@@ -485,7 +640,7 @@ mod tests {
         // No agent-set intermediate state: only `done` is settable via task-update.
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         for bad in ["open", "claimed", "closed", "cancelled"] {
             let err = update(
                 &mut c,
@@ -509,20 +664,22 @@ mod tests {
     fn release_returns_task_to_open_and_drops_lease() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let t = release(&mut c, "A", id, 1100).unwrap();
         assert_eq!(t.status, "open");
         assert!(t.assignee.is_none());
         assert!(!has_live_lease(&c, id, 1100));
         // Released task is re-claimable by anyone.
-        assert!(claim(&mut c, "B", Some(id), TTL, 1200).unwrap().is_some());
+        assert!(claim(&mut c, "B", Some(id), &[], TTL, 1200)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn release_by_nonassignee_fails_loud() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         assert!(matches!(
             release(&mut c, "B", id, 1100).unwrap_err(),
             QuorumError::NotHolder
@@ -533,8 +690,8 @@ mod tests {
     fn renew_extends_lease_for_holder_only() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), 100, 1000).unwrap(); // expires at 1100
-                                                          // Holder renews near expiry → lease lives past the old boundary.
+        claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // expires at 1100
+                                                               // Holder renews near expiry → lease lives past the old boundary.
         renew(&mut c, "A", id, 100, 1090).unwrap(); // now expires at 1190
         assert!(has_live_lease(&c, id, 1150));
         // A non-holder cannot renew.
@@ -548,8 +705,8 @@ mod tests {
     fn renew_fails_once_lease_lapsed() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), 100, 1000).unwrap(); // dead at 1100
-                                                          // At/after expiry the lease is gone → must re-claim, renew fails loud.
+        claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // dead at 1100
+                                                               // At/after expiry the lease is gone → must re-claim, renew fails loud.
         assert!(matches!(
             renew(&mut c, "A", id, 100, 1100).unwrap_err(),
             QuorumError::NotHolder
@@ -567,7 +724,7 @@ mod tests {
         );
         // Assignee can cancel a claimed task (and the lease is dropped).
         let id2 = create(&mut c, "boss", "y", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id2), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id2), &[], TTL, 1000).unwrap();
         assert_eq!(cancel(&mut c, "A", id2, 1100).unwrap().status, "cancelled");
         assert!(!has_live_lease(&c, id2, 1100));
     }
@@ -576,7 +733,7 @@ mod tests {
     fn cancel_rejected_for_stranger_and_terminal() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         // A bystander (neither creator nor assignee) cannot cancel.
         assert!(matches!(
             cancel(&mut c, "C", id, 1100).unwrap_err(),

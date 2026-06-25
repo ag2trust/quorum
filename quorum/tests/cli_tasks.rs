@@ -285,3 +285,131 @@ fn concurrent_task_claim_one_winner() {
         .count();
     assert_eq!(wins, 1, "exactly one process may claim the task");
 }
+
+// -- --match-label (issue #1) -------------------------------------------------------------
+
+#[test]
+fn match_label_end_to_end() {
+    let home = tempfile::tempdir().unwrap();
+    // A high-priority task without the label and a low-priority one with it.
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "no-label",
+            "--priority",
+            "9",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "with-label",
+            "--priority",
+            "1",
+            "--labels",
+            r#"["tier:opus-47"]"#,
+        ])
+        .assert()
+        .success();
+
+    // --match-label restricts to the labeled task even though the other is higher-priority.
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "A",
+            "--match-label",
+            "tier:opus-47",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("with-label"))
+        .stdout(predicates::str::contains("\"status\":\"claimed\""));
+
+    // No more labeled tasks open → exit 1, clean reason.
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "B",
+            "--match-label",
+            "tier:opus-47",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("no claimable task"));
+}
+
+#[test]
+fn match_label_and_task_id_are_mutually_exclusive() {
+    // clap rejects --task-id + --match-label at parse time (exit 2 = usage error). An explicit
+    // --task-id is already a more specific selector than any label filter.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--match-label",
+            "k",
+        ])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn concurrent_match_label_claim_one_winner() {
+    // Project bar (CLAUDE.md): stress concurrency. Spawn 12 processes all racing for the same
+    // label-filtered task; the partial unique index + BEGIN IMMEDIATE must still give exactly
+    // one winner — the WHERE label-filter doesn't change the atomicity gate.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "labeled",
+            "--labels",
+            r#"["k"]"#,
+        ])
+        .assert()
+        .success();
+
+    let bin = assert_cmd::cargo::cargo_bin("quorum");
+    let children: Vec<_> = (0..12)
+        .map(|i| {
+            Proc::new(&bin)
+                .env("QUORUM_HOME", home.path())
+                .args([
+                    "task-claim",
+                    "--agent",
+                    &format!("a{i}"),
+                    "--match-label",
+                    "k",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let wins = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .filter(|o| o.status.success())
+        .count();
+    assert_eq!(
+        wins, 1,
+        "label-filtered claim must still grant to exactly one process"
+    );
+}

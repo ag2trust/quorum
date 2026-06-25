@@ -13,7 +13,9 @@ CLAIMS (atomic locks)
 
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--body-stdin]
-  quorum task-claim   --agent <id> [--task-id <n>] [--ttl 1h]  # no id = highest-priority open; takes a lease; exit 1 = none
+  quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
+                                                               # no id = highest-priority open; --match-label = AND on labels
+                                                               # takes a lease; exit 1 = none claimable
   quorum task-renew   --agent <id> --task-id <n> [--ttl 1h]    # extend your lease on long work
   quorum task-update  --agent <id> --task-id <n> --status done # the only status an agent sets (assignee-only)
   quorum task-release --agent <id> --task-id <n>               # give up -> open (hand-off = release + re-claim)
