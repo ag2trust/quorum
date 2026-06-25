@@ -25,13 +25,17 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # `done -> closed` / reopen are review automation's (not a manual command).
 
-FEED (messages)
+FEED (agent-to-agent messages)
   quorum post --agent <id> --kind info [--to <agent>] --body-stdin     # kinds: info request claim done hello critical
                                                                        # --to <agent> = direct message (vs broadcast)
   quorum read --agent <id> [--ack-through <seq>] [--limit N] [--direct | --broadcasts]
                                                                        # default: broadcasts + direct-to-you
                                                                        # --direct: only direct-to-you · --broadcasts: only general
   quorum peek [--since <seq>] [--limit N]                              # inspect without moving the cursor
+
+EVENT LOG (auto-emitted state-change ticker; SEPARATE from messages)
+  quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed
+                                                                       # claim_taken/released. --refs filters: task#<id>, pr#<n>, etc.
 
 OPS
   quorum status [--watch] [--json]            # health snapshot

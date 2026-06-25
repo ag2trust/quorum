@@ -48,6 +48,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Post { .. } => "post",
         cli::Command::Read { .. } => "read",
         cli::Command::Peek { .. } => "peek",
+        cli::Command::Log { .. } => "log",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
         cli::Command::Help => "help",
@@ -430,6 +431,21 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 now,
             )?;
             output::emit(&msgs);
+            Ok(0)
+        }
+        cli::Command::Log { since, refs, limit } => {
+            check_nonneg("--limit", limit)?;
+            check_nonneg("--since", since)?;
+            let read_limit = load_cfg()?.read_limit;
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let evs = quorum_core::events::list(
+                &conn,
+                since.unwrap_or(0),
+                refs.as_deref(),
+                limit.unwrap_or(read_limit),
+                now,
+            )?;
+            output::emit(&evs);
             Ok(0)
         }
         cli::Command::Status { json, watch } => {

@@ -11,14 +11,13 @@ use rusqlite::{params, Connection};
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
 
-/// How long a `reclaimed` event posted by the task reaper stays on the feed.
-pub const RECLAIM_EVENT_TTL_SECS: i64 = 24 * 3600;
-
 /// Max rows reclaimed per table by an opportunistic sweep-on-write.
 pub const SWEEP_LIMIT: usize = 100;
 
 /// Reaper: return any `claimed` task whose lease has lapsed (no active, unexpired lease on
-/// `task#<id>`) back to `open`, clearing the assignee, and post a `reclaimed` event per task.
+/// `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed` event per
+/// task to the event log (NOT to the message feed — events live separate from messaging per
+/// issue #4 so auto-events don't drown agent-to-agent messages).
 ///
 /// Runs inside the caller's write transaction as part of [`sweep_on_write`] — this is how a
 /// lost agent's work re-enters the queue with no background daemon. Lease expiry boundary
@@ -50,21 +49,14 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64) -> Result<()> {
             "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
             params![target],
         )?;
-        // Build the event body with serde_json so any value (incl. control chars in a
-        // free-form agent id) is escaped correctly — never hand-rolled JSON.
-        let body = serde_json::json!({
-            "event": "reclaimed",
-            "task": id,
-            "prev_assignee": prev,
-            "status": "open",
-            "reason": "lease lapsed",
-        })
-        .to_string();
-        conn.execute(
-            "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at)
-             VALUES (?1, 'quorum', 'hub', 'info', ?2, NULL, ?3)",
-            params![now, body, now + RECLAIM_EVENT_TTL_SECS],
-        )?;
+        // Emit to the event log. Body carries the prev_assignee so consumers can identify
+        // whose work returned to the queue without parsing JSON; `subject = task#<id>` makes
+        // it filterable via `quorum log --refs task#<id>`.
+        let body = match prev {
+            Some(a) => format!("reclaimed from {a} (lease lapsed) → open"),
+            None => "reclaimed (lease lapsed) → open".to_string(),
+        };
+        crate::events::emit_conn(conn, "task_reclaimed", &target, &body, now)?;
     }
     Ok(())
 }
@@ -86,6 +78,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // `claimed` task must become re-claimable on the next write).
     reap_lapsed_tasks(conn, now)?;
     delete_bounded(conn, "messages", now, limit)?;
+    delete_bounded(conn, "events", now, limit)?;
     delete_bounded(conn, "errors", now, limit)?;
     // Deletes expired claims of any `active` value: an expired `active=1` row is already
     // logically dead (the read-filter hid it), and removing it just frees the partial index.
@@ -102,6 +95,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
 pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     reap_lapsed_tasks(conn, now)?;
     conn.execute("DELETE FROM messages WHERE expires_at < ?1", params![now])?;
+    conn.execute("DELETE FROM events WHERE expires_at < ?1", params![now])?;
     conn.execute("DELETE FROM errors WHERE expires_at < ?1", params![now])?;
     conn.execute("DELETE FROM claims WHERE expires_at < ?1", params![now])?;
     conn.execute(
@@ -154,29 +148,36 @@ mod tests {
             crate::tasks::get(&c, id).unwrap().unwrap().status,
             "claimed"
         );
-        // After the lease lapses: reaper returns it to open, clears assignee, posts an event.
+        // After the lease lapses: reaper returns it to open, clears assignee, emits a
+        // `task_reclaimed` event to the EVENT LOG (not the message feed).
         reap_lapsed_tasks(&c, 1100).unwrap();
         let t = crate::tasks::get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "open");
         assert!(t.assignee.is_none());
-        let ev: i64 = c
+        let target = format!("task#{id}");
+        let evs = crate::events::list(&c, 0, Some(&target), 10, 1100).unwrap();
+        let reclaimed = evs.iter().filter(|e| e.kind == "task_reclaimed").count();
+        assert_eq!(reclaimed, 1, "exactly one task_reclaimed event");
+        // The message feed is NOT polluted with auto-events.
+        let msg_count: i64 = c
             .query_row(
-                "SELECT count(*) FROM messages WHERE author='quorum' AND body LIKE '%reclaimed%'",
+                "SELECT count(*) FROM messages WHERE body LIKE '%reclaimed%'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ev, 1, "exactly one reclaimed event");
+        assert_eq!(
+            msg_count, 0,
+            "reaper events must NOT appear on the message feed"
+        );
         // Idempotent: a now-open task is not reaped again (no duplicate event).
         reap_lapsed_tasks(&c, 1200).unwrap();
-        let ev2: i64 = c
-            .query_row(
-                "SELECT count(*) FROM messages WHERE author='quorum' AND body LIKE '%reclaimed%'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(ev2, 1, "reaper must not re-fire on an already-open task");
+        let evs2 = crate::events::list(&c, 0, Some(&target), 10, 1200).unwrap();
+        let reclaimed2 = evs2.iter().filter(|e| e.kind == "task_reclaimed").count();
+        assert_eq!(
+            reclaimed2, 1,
+            "reaper must not re-fire on an already-open task"
+        );
     }
 
     #[test]

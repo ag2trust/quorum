@@ -102,6 +102,13 @@ pub fn claim(
         match ins {
             Ok(_) => {
                 let id = tx.last_insert_rowid();
+                crate::events::emit(
+                    &tx,
+                    "claim_taken",
+                    target,
+                    &format!("claimed by {agent}"),
+                    now,
+                )?;
                 tx.commit().map_err(map_sql_err)?;
                 return Ok(ClaimOutcome::Won(Claim {
                     id,
@@ -180,7 +187,19 @@ pub fn release(
             Err(QuorumError::NotHolder)
         }
         Some((id, _)) => {
+            // Capture the target before we deactivate so the event names what was released.
+            let target: String =
+                tx.query_row("SELECT target FROM claims WHERE id=?1", params![id], |r| {
+                    r.get(0)
+                })?;
             tx.execute("UPDATE claims SET active=0 WHERE id=?1", params![id])?;
+            crate::events::emit(
+                &tx,
+                "claim_released",
+                &target,
+                &format!("released by {agent}"),
+                now,
+            )?;
             tx.commit().map_err(map_sql_err)?;
             Ok(ReleaseOutcome { released: true })
         }
