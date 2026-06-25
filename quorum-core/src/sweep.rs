@@ -65,7 +65,7 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
     // `table` is always a string literal from this module — never user input.
     let sql = format!(
         "DELETE FROM {table} WHERE rowid IN \
-         (SELECT rowid FROM {table} WHERE expires_at < ?1 LIMIT ?2)"
+         (SELECT rowid FROM {table} WHERE expires_at <= ?1 LIMIT ?2)"
     );
     conn.execute(&sql, params![now, limit as i64])?;
     Ok(())
@@ -94,10 +94,10 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
 /// Unbounded sweep + `wal_checkpoint(TRUNCATE)`. Backs `quorum sweep`.
 pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     reap_lapsed_tasks(conn, now)?;
-    conn.execute("DELETE FROM messages WHERE expires_at < ?1", params![now])?;
-    conn.execute("DELETE FROM events WHERE expires_at < ?1", params![now])?;
-    conn.execute("DELETE FROM errors WHERE expires_at < ?1", params![now])?;
-    conn.execute("DELETE FROM claims WHERE expires_at < ?1", params![now])?;
+    conn.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
+    conn.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
+    conn.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
+    conn.execute("DELETE FROM claims WHERE expires_at <= ?1", params![now])?;
     conn.execute(
         "DELETE FROM tasks WHERE status='done' AND updated_at < ?1",
         params![now - DONE_TASK_TTL_SECS],
@@ -178,6 +178,50 @@ mod tests {
         assert_eq!(
             reclaimed2, 1,
             "reaper must not re-fire on an already-open task"
+        );
+    }
+
+    #[test]
+    fn sweep_deletes_at_exact_expiry_boundary() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO messages(ts,author,topic,kind,body,expires_at)
+             VALUES (1,'a','hub','info','boundary',100), (1,'a','hub','info','live',101)",
+            [],
+        )
+        .unwrap();
+        sweep_on_write(&c, 100, 100).unwrap();
+        let bodies: Vec<String> = c
+            .prepare("SELECT body FROM messages ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(bodies, vec!["live"], "expires_at == now must be swept");
+    }
+
+    #[test]
+    fn sweep_all_deletes_at_exact_expiry_boundary() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (1,'test','s','boundary',100), (1,'test','s','live',101)",
+            [],
+        )
+        .unwrap();
+        sweep_all(&c, 100).unwrap();
+        let bodies: Vec<String> = c
+            .prepare("SELECT body FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["live"],
+            "sweep_all: expires_at == now must be swept"
         );
     }
 
