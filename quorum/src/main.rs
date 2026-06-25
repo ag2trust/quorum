@@ -104,10 +104,24 @@ fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
 
 /// Resolve an optional free-text body from `--body-stdin` / `--body-file` (at most one).
 fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<Option<String>> {
+    read_optional_text(stdin, file, "--body-stdin", "--body-file")
+}
+
+/// Resolve an optional free-text note from `--note-stdin` / `--note-file` (at most one).
+fn read_optional_note(stdin: bool, file: Option<std::path::PathBuf>) -> Result<Option<String>> {
+    read_optional_text(stdin, file, "--note-stdin", "--note-file")
+}
+
+fn read_optional_text(
+    stdin: bool,
+    file: Option<std::path::PathBuf>,
+    stdin_flag: &str,
+    file_flag: &str,
+) -> Result<Option<String>> {
     match (stdin, file) {
-        (true, Some(_)) => Err(QuorumError::Usage(
-            "use only one of --body-stdin / --body-file".into(),
-        )),
+        (true, Some(_)) => Err(QuorumError::Usage(format!(
+            "use only one of {stdin_flag} / {file_flag}"
+        ))),
         (true, None) => Ok(Some(input::read_text(input::TextSource::Stdin)?)),
         (false, Some(p)) => Ok(Some(input::read_text(input::TextSource::File(p))?)),
         (false, None) => Ok(None),
@@ -288,16 +302,48 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             refs,
             body_stdin,
             body_file,
+            note_stdin,
+            note_file,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
+            let note = read_optional_note(note_stdin, note_file)?;
+            let has_field_update = status.is_some() || refs.is_some() || body.is_some();
+            if !has_field_update && note.is_none() {
+                return Err(QuorumError::Usage(
+                    "task-update needs at least one of --status/--refs/\
+                     --body-stdin/--body-file/--note-stdin/--note-file"
+                        .into(),
+                ));
+            }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let fields = quorum_core::tasks::TaskUpdate {
-                status: status.as_deref(),
-                body: body.as_deref(),
-                refs: refs.as_deref(),
+            // Field updates first (assignee-gated under #14's lifecycle: only `--status done`
+            // and free-text `--body-*`/`--refs` are accepted). If the caller isn't the holder
+            // we abort before adding the note, so `--note-* + --status done` from a
+            // non-assignee is a single coherent failure rather than a half-applied operation.
+            let task = if has_field_update {
+                let fields = quorum_core::tasks::TaskUpdate {
+                    status: status.as_deref(),
+                    body: body.as_deref(),
+                    refs: refs.as_deref(),
+                };
+                quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?
+            } else {
+                match quorum_core::tasks::get(&conn, task_id)? {
+                    Some(t) => t,
+                    None => {
+                        output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
+                        return Ok(1);
+                    }
+                }
             };
-            let t = quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?;
-            output::emit(&t);
+            // Note path: any agent may add a note; no assignee guard.
+            if let Some(body) = note {
+                if quorum_core::tasks::add_note(&mut conn, &agent, task_id, &body, now)?.is_none() {
+                    output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
+                    return Ok(1);
+                }
+            }
+            output::emit(&task);
             Ok(0)
         }
         cli::Command::TaskRelease { agent, task_id } => {
@@ -343,7 +389,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::TaskGet { task_id } => {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::get(&conn, task_id)? {
+            match quorum_core::tasks::get_with_notes(&conn, task_id)? {
                 Some(t) => {
                     output::emit(&t);
                     Ok(0)

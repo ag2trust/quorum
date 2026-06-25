@@ -266,6 +266,190 @@ fn reaper_reclaims_lapsed_lease_via_cli() {
 }
 
 #[test]
+fn notes_round_trip_byte_exact_and_any_agent_can_add() {
+    let home = tempfile::tempdir().unwrap();
+    // create + claim by A
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+
+    // A leaves a note via stdin — heredoc-style content with $vars + backticks + newlines
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--note-stdin",
+        ])
+        .write_stdin("step 1: $hello\n`backtick`\nmulti\n")
+        .assert()
+        .success();
+
+    // B (NOT the assignee) can still leave a note — no assignee guard on notes (the
+    // contract differentiator vs `--status done` which IS assignee-gated under #14).
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "B",
+            "--task-id",
+            "1",
+            "--note-stdin",
+        ])
+        .write_stdin("watcher sees rough edge in step 1\n")
+        .assert()
+        .success();
+
+    // task-get returns both notes in insertion order, byte-exact
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"notes\":["))
+        .stdout(predicates::str::contains("\"agent\":\"A\""))
+        .stdout(predicates::str::contains("\"agent\":\"B\""))
+        .stdout(predicates::str::contains(
+            "step 1: $hello\\n`backtick`\\nmulti",
+        ))
+        .stdout(predicates::str::contains(
+            "watcher sees rough edge in step 1",
+        ));
+}
+
+#[test]
+fn note_combinable_with_done_submit() {
+    // Post-#14 reconciliation: --note-* IS combinable with --status done (the only field
+    // update an executor performs), so the executor can submit + leave a final breadcrumb
+    // in one call. The field update runs first under the assignee guard; the note follows.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "done",
+            "--note-stdin",
+        ])
+        .write_stdin("submitted: see PR #123\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"done\""));
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("submitted: see PR #123"));
+}
+
+#[test]
+fn note_with_status_done_from_nonassignee_aborts_before_adding_note() {
+    // Coherence: field update runs first; non-assignee --status done fails NotHolder (exit 1)
+    // and the note is NOT added. No half-applied state.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "B",
+            "--task-id",
+            "1",
+            "--status",
+            "done",
+            "--note-stdin",
+        ])
+        .write_stdin("shouldnt land\n")
+        .assert()
+        .code(1);
+    // Verify: the note was not added, the task is still claimed by A.
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"claimed\""))
+        .stdout(predicates::str::contains("\"notes\":[]"))
+        .stdout(predicates::str::contains("shouldnt land").not());
+}
+
+#[test]
+fn note_on_missing_task_is_exit_1_not_an_error() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "9999",
+            "--note-stdin",
+        ])
+        .write_stdin("into the void\n")
+        .assert()
+        .code(1);
+    // and nothing logged to errors
+    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn task_update_without_any_change_is_usage_error() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-update", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn body_stdin_and_note_stdin_conflict_at_parse() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--body-stdin",
+            "--note-stdin",
+        ])
+        .assert()
+        .code(2);
+}
+
+#[test]
 fn concurrent_task_claim_one_winner() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())

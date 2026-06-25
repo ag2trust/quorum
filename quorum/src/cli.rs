@@ -101,6 +101,10 @@ pub enum Command {
     },
     /// Submit a task as `done` (review pending). Only the assignee may, and only `done`.
     /// (Hand-off is `task-release` then a fresh `task-claim`, not reassignment.)
+    ///
+    /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
+    /// have **no assignee guard** (any agent can leave one) and can be combined with the
+    /// other field updates in the same call.
     TaskUpdate {
         #[arg(long)]
         agent: String,
@@ -110,10 +114,16 @@ pub enum Command {
         status: Option<String>,
         #[arg(long)]
         refs: Option<String>,
-        #[arg(long = "body-stdin")]
+        #[arg(long = "body-stdin", conflicts_with = "note_stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+        /// Read a free-text note from stdin and append it to the task's history.
+        #[arg(long = "note-stdin")]
+        note_stdin: bool,
+        /// Read a free-text note from a file and append it to the task's history.
+        #[arg(long = "note-file")]
+        note_file: Option<PathBuf>,
     },
     /// Release a task you hold back to `open` (give-up). Assignee-only.
     TaskRelease {

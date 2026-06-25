@@ -20,11 +20,13 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
   quorum task-renew   --agent <id> --task-id <n> [--ttl 1h]    # extend your lease on long work
-  quorum task-update  --agent <id> --task-id <n> --status done # the only status an agent sets (assignee-only)
+  quorum task-update  --agent <id> --task-id <n> [--status done] [--note-stdin]
+                                                               # --status done: assignee-only submit (the only agent-set status)
+                                                               # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
   quorum task-release --agent <id> --task-id <n>               # give up -> open (hand-off = release + re-claim)
   quorum task-cancel  --agent <id> --task-id <n>               # terminal won't-do (creator OR assignee)
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>]
-  quorum task-get  --task-id <n>
+  quorum task-get  --task-id <n>                               # includes append-only notes history
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # `done -> closed` / reopen are review automation's (not a manual command).
 
