@@ -5,7 +5,7 @@
 //! active=1`, enforced inside a `BEGIN IMMEDIATE` transaction — so N concurrent processes
 //! racing the same target produce exactly one winner.
 //!
-//! Eviction is lease-only: a claim dies when `expires_at < now`. The next `claim` on that
+//! Eviction is lease-only: a claim dies when `expires_at <= now`. The next `claim` on that
 //! target reaps the dead row inside its own transaction before inserting (self-healing).
 
 use crate::error::{QuorumError, Result};
