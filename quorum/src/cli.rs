@@ -78,11 +78,18 @@ pub enum Command {
     },
     /// Atomically claim a task (a specific --task-id, or the highest-priority open task), taking
     /// a renewable lease. A lapsed lease returns the task to `open` (reaper).
+    ///
+    /// `--match-label <L>` (repeatable, AND) restricts the auto-pick to tasks whose `labels`
+    /// contain every supplied label — useful for capability/tier matching. Mutually exclusive
+    /// with `--task-id` (an explicit id is already a more specific selector).
     TaskClaim {
         #[arg(long)]
         agent: String,
-        #[arg(long = "task-id")]
+        #[arg(long = "task-id", conflicts_with = "match_label")]
         task_id: Option<i64>,
+        /// Restrict the auto-pick to tasks whose labels contain this label. Repeatable = AND.
+        #[arg(long = "match-label")]
+        match_label: Vec<String>,
         /// Lease duration, e.g. 45m, 1h, 30s, or bare seconds. Defaults to the config lease TTL.
         #[arg(long)]
         ttl: Option<String>,
