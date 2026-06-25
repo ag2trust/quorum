@@ -469,12 +469,43 @@ fn concurrent_task_claim_one_winner() {
                 .unwrap()
         })
         .collect();
-    let wins = children
+    let outputs: Vec<_> = children
         .into_iter()
         .map(|c| c.wait_with_output().unwrap())
-        .filter(|o| o.status.success())
-        .count();
+        .collect();
+    let wins = outputs.iter().filter(|o| o.status.success()).count();
     assert_eq!(wins, 1, "exactly one process may claim the task");
+
+    // Mirror the claims canary (race.rs): the *quality* of the race matters too, not just
+    // the count of winners. Losers must exit 1 (clean lost-race), never 3 (abnormal). A
+    // post-#9 lease-insert boundary-corpse regression would surface as exit 3 here — the
+    // win-count check alone would miss it because the status-UPDATE still gates correctly.
+    for o in &outputs {
+        let code = o.status.code().unwrap_or(-1);
+        assert!(
+            code == 0 || code == 1,
+            "loser must exit 1 (clean lost-race), got {code} — exit 3 means tasks::claim hit an abnormal DB error"
+        );
+    }
+
+    // Storage agrees: exactly one active lease row for task#1, the same property the claims
+    // canary asserts for an arbitrary target. Catches a half-applied claim (status UPDATE
+    // wins, lease INSERT fails) that the win-count check can't see.
+    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let active: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 1, "exactly one active lease row for task#1");
+
+    // And no errors logged — a normal race is not a failure mode.
+    let errs: i64 = conn
+        .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(errs, 0, "a normal race must not log any errors");
 }
 
 // -- --match-label (issue #1) -------------------------------------------------------------
@@ -594,15 +625,38 @@ fn concurrent_match_label_claim_one_winner() {
                 .unwrap()
         })
         .collect();
-    let wins = children
+    let outputs: Vec<_> = children
         .into_iter()
         .map(|c| c.wait_with_output().unwrap())
-        .filter(|o| o.status.success())
-        .count();
+        .collect();
+    let wins = outputs.iter().filter(|o| o.status.success()).count();
     assert_eq!(
         wins, 1,
         "label-filtered claim must still grant to exactly one process"
     );
+
+    // Same canary-grade guards as the task-id variant — the label filter is just an extra
+    // AND on the selector and must not change exit-code or lease-row semantics.
+    for o in &outputs {
+        let code = o.status.code().unwrap_or(-1);
+        assert!(
+            code == 0 || code == 1,
+            "loser must exit 1 (clean lost-race), got {code}"
+        );
+    }
+    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let active: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(active, 1, "exactly one active lease row for task#1");
+    let errs: i64 = conn
+        .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(errs, 0, "a normal race must not log any errors");
 }
 
 // -- task dependencies (issue #2) ---------------------------------------------------------
