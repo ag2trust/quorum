@@ -140,7 +140,8 @@ mod tests {
     fn reaper_returns_lapsed_claimed_task_to_open_with_event() {
         let (_d, mut c) = open_tmp();
         // A claimed task with a short lease (dead at 1100).
-        let id = crate::tasks::create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id =
+            crate::tasks::create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
         // Before expiry: reaper leaves it alone.
         reap_lapsed_tasks(&c, 1050).unwrap();

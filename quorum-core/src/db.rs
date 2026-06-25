@@ -8,7 +8,7 @@ use rusqlite::{Connection, Error as SqlErr, ErrorCode};
 use std::path::Path;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The full schema. Every statement is idempotent (`IF NOT EXISTS`).
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -76,6 +76,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_SQL)?;
         if current < 2 && !column_exists(conn, "messages", "recipient")? {
             conn.execute("ALTER TABLE messages ADD COLUMN recipient TEXT", [])?;
+        }
+        // v3 = events table addition (new CREATE TABLE in SCHEMA_SQL — no ALTER needed).
+        if current < 4 && !column_exists(conn, "tasks", "depends_on")? {
+            // Issue #2: JSON array of task ids; NULL = no deps. Filled via task-create
+            // --depends-on (validated at the boundary). The claim auto-pick and explicit
+            // --task-id both gate on every dep being `closed`.
+            conn.execute("ALTER TABLE tasks ADD COLUMN depends_on TEXT", [])?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -251,6 +258,54 @@ mod tests {
         let _ = open(&p).unwrap();
         let c = open(&p).unwrap();
         assert!(column_exists(&c, "messages", "recipient").unwrap());
+        assert!(column_exists(&c, "tasks", "depends_on").unwrap());
+    }
+
+    #[test]
+    fn migrates_v3_to_v4_adds_depends_on_column() {
+        // Simulate a v3 DB (events table present, tasks.depends_on absent, user_version=3)
+        // with a pre-existing task row; re-open and verify the column lands without losing
+        // the row.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            // v3 shape: tasks WITHOUT depends_on. Re-CREATE at the v3 shape + seed.
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL, body TEXT,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    labels TEXT, assignee TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    refs TEXT
+                 );
+                 INSERT INTO tasks(title, status, priority, created_by, created_at, updated_at)
+                 VALUES ('pre-existing', 'open', 0, 'boss', 1, 1);
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(column_exists(&c, "tasks", "depends_on").unwrap());
+        // depends_on is NULL for the pre-existing row (treated as no-deps → ready).
+        let (title, deps): (String, Option<String>) = c
+            .query_row("SELECT title, depends_on FROM tasks WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title, "pre-existing");
+        assert!(deps.is_none());
     }
 
     #[test]

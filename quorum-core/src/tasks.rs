@@ -37,6 +37,14 @@ fn deactivate_lease(tx: &rusqlite::Transaction, id: i64, now: i64) -> Result<()>
 }
 
 /// A task row.
+///
+/// `depends_on` is a JSON array of task ids this task waits on; `None` = no deps. The value
+/// is validated at create-time (must be a JSON array of i64), so reads NEVER fault on bad
+/// JSON.
+///
+/// `ready` is **derived** (true iff every listed dep exists and is `closed`) — populated by
+/// [`get`], [`list`], and [`update`]; [`claim`] always sees `true` (a non-ready task can never
+/// be claimed). A task with no deps is always ready.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Task {
     pub id: i64,
@@ -50,6 +58,8 @@ pub struct Task {
     pub created_at: i64,
     pub updated_at: i64,
     pub refs: Option<String>,
+    pub depends_on: Option<String>,
+    pub ready: bool,
 }
 
 /// Fields a [`update`] may change. `None` leaves the field untouched.
@@ -66,9 +76,11 @@ pub struct TaskUpdate<'a> {
 }
 
 const COLS: &str =
-    "id, title, body, status, priority, labels, assignee, created_by, created_at, updated_at, refs";
+    "id, title, body, status, priority, labels, assignee, created_by, created_at, updated_at, refs, depends_on";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
+    // `ready` is set false by default and filled in by the caller (get/list/update/claim).
+    // Materializing it requires another query, which the raw row reader can't do.
     Ok(Task {
         id: r.get(0)?,
         title: r.get(1)?,
@@ -81,7 +93,46 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
         refs: r.get(10)?,
+        depends_on: r.get(11)?,
+        ready: false,
     })
+}
+
+/// Validate `--depends-on` at the boundary: parse as a JSON array of i64 and return a clean
+/// usage error if it doesn't. Storing unvalidated JSON would let one bad row poison every
+/// `task-list`/`task-get`/`task-cancel` call (json_each errors propagate from `compute_ready`)
+/// — including the cancel that would otherwise let an operator recover. Reject early; never
+/// store bad JSON.
+fn validate_depends_on(s: &str) -> Result<()> {
+    serde_json::from_str::<Vec<i64>>(s).map_err(|e| {
+        QuorumError::Usage(format!(
+            "--depends-on must be a JSON array of task ids (e.g. '[1,3]'): {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Compute whether a task's deps are all `closed`. `None`/empty deps = ready.
+///
+/// Issue #2 alignment: a dependent unblocks only when every dep is **`closed`** (reviewed +
+/// finalized per #9/#10), not `done` (submitted/unreviewed). A missing or `cancelled` dep is
+/// treated as unmet — never satisfied — so the dependent stays unclaimable.
+///
+/// Safe-by-construction: bad JSON can never reach this function because [`validate_depends_on`]
+/// rejects malformed input in [`create`].
+fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<bool> {
+    let Some(json) = depends_on.as_deref() else {
+        return Ok(true);
+    };
+    let unmet: i64 = conn.query_row(
+        "SELECT count(*) FROM json_each(?1)
+         WHERE NOT EXISTS (
+             SELECT 1 FROM tasks d WHERE d.id = json_each.value AND d.status = 'closed'
+         )",
+        params![json],
+        |r| r.get(0),
+    )?;
+    Ok(unmet == 0)
 }
 
 fn begin(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
@@ -89,6 +140,10 @@ fn begin(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
 }
 
 /// Create a new `open` task. Returns its id.
+///
+/// `depends_on` is a JSON array of task ids this task waits on (e.g. `"[1,3]"`); `None` =
+/// no deps. Validated at the boundary as a JSON array of i64 — malformed input is rejected
+/// with a usage error (exit 2) BEFORE the row lands, so no read path can be poisoned.
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     conn: &mut Connection,
@@ -98,15 +153,20 @@ pub fn create(
     priority: i64,
     labels: Option<&str>,
     refs: Option<&str>,
+    depends_on: Option<&str>,
     now: i64,
 ) -> Result<i64> {
+    // Reject malformed depends_on at the boundary. See validate_depends_on for why.
+    if let Some(s) = depends_on {
+        validate_depends_on(s)?;
+    }
     let tx = begin(conn)?;
     crate::agents::touch(&tx, created_by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.execute(
-        "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, created_at, updated_at, refs)
-         VALUES (?1, ?2, 'open', ?3, ?4, NULL, ?5, ?6, ?6, ?7)",
-        params![title, body, priority, labels, created_by, now, refs],
+        "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, created_at, updated_at, refs, depends_on)
+         VALUES (?1, ?2, 'open', ?3, ?4, NULL, ?5, ?6, ?6, ?7, ?8)",
+        params![title, body, priority, labels, created_by, now, refs, depends_on],
     )?;
     let id = tx.last_insert_rowid();
     let body_str = match labels {
@@ -141,22 +201,37 @@ pub fn claim(
     let tx = begin(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let task = match task_id {
+    // #2 dep-gate clause: claimable only when every dep id is `closed` (or no deps).
+    // Gate on `closed` (reviewed + finalized per #9/#10), NOT `done` (submitted/unreviewed) —
+    // don't let dependents build on unreviewed work. Composed with the match-label filter as
+    // additional ANDs; both are pure-narrowing.
+    const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
+        SELECT 1 FROM json_each(depends_on) je
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
+        )
+    ))";
+    let mut task = match task_id {
         Some(id) => tx
             .query_row(
+                // Even with an explicit --task-id, the dep gate applies: the acceptance bar
+                // is "a task with an unmet dep is never returned by task-claim." An agent that
+                // truly needs to bypass the gate can wait or cancel the dep.
                 &format!(
                     "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
-                     WHERE id=?3 AND status='open' RETURNING {COLS}"
+                     WHERE id=?3 AND status='open' AND {DEP_READY_CLAUSE}
+                     RETURNING {COLS}"
                 ),
                 params![agent, now, id],
                 row_to_task,
             )
             .optional()?,
         None => {
-            // Build the open-task selector with one `AND labels LIKE ?N` per match-label.
-            // Patterns are bound as parameters; only the placeholders are interpolated into SQL
-            // (count-based, derived from match_labels.len() — no value reaches SQL as a string).
-            let mut selector = String::from("SELECT id FROM tasks WHERE status='open'");
+            // Build the open-task selector with one `AND labels LIKE ?N` per match-label,
+            // plus the dep-ready clause. Patterns are bound as parameters; only the
+            // placeholder count is interpolated (no value reaches SQL as a string).
+            let mut selector =
+                format!("SELECT id FROM tasks WHERE status='open' AND {DEP_READY_CLAUSE}");
             for i in 0..match_labels.len() {
                 // Params are 1-indexed; ?1 = agent, ?2 = now, so label params start at ?3.
                 use std::fmt::Write as _;
@@ -176,7 +251,9 @@ pub fn claim(
             tx.query_row(&sql, &bind[..], row_to_task).optional()?
         }
     };
-    if let Some(t) = &task {
+    if let Some(t) = &mut task {
+        // A claim only fires when the row was claimable, so deps are by construction met.
+        t.ready = true;
         // Take the lease in the same txn. Reap a dead lease first (a reopened task may carry a
         // stale row), then insert active. Only the single status-winner reaches here, so the
         // partial unique index won't collide.
@@ -255,11 +332,12 @@ pub fn update(
             now,
         )?;
     }
-    let task = tx.query_row(
+    let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
         row_to_task,
     )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(task)
 }
@@ -288,11 +366,12 @@ pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<
         &format!("released by {agent}"),
         now,
     )?;
-    let task = tx.query_row(
+    let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
         row_to_task,
     )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(task)
 }
@@ -312,11 +391,12 @@ pub fn renew(conn: &mut Connection, agent: &str, id: i64, ttl: i64, now: i64) ->
         tx.commit()?;
         return Err(QuorumError::NotHolder);
     }
-    let task = tx.query_row(
+    let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
         row_to_task,
     )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(task)
 }
@@ -351,11 +431,12 @@ pub fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<T
         &format!("cancelled by {agent}"),
         now,
     )?;
-    let task = tx.query_row(
+    let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
         row_to_task,
     )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(task)
 }
@@ -395,21 +476,27 @@ pub fn list(
         }
         v
     };
-    let tasks = stmt
+    let mut tasks: Vec<Task> = stmt
         .query_map(&params[..], row_to_task)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    for t in &mut tasks {
+        t.ready = compute_ready(conn, &t.depends_on)?;
+    }
     Ok(tasks)
 }
 
-/// Fetch a single task by id.
+/// Fetch a single task by id. `ready` is filled per the dependency rule (#2).
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Task>> {
-    let task = conn
+    let mut task = conn
         .query_row(
             &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
             params![id],
             row_to_task,
         )
         .optional()?;
+    if let Some(t) = &mut task {
+        t.ready = compute_ready(conn, &t.depends_on)?;
+    }
     Ok(task)
 }
 
@@ -439,7 +526,7 @@ mod tests {
     #[test]
     fn create_then_claim_sets_assignee_and_lease() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "fix bug", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "fix bug", None, 0, None, None, None, 1000).unwrap();
         let t = claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .unwrap();
@@ -452,7 +539,7 @@ mod tests {
     #[test]
     fn second_claim_of_same_task_is_none() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         assert!(claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .is_some());
@@ -464,8 +551,8 @@ mod tests {
     #[test]
     fn claim_without_id_picks_highest_priority() {
         let (_d, mut c) = open_tmp();
-        create(&mut c, "boss", "low", None, 1, None, None, 1000).unwrap();
-        create(&mut c, "boss", "high", None, 9, None, None, 1000).unwrap();
+        create(&mut c, "boss", "low", None, 1, None, None, None, 1000).unwrap();
+        create(&mut c, "boss", "high", None, 9, None, None, None, 1000).unwrap();
         let t = claim(&mut c, "A", None, &[], TTL, 1000).unwrap().unwrap();
         assert_eq!(t.title, "high");
     }
@@ -490,6 +577,7 @@ mod tests {
             9,
             Some(r#"["tier:opus-46"]"#),
             None,
+            None,
             1000,
         )
         .unwrap();
@@ -500,6 +588,7 @@ mod tests {
             None,
             1,
             Some(r#"["tier:opus-47","lang:rust"]"#),
+            None,
             None,
             1000,
         )
@@ -522,6 +611,7 @@ mod tests {
             5,
             Some(r#"["lang:rust"]"#),
             None,
+            None,
             1000,
         )
         .unwrap();
@@ -543,6 +633,7 @@ mod tests {
             9,
             Some(r#"["lang:rust"]"#),
             None,
+            None,
             1000,
         )
         .unwrap();
@@ -554,6 +645,7 @@ mod tests {
             9,
             Some(r#"["tier:opus-47"]"#),
             None,
+            None,
             1000,
         )
         .unwrap();
@@ -564,6 +656,7 @@ mod tests {
             None,
             5,
             Some(r#"["lang:rust","tier:opus-47"]"#),
+            None,
             None,
             1000,
         )
@@ -578,7 +671,18 @@ mod tests {
     fn match_label_picks_highest_priority_among_matches() {
         let (_d, mut c) = open_tmp();
         // Three matching tasks at different priorities; claim must pick the top.
-        create(&mut c, "boss", "low", None, 1, Some(r#"["k"]"#), None, 1000).unwrap();
+        create(
+            &mut c,
+            "boss",
+            "low",
+            None,
+            1,
+            Some(r#"["k"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
         let want = create(
             &mut c,
             "boss",
@@ -587,10 +691,22 @@ mod tests {
             9,
             Some(r#"["k"]"#),
             None,
+            None,
             1000,
         )
         .unwrap();
-        create(&mut c, "boss", "mid", None, 5, Some(r#"["k"]"#), None, 1000).unwrap();
+        create(
+            &mut c,
+            "boss",
+            "mid",
+            None,
+            5,
+            Some(r#"["k"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
         let t = claim(&mut c, "A", None, &["k"], TTL, 1000)
             .unwrap()
             .unwrap();
@@ -600,7 +716,18 @@ mod tests {
     #[test]
     fn match_label_takes_lease_just_like_unfiltered_claim() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, Some(r#"["k"]"#), None, 1000).unwrap();
+        let id = create(
+            &mut c,
+            "boss",
+            "x",
+            None,
+            0,
+            Some(r#"["k"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
         let t = claim(&mut c, "A", None, &["k"], TTL, 1000)
             .unwrap()
             .unwrap();
@@ -611,7 +738,7 @@ mod tests {
     #[test]
     fn update_by_assignee_sets_done_and_drops_lease() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let t = update(
             &mut c,
@@ -633,7 +760,7 @@ mod tests {
     #[test]
     fn update_by_nonassignee_fails_loud() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let err = update(
             &mut c,
@@ -652,7 +779,7 @@ mod tests {
     #[test]
     fn update_rejects_invalid_status() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let err = update(
             &mut c,
@@ -672,7 +799,7 @@ mod tests {
     fn update_rejects_non_done_status() {
         // No agent-set intermediate state: only `done` is settable via task-update.
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         for bad in ["open", "claimed", "closed", "cancelled"] {
             let err = update(
@@ -696,7 +823,7 @@ mod tests {
     #[test]
     fn release_returns_task_to_open_and_drops_lease() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let t = release(&mut c, "A", id, 1100).unwrap();
         assert_eq!(t.status, "open");
@@ -711,7 +838,7 @@ mod tests {
     #[test]
     fn release_by_nonassignee_fails_loud() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         assert!(matches!(
             release(&mut c, "B", id, 1100).unwrap_err(),
@@ -722,7 +849,7 @@ mod tests {
     #[test]
     fn renew_extends_lease_for_holder_only() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // expires at 1100
                                                                // Holder renews near expiry → lease lives past the old boundary.
         renew(&mut c, "A", id, 100, 1090).unwrap(); // now expires at 1190
@@ -737,7 +864,7 @@ mod tests {
     #[test]
     fn renew_fails_once_lease_lapsed() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // dead at 1100
                                                                // At/after expiry the lease is gone → must re-claim, renew fails loud.
         assert!(matches!(
@@ -750,13 +877,13 @@ mod tests {
     fn cancel_allowed_for_creator_or_assignee() {
         let (_d, mut c) = open_tmp();
         // Creator can cancel an open task.
-        let id1 = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id1 = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         assert_eq!(
             cancel(&mut c, "boss", id1, 1100).unwrap().status,
             "cancelled"
         );
         // Assignee can cancel a claimed task (and the lease is dropped).
-        let id2 = create(&mut c, "boss", "y", None, 0, None, None, 1000).unwrap();
+        let id2 = create(&mut c, "boss", "y", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id2), &[], TTL, 1000).unwrap();
         assert_eq!(cancel(&mut c, "A", id2, 1100).unwrap().status, "cancelled");
         assert!(!has_live_lease(&c, id2, 1100));
@@ -765,7 +892,7 @@ mod tests {
     #[test]
     fn cancel_rejected_for_stranger_and_terminal() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         // A bystander (neither creator nor assignee) cannot cancel.
         assert!(matches!(
@@ -783,8 +910,30 @@ mod tests {
     #[test]
     fn list_filters_by_status_and_label() {
         let (_d, mut c) = open_tmp();
-        create(&mut c, "boss", "a", None, 0, Some("[\"ui\"]"), None, 1000).unwrap();
-        create(&mut c, "boss", "b", None, 0, Some("[\"api\"]"), None, 1000).unwrap();
+        create(
+            &mut c,
+            "boss",
+            "a",
+            None,
+            0,
+            Some("[\"ui\"]"),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        create(
+            &mut c,
+            "boss",
+            "b",
+            None,
+            0,
+            Some("[\"api\"]"),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
         assert_eq!(list(&c, Some("open"), None, None).unwrap().len(), 2);
         assert_eq!(list(&c, None, Some("ui"), None).unwrap().len(), 1);
         assert_eq!(list(&c, Some("done"), None, None).unwrap().len(), 0);
@@ -793,8 +942,280 @@ mod tests {
     #[test]
     fn get_returns_task_or_none() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         assert!(get(&c, id).unwrap().is_some());
         assert!(get(&c, 9999).unwrap().is_none());
+    }
+
+    // -- task dependencies (issue #2) -------------------------------------------------------
+
+    /// Force a task to `closed` directly in the DB — there is no public `close()` helper yet
+    /// (that's the review automation, issue #10). Bypasses the executor/reviewer split so the
+    /// dep-gate tests can simulate the resolved state without staging the whole #10 machinery.
+    fn force_close(c: &Connection, id: i64) {
+        c.execute("UPDATE tasks SET status='closed' WHERE id=?1", params![id])
+            .unwrap();
+    }
+
+    #[test]
+    fn create_rejects_malformed_depends_on_before_storing() {
+        // Cobble-x7M's blocking finding on #18 v1: unvalidated --depends-on poisons every
+        // subsequent task-list/task-get/task-cancel via compute_ready -> json_each. Fix:
+        // reject malformed JSON at the boundary, never store it.
+        let (_d, mut c) = open_tmp();
+        // Forgot the brackets (Cobble's repro). Must be a clean Usage error (exit 2).
+        let err = create(
+            &mut c,
+            "boss",
+            "bad",
+            None,
+            0,
+            None,
+            None,
+            Some("1,2"),
+            1000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "got {err:?}");
+        // And nothing was inserted — list is empty, queue not poisoned.
+        assert_eq!(list(&c, None, None, None).unwrap().len(), 0);
+        // Other malformed shapes — string, object, array-of-strings — all rejected.
+        for bad in &["garbage", "{}", r#"["one"]"#, "[1, 2,"] {
+            assert!(matches!(
+                create(&mut c, "boss", "x", None, 0, None, None, Some(bad), 1000).unwrap_err(),
+                QuorumError::Usage(_)
+            ));
+        }
+        // Empty array and well-formed deps still accepted.
+        assert!(create(
+            &mut c,
+            "boss",
+            "ok-empty",
+            None,
+            0,
+            None,
+            None,
+            Some("[]"),
+            1000
+        )
+        .is_ok());
+        assert!(create(
+            &mut c,
+            "boss",
+            "ok-one",
+            None,
+            0,
+            None,
+            None,
+            Some("[1]"),
+            1000
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn auto_pick_skips_task_with_unmet_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 5, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            5,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            1000,
+        )
+        .unwrap();
+        // Auto-pick: only `dep` is eligible. The dependent must be invisible to auto-pick
+        // until its dep is `closed`.
+        let first = claim(&mut c, "A", None, &[], TTL, 1000).unwrap().unwrap();
+        assert_eq!(first.id, dep);
+        // dep is now `claimed`, dependent stays gated.
+        assert!(claim(&mut c, "B", None, &[], TTL, 1000).unwrap().is_none());
+        // Forcing dep → done is *not enough* per the #9/#10 alignment: gate is on `closed`.
+        c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![dep])
+            .unwrap();
+        assert!(claim(&mut c, "B", None, &[], TTL, 1000).unwrap().is_none());
+        // Once dep is `closed`, the dependent becomes claimable.
+        force_close(&c, dep);
+        let unblocked = claim(&mut c, "B", None, &[], TTL, 1000).unwrap().unwrap();
+        assert_eq!(unblocked.id, dependent);
+    }
+
+    #[test]
+    fn explicit_task_id_also_respects_dep_gate() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            1000,
+        )
+        .unwrap();
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1000)
+            .unwrap()
+            .is_none());
+        force_close(&c, dep);
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1000)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn missing_dep_id_blocks_forever() {
+        let (_d, mut c) = open_tmp();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some("[9999]"),
+            1000,
+        )
+        .unwrap();
+        assert!(claim(&mut c, "A", None, &[], TTL, 1000).unwrap().is_none());
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cancelled_dep_blocks_dependent() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            1000,
+        )
+        .unwrap();
+        cancel(&mut c, "boss", dep, 1100).unwrap();
+        assert!(claim(&mut c, "A", None, &[], TTL, 1100).unwrap().is_none());
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1100)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn multiple_deps_all_must_be_closed() {
+        let (_d, mut c) = open_tmp();
+        let d1 = create(&mut c, "boss", "d1", None, 0, None, None, None, 1000).unwrap();
+        let d2 = create(&mut c, "boss", "d2", None, 0, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            9,
+            None,
+            None,
+            Some(&format!("[{d1},{d2}]")),
+            1000,
+        )
+        .unwrap();
+        force_close(&c, d1);
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1000)
+            .unwrap()
+            .is_none());
+        force_close(&c, d2);
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1000)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn get_surfaces_depends_on_and_ready() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            1000,
+        )
+        .unwrap();
+        let solo = get(&c, dep).unwrap().unwrap();
+        assert!(solo.depends_on.is_none());
+        assert!(solo.ready);
+        let t = get(&c, dependent).unwrap().unwrap();
+        assert_eq!(t.depends_on.as_deref(), Some(format!("[{dep}]").as_str()));
+        assert!(!t.ready);
+        force_close(&c, dep);
+        let t = get(&c, dependent).unwrap().unwrap();
+        assert!(t.ready);
+    }
+
+    #[test]
+    fn dep_gate_composes_with_match_label_filter() {
+        // Two AND clauses (dep-ready + label-match) co-exist in the same auto-pick selector.
+        // Smoke-test the composition: only a task matching BOTH label AND ready-deps wins.
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, 1000).unwrap();
+        // (a) labeled but gated by an unmet dep
+        create(
+            &mut c,
+            "boss",
+            "labeled-gated",
+            None,
+            9,
+            Some(r#"["tier:opus-47"]"#),
+            None,
+            Some(&format!("[{dep}]")),
+            1000,
+        )
+        .unwrap();
+        // (b) ready but wrong label
+        create(
+            &mut c,
+            "boss",
+            "ready-no-label",
+            None,
+            9,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        // (c) labeled AND ready
+        let want = create(
+            &mut c,
+            "boss",
+            "labeled-and-ready",
+            None,
+            1,
+            Some(r#"["tier:opus-47"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let t = claim(&mut c, "A", None, &["tier:opus-47"], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, want, "claim must pick the labeled+ready task");
     }
 }
