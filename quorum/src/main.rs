@@ -142,12 +142,14 @@ fn best_effort_errlog(source: &str, detail: &str) {
     }
 }
 
-/// Largest accepted TTL: ~100 years in seconds. `parse_ttl` is the single source of every
-/// `ttl` reaching a write site, so bounding it here guarantees `now + ttl` can never overflow
-/// i64 for any realistic `now` — preserving the at-most-one-active-claim invariant (an
-/// overflowed `expires_at` wraps into the past, silently letting a second agent re-win the
-/// target). Unbounded TTLs aren't a real need: "non-expiring" control state lives in its own
-/// table, not in a huge lease.
+/// Largest accepted TTL: ~100 years in seconds. There are two TTL input paths — the `--ttl`
+/// flag (bounded here in `parse_ttl`) and the `message_ttl_secs` / `task_lease_ttl_secs`
+/// config defaults used when `--ttl` is omitted (bounded in `config::validate`). Clamping
+/// BOTH to this ceiling guarantees `now + ttl` can never overflow i64 at any write site for
+/// any realistic `now` — preserving the at-most-one-active-claim invariant (an overflowed
+/// `expires_at` wraps into the past, silently letting a second agent re-win the target).
+/// Unbounded TTLs aren't a real need: "non-expiring" control state lives in its own table,
+/// not in a huge lease.
 const MAX_TTL_SECS: i64 = 100 * 365 * 86_400;
 
 /// Parse a duration like `45m`, `1h`, `30s`, `2d`, or bare seconds, into seconds.
