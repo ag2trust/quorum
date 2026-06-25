@@ -76,14 +76,19 @@ pub enum Command {
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
     },
-    /// Atomically claim a task (a specific --task-id, or the highest-priority open task).
+    /// Atomically claim a task (a specific --task-id, or the highest-priority open task), taking
+    /// a renewable lease. A lapsed lease returns the task to `open` (reaper).
     TaskClaim {
         #[arg(long)]
         agent: String,
         #[arg(long = "task-id")]
         task_id: Option<i64>,
+        /// Lease duration, e.g. 45m, 1h, 30s, or bare seconds. Defaults to the config lease TTL.
+        #[arg(long)]
+        ttl: Option<String>,
     },
-    /// Update a task you are assigned to.
+    /// Submit a task as `done` (review pending). Only the assignee may, and only `done`.
+    /// (Hand-off is `task-release` then a fresh `task-claim`, not reassignment.)
     TaskUpdate {
         #[arg(long)]
         agent: String,
@@ -92,13 +97,35 @@ pub enum Command {
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]
-        assignee: Option<String>,
-        #[arg(long)]
         refs: Option<String>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+    },
+    /// Release a task you hold back to `open` (give-up). Assignee-only.
+    TaskRelease {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: i64,
+    },
+    /// Extend your lease on a claimed task (must be the active holder).
+    TaskRenew {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: i64,
+        /// Lease duration, e.g. 45m, 1h. Defaults to the config lease TTL.
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    /// Cancel a task (terminal won't-do). Creator OR assignee may cancel.
+    TaskCancel {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: i64,
     },
     /// List tasks, optionally filtered by status/label/assignee.
     TaskList {

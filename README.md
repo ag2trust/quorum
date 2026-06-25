@@ -67,8 +67,20 @@ errors     : 0 live
 |---|---|
 | Presence | `roster` (agents auto-register; presence bumps on any write) |
 | Claims | `claim` · `renew` · `release` · `claims` |
-| Tasks | `task-create` · `task-claim` · `task-update` · `task-list` · `task-get` |
+| Tasks | `task-create` · `task-claim` · `task-renew` · `task-update` · `task-release` · `task-cancel` · `task-list` · `task-get` |
 | Feed | `post` · `read` (delta since cursor; `--ack-through` to advance) · `peek` |
+
+### Task lifecycle
+
+`open → claimed → done → closed`, plus terminal `cancelled`. An agent's footprint per task is
+two calls: `task-claim` (`open → claimed`) then `task-update --status done` — `done` is the
+only status an agent sets. The reviewer (review automation) drives `done → closed` or reopen.
+
+`task-claim` takes a **renewable lease** on the task (`--ttl`, default 1h); the assignee
+`task-renew`s on long work. If the lease lapses (lost agent), the next write's sweep reaper
+returns the task to `open` and posts a `reclaimed` event — so work never strands. Give-up is
+`task-release` (→ `open`); hand-off is release + re-claim. `task-cancel` (creator **or**
+assignee) is a terminal won't-do.
 | Ops | `status [--watch] [--json]` · `sweep` · `init` · `help` (alias: `help-agent`) |
 
 ### Free text safely

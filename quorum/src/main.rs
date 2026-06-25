@@ -40,6 +40,9 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::TaskCreate { .. } => "task-create",
         cli::Command::TaskClaim { .. } => "task-claim",
         cli::Command::TaskUpdate { .. } => "task-update",
+        cli::Command::TaskRelease { .. } => "task-release",
+        cli::Command::TaskRenew { .. } => "task-renew",
+        cli::Command::TaskCancel { .. } => "task-cancel",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
         cli::Command::Post { .. } => "post",
@@ -250,9 +253,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "id": id }));
             Ok(0)
         }
-        cli::Command::TaskClaim { agent, task_id } => {
+        cli::Command::TaskClaim {
+            agent,
+            task_id,
+            ttl,
+        } => {
+            let ttl = match ttl {
+                Some(s) => parse_ttl(&s)?,
+                None => load_cfg()?.task_lease_ttl_secs,
+            };
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::claim(&mut conn, &agent, task_id, now)? {
+            match quorum_core::tasks::claim(&mut conn, &agent, task_id, ttl, now)? {
                 Some(t) => {
                     output::emit(&t);
                     Ok(0)
@@ -269,7 +280,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent,
             task_id,
             status,
-            assignee,
             refs,
             body_stdin,
             body_file,
@@ -280,9 +290,34 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 status: status.as_deref(),
                 body: body.as_deref(),
                 refs: refs.as_deref(),
-                assignee: assignee.as_deref(),
             };
             let t = quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?;
+            output::emit(&t);
+            Ok(0)
+        }
+        cli::Command::TaskRelease { agent, task_id } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let t = quorum_core::tasks::release(&mut conn, &agent, task_id, now)?;
+            output::emit(&t);
+            Ok(0)
+        }
+        cli::Command::TaskRenew {
+            agent,
+            task_id,
+            ttl,
+        } => {
+            let ttl = match ttl {
+                Some(s) => parse_ttl(&s)?,
+                None => load_cfg()?.task_lease_ttl_secs,
+            };
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let t = quorum_core::tasks::renew(&mut conn, &agent, task_id, ttl, now)?;
+            output::emit(&t);
+            Ok(0)
+        }
+        cli::Command::TaskCancel { agent, task_id } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let t = quorum_core::tasks::cancel(&mut conn, &agent, task_id, now)?;
             output::emit(&t);
             Ok(0)
         }

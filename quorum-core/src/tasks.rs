@@ -1,23 +1,40 @@
 //! The shared work queue.
 //!
-//! Tasks have a lifecycle (`open` → `claimed`/`in_progress`/`blocked` → `done`/`cancelled`).
+//! Tasks move through five states: `open → claimed → done → closed`, plus terminal
+//! `cancelled`. The agent's write footprint per task is exactly two calls — `task-claim`
+//! (`open → claimed`) then `task-update --status done` (`claimed → done`). The reviewer
+//! (issue #10) drives `done → closed` (terminal) or `done → open` (rework); this module
+//! exposes `closed` as a valid value but does not own that transition.
+//!
 //! Claiming is atomic via a guarded `UPDATE ... WHERE status='open' RETURNING`, so two agents
-//! can never claim the same task. Done tasks are reclaimed by the sweeper after a TTL.
+//! can never claim the same task. A claim also takes a **renewable lease** on `task#<id>`
+//! (reusing the `claims` table): the assignee `renew`s on long work, and a lapsed lease lets
+//! the sweep-on-write reaper return the task to `open` (see `sweep::reap_lapsed_tasks`).
+//! `done` tasks are physically reclaimed by the sweeper after a TTL.
 
 use crate::error::{QuorumError, Result};
 use crate::sweep::SWEEP_LIMIT;
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
 
-/// Valid task statuses.
-pub const STATUSES: &[&str] = &[
-    "open",
-    "claimed",
-    "in_progress",
-    "blocked",
-    "done",
-    "cancelled",
-];
+/// Valid task statuses. `open`/`claimed` are system-driven (claim/release/reaper); `done` is
+/// the executor's only settable status; `closed`/`cancelled` are terminal (review #10 / cancel).
+pub const STATUSES: &[&str] = &["open", "claimed", "done", "closed", "cancelled"];
+
+/// The lease target string for a task id — the key under which a task's renewable claim-lease
+/// lives in the shared `claims` table.
+pub fn lease_target(id: i64) -> String {
+    format!("task#{id}")
+}
+
+/// Deactivate any live lease on a task within an existing transaction. Idempotent.
+fn deactivate_lease(tx: &rusqlite::Transaction, id: i64, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at > ?2",
+        params![lease_target(id), now],
+    )?;
+    Ok(())
+}
 
 /// A task row.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -36,12 +53,16 @@ pub struct Task {
 }
 
 /// Fields a [`update`] may change. `None` leaves the field untouched.
+///
+/// Note: there is no `assignee` field — reassignment is intentionally not a `task-update`
+/// operation under the lease model (it would leave the `task#<id>` lease with the old holder,
+/// so the new assignee couldn't renew and the reaper could reclaim under them). Hand-off is
+/// `task-release` (→ `open`) followed by a fresh `task-claim`.
 #[derive(Default)]
 pub struct TaskUpdate<'a> {
     pub status: Option<&'a str>,
     pub body: Option<&'a str>,
     pub refs: Option<&'a str>,
-    pub assignee: Option<&'a str>,
 }
 
 const COLS: &str =
@@ -92,13 +113,18 @@ pub fn create(
     Ok(id)
 }
 
-/// Atomically claim a task. With `task_id`, claims that specific open task; without, claims
-/// the highest-priority open task. Returns `None` if nothing claimable (already taken / none
-/// open).
+/// Atomically claim a task and take a renewable `ttl`-second lease on it. With `task_id`,
+/// claims that specific open task; without, claims the highest-priority open task. Returns
+/// `None` if nothing claimable (already taken / none open).
+///
+/// The guarded `UPDATE ... WHERE status='open'` is the single-winner gate; the lease row
+/// (`target='task#<id>'`) is written in the same transaction so claim + lease are atomic. The
+/// lease lets a lost agent's task be reaped back to `open` (see `sweep::reap_lapsed_tasks`).
 pub fn claim(
     conn: &mut Connection,
     agent: &str,
     task_id: Option<i64>,
+    ttl: i64,
     now: i64,
 ) -> Result<Option<Task>> {
     let tx = begin(conn)?;
@@ -128,12 +154,31 @@ pub fn claim(
             )
             .optional()?,
     };
+    if let Some(t) = &task {
+        // Take the lease in the same txn. Reap a dead lease first (a reopened task may carry a
+        // stale row), then insert active. Only the single status-winner reaches here, so the
+        // partial unique index won't collide.
+        let target = lease_target(t.id);
+        tx.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at <= ?2",
+            params![target, now],
+        )?;
+        tx.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+            params![target, agent, now, now + ttl],
+        )?;
+    }
     tx.commit()?;
     Ok(task)
 }
 
 /// Update a task. Fails loud ([`QuorumError::NotHolder`]) if `agent` is not the assignee.
-/// An invalid status is a usage error.
+///
+/// The only status an agent may set is `done` (the executor's submit, `claimed → done`) —
+/// there is no agent-set intermediate state. Other transitions have dedicated paths: `open`/
+/// `claimed` are system-driven (claim/release/reaper), `cancelled` via [`cancel`], and
+/// `closed`/reopen are the reviewer's (issue #10). Any other status value is a usage error.
+/// Setting `done` deactivates the task's lease (the work is submitted; no reclaim needed).
 pub fn update(
     conn: &mut Connection,
     agent: &str,
@@ -145,6 +190,12 @@ pub fn update(
         if !STATUSES.contains(&s) {
             return Err(QuorumError::Usage(format!("invalid status: {s}")));
         }
+        if s != "done" {
+            return Err(QuorumError::Usage(format!(
+                "task-update can only set status 'done'; use task-release (→open), \
+                 task-cancel (→cancelled), or review automation (→closed) for {s}"
+            )));
+        }
     }
     let tx = begin(conn)?;
     crate::agents::touch(&tx, agent, now)?;
@@ -155,23 +206,101 @@ pub fn update(
             status   = COALESCE(?2, status),
             body     = COALESCE(?3, body),
             refs     = COALESCE(?4, refs),
-            assignee = COALESCE(?5, assignee),
-            updated_at = ?6
-         WHERE id=?1 AND assignee=?7",
-        params![
-            id,
-            fields.status,
-            fields.body,
-            fields.refs,
-            fields.assignee,
-            now,
-            agent
-        ],
+            updated_at = ?5
+         WHERE id=?1 AND assignee=?6",
+        params![id, fields.status, fields.body, fields.refs, now, agent],
     )?;
     if n == 0 {
         tx.commit()?;
         return Err(QuorumError::NotHolder);
     }
+    // Submitting `done` ends the active phase: drop the lease so the reaper can't reclaim the
+    // task and so a future reopen (#10) can take a fresh lease without a stale-row collision.
+    if fields.status == Some("done") {
+        deactivate_lease(&tx, id, now)?;
+    }
+    let task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    tx.commit()?;
+    Ok(task)
+}
+
+/// Release a claimed task back to `open` (give-up). Fails loud ([`QuorumError::NotHolder`]) if
+/// `agent` is not the current assignee of a `claimed` task. Drops the lease and clears the
+/// assignee so any agent can re-claim.
+pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let n = tx.execute(
+        "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1
+         WHERE id=?2 AND assignee=?3 AND status='claimed'",
+        params![now, id, agent],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Err(QuorumError::NotHolder);
+    }
+    deactivate_lease(&tx, id, now)?;
+    let task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    tx.commit()?;
+    Ok(task)
+}
+
+/// Extend the lease on a task you hold. Fails loud if `agent` is not the active, unexpired
+/// holder of a `claimed` task (lapsed lease → must re-claim). Returns the task.
+pub fn renew(conn: &mut Connection, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Task> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let n = tx.execute(
+        "UPDATE claims SET expires_at=?1
+         WHERE target=?2 AND holder=?3 AND active=1 AND expires_at > ?4",
+        params![now + ttl, lease_target(id), agent, now],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Err(QuorumError::NotHolder);
+    }
+    let task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    tx.commit()?;
+    Ok(task)
+}
+
+/// Cancel a task (terminal won't-do). Guard: the **creator OR the assignee** may cancel (a
+/// wider guard than `done`, which is assignee-only). Already-terminal tasks
+/// (`closed`/`cancelled`) cannot be cancelled. Drops the lease. Fails loud
+/// ([`QuorumError::NotHolder`]) if the task is missing, terminal, or `agent` is neither
+/// creator nor assignee.
+///
+/// Per-dependent notification (one event per blocked dependent) lands with the dependency
+/// model (#2); there is no dependency schema yet, so nothing to notify today.
+pub fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
+    let tx = begin(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let n = tx.execute(
+        "UPDATE tasks SET status='cancelled', updated_at=?1
+         WHERE id=?2 AND (created_by=?3 OR assignee=?3)
+               AND status NOT IN ('cancelled', 'closed')",
+        params![now, id, agent],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Err(QuorumError::NotHolder);
+    }
+    deactivate_lease(&tx, id, now)?;
     let task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -244,21 +373,36 @@ mod tests {
         (dir, c)
     }
 
+    const TTL: i64 = 3600;
+
+    /// Is there a live (active, unexpired) lease on this task?
+    fn has_live_lease(c: &Connection, id: i64, now: i64) -> bool {
+        c.query_row(
+            "SELECT count(*) FROM claims WHERE target=?1 AND active=1 AND expires_at > ?2",
+            params![lease_target(id), now],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
     #[test]
-    fn create_then_claim_sets_assignee() {
+    fn create_then_claim_sets_assignee_and_lease() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "fix bug", None, 0, None, None, 1000).unwrap();
-        let t = claim(&mut c, "A", Some(id), 1000).unwrap().unwrap();
+        let t = claim(&mut c, "A", Some(id), TTL, 1000).unwrap().unwrap();
         assert_eq!(t.status, "claimed");
         assert_eq!(t.assignee.as_deref(), Some("A"));
+        // The claim took a renewable lease on task#<id>.
+        assert!(has_live_lease(&c, id, 1000));
     }
 
     #[test]
     fn second_claim_of_same_task_is_none() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        assert!(claim(&mut c, "A", Some(id), 1000).unwrap().is_some());
-        assert!(claim(&mut c, "B", Some(id), 1000).unwrap().is_none());
+        assert!(claim(&mut c, "A", Some(id), TTL, 1000).unwrap().is_some());
+        assert!(claim(&mut c, "B", Some(id), TTL, 1000).unwrap().is_none());
     }
 
     #[test]
@@ -266,41 +410,43 @@ mod tests {
         let (_d, mut c) = open_tmp();
         create(&mut c, "boss", "low", None, 1, None, None, 1000).unwrap();
         create(&mut c, "boss", "high", None, 9, None, None, 1000).unwrap();
-        let t = claim(&mut c, "A", None, 1000).unwrap().unwrap();
+        let t = claim(&mut c, "A", None, TTL, 1000).unwrap().unwrap();
         assert_eq!(t.title, "high");
     }
 
     #[test]
     fn claim_nothing_open_is_none() {
         let (_d, mut c) = open_tmp();
-        assert!(claim(&mut c, "A", None, 1000).unwrap().is_none());
+        assert!(claim(&mut c, "A", None, TTL, 1000).unwrap().is_none());
     }
 
     #[test]
-    fn update_by_assignee_changes_status() {
+    fn update_by_assignee_sets_done_and_drops_lease() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
         let t = update(
             &mut c,
             "A",
             id,
             &TaskUpdate {
-                status: Some("in_progress"),
+                status: Some("done"),
                 ..Default::default()
             },
             1100,
         )
         .unwrap();
-        assert_eq!(t.status, "in_progress");
+        assert_eq!(t.status, "done");
         assert_eq!(t.updated_at, 1100);
+        // Submitting `done` drops the lease.
+        assert!(!has_live_lease(&c, id, 1100));
     }
 
     #[test]
     fn update_by_nonassignee_fails_loud() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
         let err = update(
             &mut c,
             "B",
@@ -319,7 +465,7 @@ mod tests {
     fn update_rejects_invalid_status() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
         let err = update(
             &mut c,
             "A",
@@ -332,6 +478,116 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, QuorumError::Usage(_)));
+    }
+
+    #[test]
+    fn update_rejects_non_done_status() {
+        // No agent-set intermediate state: only `done` is settable via task-update.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        for bad in ["open", "claimed", "closed", "cancelled"] {
+            let err = update(
+                &mut c,
+                "A",
+                id,
+                &TaskUpdate {
+                    status: Some(bad),
+                    ..Default::default()
+                },
+                1100,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, QuorumError::Usage(_)),
+                "status {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn release_returns_task_to_open_and_drops_lease() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        let t = release(&mut c, "A", id, 1100).unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+        assert!(!has_live_lease(&c, id, 1100));
+        // Released task is re-claimable by anyone.
+        assert!(claim(&mut c, "B", Some(id), TTL, 1200).unwrap().is_some());
+    }
+
+    #[test]
+    fn release_by_nonassignee_fails_loud() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        assert!(matches!(
+            release(&mut c, "B", id, 1100).unwrap_err(),
+            QuorumError::NotHolder
+        ));
+    }
+
+    #[test]
+    fn renew_extends_lease_for_holder_only() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), 100, 1000).unwrap(); // expires at 1100
+                                                          // Holder renews near expiry → lease lives past the old boundary.
+        renew(&mut c, "A", id, 100, 1090).unwrap(); // now expires at 1190
+        assert!(has_live_lease(&c, id, 1150));
+        // A non-holder cannot renew.
+        assert!(matches!(
+            renew(&mut c, "B", id, 100, 1150).unwrap_err(),
+            QuorumError::NotHolder
+        ));
+    }
+
+    #[test]
+    fn renew_fails_once_lease_lapsed() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), 100, 1000).unwrap(); // dead at 1100
+                                                          // At/after expiry the lease is gone → must re-claim, renew fails loud.
+        assert!(matches!(
+            renew(&mut c, "A", id, 100, 1100).unwrap_err(),
+            QuorumError::NotHolder
+        ));
+    }
+
+    #[test]
+    fn cancel_allowed_for_creator_or_assignee() {
+        let (_d, mut c) = open_tmp();
+        // Creator can cancel an open task.
+        let id1 = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        assert_eq!(
+            cancel(&mut c, "boss", id1, 1100).unwrap().status,
+            "cancelled"
+        );
+        // Assignee can cancel a claimed task (and the lease is dropped).
+        let id2 = create(&mut c, "boss", "y", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id2), TTL, 1000).unwrap();
+        assert_eq!(cancel(&mut c, "A", id2, 1100).unwrap().status, "cancelled");
+        assert!(!has_live_lease(&c, id2, 1100));
+    }
+
+    #[test]
+    fn cancel_rejected_for_stranger_and_terminal() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), TTL, 1000).unwrap();
+        // A bystander (neither creator nor assignee) cannot cancel.
+        assert!(matches!(
+            cancel(&mut c, "C", id, 1100).unwrap_err(),
+            QuorumError::NotHolder
+        ));
+        // Already terminal → cannot cancel again.
+        cancel(&mut c, "boss", id, 1100).unwrap();
+        assert!(matches!(
+            cancel(&mut c, "boss", id, 1200).unwrap_err(),
+            QuorumError::NotHolder
+        ));
     }
 
     #[test]

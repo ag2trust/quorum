@@ -12,6 +12,9 @@ pub struct Config {
     pub online_window_secs: i64,
     /// Default message TTL when `--ttl` is omitted.
     pub message_ttl_secs: i64,
+    /// Default task-claim lease TTL when `--ttl` is omitted. The assignee renews on long work;
+    /// a lapsed lease lets the reaper return the task to `open`.
+    pub task_lease_ttl_secs: i64,
     /// Default page size for read/peek.
     pub read_limit: i64,
 }
@@ -21,6 +24,7 @@ impl Default for Config {
         Self {
             online_window_secs: 300,
             message_ttl_secs: 48 * 3600,
+            task_lease_ttl_secs: 3600,
             read_limit: 100,
         }
     }
@@ -29,9 +33,10 @@ impl Default for Config {
 /// The default config file contents, written by `quorum init`.
 pub const DEFAULT_TOML: &str = "\
 # Quorum config. Delete any line to use its built-in default.
-online_window_secs = 300        # agent considered online if active within 5 min
-message_ttl_secs   = 172800     # 48h
-read_limit         = 100        # default page size for read/peek
+online_window_secs   = 300        # agent considered online if active within 5 min
+message_ttl_secs     = 172800     # 48h
+task_lease_ttl_secs  = 3600       # 1h task-claim lease; assignee renews on long work
+read_limit           = 100        # default page size for read/peek
 ";
 
 /// Load config from `path`. Missing file → defaults; malformed → fail loud (exit 3).
