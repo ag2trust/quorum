@@ -1,5 +1,6 @@
 //! Integration tests for ops commands: status, sweep, help (and the help-agent alias),
-//! config handling, and the WAL-health property (short-lived connections self-checkpoint).
+//! config handling, migration refusal, and the WAL-health property (short-lived connections
+//! self-checkpoint).
 
 use assert_cmd::Command;
 
@@ -126,5 +127,75 @@ fn wal_stays_small_with_short_lived_connections() {
     assert!(
         size < 100_000,
         "WAL grew to {size} bytes — not checkpointing"
+    );
+}
+
+#[test]
+fn migration_refusal_exits_3_on_newer_schema() {
+    let home = tempfile::tempdir().unwrap();
+    // Create a valid DB first...
+    quorum(home.path()).arg("init").assert().success();
+    // ...then bump user_version past what this binary understands.
+    let db_path = home.path().join("quorum.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch("PRAGMA user_version = 999").unwrap();
+    drop(conn);
+    // Any command that opens the DB should fail with exit 3.
+    quorum(home.path())
+        .arg("roster")
+        .assert()
+        .code(3)
+        .stderr(predicates::str::contains("schema version 999"));
+}
+
+#[test]
+fn missing_config_falls_back_to_defaults() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    // Delete config.toml — commands should still work with built-in defaults.
+    std::fs::remove_file(home.path().join("config.toml")).unwrap();
+    quorum(home.path())
+        .arg("roster")
+        .assert()
+        .success()
+        .stdout(predicates::str::diff("[]\n"));
+    quorum(home.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"agents_total\":0"));
+}
+
+#[test]
+fn status_watch_emits_output_before_kill() {
+    let home = tempfile::tempdir().unwrap();
+    // Seed data so the status table has something visible.
+    quorum(home.path())
+        .args(["claim", "--agent", "A", "--target", "pr#1", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["status", "--watch"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn status --watch");
+
+    // One tick is 1.5s; wait for two ticks so at least one full render completes.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+
+    child.kill().expect("failed to kill watch process");
+    let output = child.wait_with_output().expect("failed to wait");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("agents"),
+        "expected status table, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("claims"),
+        "expected claims line in status table"
     );
 }
