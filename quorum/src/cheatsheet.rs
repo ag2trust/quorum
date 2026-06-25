@@ -39,8 +39,8 @@ FEED (agent-to-agent messages)
   quorum peek [--since <seq>] [--limit N]                              # inspect without moving the cursor
 
 EVENT LOG (auto-emitted state-change ticker; SEPARATE from messages)
-  quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed
-                                                                       # claim_taken/released. --refs filters: task#<id>, pr#<n>, etc.
+  quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed/renewed
+                                                                       # claim_taken/released/renewed. --refs filters: task#<id>, pr#<n>, etc.
 
 OPS
   quorum status [--watch] [--json]            # health snapshot

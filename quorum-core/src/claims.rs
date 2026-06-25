@@ -237,6 +237,13 @@ pub fn renew(
             })
         },
     )?;
+    crate::events::emit(
+        &tx,
+        "claim_renewed",
+        &claim.target,
+        &format!("renewed by {agent} (expires {})", claim.expires_at),
+        now,
+    )?;
     tx.commit().map_err(map_sql_err)?;
     Ok(claim)
 }
@@ -381,6 +388,21 @@ mod tests {
         assert_eq!(renewed.expires_at, 1550);
         let err = renew(&mut c, "B", id, 500, 1050).unwrap_err();
         assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn renew_emits_claim_renewed_event() {
+        let (_d, mut c) = open_tmp();
+        let won = claim(&mut c, "A", "pr#1", 100, 1000).unwrap();
+        let id = match won {
+            ClaimOutcome::Won(c) => c.id,
+            _ => unreachable!(),
+        };
+        renew(&mut c, "A", id, 500, 1050).unwrap();
+        let evs = crate::events::list(&c, 0, Some("pr#1"), 10, 1050).unwrap();
+        let renewed: Vec<_> = evs.iter().filter(|e| e.kind == "claim_renewed").collect();
+        assert_eq!(renewed.len(), 1);
+        assert!(renewed[0].body.contains("renewed by A"));
     }
 
     #[test]

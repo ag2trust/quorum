@@ -25,8 +25,8 @@ pub struct Event {
     pub seq: i64,
     pub ts: i64,
     /// Machine-readable category, e.g. `task_created`, `task_claimed`, `task_done`,
-    /// `task_released`, `task_cancelled`, `task_reclaimed`, `claim_taken`, `claim_released`,
-    /// `claim_renewed`. Stable enough for callers to branch on.
+    /// `task_released`, `task_cancelled`, `task_reclaimed`, `task_renewed`, `claim_taken`,
+    /// `claim_released`, `claim_renewed`. Stable enough for callers to branch on.
     pub kind: String,
     /// Filterable identifier — the entity the event is about (e.g. `task#42`, `pr#2459`).
     /// `quorum log --refs <s>` matches on this column.
