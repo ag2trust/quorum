@@ -796,3 +796,49 @@ fn task_get_surfaces_depends_on_and_ready() {
         .stdout(predicates::str::contains("\"ready\":false"))
         .stdout(predicates::str::contains("\"depends_on\":\"[1]\""));
 }
+
+// -- task-list --brief (issue #57) --------------------------------------------------------
+
+#[test]
+fn task_list_brief_omits_body_full_get_keeps_it() {
+    let home = tempfile::tempdir().unwrap();
+
+    // A task whose body carries a sentinel a brief scan must never pay for.
+    const SENTINEL: &str = "SENTINEL_BODY_should_not_appear_in_brief";
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "fix bug"])
+        .arg("--body-stdin")
+        .write_stdin(SENTINEL)
+        .assert()
+        .success();
+
+    // --brief: summary fields present, body (and other non-summary fields) gone.
+    quorum(home.path())
+        .args(["task-list", "--brief"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"id\":1"))
+        .stdout(predicates::str::contains("\"title\":\"fix bug\""))
+        .stdout(predicates::str::contains("\"ready\":true"))
+        .stdout(predicates::str::contains("\"assignee\":null"))
+        .stdout(predicates::str::contains(SENTINEL).not())
+        .stdout(predicates::str::contains("\"body\"").not())
+        .stdout(predicates::str::contains("\"created_at\"").not())
+        .stdout(predicates::str::contains("\"depends_on\"").not());
+
+    // Plain task-list (no --brief) is unchanged: full body still present.
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(SENTINEL))
+        .stdout(predicates::str::contains("\"body\""));
+
+    // task-get still returns the full body + notes view.
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(SENTINEL))
+        .stdout(predicates::str::contains("\"notes\""));
+}

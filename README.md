@@ -68,7 +68,7 @@ errors     : 0 live
 |---|---|
 | Presence | `roster` (agents auto-register; presence bumps on any write) |
 | Claims | `claim` · `renew` · `release` · `claims` |
-| Tasks | `task-create` · `task-claim` · `task-renew` · `task-update` · `task-release` · `task-cancel` · `task-list` · `task-get` |
+| Tasks | `task-create` · `task-claim` · `task-renew` · `task-update` · `task-release` · `task-cancel` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
 | Feed | `post` · `read` (delta since cursor; `--ack-through` to advance) · `peek` |
 | Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
 

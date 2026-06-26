@@ -35,7 +35,8 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
                                                                # --verdict: reviewer-only, REQUIRED on `kind:review` task done (#10).
   quorum task-release --agent <id> --task-id <n>               # give up -> open (hand-off = release + re-claim) — also clears sticky window
   quorum task-cancel  --agent <id> --task-id <n>               # terminal won't-do (creator OR assignee) — also clears sticky window
-  quorum task-list [--status <s>] [--label <l>] [--assignee <id>]
+  quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
+                                                               # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # `done -> closed` / reopen are review automation's (issue #10) — see REVIEW below.
