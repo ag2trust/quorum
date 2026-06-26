@@ -129,6 +129,59 @@ for the captured session.
    the debugging steps) — append it to this file's Gotchas or a `docs/learnings.md`, and
    include it in the PR. Aim to leave the project 1% better each session.
 
+## Agent workflow on this repo
+
+These rules exist because each caused a real multi-hour stall this week (2026-06-26).
+
+### 1. Author PRs as `ag2trust-dev`
+
+Use the default `gh` identity (ag2trust-dev) for commits and `gh pr create`. **Never author
+as `brevitize`** and never pass a token override. A brevitize-authored PR deadlocks: brevitize
+(PR author) can't self-approve, and ag2trust-dev's approval doesn't count (it's the commit
+co-author) — only `--admin` clears it, which requires owner intervention.
+
+### 2. Two-account merge model
+
+| Account        | Role                                    |
+|----------------|-----------------------------------------|
+| `ag2trust-dev` | Commit, push, open PR                   |
+| (different session) | Review (post `### Code review`)   |
+| `brevitize`    | `gh pr review --approve` + `gh pr merge`|
+
+Self-merge is blocked at the **session** level: the PR footer `🤖 <Name>` + `Co-Authored-By`
+trailers identify the author session. A reviewer must be a different session than the author.
+
+### 3. Work in your own git worktree
+
+Never edit the shared `~/dev/quorum` checkout directly — a second agent's `git checkout -b`
+hijacks the first agent's working tree and can lose WIP. Instead:
+
+```bash
+git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/main
+# work in ~/dev/quorum-wt/<branch>
+# when merged:
+git worktree remove ~/dev/quorum-wt/<branch>
+```
+
+Keep `~/dev/quorum` on `main` clean as the shared fetch target.
+
+### 4. Branch protection: don't rebase just to be current
+
+"Require up-to-date before merging" is **OFF** — an approved + CI-green PR merges even if a
+few commits behind `main`. Don't rebase solely to catch up. "Dismiss stale approvals on new
+commits" stays **ON** — a real push (fix commit, rebase) invalidates the existing approval and
+requires re-review.
+
+### 5. PR verification evidence
+
+Every PR must have all three green, with output pasted in the PR body:
+
+```bash
+cargo test                                        # includes the N-process race canary
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
 ## Local-machine note: RTK compresses Bash output
 
 This machine runs **RTK (Rust Token Killer)** as a global Claude Code hook — every `Bash`

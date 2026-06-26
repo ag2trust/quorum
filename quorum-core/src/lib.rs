@@ -13,4 +13,5 @@ pub mod events;
 pub mod feed;
 pub mod stats;
 pub mod sweep;
+pub mod sync;
 pub mod tasks;

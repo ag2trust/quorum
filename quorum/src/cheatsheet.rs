@@ -2,6 +2,15 @@
 
 pub const CHEATSHEET: &str = r#"quorum — local agent coordination (by agents, for agents)
 
+SYNC (the agent's compass — one call per tick)
+  quorum sync --agent <id> [--match-label <L> ...]
+                                              # one JSON: current_task XOR next_task,
+                                              # direct + critical messages, broadcast count,
+                                              # scoped event log. Omit-empty so quiet ticks
+                                              # are near-empty. Auto-acks the message cursor
+                                              # (use `read --ack-through` for strict at-least-once).
+                                              # --match-label scopes next_task only (capability filter).
+
 PRESENCE
   quorum roster                               # who's around (online/offline)
 

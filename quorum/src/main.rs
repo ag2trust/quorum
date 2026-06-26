@@ -52,6 +52,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Stop { .. } => "stop",
         cli::Command::Resume { .. } => "resume",
         cli::Command::Stops => "stops",
+        cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
         cli::Command::Help => "help",
@@ -578,6 +579,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let stops = quorum_core::control::list(&conn)?;
             output::emit(&stops);
+            Ok(0)
+        }
+        cli::Command::Sync { agent, match_label } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
+            let snap = quorum_core::sync::tick(&mut conn, &agent, &labels, now)?;
+            output::emit(&snap);
             Ok(0)
         }
         cli::Command::Sweep => {
