@@ -4,11 +4,25 @@
 //! [`migrate`] before use, so any short-lived `quorum` process self-heals the schema.
 
 use crate::error::{QuorumError, Result};
-use rusqlite::{Connection, Error as SqlErr, ErrorCode};
+use rusqlite::{Connection, Error as SqlErr, ErrorCode, Transaction, TransactionBehavior};
 use std::path::Path;
+use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
 pub const SCHEMA_VERSION: i64 = 5;
+
+/// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
+/// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
+/// write while still keeping pathological deadlocks from hanging the CLI indefinitely.
+/// Load-bearing invariant: tests in [`tests::pragmas_are_set`] pin the deployed value.
+pub const BUSY_TIMEOUT_MS: u32 = 5000;
+
+/// Bounded retry budget for the first-open WAL-mode switch (see [`set_journal_wal`]). The
+/// engine's busy-timeout handler doesn't cover journal-mode changes, so we re-try in
+/// userspace. 100 × 20ms ≈ 2s — enough headroom for concurrent first-opens without making a
+/// pathological lock hold a single command indefinitely.
+const WAL_RETRY_MAX: usize = 100;
+const WAL_RETRY_SLEEP: Duration = Duration::from_millis(20);
 
 /// The full schema. Every statement is idempotent (`IF NOT EXISTS`).
 const SCHEMA_SQL: &str = include_str!("schema.sql");
@@ -16,10 +30,33 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 /// Apply the mandatory per-connection PRAGMAs (see design spec §Concurrency & atomicity).
 pub fn apply_pragmas(conn: &Connection) -> Result<()> {
     // busy_timeout MUST be first so every subsequent lock acquisition honors it.
-    conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
     set_journal_wal(conn)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
+}
+
+/// Begin a `BEGIN IMMEDIATE` transaction with BUSY-aware error mapping.
+///
+/// `BEGIN IMMEDIATE` takes the database's write lock up-front, so racing writers serialize on
+/// the lock instead of discovering the contention at commit time. A post-timeout SQLITE_BUSY
+/// here maps to [`QuorumError::Busy`] (clean exit 3, stable detail) rather than a raw
+/// `Db(rusqlite::Error)` — every write path in the engine exits with the same string for the
+/// same condition.
+pub fn begin_immediate(conn: &mut Connection) -> Result<Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(map_sql_err)
+}
+
+/// Map a raw SQLite error: a post-timeout BUSY becomes [`QuorumError::Busy`] (exit 3 with
+/// stable detail at the CLI boundary); anything else stays a generic DB error.
+pub(crate) fn map_sql_err(e: rusqlite::Error) -> QuorumError {
+    if let rusqlite::Error::SqliteFailure(f, _) = &e {
+        if f.code == ErrorCode::DatabaseBusy {
+            return QuorumError::Busy;
+        }
+    }
+    QuorumError::Db(e)
 }
 
 /// Switch the database to WAL mode, retrying briefly on transient lock contention.
@@ -30,7 +67,7 @@ pub fn apply_pragmas(conn: &Connection) -> Result<()> {
 /// set. WAL is persistent on the file, so this race exists only on the very first switch;
 /// a bounded retry resolves it. Subsequent opens see WAL already set (a no-op, no lock).
 fn set_journal_wal(conn: &Connection) -> Result<()> {
-    set_journal_wal_with(conn, 100, std::time::Duration::from_millis(20))
+    set_journal_wal_with(conn, WAL_RETRY_MAX, WAL_RETRY_SLEEP)
 }
 
 /// Inner: parameterized retry. Production uses (100, 20ms) → ~2s budget. Tests use tiny
@@ -131,7 +168,7 @@ mod tests {
         let bt: i64 = c
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(bt, 5000);
+        assert_eq!(bt, i64::from(BUSY_TIMEOUT_MS));
     }
 
     #[test]

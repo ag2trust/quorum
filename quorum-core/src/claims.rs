@@ -8,9 +8,10 @@
 //! Eviction is lease-only: a claim dies when `expires_at <= now`. The next `claim` on that
 //! target reaps the dead row inside its own transaction before inserting (self-healing).
 
+use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
 use crate::sweep::SWEEP_LIMIT;
-use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 /// An active claim.
@@ -43,22 +44,6 @@ pub struct ReleaseOutcome {
     pub released: bool,
 }
 
-fn begin(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
-    conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(map_sql_err)
-}
-
-/// Map a raw SQLite error: a post-timeout BUSY becomes [`QuorumError::Busy`] (exit 3 +
-/// errlog at the CLI boundary); anything else stays a generic DB error.
-fn map_sql_err(e: rusqlite::Error) -> QuorumError {
-    if let rusqlite::Error::SqliteFailure(f, _) = &e {
-        if f.code == ErrorCode::DatabaseBusy {
-            return QuorumError::Busy;
-        }
-    }
-    QuorumError::Db(e)
-}
-
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
     // Match only the UNIQUE *extended* code. All NOT NULL columns are always supplied, so the
     // only constraint an INSERT can hit today is the partial unique index — but matching the
@@ -85,7 +70,7 @@ pub fn claim(
     // then wins. With reap using `<= now` this is unreachable, but the retry keeps any future
     // boundary slip from surfacing as an errlog'd exit 3.
     for _ in 0..3 {
-        let tx = begin(conn)?;
+        let tx = begin_immediate(conn)?;
         crate::agents::touch(&tx, agent, now)?;
         crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
         // A claim is dead iff `expires_at <= now` (consistent with the read-filter's
@@ -158,7 +143,7 @@ pub fn release(
     sel: &ClaimSelector,
     now: i64,
 ) -> Result<ReleaseOutcome> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let found: Option<(i64, String)> = match sel {
@@ -214,7 +199,7 @@ pub fn renew(
     ttl: i64,
     now: i64,
 ) -> Result<Claim> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(

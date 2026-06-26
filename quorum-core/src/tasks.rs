@@ -12,14 +12,19 @@
 //! the sweep-on-write reaper return the task to `open` (see `sweep::reap_lapsed_tasks`).
 //! `done` tasks are physically reclaimed by the sweeper after a TTL.
 
+use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use crate::sweep::SWEEP_LIMIT;
-use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 /// Valid task statuses. `open`/`claimed` are system-driven (claim/release/reaper); `done` is
 /// the executor's only settable status; `closed`/`cancelled` are terminal (review #10 / cancel).
 pub const STATUSES: &[&str] = &["open", "claimed", "done", "closed", "cancelled"];
+
+/// Default task-claim lease TTL when `--ttl` is omitted. The assignee renews on long work;
+/// a lapsed lease lets the reaper return the task to `open`.
+pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 
 /// The lease target string for a task id — the key under which a task's renewable claim-lease
 /// lives in the shared `claims` table.
@@ -154,10 +159,6 @@ fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<bool>
     Ok(unmet == 0)
 }
 
-fn begin(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
-    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
-}
-
 /// Create a new `open` task. Returns its id.
 ///
 /// `depends_on` is a JSON array of task ids this task waits on (e.g. `"[1,3]"`); `None` =
@@ -179,7 +180,7 @@ pub fn create(
     if let Some(s) = depends_on {
         validate_depends_on(s)?;
     }
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, created_by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.execute(
@@ -217,7 +218,7 @@ pub fn claim(
     ttl: i64,
     now: i64,
 ) -> Result<Option<Task>> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     // #2 dep-gate clause: claimable only when every dep id is `closed` (or no deps).
@@ -322,7 +323,7 @@ pub fn update(
             )));
         }
     }
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     // COALESCE keeps the existing value when a field is None. Guard on assignee = caller.
@@ -365,7 +366,7 @@ pub fn update(
 /// `agent` is not the current assignee of a `claimed` task. Drops the lease and clears the
 /// assignee so any agent can re-claim.
 pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(
@@ -398,7 +399,7 @@ pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<
 /// Extend the lease on a task you hold. Fails loud if `agent` is not the active, unexpired
 /// holder of a `claimed` task (lapsed lease → must re-claim). Returns the task.
 pub fn renew(conn: &mut Connection, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Task> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(
@@ -436,7 +437,7 @@ pub fn renew(conn: &mut Connection, agent: &str, id: i64, ttl: i64, now: i64) ->
 /// Per-dependent notification (one event per blocked dependent) lands with the dependency
 /// model (#2); there is no dependency schema yet, so nothing to notify today.
 pub fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(
@@ -547,7 +548,7 @@ pub fn add_note(
     body: &str,
     now: i64,
 ) -> Result<Option<i64>> {
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     // Verify the task exists *inside the transaction* so it can't disappear between the

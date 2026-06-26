@@ -56,7 +56,7 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64) -> Result<()> {
             Some(a) => format!("reclaimed from {a} (lease lapsed) → open"),
             None => "reclaimed (lease lapsed) → open".to_string(),
         };
-        crate::events::emit_conn(conn, "task_reclaimed", &target, &body, now)?;
+        crate::events::emit(conn, "task_reclaimed", &target, &body, now)?;
     }
     Ok(())
 }

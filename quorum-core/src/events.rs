@@ -49,33 +49,14 @@ fn row_to_event(r: &Row) -> rusqlite::Result<Event> {
     })
 }
 
-/// Append an event from inside a mutator's existing transaction. The caller MUST already
-/// hold the write lock (`BEGIN IMMEDIATE`) and MUST commit after — emitting outside the
-/// state mutation's transaction is a bug (it would let an event and its state disagree).
-pub fn emit(
-    tx: &rusqlite::Transaction,
-    kind: &str,
-    subject: &str,
-    body: &str,
-    now: i64,
-) -> Result<i64> {
-    tx.execute(
-        "INSERT INTO events(ts, kind, subject, body, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![now, kind, subject, body, now + EVENT_TTL_SECS],
-    )?;
-    Ok(tx.last_insert_rowid())
-}
-
-/// Same as [`emit`] but for callers that hold a bare [`Connection`] (no open transaction) —
-/// e.g. the sweep reaper, which runs as part of its own outer write. The caller is
-/// responsible for the surrounding atomicity guarantees.
-pub fn emit_conn(
-    conn: &Connection,
-    kind: &str,
-    subject: &str,
-    body: &str,
-    now: i64,
-) -> Result<i64> {
+/// Append an event from inside a mutator's existing write context. The caller MUST already
+/// hold the write lock (a `BEGIN IMMEDIATE` transaction, or — for the sweep reaper —
+/// participation in its outer write) and MUST commit after; emitting outside the state
+/// mutation's transaction is a bug (it would let an event and its state disagree).
+///
+/// Takes `&Connection` so a `&Transaction` callsite passes via deref coercion (rusqlite's
+/// `Transaction: Deref<Target = Connection>`).
+pub fn emit(conn: &Connection, kind: &str, subject: &str, body: &str, now: i64) -> Result<i64> {
     conn.execute(
         "INSERT INTO events(ts, kind, subject, body, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![now, kind, subject, body, now + EVENT_TTL_SECS],
