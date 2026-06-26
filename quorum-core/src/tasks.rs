@@ -26,6 +26,16 @@ pub const STATUSES: &[&str] = &["open", "claimed", "done", "closed", "cancelled"
 /// a lapsed lease lets the reaper return the task to `open`.
 pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 
+/// Label that marks a task as a review task (issue #10). The claim path uses this to enforce
+/// "no self-review" (an agent whose `orig` equals the caller is filtered out) and reviews
+/// don't auto-spawn reviews. Stored inside the `labels` JSON array.
+pub const REVIEW_LABEL: &str = "kind:review";
+
+/// Default sticky-reopen window (issue #10). When a reviewer's `changes` verdict reopens a
+/// task, only the original assignee may claim it for this many seconds; after, anyone may.
+/// Eligibility-only — does not change priority. The issue spec pins "Default W = 30m".
+pub const STICKY_WINDOW_SECS: i64 = 1800;
+
 /// The lease target string for a task id — the key under which a task's renewable claim-lease
 /// lives in the shared `claims` table.
 pub fn lease_target(id: i64) -> String {
@@ -64,6 +74,13 @@ pub struct Task {
     pub updated_at: i64,
     pub refs: Option<String>,
     pub depends_on: Option<String>,
+    /// Unix-ts sticky-reopen window end. `> now` ⇒ only `assignee` may claim. NULL = no
+    /// window. Set by the reviewer's `changes` verdict (issue #10); cleared on a sticky-orig
+    /// re-claim or any `release`/`cancel`. Eligibility-only — does not change priority.
+    pub sticky_until: Option<i64>,
+    /// Review-task only: the original executor whose `done` spawned this review (issue #10).
+    /// `claim` filters review tasks whose `orig` equals the caller — no self-review.
+    pub orig: Option<String>,
     pub ready: bool,
 }
 
@@ -100,7 +117,7 @@ pub struct TaskUpdate<'a> {
 }
 
 const COLS: &str =
-    "id, title, body, status, priority, labels, assignee, created_by, created_at, updated_at, refs, depends_on";
+    "id, title, body, status, priority, labels, assignee, created_by, created_at, updated_at, refs, depends_on, sticky_until, orig";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     // `ready` is set false by default and filled in by the caller (get/list/update/claim).
@@ -118,6 +135,8 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         updated_at: r.get(9)?,
         refs: r.get(10)?,
         depends_on: r.get(11)?,
+        sticky_until: r.get(12)?,
+        orig: r.get(13)?,
         ready: false,
     })
 }
@@ -231,15 +250,27 @@ pub fn claim(
             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
         )
     ))";
+    // #10 self-review block: a review task (labels contain "kind:review") whose `orig` equals
+    // the caller is invisible to that caller. Reject-at-claim, not reject-at-update — else an
+    // orig could claim and hold the lease (denying everyone else) until they noticed. Composes
+    // as another AND clause; ?1 is the agent param shared with the UPDATE/SELECT.
+    const SELF_REVIEW_BLOCK_CLAUSE: &str =
+        "(labels IS NULL OR labels NOT LIKE '%\"kind:review\"%' OR orig IS NULL OR orig != ?1)";
+    // #10 sticky-reopen gate: a task in its sticky window is claimable only by its assignee
+    // (the original executor whose `changes`-verdict reopen set the window). After expiry,
+    // anyone — eligibility narrows for `now < sticky_until` only. ?2 is the `now` param.
+    const STICKY_CLAUSE: &str = "(sticky_until IS NULL OR sticky_until <= ?2 OR assignee = ?1)";
     let mut task = match task_id {
         Some(id) => tx
             .query_row(
-                // Even with an explicit --task-id, the dep gate applies: the acceptance bar
-                // is "a task with an unmet dep is never returned by task-claim." An agent that
-                // truly needs to bypass the gate can wait or cancel the dep.
+                // Even with an explicit --task-id, all three gates apply: dep-ready, no
+                // self-review, sticky eligibility. An agent that truly needs to bypass the
+                // dep gate can wait or cancel the dep; the other two are mechanism for the
+                // #10 contract and have no bypass.
                 &format!(
                     "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
                      WHERE id=?3 AND status='open' AND {DEP_READY_CLAUSE}
+                       AND {SELF_REVIEW_BLOCK_CLAUSE} AND {STICKY_CLAUSE}
                      RETURNING {COLS}"
                 ),
                 params![agent, now, id],
@@ -248,10 +279,13 @@ pub fn claim(
             .optional()?,
         None => {
             // Build the open-task selector with one `AND labels LIKE ?N` per match-label,
-            // plus the dep-ready clause. Patterns are bound as parameters; only the
-            // placeholder count is interpolated (no value reaches SQL as a string).
-            let mut selector =
-                format!("SELECT id FROM tasks WHERE status='open' AND {DEP_READY_CLAUSE}");
+            // plus the dep-ready / self-review / sticky clauses. Patterns are bound as
+            // parameters; only the placeholder count is interpolated (no value reaches SQL
+            // as a string).
+            let mut selector = format!(
+                "SELECT id FROM tasks WHERE status='open' AND {DEP_READY_CLAUSE}
+                 AND {SELF_REVIEW_BLOCK_CLAUSE} AND {STICKY_CLAUSE}"
+            );
             for i in 0..match_labels.len() {
                 // Params are 1-indexed; ?1 = agent, ?2 = now, so label params start at ?3.
                 use std::fmt::Write as _;
@@ -1406,5 +1440,203 @@ mod tests {
     fn get_with_notes_on_missing_task_is_none() {
         let (_d, c) = open_tmp();
         assert!(get_with_notes(&c, 9999).unwrap().is_none());
+    }
+
+    // -- Review-as-task: claim-side filters (issue #10, Phase 1) ---------------------------
+    //
+    // Phase 1 only wires the claim-side gates that READ `kind:review` / `orig` / `sticky_until`.
+    // Phase 2 will land the auto-spawn + verdict that WRITE those fields. To exercise the
+    // gates standalone, these tests stamp the relevant fields directly via SQL — mirroring
+    // the existing `force_close` shortcut used by the dep-gate tests above.
+
+    /// Mark a task as a review task spawned by `orig_agent`. Mirrors the auto-spawn that
+    /// Phase 2 will add (label `kind:review` + the new `orig` column).
+    fn force_review_task(c: &Connection, id: i64, orig_agent: &str) {
+        c.execute(
+            "UPDATE tasks SET labels = ?1, orig = ?2 WHERE id = ?3",
+            params![r#"["kind:review"]"#, orig_agent, id],
+        )
+        .unwrap();
+    }
+
+    /// Stamp a sticky-reopen window on a task. Mirrors what the Phase 2 `changes` verdict
+    /// will do (set status=open, assignee=orig, sticky_until=now+W).
+    fn force_sticky_reopen(c: &Connection, id: i64, orig_agent: &str, sticky_until: i64) {
+        c.execute(
+            "UPDATE tasks SET status='open', assignee=?1, sticky_until=?2 WHERE id=?3",
+            params![orig_agent, sticky_until, id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claim_blocks_orig_from_own_review_task_auto_pick() {
+        // Auto-pick must skip a review task whose `orig` equals the caller — even if it's the
+        // only open task and has higher priority. The orig sees `None` (clean exit 1), not an
+        // error.
+        let (_d, mut c) = open_tmp();
+        let rid = create(
+            &mut c,
+            "boss",
+            "review of A's work",
+            None,
+            9,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        force_review_task(&c, rid, "A");
+        // A tries to auto-pick: nothing claimable (the only open task is their own review).
+        assert!(claim(&mut c, "A", None, &[], TTL, 1000).unwrap().is_none());
+        // Sanity: a non-orig (B) sees and claims it.
+        let t = claim(&mut c, "B", None, &[], TTL, 1000).unwrap().unwrap();
+        assert_eq!(t.id, rid);
+        assert_eq!(t.assignee.as_deref(), Some("B"));
+        assert_eq!(t.orig.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn claim_blocks_orig_from_own_review_task_explicit_id() {
+        // Even with an explicit --task-id, the orig is rejected (no bypass). Returns None,
+        // which the CLI maps to a clean exit 1 — the dominant lost-race shape, not an error.
+        let (_d, mut c) = open_tmp();
+        let rid = create(
+            &mut c,
+            "boss",
+            "review of A's work",
+            None,
+            0,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        force_review_task(&c, rid, "A");
+        assert!(claim(&mut c, "A", Some(rid), &[], TTL, 1000)
+            .unwrap()
+            .is_none());
+        // And a non-orig with the explicit id can still claim.
+        assert!(claim(&mut c, "B", Some(rid), &[], TTL, 1000)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn claim_allows_non_orig_on_review_task() {
+        // Non-orig sees and claims a review task normally — the self-review block targets
+        // exactly the orig, nobody else.
+        let (_d, mut c) = open_tmp();
+        let rid = create(
+            &mut c,
+            "boss",
+            "review of A's work",
+            None,
+            0,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        force_review_task(&c, rid, "A");
+        let t = claim(&mut c, "C", None, &[], TTL, 1000).unwrap().unwrap();
+        assert_eq!(t.id, rid);
+        assert_eq!(t.assignee.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn claim_blocked_during_sticky_window_for_non_orig() {
+        // A reopened task in its sticky window is invisible to non-orig (auto-pick) and
+        // rejected with `None` for non-orig via explicit --task-id. The orig may still claim.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 9, None, None, None, 1000).unwrap();
+        // Sticky window from t=1000 to t=2000; caller A is orig.
+        force_sticky_reopen(&c, tid, "A", 2000);
+        // Auto-pick at t=1500 by non-orig B: nothing visible (the only open task is sticky to A).
+        assert!(claim(&mut c, "B", None, &[], TTL, 1500).unwrap().is_none());
+        // Explicit --task-id by B is also rejected.
+        assert!(claim(&mut c, "B", Some(tid), &[], TTL, 1500)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn claim_allowed_during_sticky_window_for_orig() {
+        // The orig (assignee) may claim during the sticky window — that's the whole point of
+        // "orig has the context, sticky-reserves them the first crack."
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 9, None, None, None, 1000).unwrap();
+        force_sticky_reopen(&c, tid, "A", 2000);
+        let t = claim(&mut c, "A", None, &[], TTL, 1500).unwrap().unwrap();
+        assert_eq!(t.id, tid);
+        assert_eq!(t.assignee.as_deref(), Some("A"));
+        assert_eq!(t.status, "claimed");
+        assert_eq!(t.sticky_until, Some(2000));
+    }
+
+    #[test]
+    fn claim_allowed_after_sticky_window_expires_for_anyone() {
+        // Once `now >= sticky_until`, the gate lifts — any agent (including a brand-new C)
+        // may claim. Eligibility-only filter; priority is unchanged so the row still sorts
+        // by priority DESC, id ASC in auto-pick.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 9, None, None, None, 1000).unwrap();
+        force_sticky_reopen(&c, tid, "A", 2000);
+        // At t=2001, sticky_until <= now → gate lifts.
+        let t = claim(&mut c, "C", None, &[], TTL, 2001).unwrap().unwrap();
+        assert_eq!(t.id, tid);
+        assert_eq!(t.assignee.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn claim_at_exact_sticky_boundary_is_allowed_for_anyone() {
+        // Spec boundary alignment with the project's "expiry is `expires_at > now`" rule
+        // (see CLAUDE.md gotcha "expiry boundary must be consistent everywhere"). The
+        // sticky predicate uses `<= now` to be DEAD, so `now == sticky_until` is DEAD →
+        // anyone may claim. The reaper boundary uses `<=`; we match it.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        force_sticky_reopen(&c, tid, "A", 2000);
+        let t = claim(&mut c, "C", None, &[], TTL, 2000).unwrap().unwrap();
+        assert_eq!(t.id, tid);
+    }
+
+    #[test]
+    fn sticky_gate_composes_with_dep_gate_and_label_filter() {
+        // All three claim-side gates (dep-ready, self-review block, sticky window) are pure
+        // AND-ed in the same selector. Smoke-test the composition: a task with an unmet dep
+        // AND a sticky window must remain unclaimable by anyone until BOTH gates clear.
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, 1000).unwrap();
+        let dependent = create(
+            &mut c,
+            "boss",
+            "dependent",
+            None,
+            5,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            1000,
+        )
+        .unwrap();
+        // Stamp the dependent as sticky-reopened to A through t=2000.
+        force_sticky_reopen(&c, dependent, "A", 2000);
+        // A is orig + within sticky window, but the dep is unmet → still blocked.
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1500)
+            .unwrap()
+            .is_none());
+        // After force-closing the dep, A can claim (orig in sticky); B still cannot.
+        c.execute("UPDATE tasks SET status='closed' WHERE id=?1", params![dep])
+            .unwrap();
+        assert!(claim(&mut c, "B", Some(dependent), &[], TTL, 1500)
+            .unwrap()
+            .is_none());
+        assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1500)
+            .unwrap()
+            .is_some());
     }
 }

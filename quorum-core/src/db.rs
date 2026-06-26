@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -135,6 +135,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         }
         // v5 = control table addition (issue #6 emergency stop). New CREATE TABLE in
         // SCHEMA_SQL handles it on fresh DBs and upgrades alike — no ALTER needed.
+        // v6 = review-as-task columns (issue #10): tasks.sticky_until + tasks.orig.
+        if current < 6 && !column_exists(conn, "tasks", "sticky_until")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN sticky_until INTEGER", [])?;
+        }
+        if current < 6 && !column_exists(conn, "tasks", "orig")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN orig TEXT", [])?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -317,6 +324,9 @@ mod tests {
         let c = open(&p).unwrap();
         assert!(column_exists(&c, "messages", "recipient").unwrap());
         assert!(column_exists(&c, "tasks", "depends_on").unwrap());
+        // v6 review-as-task columns are added by ALTER on upgrades and by SCHEMA_SQL on fresh.
+        assert!(column_exists(&c, "tasks", "sticky_until").unwrap());
+        assert!(column_exists(&c, "tasks", "orig").unwrap());
         // v5 control table is created via SCHEMA_SQL on every open — verify it exists.
         let n: i64 = c
             .query_row(
@@ -326,6 +336,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "control table missing");
+    }
+
+    #[test]
+    fn migrates_v5_to_v6_adds_review_columns_without_disturbing_existing_rows() {
+        // Simulate a v5 DB (control table present, sticky_until + orig absent, user_version=5)
+        // with seeded rows; re-open and verify the new columns land NULL without losing data.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            // v5 tasks shape: depends_on present, sticky_until/orig absent.
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                    created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT
+                 );
+                 INSERT INTO tasks(title, status, priority, created_by, created_at, updated_at)
+                 VALUES ('pre-review-cols', 'open', 5, 'boss', 1, 1);
+                 PRAGMA user_version = 5;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(column_exists(&c, "tasks", "sticky_until").unwrap());
+        assert!(column_exists(&c, "tasks", "orig").unwrap());
+        // Pre-existing row: new columns are NULL, original data preserved.
+        let (title, priority, sticky, orig): (String, i64, Option<i64>, Option<String>) = c
+            .query_row(
+                "SELECT title, priority, sticky_until, orig FROM tasks WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "pre-review-cols");
+        assert_eq!(priority, 5);
+        assert!(sticky.is_none());
+        assert!(orig.is_none());
     }
 
     #[test]

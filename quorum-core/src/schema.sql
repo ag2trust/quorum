@@ -55,7 +55,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- JSON array of task ids this task depends on; NULL = no deps. Claim auto-pick + explicit
     -- --task-id both gate on every listed dep being status='closed' (reviewed + finalized).
     -- Validated at create-time, so reads never fault on bad JSON.
-    depends_on  TEXT
+    depends_on  TEXT,
+    -- Sticky-reopen window (issue #10): set on a `changes`-driven reopen; while sticky_until
+    -- > now, only `assignee` may claim. NULL = no window. Eligibility filter only — does not
+    -- change priority. Cleared by release/cancel/successful sticky-claim.
+    sticky_until INTEGER,
+    -- Review-task only: the original executor whose `done` spawned this review (issue #10).
+    -- The claim path filters review tasks where orig == caller so an agent cannot review its
+    -- own work — "no self-review" as mechanism, not policy. NULL on non-review tasks.
+    orig         TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 
