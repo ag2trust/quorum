@@ -546,8 +546,14 @@ fn match_label_end_to_end() {
         ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("with-label"))
+        // #64 compact write response: title is no longer in the success JSON. Verify
+        // the right task was claimed via `task-get` (full record) instead.
         .stdout(predicates::str::contains("\"status\":\"claimed\""));
+    quorum(home.path())
+        .args(["task-get", "--task-id", "2"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("with-label"));
 
     // No more labeled tasks open → exit 1, clean reason.
     quorum(home.path())
@@ -738,12 +744,19 @@ fn depends_on_gates_claim_end_to_end() {
         .success();
     // `done` auto-spawns a review task (issue #10 Phase 2). B (not the orig) sees and claims
     // it — that's the new top-priority work, REVIEW_PRIORITY=1000 beats the dep's priority.
+    // #64 compact write response omits labels; we verify `refs.review_of` (which IS in the
+    // compact shape since refs stays) and use `task-get` to check the label.
     quorum(home.path())
         .args(["task-claim", "--agent", "B"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("kind:review"))
         .stdout(predicates::str::contains("review_of"));
+    // Find the just-claimed review task id (B should be the assignee).
+    quorum(home.path())
+        .args(["task-list", "--assignee", "B"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("kind:review"));
     // With the review claimed and `dep` still `done` (not `closed`), the dependent stays
     // gated for everyone — the dep-gate's "closed-not-done" boundary holds even after the
     // review-as-task layer.

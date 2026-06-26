@@ -41,6 +41,10 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
                                                                # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
+  # COMPACT WRITE RESPONSES (#64): task-claim/task-update/task-release/task-cancel return only
+  # {id, status, assignee, refs} (+ lease_expires_at on claim, + note_id on --note-*). Body and
+  # descriptive fields are omitted — you just wrote them, no need to re-pay tokens. Use
+  # `task-get <id>` for the full record (body + notes history).
   # AUTO-RENEW (#55): every `--agent`-identified command (claim, task-claim, task-update, post,
   # read --ack-through, sync, etc.) auto-extends YOUR active leases to now + DEFAULT_LEASE_TTL_SECS.
   # Monotonic — an explicit longer TTL is never shortened. Only true silence past the lease lapses
