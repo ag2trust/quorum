@@ -386,18 +386,30 @@ pub fn claim(
             )
             .optional()?,
         None => {
-            // Build the open-task selector with one `AND labels LIKE ?N` per match-label,
-            // plus the dep-ready / self-review / sticky clauses. Patterns are bound as
-            // parameters; only the placeholder count is interpolated (no value reaches SQL
-            // as a string).
+            // Build the open-task selector with the dep-ready / self-review / sticky
+            // clauses, plus a tier-exempt label match: (kind:review OR all match_labels
+            // present). Without the kind:review exempt branch, auto-spawned review tasks
+            // (only `["kind:review"]`, no `tier:*` label) are invisible to every
+            // tier-filtered claim → the review→merge loop stalls (#73). Patterns are
+            // bound as parameters; only the placeholder count is interpolated (no value
+            // reaches SQL as a string).
+            const REVIEW_EXEMPT_CLAUSE: &str = "labels LIKE '%\"kind:review\"%'";
             let mut selector = format!(
                 "SELECT id FROM tasks WHERE status='open' AND {DEP_READY_CLAUSE}
                  AND {SELF_REVIEW_BLOCK_CLAUSE} AND {STICKY_CLAUSE}"
             );
-            for i in 0..match_labels.len() {
-                // Params are 1-indexed; ?1 = agent, ?2 = now, so label params start at ?3.
+            if !match_labels.is_empty() {
                 use std::fmt::Write as _;
-                let _ = write!(selector, " AND labels LIKE ?{}", i + 3);
+                // (kind:review OR (label1 AND label2 AND ...))
+                let _ = write!(selector, " AND ({REVIEW_EXEMPT_CLAUSE} OR (");
+                for i in 0..match_labels.len() {
+                    if i > 0 {
+                        selector.push_str(" AND ");
+                    }
+                    // Params are 1-indexed; ?1 = agent, ?2 = now, so label params start at ?3.
+                    let _ = write!(selector, "labels LIKE ?{}", i + 3);
+                }
+                selector.push_str("))");
             }
             selector.push_str(" ORDER BY priority DESC, id ASC LIMIT 1");
             let sql = format!(
@@ -1148,6 +1160,76 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(t.id, want);
+    }
+
+    #[test]
+    fn claim_treats_kind_review_as_tier_exempt() {
+        // #73: a `kind:review` task carries only `["kind:review"]` — before the
+        // fix, a tier-filtered claim excluded it before priority was considered,
+        // so review tasks could only be claimed via explicit --task-id. After
+        // the fix, the normal queue-driven loop picks them up too.
+        let (_d, mut c) = open_tmp();
+        let _user = create(
+            &mut c, "boss", "user-work", None, 50, Some(r#"["tier:opus-47"]"#), None, None, 1000,
+        )
+        .unwrap();
+        let review = create(
+            &mut c, "boss", "review-pending", None, 1000, Some(r#"["kind:review"]"#),
+            None, None, 1000,
+        )
+        .unwrap();
+        let t = claim(&mut c, "agent-X", None, &["tier:opus-47"], TTL, 1000)
+            .unwrap()
+            .expect("tier-filtered claim should surface the review task");
+        assert_eq!(
+            t.id, review,
+            "priority-1000 review task must win the tier-filtered claim over the priority-50 user-work task",
+        );
+        assert!(has_live_lease(&c, review, 1000));
+    }
+
+    #[test]
+    fn claim_tier_exempt_does_not_widen_non_review_matching() {
+        // The tier-exempt OR must NOT let a non-review task in a different tier
+        // through the filter — only `kind:review` gets the bypass.
+        let (_d, mut c) = open_tmp();
+        let _foreign = create(
+            &mut c, "boss", "foreign", None, 100, Some(r#"["tier:opus-46"]"#),
+            None, None, 1000,
+        )
+        .unwrap();
+        let got = claim(&mut c, "agent-X", None, &["tier:opus-47"], TTL, 1000).unwrap();
+        assert!(
+            got.is_none(),
+            "non-review task in a different tier must NOT be claimable through the tier-exempt branch",
+        );
+    }
+
+    #[test]
+    fn claim_kind_review_still_blocks_self_review() {
+        // Defense-in-depth: the tier-exempt branch must compose with the
+        // self-review block (#10) — an `orig` agent must NOT be able to claim
+        // their own review task via the tier-filtered path.
+        let (_d, mut c) = open_tmp();
+        // Manually insert a `kind:review` task whose `orig` is "author-A".
+        let id: i64 = c.query_row(
+            "INSERT INTO tasks (title, created_by, priority, labels, orig, status, created_at, updated_at)
+             VALUES ('review-of-A', 'system', 1000, '[\"kind:review\"]', 'author-A', 'open', 1000, 1000)
+             RETURNING id",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        // author-A passes a tier filter — must still be blocked by self-review.
+        let got = claim(&mut c, "author-A", None, &["tier:opus-47"], TTL, 1000).unwrap();
+        assert!(
+            got.is_none(),
+            "author of the orig task must NOT be able to claim their own review, even via the tier-exempt branch",
+        );
+        // A different agent can claim it.
+        let got_b = claim(&mut c, "agent-B", None, &["tier:opus-47"], TTL, 1000)
+            .unwrap()
+            .expect("a non-author with a tier filter should still claim the review");
+        assert_eq!(got_b.id, id);
     }
 
     #[test]

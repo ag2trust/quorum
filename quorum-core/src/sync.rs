@@ -395,22 +395,38 @@ fn current_task_view(conn: &Connection, agent: &str, now: i64) -> Result<Option<
 }
 
 fn next_task_view(conn: &Connection, match_labels: &[&str]) -> Result<Option<NextTaskView>> {
-    // Mirror `tasks::claim`'s selector exactly: status='open' AND dep-ready AND every
-    // match-label present. Shown, never claimed.
+    // Mirror `tasks::claim`'s selector exactly: status='open' AND dep-ready AND
+    // (kind:review OR every match-label present). The kind:review tier-exempt
+    // branch is #73 — without it, auto-spawned review tasks (which carry only
+    // `["kind:review"]`, no `tier:*` label) are invisible to every tier-filtered
+    // `sync`, so the review→merge loop stalls. Shown, never claimed.
     const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
         SELECT 1 FROM json_each(depends_on) je
         WHERE NOT EXISTS (
             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
         )
     ))";
+    // #73: tier-exempt branch for review tasks. The OR composes with the
+    // AND-bag of match_labels so a `--match-label tier:X` sync still surfaces
+    // any open `kind:review` task (eligibility still gated by self-review +
+    // sticky at claim time, which is correct — sync only previews).
+    const REVIEW_EXEMPT_CLAUSE: &str = "labels LIKE '%\"kind:review\"%'";
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
          WHERE status = 'open' AND {DEP_READY_CLAUSE}"
     );
-    for i in 0..match_labels.len() {
+    if !match_labels.is_empty() {
         use std::fmt::Write as _;
-        // Params start at ?1 — only label patterns are bound.
-        let _ = write!(sql, " AND labels LIKE ?{}", i + 1);
+        // (kind:review OR (label1 AND label2 AND ...))
+        let _ = write!(sql, " AND ({REVIEW_EXEMPT_CLAUSE} OR (");
+        for i in 0..match_labels.len() {
+            if i > 0 {
+                sql.push_str(" AND ");
+            }
+            // Params start at ?1 — only label patterns are bound.
+            let _ = write!(sql, "labels LIKE ?{}", i + 1);
+        }
+        sql.push_str("))");
     }
     sql.push_str(" ORDER BY priority DESC, id ASC LIMIT 1");
 
@@ -697,6 +713,49 @@ mod tests {
         // Requesting an unmatched label hides it.
         let snap3 = gather(&c, "A", &["go"], 200).unwrap();
         assert!(snap3.next_task.is_none());
+    }
+
+    #[test]
+    fn snapshot_kind_review_is_tier_exempt_for_match_label_sync() {
+        // #73 regression: a `kind:review` task carries only `["kind:review"]` —
+        // before the fix, a `--match-label tier:X` sync excluded it before
+        // priority was considered, so auto-spawned reviews never surfaced to
+        // tier-filtered agents and the review→merge loop stalled.
+        let (_d, mut c) = open_tmp();
+        let _user = make_task(&mut c, "user-work", 50, Some("[\"tier:opus-47\"]"), 100);
+        let review = make_task(&mut c, "review-pending", 1000, Some("[\"kind:review\"]"), 100);
+
+        let snap = gather(&c, "agent-X", &["tier:opus-47"], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(
+            nxt.id, review,
+            "review task must surface to tier-filtered sync — priority 1000 should win over the user-work priority 50",
+        );
+    }
+
+    #[test]
+    fn snapshot_kind_review_still_visible_without_tier_filter() {
+        // Sanity: with no --match-label, the existing behavior is unchanged —
+        // the review task surfaces by priority just like before.
+        let (_d, mut c) = open_tmp();
+        let _user = make_task(&mut c, "user-work", 50, Some("[\"tier:opus-47\"]"), 100);
+        let review = make_task(&mut c, "review-pending", 1000, Some("[\"kind:review\"]"), 100);
+
+        let snap = gather(&c, "agent-X", &[], 200).unwrap();
+        assert_eq!(snap.next_task.as_ref().unwrap().id, review);
+    }
+
+    #[test]
+    fn snapshot_kind_review_exemption_does_not_break_non_review_filtering() {
+        // The tier-exempt OR must NOT widen the matcher for non-review tasks —
+        // a user-work task without the tier label must still be hidden.
+        let (_d, mut c) = open_tmp();
+        let _foreign = make_task(&mut c, "foreign-tier", 100, Some("[\"tier:opus-46\"]"), 100);
+        let snap = gather(&c, "agent-X", &["tier:opus-47"], 200).unwrap();
+        assert!(
+            snap.next_task.is_none(),
+            "non-review task in a different tier must remain filtered out",
+        );
     }
 
     #[test]
