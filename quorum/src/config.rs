@@ -20,17 +20,22 @@ pub struct Config {
 }
 
 impl Default for Config {
+    /// Single source of truth for each default lives in the core module that USES it
+    /// (`agents`/`feed`/`tasks`); this `Default` impl + the `DEFAULT_TOML` string below are
+    /// thin re-exports. The `default_toml_matches_default_config` test pins all three to stay
+    /// consistent so a value change in one place can never silently drift from the others.
     fn default() -> Self {
         Self {
-            online_window_secs: 300,
-            message_ttl_secs: 48 * 3600,
-            task_lease_ttl_secs: 3600,
-            read_limit: 100,
+            online_window_secs: quorum_core::agents::ONLINE_WINDOW_SECS,
+            message_ttl_secs: quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
+            task_lease_ttl_secs: quorum_core::tasks::DEFAULT_LEASE_TTL_SECS,
+            read_limit: quorum_core::feed::DEFAULT_READ_LIMIT,
         }
     }
 }
 
-/// The default config file contents, written by `quorum init`.
+/// The default config file contents, written by `quorum init`. The values MUST match
+/// `Config::default()` — verified by `default_toml_matches_default_config`.
 pub const DEFAULT_TOML: &str = "\
 # Quorum config. Delete any line to use its built-in default.
 online_window_secs   = 300        # agent considered online if active within 5 min
@@ -101,6 +106,20 @@ mod tests {
             ..Default::default()
         };
         assert!(validate(&cfg, Path::new("cfg")).is_err());
+    }
+
+    #[test]
+    fn default_toml_matches_default_config() {
+        // Pins the three sources of every default — the core constant (e.g.
+        // `quorum_core::agents::ONLINE_WINDOW_SECS`), `Config::default()`, and the
+        // `DEFAULT_TOML` string written by `quorum init`. If a value changes in one place
+        // without the others, this fails and forces the author to update them together.
+        let parsed: Config = toml::from_str(DEFAULT_TOML).unwrap();
+        let d = Config::default();
+        assert_eq!(parsed.online_window_secs, d.online_window_secs);
+        assert_eq!(parsed.message_ttl_secs, d.message_ttl_secs);
+        assert_eq!(parsed.task_lease_ttl_secs, d.task_lease_ttl_secs);
+        assert_eq!(parsed.read_limit, d.read_limit);
     }
 
     #[test]

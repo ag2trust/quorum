@@ -5,13 +5,21 @@
 //! `read` is a pure read by default and only advances the cursor when the caller passes
 //! `ack_through` (what it durably handled last poll), so a crash mid-poll re-delivers.
 
+use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use crate::sweep::SWEEP_LIMIT;
-use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 /// The default topic when none is given.
 pub const DEFAULT_TOPIC: &str = "hub";
+
+/// Default message TTL when the CLI's `--ttl` is omitted. 48h matches the typical end-of-day
+/// + next-morning round-trip on the hub.
+pub const DEFAULT_MESSAGE_TTL_SECS: i64 = 48 * 3600;
+
+/// Default page size for `read`/`peek` when the caller omits `--limit`.
+pub const DEFAULT_READ_LIMIT: i64 = 100;
 
 /// Valid message kinds.
 pub const KINDS: &[&str] = &["info", "request", "claim", "done", "hello", "critical"];
@@ -66,10 +74,6 @@ fn row_to_msg(r: &Row) -> rusqlite::Result<Message> {
     })
 }
 
-fn begin(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
-    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
-}
-
 /// Append a message. `ttl` is seconds-from-now until it logically expires. `recipient =
 /// Some(agent)` marks it as a direct message to that agent; `None` is a broadcast.
 #[allow(clippy::too_many_arguments)]
@@ -89,7 +93,7 @@ pub fn post(
     }
     let topic = topic.unwrap_or(DEFAULT_TOPIC);
     let expires_at = now + ttl;
-    let tx = begin(conn)?;
+    let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, author, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.execute(
@@ -124,7 +128,7 @@ pub fn read(
     let topic = topic.unwrap_or(DEFAULT_TOPIC);
     let cursor = match ack_through {
         Some(ack) => {
-            let tx = begin(conn)?;
+            let tx = begin_immediate(conn)?;
             crate::agents::touch(&tx, agent, now)?;
             crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
             tx.execute(
