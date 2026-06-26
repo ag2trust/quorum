@@ -191,14 +191,22 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::Init => {
             paths::ensure_home()?;
             let db = paths::db_path()?;
-            quorum_core::db::open(&db)?;
+            let (_conn, info) = quorum_core::db::open_init(&db)?;
             // Write a default config if absent (don't clobber an existing one).
             let cfg_path = paths::config_path()?;
             if !cfg_path.exists() {
                 std::fs::write(&cfg_path, config::DEFAULT_TOML)
                     .map_err(|e| QuorumError::Io(e.to_string()))?;
             }
-            output::emit(&serde_json::json!({ "ok": true, "db": db.to_string_lossy() }));
+            let mut out = serde_json::json!({
+                "ok": true,
+                "db": db.to_string_lossy(),
+                "schema_version": info.schema_version,
+            });
+            if info.migrated_from > 0 && info.migrated_from != info.schema_version {
+                out["migrated_from"] = serde_json::json!(info.migrated_from);
+            }
+            output::emit(&out);
             Ok(0)
         }
         cli::Command::Reset { yes } => {
