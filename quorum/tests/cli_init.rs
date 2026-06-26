@@ -1,6 +1,12 @@
-//! Integration tests for `quorum init`.
+//! Integration tests for `quorum init` and `quorum reset`.
 
 use assert_cmd::Command;
+
+fn quorum(home: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("quorum").unwrap();
+    c.env("QUORUM_HOME", home);
+    c
+}
 
 #[test]
 fn init_creates_db() {
@@ -58,4 +64,74 @@ fn concurrent_init_is_safe() {
         }
         assert!(home.path().join("quorum.db").exists());
     }
+}
+
+// -- reset (#59) --------------------------------------------------------------------------
+
+#[test]
+fn reset_without_yes_refuses_and_preserves_state() {
+    let home = tempfile::tempdir().unwrap();
+    // Seed a task so we can prove nothing was wiped.
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "keep me"])
+        .assert()
+        .success();
+    // `reset` with no --yes must refuse: exit 2 (usage) and name the confirm flag.
+    quorum(home.path())
+        .args(["reset"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--yes"));
+    // State is intact — the refusal did not touch the DB.
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("keep me"));
+}
+
+#[test]
+fn reset_yes_wipes_to_clean_db() {
+    let home = tempfile::tempdir().unwrap();
+    // Seed a task (also registers agent "boss" via touch) so there's state to wipe.
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "wipe me"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("wipe me"));
+    // Wipe with confirmation.
+    quorum(home.path())
+        .args(["reset", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"reset\":true"));
+    // Clean DB: no tasks, no agents, and the file is recreated (usable).
+    quorum(home.path())
+        .args(["task-list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("[]"));
+    quorum(home.path())
+        .args(["roster"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("[]"));
+    assert!(home.path().join("quorum.db").exists());
+}
+
+#[test]
+fn reset_yes_on_fresh_home_succeeds() {
+    // reset --yes before any DB exists must not error on the missing-file removal — it
+    // should just create a clean DB (the sidecar removals are NotFound-tolerant).
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["reset", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"reset\":true"));
+    assert!(home.path().join("quorum.db").exists());
 }

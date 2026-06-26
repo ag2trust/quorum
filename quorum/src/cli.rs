@@ -22,6 +22,12 @@ pub struct Cli {
 pub enum Command {
     /// Create ~/.quorum/, the database, and run migrations (idempotent).
     Init,
+    /// Wipe ALL state — drop the database and recreate a clean schema. Requires `--yes`.
+    Reset {
+        /// Confirm the destructive wipe. Without it, `reset` refuses (exit 2) — no accidental wipe.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List known agents with derived online/offline presence.
     Roster,
     /// Atomically claim a target (e.g. pr#2459) for a TTL lease.

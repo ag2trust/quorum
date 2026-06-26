@@ -32,6 +32,7 @@ fn run() -> Result<i32> {
 fn command_source(cmd: &cli::Command) -> &'static str {
     match cmd {
         cli::Command::Init => "init",
+        cli::Command::Reset { .. } => "reset",
         cli::Command::Roster => "roster",
         cli::Command::Claim { .. } => "claim",
         cli::Command::Release { .. } => "release",
@@ -198,6 +199,35 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     .map_err(|e| QuorumError::Io(e.to_string()))?;
             }
             output::emit(&serde_json::json!({ "ok": true, "db": db.to_string_lossy() }));
+            Ok(0)
+        }
+        cli::Command::Reset { yes } => {
+            // Destructive: refuse without explicit confirmation (exit 2, no wipe).
+            if !yes {
+                return Err(QuorumError::Usage(
+                    "reset wipes ALL state (agents, tasks, claims, messages). Re-run with --yes to confirm.".into(),
+                ));
+            }
+            paths::ensure_home()?;
+            let db = paths::db_path()?;
+            // Remove the SQLite DB and its WAL/SHM sidecars (absent = fine), then recreate a
+            // clean schema via open() (migrations run on the fresh file).
+            let fname = db
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "quorum.db".into());
+            for suffix in ["", "-wal", "-shm"] {
+                let p = db.with_file_name(format!("{fname}{suffix}"));
+                match std::fs::remove_file(&p) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(QuorumError::Io(e.to_string())),
+                }
+            }
+            quorum_core::db::open(&db)?;
+            output::emit(
+                &serde_json::json!({ "ok": true, "reset": true, "db": db.to_string_lossy() }),
+            );
             Ok(0)
         }
         cli::Command::Roster => {

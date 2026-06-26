@@ -78,6 +78,7 @@ OPS
   quorum status [--watch] [--json]            # health snapshot
   quorum sweep                                # reclaim expired rows + checkpoint WAL (control state is NOT swept)
   quorum init                                 # create ~/.quorum + db (idempotent)
+  quorum reset --yes                          # wipe ALL state -> clean db (needs --yes; refuses without)
   quorum help                                 # this cheat-sheet (alias: help-agent)
 
 FREE TEXT (bodies): never pass as a flag. Use a quoted heredoc on stdin (disables shell
