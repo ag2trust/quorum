@@ -142,6 +142,16 @@ fn best_effort_errlog(source: &str, detail: &str) {
     }
 }
 
+/// Largest accepted TTL: ~100 years in seconds. There are two TTL input paths — the `--ttl`
+/// flag (bounded here in `parse_ttl`) and the `message_ttl_secs` / `task_lease_ttl_secs`
+/// config defaults used when `--ttl` is omitted (bounded in `config::validate`). Clamping
+/// BOTH to this ceiling guarantees `now + ttl` can never overflow i64 at any write site for
+/// any realistic `now` — preserving the at-most-one-active-claim invariant (an overflowed
+/// `expires_at` wraps into the past, silently letting a second agent re-win the target).
+/// Unbounded TTLs aren't a real need: "non-expiring" control state lives in its own table,
+/// not in a huge lease.
+const MAX_TTL_SECS: i64 = 100 * 365 * 86_400;
+
 /// Parse a duration like `45m`, `1h`, `30s`, `2d`, or bare seconds, into seconds.
 fn parse_ttl(s: &str) -> Result<i64> {
     let s = s.trim();
@@ -163,7 +173,12 @@ fn parse_ttl(s: &str) -> Result<i64> {
             "duration must be positive: {s}"
         )));
     }
-    Ok(v * mult)
+    // `checked_mul` guards the unit multiply (wraps in release, panics in debug); the ceiling
+    // then bounds the result so every downstream `now + ttl` is overflow-safe. Both map to a
+    // clean usage error (exit 2) rather than a silent wrap or a panic.
+    v.checked_mul(mult)
+        .filter(|&secs| secs <= MAX_TTL_SECS)
+        .ok_or_else(|| QuorumError::Usage(format!("duration too large (max {MAX_TTL_SECS}s): {s}")))
 }
 
 fn dispatch(cmd: cli::Command) -> Result<i32> {
@@ -553,5 +568,26 @@ mod tests {
         assert!(parse_ttl("abc").is_err());
         assert!(parse_ttl("0").is_err());
         assert!(parse_ttl("-5").is_err());
+    }
+
+    #[test]
+    fn parse_ttl_rejects_overflow() {
+        // Unit multiply must not wrap (release) or panic (debug): `200000000000000d`
+        // overflows i64 when multiplied by 86_400.
+        assert!(parse_ttl("200000000000000d").is_err());
+        // A bare value larger than the ceiling but still in i64 range is rejected too,
+        // so no downstream `now + ttl` can overflow and break the claim invariant.
+        assert!(parse_ttl(&i64::MAX.to_string()).is_err());
+        assert!(parse_ttl(&(super::MAX_TTL_SECS + 1).to_string()).is_err());
+    }
+
+    #[test]
+    fn parse_ttl_accepts_ceiling() {
+        // The ceiling itself is valid (boundary), and so is a generous real-world TTL.
+        assert_eq!(
+            parse_ttl(&super::MAX_TTL_SECS.to_string()).unwrap(),
+            super::MAX_TTL_SECS
+        );
+        assert_eq!(parse_ttl("30d").unwrap(), 30 * 86_400);
     }
 }
