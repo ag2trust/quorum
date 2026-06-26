@@ -32,7 +32,12 @@ pub fn read_text(src: TextSource) -> Result<String> {
                 .map_err(|e| QuorumError::Io(e.to_string()))?;
             b
         }
-        TextSource::File(p) => std::fs::read(&p).map_err(|e| QuorumError::Io(e.to_string()))?,
+        TextSource::File(ref p) => std::fs::read(p).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                QuorumError::BadInput(format!("{}: {e}", p.display()))
+            }
+            _ => QuorumError::Io(e.to_string()),
+        })?,
     };
     validate(bytes)
 }
@@ -55,6 +60,13 @@ mod tests {
     fn accepts_unicode_quotes_newlines() {
         let s = "héllo \"world\"\n`$x` 'mixed'\n";
         assert_eq!(validate(s.as_bytes().to_vec()).unwrap(), s);
+    }
+
+    #[test]
+    fn file_not_found_yields_bad_input() {
+        let err = read_text(TextSource::File("/no/such/file".into())).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("/no/such/file"));
     }
 
     #[test]
