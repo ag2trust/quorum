@@ -41,7 +41,6 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::TaskClaim { .. } => "task-claim",
         cli::Command::TaskUpdate { .. } => "task-update",
         cli::Command::TaskRelease { .. } => "task-release",
-        cli::Command::TaskRenew { .. } => "task-renew",
         cli::Command::TaskCancel { .. } => "task-cancel",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
@@ -378,20 +377,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::TaskRelease { agent, task_id } => {
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let t = quorum_core::tasks::release(&mut conn, &agent, task_id, now)?;
-            output::emit(&t);
-            Ok(0)
-        }
-        cli::Command::TaskRenew {
-            agent,
-            task_id,
-            ttl,
-        } => {
-            let ttl = match ttl {
-                Some(s) => parse_ttl(&s)?,
-                None => load_cfg()?.task_lease_ttl_secs,
-            };
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let t = quorum_core::tasks::renew(&mut conn, &agent, task_id, ttl, now)?;
             output::emit(&t);
             Ok(0)
         }

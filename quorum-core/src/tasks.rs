@@ -728,38 +728,6 @@ pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<
     Ok(task)
 }
 
-/// Extend the lease on a task you hold. Fails loud if `agent` is not the active, unexpired
-/// holder of a `claimed` task (lapsed lease → must re-claim). Returns the task.
-pub fn renew(conn: &mut Connection, agent: &str, id: i64, ttl: i64, now: i64) -> Result<Task> {
-    let tx = begin_immediate(conn)?;
-    crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let n = tx.execute(
-        "UPDATE claims SET expires_at=?1
-         WHERE target=?2 AND holder=?3 AND active=1 AND expires_at > ?4",
-        params![now + ttl, lease_target(id), agent, now],
-    )?;
-    if n == 0 {
-        tx.commit()?;
-        return Err(QuorumError::NotHolder);
-    }
-    let mut task = tx.query_row(
-        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
-        params![id],
-        row_to_task,
-    )?;
-    task.ready = compute_ready(&tx, &task.depends_on)?;
-    crate::events::emit(
-        &tx,
-        "task_renewed",
-        &lease_target(id),
-        &format!("renewed by {agent}"),
-        now,
-    )?;
-    tx.commit()?;
-    Ok(task)
-}
-
 /// Cancel a task (terminal won't-do). Guard: the **creator OR the assignee** may cancel (a
 /// wider guard than `done`, which is assignee-only). Already-terminal tasks
 /// (`closed`/`cancelled`) cannot be cancelled. Drops the lease. Fails loud
@@ -1325,45 +1293,6 @@ mod tests {
             release(&mut c, "B", id, 1100).unwrap_err(),
             QuorumError::NotHolder
         ));
-    }
-
-    #[test]
-    fn renew_extends_lease_for_holder_only() {
-        let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // expires at 1100
-                                                               // Holder renews near expiry → lease lives past the old boundary.
-        renew(&mut c, "A", id, 100, 1090).unwrap(); // now expires at 1190
-        assert!(has_live_lease(&c, id, 1150));
-        // A non-holder cannot renew.
-        assert!(matches!(
-            renew(&mut c, "B", id, 100, 1150).unwrap_err(),
-            QuorumError::NotHolder
-        ));
-    }
-
-    #[test]
-    fn renew_fails_once_lease_lapsed() {
-        let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // dead at 1100
-                                                               // At/after expiry the lease is gone → must re-claim, renew fails loud.
-        assert!(matches!(
-            renew(&mut c, "A", id, 100, 1100).unwrap_err(),
-            QuorumError::NotHolder
-        ));
-    }
-
-    #[test]
-    fn renew_emits_task_renewed_event() {
-        let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
-        claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
-        renew(&mut c, "A", id, 200, 1050).unwrap();
-        let evs = crate::events::list(&c, 0, Some(&format!("task#{id}")), 10, 1050).unwrap();
-        let renewed: Vec<_> = evs.iter().filter(|e| e.kind == "task_renewed").collect();
-        assert_eq!(renewed.len(), 1);
-        assert!(renewed[0].body.contains("renewed by A"));
     }
 
     #[test]

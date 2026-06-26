@@ -243,7 +243,13 @@ mod tests {
                 1000,
             )
             .unwrap();
-            crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+            // Use DISTINCT agents per task so #55's auto-renew-on-touch doesn't extend
+            // the prior agents' leases at each iteration (every claim() calls
+            // agents::touch which renews the caller's OTHER active leases). With one
+            // agent per task, each lease lapses independently at TTL=100 → all 5 lapse
+            // at now=1100 as the reaper test expects.
+            let agent = format!("A{i}");
+            crate::tasks::claim(&mut c, &agent, Some(id), &[], 100, 1000).unwrap();
             ids.push(id);
         }
         // All 5 leases lapse at 1100. Reap with limit=2: only 2 reaped.
