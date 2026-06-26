@@ -723,7 +723,13 @@ mod tests {
         // tier-filtered agents and the review→merge loop stalled.
         let (_d, mut c) = open_tmp();
         let _user = make_task(&mut c, "user-work", 50, Some("[\"tier:opus-47\"]"), 100);
-        let review = make_task(&mut c, "review-pending", 1000, Some("[\"kind:review\"]"), 100);
+        let review = make_task(
+            &mut c,
+            "review-pending",
+            1000,
+            Some("[\"kind:review\"]"),
+            100,
+        );
 
         let snap = gather(&c, "agent-X", &["tier:opus-47"], 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
@@ -739,7 +745,13 @@ mod tests {
         // the review task surfaces by priority just like before.
         let (_d, mut c) = open_tmp();
         let _user = make_task(&mut c, "user-work", 50, Some("[\"tier:opus-47\"]"), 100);
-        let review = make_task(&mut c, "review-pending", 1000, Some("[\"kind:review\"]"), 100);
+        let review = make_task(
+            &mut c,
+            "review-pending",
+            1000,
+            Some("[\"kind:review\"]"),
+            100,
+        );
 
         let snap = gather(&c, "agent-X", &[], 200).unwrap();
         assert_eq!(snap.next_task.as_ref().unwrap().id, review);

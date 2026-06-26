@@ -1170,12 +1170,27 @@ mod tests {
         // the fix, the normal queue-driven loop picks them up too.
         let (_d, mut c) = open_tmp();
         let _user = create(
-            &mut c, "boss", "user-work", None, 50, Some(r#"["tier:opus-47"]"#), None, None, 1000,
+            &mut c,
+            "boss",
+            "user-work",
+            None,
+            50,
+            Some(r#"["tier:opus-47"]"#),
+            None,
+            None,
+            1000,
         )
         .unwrap();
         let review = create(
-            &mut c, "boss", "review-pending", None, 1000, Some(r#"["kind:review"]"#),
-            None, None, 1000,
+            &mut c,
+            "boss",
+            "review-pending",
+            None,
+            1000,
+            Some(r#"["kind:review"]"#),
+            None,
+            None,
+            1000,
         )
         .unwrap();
         let t = claim(&mut c, "agent-X", None, &["tier:opus-47"], TTL, 1000)
@@ -1194,8 +1209,15 @@ mod tests {
         // through the filter — only `kind:review` gets the bypass.
         let (_d, mut c) = open_tmp();
         let _foreign = create(
-            &mut c, "boss", "foreign", None, 100, Some(r#"["tier:opus-46"]"#),
-            None, None, 1000,
+            &mut c,
+            "boss",
+            "foreign",
+            None,
+            100,
+            Some(r#"["tier:opus-46"]"#),
+            None,
+            None,
+            1000,
         )
         .unwrap();
         let got = claim(&mut c, "agent-X", None, &["tier:opus-47"], TTL, 1000).unwrap();
