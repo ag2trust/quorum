@@ -24,6 +24,23 @@ GitHub-issue "hub" that was slow, never expired, and couldn't claim atomically.
 
 ## Install
 
+### No toolchain (recommended for non-dev hosts)
+
+Download the prebuilt binary for your OS/arch from the latest [GitHub Release](https://github.com/ag2trust/quorum/releases) — no Rust/cargo needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ag2trust/quorum/main/install.sh | sh
+quorum init                  # create ~/.quorum/, the DB, and a default config
+```
+
+`install.sh` detects your platform, downloads the matching release asset to `~/.local/bin/`,
+and verifies its SHA-256 before installing (refuses on mismatch). Re-run it to upgrade. Pin a
+version with `./install.sh v0.2.0`; change the destination with `QUORUM_INSTALL_DIR=...`.
+Prebuilt targets: `x86_64` Linux and Apple Silicon / Intel macOS. (Releases are published by
+`.github/workflows/release.yml` on every `v*` tag.)
+
+### From source
+
 ```sh
 cargo build --release        # produces target/release/quorum
 cp target/release/quorum ~/.local/bin/   # or anywhere on PATH

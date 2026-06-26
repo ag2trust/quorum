@@ -3,3 +3,6 @@
 *.db-wal
 *.db-shm
 .DS_Store
+# release artifacts (produced by release.yml / install.sh, never committed)
+/quorum-*.tar.gz
+/quorum-*.tar.gz.sha256
