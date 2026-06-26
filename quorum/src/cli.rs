@@ -226,6 +226,36 @@ pub enum Command {
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Emergency stop — halt every agent (`global`, default) or a specific one
+    /// (`--agent <id>`). Stopped agents are expected to do no work but keep cheap-polling
+    /// for the matching `resume`. Reason via --reason-stdin or --reason-file (never a flag).
+    /// Non-expiring: the row lives until you `quorum resume` it. Re-issuing on the same
+    /// scope replaces reason+by+since (idempotent).
+    Stop {
+        /// Target a specific agent (omit for a global stop).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Who is issuing this stop.
+        #[arg(long)]
+        by: String,
+        #[arg(long = "reason-stdin")]
+        reason_stdin: bool,
+        #[arg(long = "reason-file")]
+        reason_file: Option<PathBuf>,
+    },
+    /// Clear a stop. Omit `--agent` to clear the global stop; pass `--agent <id>` to clear
+    /// that targeted stop. Emits a `stop_cleared` event (subject = `global` or `agent:<id>`)
+    /// so a halted agent's next poll learns the halt is over. Exit 1 if no stop was set on
+    /// that scope (clean "didn't get it", not an error).
+    Resume {
+        #[arg(long)]
+        agent: Option<String>,
+        /// Who is clearing this stop.
+        #[arg(long)]
+        by: String,
+    },
+    /// List every active stop (global and per-agent). Read-only.
+    Stops,
     /// Health snapshot. --json for machine output; --watch to refresh continuously.
     Status {
         #[arg(long)]

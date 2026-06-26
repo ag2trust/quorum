@@ -42,9 +42,14 @@ EVENT LOG (auto-emitted state-change ticker; SEPARATE from messages)
   quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed/renewed
                                                                        # claim_taken/released/renewed. --refs filters: task#<id>, pr#<n>, etc.
 
+CONTROL (emergency halt; non-expiring — only `resume` clears)
+  quorum stop   [--agent <id>] --by <id> --reason-stdin     # set; omit --agent = global halt
+  quorum resume [--agent <id>] --by <id>                    # clear; emits stop_cleared event (exit 1 = nothing set)
+  quorum stops                                              # list active stops
+
 OPS
   quorum status [--watch] [--json]            # health snapshot
-  quorum sweep                                # reclaim expired rows + checkpoint WAL
+  quorum sweep                                # reclaim expired rows + checkpoint WAL (control state is NOT swept)
   quorum init                                 # create ~/.quorum + db (idempotent)
   quorum help                                 # this cheat-sheet (alias: help-agent)
 

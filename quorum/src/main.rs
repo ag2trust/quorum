@@ -49,6 +49,9 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Read { .. } => "read",
         cli::Command::Peek { .. } => "peek",
         cli::Command::Log { .. } => "log",
+        cli::Command::Stop { .. } => "stop",
+        cli::Command::Resume { .. } => "resume",
+        cli::Command::Stops => "stops",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
         cli::Command::Help => "help",
@@ -529,6 +532,46 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
                 Ok(0)
             }
+        }
+        cli::Command::Stop {
+            agent,
+            by,
+            reason_stdin,
+            reason_file,
+        } => {
+            // Reason must come via stdin/file per Invariant #10 (free text never as a flag).
+            let reason = read_optional_body(reason_stdin, reason_file)?.ok_or_else(|| {
+                QuorumError::Usage("--reason-stdin or --reason-file is required for `stop`".into())
+            })?;
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let s = quorum_core::control::stop(&mut conn, agent.as_deref(), &reason, &by, now)?;
+            output::emit(&s);
+            Ok(0)
+        }
+        cli::Command::Resume { agent, by } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            match quorum_core::control::resume(&mut conn, agent.as_deref(), &by, now)? {
+                Some(cleared) => {
+                    output::emit(&serde_json::json!({
+                        "ok": true,
+                        "cleared": cleared,
+                    }));
+                    Ok(0)
+                }
+                None => {
+                    output::emit(&serde_json::json!({
+                        "ok": false,
+                        "reason": "no active stop on that scope",
+                    }));
+                    Ok(1)
+                }
+            }
+        }
+        cli::Command::Stops => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let stops = quorum_core::control::list(&conn)?;
+            output::emit(&stops);
+            Ok(0)
         }
         cli::Command::Sweep => {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
