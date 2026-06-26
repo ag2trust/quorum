@@ -21,15 +21,19 @@ CLAIMS (atomic locks)
   quorum claims [--target <t>]
 
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
-  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--body-stdin]
+  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
                                                                # --depends-on gates the claim: dependent stays unclaimable
                                                                # until every listed task is `closed` (#2 alignment).
+                                                               # --refs: structured external-ref JSON (e.g. {"pr":N}) — load-bearing
+                                                               # for review-loop traceability (#10 + creator monitor #62).
                                                                # Malformed JSON → exit 2 at create (never poisons reads).
   quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
-  quorum task-update  --agent <id> --task-id <n> [--status done] [--verdict approve|changes] [--note-stdin]
+  quorum task-update  --agent <id> --task-id <n> [--status done] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
                                                                # --status done: assignee-only submit (the only agent-set status)
+                                                               # --refs: link the PR on submit, e.g. `--status done --refs '{"pr":2459}'`
+                                                               #   surfaced through `log --refs pr#N` + creator sync (#62).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
                                                                # --verdict: reviewer-only, REQUIRED on `kind:review` task done (#10).
   quorum task-release --agent <id> --task-id <n>               # give up -> open (hand-off = release + re-claim) — also clears sticky window
