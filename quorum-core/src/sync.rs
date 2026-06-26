@@ -91,14 +91,57 @@ pub struct LogEntry {
     pub body: String,
 }
 
+/// The HALT signal — present when the agent (or everybody, on a global stop) is stopped.
+/// Field order matches the issue's lock: `{reason, scope, since, by}`. Global stops
+/// take precedence over agent-targeted stops on the `is_stopped` query (broader signal —
+/// the agent shouldn't have to merge two stop rows).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct StopView {
+    pub reason: String,
+    /// `global` or `agent:<id>`.
+    pub scope: String,
+    pub since: i64,
+    pub by: String,
+}
+
+impl From<crate::control::Stop> for StopView {
+    fn from(s: crate::control::Stop) -> Self {
+        StopView {
+            reason: s.reason,
+            scope: s.scope,
+            since: s.since,
+            by: s.by,
+        }
+    }
+}
+
+/// How recent a `stop_cleared` event has to be for `sync` to surface it as the one-shot
+/// affirmative resume signal. The locked design wants "next sync after resume shows
+/// `stop_cleared: true`, subsequent syncs omit"; with no per-agent shown-set state
+/// (CTO-greenlit Simple > schema-surface, hub 04:36), we approximate with a 2-minute
+/// window after the event's `ts`. A halted agent polls cheaply, so the resume signal
+/// is almost always seen within seconds; the 2 min absorbs realistic poll-cadence
+/// variance without re-emitting the signal indefinitely (event TTL is 24h).
+pub const STOP_CLEARED_WINDOW_SECS: i64 = 120;
+
 /// The agent's one-call orientation payload. Empty sections are omitted on serialization —
 /// a quiet tick (mid-task, no new messages, no stop) returns nearly nothing.
 ///
-/// **Locked field order** (see issue #8): stop ▸ critical ▸ current_task ▸ next_task ▸
-/// direct ▸ notifications ▸ log. Phase 1a omits stop/stop_cleared (waits on #6).
+/// **Locked field order** (see issue #8): stop ▸ stop_cleared ▸ critical ▸ current_task ▸
+/// next_task ▸ direct ▸ notifications ▸ log.
+///
+/// **STOP is absolute.** When `stop` is set, gather returns ONLY `stop` + `critical` (a
+/// critical msg may explain the halt or be an even more urgent directive). All other
+/// fields are omitted — the agent does nothing but cheap-poll for resume.
 #[derive(Debug, Serialize, Default, PartialEq, Eq)]
 pub struct Snapshot {
-    // Phase 3: stop / stop_cleared once #6 (control table + emergency stop/resume) merges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopView>,
+    /// One-shot affirmative resume signal — `true` for the first ~2 min after a stop
+    /// clears, then drops out. See [`STOP_CLEARED_WINDOW_SECS`]. Always `Some(true)` or
+    /// `None`; never `Some(false)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_cleared: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub critical: Vec<MsgView>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +166,29 @@ pub struct Snapshot {
 ///
 /// Running this mid-task is a non-event by design.
 pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -> Result<Snapshot> {
+    // 0. STOP is first and absolute. If we're halted (globally or per-agent), return ONLY
+    //    stop + critical and skip the rest — the agent does nothing but cheap-poll for
+    //    resume. Critical msgs still come through (they may explain the halt or be a more
+    //    urgent directive). This honors the locked "Nothing else matters" semantics while
+    //    keeping the priority-hint surface live.
+    if let Some(stop_row) = crate::control::is_stopped(conn, agent)? {
+        let cursor = read_cursor(conn, agent, DEFAULT_TOPIC)?;
+        let buckets = bucket_messages(conn, agent, cursor, now)?;
+        return Ok(Snapshot {
+            stop: Some(stop_row.into()),
+            critical: buckets.critical,
+            ..Snapshot::default()
+        });
+    }
+
+    // 0b. stop_cleared — one-shot affirmative resume signal. Only meaningful when we're
+    //     NOT currently stopped (i.e., we just transitioned out). Derived from the event
+    //     log: a recent `stop_cleared` event on `global` OR `agent:<me>` within the
+    //     STOP_CLEARED_WINDOW_SECS window. Approximate "one-shot" without per-agent state
+    //     per CTO 04:36 (Simple > schema-surface) — the agent's poll cadence almost always
+    //     sees it within seconds, and the window absorbs realistic variance.
+    let stop_cleared = recently_cleared(conn, agent, now)?.then_some(true);
+
     // 1. State-adaptive XOR. If we hold a claimed task, surface it; do NOT also dangle
     //    next_task (locked in the design session — never show a second task to a busy agent).
     let current_task = current_task_view(conn, agent, now)?;
@@ -133,8 +199,7 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
     };
 
     // 2. Message bucketing: direct full / critical full / broadcasts count + critical bodies.
-    //    Reads from the cursor established by prior `read --ack-through` (no advance here
-    //    in 1a; Phase 1b adds the auto-ack).
+    //    Reads from the cursor established by prior `read --ack-through` or `tick`.
     let cursor = read_cursor(conn, agent, DEFAULT_TOPIC)?;
     let buckets = bucket_messages(conn, agent, cursor, now)?;
     let notifications = if buckets.broadcast_count > 0 || !buckets.critical_broadcasts.is_empty() {
@@ -152,6 +217,8 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
     let log = scoped_log(conn, agent, current_task_id, now)?;
 
     Ok(Snapshot {
+        stop: None,
+        stop_cleared,
         critical: buckets.critical,
         current_task,
         next_task,
@@ -159,6 +226,27 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
         notifications,
         log,
     })
+}
+
+/// `true` iff there's a `stop_cleared` event for the agent's scope (`global` or
+/// `agent:<id>`) whose `ts` is within the last `STOP_CLEARED_WINDOW_SECS` seconds AND
+/// the event itself isn't expired. Used by [`gather`] to surface the one-shot resume
+/// signal without per-agent state. Caller must already have checked that the agent is
+/// NOT currently stopped (otherwise we'd surface stop_cleared during an active stop —
+/// nonsensical).
+fn recently_cleared(conn: &Connection, agent: &str, now: i64) -> Result<bool> {
+    let agent_scope = crate::control::agent_scope(agent);
+    let threshold = now - STOP_CLEARED_WINDOW_SECS;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE kind = 'stop_cleared'
+           AND expires_at > ?1
+           AND ts > ?2
+           AND (subject = ?3 OR subject = ?4)",
+        params![now, threshold, crate::control::GLOBAL, agent_scope],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Assemble the orientation snapshot AND advance the message cursor past everything that
@@ -763,6 +851,162 @@ mod tests {
         // No tasks, no claims, no messages: every optional/list field is empty → omitted.
         let json = serde_json::to_string(&snap).unwrap();
         assert_eq!(json, "{}", "quiet tick must serialize to {{}}, got {json}");
+    }
+
+    // --- Phase 3: stop / stop_cleared (#6 control) ---------------------------------------
+
+    #[test]
+    fn snapshot_surfaces_global_stop_and_omits_everything_else() {
+        // STOP is absolute: when stopped, gather returns ONLY stop + critical. current_task,
+        // next_task, direct, notifications, log are all omitted (the agent does nothing
+        // but cheap-poll for resume).
+        let (_d, mut c) = open_tmp();
+        // Set up substantial unrelated state — should NOT bleed through.
+        let id = make_task(&mut c, "in-flight", 5, None, 100);
+        tasks::claim(&mut c, "A", Some(id), &[], 1000, 100).unwrap();
+        feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "to-A",
+            None,
+            Some("A"),
+            1000,
+            100,
+        )
+        .unwrap();
+        for body in ["b1", "b2"] {
+            feed::post(&mut c, "Z", "info", None, body, None, None, 1000, 100).unwrap();
+        }
+        crate::control::stop(&mut c, None, "deploy in flight", "cto", 100).unwrap();
+
+        let snap = gather(&c, "A", &[], 200).unwrap();
+        let stop = snap.stop.as_ref().expect("stop present under global halt");
+        assert_eq!(stop.scope, "global");
+        assert_eq!(stop.reason, "deploy in flight");
+        assert_eq!(stop.by, "cto");
+        // Nothing else surfaces.
+        assert!(
+            snap.current_task.is_none(),
+            "current_task leaked under stop"
+        );
+        assert!(snap.next_task.is_none());
+        assert!(snap.direct.is_empty(), "direct leaked under stop");
+        assert!(snap.notifications.is_none());
+        assert!(snap.log.is_empty());
+        assert!(
+            snap.stop_cleared.is_none(),
+            "stop_cleared cannot be true during an active stop"
+        );
+    }
+
+    #[test]
+    fn snapshot_surfaces_targeted_stop_only_for_named_agent() {
+        let (_d, mut c) = open_tmp();
+        crate::control::stop(&mut c, Some("A"), "rate-limited", "cto", 100).unwrap();
+        // A sees the stop.
+        let snap_a = gather(&c, "A", &[], 200).unwrap();
+        let stop = snap_a.stop.as_ref().expect("A is stopped");
+        assert_eq!(stop.scope, "agent:A");
+        // B is not affected — payload is normal (empty here since no state).
+        let snap_b = gather(&c, "B", &[], 200).unwrap();
+        assert!(snap_b.stop.is_none(), "B leaked A's targeted stop");
+    }
+
+    #[test]
+    fn snapshot_critical_still_surfaces_under_stop() {
+        // Critical messages are the priority-hint surface — they may explain the halt or
+        // be an even-more-urgent directive, so they keep surfacing under stop.
+        let (_d, mut c) = open_tmp();
+        feed::post(
+            &mut c,
+            "Z",
+            "critical",
+            None,
+            "EVAC-NOW",
+            None,
+            Some("A"),
+            1000,
+            100,
+        )
+        .unwrap();
+        crate::control::stop(&mut c, None, "site outage", "cto", 100).unwrap();
+        let snap = gather(&c, "A", &[], 200).unwrap();
+        assert!(snap.stop.is_some());
+        assert!(
+            snap.critical.iter().any(|m| m.body == "EVAC-NOW"),
+            "critical msg must surface under stop"
+        );
+    }
+
+    #[test]
+    fn snapshot_stop_cleared_fires_within_window_after_resume() {
+        // resume() emits a stop_cleared event; gather sees it within STOP_CLEARED_WINDOW_SECS
+        // and surfaces stop_cleared=true.
+        let (_d, mut c) = open_tmp();
+        crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
+        crate::control::resume(&mut c, None, "cto", 110).unwrap();
+        // Tight window: 110 + 5s = 115. resume emitted stop_cleared with ts=110, threshold
+        // is now-WINDOW = 115-120 = -5 < 110 → match.
+        let snap = gather(&c, "A", &[], 115).unwrap();
+        assert!(snap.stop.is_none(), "stop should be cleared");
+        assert_eq!(
+            snap.stop_cleared,
+            Some(true),
+            "stop_cleared must fire after resume"
+        );
+    }
+
+    #[test]
+    fn snapshot_stop_cleared_drops_after_window() {
+        // After STOP_CLEARED_WINDOW_SECS has elapsed since the resume, the signal goes
+        // silent — the agent has had ample time to poll and see it (approximation of
+        // one-shot semantics; the trade-off is documented on the constant).
+        let (_d, mut c) = open_tmp();
+        crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
+        crate::control::resume(&mut c, None, "cto", 110).unwrap();
+        // Past the window: now = 110 + WINDOW + 1 = past threshold.
+        let snap = gather(&c, "A", &[], 110 + STOP_CLEARED_WINDOW_SECS + 1).unwrap();
+        assert!(
+            snap.stop_cleared.is_none(),
+            "stop_cleared must drop after window"
+        );
+    }
+
+    #[test]
+    fn snapshot_stop_cleared_respects_scope() {
+        // A resume for A's targeted stop emits on `agent:A`. Bob does NOT see it.
+        let (_d, mut c) = open_tmp();
+        crate::control::stop(&mut c, Some("A"), "rate-limited", "cto", 100).unwrap();
+        crate::control::resume(&mut c, Some("A"), "cto", 110).unwrap();
+        let snap_a = gather(&c, "A", &[], 115).unwrap();
+        assert_eq!(
+            snap_a.stop_cleared,
+            Some(true),
+            "A's resume must surface for A"
+        );
+        let snap_b = gather(&c, "B", &[], 115).unwrap();
+        assert!(
+            snap_b.stop_cleared.is_none(),
+            "A's resume must NOT leak to B (different scope)"
+        );
+    }
+
+    #[test]
+    fn snapshot_global_resume_surfaces_for_every_agent() {
+        // A global resume emits on `global` — every agent sees stop_cleared.
+        let (_d, mut c) = open_tmp();
+        crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
+        crate::control::resume(&mut c, None, "cto", 110).unwrap();
+        for agent in ["A", "B", "C"] {
+            let snap = gather(&c, agent, &[], 115).unwrap();
+            assert_eq!(
+                snap.stop_cleared,
+                Some(true),
+                "global resume must fire for {agent}"
+            );
+        }
     }
 
     // --- Caps (per #52 review) ---------------------------------------------------------
