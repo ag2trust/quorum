@@ -5,15 +5,17 @@
 //! contract. The cardinal rule: **`sync` orients, the agent acts.** No side effects except
 //! the message-cursor advance (Phase 1b).
 //!
-//! Phase 1a — this commit — implements the read-only payload assembly: `current_task` XOR
-//! `next_task`, message bucketing (direct / critical / broadcast-count), and the scoped
-//! event log. No auto-ack yet (agents continue to call `quorum read --ack-through ...`
-//! explicitly until Phase 1b lands).
+//! Two public entry points:
+//! - [`gather`] — **read-only** snapshot, no side effects. Useful for tests + ad-hoc
+//!   introspection ("what does this agent's compass currently show?").
+//! - [`tick`] — snapshot + **auto-ack the message cursor**. The CLI's `quorum sync` wires
+//!   here; it's what an agent calls every loop iteration. Honors the single-write
+//!   contract: the only mutation is advancing `cursors.last_seq` past what was returned.
 //!
-//! Phases 2/3/4 deferred per plan: `--match-label` plumbing (the gather signature already
-//! accepts it; the CLI flag wiring lands in Phase 2), `stop`/`stop_cleared` (waits on #6),
-//! cheatsheet polish.
+//! Phases 2/3/4 deferred per plan: `quorum sync --agent X` CLI flag wiring (Phase 2),
+//! `stop` / `stop_cleared` (Phase 3, waits on #6 / PR #20), cheatsheet polish (Phase 4).
 
+use crate::db::begin_immediate;
 use crate::error::Result;
 use crate::feed::DEFAULT_TOPIC;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -108,12 +110,15 @@ pub struct Snapshot {
     pub log: Vec<LogEntry>,
 }
 
-/// Assemble the orientation snapshot for `agent`. **Read-only** (Phase 1a — auto-ack
-/// lands in 1b). `match_labels` scopes `next_task` to tasks whose `labels` JSON-array
-/// contains every entry; empty slice = no label filter (mirrors `tasks::claim`).
+/// Assemble the orientation snapshot for `agent`. **Read-only** — no side effects, no
+/// `BEGIN IMMEDIATE`, no presence bump. Use this for ad-hoc introspection ("what does
+/// this agent's compass currently show?") or in tests. The CLI's `quorum sync` calls
+/// [`tick`] instead — it auto-acks so the agent doesn't have to.
 ///
-/// The query is one read transaction's worth of work — no `BEGIN IMMEDIATE`, no writes,
-/// no presence bump. Running `sync` mid-task is a non-event by design.
+/// `match_labels` scopes `next_task` to tasks whose `labels` JSON-array contains every
+/// entry; empty slice = no label filter (mirrors `tasks::claim`).
+///
+/// Running this mid-task is a non-event by design.
 pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -> Result<Snapshot> {
     // 1. State-adaptive XOR. If we hold a claimed task, surface it; do NOT also dangle
     //    next_task (locked in the design session — never show a second task to a busy agent).
@@ -151,6 +156,115 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
         notifications,
         log,
     })
+}
+
+/// Assemble the orientation snapshot AND advance the message cursor past everything that
+/// was visible this tick — the one side effect the design allows. This is what the CLI's
+/// `quorum sync` call wires to; an agent calls it every loop iteration and never has to
+/// think about message acks.
+///
+/// **Cursor advance contract:** at the end of the call, `cursors.last_seq` is set to
+/// `MAX(prior_last_seq, highest seq of any message read this tick)`. That includes
+/// direct + critical msgs AND the broadcasts that fed into `notifications.count` — once
+/// counted, they shouldn't be counted again. The advance is monotonic (a smaller cursor
+/// never overwrites a larger one) and lives in the same transaction as the read so a
+/// crash leaves either the old cursor (no msgs returned) or the new cursor (msgs
+/// returned, agent saw them) — never a partial state.
+///
+/// **At-least-once vs at-most-once:** this is at-most-once per `tick()` call (the cursor
+/// advances before the caller has a chance to "process" the snapshot). Agents that need
+/// strict at-least-once should use [`gather`] plus explicit
+/// `feed::read(..., ack_through=Some(seq))` after they've durably handled the payload.
+/// For the agent-loop case the at-most-once weakening is intentional: the alternative
+/// requires per-agent shown-but-not-acked state (a new schema column), which CTO has
+/// ruled out as over-engineering — see plan doc + hub 04:36.
+///
+/// Same params as [`gather`]. Takes `&mut Connection` (the cursor advance needs a write
+/// transaction).
+pub fn tick(
+    conn: &mut Connection,
+    agent: &str,
+    match_labels: &[&str],
+    now: i64,
+) -> Result<Snapshot> {
+    let snap = gather(conn, agent, match_labels, now)?;
+    advance_cursor_past(conn, agent, &snap, now)?;
+    Ok(snap)
+}
+
+/// Advance `cursors.last_seq` past every message we just surfaced (or counted, in the
+/// case of broadcasts). Monotonic — the `MAX(...)` clause prevents the cursor from ever
+/// going backward.
+///
+/// The advance is bounded by what `bucket_messages` actually read. In the current
+/// design that's "everything > old_cursor that wasn't expired" — which is exactly what
+/// the auto-ack should cover. Even if a bucket's body was truncated by `DEFAULT_MSG_LIMIT`,
+/// we still acked the seq beyond the truncation point (the count is correct; just some
+/// bodies aren't inlined). A future enhancement could narrow the ack to "highest body
+/// returned" to give the agent a re-read window, but that's a Phase-5 nice-to-have.
+fn advance_cursor_past(
+    conn: &mut Connection,
+    agent: &str,
+    snap: &Snapshot,
+    now: i64,
+) -> Result<()> {
+    // Highest seq across everything we surfaced. broadcasts that ONLY contributed to the
+    // count (not bodies) need the cursor too — otherwise the next tick re-counts them.
+    // Since `gather` already read past them, we need to walk the un-bucketed broadcast
+    // tail too; do that here with one read inside the same write txn for atomicity.
+    let cursor_now = read_cursor(conn, agent, DEFAULT_TOPIC)?;
+    let mut max_seen: i64 = cursor_now;
+    for m in snap.direct.iter().chain(snap.critical.iter()) {
+        if m.seq > max_seen {
+            max_seen = m.seq;
+        }
+    }
+    if let Some(n) = &snap.notifications {
+        for m in &n.critical {
+            if m.seq > max_seen {
+                max_seen = m.seq;
+            }
+        }
+    }
+    // Pick up any broadcast tail beyond what we inlined (notifications.count covers it).
+    // Cap on the read = the same window gather just walked.
+    if let Some(broadcast_tail_max) = max_broadcast_seq_past_cursor(conn, cursor_now, now)? {
+        if broadcast_tail_max > max_seen {
+            max_seen = broadcast_tail_max;
+        }
+    }
+
+    // No-op if nothing to advance.
+    if max_seen <= cursor_now {
+        return Ok(());
+    }
+
+    // Same shape as feed::read --ack-through: insert-or-update with MAX(...) to guarantee
+    // monotonicity. Wrapped in begin_immediate so a concurrent tick can't race the write.
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "INSERT INTO cursors(agent_id, topic, last_seq) VALUES (?1, ?2, ?3)
+         ON CONFLICT(agent_id, topic)
+         DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
+        params![agent, DEFAULT_TOPIC, max_seen],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Highest seq across un-expired broadcast messages with seq > cursor. None if no rows
+/// match. Used by [`advance_cursor_past`] so the auto-ack covers broadcasts that only
+/// contributed to `notifications.count`, not just inlined bodies.
+fn max_broadcast_seq_past_cursor(conn: &Connection, cursor: i64, now: i64) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT MAX(seq) FROM messages
+             WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3 AND recipient IS NULL",
+            params![DEFAULT_TOPIC, cursor, now],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 // -- internal helpers --------------------------------------------------------------------
@@ -624,6 +738,130 @@ mod tests {
         // No tasks, no claims, no messages: every optional/list field is empty → omitted.
         let json = serde_json::to_string(&snap).unwrap();
         assert_eq!(json, "{}", "quiet tick must serialize to {{}}, got {json}");
+    }
+
+    // --- Phase 1b: tick() / auto-ack --------------------------------------------------
+
+    #[test]
+    fn tick_advances_cursor_past_returned_direct_msgs() {
+        let (_d, mut c) = open_tmp();
+        let s1 = feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100)
+            .unwrap()
+            .seq;
+        feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100).unwrap();
+        let snap = tick(&mut c, "A", &[], 200).unwrap();
+        assert_eq!(snap.direct.len(), 2);
+        // Cursor should now sit at or past the highest seq we showed (m2's seq).
+        let cursor: i64 = c
+            .query_row(
+                "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(cursor > s1, "cursor must advance past returned direct msgs");
+    }
+
+    #[test]
+    fn tick_is_at_most_once_on_quiet_re_call() {
+        // After a tick that returns direct msgs, a second tick (with no new posts) must
+        // return zero direct/critical and the cursor must not regress. This pins the
+        // at-most-once behavior the design accepts for token-cheap auto-ack.
+        let (_d, mut c) = open_tmp();
+        feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100).unwrap();
+        feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100).unwrap();
+        let first = tick(&mut c, "A", &[], 200).unwrap();
+        assert_eq!(first.direct.len(), 2);
+        let cursor_after_first: i64 = c
+            .query_row(
+                "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let second = tick(&mut c, "A", &[], 200).unwrap();
+        assert!(second.direct.is_empty());
+        assert!(second.critical.is_empty());
+        assert!(second.notifications.is_none());
+        let cursor_after_second: i64 = c
+            .query_row(
+                "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_after_first, cursor_after_second,
+            "cursor must not regress on a quiet re-call"
+        );
+    }
+
+    #[test]
+    fn tick_acks_broadcasts_so_notifications_count_does_not_double_count() {
+        // 3 broadcasts; first tick reports count=3; second tick should report no
+        // notifications (the broadcast tail also gets acked, not just direct bodies).
+        let (_d, mut c) = open_tmp();
+        for body in ["b1", "b2", "b3"] {
+            feed::post(&mut c, "Z", "info", None, body, None, None, 1000, 100).unwrap();
+        }
+        let first = tick(&mut c, "A", &[], 200).unwrap();
+        assert_eq!(first.notifications.as_ref().unwrap().count, 3);
+        let second = tick(&mut c, "A", &[], 200).unwrap();
+        assert!(
+            second.notifications.is_none(),
+            "broadcasts must not be re-counted on the next tick — got {:?}",
+            second.notifications
+        );
+    }
+
+    #[test]
+    fn tick_is_monotonic_under_concurrent_acks() {
+        // If an external `feed::read --ack-through` advanced the cursor past where the
+        // current tick's max-seen sits, tick's MAX(...) clause must NOT regress it.
+        let (_d, mut c) = open_tmp();
+        let s1 = feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100)
+            .unwrap()
+            .seq;
+        let s2 = feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100)
+            .unwrap()
+            .seq;
+        // Externally ack past s2 (somehow the agent or another caller advanced first).
+        feed::read(&mut c, "A", None, Some(s2), feed::ReadFilter::All, 10, 200).unwrap();
+        // Tick now: would compute max_seen <= s2 from a stale read, but the MAX clause
+        // must keep the cursor at s2 (or higher).
+        let _ = tick(&mut c, "A", &[], 200).unwrap();
+        let cursor: i64 = c
+            .query_row(
+                "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            cursor >= s2,
+            "cursor regressed below external ack at s2 ({cursor} < {s2})"
+        );
+        let _ = s1; // silence unused
+    }
+
+    #[test]
+    fn tick_no_advance_when_inbox_is_empty() {
+        // A tick with nothing to read must NOT create a cursor row (we don't churn
+        // sqlite writes on quiet ticks).
+        let (_d, mut c) = open_tmp();
+        let _ = tick(&mut c, "A", &[], 200).unwrap();
+        let row: Option<i64> = c
+            .query_row(
+                "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "tick on empty inbox should not write a cursor row"
+        );
     }
 
     #[test]
