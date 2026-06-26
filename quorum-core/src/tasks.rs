@@ -298,7 +298,9 @@ pub fn claim(
     Ok(task)
 }
 
-/// Update a task. Fails loud ([`QuorumError::NotHolder`]) if `agent` is not the assignee.
+/// Update a task. Fails loud ([`QuorumError::NotHolder`]) if `agent` is not the assignee of a
+/// **`claimed`** task — a terminal (`done`/`cancelled`/`closed`) or `open` task cannot be
+/// updated, so a settled task can never be resurrected (issue #21).
 ///
 /// The only status an agent may set is `done` (the executor's submit, `claimed → done`) —
 /// there is no agent-set intermediate state. Other transitions have dedicated paths: `open`/
@@ -326,14 +328,18 @@ pub fn update(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    // COALESCE keeps the existing value when a field is None. Guard on assignee = caller.
+    // COALESCE keeps the existing value when a field is None. Guard on assignee=caller AND
+    // status='claimed': the only legal agent transition is `claimed → done`, so a terminal
+    // (done/cancelled/closed) or open row matches zero rows → loud NotHolder (#21). Without
+    // the status guard a cancelled/done task (which retains its assignee) could be resurrected
+    // back to done. Checked inside the BEGIN IMMEDIATE txn, so the guard is race-safe.
     let n = tx.execute(
         "UPDATE tasks SET
             status   = COALESCE(?2, status),
             body     = COALESCE(?3, body),
             refs     = COALESCE(?4, refs),
             updated_at = ?5
-         WHERE id=?1 AND assignee=?6",
+         WHERE id=?1 AND assignee=?6 AND status='claimed'",
         params![id, fields.status, fields.body, fields.refs, now, agent],
     )?;
     if n == 0 {
@@ -906,6 +912,67 @@ mod tests {
                 "status {bad} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn update_cannot_resurrect_terminal_task() {
+        // Issue #21: task-update guarded only the assignee, never the status. A terminal task
+        // retains its assignee (cancel keeps it; done keeps it), so `WHERE assignee=A` matched
+        // and the task could be moved back to `done` — a "resurrection". The fix adds
+        // `AND status='claimed'`: the only legal agent transition is `claimed → done`, so a
+        // settled row matches zero rows → loud NotHolder (exit 1) and is left untouched.
+        let (_d, mut c) = open_tmp();
+
+        // (a) cancelled → done must be rejected (the exact repro in the issue).
+        let cancelled = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(cancelled), &[], TTL, 1000).unwrap();
+        cancel(&mut c, "A", cancelled, 1100).unwrap(); // status=cancelled, assignee still A
+        let err = update(
+            &mut c,
+            "A",
+            cancelled,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1200,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
+        // Status (and updated_at) unchanged — the rejected update mutated nothing.
+        let still = get(&c, cancelled).unwrap().unwrap();
+        assert_eq!(still.status, "cancelled");
+        assert_eq!(still.updated_at, 1100);
+
+        // (b) done → done re-fire must be rejected (no duplicate task_done, no done-TTL reset).
+        let done = create(&mut c, "boss", "y", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(done), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            done,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let err = update(
+            &mut c,
+            "A",
+            done,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1200,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
+        let still = get(&c, done).unwrap().unwrap();
+        assert_eq!(still.status, "done");
+        assert_eq!(still.updated_at, 1100); // the rejected re-fire did not bump updated_at
     }
 
     #[test]
