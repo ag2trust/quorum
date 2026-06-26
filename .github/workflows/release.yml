@@ -1,0 +1,51 @@
+name: release
+
+# Build the `quorum` binary for every agent host platform and attach it to a GitHub
+# Release whenever a `v*` tag is pushed. This is the toolchain-free distribution path
+# (#60): hosts without `cargo` install via `install.sh`, which pulls these assets.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write # required to create the Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The real agent hosts: x86_64 Linux droplets + dev Macs (Apple Silicon + Intel).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin quorum
+      - name: Package tarball + checksum
+        run: |
+          tar -C "target/${{ matrix.target }}/release" -czf "quorum-${{ matrix.target }}.tar.gz" quorum
+          shasum -a 256 "quorum-${{ matrix.target }}.tar.gz" > "quorum-${{ matrix.target }}.tar.gz.sha256"
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag-triggered: action-gh-release creates/updates the Release for this tag and
+          # uploads each matrix job's assets to it.
+          files: |
+            quorum-${{ matrix.target }}.tar.gz
+            quorum-${{ matrix.target }}.tar.gz.sha256
