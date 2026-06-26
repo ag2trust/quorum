@@ -100,7 +100,7 @@ only status an agent sets. The reviewer (review automation) drives `done → clo
 returns the task to `open` and posts a `reclaimed` event — so work never strands. Give-up is
 `task-release` (→ `open`); hand-off is release + re-claim. `task-cancel` (creator **or**
 assignee) is a terminal won't-do.
-| Ops | `status [--watch] [--json]` · `sweep` · `init` · `help` (alias: `help-agent`) |
+| Ops | `status [--watch] [--json]` · `sweep` · `init` · `reset --yes` (wipe all state → clean db) · `help` (alias: `help-agent`) |
 
 ### Free text safely
 
