@@ -234,6 +234,13 @@ pub fn renew(
 }
 
 /// List active, unexpired claims, optionally filtered to one target. Read-only.
+///
+/// **Task leases are excluded** (`target NOT LIKE 'task#%'`, #58): a `task-claim` takes its
+/// renewable lease in this same `claims` table under the reserved `task#<id>` target, but
+/// those are internal to the task queue — they belong to `task-list`/`task-get`, not the
+/// arbitrary-lock surface. So `claims` lists only the locks an agent took with `quorum claim`
+/// (`pr#…`, free-form targets). The `task#` prefix is reserved for the queue; don't claim it
+/// directly. This is a behavior-contract clarification, not a removal — no command goes away.
 pub fn list(conn: &Connection, target: Option<&str>, now: i64) -> Result<Vec<Claim>> {
     let map = |r: &rusqlite::Row| {
         Ok(Claim {
@@ -247,7 +254,8 @@ pub fn list(conn: &Connection, target: Option<&str>, now: i64) -> Result<Vec<Cla
         Some(t) => {
             let mut stmt = conn.prepare(
                 "SELECT id, target, holder, expires_at FROM claims
-                 WHERE target=?1 AND active=1 AND expires_at > ?2 ORDER BY target",
+                 WHERE target=?1 AND active=1 AND expires_at > ?2
+                   AND target NOT LIKE 'task#%' ORDER BY target",
             )?;
             let v = stmt
                 .query_map(params![t, now], map)?
@@ -257,7 +265,8 @@ pub fn list(conn: &Connection, target: Option<&str>, now: i64) -> Result<Vec<Cla
         None => {
             let mut stmt = conn.prepare(
                 "SELECT id, target, holder, expires_at FROM claims
-                 WHERE active=1 AND expires_at > ?1 ORDER BY target",
+                 WHERE active=1 AND expires_at > ?1
+                   AND target NOT LIKE 'task#%' ORDER BY target",
             )?;
             let v = stmt
                 .query_map(params![now], map)?
@@ -396,5 +405,25 @@ mod tests {
         claim(&mut c, "A", "pr#1", 100, 1000).unwrap(); // expires 1100
         assert_eq!(list(&c, None, 1050).unwrap().len(), 1);
         assert_eq!(list(&c, None, 2000).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_excludes_task_leases() {
+        // A task-claim takes its lease in this same table under the reserved `task#<id>`
+        // target (#58). Those are internal to the queue and must not surface via `claims`;
+        // an arbitrary `pr#` lock still does.
+        let (_d, mut c) = open_tmp();
+        claim(&mut c, "A", "pr#7", 100, 1000).unwrap(); // arbitrary lock -> visible
+        let id =
+            crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, 1000).unwrap();
+        crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // task lease -> hidden
+        let all = list(&c, None, 1050).unwrap();
+        assert_eq!(all.len(), 1, "only the arbitrary lock should list");
+        assert_eq!(all[0].target, "pr#7");
+        // Even an explicit `--target task#<id>` via claims returns nothing — the `task#`
+        // namespace is owned by the queue, not the arbitrary-lock surface.
+        assert!(list(&c, Some(&format!("task#{id}")), 1050)
+            .unwrap()
+            .is_empty());
     }
 }
