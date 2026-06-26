@@ -742,10 +742,22 @@ fn depends_on_gates_claim_end_to_end() {
         ])
         .assert()
         .success();
+    // `done` auto-spawns a review task (issue #10 Phase 2). B (not the orig) sees and claims
+    // it — that's the new top-priority work, REVIEW_PRIORITY=1000 beats the dep's priority.
     quorum(home.path())
         .args(["task-claim", "--agent", "B"])
         .assert()
-        .code(1);
+        .success()
+        .stdout(predicates::str::contains("kind:review"))
+        .stdout(predicates::str::contains("review_of"));
+    // With the review claimed and `dep` still `done` (not `closed`), the dependent stays
+    // gated for everyone — the dep-gate's "closed-not-done" boundary holds even after the
+    // review-as-task layer.
+    quorum(home.path())
+        .args(["task-claim", "--agent", "C"])
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("no claimable task"));
 }
 
 #[test]

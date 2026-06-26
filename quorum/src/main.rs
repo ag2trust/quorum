@@ -326,27 +326,34 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             body_file,
             note_stdin,
             note_file,
+            verdict,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
             let note = read_optional_note(note_stdin, note_file)?;
-            let has_field_update = status.is_some() || refs.is_some() || body.is_some();
+            // `--verdict` is a field update too — it drives the review-task done branch in
+            // tasks::update (issue #10). Treat it as part of the field-update bundle so a
+            // bare `task-update --verdict approve --status done` is accepted as one call.
+            let has_field_update =
+                status.is_some() || refs.is_some() || body.is_some() || verdict.is_some();
             if !has_field_update && note.is_none() {
                 return Err(QuorumError::Usage(
-                    "task-update needs at least one of --status/--refs/\
+                    "task-update needs at least one of --status/--refs/--verdict/\
                      --body-stdin/--body-file/--note-stdin/--note-file"
                         .into(),
                 ));
             }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             // Field updates first (assignee-gated under #14's lifecycle: only `--status done`
-            // and free-text `--body-*`/`--refs` are accepted). If the caller isn't the holder
-            // we abort before adding the note, so `--note-* + --status done` from a
-            // non-assignee is a single coherent failure rather than a half-applied operation.
+            // and free-text `--body-*`/`--refs`/`--verdict` are accepted). If the caller
+            // isn't the holder we abort before adding the note, so `--note-* + --status done`
+            // from a non-assignee is a single coherent failure rather than a half-applied
+            // operation.
             let task = if has_field_update {
                 let fields = quorum_core::tasks::TaskUpdate {
                     status: status.as_deref(),
                     body: body.as_deref(),
                     refs: refs.as_deref(),
+                    verdict: verdict.as_deref(),
                 };
                 quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?
             } else {

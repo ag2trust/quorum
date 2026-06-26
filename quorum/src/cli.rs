@@ -105,6 +105,12 @@ pub enum Command {
     /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
     /// other field updates in the same call.
+    ///
+    /// `--verdict approve|changes` (issue #10) is the reviewer's decision when marking a
+    /// `kind:review` task `done`. **Required** on review tasks; **forbidden** on non-review
+    /// tasks. `approve` chains the original task to `closed`; `changes` reopens the original
+    /// with the `rework` label and a sticky window (only the original assignee may claim
+    /// during the window, then anyone).
     TaskUpdate {
         #[arg(long)]
         agent: String,
@@ -124,6 +130,10 @@ pub enum Command {
         /// Read a free-text note from a file and append it to the task's history.
         #[arg(long = "note-file")]
         note_file: Option<PathBuf>,
+        /// Reviewer's verdict on a `kind:review` task being marked done. One of: approve,
+        /// changes. Required on review tasks, rejected on non-review.
+        #[arg(long)]
+        verdict: Option<String>,
     },
     /// Release a task you hold back to `open` (give-up). Assignee-only.
     TaskRelease {
