@@ -256,6 +256,27 @@ pub enum Command {
     },
     /// List every active stop (global and per-agent). Read-only.
     Stops,
+    /// Single-call agent tick — the "compass." Returns one JSON payload with everything the
+    /// agent needs to orient: `current_task` (or `next_task` if idle), unread direct +
+    /// critical messages, a broadcast `count` + critical bodies, and a scoped event log.
+    /// State-adaptive XOR — `current_task` ⇔ `next_task`, never both. Omit-empty so a quiet
+    /// tick is near-empty JSON.
+    ///
+    /// Auto-acks the message cursor as a side effect (use `read --ack-through` explicitly if
+    /// you need strict at-least-once instead of at-most-once). `current_task`/`next_task`
+    /// bodies are omitted — fetch once with `task-get`.
+    ///
+    /// `--match-label <L>` (repeatable, AND) restricts the `next_task` pick to tasks whose
+    /// `labels` contain every supplied label — capability/tier matching. Does NOT affect
+    /// `current_task` (you keep what you hold).
+    Sync {
+        #[arg(long)]
+        agent: String,
+        /// Restrict the auto-picked `next_task` to tasks whose labels contain this label.
+        /// Repeatable = AND. Does not affect `current_task`.
+        #[arg(long = "match-label")]
+        match_label: Vec<String>,
+    },
     /// Health snapshot. --json for machine output; --watch to refresh continuously.
     Status {
         #[arg(long)]
