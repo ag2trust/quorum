@@ -84,10 +84,15 @@ errors     : 0 live
 | Area | Commands |
 |---|---|
 | Presence | `roster` (agents auto-register; presence bumps on any write) |
-| Claims | `claim` · `renew` · `release` · `claims` |
-| Tasks | `task-create` · `task-claim` · `task-renew` · `task-update` · `task-release` · `task-cancel` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
+| Claims | `claim` · `renew` · `release` · `claims` (arbitrary locks only — task leases are queue-internal) |
+| Tasks | `task-create` · `task-claim` · `task-update` · `task-release` · `task-cancel` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
 | Feed | `post` · `read` (delta since cursor; `--ack-through` to advance) · `peek` |
 | Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
+
+**Two pairs that look alike — pick by what you actually have (#58):**
+
+- **`claim`/`claims` vs. `task-claim`/`task-list`.** `claim` is an arbitrary mutual-exclusion lock on any string target (`pr#2459`, a free-form name); `claims` lists those. The **work queue** is separate: `task-*` manage queued units of work, and a `task-claim` takes its renewable lease in the same store under a reserved `task#<id>` target — but those leases are **never** shown by `claims` (they belong to `task-list`/`task-get`). Hold an arbitrary lock → `claims`; hold a queued task → `task-list`.
+- **`read`/`post` (feed) vs. `log` (event log).** The feed is agent-to-agent **messages you author** (with a per-agent read cursor). The event log is **state-changes the system auto-emits** (claim/task transitions). Two streams, two cursors — `read` never surfaces `log` events. "What did agents say?" → `read`; "what changed in the queue/claims?" → `log`.
 
 ### Task lifecycle
 
@@ -95,11 +100,12 @@ errors     : 0 live
 two calls: `task-claim` (`open → claimed`) then `task-update --status done` — `done` is the
 only status an agent sets. The reviewer (review automation) drives `done → closed` or reopen.
 
-`task-claim` takes a **renewable lease** on the task (`--ttl`, default 1h); the assignee
-`task-renew`s on long work. If the lease lapses (lost agent), the next write's sweep reaper
-returns the task to `open` and posts a `reclaimed` event — so work never strands. Give-up is
-`task-release` (→ `open`); hand-off is release + re-claim. `task-cancel` (creator **or**
-assignee) is a terminal won't-do.
+`task-claim` takes a **renewable lease** on the task (`--ttl`, default 1h); the lease
+auto-renews on any `--agent` command the assignee runs (working through quorum keeps the
+work — there is no separate `task-renew`). If the lease lapses (lost agent), the next write's
+sweep reaper returns the task to `open` and posts a `reclaimed` event — so work never strands.
+Give-up is `task-release` (→ `open`); hand-off is release + re-claim. `task-cancel` (creator
+**or** assignee) is a terminal won't-do.
 | Ops | `status [--watch] [--json]` · `sweep` · `init` · `reset --yes` (wipe all state → clean db) · `help` (alias: `help-agent`) |
 
 ### Free text safely

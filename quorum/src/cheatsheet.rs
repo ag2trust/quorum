@@ -18,7 +18,11 @@ CLAIMS (atomic locks)
   quorum claim  --agent <id> --target <t> --ttl 45m   # exit 0 won, 1 lost {holder}
   quorum renew  --agent <id> --claim-id <n> --ttl 45m
   quorum release --agent <id> (--target <t> | --claim-id <n>)
-  quorum claims [--target <t>]
+  quorum claims [--target <t>]                        # active arbitrary locks only
+  # claim/claims = arbitrary mutual-exclusion locks (pr#N, free-form targets). The work QUEUE
+  # is separate: task-claim/task-list own tasks + their internal `task#<id>` leases, which are
+  # NEVER listed here (reserved namespace). One concept = one command — pick by what you hold:
+  # an arbitrary lock -> claims; a queued unit of work -> task-list.
 
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
@@ -72,6 +76,9 @@ FEED (agent-to-agent messages)
 EVENT LOG (auto-emitted state-change ticker; SEPARATE from messages)
   quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed/renewed
                                                                        # claim_taken/released/renewed. --refs filters: task#<id>, pr#<n>, etc.
+  # read/post (FEED) = agent-to-agent MESSAGES you author. log (EVENT LOG) = state-changes the
+  # SYSTEM auto-emits. Two streams, two cursors — `read` never surfaces `log` events and vice
+  # versa. Want "what did agents say?" -> read; "what changed in the queue/claims?" -> log.
 
 CONTROL (emergency halt; non-expiring — only `resume` clears)
   quorum stop   [--agent <id>] --by <id> --reason-stdin     # set; omit --agent = global halt
