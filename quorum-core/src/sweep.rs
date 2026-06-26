@@ -22,7 +22,7 @@ pub const SWEEP_LIMIT: usize = 100;
 /// Runs inside the caller's write transaction as part of [`sweep_on_write`] — this is how a
 /// lost agent's work re-enters the queue with no background daemon. Lease expiry boundary
 /// matches the rest of the engine: a lease is live iff `expires_at > now`.
-pub fn reap_lapsed_tasks(conn: &Connection, now: i64) -> Result<()> {
+pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // Snapshot lapsed-claimed tasks first (we need the about-to-be-cleared assignee for the
     // event body). The correlated `'task#' || tasks.id` rebuilds the lease target per row.
     let lapsed: Vec<(i64, Option<String>)> = {
@@ -31,10 +31,11 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64) -> Result<()> {
              WHERE status='claimed' AND NOT EXISTS (
                  SELECT 1 FROM claims c
                  WHERE c.target = 'task#' || tasks.id AND c.active=1 AND c.expires_at > ?1
-             )",
+             )
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![now], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![now, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
@@ -76,7 +77,7 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
 pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // Correctness first: reclaim lost-agent tasks before the housekeeping deletes (a lapsed
     // `claimed` task must become re-claimable on the next write).
-    reap_lapsed_tasks(conn, now)?;
+    reap_lapsed_tasks(conn, now, limit)?;
     delete_bounded(conn, "messages", now, limit)?;
     delete_bounded(conn, "events", now, limit)?;
     delete_bounded(conn, "errors", now, limit)?;
@@ -93,7 +94,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
 
 /// Unbounded sweep + `wal_checkpoint(TRUNCATE)`. Backs `quorum sweep`.
 pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
-    reap_lapsed_tasks(conn, now)?;
+    reap_lapsed_tasks(conn, now, usize::MAX)?;
     conn.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
     conn.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
     conn.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
@@ -144,14 +145,14 @@ mod tests {
             crate::tasks::create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
         // Before expiry: reaper leaves it alone.
-        reap_lapsed_tasks(&c, 1050).unwrap();
+        reap_lapsed_tasks(&c, 1050, SWEEP_LIMIT).unwrap();
         assert_eq!(
             crate::tasks::get(&c, id).unwrap().unwrap().status,
             "claimed"
         );
         // After the lease lapses: reaper returns it to open, clears assignee, emits a
         // `task_reclaimed` event to the EVENT LOG (not the message feed).
-        reap_lapsed_tasks(&c, 1100).unwrap();
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
         let t = crate::tasks::get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "open");
         assert!(t.assignee.is_none());
@@ -172,7 +173,7 @@ mod tests {
             "reaper events must NOT appear on the message feed"
         );
         // Idempotent: a now-open task is not reaped again (no duplicate event).
-        reap_lapsed_tasks(&c, 1200).unwrap();
+        reap_lapsed_tasks(&c, 1200, SWEEP_LIMIT).unwrap();
         let evs2 = crate::events::list(&c, 0, Some(&target), 10, 1200).unwrap();
         let reclaimed2 = evs2.iter().filter(|e| e.kind == "task_reclaimed").count();
         assert_eq!(
@@ -223,6 +224,60 @@ mod tests {
             vec!["live"],
             "sweep_all: expires_at == now must be swept"
         );
+    }
+
+    #[test]
+    fn reaper_respects_limit() {
+        let (_d, mut c) = open_tmp();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id = crate::tasks::create(
+                &mut c,
+                "boss",
+                &format!("task-{i}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+            ids.push(id);
+        }
+        // All 5 leases lapse at 1100. Reap with limit=2: only 2 reaped.
+        reap_lapsed_tasks(&c, 1100, 2).unwrap();
+        let open: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE status='open'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let claimed: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE status='claimed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 2, "exactly 2 reaped to open");
+        assert_eq!(claimed, 3, "3 remain claimed (limit respected)");
+        // Second call reaps 2 more.
+        reap_lapsed_tasks(&c, 1100, 2).unwrap();
+        let open2: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE status='open'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(open2, 4, "4 total reaped after two batches");
+        // Third call reaps the last 1.
+        reap_lapsed_tasks(&c, 1100, 2).unwrap();
+        let open3: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE status='open'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(open3, 5, "all 5 reaped after three batches");
     }
 
     #[test]
