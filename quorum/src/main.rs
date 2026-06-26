@@ -305,7 +305,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
             match quorum_core::tasks::claim(&mut conn, &agent, task_id, &labels, ttl, now)? {
                 Some(t) => {
-                    output::emit(&t);
+                    // Issue #64: compact success response — omit `body` (caller knows it)
+                    // and include `lease_expires_at` since the lease just landed.
+                    let mut compact = quorum_core::tasks::TaskCompact::from(&t);
+                    compact.lease_expires_at = Some(now + ttl);
+                    output::emit(&compact);
                     Ok(0)
                 }
                 None => {
@@ -364,26 +368,38 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     }
                 }
             };
-            // Note path: any agent may add a note; no assignee guard.
-            if let Some(body) = note {
-                if quorum_core::tasks::add_note(&mut conn, &agent, task_id, &body, now)?.is_none() {
-                    output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
-                    return Ok(1);
+            // Note path: any agent may add a note; no assignee guard. Capture the
+            // note's id so the compact response surfaces it without a re-read (#64).
+            let note_id: Option<i64> = if let Some(body) = note {
+                match quorum_core::tasks::add_note(&mut conn, &agent, task_id, &body, now)? {
+                    Some(id) => Some(id),
+                    None => {
+                        output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
+                        return Ok(1);
+                    }
                 }
-            }
-            output::emit(&task);
+            } else {
+                None
+            };
+            // Issue #64: compact success — omit `body` (caller wrote it) and surface
+            // `note_id` if a breadcrumb landed this call.
+            let mut compact = quorum_core::tasks::TaskCompact::from(&task);
+            compact.note_id = note_id;
+            output::emit(&compact);
             Ok(0)
         }
         cli::Command::TaskRelease { agent, task_id } => {
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let t = quorum_core::tasks::release(&mut conn, &agent, task_id, now)?;
-            output::emit(&t);
+            // Compact (#64) — lease just deactivated; lease_expires_at omitted by design.
+            output::emit(&quorum_core::tasks::TaskCompact::from(&t));
             Ok(0)
         }
         cli::Command::TaskCancel { agent, task_id } => {
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let t = quorum_core::tasks::cancel(&mut conn, &agent, task_id, now)?;
-            output::emit(&t);
+            // Compact (#64) — lease dead, terminal status; lease_expires_at omitted.
+            output::emit(&quorum_core::tasks::TaskCompact::from(&t));
             Ok(0)
         }
         cli::Command::TaskList {

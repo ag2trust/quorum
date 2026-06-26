@@ -135,6 +135,55 @@ impl From<&Task> for TaskBrief {
     }
 }
 
+/// Compact projection of a task — used by write-command success responses
+/// (`task-claim`, `task-update`, `task-release`, `task-cancel`) to omit the multi-KB
+/// `body` field and notes history that the caller already produced. The full record
+/// stays one `task-get <id>` away. **Issue #64** (write-side twin of #57's read-side
+/// `TaskBrief`).
+///
+/// Locked field set: `{id, status, assignee, refs}` + two optional context fields the
+/// caller would otherwise need an extra read for:
+/// - `lease_expires_at` — included when the response is from a command that maintains a
+///   live lease (i.e. `task-claim`). Omitted for release/cancel (lease is dead) and for
+///   `task-update` (lease unchanged; `task-get` if you need it).
+/// - `note_id` — included on `task-update --note-*` so the caller can identify the
+///   breadcrumb they just appended without a re-read.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TaskCompact {
+    pub id: i64,
+    pub status: String,
+    /// Always serialized (even `null`) — the caller's most-asked question after a write
+    /// is "who is this assigned to now?", and an absent field is harder to parse than
+    /// an explicit `null`. Mirrors the spec's "{id, status, assignee, refs,
+    /// lease_expires_at}" literal field set.
+    pub assignee: Option<String>,
+    /// Always serialized — same reasoning as `assignee`; structured refs are commonly
+    /// checked after a `done` (e.g. `refs.pr`).
+    pub refs: Option<String>,
+    /// Lease expiry, included only by commands that maintain a live lease
+    /// (`task-claim`). Omitted (skipped) otherwise — `release`/`cancel` killed it; for
+    /// `task-update` the lease is unchanged and an extra query just to fill this field
+    /// would defeat the compact-response point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<i64>,
+    /// Id of the breadcrumb appended on `task-update --note-*`. Omitted on other calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<i64>,
+}
+
+impl From<&Task> for TaskCompact {
+    fn from(t: &Task) -> Self {
+        TaskCompact {
+            id: t.id,
+            status: t.status.clone(),
+            assignee: t.assignee.clone(),
+            refs: t.refs.clone(),
+            lease_expires_at: None,
+            note_id: None,
+        }
+    }
+}
+
 /// One append-only breadcrumb attached to a task. Ordered by `id` (= insertion order).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Note {
@@ -1359,6 +1408,85 @@ mod tests {
         assert_eq!(list(&c, Some("open"), None, None).unwrap().len(), 2);
         assert_eq!(list(&c, None, Some("ui"), None).unwrap().len(), 1);
         assert_eq!(list(&c, Some("done"), None, None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn task_compact_projects_write_summary_and_omits_body() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "do-thing",
+            Some("multi-KB-body-here"),
+            5,
+            Some(r#"["rust"]"#),
+            Some(r#"{"pr":2459}"#),
+            None,
+            100,
+        )
+        .unwrap();
+        claim(&mut c, "A", Some(id), &[], 1000, 100).unwrap();
+        let task = get(&c, id).unwrap().unwrap();
+        let compact = TaskCompact::from(&task);
+        // Locked field set per #64: id + status + assignee + refs surface; body and the
+        // descriptive fields (title/labels/priority) do NOT.
+        assert_eq!(compact.id, id);
+        assert_eq!(compact.status, "claimed");
+        assert_eq!(compact.assignee.as_deref(), Some("A"));
+        assert_eq!(compact.refs.as_deref(), Some(r#"{"pr":2459}"#));
+        // Lease/note are caller-filled context (None on a bare `From<&Task>`).
+        assert!(compact.lease_expires_at.is_none());
+        assert!(compact.note_id.is_none());
+        // Serialized JSON: no `body`, no `title`, no `labels`, no `priority`, no `notes`.
+        // (assignee + refs always present per the spec; lease_expires_at + note_id are
+        // omit-empty when None.)
+        let json = serde_json::to_string(&compact).unwrap();
+        assert!(!json.contains("\"body\""), "body must not surface: {json}");
+        assert!(
+            !json.contains("\"title\""),
+            "title must not surface: {json}"
+        );
+        assert!(
+            !json.contains("\"labels\""),
+            "labels must not surface: {json}"
+        );
+        assert!(
+            !json.contains("\"priority\""),
+            "priority must not surface: {json}"
+        );
+        assert!(
+            !json.contains("\"notes\""),
+            "notes must not surface: {json}"
+        );
+        assert!(
+            !json.contains("\"lease_expires_at\""),
+            "lease omitted when None: {json}"
+        );
+        assert!(
+            !json.contains("\"note_id\""),
+            "note_id omitted when None: {json}"
+        );
+        assert!(json.contains("\"id\":"));
+        assert!(json.contains("\"status\":\"claimed\""));
+        assert!(json.contains("\"assignee\":\"A\""));
+        assert!(json.contains("\"refs\":\"{\\\"pr\\\":2459}\""));
+    }
+
+    #[test]
+    fn task_compact_assignee_serializes_null_after_release() {
+        // After a release (or any path that nulls assignee), the field must serialize
+        // as `null`, not be omitted — callers care a lot about "who is this assigned to
+        // now" and an absent field is harder to parse than an explicit null.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "x", None, 0, None, None, None, 100).unwrap();
+        claim(&mut c, "A", Some(id), &[], 1000, 100).unwrap();
+        let task = release(&mut c, "A", id, 200).unwrap();
+        let compact = TaskCompact::from(&task);
+        let json = serde_json::to_string(&compact).unwrap();
+        assert!(
+            json.contains("\"assignee\":null"),
+            "assignee must serialize as null when None: {json}"
+        );
     }
 
     #[test]
