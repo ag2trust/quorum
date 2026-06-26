@@ -36,6 +36,27 @@ pub const REVIEW_LABEL: &str = "kind:review";
 /// Eligibility-only — does not change priority. The issue spec pins "Default W = 30m".
 pub const STICKY_WINDOW_SECS: i64 = 1800;
 
+/// Priority assigned to an auto-spawned review task (issue #10). Reviews precede new work
+/// by sorting above any realistic executor-priority — the issue spec says "priority HIGH
+/// (so reviews precede new work — automatic)." Hardcoded in v1 because making it tunable
+/// invites "let me lower it to clear my queue" anti-patterns; can move to config later
+/// (forward-only) if a real need surfaces.
+pub const REVIEW_PRIORITY: i64 = 1000;
+
+/// Label that marks a reopened task carrying a reviewer's `changes` action items (#10).
+/// Additive to the task's existing labels; deduped so multiple review rounds don't
+/// accumulate duplicate `"rework"` entries.
+pub const REWORK_LABEL: &str = "rework";
+
+/// True iff a labels JSON value contains `"kind:review"`. Mirrors the SQL `labels LIKE
+/// '%"kind:review"%'` pattern used by the claim selector so the Rust-side check and the
+/// SQL-side check agree on what counts as a review task.
+fn labels_contain_review(labels: &Option<String>) -> bool {
+    labels
+        .as_deref()
+        .is_some_and(|s| s.contains(&format!("\"{REVIEW_LABEL}\"")))
+}
+
 /// The lease target string for a task id — the key under which a task's renewable claim-lease
 /// lives in the shared `claims` table.
 pub fn lease_target(id: i64) -> String {
@@ -109,11 +130,19 @@ pub struct TaskDetail {
 /// operation under the lease model (it would leave the `task#<id>` lease with the old holder,
 /// so the new assignee couldn't renew and the reaper could reclaim under them). Hand-off is
 /// `task-release` (→ `open`) followed by a fresh `task-claim`.
+///
+/// `verdict` (issue #10) is the reviewer's call on a review task being marked `done`. Valid
+/// only when (a) the task carries `kind:review` AND (b) `status` is `Some("done")` — the
+/// validator rejects every other combination as a usage error. `Some("approve")` chains the
+/// original task to `closed`; `Some("changes")` reopens the original with the `rework` label
+/// and a sticky window. `None` is rejected on a review-task `done` (verdict is mandatory
+/// there) and ignored elsewhere.
 #[derive(Default)]
 pub struct TaskUpdate<'a> {
     pub status: Option<&'a str>,
     pub body: Option<&'a str>,
     pub refs: Option<&'a str>,
+    pub verdict: Option<&'a str>,
 }
 
 const COLS: &str =
@@ -334,11 +363,21 @@ pub fn claim(
 
 /// Update a task. Fails loud ([`QuorumError::NotHolder`]) if `agent` is not the assignee.
 ///
-/// The only status an agent may set is `done` (the executor's submit, `claimed → done`) —
-/// there is no agent-set intermediate state. Other transitions have dedicated paths: `open`/
-/// `claimed` are system-driven (claim/release/reaper), `cancelled` via [`cancel`], and
-/// `closed`/reopen are the reviewer's (issue #10). Any other status value is a usage error.
-/// Setting `done` deactivates the task's lease (the work is submitted; no reclaim needed).
+/// **Non-review task (executor's path):** the only status an agent may set is `done`
+/// (`claimed → done`); no agent-set intermediate state. Setting `done` deactivates the
+/// task's lease AND (issue #10) **atomically auto-spawns a review task** in the same
+/// transaction — submitting work guarantees a review is queued, with no race window between
+/// the two. The spawn skips when the source task is itself a `kind:review` task (no recursion,
+/// per the issue's "reviews don't spawn reviews" rule).
+///
+/// **Review task (reviewer's path, issue #10):** marking `done` REQUIRES `--verdict
+/// approve|changes`. Both verdicts deactivate the review lease and chain a state change to
+/// the original task **in the same transaction**:
+/// - `approve` → original task → `closed` (terminal).
+/// - `changes` → original task → `open` + `rework` label + assignee=`orig` + sticky window.
+///
+/// Other transitions have dedicated paths: `open`/`claimed` are system-driven (claim/release/
+/// reaper), `cancelled` via [`cancel`]. Any other status value is a usage error.
 pub fn update(
     conn: &mut Connection,
     agent: &str,
@@ -346,6 +385,7 @@ pub fn update(
     fields: &TaskUpdate,
     now: i64,
 ) -> Result<Task> {
+    // -- Up-front argument validation (cheap, before we take the write lock). --------------
     if let Some(s) = fields.status {
         if !STATUSES.contains(&s) {
             return Err(QuorumError::Usage(format!("invalid status: {s}")));
@@ -357,10 +397,27 @@ pub fn update(
             )));
         }
     }
+    if let Some(v) = fields.verdict {
+        if v != "approve" && v != "changes" {
+            return Err(QuorumError::Usage(format!(
+                "--verdict must be 'approve' or 'changes' (got '{v}')"
+            )));
+        }
+        if fields.status != Some("done") {
+            return Err(QuorumError::Usage(
+                "--verdict is only valid with --status done".into(),
+            ));
+        }
+    }
+
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    // COALESCE keeps the existing value when a field is None. Guard on assignee = caller.
+
+    // -- Apply the requested update; the assignee guard lives in the WHERE clause. ---------
+    // COALESCE keeps the existing value when a field is None. A zero-row UPDATE means either
+    // the task doesn't exist OR the caller isn't the assignee — both map to NotHolder (the
+    // pre-#10 contract; no caller distinguishes them today).
     let n = tx.execute(
         "UPDATE tasks SET
             status   = COALESCE(?2, status),
@@ -374,18 +431,78 @@ pub fn update(
         tx.commit()?;
         return Err(QuorumError::NotHolder);
     }
-    // Submitting `done` ends the active phase: drop the lease so the reaper can't reclaim the
-    // task and so a future reopen (#10) can take a fresh lease without a stale-row collision.
+
+    // -- `done` branch: spawn review (non-review source) OR drive verdict (review source). -
     if fields.status == Some("done") {
+        // Drop the lease either way — the active phase is over for both source types.
         deactivate_lease(&tx, id, now)?;
-        crate::events::emit(
-            &tx,
-            "task_done",
-            &lease_target(id),
-            &format!("done by {agent}"),
-            now,
+
+        // Re-read the row we just touched. This is the authoritative source for "is this a
+        // review task", "what's the orig", "what's in refs.pr" — all of which the spawn /
+        // verdict branches need.
+        let (title, labels, refs_str, orig_opt): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT title, labels, refs, orig FROM tasks WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
+        let is_review = labels_contain_review(&labels);
+
+        if is_review {
+            // -- Reviewer's verdict path. --------------------------------------------------
+            let Some(verdict) = fields.verdict else {
+                // Roll back the bare `done` update — a review task without a verdict is not
+                // a valid terminal state (the review's whole point is producing a verdict).
+                // Without rollback we'd leave the review in `done` with no chained state on
+                // the original, half-applying the contract.
+                let _ = tx.rollback();
+                return Err(QuorumError::Usage(
+                    "review task requires --verdict (approve|changes) on --status done".into(),
+                ));
+            };
+            let Some(orig) = orig_opt else {
+                // A `kind:review`-labeled task with NULL `orig` is malformed (data drift —
+                // someone applied the label by hand without setting orig). Roll back; refuse
+                // to invent the original assignee.
+                let _ = tx.rollback();
+                return Err(QuorumError::Usage(
+                    "review task is missing `orig` — cannot resolve verdict target".into(),
+                ));
+            };
+            let target_t = extract_review_of(&refs_str).ok_or_else(|| {
+                let _ = ();
+                QuorumError::Usage(
+                    "review task is missing refs.review_of — cannot resolve verdict target".into(),
+                )
+            })?;
+            apply_verdict(&tx, verdict, target_t, agent, &orig, now)?;
+        } else {
+            // -- Executor's done path: emit + auto-spawn review. ---------------------------
+            if fields.verdict.is_some() {
+                // Non-review tasks cannot carry a verdict — would silently no-op otherwise.
+                let _ = tx.rollback();
+                return Err(QuorumError::Usage(
+                    "--verdict is only valid on a review task (labels contain kind:review)".into(),
+                ));
+            }
+            crate::events::emit(
+                &tx,
+                "task_done",
+                &lease_target(id),
+                &format!("done by {agent}"),
+                now,
+            )?;
+            spawn_review(&tx, id, &title, &refs_str, agent, now)?;
+        }
     }
+
+    // Final task fetch + ready re-compute (deps may have shifted if a chained `closed` landed
+    // above, e.g. on the approve path the target task is now `closed`; downstream tasks
+    // depending on it become claimable — surface that via `ready` on the returned row).
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -396,15 +513,161 @@ pub fn update(
     Ok(task)
 }
 
+/// Pull `refs.review_of` (a task id) out of a review task's refs JSON. Returns `None` if the
+/// refs are missing, malformed, or lack `review_of`. Used only by the verdict path.
+fn extract_review_of(refs_str: &Option<String>) -> Option<i64> {
+    let s = refs_str.as_deref()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("review_of").and_then(|x| x.as_i64())
+}
+
+/// Auto-spawn the review task that pairs with a non-review task's `done`. Same transaction
+/// as the source `done` so a crash between them is impossible — the contract is "submit ⇒
+/// review queued, atomically." Skip when the source is itself a review task (no recursion,
+/// enforced one level up by the `is_review` branch).
+fn spawn_review(
+    tx: &rusqlite::Transaction,
+    source_id: i64,
+    source_title: &str,
+    source_refs: &Option<String>,
+    orig_agent: &str,
+    now: i64,
+) -> Result<()> {
+    // Compose the review task's refs. `review_of` points back at the source so the verdict
+    // path can resolve T from R alone. Inherit `pr` if the source carried one (a human
+    // breadcrumb; nothing in quorum branches on it).
+    let pr_value: Option<serde_json::Value> = source_refs
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.get("pr").cloned());
+    let review_refs = {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "review_of".to_string(),
+            serde_json::Value::Number(source_id.into()),
+        );
+        if let Some(pr) = pr_value {
+            obj.insert("pr".to_string(), pr);
+        }
+        serde_json::Value::Object(obj).to_string()
+    };
+    let review_labels = format!("[\"{REVIEW_LABEL}\"]");
+    let review_title = format!("review: {source_title}");
+    // `created_by` records the executor whose `done` triggered the spawn — useful in a
+    // roster trace for "who is this review chained from."
+    tx.execute(
+        "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by,
+                           created_at, updated_at, refs, depends_on, sticky_until, orig)
+         VALUES (?1, NULL, 'open', ?2, ?3, NULL, ?4, ?5, ?5, ?6, NULL, NULL, ?7)",
+        params![
+            review_title,
+            REVIEW_PRIORITY,
+            review_labels,
+            orig_agent,
+            now,
+            review_refs,
+            orig_agent,
+        ],
+    )?;
+    let review_id = tx.last_insert_rowid();
+    crate::events::emit(
+        tx,
+        "review_spawned",
+        &lease_target(review_id),
+        &format!("for task#{source_id} by {orig_agent}"),
+        now,
+    )?;
+    Ok(())
+}
+
+/// Apply the reviewer's verdict to the original task. Inside the same transaction as the
+/// review task's `done`, so the chained state change either commits as one with the verdict
+/// or rolls back as one — there is never a `done` review without its consequence.
+fn apply_verdict(
+    tx: &rusqlite::Transaction,
+    verdict: &str,
+    target_t: i64,
+    reviewer: &str,
+    orig: &str,
+    now: i64,
+) -> Result<()> {
+    match verdict {
+        "approve" => {
+            // T → closed (terminal). Any sticky carried over from a prior `changes` round is
+            // wiped — terminal state has no eligibility window.
+            let n = tx.execute(
+                "UPDATE tasks SET status='closed', sticky_until=NULL, updated_at=?1
+                 WHERE id=?2 AND status='done'",
+                params![now, target_t],
+            )?;
+            if n == 0 {
+                let _ = ();
+                return Err(QuorumError::Usage(format!(
+                    "verdict 'approve' requires target task#{target_t} to be in 'done' \
+                     (someone changed it under us)"
+                )));
+            }
+            crate::events::emit(
+                tx,
+                "task_closed",
+                &lease_target(target_t),
+                &format!("approved by {reviewer}"),
+                now,
+            )?;
+        }
+        "changes" => {
+            // T → open + sticky window + assignee=orig + dedup-append "rework" label. We use
+            // json_insert with a CASE for dedup — appending an already-present "rework"
+            // would accumulate dupes across multiple review rounds for the same task.
+            let n = tx.execute(
+                "UPDATE tasks SET
+                    status = 'open',
+                    assignee = ?1,
+                    sticky_until = ?2,
+                    labels = CASE
+                        WHEN labels IS NULL OR labels NOT LIKE '%\"rework\"%'
+                        THEN json_insert(COALESCE(labels, '[]'), '$[#]', ?3)
+                        ELSE labels
+                    END,
+                    updated_at = ?4
+                 WHERE id = ?5 AND status = 'done'",
+                params![orig, now + STICKY_WINDOW_SECS, REWORK_LABEL, now, target_t],
+            )?;
+            if n == 0 {
+                let _ = ();
+                return Err(QuorumError::Usage(format!(
+                    "verdict 'changes' requires target task#{target_t} to be in 'done' \
+                     (someone changed it under us)"
+                )));
+            }
+            crate::events::emit(
+                tx,
+                "task_reopened",
+                &lease_target(target_t),
+                &format!("changes requested by {reviewer} (sticky to {orig})"),
+                now,
+            )?;
+        }
+        _ => unreachable!("verdict pre-validated upstream"),
+    }
+    Ok(())
+}
+
 /// Release a claimed task back to `open` (give-up). Fails loud ([`QuorumError::NotHolder`]) if
 /// `agent` is not the current assignee of a `claimed` task. Drops the lease and clears the
 /// assignee so any agent can re-claim.
+///
+/// Also clears `sticky_until` (issue #10): if the assignee was within a sticky-reopen window
+/// (a prior `changes` verdict put them as sticky-orig) and they're now giving up, the window
+/// is no longer doing useful work — leaving it set would block other agents for the rest of
+/// the window with no claimant in flight. Clear it so the open task is immediately claimable
+/// by anyone.
 pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(
-        "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1
+        "UPDATE tasks SET status='open', assignee=NULL, sticky_until=NULL, updated_at=?1
          WHERE id=?2 AND assignee=?3 AND status='claimed'",
         params![now, id, agent],
     )?;
@@ -475,7 +738,7 @@ pub fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<T
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(
-        "UPDATE tasks SET status='cancelled', updated_at=?1
+        "UPDATE tasks SET status='cancelled', sticky_until=NULL, updated_at=?1
          WHERE id=?2 AND (created_by=?3 OR assignee=?3)
                AND status NOT IN ('cancelled', 'closed')",
         params![now, id, agent],
@@ -1602,6 +1865,505 @@ mod tests {
         force_sticky_reopen(&c, tid, "A", 2000);
         let t = claim(&mut c, "C", None, &[], TTL, 2000).unwrap().unwrap();
         assert_eq!(t.id, tid);
+    }
+
+    // -- Review-as-task: auto-spawn + verdict (issue #10, Phase 2) -------------------------
+    //
+    // These pin the WRITE side of review-as-task: marking a non-review task `done` MUST
+    // auto-spawn a review task in the same txn; a reviewer's `--verdict approve|changes` on
+    // the spawned review MUST chain the original task's state change atomically. Phase 1's
+    // claim-side gates already filter on the columns these write; the spawn/verdict path is
+    // what fills them.
+
+    /// Find the most-recently inserted review task (label `kind:review`, highest id). Used
+    /// to look up the auto-spawned R from a test that just submitted T's `done`.
+    fn last_review_task(c: &Connection) -> Task {
+        list(c, Some("open"), Some(REVIEW_LABEL), None)
+            .unwrap()
+            .into_iter()
+            .max_by_key(|t| t.id)
+            .expect("expected an auto-spawned review task")
+    }
+
+    #[test]
+    fn done_auto_spawns_review_with_orig_and_refs_review_of() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "fix bug", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        // Title is review-prefixed; review_of points at T; orig is the executor.
+        assert_eq!(r.title, "review: fix bug");
+        assert_eq!(r.status, "open");
+        assert_eq!(r.priority, REVIEW_PRIORITY);
+        assert_eq!(r.orig.as_deref(), Some("A"));
+        assert!(r.labels.as_deref().unwrap().contains(REVIEW_LABEL));
+        let refs: serde_json::Value = serde_json::from_str(r.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["review_of"].as_i64(), Some(tid));
+    }
+
+    #[test]
+    fn done_on_review_task_does_not_recurse_spawn() {
+        // Reviews don't spawn reviews — the source-is-review check inside `update` skips the
+        // auto-spawn for `kind:review`-labeled tasks. The reviewer marks R done with a
+        // verdict; no R-of-R appears.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        // Only one review task ever existed — no recursive R-of-R.
+        assert_eq!(
+            list(&c, None, Some(REVIEW_LABEL), None).unwrap().len(),
+            1,
+            "review must not auto-spawn its own review"
+        );
+    }
+
+    #[test]
+    fn auto_spawn_inherits_pr_ref_when_source_had_one() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "fix bug",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":2459}"#),
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        let refs: serde_json::Value = serde_json::from_str(r.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["review_of"].as_i64(), Some(tid));
+        // pr breadcrumb travels with the review for human navigation.
+        assert_eq!(refs["pr"].as_i64(), Some(2459));
+    }
+
+    #[test]
+    fn verdict_approve_closes_target_task_atomically() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        let r_after = update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        assert_eq!(r_after.status, "done");
+        // Original task is now `closed` (terminal).
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "closed");
+        // No sticky carried over.
+        assert!(t.sticky_until.is_none());
+    }
+
+    #[test]
+    fn verdict_changes_reopens_target_with_rework_label_and_sticky() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 5, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "open");
+        assert_eq!(t.assignee.as_deref(), Some("A"));
+        assert_eq!(t.sticky_until, Some(1300 + STICKY_WINDOW_SECS));
+        assert!(t.labels.as_deref().unwrap().contains(REWORK_LABEL));
+        // Priority unchanged — eligibility-only, no priority bump.
+        assert_eq!(t.priority, 5);
+    }
+
+    #[test]
+    fn verdict_changes_dedupes_rework_label_across_rounds() {
+        // Multiple `changes` rounds for the same T must not accumulate duplicate "rework"
+        // entries in the labels JSON. The dedup CASE-WHEN in apply_verdict pins this.
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "T",
+            None,
+            0,
+            Some(r#"["other"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        // Round 1: A → done → B reviews → changes → T reopened with rework.
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r1 = last_review_task(&c);
+        claim(&mut c, "B", Some(r1.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r1.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        // Round 2: A (still in sticky) re-claims, redos, done → B reviews → changes again.
+        // Pass current "now" past sticky_until so A can claim freely; A is orig either way.
+        claim(&mut c, "A", Some(tid), &[], TTL, 4000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            4100,
+        )
+        .unwrap();
+        let r2 = last_review_task(&c);
+        assert_ne!(r1.id, r2.id, "second round must spawn a fresh review");
+        claim(&mut c, "B", Some(r2.id), &[], TTL, 4200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r2.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            4300,
+        )
+        .unwrap();
+        // T's labels: exactly one "rework", "other" preserved.
+        let t = get(&c, tid).unwrap().unwrap();
+        let labels_json: serde_json::Value =
+            serde_json::from_str(t.labels.as_deref().unwrap()).unwrap();
+        let arr = labels_json.as_array().unwrap();
+        let rework_count = arr
+            .iter()
+            .filter(|v| v.as_str() == Some(REWORK_LABEL))
+            .count();
+        assert_eq!(rework_count, 1, "rework must appear exactly once");
+        assert!(arr.iter().any(|v| v.as_str() == Some("other")));
+    }
+
+    #[test]
+    fn verdict_required_on_review_task_done() {
+        // A review task marked `done` without a verdict is a usage error AND the half-applied
+        // status change is rolled back — the review stays `claimed` (no state drift).
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        let err = update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                // no verdict
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(ref m) if m.contains("verdict")));
+        // R rolled back to its prior status (claimed by B).
+        let r_after = get(&c, r.id).unwrap().unwrap();
+        assert_eq!(r_after.status, "claimed");
+        // T untouched.
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "done");
+    }
+
+    #[test]
+    fn verdict_forbidden_on_non_review_task() {
+        // A non-review task marked done with a verdict is a usage error; rollback again so
+        // the regular `done` half doesn't half-apply.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        let err = update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(ref m) if m.contains("kind:review")));
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(
+            t.status, "claimed",
+            "non-review verdict must roll back to claimed"
+        );
+    }
+
+    #[test]
+    fn verdict_invalid_value_is_usage_error_pre_txn() {
+        // Bad verdict value rejected up-front (before begin_immediate) — no write hit.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        let err = update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("maybe"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(ref m) if m.contains("verdict")));
+    }
+
+    #[test]
+    fn verdict_without_status_done_is_usage_error_pre_txn() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        let err = update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QuorumError::Usage(ref m) if m.contains("only valid with --status done"))
+        );
+    }
+
+    #[test]
+    fn spawn_then_approve_emits_events_for_both() {
+        // Acceptance: spawn / verdict / reopen emit events (#6).
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        // review_spawned event on the review's lease target.
+        let spawn_events =
+            crate::events::list(&c, 0, Some(&lease_target(r.id)), 100, 1100).unwrap();
+        assert!(
+            spawn_events.iter().any(|e| e.kind == "review_spawned"),
+            "review_spawned event must fire"
+        );
+        // Approve → task_closed on T.
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        let t_events = crate::events::list(&c, 0, Some(&lease_target(tid)), 100, 1300).unwrap();
+        assert!(t_events.iter().any(|e| e.kind == "task_closed"));
+    }
+
+    #[test]
+    fn spawn_then_changes_emits_task_reopened() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        let t_events = crate::events::list(&c, 0, Some(&lease_target(tid)), 100, 1300).unwrap();
+        assert!(t_events.iter().any(|e| e.kind == "task_reopened"));
+    }
+
+    #[test]
+    fn release_clears_sticky_until() {
+        // If the sticky-orig releases (gives up) during the window, sticky_until is cleared
+        // so the task is immediately claimable by anyone — no 30-min dead window.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        // Stage: simulate a post-changes sticky-reopen state directly, then have A claim &
+        // release it to verify sticky_until is wiped.
+        force_sticky_reopen(&c, tid, "A", 2000);
+        claim(&mut c, "A", Some(tid), &[], TTL, 1500).unwrap();
+        release(&mut c, "A", tid, 1600).unwrap();
+        let t = get(&c, tid).unwrap().unwrap();
+        assert!(t.sticky_until.is_none(), "release must clear sticky_until");
+        // C (non-orig) can immediately claim despite the original window being unexpired.
+        let claimed = claim(&mut c, "C", None, &[], TTL, 1700).unwrap().unwrap();
+        assert_eq!(claimed.id, tid);
+    }
+
+    #[test]
+    fn cancel_clears_sticky_until() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 0, None, None, None, 1000).unwrap();
+        force_sticky_reopen(&c, tid, "A", 2000);
+        cancel(&mut c, "boss", tid, 1500).unwrap();
+        let t = get(&c, tid).unwrap().unwrap();
+        assert!(t.sticky_until.is_none(), "cancel must clear sticky_until");
+        assert_eq!(t.status, "cancelled");
     }
 
     #[test]
