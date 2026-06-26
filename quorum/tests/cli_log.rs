@@ -143,6 +143,70 @@ fn standalone_claim_emits_claim_taken_and_released() {
 }
 
 #[test]
+fn renew_emits_events_for_claims_and_tasks() {
+    let home = tempfile::tempdir().unwrap();
+
+    // Claim renew → claim_renewed
+    quorum(home.path())
+        .args(["claim", "--agent", "A", "--target", "pr#5", "--ttl", "1h"])
+        .assert()
+        .success();
+    let claim_id: String = {
+        let out = quorum(home.path())
+            .args(["claims", "--target", "pr#5"])
+            .output()
+            .unwrap()
+            .stdout;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v[0]["id"].to_string()
+    };
+    quorum(home.path())
+        .args([
+            "renew",
+            "--agent",
+            "A",
+            "--claim-id",
+            &claim_id,
+            "--ttl",
+            "2h",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["log", "--refs", "pr#5"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"kind\":\"claim_renewed\""));
+
+    // Task renew → task_renewed
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "t"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-renew",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--ttl",
+            "2h",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["log", "--refs", "task#1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"kind\":\"task_renewed\""));
+}
+
+#[test]
 fn limit_caps_returned_rows() {
     let home = tempfile::tempdir().unwrap();
     for _ in 0..5 {

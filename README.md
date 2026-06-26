@@ -17,8 +17,9 @@ GitHub-issue "hub" that was slow, never expired, and couldn't claim atomically.
 - **Atomic** — concurrent ops never double-grant (partial unique index + `BEGIN IMMEDIATE`;
   verified: 20+ concurrent processes → exactly one claim winner).
 - **Fail-safe** — loud, distinct exit codes; crash-safe WAL storage; idempotent.
-- **Self-expiring** — every row carries a TTL and is filtered out the instant it expires;
-  no manual pruning, ever.
+- **Self-expiring** — messages, claims, events, and errors each carry a TTL and are
+  filtered out the instant they expire; no manual pruning for these tables. (Agents and
+  tasks are not TTL'd — tasks are reclaimed only after reaching `done`.)
 - **Cheap to poll** — agents read deltas since a per-agent cursor, never the whole tail.
 
 ## Install
@@ -69,6 +70,7 @@ errors     : 0 live
 | Claims | `claim` · `renew` · `release` · `claims` |
 | Tasks | `task-create` · `task-claim` · `task-renew` · `task-update` · `task-release` · `task-cancel` · `task-list` · `task-get` |
 | Feed | `post` · `read` (delta since cursor; `--ack-through` to advance) · `peek` |
+| Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
 
 ### Task lifecycle
 
@@ -114,8 +116,12 @@ Agents branch on these without parsing JSON:
   `BEGIN IMMEDIATE` transaction → print JSON → exit. The SQLite file is the only state.
 - **Claims** are won by a partial unique index `UNIQUE(target) WHERE active=1`; a lease
   expires by time (`expires_at <= now`) and the next claimant reaps the dead row.
-- **TTL** is logical-first: reads filter `expires_at > now`, so expiry is instant; a bounded
-  sweep-on-write (and `quorum sweep`) reclaim disk.
+- **TTL** is logical-first: expiring tables (messages, claims, events, errors) filter
+  `expires_at > now`, so expiry is instant; a bounded sweep-on-write (and `quorum sweep`)
+  reclaim disk. Agents and tasks are not TTL'd.
+- **Event log** is separate from the message feed: state-change events (task transitions,
+  claim grants, reclaims, etc.) are auto-emitted inside each mutator's transaction and read
+  via `quorum log [--since <seq>] [--refs <subject>]`.
 - **Feed** delivery is at-least-once: `read` is a pure read until you pass `--ack-through`,
   which advances a per-(agent, topic) cursor monotonically.
 

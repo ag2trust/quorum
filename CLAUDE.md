@@ -8,7 +8,8 @@ atomically.
 
 - **Design spec (source of truth):** `docs/2026-06-23-quorum-design.md` — read it before any
   non-trivial work. This file is the *operating brief*; the spec is the *design of record*.
-- **Status:** pre-implementation (spec approved + twice-reviewed). No code yet.
+- **Status:** implemented and shipping. 11 core modules, 6 bin modules, schema v5, 142 tests
+  (incl. 20-process claim-race canary). `cargo test` passes; release binary verified end-to-end.
 
 ## Purpose & principle (north star)
 
@@ -58,10 +59,13 @@ established it.
 5. **Stable exit codes** (agents branch on these without parsing JSON): `0` success · `1`
    clean "didn't get it" / not-holder (expected) · `2` usage/arg/bad-input error · `3`
    internal / DB / migration error.
-6. **TTL is logical-first.** `expires_at = now + ttl` at write; **every read filters
-   `WHERE expires_at > now`** — messages *and* claims *and* `task-list`/`status`/`roster`.
-   Expired data is invisible instantly; physical cleanup (bounded `DELETE … LIMIT 100`
-   sweep-on-write, or `quorum sweep`) is housekeeping, not correctness.
+6. **TTL is logical-first.** `expires_at = now + ttl` at write; every *expiring* table
+   (**messages, claims, events, errors**) filters `WHERE expires_at > now` so expiry is
+   instant. **Agents and tasks are NOT TTL'd** — agents have no `expires_at` column and
+   never expire; tasks have no `expires_at` column and persist indefinitely (only `done`
+   tasks older than the sweep TTL are physically reclaimed by `quorum sweep`/sweep-on-write).
+   Physical cleanup (bounded `DELETE … LIMIT 100` sweep-on-write, or `quorum sweep`) is
+   housekeeping, not correctness.
 7. **WAL self-truncates only with short-lived connections.** A long-lived reader holding an
    open transaction pins the WAL and it grows unbounded (verified: 8.5 MB and climbing).
    `status --watch` MUST open a fresh read per tick (connect→read→close), never hold a txn
