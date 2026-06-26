@@ -250,7 +250,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let ttl = parse_ttl(&ttl)?;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let c = quorum_core::claims::renew(&mut conn, &agent, claim_id, ttl, now)?;
-            output::emit(&c);
+            output::emit(&serde_json::json!({
+                "ok": true, "claim_id": c.id, "target": c.target,
+                "holder": c.holder, "expires_at": c.expires_at,
+            }));
             Ok(0)
         }
         cli::Command::Claims { target } => {
