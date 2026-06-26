@@ -40,8 +40,11 @@ pub struct CurrentTaskView {
     pub priority: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<String>,
-    /// `task.updated_at` when the row moved to `claimed`. Useful to detect a stale own-task.
-    pub claimed_at: i64,
+    /// `task.updated_at` — the last time the row was modified (claim, body/refs edit, etc.).
+    /// Named honestly: this is the row's current updated_at, not strictly "when claimed,"
+    /// because a `task-update` after the claim transition shifts it. The agent can use it
+    /// to detect stale own-tasks (e.g. "I claimed this 3 days ago and never touched it").
+    pub last_updated_at: i64,
     /// `claim.expires_at` on `target='task#<id>'`. Agent renews before this.
     pub lease_expires_at: i64,
 }
@@ -291,7 +294,7 @@ fn current_task_view(conn: &Connection, agent: &str, now: i64) -> Result<Option<
                     title: r.get(1)?,
                     priority: r.get(2)?,
                     labels: r.get(3)?,
-                    claimed_at: r.get(4)?,
+                    last_updated_at: r.get(4)?,
                     lease_expires_at: r.get(5)?,
                 })
             },
@@ -359,64 +362,86 @@ struct Buckets {
 }
 
 fn bucket_messages(conn: &Connection, agent: &str, cursor: i64, now: i64) -> Result<Buckets> {
-    // Pull all unread, unexpired messages in this topic with one query, then partition into
-    // four buckets in-memory. Cheaper than 4 SQL queries on the same row-set, and the row
-    // count is already bounded by DEFAULT_MSG_LIMIT for direct/critical (broadcast count is
-    // a separate COUNT).
-    let mut direct: Vec<MsgView> = Vec::new();
-    let mut critical: Vec<MsgView> = Vec::new();
-    let mut critical_broadcasts: Vec<MsgView> = Vec::new();
+    // SQL-level bounding so a long-offline agent doesn't pull the full unread set into
+    // memory before truncating. Three small targeted queries instead of one unbounded
+    // fetch + in-memory partition:
+    //   (1) direct-to-me (info + critical), LIMIT DEFAULT_MSG_LIMIT
+    //   (2) critical broadcasts, LIMIT DEFAULT_MSG_LIMIT
+    //   (3) total broadcast count (one COUNT, no rows)
+    // critical bucket = direct-critical from (1) + all of (2).
+    //
+    // Each statement is index-friendly via messages_topic_seq. (3) is a COUNT over unread
+    // broadcasts — one row, no body bytes — the only honest way to report "N unread
+    // broadcasts" without inlining them (token discipline). #52 review: previously this
+    // was one unbounded SELECT + in-memory truncate; an agent with 10k unread broadcasts
+    // would fetch all 10k just to return ~20 inlined ones. Now bounded at the SQL layer.
 
+    // (1) direct-to-me, full payload, bounded
     let mut stmt = conn.prepare(
-        "SELECT seq, ts, author, kind, body, recipient FROM messages
-         WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3
-         ORDER BY seq ASC",
+        "SELECT seq, ts, author, kind, body FROM messages
+         WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3 AND recipient = ?4
+         ORDER BY seq ASC LIMIT ?5",
     )?;
-    let rows = stmt.query_map(params![DEFAULT_TOPIC, cursor, now], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, Option<String>>(5)?,
-        ))
-    })?;
+    let direct: Vec<MsgView> = stmt
+        .query_map(
+            params![DEFAULT_TOPIC, cursor, now, agent, DEFAULT_MSG_LIMIT],
+            |r| {
+                Ok(MsgView {
+                    seq: r.get(0)?,
+                    ts: r.get(1)?,
+                    author: r.get(2)?,
+                    kind: r.get(3)?,
+                    body: r.get(4)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut broadcast_count: i64 = 0;
-    for row in rows {
-        let (seq, ts, author, kind, body, recipient) = row?;
-        let view = MsgView {
-            seq,
-            ts,
-            author,
-            kind: kind.clone(),
-            body,
-        };
-        match recipient.as_deref() {
-            Some(r) if r == agent => {
-                // Direct-to-me. If it's critical, also surface in `critical` (priority hint
-                // — the agent shouldn't have to scan both buckets to see a HALT-level msg).
-                if kind == "critical" && critical.len() < DEFAULT_MSG_LIMIT as usize {
-                    critical.push(view.clone());
-                }
-                if direct.len() < DEFAULT_MSG_LIMIT as usize {
-                    direct.push(view);
-                }
-            }
-            Some(_) => {
-                // Direct to someone else. Not visible — sync respects recipient privacy.
-                // Do NOT count toward broadcasts.
-            }
-            None => {
-                // Broadcast. Counted always; only critical bodies inlined.
-                broadcast_count += 1;
-                if kind == "critical" && critical_broadcasts.len() < DEFAULT_MSG_LIMIT as usize {
-                    critical_broadcasts.push(view);
-                }
-            }
-        }
+    // direct-critical (subset of `direct`) is surfaced in the critical bucket too — priority
+    // hint so the agent doesn't have to scan both buckets to see a HALT-level msg.
+    let critical_self: Vec<MsgView> = direct
+        .iter()
+        .filter(|m| m.kind == "critical")
+        .cloned()
+        .collect();
+
+    // (2) critical broadcasts, full payload, bounded
+    let mut stmt = conn.prepare(
+        "SELECT seq, ts, author, kind, body FROM messages
+         WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3
+           AND recipient IS NULL AND kind = 'critical'
+         ORDER BY seq ASC LIMIT ?4",
+    )?;
+    let critical_broadcasts: Vec<MsgView> = stmt
+        .query_map(
+            params![DEFAULT_TOPIC, cursor, now, DEFAULT_MSG_LIMIT],
+            |r| {
+                Ok(MsgView {
+                    seq: r.get(0)?,
+                    ts: r.get(1)?,
+                    author: r.get(2)?,
+                    kind: r.get(3)?,
+                    body: r.get(4)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // critical bucket = direct-critical + critical-broadcast, bounded again so the merged
+    // length never exceeds DEFAULT_MSG_LIMIT (each input is already capped at it).
+    let mut critical: Vec<MsgView> = critical_self;
+    critical.extend(critical_broadcasts.iter().cloned());
+    if critical.len() > DEFAULT_MSG_LIMIT as usize {
+        critical.truncate(DEFAULT_MSG_LIMIT as usize);
     }
+
+    // (3) broadcast count — exact total, no row bodies fetched.
+    let broadcast_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages
+         WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3 AND recipient IS NULL",
+        params![DEFAULT_TOPIC, cursor, now],
+        |r| r.get(0),
+    )?;
 
     Ok(Buckets {
         direct,
@@ -738,6 +763,92 @@ mod tests {
         // No tasks, no claims, no messages: every optional/list field is empty → omitted.
         let json = serde_json::to_string(&snap).unwrap();
         assert_eq!(json, "{}", "quiet tick must serialize to {{}}, got {json}");
+    }
+
+    // --- Caps (per #52 review) ---------------------------------------------------------
+
+    #[test]
+    fn snapshot_direct_caps_at_default_msg_limit() {
+        // Post 25 direct-to-A messages. The cap is DEFAULT_MSG_LIMIT (20); the SQL `LIMIT`
+        // bounds it at the storage layer (no in-memory churn).
+        let (_d, mut c) = open_tmp();
+        for i in 0..25 {
+            feed::post(
+                &mut c,
+                "Z",
+                "info",
+                None,
+                &format!("m{i}"),
+                None,
+                Some("A"),
+                1000,
+                100,
+            )
+            .unwrap();
+        }
+        let snap = gather(&c, "A", &[], 200).unwrap();
+        assert_eq!(
+            snap.direct.len(),
+            DEFAULT_MSG_LIMIT as usize,
+            "direct must cap at DEFAULT_MSG_LIMIT, got {}",
+            snap.direct.len()
+        );
+        // The first DEFAULT_MSG_LIMIT msgs (lowest seq) are kept — ORDER BY seq ASC.
+        assert_eq!(snap.direct[0].body, "m0");
+        assert_eq!(snap.direct[19].body, "m19");
+    }
+
+    #[test]
+    fn snapshot_critical_caps_at_default_msg_limit() {
+        // Post 25 critical broadcasts. critical bucket caps at DEFAULT_MSG_LIMIT (20).
+        // The notifications.count is exact (25), the inlined `critical` is bounded.
+        let (_d, mut c) = open_tmp();
+        for i in 0..25 {
+            feed::post(
+                &mut c,
+                "Z",
+                "critical",
+                None,
+                &format!("c{i}"),
+                None,
+                None,
+                1000,
+                100,
+            )
+            .unwrap();
+        }
+        let snap = gather(&c, "A", &[], 200).unwrap();
+        assert_eq!(snap.critical.len(), DEFAULT_MSG_LIMIT as usize);
+        let notif = snap.notifications.as_ref().unwrap();
+        assert_eq!(
+            notif.count, 25,
+            "broadcast COUNT must be exact (not capped)"
+        );
+        assert_eq!(notif.critical.len(), DEFAULT_MSG_LIMIT as usize);
+    }
+
+    #[test]
+    fn snapshot_log_caps_at_default_log_limit() {
+        // Stand up an agent's task + 30 events on its target. log bucket caps at
+        // DEFAULT_LOG_LIMIT (20). The cap is SQL `LIMIT`-driven.
+        let (_d, mut c) = open_tmp();
+        let id = make_task(&mut c, "x", 1, None, 100);
+        tasks::claim(&mut c, "A", Some(id), &[], 1000, 100).unwrap();
+        let target = format!("task#{id}");
+        // claim() emits one event; pad with 30 more to exceed the cap.
+        for i in 0..30 {
+            let tx = c.transaction().unwrap();
+            crate::events::emit(&tx, "task_renewed", &target, &format!("note-{i}"), 100 + i)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let snap = gather(&c, "A", &[], 200).unwrap();
+        assert_eq!(
+            snap.log.len(),
+            DEFAULT_LOG_LIMIT as usize,
+            "log must cap at DEFAULT_LOG_LIMIT, got {}",
+            snap.log.len()
+        );
     }
 
     // --- Phase 1b: tick() / auto-ack --------------------------------------------------
