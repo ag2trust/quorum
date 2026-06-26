@@ -405,6 +405,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             status,
             label,
             assignee,
+            brief,
         } => {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let list = quorum_core::tasks::list(
@@ -413,7 +414,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 label.as_deref(),
                 assignee.as_deref(),
             )?;
-            output::emit(&list);
+            // --brief projects each task to a summary row (no body) for a cheap queue scan;
+            // the full record stays available via `task-get`.
+            if brief {
+                let rows: Vec<quorum_core::tasks::TaskBrief> =
+                    list.iter().map(Into::into).collect();
+                output::emit(&rows);
+            } else {
+                output::emit(&list);
+            }
             Ok(0)
         }
         cli::Command::TaskGet { task_id } => {

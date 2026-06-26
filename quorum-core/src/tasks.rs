@@ -105,6 +105,36 @@ pub struct Task {
     pub ready: bool,
 }
 
+/// A token-efficient summary view of a [`Task`] for queue scans (`task-list --brief`). Drops
+/// the full `body` — the one large field an agent doesn't need until it picks a task up — plus
+/// the timestamps/refs/deps a scan doesn't read. The full task is always one `task-get <id>`
+/// away. Fields match the spec's summary set: id, title, labels, priority, status, assignee,
+/// ready.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TaskBrief {
+    pub id: i64,
+    pub title: String,
+    pub labels: Option<String>,
+    pub priority: i64,
+    pub status: String,
+    pub assignee: Option<String>,
+    pub ready: bool,
+}
+
+impl From<&Task> for TaskBrief {
+    fn from(t: &Task) -> Self {
+        TaskBrief {
+            id: t.id,
+            title: t.title.clone(),
+            labels: t.labels.clone(),
+            priority: t.priority,
+            status: t.status.clone(),
+            assignee: t.assignee.clone(),
+            ready: t.ready,
+        }
+    }
+}
+
 /// One append-only breadcrumb attached to a task. Ordered by `id` (= insertion order).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Note {
@@ -1400,6 +1430,53 @@ mod tests {
         assert_eq!(list(&c, Some("open"), None, None).unwrap().len(), 2);
         assert_eq!(list(&c, None, Some("ui"), None).unwrap().len(), 1);
         assert_eq!(list(&c, Some("done"), None, None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn task_brief_projects_summary_and_omits_body() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "title here",
+            Some("a long body the queue scan should not pay for"),
+            5,
+            Some("[\"ui\"]"),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let task = get(&c, id).unwrap().unwrap();
+        let brief = TaskBrief::from(&task);
+        // Carries the summary fields verbatim, including derived `ready`.
+        assert_eq!(brief.id, id);
+        assert_eq!(brief.title, "title here");
+        assert_eq!(brief.priority, 5);
+        assert_eq!(brief.labels.as_deref(), Some("[\"ui\"]"));
+        assert_eq!(brief.status, "open");
+        assert_eq!(brief.assignee, None);
+        assert!(brief.ready); // no deps => ready
+                              // The JSON is exactly the 7 summary fields — body (and the other non-summary fields)
+                              // are gone, which is the whole point of --brief.
+        let json = serde_json::to_value(&brief).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 7, "brief must serialize exactly 7 fields");
+        for k in [
+            "id", "title", "labels", "priority", "status", "assignee", "ready",
+        ] {
+            assert!(obj.contains_key(k), "brief missing summary field {k}");
+        }
+        for k in [
+            "body",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "refs",
+            "depends_on",
+        ] {
+            assert!(!obj.contains_key(k), "brief must omit {k}");
+        }
     }
 
     #[test]

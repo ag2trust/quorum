@@ -159,7 +159,8 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
     },
-    /// List tasks, optionally filtered by status/label/assignee.
+    /// List tasks, optionally filtered by status/label/assignee. `--brief` returns summary rows
+    /// (no body) for a token-cheap queue scan; the full body is one `task-get <id>` away.
     TaskList {
         #[arg(long)]
         status: Option<String>,
@@ -167,6 +168,9 @@ pub enum Command {
         label: Option<String>,
         #[arg(long)]
         assignee: Option<String>,
+        /// Summary rows only — id, title, labels, priority, status, assignee, ready (omits body).
+        #[arg(long)]
+        brief: bool,
     },
     /// Fetch a single task by id.
     TaskGet {
