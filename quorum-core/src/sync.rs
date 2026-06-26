@@ -548,18 +548,24 @@ fn scoped_log(
     current_task_id: Option<i64>,
     now: i64,
 ) -> Result<Vec<LogEntry>> {
-    // Subject set = {task#<my-current-id> if any} ∪ {target from claims where holder=me
-    // AND active=1 AND expires_at > now}. If the set is empty, return [] (a fresh idle agent
-    // with no claims has no scoped events — the global firehose is `quorum log`, not sync).
+    // Subject set = three sources, all about-the-agent:
+    //   1. {task#<my-current-id>} — the task I'm working
+    //   2. {target FROM claims WHERE holder=me AND active=1 AND expires_at>now} — non-task
+    //      claims I currently hold (e.g. pr#2459)
+    //   3. {task#<id> FROM tasks WHERE created_by=me AND status != 'closed'} — tasks I
+    //      *created* (issue #62 / coordination-migration §6): a creator (typically the CTO)
+    //      gets a live digest of every task they spun up without polling task-list. Bounded
+    //      by status — once a task is `closed` it stops surfacing, otherwise an idle CTO's
+    //      log fills with old terminal-state churn.
     //
-    // Implemented as a UNION subquery so the events query is one statement. SQLite optimizer
-    // turns this into an index scan via events_subject_seq.
+    // If the union is empty, return [] (a fresh agent with no current/held/created tasks
+    // has no scoped events — the global firehose is `quorum log`, not sync).
     let mut targets: Vec<String> = Vec::new();
     if let Some(id) = current_task_id {
         targets.push(format!("task#{id}"));
     }
-    // All live claim targets for this agent (includes the task lease implicitly, but the
-    // dedup below keeps the in-clause minimal).
+    // Live claim targets I hold (includes the task lease implicitly, but the dedup below
+    // keeps the in-clause minimal).
     let mut stmt = conn.prepare(
         "SELECT DISTINCT target FROM claims
          WHERE holder = ?1 AND active = 1 AND expires_at > ?2",
@@ -567,6 +573,19 @@ fn scoped_log(
     let claim_targets = stmt.query_map(params![agent, now], |r| r.get::<_, String>(0))?;
     for t in claim_targets {
         let t = t?;
+        if !targets.contains(&t) {
+            targets.push(t);
+        }
+    }
+    // #62: tasks I created (non-terminal). `closed` is the only true terminal in the
+    // 4-state lifecycle (`cancelled` reaches it via `task-cancel`); both stop surfacing so
+    // an old CTO log doesn't drown the fresh signal.
+    let mut stmt = conn.prepare(
+        "SELECT id FROM tasks WHERE created_by = ?1 AND status NOT IN ('closed','cancelled')",
+    )?;
+    let created_ids = stmt.query_map(params![agent], |r| r.get::<_, i64>(0))?;
+    for id in created_ids {
+        let t = format!("task#{}", id?);
         if !targets.contains(&t) {
             targets.push(t);
         }
@@ -827,6 +846,114 @@ mod tests {
         // Sanity: B's snapshot only sees B's events.
         let snap_b = gather(&c, "B", &[], 200).unwrap();
         assert!(snap_b.log.iter().all(|e| e.subject == b_subj));
+    }
+
+    // --- #62 creator-routed events ------------------------------------------------------
+
+    #[test]
+    fn snapshot_log_includes_events_for_tasks_i_created() {
+        // CTO-flavored use case: an agent that creates tasks (typically the CTO) sees
+        // lifecycle events for every non-terminal task they spawned, without polling
+        // task-list. Implemented by adding `created_by = me` task ids to the scoped-log
+        // targets set in addition to current_task + held claims.
+        let (_d, mut c) = open_tmp();
+        // CTO creates 2 tasks; A claims one, B claims the other. Neither is `closed`.
+        let t_a = tasks::create(&mut c, "CTO", "do-A", None, 0, None, None, None, 100).unwrap();
+        let t_b = tasks::create(&mut c, "CTO", "do-B", None, 0, None, None, None, 100).unwrap();
+        tasks::claim(&mut c, "A", Some(t_a), &[], 1000, 100).unwrap();
+        tasks::claim(&mut c, "B", Some(t_b), &[], 1000, 100).unwrap();
+        // CTO has no current task and no claims, but they CREATED both — sync.log must
+        // include events for both.
+        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let a_subj = format!("task#{t_a}");
+        let b_subj = format!("task#{t_b}");
+        assert!(
+            snap.log.iter().any(|e| e.subject == a_subj),
+            "CTO must see events on task they created (t_a); got {:?}",
+            snap.log
+        );
+        assert!(
+            snap.log.iter().any(|e| e.subject == b_subj),
+            "CTO must see events on task they created (t_b); got {:?}",
+            snap.log
+        );
+    }
+
+    #[test]
+    fn snapshot_log_creator_view_excludes_other_creators() {
+        // No leak: CTO sees their own created tasks; "other-CTO" tasks stay hidden from CTO.
+        let (_d, mut c) = open_tmp();
+        let mine = tasks::create(&mut c, "CTO", "mine", None, 0, None, None, None, 100).unwrap();
+        let theirs = tasks::create(
+            &mut c,
+            "other-CTO",
+            "theirs",
+            None,
+            0,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        tasks::claim(&mut c, "A", Some(mine), &[], 1000, 100).unwrap();
+        tasks::claim(&mut c, "B", Some(theirs), &[], 1000, 100).unwrap();
+        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let my_subj = format!("task#{mine}");
+        let their_subj = format!("task#{theirs}");
+        assert!(snap.log.iter().any(|e| e.subject == my_subj));
+        assert!(
+            !snap.log.iter().any(|e| e.subject == their_subj),
+            "CTO leaked another creator's task events"
+        );
+    }
+
+    #[test]
+    fn snapshot_log_creator_view_drops_closed_tasks() {
+        // Once a task is `closed` (terminal), its events stop surfacing on the creator's
+        // log — otherwise an idle CTO's log fills with old terminal-state churn. Use
+        // direct SQL to set `closed` (no public path: that's the reviewer's via
+        // #10 verdict=approve, which would also need an auto-spawned review etc. — too
+        // much setup for this unit test).
+        let (_d, mut c) = open_tmp();
+        let t_closed =
+            tasks::create(&mut c, "CTO", "closed-one", None, 0, None, None, None, 100).unwrap();
+        let t_open =
+            tasks::create(&mut c, "CTO", "open-one", None, 0, None, None, None, 100).unwrap();
+        // Force-close the first task directly (events on it have been emitted up to here).
+        c.execute(
+            "UPDATE tasks SET status='closed' WHERE id=?1",
+            rusqlite::params![t_closed],
+        )
+        .unwrap();
+        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let closed_subj = format!("task#{t_closed}");
+        let open_subj = format!("task#{t_open}");
+        assert!(
+            snap.log.iter().any(|e| e.subject == open_subj),
+            "CTO must see open task they created"
+        );
+        assert!(
+            !snap.log.iter().any(|e| e.subject == closed_subj),
+            "closed task should not surface on creator log: {:?}",
+            snap.log
+        );
+    }
+
+    #[test]
+    fn snapshot_log_creator_view_drops_cancelled_tasks() {
+        // Same as closed — cancelled is the other terminal state.
+        let (_d, mut c) = open_tmp();
+        let t_cancelled =
+            tasks::create(&mut c, "CTO", "cnx", None, 0, None, None, None, 100).unwrap();
+        // Cancel via the proper path (creator can cancel an open task).
+        tasks::cancel(&mut c, "CTO", t_cancelled, 150).unwrap();
+        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let subj = format!("task#{t_cancelled}");
+        assert!(
+            !snap.log.iter().any(|e| e.subject == subj),
+            "cancelled task should not surface on creator log"
+        );
     }
 
     #[test]
