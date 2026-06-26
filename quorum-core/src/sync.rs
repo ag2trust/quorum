@@ -279,30 +279,35 @@ pub fn tick(
     now: i64,
 ) -> Result<Snapshot> {
     let snap = gather(conn, agent, match_labels, now)?;
-    advance_cursor_past(conn, agent, &snap, now)?;
+    touch_and_advance_cursor(conn, agent, &snap, now)?;
     Ok(snap)
 }
 
-/// Advance `cursors.last_seq` past every message we just surfaced (or counted, in the
-/// case of broadcasts). Monotonic — the `MAX(...)` clause prevents the cursor from ever
-/// going backward.
+/// Touch the agent (presence bump + auto-renew live leases per #55) AND advance the
+/// message cursor past everything we just surfaced. Both writes happen inside the SAME
+/// `begin_immediate` transaction — atomic by construction, and one connection write
+/// rather than two.
 ///
-/// The advance is bounded by what `bucket_messages` actually read. In the current
-/// design that's "everything > old_cursor that wasn't expired" — which is exactly what
-/// the auto-ack should cover. Even if a bucket's body was truncated by `DEFAULT_MSG_LIMIT`,
-/// we still acked the seq beyond the truncation point (the count is correct; just some
-/// bodies aren't inlined). A future enhancement could narrow the ack to "highest body
-/// returned" to give the agent a re-read window, but that's a Phase-5 nice-to-have.
-fn advance_cursor_past(
+/// **Why touch lives here instead of inside `gather`:** `gather` is the read-only entry
+/// point. `tick` is where the agent's loop is — its purpose is the cursor advance + the
+/// presence/renew side effects. Folding touch in the write txn means an agent that calls
+/// only `quorum sync` (the design's whole point) still auto-renews its leases through
+/// `agents::touch`'s renew clause (#55). This is the load-bearing piece that closes the
+/// dogfood loop's "manual renew" hole.
+///
+/// **Cursor advance** is bounded by what `bucket_messages` actually read. In the current
+/// design that's "everything > old_cursor that wasn't expired" — exactly what auto-ack
+/// should cover. Even if a bucket's body was truncated by `DEFAULT_MSG_LIMIT`, we still
+/// acked the seq beyond the truncation point (count is correct; just some bodies aren't
+/// inlined). The cursor advance is a no-op when there's nothing new — but `touch` ALWAYS
+/// runs (every `tick` is an `--agent` call by definition).
+fn touch_and_advance_cursor(
     conn: &mut Connection,
     agent: &str,
     snap: &Snapshot,
     now: i64,
 ) -> Result<()> {
-    // Highest seq across everything we surfaced. broadcasts that ONLY contributed to the
-    // count (not bodies) need the cursor too — otherwise the next tick re-counts them.
-    // Since `gather` already read past them, we need to walk the un-bucketed broadcast
-    // tail too; do that here with one read inside the same write txn for atomicity.
+    // Highest seq across everything we surfaced (direct + critical + critical broadcasts).
     let cursor_now = read_cursor(conn, agent, DEFAULT_TOPIC)?;
     let mut max_seen: i64 = cursor_now;
     for m in snap.direct.iter().chain(snap.critical.iter()) {
@@ -318,27 +323,25 @@ fn advance_cursor_past(
         }
     }
     // Pick up any broadcast tail beyond what we inlined (notifications.count covers it).
-    // Cap on the read = the same window gather just walked.
     if let Some(broadcast_tail_max) = max_broadcast_seq_past_cursor(conn, cursor_now, now)? {
         if broadcast_tail_max > max_seen {
             max_seen = broadcast_tail_max;
         }
     }
 
-    // No-op if nothing to advance.
-    if max_seen <= cursor_now {
-        return Ok(());
-    }
-
-    // Same shape as feed::read --ack-through: insert-or-update with MAX(...) to guarantee
-    // monotonicity. Wrapped in begin_immediate so a concurrent tick can't race the write.
+    // ALWAYS write a txn — even on a quiet tick, `touch` runs (presence + auto-renew).
+    // Two updates, one transaction:
     let tx = begin_immediate(conn)?;
-    tx.execute(
-        "INSERT INTO cursors(agent_id, topic, last_seq) VALUES (?1, ?2, ?3)
-         ON CONFLICT(agent_id, topic)
-         DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
-        params![agent, DEFAULT_TOPIC, max_seen],
-    )?;
+    crate::agents::touch(&tx, agent, now)?;
+    if max_seen > cursor_now {
+        // Same shape as feed::read --ack-through: insert-or-update with MAX(...).
+        tx.execute(
+            "INSERT INTO cursors(agent_id, topic, last_seq) VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent_id, topic)
+             DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
+            params![agent, DEFAULT_TOPIC, max_seen],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }

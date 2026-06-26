@@ -28,7 +28,6 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
-  quorum task-renew   --agent <id> --task-id <n> [--ttl 1h]    # extend your lease on long work
   quorum task-update  --agent <id> --task-id <n> [--status done] [--verdict approve|changes] [--note-stdin]
                                                                # --status done: assignee-only submit (the only agent-set status)
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
@@ -37,6 +36,11 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   quorum task-cancel  --agent <id> --task-id <n>               # terminal won't-do (creator OR assignee) — also clears sticky window
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>]
   quorum task-get  --task-id <n>                               # includes append-only notes history
+  # AUTO-RENEW (#55): every `--agent`-identified command (claim, task-claim, task-update, post,
+  # read --ack-through, sync, etc.) auto-extends YOUR active leases to now + DEFAULT_LEASE_TTL_SECS.
+  # Monotonic — an explicit longer TTL is never shortened. Only true silence past the lease lapses
+  # it (lost-agent recovery, unchanged). No more manual `task-renew` — the command is removed; the
+  # `claim renew` for non-task targets like pr#N remains as an explicit override for that case.
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # `done -> closed` / reopen are review automation's (issue #10) — see REVIEW below.
 

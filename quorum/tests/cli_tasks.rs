@@ -164,7 +164,10 @@ fn release_then_reclaim_hands_off_task() {
 }
 
 #[test]
-fn renew_and_cancel_lifecycle() {
+fn cancel_lifecycle() {
+    // `task-renew` was removed in #55 (auto-renew on agent touch). The lease-extend path
+    // is now exercised by any --agent command (covered in agents::touch unit tests). This
+    // test focuses on the cancel half of the original lifecycle test.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "x"])
@@ -182,15 +185,6 @@ fn renew_and_cancel_lifecycle() {
         ])
         .assert()
         .success();
-    // Holder renews; a non-holder cannot.
-    quorum(home.path())
-        .args(["task-renew", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["task-renew", "--agent", "B", "--task-id", "1"])
-        .assert()
-        .code(1);
     // A stranger (neither creator nor assignee) cannot cancel...
     quorum(home.path())
         .args(["task-cancel", "--agent", "C", "--task-id", "1"])

@@ -143,10 +143,10 @@ fn standalone_claim_emits_claim_taken_and_released() {
 }
 
 #[test]
-fn renew_emits_events_for_claims_and_tasks() {
+fn renew_emits_event_for_claims() {
+    // `task-renew` removed in #55 (auto-renew on agent touch). The `claim_renewed` event
+    // path still exists via the generic `quorum renew` for non-task targets like `pr#…`.
     let home = tempfile::tempdir().unwrap();
-
-    // Claim renew → claim_renewed
     quorum(home.path())
         .args(["claim", "--agent", "A", "--target", "pr#5", "--ttl", "1h"])
         .assert()
@@ -177,33 +177,6 @@ fn renew_emits_events_for_claims_and_tasks() {
         .assert()
         .success()
         .stdout(predicates::str::contains("\"kind\":\"claim_renewed\""));
-
-    // Task renew → task_renewed
-    quorum(home.path())
-        .args(["task-create", "--created-by", "boss", "--title", "t"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args([
-            "task-renew",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--ttl",
-            "2h",
-        ])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["log", "--refs", "task#1"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"kind\":\"task_renewed\""));
 }
 
 #[test]

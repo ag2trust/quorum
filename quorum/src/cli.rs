@@ -142,16 +142,6 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
     },
-    /// Extend your lease on a claimed task (must be the active holder).
-    TaskRenew {
-        #[arg(long)]
-        agent: String,
-        #[arg(long = "task-id")]
-        task_id: i64,
-        /// Lease duration, e.g. 45m, 1h. Defaults to the config lease TTL.
-        #[arg(long)]
-        ttl: Option<String>,
-    },
     /// Cancel a task (terminal won't-do). Creator OR assignee may cancel.
     TaskCancel {
         #[arg(long)]
