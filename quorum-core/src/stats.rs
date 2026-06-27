@@ -371,13 +371,17 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
         params![hour_ago],
         |r| r.get(0),
     )?;
-    let done_awaiting_review: i64 =
-        conn.query_row("SELECT count(*) FROM tasks WHERE status='done'", [], |r| {
-            r.get(0)
-        })?;
+    // Exclude kind:review tasks — their terminal state is `done` (they never transition
+    // to `closed`), so they inflate "awaiting review" counters. See issue #81.
+    let done_filter = "status='done' AND (labels IS NULL OR labels NOT LIKE '%\"kind:review\"%')";
+    let done_awaiting_review: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM tasks WHERE {done_filter}"),
+        [],
+        |r| r.get(0),
+    )?;
     let oldest_done_ts: Option<i64> = conn
         .query_row(
-            "SELECT MIN(updated_at) FROM tasks WHERE status='done'",
+            &format!("SELECT MIN(updated_at) FROM tasks WHERE {done_filter}"),
             [],
             |r| r.get(0),
         )
@@ -385,7 +389,7 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
     let oldest_done_awaiting_review_secs = oldest_done_ts.map(|ts| (now - ts).max(0));
     let stuck_threshold = now - DONE_STUCK_THRESHOLD_SECS;
     let done_stuck_count: i64 = conn.query_row(
-        "SELECT count(*) FROM tasks WHERE status='done' AND updated_at < ?1",
+        &format!("SELECT count(*) FROM tasks WHERE {done_filter} AND updated_at < ?1"),
         params![stuck_threshold],
         |r| r.get(0),
     )?;
@@ -657,6 +661,61 @@ mod tests {
         // 200s < DONE_STUCK_THRESHOLD_SECS (30 min) → not stuck.
         assert_eq!(s.throughput.done_stuck_count, 0);
         assert!(crate::tasks::get(&c, t3_open).unwrap().is_some());
+    }
+
+    /// Insert a task directly with arbitrary status and labels — bypasses the claim/update
+    /// lifecycle so stats tests can set up specific states without wiring the full review flow.
+    fn insert_task_raw(
+        c: &Connection,
+        title: &str,
+        status: &str,
+        labels: Option<&str>,
+        updated_at: i64,
+    ) -> i64 {
+        c.execute(
+            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, created_at, updated_at)
+             VALUES (?1, NULL, ?2, 0, ?3, NULL, 'test', 100, ?4)",
+            params![title, status, labels, updated_at],
+        ).unwrap();
+        c.last_insert_rowid()
+    }
+
+    #[test]
+    fn throughput_excludes_review_tasks_from_done_counters() {
+        let (_d, c) = open_tmp();
+        // A work task in done (should count).
+        insert_task_raw(&c, "work-task", "done", None, 300);
+        // A review task in done (should NOT count).
+        insert_task_raw(
+            &c,
+            "review-1",
+            "done",
+            Some(r#"["kind:review","tier:opus-46"]"#),
+            250,
+        );
+        // A second review task in done (should NOT count).
+        insert_task_raw(&c, "review-2", "done", Some(r#"["kind:review"]"#), 220);
+
+        let now = 400;
+        let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        // Only the work task counts.
+        assert_eq!(s.throughput.done_awaiting_review, 1);
+        // Oldest done is the work task (updated_at=300), age = 100s.
+        assert_eq!(s.throughput.oldest_done_awaiting_review_secs, Some(100));
+        // 100s < 30min threshold → not stuck.
+        assert_eq!(s.throughput.done_stuck_count, 0);
+    }
+
+    #[test]
+    fn throughput_zero_when_only_review_tasks_done() {
+        let (_d, c) = open_tmp();
+        insert_task_raw(&c, "review-only", "done", Some(r#"["kind:review"]"#), 300);
+
+        let now = 400;
+        let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.throughput.done_awaiting_review, 0);
+        assert_eq!(s.throughput.oldest_done_awaiting_review_secs, None);
+        assert_eq!(s.throughput.done_stuck_count, 0);
     }
 
     #[test]
