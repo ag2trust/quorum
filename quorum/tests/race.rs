@@ -1,6 +1,7 @@
-//! The load-bearing invariant: N separate OS processes racing `claim` on one target produce
-//! exactly one winner. This is the canary — if it ever flakes, stop and investigate before
-//! anything else.
+//! The load-bearing invariant: N separate OS processes racing `task-claim` on one task produce
+//! exactly one winner. The task lease reuses the same atomic claims primitive
+//! (`UNIQUE(target) WHERE active=1`) the queue is built on. This is the canary — if it ever
+//! flakes, stop and investigate before anything else.
 
 use std::process::{Command, Stdio};
 
@@ -8,36 +9,44 @@ use std::process::{Command, Stdio};
 fn n_processes_exactly_one_winner() {
     let home = tempfile::tempdir().unwrap();
 
-    // Initialize first to isolate the *claim* race from the create/migrate race (the latter
-    // is covered by cli_init::concurrent_init_is_safe).
+    // Initialize, then create the single task every racer will contend for. This isolates the
+    // *claim* race from the create/migrate race (the latter is covered by
+    // cli_init::concurrent_init_is_safe) and from the task-create itself.
     assert_cmd::Command::cargo_bin("quorum")
         .unwrap()
         .env("QUORUM_HOME", home.path())
         .arg("init")
         .assert()
         .success();
+    assert_cmd::Command::cargo_bin("quorum")
+        .unwrap()
+        .env("QUORUM_HOME", home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "race-me"])
+        .assert()
+        .success();
 
     let bin = assert_cmd::cargo::cargo_bin("quorum");
     let n = 20;
 
-    // Spawn all children first (maximize overlap), then wait.
+    // Spawn all children first (maximize overlap), then wait. Every child races to claim the
+    // same task#1 — exactly one may win the lease.
     let children: Vec<_> = (0..n)
         .map(|i| {
             Command::new(&bin)
                 .env("QUORUM_HOME", home.path())
                 .args([
-                    "claim",
+                    "task-claim",
                     "--agent",
                     &format!("a{i}"),
-                    "--target",
-                    "pr#1",
+                    "--task-id",
+                    "1",
                     "--ttl",
                     "5m",
                 ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn quorum claim")
+                .expect("spawn quorum task-claim")
         })
         .collect();
 
@@ -49,11 +58,11 @@ fn n_processes_exactly_one_winner() {
 
     assert_eq!(wins, 1, "exactly one process must win the claim");
 
-    // And the store agrees: exactly one active row for the target.
+    // And the store agrees: exactly one active lease row for the task.
     let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
     let active: i64 = conn
         .query_row(
-            "SELECT count(*) FROM claims WHERE target='pr#1' AND active=1",
+            "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
             [],
             |r| r.get(0),
         )

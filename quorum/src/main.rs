@@ -12,7 +12,6 @@ mod output;
 mod paths;
 
 use clap::Parser;
-use quorum_core::claims::{ClaimOutcome, ClaimSelector};
 use quorum_core::error::{QuorumError, Result};
 
 fn run() -> Result<i32> {
@@ -34,10 +33,6 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Init => "init",
         cli::Command::Reset { .. } => "reset",
         cli::Command::Roster => "roster",
-        cli::Command::Claim { .. } => "claim",
-        cli::Command::Release { .. } => "release",
-        cli::Command::Renew { .. } => "renew",
-        cli::Command::Claims { .. } => "claims",
         cli::Command::TaskCreate { .. } => "task-create",
         cli::Command::TaskClaim { .. } => "task-claim",
         cli::Command::TaskUpdate { .. } => "task-update",
@@ -368,64 +363,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let agents = quorum_core::agents::roster(&conn, now, cfg.online_window_secs)?;
             output::emit(&agents);
-            Ok(0)
-        }
-        cli::Command::Claim { agent, target, ttl } => {
-            let ttl = parse_ttl(&ttl)?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::claims::claim(&mut conn, &agent, &target, ttl, now)? {
-                ClaimOutcome::Won(c) => {
-                    output::emit(&serde_json::json!({
-                        "ok": true, "claim_id": c.id, "target": c.target,
-                        "holder": c.holder, "expires_at": c.expires_at,
-                    }));
-                    Ok(0)
-                }
-                ClaimOutcome::Lost { holder, expires_at } => {
-                    output::emit(&serde_json::json!({
-                        "ok": false, "holder": holder, "expires_at": expires_at,
-                    }));
-                    Ok(1)
-                }
-            }
-        }
-        cli::Command::Release {
-            agent,
-            target,
-            claim_id,
-        } => {
-            let sel = match (target, claim_id) {
-                (Some(t), None) => ClaimSelector::Target(t),
-                (None, Some(id)) => ClaimSelector::Id(id),
-                _ => {
-                    return Err(QuorumError::Usage(
-                        "exactly one of --target / --claim-id is required".into(),
-                    ))
-                }
-            };
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let out = quorum_core::claims::release(&mut conn, &agent, &sel, now)?;
-            output::emit(&out);
-            Ok(0)
-        }
-        cli::Command::Renew {
-            agent,
-            claim_id,
-            ttl,
-        } => {
-            let ttl = parse_ttl(&ttl)?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let c = quorum_core::claims::renew(&mut conn, &agent, claim_id, ttl, now)?;
-            output::emit(&serde_json::json!({
-                "ok": true, "claim_id": c.id, "target": c.target,
-                "holder": c.holder, "expires_at": c.expires_at,
-            }));
-            Ok(0)
-        }
-        cli::Command::Claims { target } => {
-            let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let list = quorum_core::claims::list(&conn, target.as_deref(), now)?;
-            output::emit(&list);
             Ok(0)
         }
         cli::Command::TaskCreate {

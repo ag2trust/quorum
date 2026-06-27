@@ -58,9 +58,6 @@ Output is JSON by default (only
 file, never a flag.
 
 ```
-$ quorum claim --agent Pumice-t97 --target pr#3360 --ttl 45m
-{"claim_id":1,"expires_at":1782272583,"holder":"Pumice-t97","ok":true,"target":"pr#3360"}
-
 $ printf 'rebase onto master\n' | quorum task-create --created-by cto --title "merge #3360" --priority 5 --body-stdin
 {"id":1}
 
@@ -84,14 +81,17 @@ errors     : 0 live
 | Area | Commands |
 |---|---|
 | Presence | `roster` (agents auto-register; presence bumps on any write) |
-| Claims | `claim` · `renew` · `release` · `claims` (arbitrary locks only — task leases are queue-internal) |
 | Tasks | `task-create` · `task-claim` · `task-update` · `task-release` · `task-cancel` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
 | Feed | `post` · `read` (delta since cursor; `--ack-through` to advance) · `peek` |
 | Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
 
-**Two pairs that look alike — pick by what you actually have (#58):**
+`task-claim` takes a renewable lease in the same store under a reserved `task#<id>` target — that
+lease is the only kind of claim there is now; the work queue (`task-list`/`task-get`) is where you
+see what you hold. (The internal claims table that backs these leases is an atomic
+`UNIQUE(target) WHERE active=1` lock — see [How it works](#how-it-works).)
 
-- **`claim`/`claims` vs. `task-claim`/`task-list`.** `claim` is an arbitrary mutual-exclusion lock on any string target (`pr#2459`, a free-form name); `claims` lists those. The **work queue** is separate: `task-*` manage queued units of work, and a `task-claim` takes its renewable lease in the same store under a reserved `task#<id>` target — but those leases are **never** shown by `claims` (they belong to `task-list`/`task-get`). Hold an arbitrary lock → `claims`; hold a queued task → `task-list`.
+**`read`/`post` (feed) vs. `log` (event log) — pick by what you actually have:**
+
 - **`read`/`post` (feed) vs. `log` (event log).** The feed is agent-to-agent **messages you author** (with a per-agent read cursor). The event log is **state-changes the system auto-emits** (claim/task transitions). Two streams, two cursors — `read` never surfaces `log` events. "What did agents say?" → `read`; "what changed in the queue/claims?" → `log`.
 
 ### Task lifecycle
