@@ -266,6 +266,27 @@ pub enum Command {
     },
     /// List every active stop (global and per-agent). Read-only.
     Stops,
+    /// Post a pinned standing notice (issue #78). Non-expiring, cursor-independent —
+    /// surfaced in EVERY agent's `sync.pinned` until explicitly unpinned. Body (free
+    /// text) via --body-stdin or --body-file.
+    Pin {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+    },
+    /// Remove a pinned notice by id. Creator-only — `--agent` must match the original
+    /// author. Exit 1 (clean "didn't") if the id doesn't exist or isn't yours.
+    Unpin {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        id: i64,
+    },
+    /// List every active pinned notice (oldest first). Read-only.
+    Pins,
     /// Single-call agent tick — the "compass." Returns one JSON payload with everything the
     /// agent needs to orient: `current_task` (or `next_task` if idle), unread direct +
     /// critical messages, a broadcast `count` + critical bodies, and a scoped event log.

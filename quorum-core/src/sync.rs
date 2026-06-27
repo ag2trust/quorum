@@ -80,6 +80,27 @@ pub struct Notifications {
     pub critical: Vec<MsgView>,
 }
 
+/// A pinned standing notice — durable, cursor-independent, surfaced on every sync.
+/// See `crate::pinned`. Distinct from `MsgView` because pins are not feed traffic.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PinView {
+    pub id: i64,
+    pub ts: i64,
+    pub author: String,
+    pub body: String,
+}
+
+impl From<crate::pinned::Pin> for PinView {
+    fn from(p: crate::pinned::Pin) -> Self {
+        PinView {
+            id: p.id,
+            ts: p.ts,
+            author: p.author,
+            body: p.body,
+        }
+    }
+}
+
 /// One scoped event — `subject` matches a target the agent currently has skin in
 /// (their current task and any claim they hold). Bounded by `DEFAULT_LOG_LIMIT`.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -152,6 +173,10 @@ pub struct Snapshot {
     pub direct: Vec<MsgView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notifications: Option<Notifications>,
+    /// Durable standing notices (issue #78) — cursor-independent, no TTL, surfaced on
+    /// every sync including the stop path. Removed only by explicit `unpin`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<PinView>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<LogEntry>,
 }
@@ -174,9 +199,17 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
     if let Some(stop_row) = crate::control::is_stopped(conn, agent)? {
         let cursor = read_cursor(conn, agent, DEFAULT_TOPIC)?;
         let buckets = bucket_messages(conn, agent, cursor, now)?;
+        // Pins are surfaced even during a stop — durable standing notices may explain
+        // the halt or carry the "do X while halted" instruction. Same rationale as
+        // critical: a halted agent benefits from the most context, not the least.
+        let pinned = crate::pinned::list(conn)?
+            .into_iter()
+            .map(PinView::from)
+            .collect();
         return Ok(Snapshot {
             stop: Some(stop_row.into()),
             critical: buckets.critical,
+            pinned,
             ..Snapshot::default()
         });
     }
@@ -216,6 +249,15 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
     let current_task_id = current_task.as_ref().map(|c| c.id);
     let log = scoped_log(conn, agent, current_task_id, now)?;
 
+    // Pinned notices — durable, cursor-independent, always surfaced. Read after the
+    // event log because nothing else depends on them; ordering follows the locked
+    // Snapshot field order (issue #8): stop ▸ stop_cleared ▸ critical ▸ current_task ▸
+    // next_task ▸ direct ▸ notifications ▸ pinned ▸ log.
+    let pinned = crate::pinned::list(conn)?
+        .into_iter()
+        .map(PinView::from)
+        .collect();
+
     Ok(Snapshot {
         stop: None,
         stop_cleared,
@@ -224,6 +266,7 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
         next_task,
         direct: buckets.direct,
         notifications,
+        pinned,
         log,
     })
 }
@@ -1462,5 +1505,89 @@ mod tests {
             before, after,
             "gather() advanced the cursor in Phase 1a (should be read-only)"
         );
+    }
+
+    // --- pinned notices (issue #78) ------------------------------------------------------
+
+    #[test]
+    fn snapshot_surfaces_pinned_cursor_independent() {
+        // A pin posted before any agent has ever synced must still appear on first sync —
+        // no cursor exists, no ack ever happened.
+        let (_d, mut c) = open_tmp();
+        let pin = crate::pinned::pin(&mut c, "cto", "MIGRATION IN PROGRESS", 50).unwrap();
+
+        let snap = gather(&c, "fresh-agent", &[], 100).unwrap();
+        assert_eq!(snap.pinned.len(), 1);
+        assert_eq!(snap.pinned[0].id, pin.id);
+        assert_eq!(snap.pinned[0].author, "cto");
+        assert_eq!(snap.pinned[0].body, "MIGRATION IN PROGRESS");
+    }
+
+    #[test]
+    fn snapshot_pinned_persists_across_repeated_ticks_unlike_messages() {
+        // Cursor-independent: tick() acks messages so they don't re-appear, but pinned
+        // must keep showing on every tick.
+        let (_d, mut c) = open_tmp();
+        crate::pinned::pin(&mut c, "cto", "standing notice", 50).unwrap();
+
+        let snap1 = tick(&mut c, "A", &[], 100).unwrap();
+        assert_eq!(snap1.pinned.len(), 1);
+        let snap2 = tick(&mut c, "A", &[], 200).unwrap();
+        assert_eq!(snap2.pinned.len(), 1, "pinned must survive cursor advance");
+        let snap3 = tick(&mut c, "A", &[], 300).unwrap();
+        assert_eq!(snap3.pinned.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_pinned_visible_during_stop() {
+        // The STOP-is-absolute path returns only stop + critical + pinned. Halted agents
+        // benefit from the most context (the pin may explain the halt or carry the
+        // "while halted do X" instruction).
+        let (_d, mut c) = open_tmp();
+        crate::pinned::pin(&mut c, "cto", "WHILE HALTED: do nothing", 50).unwrap();
+        crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
+
+        let snap = gather(&c, "anyone", &[], 200).unwrap();
+        assert!(snap.stop.is_some(), "stop is set");
+        assert_eq!(snap.pinned.len(), 1, "pinned must surface even on stop");
+        // Other fields must be omitted per STOP-is-absolute.
+        assert!(snap.current_task.is_none());
+        assert!(snap.next_task.is_none());
+    }
+
+    #[test]
+    fn snapshot_pinned_removed_after_unpin() {
+        let (_d, mut c) = open_tmp();
+        let p = crate::pinned::pin(&mut c, "cto", "transient", 50).unwrap();
+        assert_eq!(gather(&c, "A", &[], 100).unwrap().pinned.len(), 1);
+        crate::pinned::unpin(&mut c, p.id, "cto", 200).unwrap();
+        assert!(gather(&c, "A", &[], 300).unwrap().pinned.is_empty());
+    }
+
+    #[test]
+    fn snapshot_pinned_omitted_when_empty() {
+        // Default state: no pins, sync payload omits the `pinned` field entirely
+        // (skip_serializing_if = "Vec::is_empty"). Wire economy.
+        let (_d, c) = open_tmp();
+        let snap = gather(&c, "A", &[], 100).unwrap();
+        assert!(snap.pinned.is_empty());
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("\"pinned\""),
+            "empty pinned vec must be omitted on serialization, got: {json}"
+        );
+    }
+
+    #[test]
+    fn snapshot_pinned_ordered_oldest_first() {
+        // Locked: deterministic order = insertion order (ascending id), oldest first.
+        // Mirrors pinned::list. Lets callers render the same way every tick.
+        let (_d, mut c) = open_tmp();
+        let a = crate::pinned::pin(&mut c, "cto", "first", 50).unwrap();
+        let b = crate::pinned::pin(&mut c, "cto", "second", 60).unwrap();
+        let c_pin = crate::pinned::pin(&mut c, "cto", "third", 70).unwrap();
+        let snap = gather(&c, "A", &[], 100).unwrap();
+        let ids: Vec<i64> = snap.pinned.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![a.id, b.id, c_pin.id]);
     }
 }

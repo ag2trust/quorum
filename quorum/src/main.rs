@@ -52,6 +52,9 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Stop { .. } => "stop",
         cli::Command::Resume { .. } => "resume",
         cli::Command::Stops => "stops",
+        cli::Command::Pin { .. } => "pin",
+        cli::Command::Unpin { .. } => "unpin",
+        cli::Command::Pins => "pins",
         cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
@@ -627,6 +630,50 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let stops = quorum_core::control::list(&conn)?;
             output::emit(&stops);
+            Ok(0)
+        }
+        cli::Command::Pin {
+            agent,
+            body_stdin,
+            body_file,
+        } => {
+            // Body via stdin/file per Invariant #10 (free text never as a flag).
+            let body = read_optional_body(body_stdin, body_file)?.ok_or_else(|| {
+                QuorumError::Usage("--body-stdin or --body-file is required for `pin`".into())
+            })?;
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let p = quorum_core::pinned::pin(&mut conn, &agent, &body, now)?;
+            output::emit(&p);
+            Ok(0)
+        }
+        cli::Command::Unpin { agent, id } => {
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            match quorum_core::pinned::unpin(&mut conn, id, &agent, now)? {
+                quorum_core::pinned::UnpinResult::Removed(p) => {
+                    output::emit(&serde_json::json!({ "ok": true, "cleared": p }));
+                    Ok(0)
+                }
+                quorum_core::pinned::UnpinResult::NotFound => {
+                    output::emit(&serde_json::json!({
+                        "ok": false,
+                        "reason": "no pin at that id",
+                    }));
+                    Ok(1)
+                }
+                quorum_core::pinned::UnpinResult::NotCreator { author } => {
+                    output::emit(&serde_json::json!({
+                        "ok": false,
+                        "reason": "creator-only: this pin belongs to another agent",
+                        "author": author,
+                    }));
+                    Ok(1)
+                }
+            }
+        }
+        cli::Command::Pins => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let pins = quorum_core::pinned::list(&conn)?;
+            output::emit(&pins);
             Ok(0)
         }
         cli::Command::Sync { agent, match_label } => {
