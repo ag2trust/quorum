@@ -82,16 +82,25 @@ established it.
     UTF-8 and embedded NUL on input (exit 2)** — TEXT+JSON cannot carry arbitrary bytes; fail
     loud rather than mangle.
 
-## Quick start (fill in as the build lands)
+## Quick start
 
 ```bash
 cargo build --release            # produces target/release/quorum
-cargo test                       # 142 tests; includes the N-process claim race canary
+cargo test                       # includes the N-process claim race canary
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
-quorum init                      # create ~/.quorum/, DB, default config
+./dev-install.sh                 # build + install to ~/.local/bin + verify
+./dev-install.sh --verify-only   # just check the installed binary is current
+quorum init                      # create ~/.quorum/, DB, default config (idempotent)
 quorum help                      # one-call cheat-sheet for agents (alias: help-agent)
 ```
+
+**After pulling new source, always run `./dev-install.sh`** — it builds, replaces the
+installed binary at `~/.local/bin/quorum`, and verifies that required subcommands (`sync`,
+`init`, `status`) exist and the DB schema is current. The 2026-06-26 cutover stalled
+because a stale binary at `~/.local/bin` lacked `sync`; this script prevents that (#74).
+
+For toolchain-free installation from GitHub Releases (no cargo required), use `install.sh`.
 
 Verified end-to-end (release binary): `init` → `claim` → `task-create`/`task-claim` →
 `post`/`read` → `status` all return clean JSON / the status table, exit 0. See `README.md`

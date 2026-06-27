@@ -92,6 +92,14 @@ fn set_journal_wal_with(
     Err(QuorumError::Busy)
 }
 
+/// Migration outcome: what version the DB was at before this binary opened it, and what
+/// version it is now. Returned by [`migrate`] so callers (e.g. `quorum init`) can report
+/// whether a retrofit happened.
+pub struct MigrateResult {
+    pub migrated_from: i64,
+    pub schema_version: i64,
+}
+
 /// Open the store at `path`, applying PRAGMAs and running migrations. The returned
 /// connection is ready for use.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -101,11 +109,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Like [`open`], but also returns the migration outcome so callers can report what changed.
+pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
+    let conn = Connection::open(path)?;
+    apply_pragmas(&conn)?;
+    let info = migrate(&conn)?;
+    Ok((conn, info))
+}
+
 /// Bring the on-disk schema up to [`SCHEMA_VERSION`].
 ///
 /// Forward-only and idempotent. Runs under `BEGIN IMMEDIATE` so concurrent first-runs are
 /// safe. Refuses (fails loud) if the DB was written by a newer binary.
-pub fn migrate(conn: &Connection) -> Result<()> {
+pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if current > SCHEMA_VERSION {
         return Err(QuorumError::SchemaTooNew {
@@ -114,7 +130,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         });
     }
     if current == SCHEMA_VERSION {
-        return Ok(());
+        return Ok(MigrateResult {
+            migrated_from: current,
+            schema_version: SCHEMA_VERSION,
+        });
     }
     // One atomic migration. SCHEMA_SQL is `CREATE TABLE IF NOT EXISTS`, so it builds a fresh
     // DB at the latest shape and is a no-op for existing tables — additive column changes
@@ -148,7 +167,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     match run() {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
-            Ok(())
+            Ok(MigrateResult {
+                migrated_from: current,
+                schema_version: SCHEMA_VERSION,
+            })
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");

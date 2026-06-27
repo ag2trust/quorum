@@ -21,6 +21,84 @@ fn init_creates_db() {
 }
 
 #[test]
+fn init_reports_schema_version() {
+    let home = tempfile::tempdir().unwrap();
+    let out = quorum(home.path()).arg("init").output().unwrap();
+    assert!(out.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["ok"], true);
+    assert!(
+        json["schema_version"].is_number(),
+        "init must report schema_version"
+    );
+    assert!(json["schema_version"].as_i64().unwrap() > 0);
+    // Fresh DB: no migrated_from (already at latest on creation).
+    assert!(
+        json.get("migrated_from").is_none(),
+        "fresh init should not report migrated_from"
+    );
+}
+
+#[test]
+fn init_on_drifted_db_reports_migrated_from() {
+    // Simulate the cutover incident: DB at v4 (no control table, no sticky_until/orig).
+    // Running init with the current binary must retrofit the schema and report the migration.
+    let home = tempfile::tempdir().unwrap();
+    let db_path = home.path().join("quorum.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             CREATE TABLE agents (id TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+             CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                 author TEXT NOT NULL, topic TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL,
+                 refs TEXT, expires_at INTEGER NOT NULL, recipient TEXT);
+             CREATE TABLE cursors (agent_id TEXT NOT NULL, topic TEXT NOT NULL, last_seq INTEGER NOT NULL, PRIMARY KEY (agent_id, topic));
+             CREATE TABLE claims (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL,
+                 holder TEXT NOT NULL, ts INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                 active INTEGER NOT NULL DEFAULT 0);
+             CREATE UNIQUE INDEX claims_one_active ON claims(target) WHERE active = 1;
+             CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+                 body TEXT, status TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0,
+                 labels TEXT, assignee TEXT, created_by TEXT NOT NULL,
+                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, refs TEXT,
+                 depends_on TEXT);
+             CREATE TABLE errors (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                 source TEXT NOT NULL, detail TEXT NOT NULL, expires_at INTEGER NOT NULL);
+             CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+                 kind TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
+                 expires_at INTEGER NOT NULL);
+             INSERT INTO tasks(title, status, priority, created_by, created_at, updated_at)
+                 VALUES ('pre-existing', 'open', 5, 'boss', 1, 1);
+             PRAGMA user_version = 4;
+             COMMIT;",
+        ).unwrap();
+    }
+    let out = quorum(home.path()).arg("init").output().unwrap();
+    assert!(out.status.success(), "init on drifted DB must succeed");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["migrated_from"], 4, "must report migrated_from=4");
+    assert!(json["schema_version"].as_i64().unwrap() >= 6);
+    // Verify the retrofit actually worked: control table + sticky_until/orig exist.
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("SELECT 1 FROM control LIMIT 0").unwrap();
+        let (title, sticky, orig): (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT title, sticky_until, orig FROM tasks WHERE id=1",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(title, "pre-existing");
+        assert!(sticky.is_none());
+        assert!(orig.is_none());
+    }
+}
+
+#[test]
 fn init_is_idempotent() {
     let home = tempfile::tempdir().unwrap();
     for _ in 0..2 {
