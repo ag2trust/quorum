@@ -36,7 +36,134 @@ fn status_json_and_table() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("claims     : 1 active"));
+        .stdout(predicates::str::contains("claims : 1 active"));
+}
+
+#[test]
+fn status_dashboard_emits_all_sections() {
+    // Issue #77: status one-shot must render the operator-dashboard sections —
+    // agents-by-tier, queue, active claims with TTL, throughput, recent feed.
+    let home = tempfile::tempdir().unwrap();
+
+    // Seed: one claim, one task, one feed message — every section gets a row.
+    quorum(home.path())
+        .args([
+            "claim", "--agent", "Alice", "--target", "pr#1", "--ttl", "1h",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "ship-it",
+            "--labels",
+            r#"["tier:opus-47"]"#,
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["post", "--agent", "Alice", "--kind", "info", "--body-stdin"])
+        .write_stdin("hello world\n")
+        .assert()
+        .success();
+
+    quorum(home.path())
+        .arg("status")
+        .assert()
+        .success()
+        // Section headers (load-bearing — agents grep for these).
+        .stdout(predicates::str::contains("## agents online (by tier)"))
+        .stdout(predicates::str::contains(
+            "## queue (open tasks by required tier)",
+        ))
+        .stdout(predicates::str::contains(
+            "## active claims (soonest to expire)",
+        ))
+        .stdout(predicates::str::contains("## throughput"))
+        .stdout(predicates::str::contains("## recent feed"))
+        // Data sanity: tier:opus-47 surfaced from the open task we created.
+        .stdout(predicates::str::contains("tier:opus-47"))
+        // Claim with TTL surfaced.
+        .stdout(predicates::str::contains("pr#1"))
+        // Recent feed message body surfaced.
+        .stdout(predicates::str::contains("hello world"));
+}
+
+#[test]
+fn status_json_includes_dashboard_fields() {
+    // Same #77 enrichments, but on the --json side: every new struct field surfaces.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "claim", "--agent", "Alice", "--target", "pr#1", "--ttl", "1h",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "x",
+            "--labels",
+            r#"["tier:opus-46"]"#,
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["post", "--agent", "Alice", "--kind", "info", "--body-stdin"])
+        .write_stdin("recent\n")
+        .assert()
+        .success();
+
+    let out = quorum(home.path())
+        .args(["status", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json.get("agents").is_some(), "agents field missing");
+    assert!(
+        json.get("queue_by_tier").is_some(),
+        "queue_by_tier field missing"
+    );
+    assert!(
+        json.get("recent_messages").is_some(),
+        "recent_messages field missing"
+    );
+    assert!(json.get("claim_ttls").is_some(), "claim_ttls field missing");
+    assert!(json.get("throughput").is_some(), "throughput field missing");
+    // Data: one open task with tier:opus-46.
+    let queue = json["queue_by_tier"].as_array().unwrap();
+    assert!(
+        queue
+            .iter()
+            .any(|q| q["tier"] == "tier:opus-46" && q["open"] == 1),
+        "expected tier:opus-46 bucket with 1 open, got: {queue:?}"
+    );
+    // throughput keys present (numbers — counts are 0 in this fresh test).
+    let tp = &json["throughput"];
+    assert_eq!(tp["closed_last_hour"], 0);
+    assert_eq!(tp["done_awaiting_review"], 0);
+    assert_eq!(tp["done_stuck_count"], 0);
+}
+
+#[test]
+fn status_dashboard_handles_empty_db() {
+    // Defensive: with no data, every section should render its (none)/(empty) sentinel.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    quorum(home.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("## agents online (by tier)"))
+        .stdout(predicates::str::contains("## recent feed"));
 }
 
 #[test]

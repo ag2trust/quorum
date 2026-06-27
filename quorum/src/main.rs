@@ -62,14 +62,35 @@ fn command_source(cmd: &cli::Command) -> &'static str {
     }
 }
 
-/// Render a stats snapshot as a compact human-readable table.
+/// Render seconds as a compact "N(s|m|h|d) ago" form. Falls back to integer seconds for
+/// non-positive inputs (clock skew). Used throughout the dashboard so every age column
+/// reads the same way.
+fn fmt_age(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Render a stats snapshot as the operator dashboard (issue #77).
+/// One-shot plain text — greppable. Section headers + simple alignment, no color or
+/// box-drawing (the watch loop also uses this; keep it terminal-portable).
 fn print_status_table(s: &quorum_core::stats::Stats) {
+    // --- Header: top-line counts ---
+    println!("# quorum status");
     println!(
-        "agents     : {} online / {} total",
-        s.agents_online, s.agents_total
+        "agents : {} online / {} total · messages : {} live · claims : {} active · errors : {} live",
+        s.agents_online,
+        s.agents_total,
+        s.messages_live,
+        s.claims_active,
+        s.errors_live,
     );
-    println!("messages   : {} live", s.messages_live);
-    println!("claims     : {} active", s.claims_active);
     let tasks = if s.tasks.is_empty() {
         "none".to_string()
     } else {
@@ -79,10 +100,111 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    println!("tasks      : {tasks}");
-    println!("errors     : {} live", s.errors_live);
-    for e in &s.last_errors {
-        println!("  [{}] {}: {}", e.ts, e.source, e.detail);
+    println!("tasks  : {tasks}");
+
+    // --- Agents online (by tier) ---
+    println!();
+    println!("## agents online (by tier)");
+    if s.agents.is_empty() {
+        println!("  (none)");
+    } else {
+        let mut current_tier = String::new();
+        for a in &s.agents {
+            if a.tier != current_tier {
+                current_tier = a.tier.clone();
+                println!("  [{current_tier}]");
+            }
+            let task_str = match &a.current_task {
+                Some(t) => format!("task#{} {}", t.id, t.title),
+                None => "idle".to_string(),
+            };
+            println!(
+                "    {:<24} last_seen {:>4} ago  ·  {}",
+                a.id,
+                fmt_age(a.last_seen_age_secs),
+                task_str
+            );
+        }
+    }
+
+    // --- Queue by tier ---
+    println!();
+    println!("## queue (open tasks by required tier)");
+    if s.queue_by_tier.is_empty() {
+        println!("  (empty)");
+    } else {
+        for q in &s.queue_by_tier {
+            println!("  {:<18} {} open", q.tier, q.open);
+        }
+    }
+
+    // --- Active claims with TTL ---
+    println!();
+    println!("## active claims (soonest to expire)");
+    if s.claim_ttls.is_empty() {
+        println!("  (none)");
+    } else {
+        for c in &s.claim_ttls {
+            let flag = if c.expires_in_secs < 60 {
+                "  ⚠ <1m"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<24} held by {:<20} expires in {}{flag}",
+                c.target,
+                c.holder,
+                fmt_age(c.expires_in_secs)
+            );
+        }
+    }
+
+    // --- Throughput ---
+    println!();
+    println!("## throughput");
+    println!(
+        "  closed in last hour     : {}",
+        s.throughput.closed_last_hour
+    );
+    println!(
+        "  done awaiting review    : {}",
+        s.throughput.done_awaiting_review
+    );
+    match s.throughput.oldest_done_awaiting_review_secs {
+        Some(age) => println!("  oldest done             : {} ago", fmt_age(age)),
+        None => println!("  oldest done             : —"),
+    }
+    if s.throughput.done_stuck_count > 0 {
+        println!(
+            "  ⚠ done stuck > 30m      : {}",
+            s.throughput.done_stuck_count
+        );
+    }
+
+    // --- Recent feed messages ---
+    println!();
+    println!("## recent feed (newest first)");
+    if s.recent_messages.is_empty() {
+        println!("  (none)");
+    } else {
+        for m in &s.recent_messages {
+            println!(
+                "  [{:>4} ago] {} ({}): {}",
+                fmt_age(m.age_secs),
+                m.author,
+                m.kind,
+                m.body_preview
+            );
+        }
+    }
+
+    // --- Last errors ---
+    if !s.last_errors.is_empty() {
+        println!();
+        println!("## last errors");
+        for e in &s.last_errors {
+            println!("  [{}] {}: {}", e.ts, e.source, e.detail);
+        }
     }
 }
 
