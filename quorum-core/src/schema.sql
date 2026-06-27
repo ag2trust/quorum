@@ -4,7 +4,8 @@
 CREATE TABLE IF NOT EXISTS agents (
     id          TEXT PRIMARY KEY,
     first_seen  INTEGER NOT NULL,
-    last_seen   INTEGER NOT NULL
+    last_seen   INTEGER NOT NULL,
+    tier        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (

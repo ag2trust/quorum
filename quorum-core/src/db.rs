@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -160,6 +160,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         }
         if current < 6 && !column_exists(conn, "tasks", "orig")? {
             conn.execute("ALTER TABLE tasks ADD COLUMN orig TEXT", [])?;
+        }
+        // v8 = persist agent tier (issue #82).
+        if current < 8 && !column_exists(conn, "agents", "tier")? {
+            conn.execute("ALTER TABLE agents ADD COLUMN tier TEXT", [])?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -555,6 +559,41 @@ mod tests {
             .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "pre-notes");
+    }
+
+    #[test]
+    fn migrates_v7_to_v8_adds_agents_tier_column_without_disturbing_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL
+                 );
+                 INSERT INTO agents(id, first_seen, last_seen) VALUES ('pre-tier', 100, 200);
+                 PRAGMA user_version = 7;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(column_exists(&c, "agents", "tier").unwrap());
+        let (id, tier): (String, Option<String>) = c
+            .query_row("SELECT id, tier FROM agents WHERE id='pre-tier'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(id, "pre-tier");
+        assert!(tier.is_none(), "tier must default NULL for existing rows");
     }
 
     #[test]

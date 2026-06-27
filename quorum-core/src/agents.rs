@@ -58,6 +58,16 @@ pub fn touch(conn: &Connection, id: &str, now: i64) -> Result<()> {
     Ok(())
 }
 
+/// Persist the agent's declared tier (e.g. `"tier:opus-46"`). Called from `sync::tick`
+/// when `--match-label tier:*` is present, inside the same write transaction as `touch`.
+/// Passing `None` is a no-op (does not clear a previously stored tier).
+pub fn set_tier(conn: &Connection, id: &str, tier: Option<&str>) -> Result<()> {
+    if let Some(t) = tier {
+        conn.execute("UPDATE agents SET tier = ?1 WHERE id = ?2", params![t, id])?;
+    }
+    Ok(())
+}
+
 /// All agents with derived online/offline, ordered by id. Read-only (no presence bump).
 pub fn roster(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
     let mut stmt = conn
@@ -127,6 +137,25 @@ mod tests {
     fn roster_empty_on_fresh_db() {
         let (_d, c) = open_tmp();
         assert!(roster(&c, 1000, ONLINE_WINDOW_SECS).unwrap().is_empty());
+    }
+
+    // -- set_tier (#82) -------------------------------------------------------------------
+
+    #[test]
+    fn set_tier_persists_and_none_is_noop() {
+        let (_d, c) = open_tmp();
+        touch(&c, "X", 1000).unwrap();
+        set_tier(&c, "X", Some("tier:opus-46")).unwrap();
+        let t: Option<String> = c
+            .query_row("SELECT tier FROM agents WHERE id='X'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t, Some("tier:opus-46".to_string()));
+        // None does not clear.
+        set_tier(&c, "X", None).unwrap();
+        let t2: Option<String> = c
+            .query_row("SELECT tier FROM agents WHERE id='X'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(t2, Some("tier:opus-46".to_string()));
     }
 
     // -- Auto-renew on touch (#55) --------------------------------------------------------
