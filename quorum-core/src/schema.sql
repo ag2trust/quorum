@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 6). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 7). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -112,4 +112,14 @@ CREATE TABLE IF NOT EXISTS control (
     reason  TEXT NOT NULL,
     by      TEXT NOT NULL,
     since   INTEGER NOT NULL
+);
+
+-- Non-expiring pinned notices (issue #78) — durable standing state every agent sees on
+-- every sync, regardless of cursor or TTL. Parallels `control`: no `expires_at` column,
+-- sweep does NOT touch this table. Removal is explicit via `unpin`.
+CREATE TABLE IF NOT EXISTS pinned (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      INTEGER NOT NULL,
+    author  TEXT NOT NULL,
+    body    TEXT NOT NULL
 );
