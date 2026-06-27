@@ -322,7 +322,7 @@ pub fn tick(
     now: i64,
 ) -> Result<Snapshot> {
     let snap = gather(conn, agent, match_labels, now)?;
-    touch_and_advance_cursor(conn, agent, &snap, now)?;
+    touch_and_advance_cursor(conn, agent, &snap, match_labels, now)?;
     Ok(snap)
 }
 
@@ -348,6 +348,7 @@ fn touch_and_advance_cursor(
     conn: &mut Connection,
     agent: &str,
     snap: &Snapshot,
+    match_labels: &[&str],
     now: i64,
 ) -> Result<()> {
     // Highest seq across everything we surfaced (direct + critical + critical broadcasts).
@@ -376,6 +377,11 @@ fn touch_and_advance_cursor(
     // Two updates, one transaction:
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
+    // Persist the agent's declared tier from --match-label (#82).
+    let tier = match_labels
+        .iter()
+        .find_map(|l| l.strip_prefix("tier:").map(|_| *l));
+    crate::agents::set_tier(&tx, agent, tier)?;
     if max_seen > cursor_now {
         // Same shape as feed::read --ack-through: insert-or-update with MAX(...).
         tx.execute(
@@ -1460,6 +1466,31 @@ mod tests {
         assert!(
             row.is_none(),
             "tick on empty inbox should not write a cursor row"
+        );
+    }
+
+    #[test]
+    fn tick_persists_tier_from_match_labels() {
+        let (_d, mut c) = open_tmp();
+        let _ = tick(&mut c, "Alice", &["tier:opus-46"], 200).unwrap();
+        let tier: Option<String> = c
+            .query_row("SELECT tier FROM agents WHERE id='Alice'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tier, Some("tier:opus-46".to_string()));
+    }
+
+    #[test]
+    fn tick_without_tier_label_does_not_clear_stored_tier() {
+        let (_d, mut c) = open_tmp();
+        let _ = tick(&mut c, "Bob", &["tier:opus-47"], 200).unwrap();
+        let _ = tick(&mut c, "Bob", &[], 300).unwrap();
+        let tier: Option<String> = c
+            .query_row("SELECT tier FROM agents WHERE id='Bob'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            tier,
+            Some("tier:opus-47".to_string()),
+            "tier must not be cleared by a sync without --match-label"
         );
     }
 

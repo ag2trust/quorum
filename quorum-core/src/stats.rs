@@ -35,10 +35,9 @@ pub struct ErrorRow {
     pub detail: String,
 }
 
-/// One online agent — what tier they appear to operate at and what they're doing right now.
-/// Tier is derived from the active claim's task labels (`tier:*`); `unknown` when the agent
-/// holds no active task. The agent table has no tier column by design (agents announce tier
-/// via `--match-label tier:X` on sync; tier is a property of the work they pick, not them).
+/// One online agent — what tier they operate at and what they're doing right now.
+/// Tier is read from the persisted `agents.tier` column, set on each `sync --match-label
+/// tier:*` call (#82). `unknown` when the agent has never synced with a tier label.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct AgentView {
     pub id: String,
@@ -187,12 +186,13 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     })
 }
 
-/// Per-online-agent view. Tier derived from their active task's labels — see
-/// [`extract_tier_from_labels`]. Sorted by tier ascending, then id ascending — deterministic
-/// so the watch loop's output is stable frame-to-frame.
+/// Per-online-agent view. Tier read from the stored `agents.tier` column (persisted on
+/// each `sync --match-label tier:*`); falls back to `unknown` when NULL.
+/// Sorted by tier ascending, then id ascending — deterministic so the watch loop's output
+/// is stable frame-to-frame.
 fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
     let mut stmt = conn.prepare(
-        "SELECT a.id, a.last_seen, t.id, t.title, t.labels
+        "SELECT a.id, a.last_seen, a.tier, t.id, t.title
          FROM agents a
          LEFT JOIN claims c
            ON c.holder = a.id
@@ -208,13 +208,13 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
         .query_map(params![now, online_window], |r| {
             let id: String = r.get(0)?;
             let last_seen: i64 = r.get(1)?;
-            let task_id: Option<i64> = r.get(2)?;
-            let task_title: Option<String> = r.get(3)?;
-            let labels: Option<String> = r.get(4)?;
+            let stored_tier: Option<String> = r.get(2)?;
+            let task_id: Option<i64> = r.get(3)?;
+            let task_title: Option<String> = r.get(4)?;
             let current_task = task_id
                 .zip(task_title)
                 .map(|(id, title)| AgentCurrentTask { id, title });
-            let tier = extract_tier_from_labels(labels.as_deref());
+            let tier = stored_tier.unwrap_or_else(|| "unknown".to_string());
             Ok(AgentView {
                 id,
                 tier,
@@ -458,9 +458,9 @@ mod tests {
     }
 
     #[test]
-    fn agents_view_includes_tier_from_current_task() {
+    fn agents_view_uses_stored_tier() {
         let (_d, mut c) = open_tmp();
-        // Two tasks at different tiers.
+        // Two agents with stored tiers and claimed tasks.
         let t46 = crate::tasks::create(
             &mut c,
             "boss",
@@ -485,12 +485,13 @@ mod tests {
             100,
         )
         .unwrap();
-        // Two agents claim them.
         crate::tasks::claim(&mut c, "Alice", Some(t46), &[], 1000, 100).unwrap();
         crate::tasks::claim(&mut c, "Bob", Some(t47), &[], 1000, 100).unwrap();
+        // Persist tiers on the agent rows (as sync would do).
+        crate::agents::set_tier(&c, "Alice", Some("tier:opus-46")).unwrap();
+        crate::agents::set_tier(&c, "Bob", Some("tier:opus-47")).unwrap();
 
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
-        // Both online, both have a current task with a tier.
         let by_id: std::collections::HashMap<_, _> =
             s.agents.iter().map(|a| (a.id.as_str(), a)).collect();
         assert_eq!(by_id["Alice"].tier, "tier:opus-46");
@@ -500,12 +501,24 @@ mod tests {
     }
 
     #[test]
-    fn agents_view_unknown_tier_when_idle() {
-        let (_d, mut c) = open_tmp();
-        // Agent posts a message (touches presence) but holds no task.
-        crate::feed::post(&mut c, "Idle", "info", None, "hi", None, None, 1000, 100).unwrap();
+    fn agents_view_stored_tier_survives_idle() {
+        let (_d, c) = open_tmp();
+        // Agent synced with a tier, then released its task — tier should persist.
+        crate::agents::touch(&c, "Idle", 100).unwrap();
+        crate::agents::set_tier(&c, "Idle", Some("tier:opus-46")).unwrap();
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         let a = s.agents.iter().find(|a| a.id == "Idle").unwrap();
+        assert_eq!(a.tier, "tier:opus-46");
+        assert!(a.current_task.is_none());
+    }
+
+    #[test]
+    fn agents_view_unknown_tier_when_never_synced_with_tier() {
+        let (_d, mut c) = open_tmp();
+        // Agent posts a message (touches presence) but never synced with --match-label.
+        crate::feed::post(&mut c, "NoTier", "info", None, "hi", None, None, 1000, 100).unwrap();
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let a = s.agents.iter().find(|a| a.id == "NoTier").unwrap();
         assert_eq!(a.tier, "unknown");
         assert!(a.current_task.is_none());
     }
