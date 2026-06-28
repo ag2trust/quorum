@@ -629,19 +629,20 @@ fn next_task_view(conn: &Connection, match_labels: &[&str]) -> Result<Option<Nex
             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
         )
     ))";
-    // #73: tier-exempt branch for review tasks. The OR composes with the
-    // AND-bag of match_labels so a `--match-label tier:X` sync still surfaces
-    // any open `kind:review` task (eligibility still gated by self-review +
-    // sticky at claim time, which is correct — sync only previews).
-    const REVIEW_EXEMPT_CLAUSE: &str = "labels LIKE '%\"kind:review\"%'";
+    // #105: only UNTIERED review tasks are tier-exempt. A review task that
+    // inherited a tier label from the original task goes through normal tier
+    // matching — so a weaker-tier agent doesn't review harder work. Untiered
+    // reviews (legacy) remain visible to every tier-filtered sync (#73).
+    const REVIEW_UNTIERED_EXEMPT: &str =
+        "(labels LIKE '%\"kind:review\"%' AND labels NOT LIKE '%\"tier:%')";
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
          WHERE status = 'open' AND {DEP_READY_CLAUSE}"
     );
     if !match_labels.is_empty() {
         use std::fmt::Write as _;
-        // (kind:review OR (label1 AND label2 AND ...))
-        let _ = write!(sql, " AND ({REVIEW_EXEMPT_CLAUSE} OR (");
+        // (untiered-review OR (label1 AND label2 AND ...))
+        let _ = write!(sql, " AND ({REVIEW_UNTIERED_EXEMPT} OR (");
         for i in 0..match_labels.len() {
             if i > 0 {
                 sql.push_str(" AND ");
@@ -939,11 +940,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_kind_review_is_tier_exempt_for_match_label_sync() {
-        // #73 regression: a `kind:review` task carries only `["kind:review"]` —
-        // before the fix, a `--match-label tier:X` sync excluded it before
-        // priority was considered, so auto-spawned reviews never surfaced to
-        // tier-filtered agents and the review→merge loop stalled.
+    fn snapshot_untiered_review_is_tier_exempt_for_match_label_sync() {
+        // #73: an UNTIERED `kind:review` task (only `["kind:review"]`, no tier)
+        // remains tier-exempt so legacy reviews still surface.
+        // #105 narrows: tiered reviews go through normal matching (see
+        // `snapshot_tiered_review_obeys_tier_matching`).
         let (_d, mut c) = open_tmp();
         let _user = make_task(&mut c, "user-work", 50, Some("[\"tier:opus-47\"]"), 100);
         let review = make_task(
@@ -991,6 +992,30 @@ mod tests {
             snap.next_task.is_none(),
             "non-review task in a different tier must remain filtered out",
         );
+    }
+
+    #[test]
+    fn snapshot_tiered_review_obeys_tier_matching() {
+        // #105: a review task that carries a tier label is NOT tier-exempt —
+        // a weaker-tier sync must not surface it.
+        let (_d, mut c) = open_tmp();
+        let review = make_task(
+            &mut c,
+            "review-47",
+            1000,
+            Some("[\"kind:review\",\"tier:opus-47\"]"),
+            100,
+        );
+        // tier:opus-46 agent should NOT see this tiered review.
+        let snap46 = gather(&c, "agent-46", &["tier:opus-46"], 200).unwrap();
+        assert!(
+            snap46.next_task.is_none(),
+            "tier:opus-46 sync must NOT surface a tier:opus-47 review",
+        );
+        // tier:opus-47 agent SHOULD see it.
+        let snap47 = gather(&c, "agent-47", &["tier:opus-47"], 200).unwrap();
+        let nxt = snap47.next_task.as_ref().expect("next_task present");
+        assert_eq!(nxt.id, review);
     }
 
     #[test]
