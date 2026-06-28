@@ -77,7 +77,7 @@ fn status_dashboard_emits_all_sections() {
         // Section headers (load-bearing — agents grep for these).
         .stdout(predicates::str::contains("## agents online (by tier)"))
         .stdout(predicates::str::contains(
-            "## queue (open tasks by required tier)",
+            "## queue (claimable tasks by required tier)",
         ))
         .stdout(predicates::str::contains(
             "## active claims (soonest to expire)",

@@ -107,9 +107,9 @@ pub struct Task {
 
 /// A token-efficient summary view of a [`Task`] for queue scans (`task-list --brief`). Drops
 /// the full `body` — the one large field an agent doesn't need until it picks a task up — plus
-/// the timestamps/refs/deps a scan doesn't read. The full task is always one `task-get <id>`
-/// away. Fields match the spec's summary set: id, title, labels, priority, status, assignee,
-/// ready.
+/// the timestamps/refs a scan doesn't read. The full task is always one `task-get <id>` away.
+/// Fields match the spec's summary set: id, title, labels, priority, status, assignee, ready,
+/// depends_on (#86).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct TaskBrief {
     pub id: i64,
@@ -119,6 +119,7 @@ pub struct TaskBrief {
     pub status: String,
     pub assignee: Option<String>,
     pub ready: bool,
+    pub depends_on: Option<String>,
 }
 
 impl From<&Task> for TaskBrief {
@@ -131,6 +132,7 @@ impl From<&Task> for TaskBrief {
             status: t.status.clone(),
             assignee: t.assignee.clone(),
             ready: t.ready,
+            depends_on: t.depends_on.clone(),
         }
     }
 }
@@ -271,7 +273,7 @@ fn validate_depends_on(s: &str) -> Result<()> {
 ///
 /// Safe-by-construction: bad JSON can never reach this function because [`validate_depends_on`]
 /// rejects malformed input in [`create`].
-fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<bool> {
+pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<bool> {
     let Some(json) = depends_on.as_deref() else {
         return Ok(true);
     };
@@ -1618,24 +1620,25 @@ mod tests {
         assert_eq!(brief.status, "open");
         assert_eq!(brief.assignee, None);
         assert!(brief.ready); // no deps => ready
-                              // The JSON is exactly the 7 summary fields — body (and the other non-summary fields)
-                              // are gone, which is the whole point of --brief.
+        assert_eq!(brief.depends_on, None); // no deps
+                                            // The JSON is exactly the 8 summary fields (#86 added depends_on) — body (and
+                                            // other non-summary fields) are gone, which is the whole point of --brief.
         let json = serde_json::to_value(&brief).unwrap();
         let obj = json.as_object().unwrap();
-        assert_eq!(obj.len(), 7, "brief must serialize exactly 7 fields");
+        assert_eq!(obj.len(), 8, "brief must serialize exactly 8 fields");
         for k in [
-            "id", "title", "labels", "priority", "status", "assignee", "ready",
+            "id",
+            "title",
+            "labels",
+            "priority",
+            "status",
+            "assignee",
+            "ready",
+            "depends_on",
         ] {
             assert!(obj.contains_key(k), "brief missing summary field {k}");
         }
-        for k in [
-            "body",
-            "created_by",
-            "created_at",
-            "updated_at",
-            "refs",
-            "depends_on",
-        ] {
+        for k in ["body", "created_by", "created_at", "updated_at", "refs"] {
             assert!(!obj.contains_key(k), "brief must omit {k}");
         }
     }

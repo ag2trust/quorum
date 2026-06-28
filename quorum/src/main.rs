@@ -127,14 +127,29 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
         }
     }
 
-    // --- Queue by tier ---
+    // --- Queue by tier (ready/claimable only, #86) ---
     println!();
-    println!("## queue (open tasks by required tier)");
+    println!("## queue (claimable tasks by required tier)");
     if s.queue_by_tier.is_empty() {
         println!("  (empty)");
     } else {
         for q in &s.queue_by_tier {
             println!("  {:<18} {} open", q.tier, q.open);
+        }
+    }
+
+    // --- Blocked tasks (#86) ---
+    if !s.blocked.is_empty() {
+        println!();
+        println!("## blocked (waiting on dependencies)");
+        for b in &s.blocked {
+            let deps: Vec<String> = b.waiting_on.iter().map(|d| format!("#{d}")).collect();
+            println!(
+                "  #{:<5} ⛔ waiting on {}  — {}",
+                b.id,
+                deps.join(", "),
+                b.title
+            );
         }
     }
 
