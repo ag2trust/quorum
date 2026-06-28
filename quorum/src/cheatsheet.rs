@@ -14,16 +14,6 @@ SYNC (the agent's compass — one call per tick)
 PRESENCE
   quorum roster                               # who's around (online/offline)
 
-CLAIMS (atomic locks)
-  quorum claim  --agent <id> --target <t> --ttl 45m   # exit 0 won, 1 lost {holder}
-  quorum renew  --agent <id> --claim-id <n> --ttl 45m
-  quorum release --agent <id> (--target <t> | --claim-id <n>)
-  quorum claims [--target <t>]                        # active arbitrary locks only
-  # claim/claims = arbitrary mutual-exclusion locks (pr#N, free-form targets). The work QUEUE
-  # is separate: task-claim/task-list own tasks + their internal `task#<id>` leases, which are
-  # NEVER listed here (reserved namespace). One concept = one command — pick by what you hold:
-  # an arbitrary lock -> claims; a queued unit of work -> task-list.
-
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
                                                                # --depends-on gates the claim: dependent stays unclaimable
@@ -49,11 +39,10 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   # {id, status, assignee, refs} (+ lease_expires_at on claim, + note_id on --note-*). Body and
   # descriptive fields are omitted — you just wrote them, no need to re-pay tokens. Use
   # `task-get <id>` for the full record (body + notes history).
-  # AUTO-RENEW (#55): every `--agent`-identified command (claim, task-claim, task-update, post,
+  # AUTO-RENEW (#55): every `--agent`-identified command (task-claim, task-update, post,
   # read --ack-through, sync, etc.) auto-extends YOUR active leases to now + DEFAULT_LEASE_TTL_SECS.
   # Monotonic — an explicit longer TTL is never shortened. Only true silence past the lease lapses
-  # it (lost-agent recovery, unchanged). No more manual `task-renew` — the command is removed; the
-  # `claim renew` for non-task targets like pr#N remains as an explicit override for that case.
+  # it (lost-agent recovery, unchanged). No more manual `task-renew` — the lease just rides along.
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # `done -> closed` / reopen are review automation's (issue #10) — see REVIEW below.
 

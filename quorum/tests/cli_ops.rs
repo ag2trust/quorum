@@ -20,8 +20,14 @@ fn init_writes_default_config() {
 #[test]
 fn status_json_and_table() {
     let home = tempfile::tempdir().unwrap();
+    // A task lease is a claim (target=task#<id>) — it populates claims_active. Same agent
+    // creates and claims so exactly one agent is online.
     quorum(home.path())
-        .args(["claim", "--agent", "A", "--target", "pr#1", "--ttl", "1h"])
+        .args(["task-create", "--created-by", "A", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
         .assert()
         .success();
 
@@ -45,13 +51,8 @@ fn status_dashboard_emits_all_sections() {
     // agents-by-tier, queue, active claims with TTL, throughput, recent feed.
     let home = tempfile::tempdir().unwrap();
 
-    // Seed: one claim, one task, one feed message — every section gets a row.
-    quorum(home.path())
-        .args([
-            "claim", "--agent", "Alice", "--target", "pr#1", "--ttl", "1h",
-        ])
-        .assert()
-        .success();
+    // Seed: one open tiered task (queue), one claimed task (its lease = the active claim),
+    // one feed message — every section gets a row.
     quorum(home.path())
         .args([
             "task-create",
@@ -61,6 +62,22 @@ fn status_dashboard_emits_all_sections() {
             "ship-it",
             "--labels",
             r#"["tier:opus-47"]"#,
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "locked"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "Alice",
+            "--task-id",
+            "2",
+            "--ttl",
+            "1h",
         ])
         .assert()
         .success();
@@ -86,8 +103,8 @@ fn status_dashboard_emits_all_sections() {
         .stdout(predicates::str::contains("## recent feed"))
         // Data sanity: tier:opus-47 surfaced from the open task we created.
         .stdout(predicates::str::contains("tier:opus-47"))
-        // Claim with TTL surfaced.
-        .stdout(predicates::str::contains("pr#1"))
+        // Claim with TTL surfaced (the claimed task's lease, target task#2).
+        .stdout(predicates::str::contains("task#2"))
         // Recent feed message body surfaced.
         .stdout(predicates::str::contains("hello world"));
 }
@@ -98,12 +115,6 @@ fn status_json_includes_dashboard_fields() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
         .args([
-            "claim", "--agent", "Alice", "--target", "pr#1", "--ttl", "1h",
-        ])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args([
             "task-create",
             "--created-by",
             "boss",
@@ -111,6 +122,23 @@ fn status_json_includes_dashboard_fields() {
             "x",
             "--labels",
             r#"["tier:opus-46"]"#,
+        ])
+        .assert()
+        .success();
+    // A claimed task whose lease populates claim_ttls.
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "locked"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-claim",
+            "--agent",
+            "Alice",
+            "--task-id",
+            "2",
+            "--ttl",
+            "1h",
         ])
         .assert()
         .success();
@@ -185,7 +213,7 @@ fn help_lists_commands_and_safety() {
         .success()
         .stdout(predicates::str::contains("--body-stdin"))
         .stdout(predicates::str::contains("EXIT CODES"))
-        .stdout(predicates::str::contains("quorum claim"));
+        .stdout(predicates::str::contains("quorum task-claim"));
 }
 
 #[test]
@@ -222,7 +250,7 @@ fn help_works_with_no_quorum_home() {
         .arg("help")
         .assert()
         .success()
-        .stdout(predicates::str::contains("quorum claim"));
+        .stdout(predicates::str::contains("quorum task-claim"));
 }
 
 #[test]
@@ -296,9 +324,13 @@ fn missing_config_falls_back_to_defaults() {
 #[test]
 fn status_watch_emits_output_before_kill() {
     let home = tempfile::tempdir().unwrap();
-    // Seed data so the status table has something visible.
+    // Seed data so the status table has something visible (a claimed task's lease).
     quorum(home.path())
-        .args(["claim", "--agent", "A", "--target", "pr#1", "--ttl", "1h"])
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
         .assert()
         .success();
 

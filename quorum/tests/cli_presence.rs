@@ -29,9 +29,9 @@ fn name_collision_merges_presence_silently() {
     // Two separate CLI invocations using the same agent id should merge into one roster
     // entry (ON CONFLICT on agents.id), not create duplicates or error.
     let home = tempfile::tempdir().unwrap();
-    // First invocation as "A" (via a claim).
+    // First invocation registering "A" (via a task-create — created_by bumps presence).
     quorum(home.path())
-        .args(["claim", "--agent", "A", "--target", "pr#1", "--ttl", "1h"])
+        .args(["task-create", "--created-by", "A", "--title", "x"])
         .assert()
         .success();
     // Second invocation as "A" (via a post) — same id, different "session."
@@ -51,19 +51,21 @@ fn name_collision_merges_presence_silently() {
 fn lost_claim_still_marks_agent_online() {
     let home = tempfile::tempdir().unwrap();
 
-    // A wins the claim.
+    // One task for two agents to contend for.
     quorum(home.path())
-        .args([
-            "claim", "--agent", "Winner", "--target", "pr#1", "--ttl", "1h",
-        ])
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
 
-    // B loses (exit 1) — but touch ran inside the txn before the insert failed.
+    // Winner takes the task lease.
     quorum(home.path())
-        .args([
-            "claim", "--agent", "Loser", "--target", "pr#1", "--ttl", "1h",
-        ])
+        .args(["task-claim", "--agent", "Winner", "--task-id", "1"])
+        .assert()
+        .success();
+
+    // Loser loses (exit 1, task already claimed) — but touch ran inside the txn first.
+    quorum(home.path())
+        .args(["task-claim", "--agent", "Loser", "--task-id", "1"])
         .assert()
         .code(1);
 
@@ -117,9 +119,6 @@ fn pure_reads_do_not_create_agent_row() {
 
     // peek (always read-only, no agent param).
     quorum(home.path()).args(["peek"]).assert().success();
-
-    // claims (read-only listing).
-    quorum(home.path()).args(["claims"]).assert().success();
 
     // task-list (read-only listing).
     quorum(home.path()).args(["task-list"]).assert().success();

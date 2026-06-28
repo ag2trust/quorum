@@ -121,65 +121,6 @@ fn message_feed_carries_no_auto_events() {
 }
 
 #[test]
-fn standalone_claim_emits_claim_taken_and_released() {
-    // The lower-level `quorum claim` / `release` on an arbitrary target (e.g. `pr#1`) emits
-    // `claim_taken` / `claim_released` to the event log.
-    let home = tempfile::tempdir().unwrap();
-    quorum(home.path())
-        .args(["claim", "--agent", "A", "--target", "pr#1", "--ttl", "1h"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["release", "--agent", "A", "--target", "pr#1"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["log", "--refs", "pr#1"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"kind\":\"claim_taken\""))
-        .stdout(predicates::str::contains("\"kind\":\"claim_released\""))
-        .stdout(predicates::str::contains("\"subject\":\"pr#1\""));
-}
-
-#[test]
-fn renew_emits_event_for_claims() {
-    // `task-renew` removed in #55 (auto-renew on agent touch). The `claim_renewed` event
-    // path still exists via the generic `quorum renew` for non-task targets like `pr#…`.
-    let home = tempfile::tempdir().unwrap();
-    quorum(home.path())
-        .args(["claim", "--agent", "A", "--target", "pr#5", "--ttl", "1h"])
-        .assert()
-        .success();
-    let claim_id: String = {
-        let out = quorum(home.path())
-            .args(["claims", "--target", "pr#5"])
-            .output()
-            .unwrap()
-            .stdout;
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-        v[0]["id"].to_string()
-    };
-    quorum(home.path())
-        .args([
-            "renew",
-            "--agent",
-            "A",
-            "--claim-id",
-            &claim_id,
-            "--ttl",
-            "2h",
-        ])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["log", "--refs", "pr#5"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"kind\":\"claim_renewed\""));
-}
-
-#[test]
 fn limit_caps_returned_rows() {
     let home = tempfile::tempdir().unwrap();
     for _ in 0..5 {
