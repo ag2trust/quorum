@@ -27,6 +27,13 @@ pub const ONLINE_WINDOW_SECS: i64 = 900;
 pub const DEFAULT_RETIRE_AFTER_ACTIVE_SECS: i64 = 5400;
 pub const DEFAULT_RETIRE_AFTER_TASKS: i64 = 8;
 
+/// Wall-clock lifetime budget (issue #97 extension). An agent that has been alive (since
+/// `first_seen`) for longer than this retires regardless of task load. Prevents the
+/// "idle ticking for hours burning context tokens" failure mode observed 2026-06-28 where
+/// agents ran 6-14 hours because work trickling in reset the cumulative-idle counter.
+/// 3600 sec = 1 hour — hard cap on session lifetime.
+pub const DEFAULT_RETIRE_AFTER_WALL_SECS: i64 = 3600;
+
 /// Retirement state machine (issue #97). String-typed so it round-trips cleanly through
 /// SQLite TEXT and JSON without a custom serde adapter; the three variants form the entire
 /// state space.
@@ -103,6 +110,20 @@ pub fn retire_state(conn: &Connection, id: &str) -> Result<(String, Option<i64>)
         )
         .ok();
     Ok(row.unwrap_or_else(|| (RETIRE_STATUS_ACTIVE.to_string(), None)))
+}
+
+/// Read `first_seen` for the agent. Returns `None` if the agent row doesn't exist yet
+/// (first tick before `touch` has run). Used by `sync::gather_with_budget` for the
+/// wall-clock retirement check.
+pub fn first_seen(conn: &Connection, id: &str) -> Result<Option<i64>> {
+    let row = conn
+        .query_row(
+            "SELECT first_seen FROM agents WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok();
+    Ok(row)
 }
 
 /// Promote the agent to `retiring`. No-op if already retiring or retired (the state machine

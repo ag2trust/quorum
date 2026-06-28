@@ -137,6 +137,10 @@ pub struct RetireView {
     /// Budget for `tasks_completed` that triggered retirement (or would have, if the
     /// active-secs budget tripped first).
     pub budget_tasks: i64,
+    /// Wall-clock seconds since `first_seen` — how long this agent has been alive.
+    pub total_wall_secs: i64,
+    /// Budget for wall-clock lifetime. Agent retires when `total_wall_secs >= budget_wall_secs`.
+    pub budget_wall_secs: i64,
     /// Unix-ts when the agent was promoted to `retired`. `None` while still `retiring`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retired_at: Option<i64>,
@@ -237,11 +241,13 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
         now,
         crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
         crate::agents::DEFAULT_RETIRE_AFTER_TASKS,
+        crate::agents::DEFAULT_RETIRE_AFTER_WALL_SECS,
     )
 }
 
 /// Same as [`gather`] but with explicit retire-budget parameters — used by the CLI to
-/// honor config overrides on `retire_after_active_secs` / `retire_after_tasks` (issue #97).
+/// honor config overrides on `retire_after_active_secs` / `retire_after_tasks` /
+/// `retire_after_wall_secs` (issue #97).
 pub fn gather_with_budget(
     conn: &Connection,
     agent: &str,
@@ -249,6 +255,7 @@ pub fn gather_with_budget(
     now: i64,
     budget_active_secs: i64,
     budget_tasks: i64,
+    budget_wall_secs: i64,
 ) -> Result<Snapshot> {
     // 0. STOP is first and absolute. If we're halted (globally or per-agent), return ONLY
     //    stop + critical and skip the rest — the agent does nothing but cheap-poll for
@@ -286,11 +293,18 @@ pub fn gather_with_budget(
     //     the load score once; both `retire` AND the next_task gate need it.
     let (tasks_completed, total_active_secs) = crate::stats::load_score_for(conn, agent)?;
     let (persisted_status, persisted_retired_at) = crate::agents::retire_state(conn, agent)?;
+    // Wall-clock lifetime: how long since the agent first appeared.
+    let total_wall_secs = crate::agents::first_seen(conn, agent)?
+        .map(|fs| (now - fs).max(0))
+        .unwrap_or(0);
+
     // The *effective* status this tick: forward-only progression based on the persisted
     // state PLUS whether the budget is currently exceeded. We never demote (a returning
     // agent doesn't un-retire by losing tasks); only promote.
     let budget_exceeded =
-        total_active_secs >= budget_active_secs.max(1) || tasks_completed >= budget_tasks.max(1);
+        total_active_secs >= budget_active_secs.max(1)
+        || tasks_completed >= budget_tasks.max(1)
+        || total_wall_secs >= budget_wall_secs.max(1);
     let effective_status: &str = if persisted_status == crate::agents::RETIRE_STATUS_RETIRED {
         crate::agents::RETIRE_STATUS_RETIRED
     } else if persisted_status == crate::agents::RETIRE_STATUS_RETIRING || budget_exceeded {
@@ -333,6 +347,8 @@ pub fn gather_with_budget(
             total_active_secs,
             budget_active_secs,
             budget_tasks,
+            total_wall_secs,
+            budget_wall_secs,
             // `retired_at` is whatever was persisted (None until tick writes it). The
             // first tick that transitions to 'retired' emits status='retired' but
             // retired_at=None; the next tick (after the write txn) has the timestamp.
@@ -465,6 +481,7 @@ pub fn tick(
         now,
         crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
         crate::agents::DEFAULT_RETIRE_AFTER_TASKS,
+        crate::agents::DEFAULT_RETIRE_AFTER_WALL_SECS,
     )
 }
 
@@ -477,6 +494,7 @@ pub fn tick_with_budget(
     now: i64,
     budget_active_secs: i64,
     budget_tasks: i64,
+    budget_wall_secs: i64,
 ) -> Result<Snapshot> {
     // #121: reap lapsed leases BEFORE the read-only gather so reaped tasks are visible
     // as `next_task` in the same tick — closes the deadlock where an idle fleet never
@@ -489,6 +507,7 @@ pub fn tick_with_budget(
         now,
         budget_active_secs,
         budget_tasks,
+        budget_wall_secs,
     )?;
     touch_and_advance_cursor(conn, agent, &snap, match_labels, now)?;
     Ok(snap)
@@ -2059,7 +2078,7 @@ mod tests {
         // normal next_task and no retire signal.
         let (_d, mut c) = open_tmp();
         let id = make_task(&mut c, "do thing", 1, None, 100);
-        let snap = gather_with_budget(&c, "Fresh", &[], 200, 5400, 8).unwrap();
+        let snap = gather_with_budget(&c, "Fresh", &[], 200, 5400, 8, i64::MAX).unwrap();
         assert!(snap.retire.is_none(), "fresh agent must not be retiring");
         assert_eq!(snap.next_task.as_ref().unwrap().id, id);
     }
@@ -2078,7 +2097,7 @@ mod tests {
         // An open task at the head of the queue — would normally be `next_task`.
         let _q = make_task(&mut c, "fresh-work", 5, None, 20000);
 
-        let snap = gather_with_budget(&c, "Tired", &[], 20000, 5400, 8).unwrap();
+        let snap = gather_with_budget(&c, "Tired", &[], 20000, 5400, 8, i64::MAX).unwrap();
         let r = snap.retire.as_ref().expect("retire signal present");
         assert_eq!(r.status, "retired"); // no current/sticky → straight to retired-effective
         assert_eq!(r.tasks_completed, 4);
@@ -2102,7 +2121,7 @@ mod tests {
             drive_done(&mut c, "ManyShort", now, now + 1);
             now += 10;
         }
-        let snap = gather_with_budget(&c, "ManyShort", &[], now + 10, 5400, 8).unwrap();
+        let snap = gather_with_budget(&c, "ManyShort", &[], now + 10, 5400, 8, i64::MAX).unwrap();
         assert!(
             snap.retire.is_some(),
             "tasks-count budget must trigger retire"
@@ -2131,7 +2150,7 @@ mod tests {
         // Also drop a normal claimable task in the queue (must stay hidden under retire).
         let _open = make_task(&mut c, "new-work", 10, None, 25500);
 
-        let snap = gather_with_budget(&c, "Dr", &[], 25500, 5400, 8).unwrap();
+        let snap = gather_with_budget(&c, "Dr", &[], 25500, 5400, 8, i64::MAX).unwrap();
         let nxt = snap.next_task.as_ref().expect("sticky-mine must surface");
         assert_eq!(
             nxt.id, sticky_id,
@@ -2151,7 +2170,7 @@ mod tests {
         for i in 0..4 {
             drive_done(&mut c, "End", 1000 + i * 5000, 1000 + i * 5000 + 1800);
         }
-        let snap1 = tick_with_budget(&mut c, "End", &[], 30_000, 5400, 8).unwrap();
+        let snap1 = tick_with_budget(&mut c, "End", &[], 30_000, 5400, 8, i64::MAX).unwrap();
         assert_eq!(snap1.retire.as_ref().unwrap().status, "retired");
         // First tick: retired_at not yet persisted at the read step (write follows).
         // Verify the persisted state.
@@ -2162,7 +2181,7 @@ mod tests {
 
         // Second tick at a later `now` — retire signal should still fire, carry the
         // ORIGINAL retired_at (idempotent: mark_retired must not re-stamp).
-        let snap2 = tick_with_budget(&mut c, "End", &[], 31_000, 5400, 8).unwrap();
+        let snap2 = tick_with_budget(&mut c, "End", &[], 31_000, 5400, 8, i64::MAX).unwrap();
         let r = snap2.retire.as_ref().expect("retire signal still present");
         assert_eq!(r.status, "retired");
         assert_eq!(r.retired_at, Some(30_000));
@@ -2182,7 +2201,7 @@ mod tests {
         let active = make_task(&mut c, "in-flight", 1, None, 30_000);
         tasks::claim(&mut c, "Busy", Some(active), &[], 3600, 30_100).unwrap();
 
-        let snap = tick_with_budget(&mut c, "Busy", &[], 30_200, 5400, 8).unwrap();
+        let snap = tick_with_budget(&mut c, "Busy", &[], 30_200, 5400, 8, i64::MAX).unwrap();
         let r = snap.retire.as_ref().expect("retire signal present");
         assert_eq!(r.status, "retiring");
         // Current task still surfaces (XOR with next_task; retirement doesn't hide it).
@@ -2210,6 +2229,36 @@ mod tests {
         // Sanity: the constants are what the doc-comment claims.
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS, 5400);
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_TASKS, 8);
+        assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_WALL_SECS, 3600);
+    }
+
+    #[test]
+    fn retire_wall_clock_budget_triggers_retirement() {
+        // An agent with minimal task load but alive longer than the wall-clock budget
+        // must retire. This is the idle-session backstop: 1 short task, well under
+        // active-secs and tasks-count budgets, but first_seen is >3600s ago.
+        let (_d, mut c) = open_tmp();
+        // One short task completed early in the agent's life.
+        drive_done(&mut c, "Idle", 100, 110);
+        // now=4000 → wall-clock = 4000 - first_seen. first_seen is the first touch
+        // timestamp from drive_done (100). So total_wall = 4000-100 = 3900 > 3600.
+        let snap = gather_with_budget(&c, "Idle", &[], 4000, 5400, 8, 3600).unwrap();
+        let r = snap.retire.as_ref().expect("wall-clock budget must trigger retire");
+        assert_eq!(r.status, "retired");
+        assert_eq!(r.total_wall_secs, 3900);
+        assert_eq!(r.budget_wall_secs, 3600);
+        // Active-secs and tasks-count are well under budget — wall-clock is the sole trigger.
+        assert!(r.total_active_secs < r.budget_active_secs);
+        assert!(r.tasks_completed < r.budget_tasks);
+    }
+
+    #[test]
+    fn wall_clock_under_budget_does_not_retire() {
+        // Same setup but now=500 → wall-clock = 400s, well under 3600.
+        let (_d, mut c) = open_tmp();
+        drive_done(&mut c, "Young", 100, 110);
+        let snap = gather_with_budget(&c, "Young", &[], 500, 5400, 8, 3600).unwrap();
+        assert!(snap.retire.is_none(), "agent under wall budget must not retire");
     }
 
     #[test]
