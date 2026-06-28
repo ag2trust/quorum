@@ -36,6 +36,30 @@ pub const REVIEW_LABEL: &str = "kind:review";
 /// Eligibility-only — does not change priority. The issue spec pins "Default W = 30m".
 pub const STICKY_WINDOW_SECS: i64 = 1800;
 
+/// Shortened sticky-reopen window for high-priority tasks (issue #88). When a reviewer's
+/// `changes` verdict reopens a task whose `priority >= CRITICAL_PRIORITY_THRESHOLD`, the
+/// sticky window collapses to this many seconds — long enough that an active original
+/// author still gets a slight preference, short enough that a disengaged author doesn't
+/// lock the task out from other idle eligible agents. Picked at 60s because the work-loop
+/// tick is currently ~5 min — well under one tick, so a sticky author who is between ticks
+/// does NOT block the queue, but an actively-running author (turn-of-conversation
+/// reviewer→author) typically still gets the first claim.
+pub const STICKY_WINDOW_SECS_CRITICAL: i64 = 60;
+
+/// Priority threshold at and above which a task is treated as critical for sticky-fallback
+/// (issue #88). Tasks created with `priority >= CRITICAL_PRIORITY_THRESHOLD` get the
+/// shortened sticky window on `changes`-verdict reopens. Set comfortably above realistic
+/// CTO-assigned priorities (typically <200) and below the auto-spawned-review priority
+/// (`REVIEW_PRIORITY = 1000`) — but reviews never go through the `changes`-verdict reopen
+/// path (verdicts target the original task T, not the review R), so the overlap is moot.
+/// The CTO opts a task INTO fast-fallback by creating it with `--priority 900` or higher.
+pub const CRITICAL_PRIORITY_THRESHOLD: i64 = 900;
+
+// Compile-time invariant: the critical sticky window must be a small fraction of the
+// default — if these ever drift to comparable values, the "fast-fallback" property the
+// CASE in apply_verdict is supposed to deliver silently disappears.
+const _: () = assert!(STICKY_WINDOW_SECS_CRITICAL < STICKY_WINDOW_SECS / 10);
+
 /// Priority assigned to an auto-spawned review task (issue #10). Reviews precede new work
 /// by sorting above any realistic executor-priority — the issue spec says "priority HIGH
 /// (so reviews precede new work — automatic)." Hardcoded in v1 because making it tunable
@@ -717,11 +741,21 @@ fn apply_verdict(
             // T → open + sticky window + assignee=orig + dedup-append "rework" label. We use
             // json_insert with a CASE for dedup — appending an already-present "rework"
             // would accumulate dupes across multiple review rounds for the same task.
+            //
+            // Issue #88: the sticky window length is row-conditional on `priority`. For
+            // `priority >= CRITICAL_PRIORITY_THRESHOLD` we use `STICKY_WINDOW_SECS_CRITICAL`
+            // (≈60s — one fleet beat) so an idle eligible non-orig agent can claim a
+            // master-blocking reopen without waiting out the default 30-minute window. The
+            // CASE is in-SQL so we avoid an extra SELECT round-trip just to read the
+            // priority of the row we're already UPDATEing.
             let n = tx.execute(
                 "UPDATE tasks SET
                     status = 'open',
                     assignee = ?1,
-                    sticky_until = ?2,
+                    sticky_until = ?2 + CASE
+                        WHEN priority >= ?6 THEN ?7
+                        ELSE ?8
+                    END,
                     labels = CASE
                         WHEN labels IS NULL OR labels NOT LIKE '%\"rework\"%'
                         THEN json_insert(COALESCE(labels, '[]'), '$[#]', ?3)
@@ -729,7 +763,16 @@ fn apply_verdict(
                     END,
                     updated_at = ?4
                  WHERE id = ?5 AND status = 'done'",
-                params![orig, now + STICKY_WINDOW_SECS, REWORK_LABEL, now, target_t],
+                params![
+                    orig,
+                    now,
+                    REWORK_LABEL,
+                    now,
+                    target_t,
+                    CRITICAL_PRIORITY_THRESHOLD,
+                    STICKY_WINDOW_SECS_CRITICAL,
+                    STICKY_WINDOW_SECS
+                ],
             )?;
             if n == 0 {
                 let _ = ();
@@ -2455,6 +2498,157 @@ mod tests {
             .count();
         assert_eq!(rework_count, 1, "rework must appear exactly once");
         assert!(arr.iter().any(|v| v.as_str() == Some("other")));
+    }
+
+    #[test]
+    fn verdict_changes_critical_priority_uses_shorter_sticky_window() {
+        // Issue #88: a task created with priority >= CRITICAL_PRIORITY_THRESHOLD gets
+        // STICKY_WINDOW_SECS_CRITICAL on `changes`-verdict reopen, not the default
+        // STICKY_WINDOW_SECS. The CASE in apply_verdict picks the window per-row from
+        // `priority`; this test pins both branches.
+        let (_d, mut c) = open_tmp();
+        let tid_crit = create(
+            &mut c,
+            "boss",
+            "T-critical",
+            None,
+            CRITICAL_PRIORITY_THRESHOLD, // exactly at threshold: gets shorter window
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let tid_normal = create(
+            &mut c,
+            "boss",
+            "T-normal",
+            None,
+            CRITICAL_PRIORITY_THRESHOLD - 1, // one below threshold: gets default window
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        for tid in [tid_crit, tid_normal] {
+            claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+            update(
+                &mut c,
+                "A",
+                tid,
+                &TaskUpdate {
+                    status: Some("done"),
+                    ..Default::default()
+                },
+                1100,
+            )
+            .unwrap();
+            let r = last_review_task(&c);
+            claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+            update(
+                &mut c,
+                "B",
+                r.id,
+                &TaskUpdate {
+                    status: Some("done"),
+                    verdict: Some("changes"),
+                    ..Default::default()
+                },
+                1300,
+            )
+            .unwrap();
+        }
+        let t_crit = get(&c, tid_crit).unwrap().unwrap();
+        let t_normal = get(&c, tid_normal).unwrap().unwrap();
+        assert_eq!(
+            t_crit.sticky_until,
+            Some(1300 + STICKY_WINDOW_SECS_CRITICAL),
+            "critical task must use STICKY_WINDOW_SECS_CRITICAL"
+        );
+        assert_eq!(
+            t_normal.sticky_until,
+            Some(1300 + STICKY_WINDOW_SECS),
+            "non-critical task must use STICKY_WINDOW_SECS"
+        );
+        // The compile-time `const _: () = assert!(STICKY_WINDOW_SECS_CRITICAL <
+        // STICKY_WINDOW_SECS / 10)` pins the "shorter window is meaningfully shorter"
+        // property; nothing to assert at runtime here.
+    }
+
+    #[test]
+    fn verdict_changes_critical_sticky_falls_back_to_non_orig_after_short_window() {
+        // The acceptance test for issue #88: a critical CHANGES_REQUESTED reopen can be
+        // claimed by a non-author idle agent without waiting out a multi-minute sticky
+        // window. End-to-end: spawn T (critical), claim by A, done, review by B, changes
+        // verdict, then verify a non-A agent C can claim T after just past
+        // STICKY_WINDOW_SECS_CRITICAL — well before the default STICKY_WINDOW_SECS would
+        // have expired.
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "T",
+            None,
+            CRITICAL_PRIORITY_THRESHOLD,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        claim(&mut c, "B", Some(r.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        // Within the shortened sticky window: only A (orig) may claim.
+        assert!(
+            claim(
+                &mut c,
+                "C",
+                None,
+                &[],
+                TTL,
+                1300 + STICKY_WINDOW_SECS_CRITICAL / 2
+            )
+            .unwrap()
+            .is_none(),
+            "non-orig C must be blocked during the shortened sticky window"
+        );
+        // Past the shortened sticky window (but WELL before STICKY_WINDOW_SECS would have
+        // expired): C may claim. This is the fast-fallback property.
+        let now_after = 1300 + STICKY_WINDOW_SECS_CRITICAL + 1;
+        assert!(
+            now_after < 1300 + STICKY_WINDOW_SECS,
+            "fast-fallback claim must happen well before the default window expires"
+        );
+        let t = claim(&mut c, "C", None, &[], TTL, now_after)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, tid);
+        assert_eq!(t.assignee.as_deref(), Some("C"));
     }
 
     #[test]
