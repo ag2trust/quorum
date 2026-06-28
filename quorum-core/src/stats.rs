@@ -164,7 +164,9 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
 
     let agents_total = one("SELECT count(*) FROM agents", &[])?;
     let agents_online = one(
-        "SELECT count(*) FROM agents WHERE (?1 - last_seen) < ?2",
+        "SELECT count(*) FROM agents WHERE (?1 - last_seen) < ?2
+           OR EXISTS (SELECT 1 FROM claims c
+                      WHERE c.holder = agents.id AND c.active = 1 AND c.expires_at > ?1)",
         &[&now, &online_window],
     )?;
     let messages_live = one(
@@ -243,6 +245,8 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
          LEFT JOIN tasks t
            ON t.id = CAST(SUBSTR(c.target, 6) AS INTEGER)
          WHERE (?1 - a.last_seen) < ?2
+            OR EXISTS (SELECT 1 FROM claims c2
+                       WHERE c2.holder = a.id AND c2.active = 1 AND c2.expires_at > ?1)
          ORDER BY a.id ASC",
     )?;
     let mut views: Vec<AgentView> = stmt
@@ -559,14 +563,17 @@ mod tests {
     #[test]
     fn counts_exclude_expired_and_stale() {
         let (_d, mut c) = open_tmp();
-        crate::feed::post(&mut c, "A", "info", None, "live", None, None, 1000, 100).unwrap();
+        // Live message survives past now; dead message expired long ago.
+        crate::feed::post(&mut c, "A", "info", None, "live", None, None, 4000, 100).unwrap();
         crate::feed::post(&mut c, "A", "info", None, "dead", None, None, 5, 100).unwrap();
+        // Claim auto-renewed by touch to expires_at = MAX(1100, 100+3600) = 3700.
         crate::claims::claim(&mut c, "A", "pr#1", 1000, 100).unwrap();
         crate::tasks::create(&mut c, "A", "t", None, 0, None, None, None, 100).unwrap();
 
-        let s = stats(&c, 500, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        // now=4000: agent last_seen=100 (3900s stale > 900 window), claim expired (3700 < 4000).
+        let s = stats(&c, 4000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert_eq!(s.messages_live, 1);
-        assert_eq!(s.claims_active, 1);
+        assert_eq!(s.claims_active, 0);
         assert_eq!(s.agents_total, 1);
         assert_eq!(s.agents_online, 0);
         assert_eq!(
@@ -577,6 +584,53 @@ mod tests {
             }]
         );
         assert_eq!(s.errors_live, 0);
+    }
+
+    // --- Issue #100: claim-holders count as online -------------------------
+
+    #[test]
+    fn claim_holder_counted_as_online_in_stats() {
+        let (_d, mut c) = open_tmp();
+        // ttl=5000 so claim expires at 5100 (well past now=2000).
+        crate::claims::claim(&mut c, "A", "pr#1", 5000, 100).unwrap();
+        // now=2000: last_seen=100 stale (1900 > 900 window), but claim active (5100>2000).
+        let s = stats(&c, 2000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.agents_online, 1, "claim-holder must count as online");
+        assert_eq!(s.agents.len(), 1, "claim-holder must appear in agents view");
+    }
+
+    #[test]
+    fn claim_holder_with_task_shows_busy_in_agents_view() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c,
+            "boss",
+            "fix-presence",
+            None,
+            0,
+            Some("[\"tier:opus-46\"]"),
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        crate::tasks::claim(&mut c, "Worker", Some(tid), &[], 3600, 100).unwrap();
+        crate::agents::set_tier(&c, "Worker", Some("tier:opus-46")).unwrap();
+        // now=2000: both agents last_seen=100 (1900s stale > 900 window).
+        // "boss" has no claims → offline. "Worker" holds task claim (expires 3700 > 2000) → online.
+        let s = stats(&c, 2000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(
+            s.agents_online, 1,
+            "only claim-holder Worker should be online"
+        );
+        assert_eq!(s.agents.len(), 1, "only online agents appear in the view");
+        let worker = &s.agents[0];
+        assert_eq!(worker.id, "Worker");
+        assert!(
+            worker.current_task.is_some(),
+            "worker must show current task"
+        );
+        assert_eq!(worker.current_task.as_ref().unwrap().title, "fix-presence");
     }
 
     // --- Issue #77 dashboard fields ----------------------------------------

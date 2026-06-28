@@ -38,7 +38,7 @@ impl Default for Config {
 /// `Config::default()` — verified by `default_toml_matches_default_config`.
 pub const DEFAULT_TOML: &str = "\
 # Quorum config. Delete any line to use its built-in default.
-online_window_secs   = 300        # agent considered online if active within 5 min
+online_window_secs   = 900        # agent considered online if active within 15 min
 message_ttl_secs     = 172800     # 48h
 task_lease_ttl_secs  = 3600       # 1h task-claim lease; assignee renews on long work
 read_limit           = 100        # default page size for read/peek
