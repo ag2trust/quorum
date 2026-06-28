@@ -1,11 +1,19 @@
--- Quorum schema (SCHEMA_VERSION = 9). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 10). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
-    id          TEXT PRIMARY KEY,
-    first_seen  INTEGER NOT NULL,
-    last_seen   INTEGER NOT NULL,
-    tier        TEXT
+    id            TEXT PRIMARY KEY,
+    first_seen    INTEGER NOT NULL,
+    last_seen     INTEGER NOT NULL,
+    tier          TEXT,
+    -- Agent-retirement state machine (issue #97): 'active' | 'retiring' | 'retired'.
+    -- Transitions are computed inside `sync::tick` from the load_score budget; once an
+    -- agent reaches 'retired' it stays there for this DB's lifetime (a fresh session
+    -- name is a fresh agent row).
+    retire_status TEXT NOT NULL DEFAULT 'active',
+    -- Unix-ts the agent reached 'retired' (NULL until then). Surfaced in `quorum status`
+    -- under the retired-agents list so the owner sees capacity dropping in real time.
+    retired_at    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS messages (

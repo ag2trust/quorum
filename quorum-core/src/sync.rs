@@ -112,6 +112,36 @@ pub struct LogEntry {
     pub body: String,
 }
 
+/// Retirement signal (issue #97) — present when the agent is in `retiring` or `retired`
+/// state. Emits the load-score that triggered retirement so the agent (and operator) can
+/// reason about why retirement fired, and the budgets so the threshold is self-documenting.
+///
+/// Semantics for the agent's work-loop:
+/// - `status = "retiring"` → drain current/sticky work, then sign off. NO new claims of
+///   non-sticky tasks. Reciprocity reviews are "new work" by this definition.
+/// - `status = "retired"` → sign off immediately; `retired_at` is the canonical timestamp.
+///
+/// Companion `work-loop` skill changes (honoring this signal) ship in ag2trust separately —
+/// see issue #97 trailing note.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RetireView {
+    /// `"retiring"` or `"retired"` — mirrors `agents.retire_status`.
+    pub status: String,
+    /// Cumulative completed tasks for this agent.
+    pub tasks_completed: i64,
+    /// Cumulative active seconds across completed tasks.
+    pub total_active_secs: i64,
+    /// Budget for `total_active_secs` that triggered retirement (or would have, if the
+    /// tasks-count budget tripped first). Self-documents the threshold every tick.
+    pub budget_active_secs: i64,
+    /// Budget for `tasks_completed` that triggered retirement (or would have, if the
+    /// active-secs budget tripped first).
+    pub budget_tasks: i64,
+    /// Unix-ts when the agent was promoted to `retired`. `None` while still `retiring`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<i64>,
+}
+
 /// The HALT signal — present when the agent (or everybody, on a global stop) is stopped.
 /// Field order matches the issue's lock: `{reason, scope, since, by}`. Global stops
 /// take precedence over agent-targeted stops on the `is_stopped` query (broader signal —
@@ -163,6 +193,11 @@ pub struct Snapshot {
     /// `None`; never `Some(false)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_cleared: Option<bool>,
+    /// Issue #97 retirement signal — present iff the agent is `retiring` or `retired`.
+    /// Field ordering (after stop_cleared, before critical) puts it just below the HALT
+    /// signals so a stop+retire collision keeps stop primacy without burying retirement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retire: Option<RetireView>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub critical: Vec<MsgView>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,7 +225,31 @@ pub struct Snapshot {
 /// entry; empty slice = no label filter (mirrors `tasks::claim`).
 ///
 /// Running this mid-task is a non-event by design.
+///
+/// Convenience wrapper around [`gather_with_budget`] using the core retirement defaults
+/// from `agents::DEFAULT_RETIRE_AFTER_*`. The CLI plumbs config-overridable budgets via
+/// `gather_with_budget` directly.
 pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -> Result<Snapshot> {
+    gather_with_budget(
+        conn,
+        agent,
+        match_labels,
+        now,
+        crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
+        crate::agents::DEFAULT_RETIRE_AFTER_TASKS,
+    )
+}
+
+/// Same as [`gather`] but with explicit retire-budget parameters — used by the CLI to
+/// honor config overrides on `retire_after_active_secs` / `retire_after_tasks` (issue #97).
+pub fn gather_with_budget(
+    conn: &Connection,
+    agent: &str,
+    match_labels: &[&str],
+    now: i64,
+    budget_active_secs: i64,
+    budget_tasks: i64,
+) -> Result<Snapshot> {
     // 0. STOP is first and absolute. If we're halted (globally or per-agent), return ONLY
     //    stop + critical and skip the rest — the agent does nothing but cheap-poll for
     //    resume. Critical msgs still come through (they may explain the halt or be a more
@@ -222,13 +281,63 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
     //     sees it within seconds, and the window absorbs realistic variance.
     let stop_cleared = recently_cleared(conn, agent, now)?.then_some(true);
 
-    // 1. State-adaptive XOR. If we hold a claimed task, surface it; do NOT also dangle
-    //    next_task (locked in the design session — never show a second task to a busy agent).
+    // 1a. Retirement signal (issue #97). Read the agent's persisted retire_status — it may
+    //     already have been promoted to 'retiring'/'retired' on a prior tick. Also compute
+    //     the load score once; both `retire` AND the next_task gate need it.
+    let (tasks_completed, total_active_secs) = crate::stats::load_score_for(conn, agent)?;
+    let (persisted_status, persisted_retired_at) = crate::agents::retire_state(conn, agent)?;
+    // The *effective* status this tick: forward-only progression based on the persisted
+    // state PLUS whether the budget is currently exceeded. We never demote (a returning
+    // agent doesn't un-retire by losing tasks); only promote.
+    let budget_exceeded =
+        total_active_secs >= budget_active_secs.max(1) || tasks_completed >= budget_tasks.max(1);
+    let effective_status: &str = if persisted_status == crate::agents::RETIRE_STATUS_RETIRED {
+        crate::agents::RETIRE_STATUS_RETIRED
+    } else if persisted_status == crate::agents::RETIRE_STATUS_RETIRING || budget_exceeded {
+        crate::agents::RETIRE_STATUS_RETIRING
+    } else {
+        crate::agents::RETIRE_STATUS_ACTIVE
+    };
+
+    // 1b. State-adaptive XOR. If we hold a claimed task, surface it; do NOT also dangle
+    //     next_task (locked in the design session — never show a second task to a busy agent).
     let current_task = current_task_view(conn, agent, now)?;
-    let next_task = if current_task.is_none() {
+    let next_task = if current_task.is_some() {
+        // Busy: never surface next_task, retiring or not.
+        None
+    } else if effective_status == crate::agents::RETIRE_STATUS_ACTIVE {
         next_task_view(conn, match_labels)?
     } else {
+        // Retiring/retired: no NEW work, but a sticky-pending rework belongs to this
+        // agent and ONLY they can do it — surface it so the agent can drain before
+        // signing off (issue #97 §2 "sticky carve-out"). Bypasses match_labels because
+        // sticky-mine is by-name, not by-tier.
+        sticky_mine_view(conn, agent, now)?
+    };
+
+    // Retirement signal is emitted whenever effective_status != active. Carries the budgets
+    // so the value is self-documenting tick-to-tick.
+    let retire = if effective_status == crate::agents::RETIRE_STATUS_ACTIVE {
         None
+    } else {
+        let no_remaining_work = current_task.is_none() && next_task.is_none();
+        let will_be_retired =
+            effective_status == crate::agents::RETIRE_STATUS_RETIRED || no_remaining_work;
+        Some(RetireView {
+            status: if will_be_retired {
+                crate::agents::RETIRE_STATUS_RETIRED.to_string()
+            } else {
+                crate::agents::RETIRE_STATUS_RETIRING.to_string()
+            },
+            tasks_completed,
+            total_active_secs,
+            budget_active_secs,
+            budget_tasks,
+            // `retired_at` is whatever was persisted (None until tick writes it). The
+            // first tick that transitions to 'retired' emits status='retired' but
+            // retired_at=None; the next tick (after the write txn) has the timestamp.
+            retired_at: persisted_retired_at,
+        })
     };
 
     // 2. Message bucketing: direct full / critical full / broadcasts count + critical bodies.
@@ -261,6 +370,7 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
     Ok(Snapshot {
         stop: None,
         stop_cleared,
+        retire,
         critical: buckets.critical,
         current_task,
         next_task,
@@ -269,6 +379,33 @@ pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -
         pinned,
         log,
     })
+}
+
+/// Sticky-pending rework view (issue #97 sticky carve-out): an open task assigned to
+/// `agent` with `sticky_until > now`. Returns `None` if no such task exists. Same
+/// `NextTaskView` shape so the agent's loop doesn't need a new code path — it just claims
+/// what `next_task` says.
+fn sticky_mine_view(conn: &Connection, agent: &str, now: i64) -> Result<Option<NextTaskView>> {
+    let row = conn
+        .query_row(
+            "SELECT id, title, priority, labels FROM tasks
+             WHERE status = 'open'
+               AND assignee = ?1
+               AND sticky_until IS NOT NULL AND sticky_until > ?2
+             ORDER BY priority DESC, id ASC
+             LIMIT 1",
+            params![agent, now],
+            |r| {
+                Ok(NextTaskView {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    priority: r.get(2)?,
+                    labels: r.get(3)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
 }
 
 /// `true` iff there's a `stop_cleared` event for the agent's scope (`global` or
@@ -321,7 +458,34 @@ pub fn tick(
     match_labels: &[&str],
     now: i64,
 ) -> Result<Snapshot> {
-    let snap = gather(conn, agent, match_labels, now)?;
+    tick_with_budget(
+        conn,
+        agent,
+        match_labels,
+        now,
+        crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
+        crate::agents::DEFAULT_RETIRE_AFTER_TASKS,
+    )
+}
+
+/// Same as [`tick`] but with explicit retire-budget parameters — the CLI calls this with
+/// values from `~/.quorum/config.toml`. Issue #97.
+pub fn tick_with_budget(
+    conn: &mut Connection,
+    agent: &str,
+    match_labels: &[&str],
+    now: i64,
+    budget_active_secs: i64,
+    budget_tasks: i64,
+) -> Result<Snapshot> {
+    let snap = gather_with_budget(
+        conn,
+        agent,
+        match_labels,
+        now,
+        budget_active_secs,
+        budget_tasks,
+    )?;
     touch_and_advance_cursor(conn, agent, &snap, match_labels, now)?;
     Ok(snap)
 }
@@ -374,7 +538,7 @@ fn touch_and_advance_cursor(
     }
 
     // ALWAYS write a txn — even on a quiet tick, `touch` runs (presence + auto-renew).
-    // Two updates, one transaction:
+    // Three updates, one transaction:
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     // Persist the agent's declared tier from --match-label (#82).
@@ -382,6 +546,16 @@ fn touch_and_advance_cursor(
         .iter()
         .find_map(|l| l.strip_prefix("tier:").map(|_| *l));
     crate::agents::set_tier(&tx, agent, tier)?;
+    // Issue #97 retirement state transitions. The effective status this tick lives on the
+    // snapshot's `RetireView` (computed by `gather_with_budget`). Each transition is
+    // forward-only; the helpers are no-ops when the destination state is already set.
+    if let Some(retire) = &snap.retire {
+        if retire.status == crate::agents::RETIRE_STATUS_RETIRED {
+            crate::agents::mark_retired(&tx, agent, now)?;
+        } else {
+            crate::agents::mark_retiring(&tx, agent)?;
+        }
+    }
     if max_seen > cursor_now {
         // Same shape as feed::read --ack-through: insert-or-update with MAX(...).
         tx.execute(
@@ -1620,5 +1794,189 @@ mod tests {
         let snap = gather(&c, "A", &[], 100).unwrap();
         let ids: Vec<i64> = snap.pinned.iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![a.id, b.id, c_pin.id]);
+    }
+
+    // -- Agent retirement (issue #97) -----------------------------------------------------
+
+    /// Drive a task to `done` as `agent`: create → claim → update(done). Returns the id.
+    /// Mirrors stats.rs's complete_task_as helper but uses a very long claim lease so
+    /// `sweep_on_write` (which fires inside every mutator's txn) does NOT delete the
+    /// claim row before `load_score_for` joins against it — load_score reads `claims.ts`
+    /// as the working-window start, so a swept claim silently zeros the score.
+    /// 10⁹ seconds is well past any test's `now`.
+    fn drive_done(c: &mut Connection, agent: &str, claim_ts: i64, done_ts: i64) -> i64 {
+        let id = make_task(c, &format!("t-{claim_ts}"), 0, None, claim_ts - 1);
+        tasks::claim(c, agent, Some(id), &[], 1_000_000_000, claim_ts).unwrap();
+        tasks::update(
+            c,
+            agent,
+            id,
+            &tasks::TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            done_ts,
+        )
+        .unwrap();
+        id
+    }
+
+    #[test]
+    fn retire_under_budget_active_agent_gets_normal_next_task() {
+        // Sanity: an agent with no load score and an open task in the queue gets a
+        // normal next_task and no retire signal.
+        let (_d, mut c) = open_tmp();
+        let id = make_task(&mut c, "do thing", 1, None, 100);
+        let snap = gather_with_budget(&c, "Fresh", &[], 200, 5400, 8).unwrap();
+        assert!(snap.retire.is_none(), "fresh agent must not be retiring");
+        assert_eq!(snap.next_task.as_ref().unwrap().id, id);
+    }
+
+    #[test]
+    fn retire_active_secs_budget_suppresses_next_task_and_emits_signal() {
+        // Agent with cumulative active-secs above the budget enters `retiring`: the
+        // queue's open task is hidden (no new work), and the retire signal is emitted
+        // carrying the load-score that triggered it.
+        let (_d, mut c) = open_tmp();
+        // 4 completed tasks, each 30 min long → 7200 sec cumulative.
+        drive_done(&mut c, "Tired", 1000, 1000 + 1800);
+        drive_done(&mut c, "Tired", 5000, 5000 + 1800);
+        drive_done(&mut c, "Tired", 9000, 9000 + 1800);
+        drive_done(&mut c, "Tired", 13000, 13000 + 1800);
+        // An open task at the head of the queue — would normally be `next_task`.
+        let _q = make_task(&mut c, "fresh-work", 5, None, 20000);
+
+        let snap = gather_with_budget(&c, "Tired", &[], 20000, 5400, 8).unwrap();
+        let r = snap.retire.as_ref().expect("retire signal present");
+        assert_eq!(r.status, "retired"); // no current/sticky → straight to retired-effective
+        assert_eq!(r.tasks_completed, 4);
+        assert_eq!(r.total_active_secs, 4 * 1800);
+        assert_eq!(r.budget_active_secs, 5400);
+        assert_eq!(r.budget_tasks, 8);
+        assert!(
+            snap.next_task.is_none(),
+            "retiring agent must NOT receive new queue work"
+        );
+    }
+
+    #[test]
+    fn retire_tasks_budget_alone_triggers_retirement() {
+        // The tasks-count backstop fires even when each individual task is short
+        // (total active secs well under the secs budget). 9 tasks at 1 sec each =
+        // 9 sec cumulative, way under 5400 — but 9 ≥ 8 trips the count budget.
+        let (_d, mut c) = open_tmp();
+        let mut now = 100i64;
+        for _ in 0..9 {
+            drive_done(&mut c, "ManyShort", now, now + 1);
+            now += 10;
+        }
+        let snap = gather_with_budget(&c, "ManyShort", &[], now + 10, 5400, 8).unwrap();
+        assert!(
+            snap.retire.is_some(),
+            "tasks-count budget must trigger retire"
+        );
+        assert_eq!(snap.retire.as_ref().unwrap().tasks_completed, 9);
+    }
+
+    #[test]
+    fn retiring_agent_with_sticky_mine_sees_sticky_in_next_task() {
+        // Sticky carve-out: when retire would otherwise hide next_task, a sticky task
+        // assigned to the retiring agent (own rework — only they can do it) MUST still
+        // surface so they can drain before signing off.
+        let (_d, mut c) = open_tmp();
+        // Build up the load score so the agent is over budget.
+        for i in 0..4 {
+            drive_done(&mut c, "Dr", 1000 + i * 5000, 1000 + i * 5000 + 1800);
+        }
+        // Stamp a sticky-rework task assigned to "Dr" the same way `changes`-verdict
+        // reopens do (open + assignee + sticky_until in the future).
+        let sticky_id = make_task(&mut c, "rework-me", 100, None, 25000);
+        c.execute(
+            "UPDATE tasks SET status='open', assignee='Dr', sticky_until=?1 WHERE id=?2",
+            params![26000_i64, sticky_id],
+        )
+        .unwrap();
+        // Also drop a normal claimable task in the queue (must stay hidden under retire).
+        let _open = make_task(&mut c, "new-work", 10, None, 25500);
+
+        let snap = gather_with_budget(&c, "Dr", &[], 25500, 5400, 8).unwrap();
+        let nxt = snap.next_task.as_ref().expect("sticky-mine must surface");
+        assert_eq!(
+            nxt.id, sticky_id,
+            "sticky-mine carve-out must surface own rework"
+        );
+        let r = snap.retire.as_ref().expect("retire signal present");
+        // Sticky-mine counts as remaining work → still 'retiring' (not yet 'retired').
+        assert_eq!(r.status, "retiring");
+    }
+
+    #[test]
+    fn tick_persists_retiring_then_retired_across_calls() {
+        // First tick (over budget, no remaining work) writes `retired` + retired_at.
+        // The next tick (with the timestamp now persisted) returns retired_at in the
+        // signal — pinning the "stable across calls" guarantee the dashboard relies on.
+        let (_d, mut c) = open_tmp();
+        for i in 0..4 {
+            drive_done(&mut c, "End", 1000 + i * 5000, 1000 + i * 5000 + 1800);
+        }
+        let snap1 = tick_with_budget(&mut c, "End", &[], 30_000, 5400, 8).unwrap();
+        assert_eq!(snap1.retire.as_ref().unwrap().status, "retired");
+        // First tick: retired_at not yet persisted at the read step (write follows).
+        // Verify the persisted state.
+        let (st, ts) = crate::agents::retire_state(&c, "End").unwrap();
+        assert_eq!(st, "retired");
+        let stamped = ts.expect("retired_at must be stamped");
+        assert_eq!(stamped, 30_000);
+
+        // Second tick at a later `now` — retire signal should still fire, carry the
+        // ORIGINAL retired_at (idempotent: mark_retired must not re-stamp).
+        let snap2 = tick_with_budget(&mut c, "End", &[], 31_000, 5400, 8).unwrap();
+        let r = snap2.retire.as_ref().expect("retire signal still present");
+        assert_eq!(r.status, "retired");
+        assert_eq!(r.retired_at, Some(30_000));
+        assert!(snap2.next_task.is_none());
+    }
+
+    #[test]
+    fn tick_writes_retiring_status_when_current_task_remains() {
+        // Over-budget agent still holding a claimed task → status persists as
+        // 'retiring' (NOT retired — they have work to drain). Verify the write actually
+        // hit the agents table.
+        let (_d, mut c) = open_tmp();
+        for i in 0..4 {
+            drive_done(&mut c, "Busy", 1000 + i * 5000, 1000 + i * 5000 + 1800);
+        }
+        // Hold a current claim (open task → claim → still claimed).
+        let active = make_task(&mut c, "in-flight", 1, None, 30_000);
+        tasks::claim(&mut c, "Busy", Some(active), &[], 3600, 30_100).unwrap();
+
+        let snap = tick_with_budget(&mut c, "Busy", &[], 30_200, 5400, 8).unwrap();
+        let r = snap.retire.as_ref().expect("retire signal present");
+        assert_eq!(r.status, "retiring");
+        // Current task still surfaces (XOR with next_task; retirement doesn't hide it).
+        assert!(snap.current_task.is_some());
+
+        let (st, ts) = crate::agents::retire_state(&c, "Busy").unwrap();
+        assert_eq!(st, "retiring");
+        assert!(
+            ts.is_none(),
+            "retired_at must NOT be stamped while retiring"
+        );
+    }
+
+    #[test]
+    fn retire_default_budget_constants_match_agents_module() {
+        // Pin: the budgets gather() uses without a config override are exactly the
+        // ones exported by `agents`. A drift here would silently shift retirement
+        // semantics for every test/CLI path that calls plain `gather`/`tick`.
+        let (_d, mut c) = open_tmp();
+        // Two completed tasks (well under both budgets).
+        drive_done(&mut c, "X", 100, 200);
+        drive_done(&mut c, "X", 300, 400);
+        let snap = gather(&c, "X", &[], 500).unwrap();
+        assert!(snap.retire.is_none());
+        // Sanity: the constants are what the doc-comment claims.
+        assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS, 5400);
+        assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_TASKS, 8);
     }
 }

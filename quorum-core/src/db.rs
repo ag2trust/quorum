@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -168,6 +168,18 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v9 = per-(task, project) branch allocations (issue #98). Net-new table — the
         // CREATE TABLE IF NOT EXISTS in SCHEMA_SQL handles fresh DBs and upgrades alike;
         // no ALTER needed.
+        // v10 = agent-retirement state machine (issue #97). Two additive columns on
+        // `agents`; both safe to apply to a populated table (pre-existing rows default to
+        // `'active'` / NULL). Forward-only — once a row reaches `'retired'` it stays there.
+        if current < 10 && !column_exists(conn, "agents", "retire_status")? {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN retire_status TEXT NOT NULL DEFAULT 'active'",
+                [],
+            )?;
+        }
+        if current < 10 && !column_exists(conn, "agents", "retired_at")? {
+            conn.execute("ALTER TABLE agents ADD COLUMN retired_at INTEGER", [])?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -726,5 +738,71 @@ mod tests {
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
+    }
+
+    /// Issue #97: simulate a DB at v9 (current main's shape) and verify that the v10
+    /// migration applies — adding both `agents.retire_status` and `agents.retired_at`,
+    /// and bumping `user_version` to 10. This pins the fix for Gravel-m38's Critical
+    /// review finding: an earlier draft of this PR declared v9 alongside main's #98
+    /// branch-allocations v9, so the `if current < 9` guard never fired on existing
+    /// databases and the retirement columns were silently skipped.
+    #[test]
+    fn migrates_v9_to_v10_adds_retire_columns() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        // Hand-craft a v9 database: the v9 `agents` table shape (no retire columns yet)
+        // plus the branch-allocations table from PR #98, then stamp user_version=9.
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE agents (
+                 id         TEXT PRIMARY KEY,
+                 first_seen INTEGER NOT NULL,
+                 last_seen  INTEGER NOT NULL,
+                 tier       TEXT
+             );
+             CREATE TABLE branch_allocations (
+                 task_id INTEGER NOT NULL,
+                 project TEXT NOT NULL,
+                 branch  TEXT NOT NULL,
+                 PRIMARY KEY (task_id, project)
+             );
+             INSERT INTO agents(id, first_seen, last_seen, tier)
+                 VALUES ('Veteran', 100, 100, 'tier:opus-46');
+             PRAGMA user_version = 9;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        // Now open via the production path — migrate() must lift v9 → v10 and ALTER
+        // the agents table to add retire_status + retired_at.
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 10, "user_version must advance to 10");
+        assert!(
+            column_exists(&c, "agents", "retire_status").unwrap(),
+            "retire_status column missing — v9→v10 migration silently skipped"
+        );
+        assert!(
+            column_exists(&c, "agents", "retired_at").unwrap(),
+            "retired_at column missing — v9→v10 migration silently skipped"
+        );
+
+        // The pre-existing row must default to active / NULL.
+        let (status, retired_at): (String, Option<i64>) = c
+            .query_row(
+                "SELECT retire_status, retired_at FROM agents WHERE id='Veteran'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert!(retired_at.is_none());
     }
 }

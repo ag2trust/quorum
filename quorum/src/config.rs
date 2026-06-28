@@ -17,6 +17,14 @@ pub struct Config {
     pub task_lease_ttl_secs: i64,
     /// Default page size for read/peek.
     pub read_limit: i64,
+    /// Issue #97 retirement budget: cumulative active seconds (across completed tasks) at
+    /// which an agent transitions `active → retiring`. Load-bearing bound — closest proxy
+    /// for context consumed.
+    pub retire_after_active_secs: i64,
+    /// Issue #97 retirement budget: cumulative completed-tasks count at which an agent
+    /// transitions `active → retiring`. Backstop for short-but-many-task agents whose
+    /// per-task seconds stay low while context drift accumulates.
+    pub retire_after_tasks: i64,
 }
 
 impl Default for Config {
@@ -30,6 +38,8 @@ impl Default for Config {
             message_ttl_secs: quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
             task_lease_ttl_secs: quorum_core::tasks::DEFAULT_LEASE_TTL_SECS,
             read_limit: quorum_core::feed::DEFAULT_READ_LIMIT,
+            retire_after_active_secs: quorum_core::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
+            retire_after_tasks: quorum_core::agents::DEFAULT_RETIRE_AFTER_TASKS,
         }
     }
 }
@@ -38,10 +48,12 @@ impl Default for Config {
 /// `Config::default()` — verified by `default_toml_matches_default_config`.
 pub const DEFAULT_TOML: &str = "\
 # Quorum config. Delete any line to use its built-in default.
-online_window_secs   = 900        # agent considered online if active within 15 min
-message_ttl_secs     = 172800     # 48h
-task_lease_ttl_secs  = 3600       # 1h task-claim lease; assignee renews on long work
-read_limit           = 100        # default page size for read/peek
+online_window_secs       = 900        # agent considered online if active within 15 min
+message_ttl_secs         = 172800     # 48h
+task_lease_ttl_secs      = 3600       # 1h task-claim lease; assignee renews on long work
+read_limit               = 100        # default page size for read/peek
+retire_after_active_secs = 5400       # 90 min cumulative active time → retiring (issue #97)
+retire_after_tasks       = 8          # OR 8 completed tasks → retiring (issue #97)
 ";
 
 /// Load config from `path`. Missing file → defaults; malformed → fail loud (exit 3).
@@ -75,6 +87,19 @@ fn validate(cfg: &Config, path: &Path) -> Result<()> {
                 "malformed config {}: {field} must be 1..={} (got {v})",
                 path.display(),
                 crate::MAX_TTL_SECS
+            )));
+        }
+    }
+    // Issue #97 retire budgets: must be > 0 (zero would retire before the first task;
+    // negative is incoherent). No upper ceiling — these are compared, not added to `now`.
+    for (field, v) in [
+        ("retire_after_active_secs", cfg.retire_after_active_secs),
+        ("retire_after_tasks", cfg.retire_after_tasks),
+    ] {
+        if v <= 0 {
+            return Err(QuorumError::Io(format!(
+                "malformed config {}: {field} must be > 0 (got {v})",
+                path.display(),
             )));
         }
     }
@@ -120,6 +145,8 @@ mod tests {
         assert_eq!(parsed.message_ttl_secs, d.message_ttl_secs);
         assert_eq!(parsed.task_lease_ttl_secs, d.task_lease_ttl_secs);
         assert_eq!(parsed.read_limit, d.read_limit);
+        assert_eq!(parsed.retire_after_active_secs, d.retire_after_active_secs);
+        assert_eq!(parsed.retire_after_tasks, d.retire_after_tasks);
     }
 
     #[test]

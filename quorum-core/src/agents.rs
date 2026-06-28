@@ -14,6 +14,26 @@ use serde::Serialize;
 /// 5-min work-loop ticks. Phase 6 config overrides.
 pub const ONLINE_WINDOW_SECS: i64 = 900;
 
+/// Retirement budget defaults (issue #97). An agent crosses into `retiring` when EITHER:
+/// - cumulative `total_active_secs` across completed tasks ≥ [`DEFAULT_RETIRE_AFTER_ACTIVE_SECS`], or
+/// - cumulative `tasks_completed` ≥ [`DEFAULT_RETIRE_AFTER_TASKS`].
+///
+/// The seconds bound is the load-bearing one (closest proxy for context-consumed); the tasks
+/// bound is a backstop for short-but-many-task agents. Both tunable via config; these
+/// constants are the single source of truth (same pattern as [`ONLINE_WINDOW_SECS`]).
+///
+/// 5400 sec ≈ 90 min and 8 tasks land deliberately conservative — we want agents to retire
+/// **before** context-compaction degrades them, not after.
+pub const DEFAULT_RETIRE_AFTER_ACTIVE_SECS: i64 = 5400;
+pub const DEFAULT_RETIRE_AFTER_TASKS: i64 = 8;
+
+/// Retirement state machine (issue #97). String-typed so it round-trips cleanly through
+/// SQLite TEXT and JSON without a custom serde adapter; the three variants form the entire
+/// state space.
+pub const RETIRE_STATUS_ACTIVE: &str = "active";
+pub const RETIRE_STATUS_RETIRING: &str = "retiring";
+pub const RETIRE_STATUS_RETIRED: &str = "retired";
+
 /// A row in the roster view.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct AgentView {
@@ -67,6 +87,48 @@ pub fn set_tier(conn: &Connection, id: &str, tier: Option<&str>) -> Result<()> {
     if let Some(t) = tier {
         conn.execute("UPDATE agents SET tier = ?1 WHERE id = ?2", params![t, id])?;
     }
+    Ok(())
+}
+
+/// Read the agent's current retire-state row. Returns `(retire_status, retired_at)`. A
+/// missing row surfaces as the active default — sync calls this after `touch`, so a row
+/// always exists in the live path; the fallback only fires for ad-hoc test queries against
+/// an empty store.
+pub fn retire_state(conn: &Connection, id: &str) -> Result<(String, Option<i64>)> {
+    let row = conn
+        .query_row(
+            "SELECT retire_status, retired_at FROM agents WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .ok();
+    Ok(row.unwrap_or_else(|| (RETIRE_STATUS_ACTIVE.to_string(), None)))
+}
+
+/// Promote the agent to `retiring`. No-op if already retiring or retired (the state machine
+/// is forward-only: active → retiring → retired). Called from `sync::tick` once the
+/// load-score budget is exceeded, inside the existing write txn.
+pub fn mark_retiring(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE agents
+         SET retire_status = ?2
+         WHERE id = ?1 AND retire_status = ?3",
+        params![id, RETIRE_STATUS_RETIRING, RETIRE_STATUS_ACTIVE],
+    )?;
+    Ok(())
+}
+
+/// Promote the agent to `retired` and stamp `retired_at`. The "already retired"
+/// short-circuit preserves the original `retired_at` so the dashboard's "retired N ago"
+/// stays stable across syncs.
+pub fn mark_retired(conn: &Connection, id: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE agents
+         SET retire_status = ?2,
+             retired_at    = ?3
+         WHERE id = ?1 AND retire_status != ?2",
+        params![id, RETIRE_STATUS_RETIRED, now],
+    )?;
     Ok(())
 }
 
@@ -314,5 +376,66 @@ mod tests {
             let exp = lease_expires(&c, "A", target).unwrap();
             assert_eq!(exp, want, "{target} not extended");
         }
+    }
+
+    // -- Retirement state machine (issue #97) ---------------------------------------------
+
+    #[test]
+    fn fresh_agent_defaults_to_active_with_no_retired_at() {
+        let (_d, c) = open_tmp();
+        touch(&c, "Newbie", 100).unwrap();
+        let (st, ts) = retire_state(&c, "Newbie").unwrap();
+        assert_eq!(st, RETIRE_STATUS_ACTIVE);
+        assert!(ts.is_none());
+    }
+
+    #[test]
+    fn retire_state_missing_row_returns_active_default() {
+        // Caller invariant: sync's read path queries an agent that may not yet have a
+        // row (the touch comes inside the write txn AFTER the read). The fallback
+        // keeps that path simple instead of forcing a guarded touch on every read.
+        let (_d, c) = open_tmp();
+        let (st, ts) = retire_state(&c, "Ghost").unwrap();
+        assert_eq!(st, RETIRE_STATUS_ACTIVE);
+        assert!(ts.is_none());
+    }
+
+    #[test]
+    fn mark_retiring_then_retired_progresses_state_forward_only() {
+        let (_d, c) = open_tmp();
+        touch(&c, "X", 100).unwrap();
+        mark_retiring(&c, "X").unwrap();
+        assert_eq!(retire_state(&c, "X").unwrap().0, RETIRE_STATUS_RETIRING);
+        // Calling mark_retiring again is a no-op (idempotent, no demote).
+        mark_retiring(&c, "X").unwrap();
+        assert_eq!(retire_state(&c, "X").unwrap().0, RETIRE_STATUS_RETIRING);
+        // Promote to retired with a stamped timestamp.
+        mark_retired(&c, "X", 200).unwrap();
+        let (st, ts) = retire_state(&c, "X").unwrap();
+        assert_eq!(st, RETIRE_STATUS_RETIRED);
+        assert_eq!(ts, Some(200));
+    }
+
+    #[test]
+    fn mark_retired_is_idempotent_and_does_not_reset_timestamp() {
+        // The "retired N ago" dashboard cell relies on retired_at being frozen at the
+        // original transition, not refreshed every sync.
+        let (_d, c) = open_tmp();
+        touch(&c, "Y", 100).unwrap();
+        mark_retired(&c, "Y", 200).unwrap();
+        mark_retired(&c, "Y", 999).unwrap();
+        assert_eq!(retire_state(&c, "Y").unwrap().1, Some(200));
+    }
+
+    #[test]
+    fn mark_retiring_cannot_demote_from_retired() {
+        // Forward-only: a retired agent stays retired even if mark_retiring is called
+        // (defensive — sync never does this, but the guard makes the helper safe to
+        // call from any future code path without a state-check).
+        let (_d, c) = open_tmp();
+        touch(&c, "Z", 100).unwrap();
+        mark_retired(&c, "Z", 200).unwrap();
+        mark_retiring(&c, "Z").unwrap();
+        assert_eq!(retire_state(&c, "Z").unwrap().0, RETIRE_STATUS_RETIRED);
     }
 }
