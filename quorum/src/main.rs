@@ -98,6 +98,10 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
     println!("tasks  : {tasks}");
 
     // --- Agents online (by tier) ---
+    // Issue #97 scoreboard: each row reports cumulative completed-tasks + active-time
+    // alongside the retire status. A `retiring` tag flags agents that are draining; a
+    // `retired` row never appears here (filtered out of `agents` and surfaced under
+    // `## retired agents` instead).
     println!();
     println!("## agents online (by tier)");
     if s.agents.is_empty() {
@@ -113,11 +117,35 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
                 Some(t) => format!("task#{} {}", t.id, t.title),
                 None => "idle".to_string(),
             };
+            let retire_tag = match a.retire_status.as_str() {
+                "retiring" => "  · ⚠ retiring",
+                _ => "",
+            };
             println!(
-                "    {:<24} last_seen {:>4} ago  ·  {}",
+                "    {:<24} last_seen {:>4} ago  ·  tasks {:>2}  ·  active {:>5}  ·  {}{}",
                 a.id,
                 fmt_age(a.last_seen_age_secs),
-                task_str
+                a.tasks_completed,
+                fmt_age(a.total_active_secs),
+                task_str,
+                retire_tag,
+            );
+        }
+    }
+
+    // --- Retired agents (issue #97) ---
+    if !s.retired_agents.is_empty() {
+        println!();
+        println!("## retired agents (capacity dropped)");
+        for r in &s.retired_agents {
+            let age = (quorum_core::clock::now() - r.retired_at).max(0);
+            println!(
+                "  {:<24} [{:<14}] retired {:>5} ago  ·  tasks {:>2}  ·  active {}",
+                r.id,
+                r.tier,
+                fmt_age(age),
+                r.tasks_completed,
+                fmt_age(r.total_active_secs),
             );
         }
     }
@@ -771,9 +799,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             Ok(0)
         }
         cli::Command::Sync { agent, match_label } => {
+            let cfg = load_cfg()?;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
-            let snap = quorum_core::sync::tick(&mut conn, &agent, &labels, now)?;
+            let snap = quorum_core::sync::tick_with_budget(
+                &mut conn,
+                &agent,
+                &labels,
+                now,
+                cfg.retire_after_active_secs,
+                cfg.retire_after_tasks,
+            )?;
             output::emit(&snap);
             Ok(0)
         }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -168,6 +168,18 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v9 = per-(task, project) branch allocations (issue #98). Net-new table — the
         // CREATE TABLE IF NOT EXISTS in SCHEMA_SQL handles fresh DBs and upgrades alike;
         // no ALTER needed.
+        // v10 = agent-retirement state machine (issue #97). Two additive columns on
+        // `agents`; both safe to apply to a populated table (pre-existing rows default to
+        // `'active'` / NULL). Forward-only — once a row reaches `'retired'` it stays there.
+        if current < 10 && !column_exists(conn, "agents", "retire_status")? {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN retire_status TEXT NOT NULL DEFAULT 'active'",
+                [],
+            )?;
+        }
+        if current < 10 && !column_exists(conn, "agents", "retired_at")? {
+            conn.execute("ALTER TABLE agents ADD COLUMN retired_at INTEGER", [])?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };

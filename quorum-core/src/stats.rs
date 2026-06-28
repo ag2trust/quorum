@@ -10,7 +10,7 @@
 //! - `throughput` — closed-last-hour + oldest-done-awaiting-review (catches review-loop stalls).
 
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
@@ -46,6 +46,14 @@ pub struct AgentView {
     pub current_task: Option<AgentCurrentTask>,
     /// Seconds since `last_seen`.
     pub last_seen_age_secs: i64,
+    /// Issue #97 scoreboard: cumulative tasks the agent has reached `done`/`closed` on.
+    /// Same accounting as `AgentLoadScore.tasks_completed` for this agent.
+    pub tasks_completed: i64,
+    /// Issue #97 scoreboard: cumulative active seconds across those completed tasks.
+    /// Same accounting as `AgentLoadScore.total_active_secs` for this agent.
+    pub total_active_secs: i64,
+    /// Issue #97 retirement state: `active` / `retiring` / `retired`.
+    pub retire_status: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -95,10 +103,22 @@ pub struct ClaimTtl {
     pub expires_in_secs: i64,
 }
 
+/// One retired agent — surfaces in the dedicated `retired_agents` dashboard section
+/// (issue #97) so the operator sees capacity drop in real time and knows when to re-spin.
+/// Sorted by `retired_at` DESC (newest first); ties broken by `id` ascending.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RetiredAgentView {
+    pub id: String,
+    pub tier: String,
+    pub retired_at: i64,
+    pub tasks_completed: i64,
+    pub total_active_secs: i64,
+}
+
 /// Per-agent cumulative work signal — issue #95 Phase 1 (data only).
 ///
-/// The retirement mechanic (server-side drain on score, sticky carve-out, retire signal in
-/// `sync`) ships in a follow-up; this struct is the load-signal it will read.
+/// Now also consumed by the issue #97 retirement mechanic (server-side drain on score,
+/// sticky carve-out, retire signal in `sync`).
 ///
 /// `tasks_completed` counts distinct tasks the agent was assignee on when the task reached
 /// `done`/`closed`. `total_active_secs` sums `(task.updated_at - latest_claim.ts)` per
@@ -151,9 +171,13 @@ pub struct Stats {
     /// Issue #77: throughput / review-loop-stall metrics.
     pub throughput: Throughput,
     /// Issue #95 Phase 1: per-agent cumulative work signal (tasks completed + active secs).
-    /// Surfaced for owner-side fleet management; the retirement mechanic that consumes this
-    /// signal lands in a follow-up. Empty when no agent has completed work yet.
+    /// Surfaced for owner-side fleet management; also consumed by the issue #97 retirement
+    /// mechanic. Empty when no agent has completed work yet.
     pub agent_load_scores: Vec<AgentLoadScore>,
+    /// Issue #97: agents whose `retire_status = 'retired'`, newest first. Surfaces in the
+    /// retired-agents section of `quorum status` so the operator can see capacity drop and
+    /// re-spin replacements.
+    pub retired_agents: Vec<RetiredAgentView>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -210,6 +234,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let claim_ttls = claim_ttls(conn, now)?;
     let throughput = throughput(conn, now)?;
     let agent_load_scores = agent_load_scores(conn)?;
+    let retired_agents = retired_agents_view(conn)?;
 
     Ok(Stats {
         agents_total,
@@ -226,6 +251,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         claim_ttls,
         throughput,
         agent_load_scores,
+        retired_agents,
     })
 }
 
@@ -233,9 +259,14 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
 /// each `sync --match-label tier:*`); falls back to `unknown` when NULL.
 /// Sorted by tier ascending, then id ascending — deterministic so the watch loop's output
 /// is stable frame-to-frame.
+///
+/// Issue #97: each row is enriched with the agent's scoreboard fields
+/// (`tasks_completed`, `total_active_secs`, `retire_status`) by looking up
+/// [`agent_load_scores`] once and joining in app-space — keeps the existing SQL simple
+/// while surfacing all the data the operator needs in one section.
 fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
     let mut stmt = conn.prepare(
-        "SELECT a.id, a.last_seen, a.tier, t.id, t.title
+        "SELECT a.id, a.last_seen, a.tier, a.retire_status, t.id, t.title
          FROM agents a
          LEFT JOIN claims c
            ON c.holder = a.id
@@ -244,9 +275,10 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
           AND c.target LIKE 'task#%'
          LEFT JOIN tasks t
            ON t.id = CAST(SUBSTR(c.target, 6) AS INTEGER)
-         WHERE (?1 - a.last_seen) < ?2
-            OR EXISTS (SELECT 1 FROM claims c2
-                       WHERE c2.holder = a.id AND c2.active = 1 AND c2.expires_at > ?1)
+         WHERE ((?1 - a.last_seen) < ?2
+                OR EXISTS (SELECT 1 FROM claims c2
+                           WHERE c2.holder = a.id AND c2.active = 1 AND c2.expires_at > ?1))
+           AND a.retire_status != 'retired'
          ORDER BY a.id ASC",
     )?;
     let mut views: Vec<AgentView> = stmt
@@ -254,8 +286,9 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
             let id: String = r.get(0)?;
             let last_seen: i64 = r.get(1)?;
             let stored_tier: Option<String> = r.get(2)?;
-            let task_id: Option<i64> = r.get(3)?;
-            let task_title: Option<String> = r.get(4)?;
+            let retire_status: String = r.get(3)?;
+            let task_id: Option<i64> = r.get(4)?;
+            let task_title: Option<String> = r.get(5)?;
             let current_task = task_id
                 .zip(task_title)
                 .map(|(id, title)| AgentCurrentTask { id, title });
@@ -265,12 +298,105 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
                 tier,
                 current_task,
                 last_seen_age_secs: (now - last_seen).max(0),
+                tasks_completed: 0,
+                total_active_secs: 0,
+                retire_status,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Pull load scores once and graft them onto the per-agent rows. The dataset is small
+    // (online agents only); a separate fold is simpler than a UNION in the SQL above.
+    let scores = agent_load_scores(conn)?;
+    use std::collections::HashMap;
+    let by_id: HashMap<&str, &AgentLoadScore> =
+        scores.iter().map(|s| (s.agent_id.as_str(), s)).collect();
+    for v in &mut views {
+        if let Some(s) = by_id.get(v.id.as_str()) {
+            v.tasks_completed = s.tasks_completed;
+            v.total_active_secs = s.total_active_secs;
+        }
+    }
     // Stable display order: by tier then id.
     views.sort_by(|a, b| a.tier.cmp(&b.tier).then_with(|| a.id.cmp(&b.id)));
     Ok(views)
+}
+
+/// Issue #97: retired-agents view — the agents who've signed off, with their final
+/// scoreboard frozen at retirement. Sorted by `retired_at` DESC (newest first); ties broken
+/// by id ASC for deterministic output.
+fn retired_agents_view(conn: &Connection) -> Result<Vec<RetiredAgentView>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, COALESCE(tier, 'unknown'), retired_at
+         FROM agents
+         WHERE retire_status = 'retired' AND retired_at IS NOT NULL
+         ORDER BY retired_at DESC, id ASC",
+    )?;
+    let rows: Vec<(String, String, i64)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let scores = agent_load_scores(conn)?;
+    use std::collections::HashMap;
+    let by_id: HashMap<&str, &AgentLoadScore> =
+        scores.iter().map(|s| (s.agent_id.as_str(), s)).collect();
+    Ok(rows
+        .into_iter()
+        .map(|(id, tier, retired_at)| {
+            let (tasks_completed, total_active_secs) = by_id
+                .get(id.as_str())
+                .map(|s| (s.tasks_completed, s.total_active_secs))
+                .unwrap_or((0, 0));
+            RetiredAgentView {
+                id,
+                tier,
+                retired_at,
+                tasks_completed,
+                total_active_secs,
+            }
+        })
+        .collect())
+}
+
+/// Per-agent slice of [`agent_load_scores`] — returns `(tasks_completed, total_active_secs)`
+/// for `agent_id`, or `(0, 0)` when the agent has no completed work yet. Used by `sync` to
+/// evaluate the retirement budget on every tick without scanning the whole fleet.
+///
+/// Same accounting as the fleet-wide version: distinct done/closed tasks where the agent
+/// was assignee, joined with the latest matching claim for the working window.
+pub fn load_score_for(conn: &Connection, agent_id: &str) -> Result<(i64, i64)> {
+    // Bind `agent_id` twice (?1 / ?2) — some SQLite driver bindings get touchy about
+    // reusing a single positional placeholder across non-adjacent clauses inside a CTE,
+    // so we keep each clause's parameter explicit. Both bindings are the same value.
+    let row = conn
+        .query_row(
+            "WITH latest_claim AS (
+                 SELECT target, holder, MAX(ts) AS ts
+                 FROM claims
+                 WHERE holder = ?1
+                 GROUP BY target, holder
+             )
+             SELECT
+                 COUNT(DISTINCT t.id) AS tasks_completed,
+                 COALESCE(SUM(CASE
+                     WHEN t.updated_at > lc.ts THEN t.updated_at - lc.ts
+                     ELSE 0
+                 END), 0) AS total_active_secs
+             FROM tasks t
+             JOIN latest_claim lc
+                 ON lc.target = 'task#' || t.id
+                 AND lc.holder = t.assignee
+             WHERE t.status IN ('done', 'closed')
+                 AND t.assignee = ?2",
+            params![agent_id, agent_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    Ok(row.unwrap_or((0, 0)))
 }
 
 /// Parse `tier:*` out of a JSON-array labels string. Returns the first matching label
@@ -1237,5 +1363,76 @@ mod tests {
         assert!(s.blocked.is_empty());
         // The dependent should now appear in the queue.
         assert!(!s.queue_by_tier.is_empty());
+    }
+
+    // -- Issue #97 scoreboard + retired list -----------------------------------
+
+    #[test]
+    fn online_agents_view_carries_load_score_and_retire_status() {
+        let (_d, mut c) = open_tmp();
+        // Alice: 2 completed tasks, 60s cumulative active. Still 'active' (default
+        // retire_status from the schema default).
+        complete_task_as(&mut c, "Alice", 100, 130);
+        complete_task_as(&mut c, "Alice", 200, 230);
+        let s = stats(&c, 300, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let a = s.agents.iter().find(|x| x.id == "Alice").unwrap();
+        assert_eq!(a.tasks_completed, 2);
+        assert_eq!(a.total_active_secs, 60);
+        assert_eq!(a.retire_status, "active");
+    }
+
+    #[test]
+    fn retired_agents_view_lists_retired_and_excludes_them_from_online() {
+        let (_d, mut c) = open_tmp();
+        complete_task_as(&mut c, "Done", 100, 130);
+        // Touch + flip to retired the way sync's write txn would.
+        crate::agents::touch(&c, "Done", 200).unwrap();
+        crate::agents::mark_retired(&c, "Done", 250).unwrap();
+        let s = stats(&c, 300, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        // Retired agent must NOT appear in the online list.
+        assert!(s.agents.iter().all(|x| x.id != "Done"));
+        // …but must appear in `retired_agents` with their final stats.
+        let r = s
+            .retired_agents
+            .iter()
+            .find(|x| x.id == "Done")
+            .expect("Done must be in retired_agents");
+        assert_eq!(r.retired_at, 250);
+        assert_eq!(r.tasks_completed, 1);
+        assert_eq!(r.total_active_secs, 30);
+    }
+
+    #[test]
+    fn retired_agents_view_orders_newest_first_then_id() {
+        let (_d, c) = open_tmp();
+        // Three retired agents at three timestamps. Newest-first sort with id tiebreaker.
+        crate::agents::touch(&c, "A", 100).unwrap();
+        crate::agents::mark_retired(&c, "A", 100).unwrap();
+        crate::agents::touch(&c, "B", 200).unwrap();
+        crate::agents::mark_retired(&c, "B", 200).unwrap();
+        crate::agents::touch(&c, "C", 200).unwrap();
+        crate::agents::mark_retired(&c, "C", 200).unwrap();
+        let s = stats(&c, 300, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let ids: Vec<&str> = s.retired_agents.iter().map(|r| r.id.as_str()).collect();
+        // B (200) < C (200, tied → id asc) < A (100, oldest last).
+        assert_eq!(ids, vec!["B", "C", "A"]);
+    }
+
+    #[test]
+    fn load_score_for_returns_zero_for_unknown_agent() {
+        let (_d, c) = open_tmp();
+        let (tasks, secs) = load_score_for(&c, "Never").unwrap();
+        assert_eq!((tasks, secs), (0, 0));
+    }
+
+    #[test]
+    fn load_score_for_matches_per_agent_slice_of_agent_load_scores() {
+        let (_d, mut c) = open_tmp();
+        complete_task_as(&mut c, "X", 100, 145); // 45s
+        complete_task_as(&mut c, "X", 200, 215); // 15s
+        complete_task_as(&mut c, "Y", 300, 310); // 10s (other agent — must not leak)
+        let (tasks, secs) = load_score_for(&c, "X").unwrap();
+        assert_eq!(tasks, 2);
+        assert_eq!(secs, 60);
     }
 }
