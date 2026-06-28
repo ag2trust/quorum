@@ -705,7 +705,18 @@ mod tests {
         // --to messages must be invisible in the global feed (privacy boundary).
         // Pre-#91 behavior leaked them; the recipient-IS-NULL filter pins the new contract.
         let (_d, mut c) = open_tmp();
-        crate::feed::post(&mut c, "A", "info", None, "broadcast-1", None, None, 1000, 100).unwrap();
+        crate::feed::post(
+            &mut c,
+            "A",
+            "info",
+            None,
+            "broadcast-1",
+            None,
+            None,
+            1000,
+            100,
+        )
+        .unwrap();
         crate::feed::post(
             &mut c,
             "A",
@@ -718,7 +729,18 @@ mod tests {
             101,
         )
         .unwrap();
-        crate::feed::post(&mut c, "A", "info", None, "broadcast-2", None, None, 1000, 102).unwrap();
+        crate::feed::post(
+            &mut c,
+            "A",
+            "info",
+            None,
+            "broadcast-2",
+            None,
+            None,
+            1000,
+            102,
+        )
+        .unwrap();
         crate::feed::post(
             &mut c,
             "A",
