@@ -831,7 +831,8 @@ fn task_list_brief_omits_body_full_get_keeps_it() {
         .stdout(predicates::str::contains(SENTINEL).not())
         .stdout(predicates::str::contains("\"body\"").not())
         .stdout(predicates::str::contains("\"created_at\"").not())
-        .stdout(predicates::str::contains("\"depends_on\"").not());
+        // depends_on is intentionally included in --brief (#86).
+        .stdout(predicates::str::contains("\"depends_on\""));
 
     // Plain task-list (no --brief) is unchanged: full body still present.
     quorum(home.path())

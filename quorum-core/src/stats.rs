@@ -54,13 +54,25 @@ pub struct AgentCurrentTask {
     pub title: String,
 }
 
-/// Open-task count grouped by required tier label. `tier` is either a `tier:*` value
+/// Claimable-task count grouped by required tier label. `tier` is either a `tier:*` value
 /// (e.g. `tier:opus-47`), `untiered` (open tasks with no `tier:` label), or `review`
 /// (open `kind:review` tasks — they're tier-exempt and routed separately, see #73 fix).
+///
+/// Only counts `ready=true` tasks (deps satisfied) — blocked tasks appear in
+/// [`Stats::blocked`] instead (#86).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct TierQueueCount {
     pub tier: String,
     pub open: i64,
+}
+
+/// A task blocked by unmet dependencies, with the chain of blocking task ids.
+/// Rendered in the `## blocked` section of `quorum status` (#86).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct BlockedTask {
+    pub id: i64,
+    pub title: String,
+    pub waiting_on: Vec<i64>,
 }
 
 /// A recent feed message — last N rows, oldest-first within the window.
@@ -109,8 +121,10 @@ pub struct Stats {
     pub last_errors: Vec<ErrorRow>,
     /// Issue #77: per-online-agent view (tier + current task + last_seen age).
     pub agents: Vec<AgentView>,
-    /// Issue #77: open-task count grouped by required tier.
+    /// Issue #77: claimable (ready) open-task count grouped by required tier.
     pub queue_by_tier: Vec<TierQueueCount>,
+    /// Issue #86: open tasks blocked by unmet dependencies.
+    pub blocked: Vec<BlockedTask>,
     /// Issue #77: last RECENT_MSG_LIMIT feed messages.
     pub recent_messages: Vec<RecentMessage>,
     /// Issue #77: active claims with time-to-expiry.
@@ -166,6 +180,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
 
     let agents = online_agents_view(conn, now, online_window)?;
     let queue_by_tier = queue_by_tier(conn)?;
+    let blocked = blocked_tasks(conn)?;
     let recent_messages = recent_messages(conn, now)?;
     let claim_ttls = claim_ttls(conn, now)?;
     let throughput = throughput(conn, now)?;
@@ -180,6 +195,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         last_errors,
         agents,
         queue_by_tier,
+        blocked,
         recent_messages,
         claim_ttls,
         throughput,
@@ -256,20 +272,27 @@ pub fn extract_tier_from_labels(labels_json: Option<&str>) -> String {
     "unknown".to_string()
 }
 
-/// Open-task count grouped by required tier. Uses [`extract_tier_from_labels`] over each
-/// open task row in app-space (the labels are JSON text in a TEXT column — pure SQL grouping
-/// would need a JSON SQL extension we don't depend on). `kind:review` open tasks land in a
-/// distinct `review` bucket because they're tier-exempt at the matcher (#73 fix).
+/// Claimable (ready) open-task count grouped by required tier (#86). Uses
+/// [`extract_tier_from_labels`] over each open task row in app-space. Only counts tasks
+/// whose dependencies are all satisfied (`ready=true`); blocked tasks are surfaced
+/// separately via [`blocked_tasks`]. `kind:review` open tasks land in a distinct `review`
+/// bucket (tier-exempt at the matcher, #73 fix).
 fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
-    let mut stmt = conn.prepare("SELECT labels FROM tasks WHERE status='open'")?;
-    let labels_rows = stmt
+    let mut stmt = conn.prepare("SELECT id, labels, depends_on FROM tasks WHERE status='open'")?;
+    let rows = stmt
         .query_map([], |r| {
-            let l: Option<String> = r.get(0)?;
-            Ok(l)
+            let id: i64 = r.get(0)?;
+            let labels: Option<String> = r.get(1)?;
+            let depends_on: Option<String> = r.get(2)?;
+            Ok((id, labels, depends_on))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for labels in labels_rows {
+    for (_id, labels, depends_on) in &rows {
+        let ready = crate::tasks::compute_ready(conn, depends_on)?;
+        if !ready {
+            continue;
+        }
         let bucket = if has_label(labels.as_deref(), "kind:review") {
             "review".to_string()
         } else {
@@ -286,6 +309,53 @@ fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
         .into_iter()
         .map(|(tier, open)| TierQueueCount { tier, open })
         .collect())
+}
+
+/// Open tasks blocked by unmet dependencies (#86). Returns each blocked task with the
+/// list of dep ids it's waiting on (only deps that are NOT yet `closed`).
+fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let title: String = r.get(1)?;
+            let depends_on: Option<String> = r.get(2)?;
+            Ok((id, title, depends_on))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut blocked = Vec::new();
+    for (id, title, depends_on) in rows {
+        let ready = crate::tasks::compute_ready(conn, &depends_on)?;
+        if ready {
+            continue;
+        }
+        let waiting_on = unmet_deps(conn, &depends_on)?;
+        blocked.push(BlockedTask {
+            id,
+            title,
+            waiting_on,
+        });
+    }
+    Ok(blocked)
+}
+
+/// Return the subset of dep ids from `depends_on` that are NOT `closed`.
+fn unmet_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<i64>> {
+    let Some(json) = depends_on.as_deref() else {
+        return Ok(vec![]);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT je.value FROM json_each(?1) je
+         WHERE NOT EXISTS (
+             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
+         )",
+    )?;
+    let ids = stmt
+        .query_map(params![json], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
 }
 
 /// Quick "does this labels JSON contain a given label string" helper.
@@ -743,5 +813,149 @@ mod tests {
         let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert_eq!(s.throughput.done_stuck_count, 1);
         assert!(s.throughput.oldest_done_awaiting_review_secs.unwrap() > DONE_STUCK_THRESHOLD_SECS);
+    }
+
+    // --- Issue #86: claimable-only queue counts + blocked section ---------------
+
+    #[test]
+    fn queue_excludes_blocked_tasks() {
+        let (_d, mut c) = open_tmp();
+        // t1: open, no deps → claimable → counted in queue.
+        crate::tasks::create(
+            &mut c,
+            "boss",
+            "ready-task",
+            None,
+            0,
+            Some("[\"tier:opus-46\"]"),
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        // t2: open, depends on t1 (not closed) → blocked → NOT in queue.
+        let t1 = 1; // t1's id
+        crate::tasks::create(
+            &mut c,
+            "boss",
+            "blocked-task",
+            None,
+            0,
+            Some("[\"tier:opus-46\"]"),
+            None,
+            Some(&format!("[{t1}]")),
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let by_tier: std::collections::HashMap<_, _> = s
+            .queue_by_tier
+            .iter()
+            .map(|q| (q.tier.as_str(), q.open))
+            .collect();
+        // Only the ready task counts.
+        assert_eq!(by_tier.get("tier:opus-46"), Some(&1));
+    }
+
+    #[test]
+    fn blocked_section_lists_tasks_with_unmet_deps() {
+        let (_d, mut c) = open_tmp();
+        let t1 = crate::tasks::create(
+            &mut c,
+            "boss",
+            "dep-task",
+            None,
+            0,
+            Some("[\"tier:opus-46\"]"),
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let t2 = crate::tasks::create(
+            &mut c,
+            "boss",
+            "blocked-by-t1",
+            None,
+            0,
+            Some("[\"tier:opus-46\"]"),
+            None,
+            Some(&format!("[{t1}]")),
+            100,
+        )
+        .unwrap();
+        let t3 = crate::tasks::create(
+            &mut c,
+            "boss",
+            "blocked-by-t2",
+            None,
+            0,
+            Some("[\"tier:opus-46\"]"),
+            None,
+            Some(&format!("[{t2}]")),
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.blocked.len(), 2);
+        let b_ids: Vec<i64> = s.blocked.iter().map(|b| b.id).collect();
+        assert!(b_ids.contains(&t2));
+        assert!(b_ids.contains(&t3));
+        let b2 = s.blocked.iter().find(|b| b.id == t2).unwrap();
+        assert_eq!(b2.waiting_on, vec![t1]);
+        let b3 = s.blocked.iter().find(|b| b.id == t3).unwrap();
+        assert_eq!(b3.waiting_on, vec![t2]);
+    }
+
+    #[test]
+    fn blocked_section_empty_when_deps_satisfied() {
+        let (_d, mut c) = open_tmp();
+        let t1 = crate::tasks::create(
+            &mut c,
+            "boss",
+            "dep-to-close",
+            None,
+            0,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        crate::tasks::create(
+            &mut c,
+            "boss",
+            "depends-on-closed",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{t1}]")),
+            100,
+        )
+        .unwrap();
+        // Close t1 via the full lifecycle: claim → done → approve.
+        crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
+        crate::tasks::update(
+            &mut c,
+            "Alice",
+            t1,
+            &crate::tasks::TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            100,
+        )
+        .unwrap();
+        // Directly mark closed via raw SQL (the full review flow is overkill for this test).
+        c.execute("UPDATE tasks SET status='closed' WHERE id=?1", params![t1])
+            .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(s.blocked.is_empty());
+        // The dependent should now appear in the queue.
+        assert!(!s.queue_by_tier.is_empty());
     }
 }
