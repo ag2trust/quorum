@@ -10,7 +10,7 @@
 //! - `throughput` — closed-last-hour + oldest-done-awaiting-review (catches review-loop stalls).
 
 use crate::error::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
@@ -106,11 +106,17 @@ pub struct ClaimTtl {
 /// One retired agent — surfaces in the dedicated `retired_agents` dashboard section
 /// (issue #97) so the operator sees capacity drop in real time and knows when to re-spin.
 /// Sorted by `retired_at` DESC (newest first); ties broken by `id` ascending.
+///
+/// `retired_age_secs` is computed against the same `now` the rest of the snapshot uses,
+/// so the dashboard's "retired N ago" cell doesn't drift relative to `last_seen_age_secs`
+/// on the online roster.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct RetiredAgentView {
     pub id: String,
     pub tier: String,
     pub retired_at: i64,
+    /// `max(0, now - retired_at)` at snapshot time. Convenience for renderers.
+    pub retired_age_secs: i64,
     pub tasks_completed: i64,
     pub total_active_secs: i64,
 }
@@ -227,14 +233,20 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let agents = online_agents_view(conn, now, online_window)?;
+    // Compute load scores once; both `online_agents_view` and `retired_agents_view` graft
+    // them onto their rows, so a shared lookup avoids running the same JOIN three times.
+    let agent_load_scores = agent_load_scores(conn)?;
+    let scores_by_id: std::collections::HashMap<&str, &AgentLoadScore> = agent_load_scores
+        .iter()
+        .map(|s| (s.agent_id.as_str(), s))
+        .collect();
+    let agents = online_agents_view(conn, now, online_window, &scores_by_id)?;
     let queue_by_tier = queue_by_tier(conn)?;
     let blocked = blocked_tasks(conn)?;
     let recent_messages = recent_messages(conn, now)?;
     let claim_ttls = claim_ttls(conn, now)?;
     let throughput = throughput(conn, now)?;
-    let agent_load_scores = agent_load_scores(conn)?;
-    let retired_agents = retired_agents_view(conn)?;
+    let retired_agents = retired_agents_view(conn, now, &scores_by_id)?;
 
     Ok(Stats {
         agents_total,
@@ -261,10 +273,15 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
 /// is stable frame-to-frame.
 ///
 /// Issue #97: each row is enriched with the agent's scoreboard fields
-/// (`tasks_completed`, `total_active_secs`, `retire_status`) by looking up
-/// [`agent_load_scores`] once and joining in app-space — keeps the existing SQL simple
-/// while surfacing all the data the operator needs in one section.
-fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
+/// (`tasks_completed`, `total_active_secs`, `retire_status`) by grafting on the caller's
+/// pre-computed `scores_by_id` map — keeps the existing SQL simple, and avoids
+/// re-running `agent_load_scores` here when `stats()` already has it.
+fn online_agents_view(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    scores_by_id: &std::collections::HashMap<&str, &AgentLoadScore>,
+) -> Result<Vec<AgentView>> {
     let mut stmt = conn.prepare(
         "SELECT a.id, a.last_seen, a.tier, a.retire_status, t.id, t.title
          FROM agents a
@@ -304,14 +321,9 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    // Pull load scores once and graft them onto the per-agent rows. The dataset is small
-    // (online agents only); a separate fold is simpler than a UNION in the SQL above.
-    let scores = agent_load_scores(conn)?;
-    use std::collections::HashMap;
-    let by_id: HashMap<&str, &AgentLoadScore> =
-        scores.iter().map(|s| (s.agent_id.as_str(), s)).collect();
+    // Graft pre-computed scores onto the per-agent rows.
     for v in &mut views {
-        if let Some(s) = by_id.get(v.id.as_str()) {
+        if let Some(s) = scores_by_id.get(v.id.as_str()) {
             v.tasks_completed = s.tasks_completed;
             v.total_active_secs = s.total_active_secs;
         }
@@ -323,8 +335,13 @@ fn online_agents_view(conn: &Connection, now: i64, online_window: i64) -> Result
 
 /// Issue #97: retired-agents view — the agents who've signed off, with their final
 /// scoreboard frozen at retirement. Sorted by `retired_at` DESC (newest first); ties broken
-/// by id ASC for deterministic output.
-fn retired_agents_view(conn: &Connection) -> Result<Vec<RetiredAgentView>> {
+/// by id ASC for deterministic output. Caller passes the shared `scores_by_id` map
+/// computed once in `stats()` so the load-score JOIN doesn't fire twice.
+fn retired_agents_view(
+    conn: &Connection,
+    now: i64,
+    scores_by_id: &std::collections::HashMap<&str, &AgentLoadScore>,
+) -> Result<Vec<RetiredAgentView>> {
     let mut stmt = conn.prepare(
         "SELECT id, COALESCE(tier, 'unknown'), retired_at
          FROM agents
@@ -340,14 +357,10 @@ fn retired_agents_view(conn: &Connection) -> Result<Vec<RetiredAgentView>> {
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let scores = agent_load_scores(conn)?;
-    use std::collections::HashMap;
-    let by_id: HashMap<&str, &AgentLoadScore> =
-        scores.iter().map(|s| (s.agent_id.as_str(), s)).collect();
     Ok(rows
         .into_iter()
         .map(|(id, tier, retired_at)| {
-            let (tasks_completed, total_active_secs) = by_id
+            let (tasks_completed, total_active_secs) = scores_by_id
                 .get(id.as_str())
                 .map(|s| (s.tasks_completed, s.total_active_secs))
                 .unwrap_or((0, 0));
@@ -355,6 +368,7 @@ fn retired_agents_view(conn: &Connection) -> Result<Vec<RetiredAgentView>> {
                 id,
                 tier,
                 retired_at,
+                retired_age_secs: (now - retired_at).max(0),
                 tasks_completed,
                 total_active_secs,
             }
@@ -369,34 +383,34 @@ fn retired_agents_view(conn: &Connection) -> Result<Vec<RetiredAgentView>> {
 /// Same accounting as the fleet-wide version: distinct done/closed tasks where the agent
 /// was assignee, joined with the latest matching claim for the working window.
 pub fn load_score_for(conn: &Connection, agent_id: &str) -> Result<(i64, i64)> {
-    // Bind `agent_id` twice (?1 / ?2) — some SQLite driver bindings get touchy about
-    // reusing a single positional placeholder across non-adjacent clauses inside a CTE,
-    // so we keep each clause's parameter explicit. Both bindings are the same value.
-    let row = conn
-        .query_row(
-            "WITH latest_claim AS (
-                 SELECT target, holder, MAX(ts) AS ts
-                 FROM claims
-                 WHERE holder = ?1
-                 GROUP BY target, holder
-             )
-             SELECT
-                 COUNT(DISTINCT t.id) AS tasks_completed,
-                 COALESCE(SUM(CASE
-                     WHEN t.updated_at > lc.ts THEN t.updated_at - lc.ts
-                     ELSE 0
-                 END), 0) AS total_active_secs
-             FROM tasks t
-             JOIN latest_claim lc
-                 ON lc.target = 'task#' || t.id
-                 AND lc.holder = t.assignee
-             WHERE t.status IN ('done', 'closed')
-                 AND t.assignee = ?2",
-            params![agent_id, agent_id],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .optional()?;
-    Ok(row.unwrap_or((0, 0)))
+    // The COUNT/COALESCE(SUM) aggregate always returns exactly one row (zero matching
+    // tasks → `(0, 0)`), so `query_row` never raises `QueryReturnedNoRows`.
+    // `agent_id` is bound twice (?1 / ?2) because some SQLite driver bindings get touchy
+    // about reusing a single positional placeholder across non-adjacent clauses inside a
+    // CTE; both bindings are the same value.
+    let row = conn.query_row(
+        "WITH latest_claim AS (
+             SELECT target, holder, MAX(ts) AS ts
+             FROM claims
+             WHERE holder = ?1
+             GROUP BY target, holder
+         )
+         SELECT
+             COUNT(DISTINCT t.id) AS tasks_completed,
+             COALESCE(SUM(CASE
+                 WHEN t.updated_at > lc.ts THEN t.updated_at - lc.ts
+                 ELSE 0
+             END), 0) AS total_active_secs
+         FROM tasks t
+         JOIN latest_claim lc
+             ON lc.target = 'task#' || t.id
+             AND lc.holder = t.assignee
+         WHERE t.status IN ('done', 'closed')
+             AND t.assignee = ?2",
+        params![agent_id, agent_id],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    )?;
+    Ok(row)
 }
 
 /// Parse `tier:*` out of a JSON-array labels string. Returns the first matching label
@@ -1398,6 +1412,7 @@ mod tests {
             .find(|x| x.id == "Done")
             .expect("Done must be in retired_agents");
         assert_eq!(r.retired_at, 250);
+        assert_eq!(r.retired_age_secs, 50, "now=300 - retired_at=250 → 50s");
         assert_eq!(r.tasks_completed, 1);
         assert_eq!(r.total_active_secs, 30);
     }

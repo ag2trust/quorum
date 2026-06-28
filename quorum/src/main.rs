@@ -138,12 +138,11 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
         println!();
         println!("## retired agents (capacity dropped)");
         for r in &s.retired_agents {
-            let age = (quorum_core::clock::now() - r.retired_at).max(0);
             println!(
                 "  {:<24} [{:<14}] retired {:>5} ago  ·  tasks {:>2}  ·  active {}",
                 r.id,
                 r.tier,
-                fmt_age(age),
+                fmt_age(r.retired_age_secs),
                 r.tasks_completed,
                 fmt_age(r.total_active_secs),
             );
