@@ -1265,8 +1265,20 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let t_cancelled =
             tasks::create(&mut c, "CTO", "cnx", None, 0, None, None, None, 100).unwrap();
-        // Cancel via the proper path (creator can cancel an open task).
-        tasks::cancel(&mut c, "CTO", t_cancelled, 150).unwrap();
+        // Cancel via task-update --status cancelled (creator can cancel an open task).
+        tasks::update(
+            &mut c,
+            "CTO",
+            t_cancelled,
+            &tasks::TaskUpdate {
+                status: Some("cancelled"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            150,
+        )
+        .unwrap();
         let snap = gather(&c, "CTO", &[], 200).unwrap();
         let subj = format!("task#{t_cancelled}");
         assert!(

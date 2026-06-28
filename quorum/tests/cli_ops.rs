@@ -262,7 +262,10 @@ fn malformed_config_fails_loud() {
         "this is not = valid = toml =",
     )
     .unwrap();
-    quorum(home.path()).arg("roster").assert().code(3);
+    quorum(home.path())
+        .args(["status", "--agents"])
+        .assert()
+        .code(3);
 }
 
 #[test]
@@ -297,7 +300,7 @@ fn migration_refusal_exits_3_on_newer_schema() {
     drop(conn);
     // Any command that opens the DB should fail with exit 3.
     quorum(home.path())
-        .arg("roster")
+        .args(["status", "--agents"])
         .assert()
         .code(3)
         .stderr(predicates::str::contains("schema version 999"));
@@ -310,7 +313,7 @@ fn missing_config_falls_back_to_defaults() {
     // Delete config.toml — commands should still work with built-in defaults.
     std::fs::remove_file(home.path().join("config.toml")).unwrap();
     quorum(home.path())
-        .arg("roster")
+        .args(["status", "--agents"])
         .assert()
         .success()
         .stdout(predicates::str::diff("[]\n"));

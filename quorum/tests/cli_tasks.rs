@@ -121,14 +121,30 @@ fn release_then_reclaim_hands_off_task() {
         .success();
     // A gives it up → back to open, assignee cleared.
     quorum(home.path())
-        .args(["task-release", "--agent", "A", "--task-id", "1"])
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "open",
+        ])
         .assert()
         .success()
         .stdout(predicates::str::contains("\"status\":\"open\""))
         .stdout(predicates::str::contains("\"assignee\":null"));
     // A no longer holds it → a second release is a clean miss (exit 1).
     quorum(home.path())
-        .args(["task-release", "--agent", "A", "--task-id", "1"])
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "open",
+        ])
         .assert()
         .code(1);
     // B claims the now-open task and submits done; A (not assignee) cannot.
@@ -187,17 +203,41 @@ fn cancel_lifecycle() {
         .success();
     // A stranger (neither creator nor assignee) cannot cancel...
     quorum(home.path())
-        .args(["task-cancel", "--agent", "C", "--task-id", "1"])
+        .args([
+            "task-update",
+            "--agent",
+            "C",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+        ])
         .assert()
         .code(1);
     // ...but the creator can. Terminal → a second cancel is a clean miss.
     quorum(home.path())
-        .args(["task-cancel", "--agent", "boss", "--task-id", "1"])
+        .args([
+            "task-update",
+            "--agent",
+            "boss",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+        ])
         .assert()
         .success()
         .stdout(predicates::str::contains("\"status\":\"cancelled\""));
     quorum(home.path())
-        .args(["task-cancel", "--agent", "boss", "--task-id", "1"])
+        .args([
+            "task-update",
+            "--agent",
+            "boss",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+        ])
         .assert()
         .code(1);
 }
@@ -247,7 +287,7 @@ fn reaper_reclaims_lapsed_lease_via_cli() {
         .stdout(predicates::str::contains("lease lapsed"));
     // And the message feed is NOT polluted with auto-events.
     quorum(home.path())
-        .args(["peek"])
+        .args(["read"])
         .assert()
         .success()
         .stdout(predicates::str::contains("reclaimed").not());

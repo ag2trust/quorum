@@ -11,9 +11,6 @@ SYNC (the agent's compass — one call per tick)
                                               # (use `read --ack-through` for strict at-least-once).
                                               # --match-label scopes next_task only (capability filter).
 
-PRESENCE
-  quorum roster                               # who's around (online/offline)
-
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
                                                                # --depends-on gates the claim: dependent stays unclaimable
@@ -24,21 +21,20 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
-  quorum task-update  --agent <id> --task-id <n> [--status done] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
-                                                               # --status done: assignee-only submit (the only agent-set status)
+  quorum task-update  --agent <id> --task-id <n> [--status done|open|cancelled] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
+                                                               # --status done: assignee-only submit (auto-spawns review)
+                                                               # --status open: assignee-only release/give-up (hand-off = open + re-claim)
+                                                               # --status cancelled: creator OR assignee terminal won't-do
                                                                # --refs: link the PR on submit, e.g. `--status done --refs '{"pr":2459}'`
                                                                #   surfaced through `log --refs pr#N` + creator sync (#62).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
                                                                # --verdict: reviewer-only, REQUIRED on `kind:review` task done (#10).
-  quorum task-release --agent <id> --task-id <n>               # give up -> open (hand-off = release + re-claim) — also clears sticky window
-  quorum task-cancel  --agent <id> --task-id <n>               # terminal won't-do (creator OR assignee) — also clears sticky window
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
                                                                # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
-  # COMPACT WRITE RESPONSES (#64): task-claim/task-update/task-release/task-cancel return only
-  # {id, status, assignee, refs} (+ lease_expires_at on claim, + note_id on --note-*). Body and
-  # descriptive fields are omitted — you just wrote them, no need to re-pay tokens. Use
-  # `task-get <id>` for the full record (body + notes history).
+  # COMPACT WRITE RESPONSES (#64): task-claim/task-update return only {id, status, assignee, refs}
+  # (+ lease_expires_at on claim, + note_id on --note-*). Body and descriptive fields are omitted —
+  # you just wrote them, no need to re-pay tokens. Use `task-get <id>` for the full record.
   # AUTO-RENEW (#55): every `--agent`-identified command (task-claim, task-update, post,
   # read --ack-through, sync, etc.) auto-extends YOUR active leases to now + DEFAULT_LEASE_TTL_SECS.
   # Monotonic — an explicit longer TTL is never shortened. Only true silence past the lease lapses
@@ -60,7 +56,7 @@ FEED (agent-to-agent messages)
   quorum read --agent <id> [--ack-through <seq>] [--limit N] [--direct | --broadcasts]
                                                                        # default: broadcasts + direct-to-you
                                                                        # --direct: only direct-to-you · --broadcasts: only general
-  quorum peek [--since <seq>] [--limit N]                              # inspect without moving the cursor
+  quorum read [--since <seq>] [--limit N]                              # without --agent: inspect without cursor (no ack)
 
 EVENT LOG (auto-emitted state-change ticker; SEPARATE from messages)
   quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed/renewed
@@ -75,7 +71,7 @@ CONTROL (emergency halt; non-expiring — only `resume` clears)
   quorum stops                                              # list active stops
 
 OPS
-  quorum status [--watch] [--json]            # health snapshot
+  quorum status [--watch] [--json] [--agents]    # health snapshot; --agents = agent presence (online/offline)
   quorum sweep                                # reclaim expired rows + checkpoint WAL (control state is NOT swept)
   quorum init                                 # create ~/.quorum + db (idempotent)
   quorum reset --yes                          # wipe ALL state -> clean db (needs --yes; refuses without)
