@@ -30,6 +30,33 @@ pub const DEFAULT_LOG_LIMIT: i64 = 20;
 /// `notifications.count` is unbounded — it's just `COUNT(*)`.
 pub const DEFAULT_MSG_LIMIT: i64 = 20;
 
+/// Per-agent sync subscription level (#94, follow-up to #91).
+///
+/// A heads-down worker shouldn't be billed tokens for fleet-coordination chatter — the
+/// scope chooses which **critical broadcast** rows reach it in full. Directs (always
+/// addressed to me), the `broadcasts.count`, the scoped `log`, and `pinned` are NOT
+/// affected by scope; only the critical-broadcast bucket bodies are.
+///
+/// - **`Minimal` (the default for workers):** delivers only `system=1` critical
+///   broadcasts in full. Coordination criticals (`"review #45 needs a claimer"`,
+///   `"task#22 needs input"`) flow through the unchanged `broadcasts.count` instead —
+///   zero body bytes per tick. The acceptance contract from #94 is exactly this:
+///   workers see system criticals; not coordination criticals.
+/// - **`Coordinator`:** delivers ALL critical broadcasts in full (the pre-#94
+///   behavior). For the CTO and any dispatcher that genuinely routes coordination.
+///
+/// Default is `Minimal` because workers vastly outnumber coordinators in this fleet,
+/// and the cost we're optimizing is per-tick fleet-wide token usage. A coordinator
+/// opts in explicitly with `--scope coordinator` (or, on the API, `SyncScope::Coordinator`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum SyncScope {
+    /// Workers (default). Critical broadcasts limited to `system=1` only.
+    #[default]
+    Minimal,
+    /// Coordinators (opt-in). All critical broadcasts delivered in full.
+    Coordinator,
+}
+
 /// The task the agent currently holds (`status='claimed' AND assignee=agent`). Body is
 /// intentionally omitted — the agent fetches it once at `task-claim` time and again via
 /// `task-get` if needed. `sync` is the compass, not the cargo manifest.
@@ -229,11 +256,18 @@ pub struct Snapshot {
 /// Convenience wrapper around [`gather_with_budget`] using the core retirement defaults
 /// from `agents::DEFAULT_RETIRE_AFTER_*`. The CLI plumbs config-overridable budgets via
 /// `gather_with_budget` directly.
-pub fn gather(conn: &Connection, agent: &str, match_labels: &[&str], now: i64) -> Result<Snapshot> {
+pub fn gather(
+    conn: &Connection,
+    agent: &str,
+    match_labels: &[&str],
+    scope: SyncScope,
+    now: i64,
+) -> Result<Snapshot> {
     gather_with_budget(
         conn,
         agent,
         match_labels,
+        scope,
         now,
         crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
         crate::agents::DEFAULT_RETIRE_AFTER_TASKS,
@@ -246,6 +280,7 @@ pub fn gather_with_budget(
     conn: &Connection,
     agent: &str,
     match_labels: &[&str],
+    scope: SyncScope,
     now: i64,
     budget_active_secs: i64,
     budget_tasks: i64,
@@ -255,9 +290,16 @@ pub fn gather_with_budget(
     //    resume. Critical msgs still come through (they may explain the halt or be a more
     //    urgent directive). This honors the locked "Nothing else matters" semantics while
     //    keeping the priority-hint surface live.
+    //
+    //    A halted worker SHOULD still see the full critical body even on `--scope
+    //    minimal` — a halt event is precisely the "system must-see" case and a `stop`
+    //    is often paired with a `system=1` critical explaining it. We surface the
+    //    halt-path criticals unfiltered (effectively `SyncScope::Coordinator` for this
+    //    one bucket) so a worker never misses a follow-up directive issued during a
+    //    stop.
     if let Some(stop_row) = crate::control::is_stopped(conn, agent)? {
         let cursor = read_cursor(conn, agent, DEFAULT_TOPIC)?;
-        let buckets = bucket_messages(conn, agent, cursor, now)?;
+        let buckets = bucket_messages(conn, agent, cursor, SyncScope::Coordinator, now)?;
         // Pins are surfaced even during a stop — durable standing notices may explain
         // the halt or carry the "do X while halted" instruction. Same rationale as
         // critical: a halted agent benefits from the most context, not the least.
@@ -342,8 +384,10 @@ pub fn gather_with_budget(
 
     // 2. Message bucketing: direct full / critical full / broadcasts count + critical bodies.
     //    Reads from the cursor established by prior `read --ack-through` or `tick`.
+    //    `scope` only affects which critical broadcasts are returned in full — directs +
+    //    counts + scoped log are unaffected (#94 acceptance).
     let cursor = read_cursor(conn, agent, DEFAULT_TOPIC)?;
-    let buckets = bucket_messages(conn, agent, cursor, now)?;
+    let buckets = bucket_messages(conn, agent, cursor, scope, now)?;
     let notifications = if buckets.broadcast_count > 0 || !buckets.critical_broadcasts.is_empty() {
         Some(Notifications {
             count: buckets.broadcast_count,
@@ -456,12 +500,14 @@ pub fn tick(
     conn: &mut Connection,
     agent: &str,
     match_labels: &[&str],
+    scope: SyncScope,
     now: i64,
 ) -> Result<Snapshot> {
     tick_with_budget(
         conn,
         agent,
         match_labels,
+        scope,
         now,
         crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
         crate::agents::DEFAULT_RETIRE_AFTER_TASKS,
@@ -469,11 +515,14 @@ pub fn tick(
 }
 
 /// Same as [`tick`] but with explicit retire-budget parameters — the CLI calls this with
-/// values from `~/.quorum/config.toml`. Issue #97.
+/// values from `~/.quorum/config.toml`. Issue #97. The `scope` param (#94) is threaded
+/// through to `gather_with_budget`; only the critical-broadcast bucket reacts to it.
+#[allow(clippy::too_many_arguments)]
 pub fn tick_with_budget(
     conn: &mut Connection,
     agent: &str,
     match_labels: &[&str],
+    scope: SyncScope,
     now: i64,
     budget_active_secs: i64,
     budget_tasks: i64,
@@ -482,6 +531,7 @@ pub fn tick_with_budget(
         conn,
         agent,
         match_labels,
+        scope,
         now,
         budget_active_secs,
         budget_tasks,
@@ -718,14 +768,26 @@ struct Buckets {
     critical_broadcasts: Vec<MsgView>,
 }
 
-fn bucket_messages(conn: &Connection, agent: &str, cursor: i64, now: i64) -> Result<Buckets> {
+fn bucket_messages(
+    conn: &Connection,
+    agent: &str,
+    cursor: i64,
+    scope: SyncScope,
+    now: i64,
+) -> Result<Buckets> {
     // SQL-level bounding so a long-offline agent doesn't pull the full unread set into
     // memory before truncating. Three small targeted queries instead of one unbounded
     // fetch + in-memory partition:
-    //   (1) direct-to-me (info + critical), LIMIT DEFAULT_MSG_LIMIT
-    //   (2) critical broadcasts, LIMIT DEFAULT_MSG_LIMIT
-    //   (3) total broadcast count (one COUNT, no rows)
-    // critical bucket = direct-critical from (1) + all of (2).
+    //   (1) direct-to-me (info + critical), LIMIT DEFAULT_MSG_LIMIT — scope-INSENSITIVE
+    //       (directs are addressed to me; they always come through in full).
+    //   (2) critical broadcasts, LIMIT DEFAULT_MSG_LIMIT — SCOPE-FILTERED. On
+    //       SyncScope::Minimal, restrict to `system = 1` (#94's "system must-see"
+    //       carve-out). On SyncScope::Coordinator, return all critical broadcasts
+    //       (pre-#94 behavior, unchanged).
+    //   (3) total broadcast count (one COUNT, no rows) — scope-INSENSITIVE (the count
+    //       reports the true unread broadcast volume to the agent regardless of which
+    //       bodies were inlined; this is the read-side honesty contract).
+    // critical bucket = direct-critical from (1) + (filtered) of (2).
     //
     // Each statement is index-friendly via messages_topic_seq. (3) is a COUNT over unread
     // broadcasts — one row, no body bytes — the only honest way to report "N unread
@@ -762,13 +824,27 @@ fn bucket_messages(conn: &Connection, agent: &str, cursor: i64, now: i64) -> Res
         .cloned()
         .collect();
 
-    // (2) critical broadcasts, full payload, bounded
-    let mut stmt = conn.prepare(
-        "SELECT seq, ts, author, kind, body FROM messages
-         WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3
-           AND recipient IS NULL AND kind = 'critical'
-         ORDER BY seq ASC LIMIT ?4",
-    )?;
+    // (2) critical broadcasts, full payload, bounded. The `system = 1` clause is
+    // conditionally added for SyncScope::Minimal — workers receive only system
+    // criticals in full (#94). Coordinators see the full bucket (pre-#94 behavior).
+    // The two SQL strings differ by exactly one AND clause; we keep them as static
+    // string literals (no runtime concat with user input) so the prepared-statement
+    // contract is preserved.
+    let critical_sql = match scope {
+        SyncScope::Minimal => {
+            "SELECT seq, ts, author, kind, body FROM messages
+             WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3
+               AND recipient IS NULL AND kind = 'critical' AND system = 1
+             ORDER BY seq ASC LIMIT ?4"
+        }
+        SyncScope::Coordinator => {
+            "SELECT seq, ts, author, kind, body FROM messages
+             WHERE topic = ?1 AND seq > ?2 AND expires_at > ?3
+               AND recipient IS NULL AND kind = 'critical'
+             ORDER BY seq ASC LIMIT ?4"
+        }
+    };
+    let mut stmt = conn.prepare(critical_sql)?;
     let critical_broadcasts: Vec<MsgView> = stmt
         .query_map(
             params![DEFAULT_TOPIC, cursor, now, DEFAULT_MSG_LIMIT],
@@ -919,7 +995,7 @@ mod tests {
         let id = make_task(&mut c, "do the thing", 5, Some("[\"rust\"]"), 100);
         tasks::claim(&mut c, "A", Some(id), &[], 1000, 100).unwrap();
 
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         let cur = snap.current_task.as_ref().expect("current_task present");
         assert_eq!(cur.id, id);
         assert_eq!(cur.title, "do the thing");
@@ -941,7 +1017,7 @@ mod tests {
         assert!(tasks::get(&c, low).unwrap().is_some());
         assert!(tasks::get(&c, high).unwrap().is_some());
 
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(snap.current_task.is_none());
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.id, high, "highest priority wins");
@@ -954,14 +1030,14 @@ mod tests {
         let _other = make_task(&mut c, "other", 10, Some("[\"python\"]"), 100);
         let mine = make_task(&mut c, "mine", 5, Some("[\"rust\",\"async\"]"), 100);
         // The higher-priority "other" doesn't match "rust" — must be skipped.
-        let snap = gather(&c, "A", &["rust"], 200).unwrap();
+        let snap = gather(&c, "A", &["rust"], SyncScope::Coordinator, 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.id, mine);
         // Multi-label AND: requesting both should still match (labels has both).
-        let snap2 = gather(&c, "A", &["rust", "async"], 200).unwrap();
+        let snap2 = gather(&c, "A", &["rust", "async"], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(snap2.next_task.as_ref().unwrap().id, mine);
         // Requesting an unmatched label hides it.
-        let snap3 = gather(&c, "A", &["go"], 200).unwrap();
+        let snap3 = gather(&c, "A", &["go"], SyncScope::Coordinator, 200).unwrap();
         assert!(snap3.next_task.is_none());
     }
 
@@ -981,7 +1057,14 @@ mod tests {
             100,
         );
 
-        let snap = gather(&c, "agent-X", &["tier:opus-47"], 200).unwrap();
+        let snap = gather(
+            &c,
+            "agent-X",
+            &["tier:opus-47"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(
             nxt.id, review,
@@ -1003,7 +1086,7 @@ mod tests {
             100,
         );
 
-        let snap = gather(&c, "agent-X", &[], 200).unwrap();
+        let snap = gather(&c, "agent-X", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(snap.next_task.as_ref().unwrap().id, review);
     }
 
@@ -1013,7 +1096,14 @@ mod tests {
         // a user-work task without the tier label must still be hidden.
         let (_d, mut c) = open_tmp();
         let _foreign = make_task(&mut c, "foreign-tier", 100, Some("[\"tier:opus-46\"]"), 100);
-        let snap = gather(&c, "agent-X", &["tier:opus-47"], 200).unwrap();
+        let snap = gather(
+            &c,
+            "agent-X",
+            &["tier:opus-47"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         assert!(
             snap.next_task.is_none(),
             "non-review task in a different tier must remain filtered out",
@@ -1033,13 +1123,27 @@ mod tests {
             100,
         );
         // tier:opus-46 agent should NOT see this tiered review.
-        let snap46 = gather(&c, "agent-46", &["tier:opus-46"], 200).unwrap();
+        let snap46 = gather(
+            &c,
+            "agent-46",
+            &["tier:opus-46"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         assert!(
             snap46.next_task.is_none(),
             "tier:opus-46 sync must NOT surface a tier:opus-47 review",
         );
         // tier:opus-47 agent SHOULD see it.
-        let snap47 = gather(&c, "agent-47", &["tier:opus-47"], 200).unwrap();
+        let snap47 = gather(
+            &c,
+            "agent-47",
+            &["tier:opus-47"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         let nxt = snap47.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.id, review);
     }
@@ -1061,7 +1165,7 @@ mod tests {
             100,
         )
         .unwrap();
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         // `dep` (priority 1) is the next claimable; dependent (priority 10) is gated.
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.title, "dep");
@@ -1096,7 +1200,7 @@ mod tests {
         let claimable_pri50 = make_task(&mut c, "claimable below", 50, None, 100);
         // A non-sticky agent's sync must NOT be offered the sticky head (which they
         // can't claim) and MUST be offered the next claimable task.
-        let snap = gather(&c, "BusyBee", &[], 200).unwrap();
+        let snap = gather(&c, "BusyBee", &[], SyncScope::Coordinator, 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(
             nxt.id, claimable_pri50,
@@ -1112,7 +1216,7 @@ mod tests {
         let sticky_pri99 = make_task(&mut c, "sticky head", 99, None, 100);
         set_sticky(&c, sticky_pri99, "Griddle-7mR", 9999);
         let _below = make_task(&mut c, "claimable below", 50, None, 100);
-        let snap = gather(&c, "Griddle-7mR", &[], 200).unwrap();
+        let snap = gather(&c, "Griddle-7mR", &[], SyncScope::Coordinator, 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(
             nxt.id, sticky_pri99,
@@ -1135,7 +1239,7 @@ mod tests {
         ).unwrap();
         let claimable = make_task(&mut c, "real work", 50, None, 100);
         // Larkspur-q8X is the PR author (`orig`) — must NOT see the self-review head.
-        let snap = gather(&c, "Larkspur-q8X", &[], 200).unwrap();
+        let snap = gather(&c, "Larkspur-q8X", &[], SyncScope::Coordinator, 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(
             nxt.id, claimable,
@@ -1152,7 +1256,7 @@ mod tests {
              VALUES ('review of someone else', 'open', 1000, '[\"kind:review\"]', 'boss', 100, 100, 'Velcro-m4D')",
             [],
         ).unwrap();
-        let snap = gather(&c, "Larkspur-q8X", &[], 200).unwrap();
+        let snap = gather(&c, "Larkspur-q8X", &[], SyncScope::Coordinator, 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(
             nxt.title, "review of someone else",
@@ -1168,7 +1272,7 @@ mod tests {
         let task = make_task(&mut c, "previously sticky", 99, None, 100);
         set_sticky(&c, task, "OfflineAgent", 150);
         // now=200 > sticky_until=150 → expired.
-        let snap = gather(&c, "BusyBee", &[], 200).unwrap();
+        let snap = gather(&c, "BusyBee", &[], SyncScope::Coordinator, 200).unwrap();
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.id, task, "expired-sticky task is open to anyone");
     }
@@ -1187,13 +1291,27 @@ mod tests {
             [],
         ).unwrap();
         // An opus-46 agent must NOT see this even though the orig != them.
-        let snap_46 = gather(&c, "OpusFourSix", &["tier:opus-46"], 200).unwrap();
+        let snap_46 = gather(
+            &c,
+            "OpusFourSix",
+            &["tier:opus-46"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         assert!(
             snap_46.next_task.is_none(),
             "tier-mismatched review must be filtered even for non-author"
         );
         // An opus-47 non-author DOES see it.
-        let snap_47 = gather(&c, "Larkspur-q8X", &["tier:opus-47"], 200).unwrap();
+        let snap_47 = gather(
+            &c,
+            "Larkspur-q8X",
+            &["tier:opus-47"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         assert_eq!(snap_47.next_task.as_ref().unwrap().title, "opus-47 review");
     }
 
@@ -1211,6 +1329,7 @@ mod tests {
             "hi-A",
             None,
             Some("A"),
+            false,
             1000,
             100,
         )
@@ -1223,6 +1342,7 @@ mod tests {
             "halt-A",
             None,
             Some("A"),
+            false,
             1000,
             100,
         )
@@ -1235,13 +1355,17 @@ mod tests {
             "hi-B",
             None,
             Some("B"),
+            false,
             1000,
             100,
         )
         .unwrap();
         // Broadcasts: 3 plain + 1 critical.
         for body in ["b1", "b2", "b3"] {
-            feed::post(&mut c, "Z", "info", None, body, None, None, 1000, 100).unwrap();
+            feed::post(
+                &mut c, "Z", "info", None, body, None, None, false, 1000, 100,
+            )
+            .unwrap();
         }
         feed::post(
             &mut c,
@@ -1251,12 +1375,13 @@ mod tests {
             "site-wide",
             None,
             None,
+            false,
             1000,
             100,
         )
         .unwrap();
 
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         // Direct: hi-A + halt-A; hi-B is hidden.
         assert_eq!(snap.direct.len(), 2);
         let bodies: Vec<&str> = snap.direct.iter().map(|m| m.body.as_str()).collect();
@@ -1275,7 +1400,7 @@ mod tests {
     #[test]
     fn snapshot_omits_notifications_when_inbox_empty() {
         let (_d, c) = open_tmp();
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(snap.notifications.is_none());
         assert!(snap.direct.is_empty());
         assert!(snap.critical.is_empty());
@@ -1285,13 +1410,36 @@ mod tests {
     fn snapshot_respects_message_cursor() {
         let (_d, mut c) = open_tmp();
         // Two direct msgs to A.
-        let s1 = feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100)
-            .unwrap()
-            .seq;
-        feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100).unwrap();
+        let s1 = feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m1",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
+        feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m2",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap();
         // Agent A acks through s1 via the existing read path — sync must then only show m2.
         feed::read(&mut c, "A", None, Some(s1), feed::ReadFilter::All, 10, 200).unwrap();
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(snap.direct.len(), 1);
         assert_eq!(snap.direct[0].body, "m2");
     }
@@ -1308,7 +1456,7 @@ mod tests {
         tasks::claim(&mut c, "B", Some(b_task), &[], 1000, 100).unwrap();
         // Pre-existing claim events from the claim() calls above also exist.
         // Verify A only sees A's events.
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(!snap.log.is_empty(), "expected log entries on A's task");
         let a_subj = format!("task#{a_task}");
         let b_subj = format!("task#{b_task}");
@@ -1319,7 +1467,7 @@ mod tests {
         );
         assert!(snap.log.iter().any(|e| e.subject == a_subj));
         // Sanity: B's snapshot only sees B's events.
-        let snap_b = gather(&c, "B", &[], 200).unwrap();
+        let snap_b = gather(&c, "B", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(snap_b.log.iter().all(|e| e.subject == b_subj));
     }
 
@@ -1339,7 +1487,7 @@ mod tests {
         tasks::claim(&mut c, "B", Some(t_b), &[], 1000, 100).unwrap();
         // CTO has no current task and no claims, but they CREATED both — sync.log must
         // include events for both.
-        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let snap = gather(&c, "CTO", &[], SyncScope::Coordinator, 200).unwrap();
         let a_subj = format!("task#{t_a}");
         let b_subj = format!("task#{t_b}");
         assert!(
@@ -1373,7 +1521,7 @@ mod tests {
         .unwrap();
         tasks::claim(&mut c, "A", Some(mine), &[], 1000, 100).unwrap();
         tasks::claim(&mut c, "B", Some(theirs), &[], 1000, 100).unwrap();
-        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let snap = gather(&c, "CTO", &[], SyncScope::Coordinator, 200).unwrap();
         let my_subj = format!("task#{mine}");
         let their_subj = format!("task#{theirs}");
         assert!(snap.log.iter().any(|e| e.subject == my_subj));
@@ -1401,7 +1549,7 @@ mod tests {
             rusqlite::params![t_closed],
         )
         .unwrap();
-        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let snap = gather(&c, "CTO", &[], SyncScope::Coordinator, 200).unwrap();
         let closed_subj = format!("task#{t_closed}");
         let open_subj = format!("task#{t_open}");
         assert!(
@@ -1435,7 +1583,7 @@ mod tests {
             150,
         )
         .unwrap();
-        let snap = gather(&c, "CTO", &[], 200).unwrap();
+        let snap = gather(&c, "CTO", &[], SyncScope::Coordinator, 200).unwrap();
         let subj = format!("task#{t_cancelled}");
         assert!(
             !snap.log.iter().any(|e| e.subject == subj),
@@ -1448,7 +1596,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         // A holds a non-task claim (e.g., pr#1). Events on that target should show up.
         claims::claim(&mut c, "A", "pr#1", 1000, 100).unwrap();
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         // The claim() above emits a `claim_taken` event with subject=pr#1.
         assert!(
             snap.log
@@ -1464,7 +1612,7 @@ mod tests {
     #[test]
     fn snapshot_quiet_tick_serializes_to_near_empty_object() {
         let (_d, c) = open_tmp();
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         // No tasks, no claims, no messages: every optional/list field is empty → omitted.
         let json = serde_json::to_string(&snap).unwrap();
         assert_eq!(json, "{}", "quiet tick must serialize to {{}}, got {json}");
@@ -1489,16 +1637,20 @@ mod tests {
             "to-A",
             None,
             Some("A"),
+            false,
             1000,
             100,
         )
         .unwrap();
         for body in ["b1", "b2"] {
-            feed::post(&mut c, "Z", "info", None, body, None, None, 1000, 100).unwrap();
+            feed::post(
+                &mut c, "Z", "info", None, body, None, None, false, 1000, 100,
+            )
+            .unwrap();
         }
         crate::control::stop(&mut c, None, "deploy in flight", "cto", 100).unwrap();
 
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         let stop = snap.stop.as_ref().expect("stop present under global halt");
         assert_eq!(stop.scope, "global");
         assert_eq!(stop.reason, "deploy in flight");
@@ -1523,11 +1675,11 @@ mod tests {
         let (_d, mut c) = open_tmp();
         crate::control::stop(&mut c, Some("A"), "rate-limited", "cto", 100).unwrap();
         // A sees the stop.
-        let snap_a = gather(&c, "A", &[], 200).unwrap();
+        let snap_a = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         let stop = snap_a.stop.as_ref().expect("A is stopped");
         assert_eq!(stop.scope, "agent:A");
         // B is not affected — payload is normal (empty here since no state).
-        let snap_b = gather(&c, "B", &[], 200).unwrap();
+        let snap_b = gather(&c, "B", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(snap_b.stop.is_none(), "B leaked A's targeted stop");
     }
 
@@ -1544,12 +1696,13 @@ mod tests {
             "EVAC-NOW",
             None,
             Some("A"),
+            false,
             1000,
             100,
         )
         .unwrap();
         crate::control::stop(&mut c, None, "site outage", "cto", 100).unwrap();
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(snap.stop.is_some());
         assert!(
             snap.critical.iter().any(|m| m.body == "EVAC-NOW"),
@@ -1566,7 +1719,7 @@ mod tests {
         crate::control::resume(&mut c, None, "cto", 110).unwrap();
         // Tight window: 110 + 5s = 115. resume emitted stop_cleared with ts=110, threshold
         // is now-WINDOW = 115-120 = -5 < 110 → match.
-        let snap = gather(&c, "A", &[], 115).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 115).unwrap();
         assert!(snap.stop.is_none(), "stop should be cleared");
         assert_eq!(
             snap.stop_cleared,
@@ -1584,7 +1737,14 @@ mod tests {
         crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
         crate::control::resume(&mut c, None, "cto", 110).unwrap();
         // Past the window: now = 110 + WINDOW + 1 = past threshold.
-        let snap = gather(&c, "A", &[], 110 + STOP_CLEARED_WINDOW_SECS + 1).unwrap();
+        let snap = gather(
+            &c,
+            "A",
+            &[],
+            SyncScope::Coordinator,
+            110 + STOP_CLEARED_WINDOW_SECS + 1,
+        )
+        .unwrap();
         assert!(
             snap.stop_cleared.is_none(),
             "stop_cleared must drop after window"
@@ -1597,13 +1757,13 @@ mod tests {
         let (_d, mut c) = open_tmp();
         crate::control::stop(&mut c, Some("A"), "rate-limited", "cto", 100).unwrap();
         crate::control::resume(&mut c, Some("A"), "cto", 110).unwrap();
-        let snap_a = gather(&c, "A", &[], 115).unwrap();
+        let snap_a = gather(&c, "A", &[], SyncScope::Coordinator, 115).unwrap();
         assert_eq!(
             snap_a.stop_cleared,
             Some(true),
             "A's resume must surface for A"
         );
-        let snap_b = gather(&c, "B", &[], 115).unwrap();
+        let snap_b = gather(&c, "B", &[], SyncScope::Coordinator, 115).unwrap();
         assert!(
             snap_b.stop_cleared.is_none(),
             "A's resume must NOT leak to B (different scope)"
@@ -1617,7 +1777,7 @@ mod tests {
         crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
         crate::control::resume(&mut c, None, "cto", 110).unwrap();
         for agent in ["A", "B", "C"] {
-            let snap = gather(&c, agent, &[], 115).unwrap();
+            let snap = gather(&c, agent, &[], SyncScope::Coordinator, 115).unwrap();
             assert_eq!(
                 snap.stop_cleared,
                 Some(true),
@@ -1642,12 +1802,13 @@ mod tests {
                 &format!("m{i}"),
                 None,
                 Some("A"),
+                false,
                 1000,
                 100,
             )
             .unwrap();
         }
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(
             snap.direct.len(),
             DEFAULT_MSG_LIMIT as usize,
@@ -1673,12 +1834,13 @@ mod tests {
                 &format!("c{i}"),
                 None,
                 None,
+                false,
                 1000,
                 100,
             )
             .unwrap();
         }
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(snap.critical.len(), DEFAULT_MSG_LIMIT as usize);
         let notif = snap.notifications.as_ref().unwrap();
         assert_eq!(
@@ -1703,7 +1865,7 @@ mod tests {
                 .unwrap();
             tx.commit().unwrap();
         }
-        let snap = gather(&c, "A", &[], 200).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(
             snap.log.len(),
             DEFAULT_LOG_LIMIT as usize,
@@ -1717,11 +1879,34 @@ mod tests {
     #[test]
     fn tick_advances_cursor_past_returned_direct_msgs() {
         let (_d, mut c) = open_tmp();
-        let s1 = feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100)
-            .unwrap()
-            .seq;
-        feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100).unwrap();
-        let snap = tick(&mut c, "A", &[], 200).unwrap();
+        let s1 = feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m1",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
+        feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m2",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap();
+        let snap = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(snap.direct.len(), 2);
         // Cursor should now sit at or past the highest seq we showed (m2's seq).
         let cursor: i64 = c
@@ -1740,9 +1925,33 @@ mod tests {
         // return zero direct/critical and the cursor must not regress. This pins the
         // at-most-once behavior the design accepts for token-cheap auto-ack.
         let (_d, mut c) = open_tmp();
-        feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100).unwrap();
-        feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100).unwrap();
-        let first = tick(&mut c, "A", &[], 200).unwrap();
+        feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m1",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap();
+        feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m2",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap();
+        let first = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(first.direct.len(), 2);
         let cursor_after_first: i64 = c
             .query_row(
@@ -1751,7 +1960,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let second = tick(&mut c, "A", &[], 200).unwrap();
+        let second = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(second.direct.is_empty());
         assert!(second.critical.is_empty());
         assert!(second.notifications.is_none());
@@ -1774,11 +1983,14 @@ mod tests {
         // notifications (the broadcast tail also gets acked, not just direct bodies).
         let (_d, mut c) = open_tmp();
         for body in ["b1", "b2", "b3"] {
-            feed::post(&mut c, "Z", "info", None, body, None, None, 1000, 100).unwrap();
+            feed::post(
+                &mut c, "Z", "info", None, body, None, None, false, 1000, 100,
+            )
+            .unwrap();
         }
-        let first = tick(&mut c, "A", &[], 200).unwrap();
+        let first = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(first.notifications.as_ref().unwrap().count, 3);
-        let second = tick(&mut c, "A", &[], 200).unwrap();
+        let second = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(
             second.notifications.is_none(),
             "broadcasts must not be re-counted on the next tick — got {:?}",
@@ -1791,17 +2003,39 @@ mod tests {
         // If an external `feed::read --ack-through` advanced the cursor past where the
         // current tick's max-seen sits, tick's MAX(...) clause must NOT regress it.
         let (_d, mut c) = open_tmp();
-        let s1 = feed::post(&mut c, "Z", "info", None, "m1", None, Some("A"), 1000, 100)
-            .unwrap()
-            .seq;
-        let s2 = feed::post(&mut c, "Z", "info", None, "m2", None, Some("A"), 1000, 100)
-            .unwrap()
-            .seq;
+        let s1 = feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m1",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
+        let s2 = feed::post(
+            &mut c,
+            "Z",
+            "info",
+            None,
+            "m2",
+            None,
+            Some("A"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
         // Externally ack past s2 (somehow the agent or another caller advanced first).
         feed::read(&mut c, "A", None, Some(s2), feed::ReadFilter::All, 10, 200).unwrap();
         // Tick now: would compute max_seen <= s2 from a stale read, but the MAX clause
         // must keep the cursor at s2 (or higher).
-        let _ = tick(&mut c, "A", &[], 200).unwrap();
+        let _ = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         let cursor: i64 = c
             .query_row(
                 "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
@@ -1821,7 +2055,7 @@ mod tests {
         // A tick with nothing to read must NOT create a cursor row (we don't churn
         // sqlite writes on quiet ticks).
         let (_d, mut c) = open_tmp();
-        let _ = tick(&mut c, "A", &[], 200).unwrap();
+        let _ = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         let row: Option<i64> = c
             .query_row(
                 "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
@@ -1839,7 +2073,14 @@ mod tests {
     #[test]
     fn tick_persists_tier_from_match_labels() {
         let (_d, mut c) = open_tmp();
-        let _ = tick(&mut c, "Alice", &["tier:opus-46"], 200).unwrap();
+        let _ = tick(
+            &mut c,
+            "Alice",
+            &["tier:opus-46"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
         let tier: Option<String> = c
             .query_row("SELECT tier FROM agents WHERE id='Alice'", [], |r| r.get(0))
             .unwrap();
@@ -1849,8 +2090,15 @@ mod tests {
     #[test]
     fn tick_without_tier_label_does_not_clear_stored_tier() {
         let (_d, mut c) = open_tmp();
-        let _ = tick(&mut c, "Bob", &["tier:opus-47"], 200).unwrap();
-        let _ = tick(&mut c, "Bob", &[], 300).unwrap();
+        let _ = tick(
+            &mut c,
+            "Bob",
+            &["tier:opus-47"],
+            SyncScope::Coordinator,
+            200,
+        )
+        .unwrap();
+        let _ = tick(&mut c, "Bob", &[], SyncScope::Coordinator, 300).unwrap();
         let tier: Option<String> = c
             .query_row("SELECT tier FROM agents WHERE id='Bob'", [], |r| r.get(0))
             .unwrap();
@@ -1875,6 +2123,7 @@ mod tests {
             "to-A",
             None,
             Some("A"),
+            false,
             1000,
             100,
         )
@@ -1890,7 +2139,7 @@ mod tests {
             )
             .optional()
             .unwrap();
-        let _ = gather(&c, "A", &[], 200).unwrap();
+        let _ = gather(&c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         let after: Option<i64> = c
             .query_row(
                 "SELECT last_seq FROM cursors WHERE agent_id='A' AND topic='hub'",
@@ -1914,7 +2163,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let pin = crate::pinned::pin(&mut c, "cto", "MIGRATION IN PROGRESS", 50).unwrap();
 
-        let snap = gather(&c, "fresh-agent", &[], 100).unwrap();
+        let snap = gather(&c, "fresh-agent", &[], SyncScope::Coordinator, 100).unwrap();
         assert_eq!(snap.pinned.len(), 1);
         assert_eq!(snap.pinned[0].id, pin.id);
         assert_eq!(snap.pinned[0].author, "cto");
@@ -1928,11 +2177,11 @@ mod tests {
         let (_d, mut c) = open_tmp();
         crate::pinned::pin(&mut c, "cto", "standing notice", 50).unwrap();
 
-        let snap1 = tick(&mut c, "A", &[], 100).unwrap();
+        let snap1 = tick(&mut c, "A", &[], SyncScope::Coordinator, 100).unwrap();
         assert_eq!(snap1.pinned.len(), 1);
-        let snap2 = tick(&mut c, "A", &[], 200).unwrap();
+        let snap2 = tick(&mut c, "A", &[], SyncScope::Coordinator, 200).unwrap();
         assert_eq!(snap2.pinned.len(), 1, "pinned must survive cursor advance");
-        let snap3 = tick(&mut c, "A", &[], 300).unwrap();
+        let snap3 = tick(&mut c, "A", &[], SyncScope::Coordinator, 300).unwrap();
         assert_eq!(snap3.pinned.len(), 1);
     }
 
@@ -1945,7 +2194,7 @@ mod tests {
         crate::pinned::pin(&mut c, "cto", "WHILE HALTED: do nothing", 50).unwrap();
         crate::control::stop(&mut c, None, "deploy", "cto", 100).unwrap();
 
-        let snap = gather(&c, "anyone", &[], 200).unwrap();
+        let snap = gather(&c, "anyone", &[], SyncScope::Coordinator, 200).unwrap();
         assert!(snap.stop.is_some(), "stop is set");
         assert_eq!(snap.pinned.len(), 1, "pinned must surface even on stop");
         // Other fields must be omitted per STOP-is-absolute.
@@ -1957,9 +2206,18 @@ mod tests {
     fn snapshot_pinned_removed_after_unpin() {
         let (_d, mut c) = open_tmp();
         let p = crate::pinned::pin(&mut c, "cto", "transient", 50).unwrap();
-        assert_eq!(gather(&c, "A", &[], 100).unwrap().pinned.len(), 1);
+        assert_eq!(
+            gather(&c, "A", &[], SyncScope::Coordinator, 100)
+                .unwrap()
+                .pinned
+                .len(),
+            1
+        );
         crate::pinned::unpin(&mut c, p.id, "cto", 200).unwrap();
-        assert!(gather(&c, "A", &[], 300).unwrap().pinned.is_empty());
+        assert!(gather(&c, "A", &[], SyncScope::Coordinator, 300)
+            .unwrap()
+            .pinned
+            .is_empty());
     }
 
     #[test]
@@ -1967,7 +2225,7 @@ mod tests {
         // Default state: no pins, sync payload omits the `pinned` field entirely
         // (skip_serializing_if = "Vec::is_empty"). Wire economy.
         let (_d, c) = open_tmp();
-        let snap = gather(&c, "A", &[], 100).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 100).unwrap();
         assert!(snap.pinned.is_empty());
         let json = serde_json::to_string(&snap).unwrap();
         assert!(
@@ -1984,7 +2242,7 @@ mod tests {
         let a = crate::pinned::pin(&mut c, "cto", "first", 50).unwrap();
         let b = crate::pinned::pin(&mut c, "cto", "second", 60).unwrap();
         let c_pin = crate::pinned::pin(&mut c, "cto", "third", 70).unwrap();
-        let snap = gather(&c, "A", &[], 100).unwrap();
+        let snap = gather(&c, "A", &[], SyncScope::Coordinator, 100).unwrap();
         let ids: Vec<i64> = snap.pinned.iter().map(|p| p.id).collect();
         assert_eq!(ids, vec![a.id, b.id, c_pin.id]);
     }
@@ -2020,7 +2278,8 @@ mod tests {
         // normal next_task and no retire signal.
         let (_d, mut c) = open_tmp();
         let id = make_task(&mut c, "do thing", 1, None, 100);
-        let snap = gather_with_budget(&c, "Fresh", &[], 200, 5400, 8).unwrap();
+        let snap =
+            gather_with_budget(&c, "Fresh", &[], SyncScope::Coordinator, 200, 5400, 8).unwrap();
         assert!(snap.retire.is_none(), "fresh agent must not be retiring");
         assert_eq!(snap.next_task.as_ref().unwrap().id, id);
     }
@@ -2039,7 +2298,8 @@ mod tests {
         // An open task at the head of the queue — would normally be `next_task`.
         let _q = make_task(&mut c, "fresh-work", 5, None, 20000);
 
-        let snap = gather_with_budget(&c, "Tired", &[], 20000, 5400, 8).unwrap();
+        let snap =
+            gather_with_budget(&c, "Tired", &[], SyncScope::Coordinator, 20000, 5400, 8).unwrap();
         let r = snap.retire.as_ref().expect("retire signal present");
         assert_eq!(r.status, "retired"); // no current/sticky → straight to retired-effective
         assert_eq!(r.tasks_completed, 4);
@@ -2063,7 +2323,16 @@ mod tests {
             drive_done(&mut c, "ManyShort", now, now + 1);
             now += 10;
         }
-        let snap = gather_with_budget(&c, "ManyShort", &[], now + 10, 5400, 8).unwrap();
+        let snap = gather_with_budget(
+            &c,
+            "ManyShort",
+            &[],
+            SyncScope::Coordinator,
+            now + 10,
+            5400,
+            8,
+        )
+        .unwrap();
         assert!(
             snap.retire.is_some(),
             "tasks-count budget must trigger retire"
@@ -2092,7 +2361,8 @@ mod tests {
         // Also drop a normal claimable task in the queue (must stay hidden under retire).
         let _open = make_task(&mut c, "new-work", 10, None, 25500);
 
-        let snap = gather_with_budget(&c, "Dr", &[], 25500, 5400, 8).unwrap();
+        let snap =
+            gather_with_budget(&c, "Dr", &[], SyncScope::Coordinator, 25500, 5400, 8).unwrap();
         let nxt = snap.next_task.as_ref().expect("sticky-mine must surface");
         assert_eq!(
             nxt.id, sticky_id,
@@ -2112,7 +2382,8 @@ mod tests {
         for i in 0..4 {
             drive_done(&mut c, "End", 1000 + i * 5000, 1000 + i * 5000 + 1800);
         }
-        let snap1 = tick_with_budget(&mut c, "End", &[], 30_000, 5400, 8).unwrap();
+        let snap1 =
+            tick_with_budget(&mut c, "End", &[], SyncScope::Coordinator, 30_000, 5400, 8).unwrap();
         assert_eq!(snap1.retire.as_ref().unwrap().status, "retired");
         // First tick: retired_at not yet persisted at the read step (write follows).
         // Verify the persisted state.
@@ -2123,7 +2394,8 @@ mod tests {
 
         // Second tick at a later `now` — retire signal should still fire, carry the
         // ORIGINAL retired_at (idempotent: mark_retired must not re-stamp).
-        let snap2 = tick_with_budget(&mut c, "End", &[], 31_000, 5400, 8).unwrap();
+        let snap2 =
+            tick_with_budget(&mut c, "End", &[], SyncScope::Coordinator, 31_000, 5400, 8).unwrap();
         let r = snap2.retire.as_ref().expect("retire signal still present");
         assert_eq!(r.status, "retired");
         assert_eq!(r.retired_at, Some(30_000));
@@ -2143,7 +2415,8 @@ mod tests {
         let active = make_task(&mut c, "in-flight", 1, None, 30_000);
         tasks::claim(&mut c, "Busy", Some(active), &[], 3600, 30_100).unwrap();
 
-        let snap = tick_with_budget(&mut c, "Busy", &[], 30_200, 5400, 8).unwrap();
+        let snap =
+            tick_with_budget(&mut c, "Busy", &[], SyncScope::Coordinator, 30_200, 5400, 8).unwrap();
         let r = snap.retire.as_ref().expect("retire signal present");
         assert_eq!(r.status, "retiring");
         // Current task still surfaces (XOR with next_task; retirement doesn't hide it).
@@ -2166,10 +2439,233 @@ mod tests {
         // Two completed tasks (well under both budgets).
         drive_done(&mut c, "X", 100, 200);
         drive_done(&mut c, "X", 300, 400);
-        let snap = gather(&c, "X", &[], 500).unwrap();
+        let snap = gather(&c, "X", &[], SyncScope::Coordinator, 500).unwrap();
         assert!(snap.retire.is_none());
         // Sanity: the constants are what the doc-comment claims.
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS, 5400);
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_TASKS, 8);
+    }
+
+    // --- #94: per-agent sync subscription scope (minimal vs coordinator) -----------------
+
+    /// On `SyncScope::Minimal` (the worker default), the critical-broadcast bucket
+    /// drops every row where `system = 0`. The coordination-class critical (`"review
+    /// #45 needs a claimer"`) here is delivered to a coordinator in full but never to a
+    /// minimal-scope worker — the load-bearing #94 acceptance.
+    #[test]
+    fn snapshot_minimal_scope_drops_non_system_critical_broadcasts() {
+        let (_d, mut c) = open_tmp();
+        // A non-system critical broadcast (typical coordination chatter).
+        let s_coord = feed::post(
+            &mut c,
+            "cto",
+            "critical",
+            None,
+            "review #45 needs a claimer",
+            None,
+            None,
+            false, // system = false
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
+
+        // Minimal scope: critical bucket empty (the coord-class broadcast filtered),
+        // but the broadcast count still reports 1 (the read-side honesty contract).
+        let snap_min = gather(&c, "worker", &[], SyncScope::Minimal, 200).unwrap();
+        assert!(
+            snap_min.critical.is_empty(),
+            "minimal: non-system critical must NOT reach worker's critical bucket"
+        );
+        let notif = snap_min
+            .notifications
+            .as_ref()
+            .expect("notifications must be present (broadcast_count=1)");
+        assert_eq!(notif.count, 1, "broadcast count is scope-insensitive");
+        assert!(
+            notif.critical.is_empty(),
+            "minimal: notifications.critical bodies must also be filtered"
+        );
+
+        // Coordinator scope: same row delivered in full.
+        let snap_coord = gather(&c, "cto-dispatcher", &[], SyncScope::Coordinator, 200).unwrap();
+        assert_eq!(
+            snap_coord.critical.len(),
+            1,
+            "coordinator: non-system critical IS delivered"
+        );
+        assert_eq!(snap_coord.critical[0].seq, s_coord);
+        assert_eq!(snap_coord.critical[0].body, "review #45 needs a claimer");
+    }
+
+    /// On `SyncScope::Minimal`, the system-must-see carve-out IS delivered: a
+    /// `quorum stop` / master-CI-red broadcast tagged `system=1` reaches every worker
+    /// regardless of scope.
+    #[test]
+    fn snapshot_minimal_scope_delivers_system_critical_broadcasts() {
+        let (_d, mut c) = open_tmp();
+        let s_sys = feed::post(
+            &mut c,
+            "cto",
+            "critical",
+            None,
+            "STOP: master CI red",
+            None,
+            None,
+            true, // system = true (must-see)
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
+
+        let snap = gather(&c, "worker", &[], SyncScope::Minimal, 200).unwrap();
+        assert_eq!(
+            snap.critical.len(),
+            1,
+            "minimal: system critical MUST reach worker's critical bucket"
+        );
+        assert_eq!(snap.critical[0].seq, s_sys);
+        assert_eq!(snap.critical[0].body, "STOP: master CI red");
+    }
+
+    /// Coordinator scope sees BOTH system and non-system critical broadcasts in full
+    /// (pre-#94 behavior preserved). This is the "no regression for dispatchers" check.
+    #[test]
+    fn snapshot_coordinator_scope_delivers_both_system_and_non_system_criticals() {
+        let (_d, mut c) = open_tmp();
+        feed::post(
+            &mut c,
+            "cto",
+            "critical",
+            None,
+            "review #45 needs a claimer",
+            None,
+            None,
+            false,
+            1000,
+            100,
+        )
+        .unwrap();
+        feed::post(
+            &mut c, "cto", "critical", None, "STOP", None, None, true, 1000, 101,
+        )
+        .unwrap();
+        let snap = gather(&c, "cto-dispatcher", &[], SyncScope::Coordinator, 200).unwrap();
+        assert_eq!(
+            snap.critical.len(),
+            2,
+            "coordinator: must see both system and non-system criticals"
+        );
+    }
+
+    /// Directs (`recipient = me`) are delivered in full regardless of scope, even when
+    /// the body has `system = 0`. The scope filter is broadcast-only.
+    #[test]
+    fn snapshot_minimal_scope_delivers_directs_regardless_of_system_flag() {
+        let (_d, mut c) = open_tmp();
+        // A direct (recipient=worker), critical, system=false. Should reach the worker.
+        let s = feed::post(
+            &mut c,
+            "cto",
+            "critical",
+            None,
+            "private hand-off",
+            None,
+            Some("worker"),
+            false,
+            1000,
+            100,
+        )
+        .unwrap()
+        .seq;
+        let snap = gather(&c, "worker", &[], SyncScope::Minimal, 200).unwrap();
+        assert_eq!(snap.direct.len(), 1, "directs are scope-insensitive");
+        assert_eq!(snap.direct[0].seq, s);
+        // Direct-critical is mirrored into the critical priority bucket — scope still
+        // doesn't filter it (it's a direct, not a broadcast).
+        assert_eq!(snap.critical.len(), 1);
+        assert_eq!(snap.critical[0].seq, s);
+    }
+
+    /// The `notifications.count` (the read-side honesty contract) reports the true
+    /// total of unread broadcasts regardless of scope. The minimal-scope worker still
+    /// learns "there were N broadcasts I didn't see in full" — they're just inlined
+    /// less.
+    #[test]
+    fn snapshot_broadcast_count_is_scope_insensitive() {
+        let (_d, mut c) = open_tmp();
+        // Mix: 2 non-system criticals + 1 system critical + 1 plain-info broadcast.
+        for (kind, sys, body, ts) in [
+            ("critical", false, "coord-1", 100),
+            ("critical", false, "coord-2", 101),
+            ("critical", true, "STOP", 102),
+            ("info", false, "general", 103),
+        ] {
+            feed::post(&mut c, "cto", kind, None, body, None, None, sys, 1000, ts).unwrap();
+        }
+
+        let snap_min = gather(&c, "worker", &[], SyncScope::Minimal, 200).unwrap();
+        let snap_coord = gather(&c, "cto", &[], SyncScope::Coordinator, 200).unwrap();
+        // Both see the same count.
+        assert_eq!(
+            snap_min.notifications.as_ref().unwrap().count,
+            4,
+            "minimal: broadcast_count must report ALL unread broadcasts"
+        );
+        assert_eq!(
+            snap_coord.notifications.as_ref().unwrap().count,
+            4,
+            "coordinator: broadcast_count unchanged"
+        );
+        // Critical inlining differs.
+        assert_eq!(
+            snap_min.critical.len(),
+            1,
+            "minimal: only system critical inlined"
+        );
+        assert_eq!(
+            snap_coord.critical.len(),
+            3,
+            "coordinator: all 3 critical broadcasts inlined"
+        );
+    }
+
+    /// Migration safety: a critical broadcast posted before #94 lands (no `system`
+    /// flag → stored as system=0 by the v9→v10 column default) is invisible to
+    /// minimal-scope workers post-upgrade. This is the safe default — coordinators
+    /// still see legacy criticals; the only behavior change is that workers stop
+    /// receiving bodies for them, which is the whole point.
+    #[test]
+    fn legacy_pre_v10_critical_broadcasts_are_invisible_to_minimal_scope() {
+        let (_d, c) = open_tmp();
+        // Simulate a legacy row: insert directly with system=0 (the ALTER default).
+        c.execute(
+            "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient, system)
+             VALUES (100, 'pre-v10', 'hub', 'critical', 'legacy coord critical', NULL, 1100, NULL, 0)",
+            [],
+        ).unwrap();
+        let snap_min = gather(&c, "worker", &[], SyncScope::Minimal, 200).unwrap();
+        assert!(
+            snap_min.critical.is_empty(),
+            "minimal: legacy critical (system=0) must NOT reach worker"
+        );
+        // But the count still reports it — honest reporting unchanged.
+        assert_eq!(snap_min.notifications.as_ref().unwrap().count, 1);
+
+        let snap_coord = gather(&c, "cto", &[], SyncScope::Coordinator, 200).unwrap();
+        assert_eq!(
+            snap_coord.critical.len(),
+            1,
+            "coordinator: legacy critical IS delivered (no regression)"
+        );
+    }
+
+    /// SyncScope::Minimal is the Default impl — confirms the worker-friendly default
+    /// (cheap-by-default) is what the type itself promises.
+    #[test]
+    fn sync_scope_default_is_minimal() {
+        assert_eq!(SyncScope::default(), SyncScope::Minimal);
     }
 }

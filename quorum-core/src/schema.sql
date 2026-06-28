@@ -25,7 +25,16 @@ CREATE TABLE IF NOT EXISTS messages (
     body        TEXT NOT NULL,
     refs        TEXT,
     expires_at  INTEGER NOT NULL,
-    recipient   TEXT
+    recipient   TEXT,
+    -- Per-agent sync subscription scope (#94). When 1, this message is part of the
+    -- "system must-see" critical bucket every worker receives regardless of scope
+    -- (e.g. `quorum stop`, master-CI-red, owner sign-off). When 0 (the default),
+    -- only `--scope coordinator` syncs receive its full body — workers on
+    -- `--scope minimal` see it only via the `broadcasts.count` (zero body bytes).
+    -- Orthogonal to `kind` (a non-`critical` message with `system=1` still routes
+    -- as a normal direct/broadcast — the column only filters the critical-broadcast
+    -- bucket). Default 0 so pre-existing rows pre-migration remain coordinator-only.
+    system      INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS messages_topic_seq ON messages(topic, seq);
 CREATE INDEX IF NOT EXISTS messages_expires  ON messages(expires_at);

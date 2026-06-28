@@ -610,6 +610,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             refs,
             body_stdin,
             body_file,
+            system_critical,
         } => {
             let body = read_optional_body(body_stdin, body_file)?.ok_or_else(|| {
                 QuorumError::Usage("post requires --body-stdin or --body-file".into())
@@ -627,6 +628,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 &body,
                 refs.as_deref(),
                 to.as_deref(),
+                system_critical,
                 ttl,
                 now,
             )?;
@@ -811,7 +813,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&pins);
             Ok(0)
         }
-        cli::Command::Sync { agent, match_label } => {
+        cli::Command::Sync {
+            agent,
+            match_label,
+            scope,
+        } => {
             let cfg = load_cfg()?;
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
             let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
@@ -819,6 +825,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 &mut conn,
                 &agent,
                 &labels,
+                scope.into(),
                 now,
                 cfg.retire_after_active_secs,
                 cfg.retire_after_tasks,

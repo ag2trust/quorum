@@ -227,7 +227,8 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum roster` → agents with derived online/offline
 
 ### Feed (at-least-once delivery)
-- `quorum post --agent <id> --kind <k> [--topic <t>] [--ttl <d>] (--body-stdin | --body-file <p> | --json-stdin)` → `{seq, expires_at}`
+- `quorum post --agent <id> --kind <k> [--topic <t>] [--ttl <d>] [--system-critical] (--body-stdin | --body-file <p> | --json-stdin)` → `{seq, expires_at}`. **`--system-critical` (#94)** marks a critical broadcast as "system must-see" so workers on `sync --scope minimal` receive its full body — typical use is `quorum stop`, master-CI-red, owner sign-off. Orthogonal to `--kind critical`; without the flag, a `--kind critical` broadcast is delivered in full ONLY to `--scope coordinator` syncs (workers see it via the broadcast count, zero body bytes).
+- `quorum sync --agent <id> [--match-label <l>] [--scope minimal|coordinator]` → orientation snapshot. **`--scope` (#94)** chooses the critical-broadcast bucket: `minimal` (default, worker-friendly) delivers only `--system-critical` broadcasts in full; `coordinator` (CTO / dispatchers) keeps the full critical feed. Directs (always addressed to me), `broadcasts.count`, scoped `log`, and `pinned` are unaffected by scope. The stop-path critical bucket is unfiltered (a halted worker sees the full body — system-must-see semantics).
 - `quorum read --agent <id> [--topic <t>] [--ack-through <seq>] [--limit N]` → messages with
   `seq > cursor` (filtered `expires_at > now`). **Two modes, made explicit:** without
   `--ack-through` it is a **pure read** (no lock). With `--ack-through` it is a **write txn**

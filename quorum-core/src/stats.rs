@@ -711,10 +711,12 @@ mod tests {
     #[test]
     fn counts_exclude_expired_and_stale() {
         let (_d, mut c) = open_tmp();
-        // Live message survives past now; dead message expired long ago.
-        crate::feed::post(&mut c, "A", "info", None, "live", None, None, 4000, 100).unwrap();
-        crate::feed::post(&mut c, "A", "info", None, "dead", None, None, 5, 100).unwrap();
-        // Claim auto-renewed by touch to expires_at = MAX(1100, 100+3600) = 3700.
+        // Live message survives past now (TTL=4000); dead message expired long ago.
+        crate::feed::post(
+            &mut c, "A", "info", None, "live", None, None, false, 4000, 100,
+        )
+        .unwrap();
+        crate::feed::post(&mut c, "A", "info", None, "dead", None, None, false, 5, 100).unwrap();
         crate::claims::claim(&mut c, "A", "pr#1", 1000, 100).unwrap();
         crate::tasks::create(&mut c, "A", "t", None, 0, None, None, None, 100).unwrap();
 
@@ -867,7 +869,10 @@ mod tests {
     fn agents_view_unknown_tier_when_never_synced_with_tier() {
         let (_d, mut c) = open_tmp();
         // Agent posts a message (touches presence) but never synced with --match-label.
-        crate::feed::post(&mut c, "NoTier", "info", None, "hi", None, None, 1000, 100).unwrap();
+        crate::feed::post(
+            &mut c, "NoTier", "info", None, "hi", None, None, false, 1000, 100,
+        )
+        .unwrap();
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         let a = s.agents.iter().find(|a| a.id == "NoTier").unwrap();
         assert_eq!(a.tier, "unknown");
@@ -951,13 +956,17 @@ mod tests {
                 &format!("msg-{i}"),
                 None,
                 None,
+                false,
                 1000,
                 100 + i,
             )
             .unwrap();
         }
         let long_body = "x".repeat(MSG_PREVIEW_CHARS + 50);
-        crate::feed::post(&mut c, "A", "info", None, &long_body, None, None, 1000, 200).unwrap();
+        crate::feed::post(
+            &mut c, "A", "info", None, &long_body, None, None, false, 1000, 200,
+        )
+        .unwrap();
 
         let s = stats(&c, 300, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert_eq!(s.recent_messages.len() as i64, RECENT_MSG_LIMIT);
@@ -984,6 +993,7 @@ mod tests {
             "broadcast-1",
             None,
             None,
+            false,
             1000,
             100,
         )
@@ -996,6 +1006,7 @@ mod tests {
             "to-Bob",
             None,
             Some("Bob"),
+            false,
             1000,
             101,
         )
@@ -1008,6 +1019,7 @@ mod tests {
             "broadcast-2",
             None,
             None,
+            false,
             1000,
             102,
         )
@@ -1020,6 +1032,7 @@ mod tests {
             "critical-to-Bob",
             None,
             Some("Bob"),
+            false,
             1000,
             103,
         )

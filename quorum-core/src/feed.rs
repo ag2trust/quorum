@@ -76,6 +76,11 @@ fn row_to_msg(r: &Row) -> rusqlite::Result<Message> {
 
 /// Append a message. `ttl` is seconds-from-now until it logically expires. `recipient =
 /// Some(agent)` marks it as a direct message to that agent; `None` is a broadcast.
+///
+/// `system` (#94) marks a critical broadcast as "system must-see" so workers on
+/// `--scope minimal` syncs receive its full body. Non-critical/direct messages may
+/// also carry `system=true` but it has no observable effect today — the scope filter
+/// only applies to critical broadcasts. `false` preserves the legacy shape.
 #[allow(clippy::too_many_arguments)]
 pub fn post(
     conn: &mut Connection,
@@ -85,6 +90,7 @@ pub fn post(
     body: &str,
     refs: Option<&str>,
     recipient: Option<&str>,
+    system: bool,
     ttl: i64,
     now: i64,
 ) -> Result<PostResult> {
@@ -96,10 +102,11 @@ pub fn post(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, author, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let system_i: i64 = i64::from(system);
     tx.execute(
-        "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![now, author, topic, kind, body, refs, expires_at, recipient],
+        "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient, system)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![now, author, topic, kind, body, refs, expires_at, recipient, system_i],
     )?;
     let seq = tx.last_insert_rowid();
     tx.commit()?;
@@ -206,15 +213,26 @@ mod tests {
     }
 
     fn post_info(c: &mut Connection, author: &str, body: &str, now: i64) -> i64 {
-        post(c, author, "info", None, body, None, None, 1000, now)
+        post(c, author, "info", None, body, None, None, false, 1000, now)
             .unwrap()
             .seq
     }
 
     fn post_to(c: &mut Connection, author: &str, to: &str, body: &str, now: i64) -> i64 {
-        post(c, author, "info", None, body, None, Some(to), 1000, now)
-            .unwrap()
-            .seq
+        post(
+            c,
+            author,
+            "info",
+            None,
+            body,
+            None,
+            Some(to),
+            false,
+            1000,
+            now,
+        )
+        .unwrap()
+        .seq
     }
 
     #[test]
@@ -228,7 +246,7 @@ mod tests {
     #[test]
     fn post_rejects_invalid_kind() {
         let (_d, mut c) = open_tmp();
-        assert!(post(&mut c, "A", "shout", None, "x", None, None, 1000, 100).is_err());
+        assert!(post(&mut c, "A", "shout", None, "x", None, None, false, 1000, 100).is_err());
     }
 
     #[test]
@@ -268,7 +286,10 @@ mod tests {
     #[test]
     fn read_filters_expired() {
         let (_d, mut c) = open_tmp();
-        post(&mut c, "A", "info", None, "soon", None, None, 10, 100).unwrap(); // expires 110
+        post(
+            &mut c, "A", "info", None, "soon", None, None, false, 10, 100,
+        )
+        .unwrap(); // expires 110
         assert_eq!(
             read(&mut c, "B", None, None, ReadFilter::All, 10, 105)
                 .unwrap()
@@ -300,7 +321,10 @@ mod tests {
     fn body_roundtrips_byte_exact() {
         let (_d, mut c) = open_tmp();
         let body = "héllo \"world\"\n`$x`\n";
-        post(&mut c, "A", "info", None, body, None, None, 1000, 100).unwrap();
+        post(
+            &mut c, "A", "info", None, body, None, None, false, 1000, 100,
+        )
+        .unwrap();
         let msgs = peek(&c, None, None, 10, 100).unwrap();
         assert_eq!(msgs[0].body, body);
     }

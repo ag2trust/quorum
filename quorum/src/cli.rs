@@ -1,8 +1,30 @@
 //! Command-line surface (clap). clap handles `--help`/usage errors itself, exiting 2 —
 //! which matches our usage-error exit code.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+/// CLI mirror of [`quorum_core::sync::SyncScope`]. Derives `ValueEnum` so clap parses
+/// `--scope minimal|coordinator` from the command line. Defaults to `Minimal` so a
+/// worker that just types `quorum sync --agent X` gets the cheap-by-default bucket
+/// (#94 acceptance — "default for workers").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum SyncScopeArg {
+    /// Workers (default). Critical broadcasts limited to `system=1` only.
+    #[default]
+    Minimal,
+    /// Coordinators (opt-in). All critical broadcasts delivered in full.
+    Coordinator,
+}
+
+impl From<SyncScopeArg> for quorum_core::sync::SyncScope {
+    fn from(a: SyncScopeArg) -> Self {
+        match a {
+            SyncScopeArg::Minimal => quorum_core::sync::SyncScope::Minimal,
+            SyncScopeArg::Coordinator => quorum_core::sync::SyncScope::Coordinator,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -153,6 +175,13 @@ pub enum Command {
         body_stdin: bool,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+        /// Mark this message as "system must-see" so workers on `sync --scope minimal`
+        /// receive its full body (#94). Orthogonal to `--kind critical`: a typical
+        /// `quorum stop` / master-CI-red broadcast pairs `--kind critical` with this
+        /// flag. Without it, a `--kind critical` broadcast is delivered only to
+        /// `--scope coordinator` syncs in full; workers see it via the broadcast count.
+        #[arg(long = "system-critical")]
+        system_critical: bool,
     },
     /// Read messages from the feed. With `--agent`, returns new messages since your cursor
     /// (broadcasts + direct-to-you); `--ack-through` advances the cursor. Without `--agent`,
@@ -260,6 +289,13 @@ pub enum Command {
         /// Repeatable = AND. Does not affect `current_task`.
         #[arg(long = "match-label")]
         match_label: Vec<String>,
+        /// Subscription level (#94). `minimal` (default for workers) delivers only
+        /// system-must-see critical broadcasts in full; the coordination critical
+        /// chatter flows through `broadcasts.count` instead — zero body bytes per
+        /// tick. `coordinator` (CTO / dispatchers) keeps the full critical feed.
+        /// Directs + counts + scoped log are unaffected by scope.
+        #[arg(long, value_enum, default_value_t = SyncScopeArg::default())]
+        scope: SyncScopeArg,
     },
     /// Health snapshot. --json for machine output; --watch to refresh continuously.
     /// --agents lists known agents with derived online/offline presence (replaces the

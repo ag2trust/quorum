@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -168,9 +168,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v9 = per-(task, project) branch allocations (issue #98). Net-new table — the
         // CREATE TABLE IF NOT EXISTS in SCHEMA_SQL handles fresh DBs and upgrades alike;
         // no ALTER needed.
-        // v10 = agent-retirement state machine (issue #97). Two additive columns on
-        // `agents`; both safe to apply to a populated table (pre-existing rows default to
-        // `'active'` / NULL). Forward-only — once a row reaches `'retired'` it stays there.
+        // v10 = agent-retirement state machine (issue #97, PR #104). Two additive
+        // columns on `agents`; both safe to apply to a populated table (pre-existing
+        // rows default to `'active'` / NULL). Forward-only — once a row reaches
+        // `'retired'` it stays there.
         if current < 10 && !column_exists(conn, "agents", "retire_status")? {
             conn.execute(
                 "ALTER TABLE agents ADD COLUMN retire_status TEXT NOT NULL DEFAULT 'active'",
@@ -180,11 +181,26 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 10 && !column_exists(conn, "agents", "retired_at")? {
             conn.execute("ALTER TABLE agents ADD COLUMN retired_at INTEGER", [])?;
         }
-        // v11 = optional PostToolUse activity-hook stats (issue #101). Two net-new
-        // tables (`agent_sessions`, `activity_events`) — the `CREATE TABLE IF NOT
-        // EXISTS` in SCHEMA_SQL handles fresh DBs and upgrades alike; no ALTER
-        // needed. EXPERIMENTAL / opt-in / stats-only — no existing query reads
-        // these tables, so absence (or hook never installed) changes nothing.
+        // v11 = optional PostToolUse activity-hook stats (issue #101, PR #111). Two
+        // net-new tables (`agent_sessions`, `activity_events`) — the `CREATE TABLE
+        // IF NOT EXISTS` in SCHEMA_SQL handles fresh DBs and upgrades alike; no
+        // ALTER needed. EXPERIMENTAL / opt-in / stats-only — no existing query
+        // reads these tables, so absence (or hook never installed) changes nothing.
+        // v12 = per-agent sync subscription scope (#94). Adds `system` column to
+        // messages for the "system must-see" critical-broadcast carve-out — workers
+        // on `--scope minimal` see only `system=1` criticals in full; coordinators
+        // unchanged. DEFAULT 0 so pre-existing rows stay coordinator-only on upgrade
+        // (safe: legacy criticals never become invisible to coordinators, just stop
+        // bloating minimal-scope syncs). Rebased from v11 to v12 after #111 took v11
+        // (this PR rebased from v10 → v11 → v12 across two successive merges; the
+        // v9→v10 retire-columns + v10→v11 activity-tables migrations above remain
+        // exactly as they live on master).
+        if current < 12 && !column_exists(conn, "messages", "system")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN system INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -694,6 +710,66 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v11_to_v12_adds_messages_system_column_without_disturbing_existing_rows() {
+        // Issue #94: v12 adds `system INTEGER NOT NULL DEFAULT 0` to messages. (Rebased
+        // from v10 to v11 to v12 after PR #104 took v10 for agent-retirement columns
+        // and PR #111 took v11 for the experimental activity-hook tables.) Verify the
+        // ALTER (a) is applied, (b) defaults pre-existing rows to system=0 (the safe
+        // migration — legacy criticals stay coordinator-only, not silently promoted to
+        // system-must-see), and (c) doesn't disturb existing message bodies. The
+        // starting schema mirrors v11 — `agents` already has retire-columns from #104
+        // and the activity tables exist from #111 — but only `messages` is exercised
+        // here.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            // Minimal v11 messages shape: no `system` column.
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    author TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    refs TEXT,
+                    expires_at INTEGER NOT NULL,
+                    recipient TEXT
+                 );
+                 INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+                 VALUES (100, 'legacy-cto', 'hub', 'critical', 'pre-v12 coord critical', NULL, 9999, NULL);
+                 PRAGMA user_version = 11;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(
+            column_exists(&c, "messages", "system").unwrap(),
+            "system column must be added by v11 → v12 migration"
+        );
+        // Pre-existing row defaults to system=0 (safe — legacy criticals stay
+        // coordinator-only, never silently broadcast to minimal-scope workers).
+        let (body, system): (String, i64) = c
+            .query_row("SELECT body, system FROM messages WHERE seq=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(body, "pre-v12 coord critical");
+        assert_eq!(
+            system, 0,
+            "legacy row must default to system=0 (NOT promoted to must-see)"
+        );
+    }
+
+    #[test]
     fn set_journal_wal_returns_busy_when_lock_held() {
         // Exercises the previously-untested exhaustion branch (`db.rs::set_journal_wal_with`
         // returning `Err(QuorumError::Busy)`). A held EXCLUSIVE transaction on a second
@@ -784,8 +860,9 @@ mod tests {
         drop(raw);
 
         // Now open via the production path — migrate() must lift v9 → SCHEMA_VERSION
-        // (currently 11 after #101's activity-hook tables landed) and ALTER the
-        // agents table along the way to add retire_status + retired_at.
+        // (currently 12 after the v10 retire-columns + v11 activity-hook tables +
+        // v12 messages.system column landed in sequence) and ALTER the agents table
+        // along the way to add retire_status + retired_at.
         let c = open(&path).unwrap();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
