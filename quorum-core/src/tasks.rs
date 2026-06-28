@@ -433,21 +433,23 @@ pub fn claim(
             .optional()?,
         None => {
             // Build the open-task selector with the dep-ready / self-review / sticky
-            // clauses, plus a tier-exempt label match: (kind:review OR all match_labels
-            // present). Without the kind:review exempt branch, auto-spawned review tasks
-            // (only `["kind:review"]`, no `tier:*` label) are invisible to every
-            // tier-filtered claim → the review→merge loop stalls (#73). Patterns are
-            // bound as parameters; only the placeholder count is interpolated (no value
-            // reaches SQL as a string).
-            const REVIEW_EXEMPT_CLAUSE: &str = "labels LIKE '%\"kind:review\"%'";
+            // clauses, plus a label match that handles both tiered and untiered reviews:
+            // - Untiered review tasks (legacy `["kind:review"]` only) are tier-exempt
+            //   so they remain visible to every tier-filtered claim (#73).
+            // - Tiered review tasks (e.g. `["kind:review","tier:opus-47"]`) go through
+            //   normal tier matching so a weaker-tier agent can't claim them (#105).
+            // Patterns are bound as parameters; only the placeholder count is
+            // interpolated (no value reaches SQL as a string).
+            const REVIEW_UNTIERED_EXEMPT: &str =
+                "(labels LIKE '%\"kind:review\"%' AND labels NOT LIKE '%\"tier:%')";
             let mut selector = format!(
                 "SELECT id FROM tasks WHERE status='open' AND {DEP_READY_CLAUSE}
                  AND {SELF_REVIEW_BLOCK_CLAUSE} AND {STICKY_CLAUSE}"
             );
             if !match_labels.is_empty() {
                 use std::fmt::Write as _;
-                // (kind:review OR (label1 AND label2 AND ...))
-                let _ = write!(selector, " AND ({REVIEW_EXEMPT_CLAUSE} OR (");
+                // (untiered-review OR (label1 AND label2 AND ...))
+                let _ = write!(selector, " AND ({REVIEW_UNTIERED_EXEMPT} OR (");
                 for i in 0..match_labels.len() {
                     if i > 0 {
                         selector.push_str(" AND ");
@@ -638,7 +640,7 @@ pub fn update(
                 &format!("done by {agent}"),
                 now,
             )?;
-            spawn_review(&tx, id, &title, &refs_str, agent, now)?;
+            spawn_review(&tx, id, &title, &refs_str, &labels, agent, now)?;
         }
     }
 
@@ -672,6 +674,7 @@ fn spawn_review(
     source_id: i64,
     source_title: &str,
     source_refs: &Option<String>,
+    source_labels: &Option<String>,
     orig_agent: &str,
     now: i64,
 ) -> Result<()> {
@@ -693,7 +696,21 @@ fn spawn_review(
         }
         serde_json::Value::Object(obj).to_string()
     };
-    let review_labels = format!("[\"{REVIEW_LABEL}\"]");
+    // #105: inherit the source task's tier label so the review routes to a
+    // same-or-higher-tier agent (a weaker-tier reviewer shouldn't review harder work).
+    let review_labels = {
+        let mut lbls = vec![REVIEW_LABEL.to_string()];
+        if let Some(s) = source_labels.as_deref() {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(s) {
+                for l in &arr {
+                    if l.starts_with("tier:") {
+                        lbls.push(l.clone());
+                    }
+                }
+            }
+        }
+        serde_json::to_string(&lbls).unwrap()
+    };
     let review_title = format!("review: {source_title}");
     // `created_by` records the executor whose `done` triggered the spawn — useful in a
     // roster trace for "who is this review chained from."
@@ -1228,11 +1245,11 @@ mod tests {
     }
 
     #[test]
-    fn claim_treats_kind_review_as_tier_exempt() {
-        // #73: a `kind:review` task carries only `["kind:review"]` — before the
-        // fix, a tier-filtered claim excluded it before priority was considered,
-        // so review tasks could only be claimed via explicit --task-id. After
-        // the fix, the normal queue-driven loop picks them up too.
+    fn claim_treats_untiered_review_as_tier_exempt() {
+        // #73: an UNTIERED `kind:review` task (only `["kind:review"]`, no tier
+        // label) remains tier-exempt so legacy reviews are still claimable.
+        // #105 narrows: tiered reviews go through normal matching (see
+        // `claim_tiered_review_obeys_tier_matching`).
         let (_d, mut c) = open_tmp();
         let _user = create(
             &mut c,
@@ -2355,6 +2372,104 @@ mod tests {
         assert_eq!(refs["review_of"].as_i64(), Some(tid));
         // pr breadcrumb travels with the review for human navigation.
         assert_eq!(refs["pr"].as_i64(), Some(2459));
+    }
+
+    #[test]
+    fn auto_spawn_inherits_tier_label_from_source() {
+        // #105: a tiered task's review must carry the same tier label so
+        // the review routes to a same-or-higher-tier agent.
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "hard work",
+            None,
+            0,
+            Some(r#"["tier:opus-47","area:core"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        let labels: Vec<String> = serde_json::from_str(r.labels.as_deref().unwrap()).unwrap();
+        assert!(
+            labels.contains(&"kind:review".to_string()),
+            "review must carry kind:review",
+        );
+        assert!(
+            labels.contains(&"tier:opus-47".to_string()),
+            "review must inherit tier:opus-47 from source",
+        );
+        assert!(
+            !labels.contains(&"area:core".to_string()),
+            "non-tier labels must NOT be inherited",
+        );
+    }
+
+    #[test]
+    fn auto_spawn_no_tier_when_source_untiered() {
+        // #105 backward compat: an untiered source produces an untiered review
+        // (only `kind:review`) — same as before the change.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "easy", None, 0, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r = last_review_task(&c);
+        let labels: Vec<String> = serde_json::from_str(r.labels.as_deref().unwrap()).unwrap();
+        assert_eq!(labels, vec!["kind:review"]);
+    }
+
+    #[test]
+    fn claim_tiered_review_obeys_tier_matching() {
+        // #105: a review task that carries a tier label is NOT tier-exempt —
+        // a weaker-tier agent must not claim it.
+        let (_d, mut c) = open_tmp();
+        let _review = create(
+            &mut c,
+            "boss",
+            "review-47",
+            None,
+            1000,
+            Some(r#"["kind:review","tier:opus-47"]"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        // A tier:opus-46 agent should NOT see this review.
+        let got = claim(&mut c, "weak-agent", None, &["tier:opus-46"], TTL, 1000).unwrap();
+        assert!(
+            got.is_none(),
+            "tier:opus-46 agent must NOT claim a tier:opus-47 review task",
+        );
+        // A tier:opus-47 agent SHOULD claim it.
+        let got = claim(&mut c, "strong-agent", None, &["tier:opus-47"], TTL, 1000)
+            .unwrap()
+            .expect("tier:opus-47 agent should claim a tier:opus-47 review");
+        assert_eq!(got.id, _review);
     }
 
     #[test]
