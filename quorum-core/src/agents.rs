@@ -9,8 +9,10 @@ use crate::error::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-/// An agent is `online` if it acted within this many seconds. Default; Phase 6 config overrides.
-pub const ONLINE_WINDOW_SECS: i64 = 300;
+/// An agent is `online` if it acted within this many seconds, OR if it holds an active claim
+/// (see [`roster`]). Bumped 300→900 (#100) so idle agents don't flicker offline between
+/// 5-min work-loop ticks. Phase 6 config overrides.
+pub const ONLINE_WINDOW_SECS: i64 = 900;
 
 /// A row in the roster view.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -69,14 +71,21 @@ pub fn set_tier(conn: &Connection, id: &str, tier: Option<&str>) -> Result<()> {
 }
 
 /// All agents with derived online/offline, ordered by id. Read-only (no presence bump).
+/// An agent is online if it acted within `online_window` seconds OR holds an active claim
+/// (#100 — claim-holders are by definition working).
 pub fn roster(conn: &Connection, now: i64, online_window: i64) -> Result<Vec<AgentView>> {
-    let mut stmt = conn
-        .prepare("SELECT id, last_seen, (?1 - last_seen) < ?2 AS online FROM agents ORDER BY id")?;
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.last_seen,
+                CASE WHEN (?1 - a.last_seen) < ?2
+                       OR EXISTS (SELECT 1 FROM claims c
+                                  WHERE c.holder = a.id AND c.active = 1 AND c.expires_at > ?1)
+                     THEN 1 ELSE 0 END AS online
+         FROM agents a ORDER BY a.id",
+    )?;
     let rows = stmt.query_map(params![now, online_window], |r| {
         Ok(AgentView {
             id: r.get(0)?,
             last_seen: r.get(1)?,
-            // column 2 is the derived 0/1 of `(now - last_seen) < window`, not a stored column
             online: r.get::<_, i64>(2)? != 0,
         })
     })?;
@@ -109,12 +118,38 @@ mod tests {
     }
 
     #[test]
-    fn stale_agent_is_offline() {
+    fn stale_agent_without_claim_is_offline() {
         let (_d, c) = open_tmp();
         touch(&c, "Bob", 1000).unwrap();
-        // now far past the online window
         let r = roster(&c, 1000 + ONLINE_WINDOW_SECS + 1, ONLINE_WINDOW_SECS).unwrap();
         assert!(!r[0].online);
+    }
+
+    #[test]
+    fn claim_holder_is_online_even_when_last_seen_stale() {
+        let (_d, c) = open_tmp();
+        touch(&c, "Eve", 1000).unwrap();
+        stamp_claim(&c, "Eve", "task#42", 5000, 1000);
+        // last_seen is 1000, now is 3000 → 2000s stale, well past the window.
+        // But Eve holds an active claim (expires 5000 > 3000) → online.
+        let r = roster(&c, 3000, ONLINE_WINDOW_SECS).unwrap();
+        assert!(
+            r[0].online,
+            "claim-holder must be online regardless of last_seen age"
+        );
+    }
+
+    #[test]
+    fn expired_claim_does_not_keep_stale_agent_online() {
+        let (_d, c) = open_tmp();
+        touch(&c, "Fay", 1000).unwrap();
+        stamp_claim(&c, "Fay", "task#42", 2000, 1000);
+        // Claim expired at 2000, now is 3000. No active claim + stale → offline.
+        let r = roster(&c, 3000, ONLINE_WINDOW_SECS).unwrap();
+        assert!(
+            !r[0].online,
+            "expired claim must not keep a stale agent online"
+        );
     }
 
     #[test]
