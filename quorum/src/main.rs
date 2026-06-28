@@ -49,6 +49,8 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
+        cli::Command::SessionRegister { .. } => "session-register",
+        cli::Command::Activity { .. } => "activity",
         cli::Command::Help => "help",
     }
 }
@@ -141,6 +143,29 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
                 fmt_age(r.retired_age_secs),
                 r.tasks_completed,
                 fmt_age(r.total_active_secs),
+            );
+        }
+    }
+
+    // --- PostToolUse activity (experimental, issue #101) ---
+    // Only printed when the optional Claude Code hook has fired at least once
+    // and rows are still within the 24h activity TTL. Stats-only — never reflects
+    // claim/routing state. An empty section means "hook not installed" or "no
+    // tool-use in the last day," not "agent idle in the coordination sense."
+    if !s.activity.is_empty() {
+        println!();
+        println!("## activity (PostToolUse hook, experimental — stats only)");
+        for a in &s.activity {
+            let who = a
+                .agent_name
+                .as_deref()
+                .unwrap_or("(unknown: session not registered)");
+            println!(
+                "  {:<32} {:>3} events / 24h  ·  last {:<10} {:>4} ago",
+                who,
+                a.events_in_window,
+                a.last_tool,
+                fmt_age(a.last_tool_age_secs),
             );
         }
     }
@@ -804,6 +829,25 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::Sweep => {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             quorum_core::sweep::sweep_all(&conn, now)?;
+            output::emit(&serde_json::json!({ "ok": true }));
+            Ok(0)
+        }
+        // EXPERIMENTAL (issue #101): session-register + activity. Both are stats-only;
+        // failure is silent (exit 0) per the issue's "MUST NOT affect any existing
+        // workflow" hard rule. A bad arg / DB-down hook firing must never error
+        // the agent's tool call.
+        cli::Command::SessionRegister { agent, session } => {
+            // Best-effort: a missing DB or invalid input here returns exit 0 (stats only).
+            if let Ok(conn) = quorum_core::db::open(&paths::db_path()?) {
+                let _ = quorum_core::activity::register_session(&conn, &session, &agent, now);
+            }
+            output::emit(&serde_json::json!({ "ok": true }));
+            Ok(0)
+        }
+        cli::Command::Activity { session, tool } => {
+            if let Ok(conn) = quorum_core::db::open(&paths::db_path()?) {
+                let _ = quorum_core::activity::record_activity(&conn, &session, &tool, now);
+            }
             output::emit(&serde_json::json!({ "ok": true }));
             Ok(0)
         }

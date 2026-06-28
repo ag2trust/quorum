@@ -184,6 +184,10 @@ pub struct Stats {
     /// retired-agents section of `quorum status` so the operator can see capacity drop and
     /// re-spin replacements.
     pub retired_agents: Vec<RetiredAgentView>,
+    /// Issue #101 (experimental): per-agent activity summary from the
+    /// PostToolUse hook. Stats-only; never read by routing/claim code.
+    /// Empty when the hook isn't installed.
+    pub activity: Vec<crate::activity::ActivityView>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -247,6 +251,9 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let claim_ttls = claim_ttls(conn, now)?;
     let throughput = throughput(conn, now)?;
     let retired_agents = retired_agents_view(conn, now, &scores_by_id)?;
+    // Issue #101 (experimental): stats-only PostToolUse hook activity. Empty
+    // vec when no events recorded — section is suppressed in the renderer.
+    let activity = crate::activity::activity_summary(conn, now)?;
 
     Ok(Stats {
         agents_total,
@@ -264,6 +271,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         throughput,
         agent_load_scores,
         retired_agents,
+        activity,
     })
 }
 

@@ -84,6 +84,10 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // Deletes expired claims of any `active` value: an expired `active=1` row is already
     // logically dead (the read-filter hid it), and removing it just frees the partial index.
     delete_bounded(conn, "claims", now, limit)?;
+    // Issue #101 (experimental PostToolUse hook): TTL the activity-stats tables
+    // alongside the rest. Both are stats-only — losing rows past TTL is by design.
+    delete_bounded(conn, "agent_sessions", now, limit)?;
+    delete_bounded(conn, "activity_events", now, limit)?;
     conn.execute(
         "DELETE FROM tasks WHERE rowid IN \
          (SELECT rowid FROM tasks WHERE status='done' AND updated_at < ?1 LIMIT ?2)",
@@ -99,6 +103,15 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     conn.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
     conn.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
     conn.execute("DELETE FROM claims WHERE expires_at <= ?1", params![now])?;
+    // Issue #101 — see sweep_on_write for rationale.
+    conn.execute(
+        "DELETE FROM agent_sessions WHERE expires_at <= ?1",
+        params![now],
+    )?;
+    conn.execute(
+        "DELETE FROM activity_events WHERE expires_at <= ?1",
+        params![now],
+    )?;
     conn.execute(
         "DELETE FROM tasks WHERE status='done' AND updated_at < ?1",
         params![now - DONE_TASK_TTL_SECS],

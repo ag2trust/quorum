@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 10). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 11). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -159,3 +159,35 @@ CREATE TABLE IF NOT EXISTS task_branches (
     UNIQUE(repo, branch)
 );
 CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);
+
+-- Optional Claude Code PostToolUse activity hook (issue #101) — EXPERIMENTAL,
+-- stats-only, opt-in. MUST NOT affect any existing workflow (claim-based
+-- presence, sign-off, retirement load-score remain authoritative).
+--
+-- `agent_sessions`: bridge Claude session UUIDs to the agent's creative name.
+-- Written by `quorum session-register` at hub-onboard time; read by
+-- `quorum activity` to resolve `session_id → agent_name` before recording.
+-- TTL'd: a stale session row falls out of the read-filter, fail-open
+-- (activity record stores session_id but `agent_name=NULL` → counted as
+-- "unresolved" in the stats surface).
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    session_id    TEXT PRIMARY KEY,
+    agent_name    TEXT NOT NULL,
+    registered_at INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS agent_sessions_expires ON agent_sessions(expires_at);
+
+-- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
+-- is resolved at insert time (NULL if the session isn't registered).
+-- Stats-only; never read by claim/routing/sign-off code paths. TTL'd.
+CREATE TABLE IF NOT EXISTS activity_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    session_id  TEXT NOT NULL,
+    agent_name  TEXT,
+    tool        TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS activity_events_agent_ts ON activity_events(agent_name, ts DESC);
+CREATE INDEX IF NOT EXISTS activity_events_expires  ON activity_events(expires_at);
