@@ -37,26 +37,43 @@ fn quorum_json(home: &std::path::Path, args: &[&str]) -> Value {
 fn verdict_changes_reopens_original_as_open_claimable_by_sticky_author() {
     let home = tempfile::tempdir().unwrap();
 
-    let create = quorum_json(home.path(), &[
-        "task-create",
-        "--created-by", "boss",
-        "--title", "ship-the-thing",
-        "--labels", r#"["tier:opus-47"]"#,
-    ]);
+    let create = quorum_json(
+        home.path(),
+        &[
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "ship-the-thing",
+            "--labels",
+            r#"["tier:opus-47"]"#,
+        ],
+    );
     let task_id = create["id"].as_i64().unwrap();
 
-    quorum_json(home.path(), &[
-        "task-claim",
-        "--agent", "Alice",
-        "--task-id", &task_id.to_string(),
-    ]);
+    quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+        ],
+    );
 
-    let done = quorum_json(home.path(), &[
-        "task-update",
-        "--agent", "Alice",
-        "--task-id", &task_id.to_string(),
-        "--status", "done",
-    ]);
+    let done = quorum_json(
+        home.path(),
+        &[
+            "task-update",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+            "--status",
+            "done",
+        ],
+    );
     assert_eq!(done["status"], "done");
 
     // Auto-spawn surfaces a kind:review task whose refs.review_of points at our task.
@@ -78,23 +95,35 @@ fn verdict_changes_reopens_original_as_open_claimable_by_sticky_author() {
         .expect("verdict-changes flow requires auto-spawned review task");
     let review_id = review["id"].as_i64().unwrap();
 
-    quorum_json(home.path(), &[
-        "task-claim",
-        "--agent", "Bob",
-        "--task-id", &review_id.to_string(),
-    ]);
-    quorum_json(home.path(), &[
-        "task-update",
-        "--agent", "Bob",
-        "--task-id", &review_id.to_string(),
-        "--status", "done",
-        "--verdict", "changes",
-    ]);
+    quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Bob",
+            "--task-id",
+            &review_id.to_string(),
+        ],
+    );
+    quorum_json(
+        home.path(),
+        &[
+            "task-update",
+            "--agent",
+            "Bob",
+            "--task-id",
+            &review_id.to_string(),
+            "--status",
+            "done",
+            "--verdict",
+            "changes",
+        ],
+    );
 
-    let after = quorum_json(home.path(), &[
-        "task-get",
-        "--task-id", &task_id.to_string(),
-    ]);
+    let after = quorum_json(
+        home.path(),
+        &["task-get", "--task-id", &task_id.to_string()],
+    );
 
     // — The load-bearing contract from issue #89: status MUST be `open`. —
     assert_eq!(
@@ -118,11 +147,16 @@ fn verdict_changes_reopens_original_as_open_claimable_by_sticky_author() {
 
     // — The downstream behavior the contract enables: sticky author can claim. —
     // (Without the status='open' fix this errors with NotClaimable on status=done.)
-    let reclaimed = quorum_json(home.path(), &[
-        "task-claim",
-        "--agent", "Alice",
-        "--task-id", &task_id.to_string(),
-    ]);
+    let reclaimed = quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+        ],
+    );
     assert_eq!(reclaimed["status"], "claimed");
     assert_eq!(reclaimed["assignee"], "Alice");
 }
@@ -134,25 +168,42 @@ fn verdict_changes_reopens_original_as_open_claimable_by_sticky_author() {
 fn verdict_changes_rejects_non_author_claim_during_sticky_window() {
     let home = tempfile::tempdir().unwrap();
 
-    let create = quorum_json(home.path(), &[
-        "task-create",
-        "--created-by", "boss",
-        "--title", "ship-the-thing",
-        "--labels", r#"["tier:opus-47"]"#,
-    ]);
+    let create = quorum_json(
+        home.path(),
+        &[
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "ship-the-thing",
+            "--labels",
+            r#"["tier:opus-47"]"#,
+        ],
+    );
     let task_id = create["id"].as_i64().unwrap();
 
-    quorum_json(home.path(), &[
-        "task-claim",
-        "--agent", "Alice",
-        "--task-id", &task_id.to_string(),
-    ]);
-    quorum_json(home.path(), &[
-        "task-update",
-        "--agent", "Alice",
-        "--task-id", &task_id.to_string(),
-        "--status", "done",
-    ]);
+    quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+        ],
+    );
+    quorum_json(
+        home.path(),
+        &[
+            "task-update",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+            "--status",
+            "done",
+        ],
+    );
 
     let list = quorum_json(home.path(), &["task-list", "--status", "open"]);
     let review = list
@@ -172,18 +223,30 @@ fn verdict_changes_rejects_non_author_claim_during_sticky_window() {
         .expect("verdict-changes flow requires auto-spawned review task");
     let review_id = review["id"].as_i64().unwrap();
 
-    quorum_json(home.path(), &[
-        "task-claim",
-        "--agent", "Bob",
-        "--task-id", &review_id.to_string(),
-    ]);
-    quorum_json(home.path(), &[
-        "task-update",
-        "--agent", "Bob",
-        "--task-id", &review_id.to_string(),
-        "--status", "done",
-        "--verdict", "changes",
-    ]);
+    quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Bob",
+            "--task-id",
+            &review_id.to_string(),
+        ],
+    );
+    quorum_json(
+        home.path(),
+        &[
+            "task-update",
+            "--agent",
+            "Bob",
+            "--task-id",
+            &review_id.to_string(),
+            "--status",
+            "done",
+            "--verdict",
+            "changes",
+        ],
+    );
 
     // Carol is neither the author nor the reviewer — she must be locked out of
     // the sticky window. Quorum returns a non-zero exit for failed claims, so
@@ -191,8 +254,10 @@ fn verdict_changes_rejects_non_author_claim_during_sticky_window() {
     quorum(home.path())
         .args([
             "task-claim",
-            "--agent", "Carol",
-            "--task-id", &task_id.to_string(),
+            "--agent",
+            "Carol",
+            "--task-id",
+            &task_id.to_string(),
         ])
         .assert()
         .failure();
