@@ -306,7 +306,7 @@ pub fn gather_with_budget(
         // Busy: never surface next_task, retiring or not.
         None
     } else if effective_status == crate::agents::RETIRE_STATUS_ACTIVE {
-        next_task_view(conn, match_labels)?
+        next_task_view(conn, agent, match_labels, now)?
     } else {
         // Retiring/retired: no NEW work, but a sticky-pending rework belongs to this
         // agent and ONLY they can do it — surface it so the agent can drain before
@@ -617,18 +617,42 @@ fn current_task_view(conn: &Connection, agent: &str, now: i64) -> Result<Option<
     Ok(row)
 }
 
-fn next_task_view(conn: &Connection, match_labels: &[&str]) -> Result<Option<NextTaskView>> {
-    // Mirror `tasks::claim`'s selector exactly: status='open' AND dep-ready AND
-    // (kind:review OR every match-label present). The kind:review tier-exempt
-    // branch is #73 — without it, auto-spawned review tasks (which carry only
-    // `["kind:review"]`, no `tier:*` label) are invisible to every tier-filtered
-    // `sync`, so the review→merge loop stalls. Shown, never claimed.
+fn next_task_view(
+    conn: &Connection,
+    agent: &str,
+    match_labels: &[&str],
+    now: i64,
+) -> Result<Option<NextTaskView>> {
+    // Mirror `tasks::claim`'s selector EXACTLY: status='open' AND dep-ready AND
+    // self-review-block AND sticky-eligible AND (untiered-review OR every match-label
+    // present). The previous version of this function omitted the self-review and
+    // sticky filters, causing an unclaimable head task (sticky-to-another or
+    // self-review-blocked) to mask all claimable work beneath it — agents that hit
+    // such a head correctly failed to claim it but `sync` did not fall through to
+    // the next claimable task, leaving them idle with available work (issue #108).
+    //
+    // The fix is to apply the same three claim-eligibility clauses here that
+    // `tasks::claim` uses, so a tier-matched, non-self-review, non-sticky-to-other
+    // task surfaces instead of the unclaimable head. Tier gate stays exact-`==` per
+    // owner — do NOT widen to `>=`.
     const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
         SELECT 1 FROM json_each(depends_on) je
         WHERE NOT EXISTS (
             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
         )
     ))";
+    // #10 / #108 self-review block: a review task (labels contain "kind:review")
+    // whose `orig` equals the caller is invisible to that caller. Identical clause
+    // to `tasks::claim` — sync MUST hide what claim would reject, otherwise the
+    // agent sees a head task it cannot take and concludes "no work" (issue #108).
+    // Bound as ?1 = agent.
+    const SELF_REVIEW_BLOCK_CLAUSE: &str =
+        "(labels IS NULL OR labels NOT LIKE '%\"kind:review\"%' OR orig IS NULL OR orig != ?1)";
+    // #10 / #108 sticky-reopen gate: a task in its sticky window is claimable only
+    // by its assignee (the original executor whose `changes`-verdict reopen set the
+    // window). After expiry, anyone — eligibility narrows for `now < sticky_until`
+    // only. Bound as ?2 = now. Identical clause to `tasks::claim`.
+    const STICKY_CLAUSE: &str = "(sticky_until IS NULL OR sticky_until <= ?2 OR assignee = ?1)";
     // #105: only UNTIERED review tasks are tier-exempt. A review task that
     // inherited a tier label from the original task goes through normal tier
     // matching — so a weaker-tier agent doesn't review harder work. Untiered
@@ -637,7 +661,8 @@ fn next_task_view(conn: &Connection, match_labels: &[&str]) -> Result<Option<Nex
         "(labels LIKE '%\"kind:review\"%' AND labels NOT LIKE '%\"tier:%')";
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
-         WHERE status = 'open' AND {DEP_READY_CLAUSE}"
+         WHERE status = 'open' AND {DEP_READY_CLAUSE}
+           AND {SELF_REVIEW_BLOCK_CLAUSE} AND {STICKY_CLAUSE}"
     );
     if !match_labels.is_empty() {
         use std::fmt::Write as _;
@@ -647,18 +672,19 @@ fn next_task_view(conn: &Connection, match_labels: &[&str]) -> Result<Option<Nex
             if i > 0 {
                 sql.push_str(" AND ");
             }
-            // Params start at ?1 — only label patterns are bound.
-            let _ = write!(sql, "labels LIKE ?{}", i + 1);
+            // ?1 = agent, ?2 = now (used by SELF_REVIEW + STICKY clauses), so
+            // label patterns start at ?3.
+            let _ = write!(sql, "labels LIKE ?{}", i + 3);
         }
         sql.push_str("))");
     }
     sql.push_str(" ORDER BY priority DESC, id ASC LIMIT 1");
 
     let label_pats: Vec<String> = match_labels.iter().map(|l| format!("%\"{l}\"%")).collect();
-    let bind: Vec<&dyn rusqlite::ToSql> = label_pats
-        .iter()
-        .map(|p| p as &dyn rusqlite::ToSql)
-        .collect();
+    let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&agent, &now];
+    for p in &label_pats {
+        bind.push(p);
+    }
     let row = conn
         .query_row(&sql, &bind[..], |r| {
             Ok(NextTaskView {
@@ -1039,6 +1065,136 @@ mod tests {
         // `dep` (priority 1) is the next claimable; dependent (priority 10) is gated.
         let nxt = snap.next_task.as_ref().expect("next_task present");
         assert_eq!(nxt.title, "dep");
+    }
+
+    // --- #108: next_task must skip unclaimable head ---------------------------------------
+    //
+    // Reproduces the live 2026-06-28 fleet incident: a sticky-to-another or
+    // self-review-blocked head task at the top of the priority queue masked all
+    // claimable work beneath it. The fix mirrors `tasks::claim`'s self-review +
+    // sticky filters here so the surfaced next_task is one the requester can
+    // actually claim.
+
+    /// Set a sticky window on an open task with a specific assignee. Used to fabricate
+    /// the "task is sticky to OfflineAgent" condition without driving a reviewer
+    /// verdict (which would also reopen status and lift the lease — extra side effects
+    /// beyond what this regression needs to test).
+    fn set_sticky(c: &Connection, task_id: i64, assignee: &str, sticky_until: i64) {
+        c.execute(
+            "UPDATE tasks SET assignee=?1, sticky_until=?2 WHERE id=?3",
+            rusqlite::params![assignee, sticky_until, task_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn next_task_skips_sticky_to_other_and_surfaces_claimable_below() {
+        // Repro of #108: sticky head masks claimable work.
+        let (_d, mut c) = open_tmp();
+        let sticky_pri99 = make_task(&mut c, "sticky head", 99, None, 100);
+        set_sticky(&c, sticky_pri99, "OfflineAgent", 9999);
+        let claimable_pri50 = make_task(&mut c, "claimable below", 50, None, 100);
+        // A non-sticky agent's sync must NOT be offered the sticky head (which they
+        // can't claim) and MUST be offered the next claimable task.
+        let snap = gather(&c, "BusyBee", &[], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(
+            nxt.id, claimable_pri50,
+            "sticky head must be skipped for a non-sticky requester"
+        );
+    }
+
+    #[test]
+    fn next_task_still_surfaces_sticky_task_to_its_sticky_assignee() {
+        // The sticky assignee is the one agent who CAN claim the sticky head —
+        // they must still see it.
+        let (_d, mut c) = open_tmp();
+        let sticky_pri99 = make_task(&mut c, "sticky head", 99, None, 100);
+        set_sticky(&c, sticky_pri99, "Griddle-7mR", 9999);
+        let _below = make_task(&mut c, "claimable below", 50, None, 100);
+        let snap = gather(&c, "Griddle-7mR", &[], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(
+            nxt.id, sticky_pri99,
+            "sticky assignee must still see their sticky head"
+        );
+    }
+
+    #[test]
+    fn next_task_skips_self_review_and_surfaces_claimable_below() {
+        // Repro the author-routing half of #108: a review task whose `orig` equals
+        // the requester is unclaimable for that requester; sync must fall through.
+        let (_d, mut c) = open_tmp();
+        // Create the review task by hand — auto-spawn (via tasks::update --status
+        // done) would also affect the original task's status and is more than we
+        // need here.
+        c.execute(
+            "INSERT INTO tasks(title, status, priority, labels, created_by, created_at, updated_at, orig)
+             VALUES ('review of mine', 'open', 1000, '[\"kind:review\"]', 'boss', 100, 100, 'Larkspur-q8X')",
+            [],
+        ).unwrap();
+        let claimable = make_task(&mut c, "real work", 50, None, 100);
+        // Larkspur-q8X is the PR author (`orig`) — must NOT see the self-review head.
+        let snap = gather(&c, "Larkspur-q8X", &[], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(
+            nxt.id, claimable,
+            "self-review head must be skipped for the orig author"
+        );
+    }
+
+    #[test]
+    fn next_task_still_surfaces_review_to_non_author() {
+        // Inverse of the above: a different agent IS eligible to review.
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(title, status, priority, labels, created_by, created_at, updated_at, orig)
+             VALUES ('review of someone else', 'open', 1000, '[\"kind:review\"]', 'boss', 100, 100, 'Velcro-m4D')",
+            [],
+        ).unwrap();
+        let snap = gather(&c, "Larkspur-q8X", &[], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(
+            nxt.title, "review of someone else",
+            "non-author must still see the review task"
+        );
+    }
+
+    #[test]
+    fn next_task_sticky_expired_is_visible_to_anyone() {
+        // After the sticky window expires, the task returns to the regular queue and
+        // any agent can pick it up. Boundary: `sticky_until <= now` ⇒ no longer sticky.
+        let (_d, mut c) = open_tmp();
+        let task = make_task(&mut c, "previously sticky", 99, None, 100);
+        set_sticky(&c, task, "OfflineAgent", 150);
+        // now=200 > sticky_until=150 → expired.
+        let snap = gather(&c, "BusyBee", &[], 200).unwrap();
+        let nxt = snap.next_task.as_ref().expect("next_task present");
+        assert_eq!(nxt.id, task, "expired-sticky task is open to anyone");
+    }
+
+    #[test]
+    fn next_task_self_review_filter_composes_with_tier_match_label() {
+        // The self-review filter must compose with the match-label tier filter,
+        // not bypass it: an agent whose tier doesn't match still doesn't see a
+        // tier-mismatched review even if it isn't a self-review for them.
+        let (_d, c) = open_tmp();
+        // Review task carrying its own tier label (inherited per #105) — only
+        // tier:opus-47 agents should see it.
+        c.execute(
+            "INSERT INTO tasks(title, status, priority, labels, created_by, created_at, updated_at, orig)
+             VALUES ('opus-47 review', 'open', 1000, '[\"kind:review\",\"tier:opus-47\"]', 'boss', 100, 100, 'Velcro-m4D')",
+            [],
+        ).unwrap();
+        // An opus-46 agent must NOT see this even though the orig != them.
+        let snap_46 = gather(&c, "OpusFourSix", &["tier:opus-46"], 200).unwrap();
+        assert!(
+            snap_46.next_task.is_none(),
+            "tier-mismatched review must be filtered even for non-author"
+        );
+        // An opus-47 non-author DOES see it.
+        let snap_47 = gather(&c, "Larkspur-q8X", &["tier:opus-47"], 200).unwrap();
+        assert_eq!(snap_47.next_task.as_ref().unwrap().title, "opus-47 review");
     }
 
     // --- message bucketing ---------------------------------------------------------------
