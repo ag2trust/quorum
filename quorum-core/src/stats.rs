@@ -376,11 +376,17 @@ pub fn has_label(labels_json: Option<&str>, target: &str) -> bool {
 }
 
 /// Last [`RECENT_MSG_LIMIT`] feed messages (newest first), with a bounded body preview.
+///
+/// **Broadcasts only.** Direct messages (`recipient IS NOT NULL`) are point-to-point per
+/// issue #91 — the global `quorum status` dashboard renders only the fleet-wide feed.
+/// Each agent's own direct messages are delivered via `quorum sync` instead. Without this
+/// filter a `--to X` from A leaks into every agent's `status` view, making `--to` a
+/// priority hint rather than a privacy boundary (verified leak on 2026-06-27, issue #91).
 fn recent_messages(conn: &Connection, now: i64) -> Result<Vec<RecentMessage>> {
     let mut stmt = conn.prepare(
         "SELECT seq, ts, author, kind, body
          FROM messages
-         WHERE expires_at > ?1
+         WHERE expires_at > ?1 AND recipient IS NULL
          ORDER BY seq DESC
          LIMIT ?2",
     )?;
@@ -692,6 +698,58 @@ mod tests {
         );
         assert!(s.recent_messages[0].body_preview.chars().count() == MSG_PREVIEW_CHARS + 1);
         // +1 for ellipsis
+    }
+
+    #[test]
+    fn recent_messages_excludes_direct_messages_issue_91() {
+        // --to messages must be invisible in the global feed (privacy boundary).
+        // Pre-#91 behavior leaked them; the recipient-IS-NULL filter pins the new contract.
+        let (_d, mut c) = open_tmp();
+        crate::feed::post(&mut c, "A", "info", None, "broadcast-1", None, None, 1000, 100).unwrap();
+        crate::feed::post(
+            &mut c,
+            "A",
+            "info",
+            None,
+            "to-Bob",
+            None,
+            Some("Bob"),
+            1000,
+            101,
+        )
+        .unwrap();
+        crate::feed::post(&mut c, "A", "info", None, "broadcast-2", None, None, 1000, 102).unwrap();
+        crate::feed::post(
+            &mut c,
+            "A",
+            "critical",
+            None,
+            "critical-to-Bob",
+            None,
+            Some("Bob"),
+            1000,
+            103,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let bodies: Vec<&str> = s
+            .recent_messages
+            .iter()
+            .map(|m| m.body_preview.as_str())
+            .collect();
+        assert!(
+            bodies.contains(&"broadcast-1"),
+            "broadcast must appear in global feed: {bodies:?}"
+        );
+        assert!(
+            bodies.contains(&"broadcast-2"),
+            "broadcast must appear in global feed: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|b| b.contains("to-Bob")),
+            "direct message must NOT appear in global feed: {bodies:?}"
+        );
     }
 
     #[test]
