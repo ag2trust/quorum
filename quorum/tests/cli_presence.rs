@@ -15,10 +15,10 @@ fn quorum(home: &std::path::Path) -> Command {
 }
 
 #[test]
-fn roster_empty_on_fresh_db() {
+fn agents_empty_on_fresh_db() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
-        .arg("roster")
+        .args(["status", "--agents"])
         .assert()
         .success()
         .stdout(predicates::str::diff("[]\n"));
@@ -26,7 +26,7 @@ fn roster_empty_on_fresh_db() {
 
 #[test]
 fn name_collision_merges_presence_silently() {
-    // Two separate CLI invocations using the same agent id should merge into one roster
+    // Two separate CLI invocations using the same agent id should merge into one agent
     // entry (ON CONFLICT on agents.id), not create duplicates or error.
     let home = tempfile::tempdir().unwrap();
     // First invocation registering "A" (via a task-create — created_by bumps presence).
@@ -40,11 +40,14 @@ fn name_collision_merges_presence_silently() {
         .write_stdin("hello from session 2")
         .assert()
         .success();
-    // Roster should show exactly one agent "A", not two.
-    let out = quorum(home.path()).arg("roster").output().unwrap();
-    let roster: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(roster.len(), 1, "expected 1 agent, got {}", roster.len());
-    assert_eq!(roster[0]["id"], "A");
+    // Agent list should show exactly one agent "A", not two.
+    let out = quorum(home.path())
+        .args(["status", "--agents"])
+        .output()
+        .unwrap();
+    let agents: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(agents.len(), 1, "expected 1 agent, got {}", agents.len());
+    assert_eq!(agents[0]["id"], "A");
 }
 
 #[test]
@@ -69,9 +72,9 @@ fn lost_claim_still_marks_agent_online() {
         .assert()
         .code(1);
 
-    // Both agents must appear in the roster.
+    // Both agents must appear in the agent list.
     quorum(home.path())
-        .arg("roster")
+        .args(["status", "--agents"])
         .assert()
         .success()
         .stdout(predicates::str::contains("\"Loser\""))
@@ -90,9 +93,9 @@ fn pre_write_usage_error_leaves_no_trace() {
         .assert()
         .code(2);
 
-    // Ghost must NOT appear in the roster — touch never ran.
+    // Ghost must NOT appear in the agent list — touch never ran.
     quorum(home.path())
-        .arg("roster")
+        .args(["status", "--agents"])
         .assert()
         .success()
         .stdout(predicates::str::diff("[]\n"));
@@ -117,8 +120,8 @@ fn pure_reads_do_not_create_agent_row() {
         .assert()
         .success();
 
-    // peek (always read-only, no agent param).
-    quorum(home.path()).args(["peek"]).assert().success();
+    // read without --agent (agent-less inspect, no cursor).
+    quorum(home.path()).args(["read"]).assert().success();
 
     // task-list (read-only listing).
     quorum(home.path()).args(["task-list"]).assert().success();
@@ -132,12 +135,15 @@ fn pure_reads_do_not_create_agent_row() {
     // log (read-only event log).
     quorum(home.path()).args(["log"]).assert().success();
 
-    // roster itself (read-only).
-    quorum(home.path()).args(["roster"]).assert().success();
-
-    // Only "Writer" should be in the roster — "Reader" must NOT appear.
+    // status --agents (read-only agent list).
     quorum(home.path())
-        .arg("roster")
+        .args(["status", "--agents"])
+        .assert()
+        .success();
+
+    // Only "Writer" should be in the agent list — "Reader" must NOT appear.
+    quorum(home.path())
+        .args(["status", "--agents"])
         .assert()
         .success()
         .stdout(predicates::str::contains("\"Writer\""))

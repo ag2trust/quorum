@@ -32,17 +32,13 @@ fn command_source(cmd: &cli::Command) -> &'static str {
     match cmd {
         cli::Command::Init => "init",
         cli::Command::Reset { .. } => "reset",
-        cli::Command::Roster => "roster",
         cli::Command::TaskCreate { .. } => "task-create",
         cli::Command::TaskClaim { .. } => "task-claim",
         cli::Command::TaskUpdate { .. } => "task-update",
-        cli::Command::TaskRelease { .. } => "task-release",
-        cli::Command::TaskCancel { .. } => "task-cancel",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
         cli::Command::Post { .. } => "post",
         cli::Command::Read { .. } => "read",
-        cli::Command::Peek { .. } => "peek",
         cli::Command::Log { .. } => "log",
         cli::Command::Stop { .. } => "stop",
         cli::Command::Resume { .. } => "resume",
@@ -400,13 +396,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             );
             Ok(0)
         }
-        cli::Command::Roster => {
-            let cfg = load_cfg()?;
-            let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let agents = quorum_core::agents::roster(&conn, now, cfg.online_window_secs)?;
-            output::emit(&agents);
-            Ok(0)
-        }
         cli::Command::TaskCreate {
             created_by,
             title,
@@ -550,20 +539,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&compact);
             Ok(0)
         }
-        cli::Command::TaskRelease { agent, task_id } => {
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let t = quorum_core::tasks::release(&mut conn, &agent, task_id, now)?;
-            // Compact (#64) — lease just deactivated; lease_expires_at omitted by design.
-            output::emit(&quorum_core::tasks::TaskCompact::from(&t));
-            Ok(0)
-        }
-        cli::Command::TaskCancel { agent, task_id } => {
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let t = quorum_core::tasks::cancel(&mut conn, &agent, task_id, now)?;
-            // Compact (#64) — lease dead, terminal status; lease_expires_at omitted.
-            output::emit(&quorum_core::tasks::TaskCompact::from(&t));
-            Ok(0)
-        }
         cli::Command::TaskList {
             status,
             label,
@@ -640,46 +615,50 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             limit,
             direct,
             broadcasts,
-        } => {
-            check_nonneg("--limit", limit)?;
-            // clap's `conflicts_with` already rejects --direct + --broadcasts at parse time;
-            // this match is the in-code projection to the core filter enum.
-            let filter = match (direct, broadcasts) {
-                (true, false) => quorum_core::feed::ReadFilter::Direct,
-                (false, true) => quorum_core::feed::ReadFilter::Broadcasts,
-                _ => quorum_core::feed::ReadFilter::All,
-            };
-            let read_limit = load_cfg()?.read_limit;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let msgs = quorum_core::feed::read(
-                &mut conn,
-                &agent,
-                topic.as_deref(),
-                ack_through,
-                filter,
-                limit.unwrap_or(read_limit),
-                now,
-            )?;
-            output::emit(&msgs);
-            Ok(0)
-        }
-        cli::Command::Peek {
-            topic,
             since,
-            limit,
         } => {
             check_nonneg("--limit", limit)?;
-            check_nonneg("--since", since)?;
             let read_limit = load_cfg()?.read_limit;
-            let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let msgs = quorum_core::feed::peek(
-                &conn,
-                topic.as_deref(),
-                since,
-                limit.unwrap_or(read_limit),
-                now,
-            )?;
-            output::emit(&msgs);
+            match agent {
+                Some(ref ag) => {
+                    // Agent-based read: cursor-aware, filter by recipient.
+                    let filter = match (direct, broadcasts) {
+                        (true, false) => quorum_core::feed::ReadFilter::Direct,
+                        (false, true) => quorum_core::feed::ReadFilter::Broadcasts,
+                        _ => quorum_core::feed::ReadFilter::All,
+                    };
+                    let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+                    let msgs = quorum_core::feed::read(
+                        &mut conn,
+                        ag,
+                        topic.as_deref(),
+                        ack_through,
+                        filter,
+                        limit.unwrap_or(read_limit),
+                        now,
+                    )?;
+                    output::emit(&msgs);
+                }
+                None => {
+                    // Agent-less read (replaces `peek`): no cursor, no recipient filter.
+                    if ack_through.is_some() {
+                        return Err(QuorumError::Usage("--ack-through requires --agent".into()));
+                    }
+                    if direct {
+                        return Err(QuorumError::Usage("--direct requires --agent".into()));
+                    }
+                    check_nonneg("--since", since)?;
+                    let conn = quorum_core::db::open(&paths::db_path()?)?;
+                    let msgs = quorum_core::feed::peek(
+                        &conn,
+                        topic.as_deref(),
+                        since,
+                        limit.unwrap_or(read_limit),
+                        now,
+                    )?;
+                    output::emit(&msgs);
+                }
+            }
             Ok(0)
         }
         cli::Command::Log { since, refs, limit } => {
@@ -697,8 +676,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&evs);
             Ok(0)
         }
-        cli::Command::Status { json, watch } => {
+        cli::Command::Status {
+            json,
+            watch,
+            agents,
+        } => {
             let cfg = load_cfg()?;
+            if agents {
+                let conn = quorum_core::db::open(&paths::db_path()?)?;
+                let roster = quorum_core::agents::roster(&conn, now, cfg.online_window_secs)?;
+                output::emit(&roster);
+                return Ok(0);
+            }
             if watch {
                 watch_status(cfg.online_window_secs)?;
                 Ok(0) // unreachable in practice (loop until interrupted)

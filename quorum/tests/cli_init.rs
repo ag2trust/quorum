@@ -194,7 +194,7 @@ fn reset_yes_wipes_to_clean_db() {
         .success()
         .stdout(predicates::str::contains("[]"));
     quorum(home.path())
-        .args(["roster"])
+        .args(["status", "--agents"])
         .assert()
         .success()
         .stdout(predicates::str::contains("[]"));

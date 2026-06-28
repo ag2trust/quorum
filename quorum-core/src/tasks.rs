@@ -517,8 +517,8 @@ pub fn claim(
 /// - `approve` → original task → `closed` (terminal).
 /// - `changes` → original task → `open` + `rework` label + assignee=`orig` + sticky window.
 ///
-/// Other transitions have dedicated paths: `open`/`claimed` are system-driven (claim/release/
-/// reaper), `cancelled` via [`cancel`]. Any other status value is a usage error.
+/// Other transitions: `claimed` is system-driven (claim/reaper). `open` releases a claimed
+/// task (assignee-only). `cancelled` is a terminal won't-do (creator OR assignee).
 pub fn update(
     conn: &mut Connection,
     agent: &str,
@@ -531,10 +531,10 @@ pub fn update(
         if !STATUSES.contains(&s) {
             return Err(QuorumError::Usage(format!("invalid status: {s}")));
         }
-        if s != "done" {
+        if s == "claimed" || s == "closed" {
             return Err(QuorumError::Usage(format!(
-                "task-update can only set status 'done'; use task-release (→open), \
-                 task-cancel (→cancelled), or review automation (→closed) for {s}"
+                "task-update cannot set status '{s}'; 'claimed' is set by task-claim, \
+                 'closed' is set by review automation"
             )));
         }
     }
@@ -554,36 +554,79 @@ pub fn update(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    // -- Apply the requested update; assignee + status='claimed' guard in the WHERE clause. -
-    // COALESCE keeps the existing value when a field is None. Guard on assignee=caller AND
-    // status='claimed': the only legal agent transition is `claimed → done`, so a terminal
-    // (done/cancelled/closed) or open row matches zero rows → loud NotHolder (#21). Without
-    // the status guard a cancelled/done task (which retains its assignee) could be resurrected
-    // back to done. Checked inside the BEGIN IMMEDIATE txn, so the guard is race-safe. The
-    // pre-merge "task doesn't exist OR caller isn't assignee → NotHolder" contract is
-    // preserved by this still mapping zero rows to NotHolder.
-    let n = tx.execute(
-        "UPDATE tasks SET
-            status   = COALESCE(?2, status),
-            body     = COALESCE(?3, body),
-            refs     = COALESCE(?4, refs),
-            updated_at = ?5
-         WHERE id=?1 AND assignee=?6 AND status='claimed'",
-        params![id, fields.status, fields.body, fields.refs, now, agent],
-    )?;
+
+    // -- Status-specific UPDATE with appropriate guards. -----------------------------------
+    // Each status transition has its own SQL because the permission guard differs:
+    //   open       → assignee-only, from claimed (release semantics)
+    //   cancelled  → creator OR assignee, from non-terminal (cancel semantics)
+    //   done       → assignee-only, from claimed
+    //   no status  → assignee-only, from claimed (metadata-only update)
+    let n = match fields.status {
+        Some("open") => {
+            // Release: assignee guard, status=claimed. Nulls assignee + sticky.
+            tx.execute(
+                "UPDATE tasks SET
+                    status='open', assignee=NULL, sticky_until=NULL,
+                    body  = COALESCE(?3, body),
+                    refs  = COALESCE(?4, refs),
+                    updated_at = ?5
+                 WHERE id=?1 AND assignee=?6 AND status='claimed'",
+                params![id, "open", fields.body, fields.refs, now, agent],
+            )?
+        }
+        Some("cancelled") => {
+            // Cancel: creator OR assignee, non-terminal status.
+            tx.execute(
+                "UPDATE tasks SET
+                    status='cancelled', sticky_until=NULL,
+                    body  = COALESCE(?3, body),
+                    refs  = COALESCE(?4, refs),
+                    updated_at = ?5
+                 WHERE id=?1 AND (created_by=?6 OR assignee=?6)
+                       AND status NOT IN ('cancelled', 'closed')",
+                params![id, "cancelled", fields.body, fields.refs, now, agent],
+            )?
+        }
+        _ => {
+            // done or metadata-only: assignee guard, status=claimed.
+            tx.execute(
+                "UPDATE tasks SET
+                    status   = COALESCE(?2, status),
+                    body     = COALESCE(?3, body),
+                    refs     = COALESCE(?4, refs),
+                    updated_at = ?5
+                 WHERE id=?1 AND assignee=?6 AND status='claimed'",
+                params![id, fields.status, fields.body, fields.refs, now, agent],
+            )?
+        }
+    };
     if n == 0 {
         tx.commit()?;
         return Err(QuorumError::NotHolder);
     }
 
-    // -- `done` branch: spawn review (non-review source) OR drive verdict (review source). -
-    if fields.status == Some("done") {
-        // Drop the lease either way — the active phase is over for both source types.
+    // -- Post-update side-effects per status. ----------------------------------------------
+    if fields.status == Some("open") {
+        deactivate_lease(&tx, id, now)?;
+        crate::events::emit(
+            &tx,
+            "task_released",
+            &lease_target(id),
+            &format!("released by {agent}"),
+            now,
+        )?;
+    } else if fields.status == Some("cancelled") {
+        deactivate_lease(&tx, id, now)?;
+        crate::events::emit(
+            &tx,
+            "task_cancelled",
+            &lease_target(id),
+            &format!("cancelled by {agent}"),
+            now,
+        )?;
+    } else if fields.status == Some("done") {
         deactivate_lease(&tx, id, now)?;
 
-        // Re-read the row we just touched. This is the authoritative source for "is this a
-        // review task", "what's the orig", "what's in refs.pr" — all of which the spawn /
-        // verdict branches need.
         let (title, labels, refs_str, orig_opt): (
             String,
             Option<String>,
@@ -597,21 +640,13 @@ pub fn update(
         let is_review = labels_contain_review(&labels);
 
         if is_review {
-            // -- Reviewer's verdict path. --------------------------------------------------
             let Some(verdict) = fields.verdict else {
-                // Roll back the bare `done` update — a review task without a verdict is not
-                // a valid terminal state (the review's whole point is producing a verdict).
-                // Without rollback we'd leave the review in `done` with no chained state on
-                // the original, half-applying the contract.
                 let _ = tx.rollback();
                 return Err(QuorumError::Usage(
                     "review task requires --verdict (approve|changes) on --status done".into(),
                 ));
             };
             let Some(orig) = orig_opt else {
-                // A `kind:review`-labeled task with NULL `orig` is malformed (data drift —
-                // someone applied the label by hand without setting orig). Roll back; refuse
-                // to invent the original assignee.
                 let _ = tx.rollback();
                 return Err(QuorumError::Usage(
                     "review task is missing `orig` — cannot resolve verdict target".into(),
@@ -625,9 +660,7 @@ pub fn update(
             })?;
             apply_verdict(&tx, verdict, target_t, agent, &orig, now)?;
         } else {
-            // -- Executor's done path: emit + auto-spawn review. ---------------------------
             if fields.verdict.is_some() {
-                // Non-review tasks cannot carry a verdict — would silently no-op otherwise.
                 let _ = tx.rollback();
                 return Err(QuorumError::Usage(
                     "--verdict is only valid on a review task (labels contain kind:review)".into(),
@@ -831,86 +864,6 @@ fn apply_verdict(
     Ok(())
 }
 
-/// Release a claimed task back to `open` (give-up). Fails loud ([`QuorumError::NotHolder`]) if
-/// `agent` is not the current assignee of a `claimed` task. Drops the lease and clears the
-/// assignee so any agent can re-claim.
-///
-/// Also clears `sticky_until` (issue #10): if the assignee was within a sticky-reopen window
-/// (a prior `changes` verdict put them as sticky-orig) and they're now giving up, the window
-/// is no longer doing useful work — leaving it set would block other agents for the rest of
-/// the window with no claimant in flight. Clear it so the open task is immediately claimable
-/// by anyone.
-pub fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
-    let tx = begin_immediate(conn)?;
-    crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let n = tx.execute(
-        "UPDATE tasks SET status='open', assignee=NULL, sticky_until=NULL, updated_at=?1
-         WHERE id=?2 AND assignee=?3 AND status='claimed'",
-        params![now, id, agent],
-    )?;
-    if n == 0 {
-        tx.commit()?;
-        return Err(QuorumError::NotHolder);
-    }
-    deactivate_lease(&tx, id, now)?;
-    crate::events::emit(
-        &tx,
-        "task_released",
-        &lease_target(id),
-        &format!("released by {agent}"),
-        now,
-    )?;
-    let mut task = tx.query_row(
-        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
-        params![id],
-        row_to_task,
-    )?;
-    task.ready = compute_ready(&tx, &task.depends_on)?;
-    tx.commit()?;
-    Ok(task)
-}
-
-/// Cancel a task (terminal won't-do). Guard: the **creator OR the assignee** may cancel (a
-/// wider guard than `done`, which is assignee-only). Already-terminal tasks
-/// (`closed`/`cancelled`) cannot be cancelled. Drops the lease. Fails loud
-/// ([`QuorumError::NotHolder`]) if the task is missing, terminal, or `agent` is neither
-/// creator nor assignee.
-///
-/// Per-dependent notification (one event per blocked dependent) lands with the dependency
-/// model (#2); there is no dependency schema yet, so nothing to notify today.
-pub fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
-    let tx = begin_immediate(conn)?;
-    crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let n = tx.execute(
-        "UPDATE tasks SET status='cancelled', sticky_until=NULL, updated_at=?1
-         WHERE id=?2 AND (created_by=?3 OR assignee=?3)
-               AND status NOT IN ('cancelled', 'closed')",
-        params![now, id, agent],
-    )?;
-    if n == 0 {
-        tx.commit()?;
-        return Err(QuorumError::NotHolder);
-    }
-    deactivate_lease(&tx, id, now)?;
-    crate::events::emit(
-        &tx,
-        "task_cancelled",
-        &lease_target(id),
-        &format!("cancelled by {agent}"),
-        now,
-    )?;
-    let mut task = tx.query_row(
-        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
-        params![id],
-        row_to_task,
-    )?;
-    task.ready = compute_ready(&tx, &task.depends_on)?;
-    tx.commit()?;
-    Ok(task)
-}
-
 /// List tasks, optionally filtered by status, label, and/or assignee. Read-only.
 pub fn list(
     conn: &Connection,
@@ -1042,6 +995,36 @@ mod tests {
     }
 
     const TTL: i64 = 3600;
+
+    fn release(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
+        update(
+            conn,
+            agent,
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            now,
+        )
+    }
+
+    fn cancel(conn: &mut Connection, agent: &str, id: i64, now: i64) -> Result<Task> {
+        update(
+            conn,
+            agent,
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            now,
+        )
+    }
 
     /// Is there a live (active, unexpired) lease on this task?
     fn has_live_lease(c: &Connection, id: i64, now: i64) -> bool {
@@ -1419,12 +1402,12 @@ mod tests {
     }
 
     #[test]
-    fn update_rejects_non_done_status() {
-        // No agent-set intermediate state: only `done` is settable via task-update.
+    fn update_rejects_system_only_statuses() {
+        // `claimed` and `closed` are system-driven (claim/review automation), never agent-set.
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
-        for bad in ["open", "claimed", "closed", "cancelled"] {
+        for bad in ["claimed", "closed"] {
             let err = update(
                 &mut c,
                 "A",

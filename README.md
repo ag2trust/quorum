@@ -80,9 +80,9 @@ errors     : 0 live
 
 | Area | Commands |
 |---|---|
-| Presence | `roster` (agents auto-register; presence bumps on any write) |
-| Tasks | `task-create` · `task-claim` · `task-update` · `task-release` · `task-cancel` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
-| Feed | `post` · `read` (delta since cursor; `--ack-through` to advance) · `peek` |
+| Presence | `status --agents` (agents auto-register; presence bumps on any write) |
+| Tasks | `task-create` · `task-claim` · `task-update --status done\|open\|cancelled` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
+| Feed | `post` · `read --agent <id>` (delta since cursor; `--ack-through` to advance) · `read` (without `--agent`: inspect without cursor) |
 | Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
 
 `task-claim` takes a renewable lease in the same store under a reserved `task#<id>` target — that
@@ -97,16 +97,17 @@ see what you hold. (The internal claims table that backs these leases is an atom
 ### Task lifecycle
 
 `open → claimed → done → closed`, plus terminal `cancelled`. An agent's footprint per task is
-two calls: `task-claim` (`open → claimed`) then `task-update --status done` — `done` is the
-only status an agent sets. The reviewer (review automation) drives `done → closed` or reopen.
+two calls: `task-claim` (`open → claimed`) then `task-update --status done`. `task-update`
+is the single transition command — `--status done` submits work (auto-spawns a review),
+`--status open` releases a claim (give-up), `--status cancelled` is a terminal won't-do
+(creator OR assignee). The reviewer (review automation) drives `done → closed` or reopen.
 
 `task-claim` takes a **renewable lease** on the task (`--ttl`, default 1h); the lease
 auto-renews on any `--agent` command the assignee runs (working through quorum keeps the
 work — there is no separate `task-renew`). If the lease lapses (lost agent), the next write's
 sweep reaper returns the task to `open` and posts a `reclaimed` event — so work never strands.
-Give-up is `task-release` (→ `open`); hand-off is release + re-claim. `task-cancel` (creator
-**or** assignee) is a terminal won't-do.
-| Ops | `status [--watch] [--json]` · `sweep` · `init` · `reset --yes` (wipe all state → clean db) · `help` (alias: `help-agent`) |
+Give-up is `task-update --status open` (→ `open`); hand-off is release + re-claim.
+| Ops | `status [--watch] [--json] [--agents]` · `sweep` · `init` · `reset --yes` (wipe all state → clean db) · `help` (alias: `help-agent`) |
 
 ### Free text safely
 

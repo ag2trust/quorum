@@ -106,7 +106,15 @@ fn message_feed_carries_no_auto_events() {
         .assert()
         .success();
     quorum(home.path())
-        .args(["task-cancel", "--agent", "A", "--task-id", "1"])
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+        ])
         .assert()
         .success();
 

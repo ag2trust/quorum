@@ -28,8 +28,6 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// List known agents with derived online/offline presence.
-    Roster,
     /// Create a new open task. Body (free text) via --body-stdin or --body-file.
     TaskCreate {
         #[arg(long = "created-by")]
@@ -72,8 +70,14 @@ pub enum Command {
         #[arg(long)]
         ttl: Option<String>,
     },
-    /// Submit a task as `done` (review pending). Only the assignee may, and only `done`.
-    /// (Hand-off is `task-release` then a fresh `task-claim`, not reassignment.)
+    /// Update a task: transition status, set refs/body, or append a note. The single
+    /// task-transition command — replaces the former `task-release` and `task-cancel`.
+    ///
+    /// Valid `--status` values and their guards:
+    ///   `done`      — assignee-only, from `claimed`. Auto-spawns a review task.
+    ///   `open`      — assignee-only, from `claimed` (release/give-up semantics).
+    ///   `cancelled` — creator OR assignee, from non-terminal (won't-do).
+    ///   Omitted     — metadata-only update (body/refs/note), assignee guard.
     ///
     /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
@@ -107,20 +111,6 @@ pub enum Command {
         /// changes. Required on review tasks, rejected on non-review.
         #[arg(long)]
         verdict: Option<String>,
-    },
-    /// Release a task you hold back to `open` (give-up). Assignee-only.
-    TaskRelease {
-        #[arg(long)]
-        agent: String,
-        #[arg(long = "task-id")]
-        task_id: i64,
-    },
-    /// Cancel a task (terminal won't-do). Creator OR assignee may cancel.
-    TaskCancel {
-        #[arg(long)]
-        agent: String,
-        #[arg(long = "task-id")]
-        task_id: i64,
     },
     /// List tasks, optionally filtered by status/label/assignee. `--brief` returns summary rows
     /// (no body) for a token-cheap queue scan; the full body is one `task-get <id>` away.
@@ -164,33 +154,29 @@ pub enum Command {
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
     },
-    /// Read new messages since your cursor; --ack-through advances the cursor.
-    /// Default returns broadcasts + direct-to-you. `--direct` keeps only direct-to-you;
-    /// `--broadcasts` keeps only general (no recipient). The two are mutually exclusive.
+    /// Read messages from the feed. With `--agent`, returns new messages since your cursor
+    /// (broadcasts + direct-to-you); `--ack-through` advances the cursor. Without `--agent`,
+    /// returns unexpired messages without touching any cursor (replaces the former `peek`
+    /// command). `--direct` / `--broadcasts` filter the feed; `--since` sets a seq floor
+    /// for agent-less reads.
     Read {
         #[arg(long)]
-        agent: String,
+        agent: Option<String>,
         #[arg(long)]
         topic: Option<String>,
         #[arg(long = "ack-through")]
         ack_through: Option<i64>,
         #[arg(long)]
         limit: Option<i64>,
-        /// Show only direct-to-you messages.
+        /// Show only direct-to-you messages (requires --agent).
         #[arg(long, conflicts_with = "broadcasts")]
         direct: bool,
         /// Show only broadcasts (no recipient).
         #[arg(long)]
         broadcasts: bool,
-    },
-    /// Inspect messages without touching any cursor.
-    Peek {
-        #[arg(long)]
-        topic: Option<String>,
+        /// Seq floor for agent-less reads: return messages with seq > since.
         #[arg(long)]
         since: Option<i64>,
-        #[arg(long)]
-        limit: Option<i64>,
     },
     /// Read the auto-emitted state-change event log (separate from the message feed).
     /// `--since <seq>` returns events strictly after a seq; `--refs <subject>` filters by
@@ -276,11 +262,16 @@ pub enum Command {
         match_label: Vec<String>,
     },
     /// Health snapshot. --json for machine output; --watch to refresh continuously.
+    /// --agents lists known agents with derived online/offline presence (replaces the
+    /// former `roster` command).
     Status {
         #[arg(long)]
         json: bool,
         #[arg(long)]
         watch: bool,
+        /// List agent presence (online/offline). Replaces the former `roster` command.
+        #[arg(long)]
+        agents: bool,
     },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
