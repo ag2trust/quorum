@@ -95,6 +95,25 @@ pub struct ClaimTtl {
     pub expires_in_secs: i64,
 }
 
+/// Per-agent cumulative work signal — issue #95 Phase 1 (data only).
+///
+/// The retirement mechanic (server-side drain on score, sticky carve-out, retire signal in
+/// `sync`) ships in a follow-up; this struct is the load-signal it will read.
+///
+/// `tasks_completed` counts distinct tasks the agent was assignee on when the task reached
+/// `done`/`closed`. `total_active_secs` sums `(task.updated_at - latest_claim.ts)` per
+/// completed task — the closest observable proxy for "context consumed" without
+/// instrumenting the agent. Multi-round (changes-verdict) tasks count only the most recent
+/// claim→done window, not the full rework history; that's an accepted Phase 1
+/// simplification (issue #95 §1 calls for "cumulative active duration" without requiring
+/// rework-perfect attribution).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AgentLoadScore {
+    pub agent_id: String,
+    pub tasks_completed: i64,
+    pub total_active_secs: i64,
+}
+
 /// Throughput / queue-health metrics — surfaces review-loop stalls early.
 #[derive(Debug, Serialize, PartialEq, Eq, Default)]
 pub struct Throughput {
@@ -131,6 +150,10 @@ pub struct Stats {
     pub claim_ttls: Vec<ClaimTtl>,
     /// Issue #77: throughput / review-loop-stall metrics.
     pub throughput: Throughput,
+    /// Issue #95 Phase 1: per-agent cumulative work signal (tasks completed + active secs).
+    /// Surfaced for owner-side fleet management; the retirement mechanic that consumes this
+    /// signal lands in a follow-up. Empty when no agent has completed work yet.
+    pub agent_load_scores: Vec<AgentLoadScore>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -184,6 +207,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let recent_messages = recent_messages(conn, now)?;
     let claim_ttls = claim_ttls(conn, now)?;
     let throughput = throughput(conn, now)?;
+    let agent_load_scores = agent_load_scores(conn)?;
 
     Ok(Stats {
         agents_total,
@@ -199,6 +223,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         recent_messages,
         claim_ttls,
         throughput,
+        agent_load_scores,
     })
 }
 
@@ -433,6 +458,50 @@ fn claim_ttls(conn: &Connection, now: i64) -> Result<Vec<ClaimTtl>> {
                 target: r.get(0)?,
                 holder: r.get(1)?,
                 expires_in_secs: expires_at - now,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Per-agent cumulative work signal — issue #95 Phase 1 (data only).
+///
+/// Joins `tasks` (status='done' or 'closed', assignee NOT NULL) against the agent's most
+/// recent claim row for that task to derive `(claim.ts → task.updated_at)` as the working
+/// window, then aggregates per-agent. Multi-round (changes-verdict) tasks expose only the
+/// most recent window — see `AgentLoadScore` for the rationale.
+///
+/// Returns rows newest-by-volume first (highest total_active_secs first); ties broken by
+/// tasks_completed descending then agent_id ascending so output is deterministic for tests.
+fn agent_load_scores(conn: &Connection) -> Result<Vec<AgentLoadScore>> {
+    let mut stmt = conn.prepare(
+        "WITH latest_claim AS (
+             SELECT target, holder, MAX(ts) AS ts
+             FROM claims
+             GROUP BY target, holder
+         )
+         SELECT
+             t.assignee AS agent_id,
+             COUNT(DISTINCT t.id) AS tasks_completed,
+             COALESCE(SUM(CASE
+                 WHEN t.updated_at > lc.ts THEN t.updated_at - lc.ts
+                 ELSE 0
+             END), 0) AS total_active_secs
+         FROM tasks t
+         JOIN latest_claim lc
+             ON lc.target = 'task#' || t.id
+             AND lc.holder = t.assignee
+         WHERE t.status IN ('done', 'closed')
+             AND t.assignee IS NOT NULL
+         GROUP BY t.assignee
+         ORDER BY total_active_secs DESC, tasks_completed DESC, agent_id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AgentLoadScore {
+                agent_id: r.get(0)?,
+                tasks_completed: r.get(1)?,
+                total_active_secs: r.get(2)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -797,6 +866,83 @@ mod tests {
             refs: None,
             verdict: None,
         }
+    }
+
+    // ── Agent load score (#95 Phase 1) ─────────────────────────────────
+
+    fn make_task(c: &mut Connection, title: &str, now: i64) -> i64 {
+        crate::tasks::create(c, "boss", title, None, 0, None, None, None, now).unwrap()
+    }
+
+    /// Drive one task all the way through claim → done as `agent`, returning the
+    /// task id. Uses distinct claim/done timestamps so the per-task active duration is
+    /// non-zero.
+    fn complete_task_as(c: &mut Connection, agent: &str, claim_ts: i64, done_ts: i64) -> i64 {
+        let id = make_task(c, &format!("t-{claim_ts}"), claim_ts - 1);
+        crate::tasks::claim(c, agent, Some(id), &[], 3600, claim_ts).unwrap();
+        crate::tasks::update(c, agent, id, &done("done"), done_ts).unwrap();
+        id
+    }
+
+    #[test]
+    fn agent_load_scores_empty_when_no_completed_tasks() {
+        let (_d, c) = open_tmp();
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(s.agent_load_scores.is_empty());
+    }
+
+    #[test]
+    fn agent_load_scores_sums_per_task_active_duration() {
+        let (_d, mut c) = open_tmp();
+        // Alice: 2 tasks, durations 30s + 60s = 90s; Bob: 1 task, 10s.
+        complete_task_as(&mut c, "Alice", 100, 130);
+        complete_task_as(&mut c, "Alice", 200, 260);
+        complete_task_as(&mut c, "Bob", 300, 310);
+
+        let s = stats(&c, 400, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        // Sorted by total_active_secs DESC: Alice (90) then Bob (10).
+        assert_eq!(s.agent_load_scores.len(), 2);
+        assert_eq!(s.agent_load_scores[0].agent_id, "Alice");
+        assert_eq!(s.agent_load_scores[0].tasks_completed, 2);
+        assert_eq!(s.agent_load_scores[0].total_active_secs, 90);
+        assert_eq!(s.agent_load_scores[1].agent_id, "Bob");
+        assert_eq!(s.agent_load_scores[1].tasks_completed, 1);
+        assert_eq!(s.agent_load_scores[1].total_active_secs, 10);
+    }
+
+    #[test]
+    fn agent_load_scores_excludes_in_flight_tasks() {
+        let (_d, mut c) = open_tmp();
+        // Alice has one completed task (30s) and one still claimed — the in-flight one
+        // must NOT contribute to the score (the retire signal looks at completed work
+        // only; in-flight time is the current lease's concern, not Phase 1's count).
+        complete_task_as(&mut c, "Alice", 100, 130);
+        let _in_flight = make_task(&mut c, "in-flight", 200);
+        crate::tasks::claim(&mut c, "Alice", None, &[], 3600, 210).unwrap();
+
+        let s = stats(&c, 300, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.agent_load_scores.len(), 1);
+        assert_eq!(s.agent_load_scores[0].agent_id, "Alice");
+        assert_eq!(s.agent_load_scores[0].tasks_completed, 1);
+        assert_eq!(s.agent_load_scores[0].total_active_secs, 30);
+    }
+
+    #[test]
+    fn agent_load_scores_orders_ties_deterministically() {
+        let (_d, mut c) = open_tmp();
+        // Bert and Anna both at 20s total — Anna sorts first by agent_id ASC tiebreaker
+        // (after total_active_secs DESC, tasks_completed DESC). Output stability is
+        // load-bearing for tests + #95-follow-up's scoreboard rendering.
+        complete_task_as(&mut c, "Bert", 100, 120);
+        complete_task_as(&mut c, "Anna", 200, 220);
+
+        let s = stats(&c, 300, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let ids: Vec<&str> = s
+            .agent_load_scores
+            .iter()
+            .map(|s| s.agent_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["Anna", "Bert"]);
     }
 
     #[test]
