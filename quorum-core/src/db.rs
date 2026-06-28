@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -165,6 +165,9 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 8 && !column_exists(conn, "agents", "tier")? {
             conn.execute("ALTER TABLE agents ADD COLUMN tier TEXT", [])?;
         }
+        // v9 = per-(task, project) branch allocations (issue #98). Net-new table — the
+        // CREATE TABLE IF NOT EXISTS in SCHEMA_SQL handles fresh DBs and upgrades alike;
+        // no ALTER needed.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -223,6 +226,7 @@ mod tests {
             "errors",
             "events",
             "task_notes",
+            "task_branches",
         ] {
             let n: i64 = c
                 .query_row(
@@ -594,6 +598,82 @@ mod tests {
             .unwrap();
         assert_eq!(id, "pre-tier");
         assert!(tier.is_none(), "tier must default NULL for existing rows");
+    }
+
+    #[test]
+    fn migrates_v8_to_v9_adds_task_branches_table_without_disturbing_existing_rows() {
+        // Issue #98: v9 is a net-new `task_branches` table. The migration is satisfied
+        // entirely by SCHEMA_SQL's `CREATE TABLE IF NOT EXISTS` running on every open; no
+        // ALTER is needed. Verify (a) the table exists post-open, (b) PRAGMA user_version
+        // is bumped to SCHEMA_VERSION, and (c) a pre-existing v8 `tasks` row is untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("q.db");
+        {
+            let c = Connection::open(&p).unwrap();
+            apply_pragmas(&c).unwrap();
+            // Minimal v8 shape: just enough for a tasks row to round-trip.
+            c.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    body TEXT,
+                    status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    labels TEXT,
+                    assignee TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    refs TEXT,
+                    depends_on TEXT,
+                    sticky_until INTEGER,
+                    orig TEXT
+                 );
+                 INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('pre-v9', 'open', 'boss', 100, 100);
+                 PRAGMA user_version = 8;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+        let c = open(&p).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // (a) task_branches table now exists.
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='task_branches'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "task_branches table must exist after v8 → v9 migration"
+        );
+        // (b) UNIQUE indices present (the load-bearing invariants of #98).
+        let idx_count: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND tbl_name='task_branches'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            idx_count >= 2,
+            "expected ≥2 indices on task_branches (UNIQUE(task_id,repo), UNIQUE(repo,branch)); got {idx_count}"
+        );
+        // (c) Pre-existing tasks row untouched.
+        let (title, status): (String, String) = c
+            .query_row("SELECT title, status FROM tasks WHERE id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title, "pre-v9");
+        assert_eq!(status, "open");
     }
 
     #[test]

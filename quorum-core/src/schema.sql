@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 7). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 9). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -124,3 +124,30 @@ CREATE TABLE IF NOT EXISTS pinned (
     author  TEXT NOT NULL,
     body    TEXT NOT NULL
 );
+
+-- Per-(task, project) branch allocations (issue #98). One row = the recommended
+-- branch + worktree path for an agent claiming this task in this project. Lifetime
+-- matches the task itself: persists across release/reopen so a rework re-claim
+-- returns the SAME branch (no reconstruction, no guessing).
+--
+-- UNIQUE(task_id, repo): one allocation per (task, project) — caller will INSERT
+-- OR IGNORE then SELECT, so a fresh task allocates and a re-claim reuses without
+-- a TOCTOU race.
+-- UNIQUE(repo, branch): centralized anti-collision — quorum is the single
+-- registry of in-use names, so two tasks in the same project can never share a
+-- branch even if their titles slugify identically.
+--
+-- Sweeper does NOT TTL these (no expires_at) — same posture as task_notes:
+-- durable context for the next picker-upper after the original assignee is lost.
+CREATE TABLE IF NOT EXISTS task_branches (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL,
+    repo         TEXT NOT NULL,
+    branch       TEXT NOT NULL,
+    worktree     TEXT NOT NULL,
+    allocated_by TEXT NOT NULL,
+    allocated_at INTEGER NOT NULL,
+    UNIQUE(task_id, repo),
+    UNIQUE(repo, branch)
+);
+CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);
