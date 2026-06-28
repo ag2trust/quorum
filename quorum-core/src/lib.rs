@@ -3,6 +3,7 @@
 //! See `docs/2026-06-23-quorum-design.md` for the design of record.
 
 pub mod agents;
+pub mod branches;
 pub mod claims;
 pub mod clock;
 pub mod control;

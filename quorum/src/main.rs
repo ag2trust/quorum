@@ -424,6 +424,26 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     // and include `lease_expires_at` since the lease just landed.
                     let mut compact = quorum_core::tasks::TaskCompact::from(&t);
                     compact.lease_expires_at = Some(now + ttl);
+                    // Issue #98: allocate (or reuse) a branch + worktree for this
+                    // (task, project) — centralized anti-collision naming. Idempotent
+                    // by construction (UNIQUE(task_id, repo)), so a reopened-task
+                    // re-claim returns the same branch as the original allocation.
+                    let repo = quorum_core::branches::repo_from_refs(t.refs.as_deref());
+                    let branch_hint =
+                        quorum_core::branches::branch_hint_from_refs(t.refs.as_deref());
+                    let alloc = quorum_core::branches::allocate_for_task(
+                        &mut conn,
+                        t.id,
+                        &repo,
+                        &agent,
+                        &t.title,
+                        t.labels.as_deref(),
+                        branch_hint.as_deref(),
+                        now,
+                    )?;
+                    compact.suggested_branch = Some(alloc.branch);
+                    compact.suggested_worktree = Some(alloc.worktree);
+                    compact.branch_exists = Some(alloc.existed);
                     output::emit(&compact);
                     Ok(0)
                 }

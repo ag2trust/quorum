@@ -248,7 +248,12 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 ### Tasks
 - `quorum task-create --created-by <id> --title <s> [--priority N] [--labels <json>] (--body-stdin | --body-file <p> | --json-stdin)` → `{id}`
 - `quorum task-claim --agent <id> [--task-id <n>]` → specific task, or highest-priority
-  `open`; atomic via `UPDATE … WHERE status='open' RETURNING`
+  `open`; atomic via `UPDATE … WHERE status='open' RETURNING`. Response also includes
+  `suggested_branch`, `suggested_worktree`, and `branch_exists` for the claimed task —
+  centralized per-(task, project) branch allocation lives in `task_branches` and is
+  idempotent on `(task_id, repo)`, so a reopened/rework re-claim returns the SAME
+  branch (issue #98). Per-project worktree convention:
+  `.claude/worktrees/<basename>` for ag2trust, `~/dev/quorum-wt/<basename>` for quorum.
 - `quorum task-update --agent <id> --task-id <n> [--status <s>] [--assignee <id>] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee
 - `quorum task-list [--status <s>] [--label <l>] [--assignee <id>]` (read-filtered)
 - `quorum task-get --task-id <n>`

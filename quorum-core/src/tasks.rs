@@ -195,6 +195,23 @@ pub struct TaskCompact {
     /// Id of the breadcrumb appended on `task-update --note-*`. Omitted on other calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note_id: Option<i64>,
+    /// Recommended branch name for this task in its project (issue #98). Populated by
+    /// `task-claim` once the claim transition succeeds; omitted by other commands.
+    /// **Recommendation, not mandate** — the agent may override locally, but defaulting
+    /// to this name keeps anti-collision centralized (quorum is the only registry of
+    /// in-use names).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_branch: Option<String>,
+    /// Recommended worktree directory for this task in its project (issue #98). Per
+    /// project convention: `.claude/worktrees/<basename>` for ag2trust,
+    /// `~/dev/quorum-wt/<basename>` for quorum. Omitted by non-claim commands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_worktree: Option<String>,
+    /// `true` when this task already had a branch allocated (e.g., a reopened/rework
+    /// task being re-claimed) → reuse the existing branch and PR. `false` on a fresh
+    /// allocation. Omitted entirely when the command did not consult the allocator.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_exists: Option<bool>,
 }
 
 impl From<&Task> for TaskCompact {
@@ -206,6 +223,9 @@ impl From<&Task> for TaskCompact {
             refs: t.refs.clone(),
             lease_expires_at: None,
             note_id: None,
+            suggested_branch: None,
+            suggested_worktree: None,
+            branch_exists: None,
         }
     }
 }
