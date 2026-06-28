@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -180,6 +180,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 10 && !column_exists(conn, "agents", "retired_at")? {
             conn.execute("ALTER TABLE agents ADD COLUMN retired_at INTEGER", [])?;
         }
+        // v11 = optional PostToolUse activity-hook stats (issue #101). Two net-new
+        // tables (`agent_sessions`, `activity_events`) — the `CREATE TABLE IF NOT
+        // EXISTS` in SCHEMA_SQL handles fresh DBs and upgrades alike; no ALTER
+        // needed. EXPERIMENTAL / opt-in / stats-only — no existing query reads
+        // these tables, so absence (or hook never installed) changes nothing.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -778,13 +783,17 @@ mod tests {
         .unwrap();
         drop(raw);
 
-        // Now open via the production path — migrate() must lift v9 → v10 and ALTER
-        // the agents table to add retire_status + retired_at.
+        // Now open via the production path — migrate() must lift v9 → SCHEMA_VERSION
+        // (currently 11 after #101's activity-hook tables landed) and ALTER the
+        // agents table along the way to add retire_status + retired_at.
         let c = open(&path).unwrap();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 10, "user_version must advance to 10");
+        assert_eq!(
+            v, SCHEMA_VERSION,
+            "user_version must advance to current SCHEMA_VERSION (this test specifically pins the v9→v10 retire-columns ALTER)"
+        );
         assert!(
             column_exists(&c, "agents", "retire_status").unwrap(),
             "retire_status column missing — v9→v10 migration silently skipped"

@@ -275,6 +275,26 @@ pub enum Command {
     },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
+    /// EXPERIMENTAL (issue #101) — register a Claude session UUID → agent name
+    /// for the optional PostToolUse activity hook. Stats-only; no workflow
+    /// impact. Idempotent; re-register extends the session TTL (48h).
+    SessionRegister {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        session: String,
+    },
+    /// EXPERIMENTAL (issue #101) — record one tool-use event for the activity
+    /// stats surface. Resolves `--session` → agent name via the
+    /// `session-register` mapping; fail-open (unregistered session is still
+    /// recorded with `agent_name = NULL` → counted as "unknown" in stats).
+    /// Designed for `~/.claude/settings.json` PostToolUse hook invocation.
+    Activity {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        tool: String,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]

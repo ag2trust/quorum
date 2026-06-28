@@ -2,6 +2,7 @@
 //!
 //! See `docs/2026-06-23-quorum-design.md` for the design of record.
 
+pub mod activity;
 pub mod agents;
 pub mod branches;
 pub mod claims;
