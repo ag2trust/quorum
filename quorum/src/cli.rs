@@ -295,6 +295,22 @@ pub enum Command {
         #[arg(long)]
         tool: String,
     },
+    /// Signal task completion (worker) or emit a review verdict (reviewer).
+    /// Writes a mailbox row for the daemon to consume.
+    Done {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        pr: Option<i64>,
+        #[arg(long)]
+        summary: Option<String>,
+        /// Review verdict: approved or changes.
+        #[arg(long)]
+        verdict: Option<String>,
+        /// Review feedback (used with --verdict changes).
+        #[arg(long)]
+        feedback: Option<String>,
+    },
     /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
     /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.
     Serve {

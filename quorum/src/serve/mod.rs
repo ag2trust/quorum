@@ -3,6 +3,15 @@
 //! Builds a tokio runtime and runs an async tick loop that polls the mailbox,
 //! spawns/drives agents, and shuts down cleanly on Ctrl-C. See spec §3.
 
+#[allow(dead_code)]
+pub mod agent;
+#[allow(dead_code)]
+pub mod names;
+#[allow(dead_code)]
+pub mod stream;
+#[allow(dead_code)]
+pub mod worktree;
+
 use quorum_core::error::{QuorumError, Result};
 use std::io::Write;
 use std::path::Path;

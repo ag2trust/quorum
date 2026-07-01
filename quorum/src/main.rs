@@ -50,6 +50,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
+        cli::Command::Done { .. } => "done",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -851,6 +852,31 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 let _ = quorum_core::activity::record_activity(&conn, &session, &tool, now);
             }
             output::emit(&serde_json::json!({ "ok": true }));
+            Ok(0)
+        }
+        cli::Command::Done {
+            agent,
+            pr,
+            summary,
+            verdict,
+            feedback,
+        } => {
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let kind = quorum_core::mailbox::MailboxKind::Done;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent,
+                kind,
+                task_id: None,
+                pr,
+                verdict,
+                feedback,
+                note: summary,
+                to_agent: None,
+                payload: None,
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
         cli::Command::Serve { cap } => {
