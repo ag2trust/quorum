@@ -478,6 +478,10 @@ pub fn tick_with_budget(
     budget_active_secs: i64,
     budget_tasks: i64,
 ) -> Result<Snapshot> {
+    // #121: reap lapsed leases BEFORE the read-only gather so reaped tasks are visible
+    // as `next_task` in the same tick — closes the deadlock where an idle fleet never
+    // triggers sweep_on_write because nothing appears claimable.
+    reap_before_gather(conn, now)?;
     let snap = gather_with_budget(
         conn,
         agent,
@@ -488,6 +492,17 @@ pub fn tick_with_budget(
     )?;
     touch_and_advance_cursor(conn, agent, &snap, match_labels, now)?;
     Ok(snap)
+}
+
+/// #121: run the lease reaper in a short write txn before the read-only `gather`.
+/// Cheap: one bounded UPDATE over expired leases. By running before `gather`, a reaped
+/// task surfaces as `next_task` in the same tick — the agent doesn't have to wait an
+/// extra round-trip to see reclaimed work.
+fn reap_before_gather(conn: &mut Connection, now: i64) -> Result<()> {
+    let tx = begin_immediate(conn)?;
+    crate::sweep::reap_lapsed_tasks(&tx, now, crate::sweep::SWEEP_LIMIT)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Touch the agent (presence bump + auto-renew live leases per #55) AND advance the
@@ -2283,5 +2298,39 @@ mod tests {
             Some(now_base + 5000),
             "sticky_until must be preserved for online agent"
         );
+    }
+
+    // --- #121: lease reaper on sync tick ---------------------------------------------------
+
+    #[test]
+    fn tick_reaps_lapsed_lease_and_surfaces_task_as_next() {
+        // Repro of issue #121: agent A claims a task with a short lease, goes offline,
+        // lease lapses. Agent B's `tick` (no manual sweep) must reap the lapsed lease
+        // and surface the task as `next_task` in the SAME tick — not require a second
+        // round-trip.
+        let (_d, mut c) = open_tmp();
+        let id = make_task(&mut c, "stranded work", 5, None, 1000);
+        // A claims with TTL=100 → lease expires at 1100.
+        tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+        // Verify the task is claimed and not visible as next_task.
+        let snap_pre = gather(&c, "B", &[], 1050).unwrap();
+        assert!(
+            snap_pre.next_task.is_none(),
+            "task must not be claimable while lease is live"
+        );
+        // Lease lapses (now=1200 > expires_at=1100). B's tick should reap + surface.
+        let snap = tick(&mut c, "B", &[], 1200).unwrap();
+        assert!(
+            snap.next_task.is_some(),
+            "tick must reap the lapsed lease and surface the task as next_task"
+        );
+        assert_eq!(snap.next_task.as_ref().unwrap().id, id);
+        // The task should now be open (reaped).
+        let t = tasks::get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+        // B can actually claim it.
+        let claimed = tasks::claim(&mut c, "B", Some(id), &[], 3600, 1200).unwrap();
+        assert!(claimed.is_some(), "B must be able to claim the reaped task");
     }
 }
