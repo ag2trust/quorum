@@ -18,20 +18,22 @@ fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn init_git_repo(dir: &std::path::Path) {
+    let d = dir.to_string_lossy();
     Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "init", "-b", "main"])
-        .output()
+        .args(["-C", &d, "init", "-b", "main"])
+        .status()
         .unwrap();
     Command::new("git")
-        .args([
-            "-C",
-            &dir.to_string_lossy(),
-            "commit",
-            "--allow-empty",
-            "-m",
-            "init",
-        ])
-        .output()
+        .args(["-C", &d, "config", "user.email", "test@test.com"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "config", "user.name", "Test"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
+        .status()
         .unwrap();
 }
 

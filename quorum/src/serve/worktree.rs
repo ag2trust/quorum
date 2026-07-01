@@ -109,21 +109,29 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn init_git_repo(dir: &Path) {
+        let d = dir.to_string_lossy();
+        let init = StdCommand::new("git")
+            .args(["-C", &d, "init", "-b", "main"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "git init failed");
         StdCommand::new("git")
-            .args(["-C", &dir.to_string_lossy(), "init", "-b", "main"])
+            .args(["-C", &d, "config", "user.email", "test@test.com"])
             .output()
             .unwrap();
         StdCommand::new("git")
-            .args([
-                "-C",
-                &dir.to_string_lossy(),
-                "commit",
-                "--allow-empty",
-                "-m",
-                "init",
-            ])
+            .args(["-C", &d, "config", "user.name", "Test"])
             .output()
             .unwrap();
+        let commit = StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
     }
 
     #[tokio::test]
