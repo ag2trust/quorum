@@ -562,6 +562,24 @@ fn touch_and_advance_cursor(
             crate::agents::mark_retiring(&tx, agent)?;
         }
     }
+    // Issue #115 bug 3: release sticky tasks whose assignee is OFFLINE (not just retired).
+    // An agent is offline when (now - last_seen) >= ONLINE_WINDOW_SECS and it holds no
+    // active claim. A sticky window locked to such an agent is dead weight — release it
+    // so any eligible agent can claim immediately.
+    tx.execute(
+        "UPDATE tasks SET assignee = NULL, sticky_until = NULL, updated_at = ?1
+         WHERE status = 'open' AND sticky_until IS NOT NULL AND sticky_until > ?1
+           AND assignee IS NOT NULL
+           AND assignee IN (
+               SELECT a.id FROM agents a
+               WHERE (?1 - a.last_seen) >= ?2
+                 AND NOT EXISTS (
+                     SELECT 1 FROM claims c
+                     WHERE c.holder = a.id AND c.active = 1 AND c.expires_at > ?1
+                 )
+           )",
+        rusqlite::params![now, crate::agents::ONLINE_WINDOW_SECS],
+    )?;
     if max_seen > cursor_now {
         // Same shape as feed::read --ack-through: insert-or-update with MAX(...).
         tx.execute(
@@ -2177,5 +2195,93 @@ mod tests {
         // Sanity: the constants are what the doc-comment claims.
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS, 5400);
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_TASKS, 8);
+    }
+
+    #[test]
+    fn tick_releases_sticky_tasks_for_offline_assignees() {
+        // Issue #115 bug 3: a sticky-rework task assigned to an OFFLINE (not retired)
+        // agent blocks the queue until sticky_until expires. The tick should release the
+        // sticky reservation so any eligible agent can claim immediately.
+        let (_d, mut c) = open_tmp();
+        let now_base = 10_000_i64;
+
+        // Agent "Gone" touched long ago — will be offline at now_base.
+        crate::agents::touch(
+            &c,
+            "Gone",
+            now_base - crate::agents::ONLINE_WINDOW_SECS - 100,
+        )
+        .unwrap();
+
+        // Create a task and stamp a sticky-reopen to "Gone" with a window well into the future.
+        let tid = make_task(&mut c, "rework-stuck", 50, None, now_base - 500);
+        c.execute(
+            "UPDATE tasks SET status='open', assignee='Gone', sticky_until=?1 WHERE id=?2",
+            params![now_base + 5000_i64, tid],
+        )
+        .unwrap();
+
+        // Before tick: task is sticky to "Gone", invisible to others.
+        let snap_pre = gather(&c, "Other", &[], now_base).unwrap();
+        assert!(
+            snap_pre.next_task.is_none(),
+            "sticky task must be invisible to non-assignee before tick"
+        );
+
+        // Run a tick as "Other" — this triggers the offline sticky sweep.
+        let _snap_post = tick_with_budget(&mut c, "Other", &[], now_base, 5400, 8).unwrap();
+
+        // After tick: the sticky was released, task is now claimable by anyone.
+        // Re-gather to see the updated state (tick wrote the release).
+        let snap_check = gather(&c, "Other", &[], now_base + 1).unwrap();
+        assert!(
+            snap_check.next_task.is_some(),
+            "sticky task must be claimable after offline assignee release"
+        );
+        assert_eq!(snap_check.next_task.as_ref().unwrap().id, tid);
+
+        // Verify the task's assignee and sticky_until were cleared.
+        let task = tasks::get(&c, tid).unwrap().unwrap();
+        assert!(
+            task.assignee.is_none(),
+            "assignee must be NULL after release"
+        );
+        assert!(
+            task.sticky_until.is_none(),
+            "sticky_until must be NULL after release"
+        );
+    }
+
+    #[test]
+    fn tick_does_not_release_sticky_for_online_assignee() {
+        // Counterpart: an online agent's sticky window must NOT be released.
+        let (_d, mut c) = open_tmp();
+        let now_base = 10_000_i64;
+
+        // Agent "Active" touched recently — will be online at now_base.
+        crate::agents::touch(&c, "Active", now_base - 100).unwrap();
+
+        let tid = make_task(&mut c, "rework-active", 50, None, now_base - 500);
+        c.execute(
+            "UPDATE tasks SET status='open', assignee='Active', sticky_until=?1 WHERE id=?2",
+            params![now_base + 5000_i64, tid],
+        )
+        .unwrap();
+
+        // Run a tick as "Other".
+        let _snap = tick_with_budget(&mut c, "Other", &[], now_base, 5400, 8).unwrap();
+
+        // Sticky must still be in place.
+        let task = tasks::get(&c, tid).unwrap().unwrap();
+        assert_eq!(
+            task.assignee.as_deref(),
+            Some("Active"),
+            "online agent's sticky must be preserved"
+        );
+        assert_eq!(
+            task.sticky_until,
+            Some(now_base + 5000),
+            "sticky_until must be preserved for online agent"
+        );
     }
 }
