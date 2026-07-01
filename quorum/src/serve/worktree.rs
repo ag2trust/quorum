@@ -15,6 +15,7 @@ impl WorktreeManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn fetch(&self, repo_dir: &Path) -> Result<(), String> {
         let _guard = self.lock.lock().await;
 

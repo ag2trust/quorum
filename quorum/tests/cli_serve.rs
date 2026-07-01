@@ -1,6 +1,6 @@
 //! Integration tests for `quorum serve`.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -8,9 +8,41 @@ fn cargo_bin() -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin("quorum")
 }
 
+fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("names.txt");
+    let mut f = std::fs::File::create(&path).unwrap();
+    for i in 0..20 {
+        writeln!(f, "Agent{i}").unwrap();
+    }
+    path
+}
+
+fn init_git_repo(dir: &std::path::Path) {
+    Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "init", "-b", "main"])
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "-C",
+            &dir.to_string_lossy(),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .output()
+        .unwrap();
+}
+
 #[test]
 fn serve_boots_and_stops_on_sigint() {
     let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
 
     let init_status = Command::new(cargo_bin())
         .env("QUORUM_HOME", home.path())
@@ -21,7 +53,17 @@ fn serve_boots_and_stops_on_sigint() {
 
     let mut child = Command::new(cargo_bin())
         .env("QUORUM_HOME", home.path())
-        .args(["serve", "--cap", "1"])
+        .args([
+            "serve",
+            "--cap",
+            "1",
+            "--repo-dir",
+            &repo_dir.path().to_string_lossy(),
+            "--worktree-base",
+            &wt_base.path().to_string_lossy(),
+            "--names-file",
+            &names_file.to_string_lossy(),
+        ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -55,7 +97,6 @@ fn serve_boots_and_stops_on_sigint() {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
 
-    // Keep reading stderr so the child doesn't get EPIPE on its writes.
     let drain = std::thread::spawn(move || {
         let mut sink = String::new();
         loop {

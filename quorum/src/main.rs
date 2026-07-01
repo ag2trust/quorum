@@ -879,9 +879,27 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
-        cli::Command::Serve { cap } => {
+        cli::Command::Serve {
+            cap,
+            repo_dir,
+            worktree_base,
+            names_file,
+            agent_bin,
+            model,
+            effort,
+        } => {
             let db = paths::db_path()?;
-            serve::run_serve(&db, cap)?;
+            let config = serve::ServeConfig {
+                db_path: db,
+                cap,
+                repo_dir: std::path::PathBuf::from(repo_dir),
+                worktree_base: std::path::PathBuf::from(worktree_base),
+                names_file: std::path::PathBuf::from(names_file),
+                agent_bin,
+                model,
+                effort,
+            };
+            serve::run_serve(config)?;
             Ok(0)
         }
         cli::Command::Help => {

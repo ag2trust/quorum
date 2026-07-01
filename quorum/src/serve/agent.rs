@@ -89,6 +89,7 @@ impl AgentProc {
         }
     }
 
+    #[allow(dead_code)]
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
     }
