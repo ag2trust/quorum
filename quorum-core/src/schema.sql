@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 11). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 12). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -177,6 +177,42 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     expires_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS agent_sessions_expires ON agent_sessions(expires_at);
+
+-- Daemon mailbox (§12 IPC): agent-pushed control events consumed by the daemon's
+-- tick loop. Each CLI invocation of `quorum done/task-update/message` writes one row;
+-- the daemon polls `consumed_at IS NULL` each tick and marks rows consumed after acting.
+-- Not TTL'd — consumed rows are GC'd by sweep (bounded by `consumed_at IS NOT NULL`).
+CREATE TABLE IF NOT EXISTS mailbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    task_id     INTEGER,
+    pr          INTEGER,
+    verdict     TEXT,
+    feedback    TEXT,
+    note        TEXT,
+    to_agent    TEXT,
+    payload     TEXT,
+    created_at  INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS mailbox_unconsumed ON mailbox(consumed_at) WHERE consumed_at IS NULL;
+
+-- Daemon journal: one row per in-flight agent (worker or reviewer). The daemon upserts
+-- on every lifecycle transition so a restart can resurrect agents via `--resume`. Keyed
+-- by agent name (one process per name at any time). Deleted on terminal transitions.
+CREATE TABLE IF NOT EXISTS journal (
+    agent           TEXT PRIMARY KEY,
+    role            TEXT NOT NULL,
+    task_id         INTEGER,
+    session_id      TEXT NOT NULL,
+    worktree        TEXT,
+    branch          TEXT,
+    phase           TEXT NOT NULL,
+    expected_signal TEXT,
+    cost_tokens     INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL
+);
 
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).

@@ -295,6 +295,13 @@ pub enum Command {
         #[arg(long)]
         tool: String,
     },
+    /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
+    /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.
+    Serve {
+        /// Maximum concurrent worker agents.
+        #[arg(long, default_value = "4")]
+        cap: usize,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]
