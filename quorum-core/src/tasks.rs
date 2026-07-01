@@ -624,6 +624,47 @@ pub fn update(
             &format!("cancelled by {agent}"),
             now,
         )?;
+        // Issue #122: cancelling a kind:review task must not strand the original in
+        // `done` with no live review. Respawn a fresh review for the original task
+        // if it's still in `done` — same atomic transaction so there's no window
+        // where the original is reviewless.
+        let (labels, refs_str, orig_opt): (Option<String>, Option<String>, Option<String>) = tx
+            .query_row(
+                "SELECT labels, refs, orig FROM tasks WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+        if labels_contain_review(&labels) {
+            if let (Some(target_id), Some(orig)) = (extract_review_of(&refs_str), orig_opt) {
+                let orig_row: Option<(String, String, Option<String>, Option<String>)> = tx
+                    .query_row(
+                        "SELECT title, status, refs, labels FROM tasks WHERE id=?1",
+                        params![target_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()?;
+                if let Some((orig_title, orig_status, orig_refs, orig_labels)) = orig_row {
+                    if orig_status == "done" {
+                        spawn_review(
+                            &tx,
+                            target_id,
+                            &orig_title,
+                            &orig_refs,
+                            &orig_labels,
+                            &orig,
+                            now,
+                        )?;
+                        crate::events::emit(
+                            &tx,
+                            "review_respawned",
+                            &lease_target(target_id),
+                            &format!("review task#{id} cancelled — respawned for task#{target_id}"),
+                            now,
+                        )?;
+                    }
+                }
+            }
+        }
     } else if fields.status == Some("done") {
         deactivate_lease(&tx, id, now)?;
 
@@ -3187,5 +3228,135 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, tid);
         assert_eq!(claimed.assignee.as_deref(), Some("Other"));
+    }
+
+    // -- cancel of review task respawns review (issue #122) ---------------------------------
+
+    #[test]
+    fn cancel_review_task_respawns_review_for_original_in_done() {
+        let (_d, mut c) = open_tmp();
+        // T: create → claim → done (spawns R1).
+        let tid = create(&mut c, "boss", "fix bug", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r1 = last_review_task(&c);
+        // R1: claim by reviewer, then cancel.
+        claim(&mut c, "B", Some(r1.id), &[], TTL, 1200).unwrap();
+        cancel(&mut c, "B", r1.id, 1300).unwrap();
+        // R1 is cancelled, but a fresh R2 was respawned.
+        let r1_after = get(&c, r1.id).unwrap().unwrap();
+        assert_eq!(r1_after.status, "cancelled");
+        let r2 = last_review_task(&c);
+        assert_ne!(r2.id, r1.id, "R2 must be a new task, not R1");
+        assert_eq!(r2.title, "review: fix bug");
+        assert_eq!(r2.orig.as_deref(), Some("A"));
+        let refs: serde_json::Value = serde_json::from_str(r2.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["review_of"].as_i64(), Some(tid));
+        // Original task T is still in `done` (not stranded — it has a live review).
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "done");
+    }
+
+    #[test]
+    fn cancel_review_task_does_not_respawn_if_original_already_closed() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r1 = last_review_task(&c);
+        // Approve T via R1 (T → closed).
+        claim(&mut c, "B", Some(r1.id), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            r1.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        assert_eq!(get(&c, tid).unwrap().unwrap().status, "closed");
+        // Now cancel R1 (already done, but test creator-cancel path on terminal —
+        // actually this won't work since R1 is done/terminal). Let's set up a second
+        // scenario: create a second review manually, then cancel it.
+        // Insert a review task pointing at the closed T.
+        let r2_id: i64 = c
+            .query_row(
+                "INSERT INTO tasks (title, status, priority, labels, orig, created_by,
+                     created_at, updated_at, refs)
+                 VALUES ('review: T', 'open', 1000, '[\"kind:review\"]', 'A', 'A',
+                     1400, 1400, ?1)
+                 RETURNING id",
+                params![format!(r#"{{"review_of":{tid}}}"#)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        cancel(&mut c, "A", r2_id, 1500).unwrap();
+        // No new review task should have been spawned (T is closed, not done).
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert!(
+            reviews.is_empty(),
+            "no review should respawn for a closed original"
+        );
+    }
+
+    #[test]
+    fn cancel_review_task_by_creator_also_respawns() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1100,
+        )
+        .unwrap();
+        let r1 = last_review_task(&c);
+        // Creator (A) cancels the unclaimed review task.
+        cancel(&mut c, "A", r1.id, 1200).unwrap();
+        let r2 = last_review_task(&c);
+        assert_ne!(r2.id, r1.id);
+        assert_eq!(r2.orig.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn cancel_non_review_task_does_not_respawn() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1000).unwrap();
+        cancel(&mut c, "A", tid, 1100).unwrap();
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert!(
+            reviews.is_empty(),
+            "cancelling a non-review task must not spawn a review"
+        );
     }
 }
