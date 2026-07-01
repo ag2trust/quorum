@@ -552,6 +552,12 @@ fn touch_and_advance_cursor(
     if let Some(retire) = &snap.retire {
         if retire.status == crate::agents::RETIRE_STATUS_RETIRED {
             crate::agents::mark_retired(&tx, agent, now)?;
+            // Issue #115 bug 1: release any sticky tasks assigned to a retired agent.
+            tx.execute(
+                "UPDATE tasks SET assignee = NULL, sticky_until = NULL, updated_at = ?1
+                 WHERE assignee = ?2 AND status = 'open' AND sticky_until IS NOT NULL AND sticky_until > ?1",
+                rusqlite::params![now, agent],
+            )?;
         } else {
             crate::agents::mark_retiring(&tx, agent)?;
         }
