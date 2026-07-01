@@ -344,10 +344,7 @@ fn cancel_review_task_respawns_review_for_original() {
     );
 
     // R1 is cancelled.
-    let r1_after = quorum_json(
-        home.path(),
-        &["task-get", "--task-id", &r1_id.to_string()],
-    );
+    let r1_after = quorum_json(home.path(), &["task-get", "--task-id", &r1_id.to_string()]);
     assert_eq!(r1_after["status"], "cancelled");
 
     // A fresh R2 must have been respawned.
