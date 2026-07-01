@@ -262,3 +262,121 @@ fn verdict_changes_rejects_non_author_claim_during_sticky_window() {
         .assert()
         .failure();
 }
+
+/// Issue #122: cancelling a review task must respawn a fresh review for the
+/// original (which stays in `done`). End-to-end CLI test.
+#[test]
+fn cancel_review_task_respawns_review_for_original() {
+    let home = tempfile::tempdir().unwrap();
+
+    let create = quorum_json(
+        home.path(),
+        &[
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "implement-feature",
+        ],
+    );
+    let task_id = create["id"].as_i64().unwrap();
+
+    quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+        ],
+    );
+    quorum_json(
+        home.path(),
+        &[
+            "task-update",
+            "--agent",
+            "Alice",
+            "--task-id",
+            &task_id.to_string(),
+            "--status",
+            "done",
+        ],
+    );
+
+    // Find R1 (auto-spawned review).
+    let list1 = quorum_json(home.path(), &["task-list", "--status", "open"]);
+    let r1 = list1
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| {
+            t["labels"]
+                .as_str()
+                .map(|s| s.contains("kind:review"))
+                .unwrap_or(false)
+        })
+        .expect("auto-spawned review must exist");
+    let r1_id = r1["id"].as_i64().unwrap();
+
+    // Reviewer claims then cancels R1.
+    quorum_json(
+        home.path(),
+        &[
+            "task-claim",
+            "--agent",
+            "Bob",
+            "--task-id",
+            &r1_id.to_string(),
+        ],
+    );
+    quorum_json(
+        home.path(),
+        &[
+            "task-update",
+            "--agent",
+            "Bob",
+            "--task-id",
+            &r1_id.to_string(),
+            "--status",
+            "cancelled",
+        ],
+    );
+
+    // R1 is cancelled.
+    let r1_after = quorum_json(
+        home.path(),
+        &["task-get", "--task-id", &r1_id.to_string()],
+    );
+    assert_eq!(r1_after["status"], "cancelled");
+
+    // A fresh R2 must have been respawned.
+    let list2 = quorum_json(home.path(), &["task-list", "--status", "open"]);
+    let r2 = list2
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| {
+            t["labels"]
+                .as_str()
+                .map(|s| s.contains("kind:review"))
+                .unwrap_or(false)
+                && t["id"].as_i64() != Some(r1_id)
+        })
+        .expect("cancelling R1 must respawn a fresh review R2");
+
+    // R2 points at the same original task.
+    let r2_refs: Value = serde_json::from_str(r2["refs"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        r2_refs["review_of"].as_i64(),
+        Some(task_id),
+        "R2 must point at the original task"
+    );
+
+    // Original task T is still in `done` (not stranded — it has a live review).
+    let t = quorum_json(
+        home.path(),
+        &["task-get", "--task-id", &task_id.to_string()],
+    );
+    assert_eq!(t["status"], "done");
+}
