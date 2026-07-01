@@ -808,9 +808,10 @@ fn apply_verdict(
             )?;
         }
         "changes" => {
-            // T → open + sticky window + assignee=orig + dedup-append "rework" label. We use
-            // json_insert with a CASE for dedup — appending an already-present "rework"
-            // would accumulate dupes across multiple review rounds for the same task.
+            // T → open + dedup-append "rework" label. Assignee + sticky window depend on
+            // whether T is a review task (#115): implementation rework is sticky-to-orig
+            // (bounce back to the code author); a re-review reopens to the pool (any
+            // eligible non-author reviewer can claim).
             //
             // Issue #88: the sticky window length is row-conditional on `priority`. For
             // `priority >= CRITICAL_PRIORITY_THRESHOLD` we use `STICKY_WINDOW_SECS_CRITICAL`
@@ -818,13 +819,28 @@ fn apply_verdict(
             // master-blocking reopen without waiting out the default 30-minute window. The
             // CASE is in-SQL so we avoid an extra SELECT round-trip just to read the
             // priority of the row we're already UPDATEing.
+            //
+            // #115: kind:review targets get assignee=NULL, sticky_until=NULL — handled
+            // inline via SQL CASE on the labels column.
+            let target_labels: Option<String> = tx.query_row(
+                "SELECT labels FROM tasks WHERE id=?1",
+                params![target_t],
+                |r| r.get(0),
+            )?;
+            let target_is_review = labels_contain_review(&target_labels);
             let n = tx.execute(
                 "UPDATE tasks SET
                     status = 'open',
-                    assignee = ?1,
-                    sticky_until = ?2 + CASE
-                        WHEN priority >= ?6 THEN ?7
-                        ELSE ?8
+                    assignee = CASE
+                        WHEN labels LIKE '%\"kind:review\"%' THEN NULL
+                        ELSE ?1
+                    END,
+                    sticky_until = CASE
+                        WHEN labels LIKE '%\"kind:review\"%' THEN NULL
+                        ELSE ?2 + CASE
+                            WHEN priority >= ?6 THEN ?7
+                            ELSE ?8
+                        END
                     END,
                     labels = CASE
                         WHEN labels IS NULL OR labels NOT LIKE '%\"rework\"%'
@@ -851,11 +867,16 @@ fn apply_verdict(
                      (someone changed it under us)"
                 )));
             }
+            let event_detail = if target_is_review {
+                format!("changes requested by {reviewer} (reopened to pool)")
+            } else {
+                format!("changes requested by {reviewer} (sticky to {orig})")
+            };
             crate::events::emit(
                 tx,
                 "task_reopened",
                 &lease_target(target_t),
-                &format!("changes requested by {reviewer} (sticky to {orig})"),
+                &event_detail,
                 now,
             )?;
         }
@@ -921,6 +942,19 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Task>> {
         t.ready = compute_ready(conn, &t.depends_on)?;
     }
     Ok(task)
+}
+
+/// Release sticky tasks held by a retired agent (#115). Sets assignee=NULL +
+/// sticky_until=NULL on any open task assigned to `agent` with an active sticky window,
+/// so the STICKY_CLAUSE frees them for the next eligible claimer.
+pub fn release_sticky_for_agent(conn: &Connection, agent: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET assignee = NULL, sticky_until = NULL, updated_at = ?3
+         WHERE assignee = ?1 AND sticky_until IS NOT NULL AND sticky_until > ?2
+           AND status = 'open'",
+        params![agent, now, now],
+    )?;
+    Ok(())
 }
 
 /// Fetch a single task and its append-only note history (oldest first).
@@ -2767,6 +2801,72 @@ mod tests {
             .unwrap();
         assert_eq!(t.id, tid);
         assert_eq!(t.assignee.as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn verdict_changes_on_review_target_reopens_to_pool() {
+        // #115 Bug 2: a `changes` verdict targeting a kind:review task must reopen it
+        // to the pool (assignee=NULL, sticky_until=NULL) instead of sticky-to-orig.
+        let (_d, mut c) = open_tmp();
+        // Set up target T: a kind:review task already in "done" status. Direct SQL
+        // because the normal API can't create a done review without a full chain.
+        let review_labels = format!(r#"["{REVIEW_LABEL}"]"#);
+        c.execute(
+            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by,
+                               created_at, updated_at, refs, depends_on, sticky_until, orig)
+             VALUES ('review: fix bug', NULL, 'done', 0, ?1, 'OldReviewer', 'boss',
+                     1000, 1100, NULL, NULL, NULL, 'OrigAuthor')",
+            params![review_labels],
+        )
+        .unwrap();
+        let target_id = c.last_insert_rowid();
+        // Create review R that targets T via review_of.
+        let review_refs = format!(r#"{{"review_of":{target_id}}}"#);
+        let rid = create(
+            &mut c,
+            "OrigAuthor",
+            "review: review: fix bug",
+            None,
+            REVIEW_PRIORITY,
+            Some(&review_labels),
+            Some(&review_refs),
+            None,
+            1000,
+        )
+        .unwrap();
+        // Manually set orig on R (create() doesn't support orig).
+        c.execute(
+            "UPDATE tasks SET orig = 'OrigAuthor' WHERE id = ?1",
+            params![rid],
+        )
+        .unwrap();
+        claim(&mut c, "B", Some(rid), &[], TTL, 1200).unwrap();
+        update(
+            &mut c,
+            "B",
+            rid,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            1300,
+        )
+        .unwrap();
+        let t = get(&c, target_id).unwrap().unwrap();
+        assert_eq!(t.status, "open");
+        assert_eq!(
+            t.assignee, None,
+            "review target must reopen to the pool, not sticky to orig"
+        );
+        assert_eq!(
+            t.sticky_until, None,
+            "review target must have no sticky window"
+        );
+        assert!(
+            t.labels.as_deref().unwrap().contains(REWORK_LABEL),
+            "rework label should still be added"
+        );
     }
 
     #[test]

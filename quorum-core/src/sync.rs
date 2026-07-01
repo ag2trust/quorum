@@ -555,6 +555,11 @@ fn touch_and_advance_cursor(
         } else {
             crate::agents::mark_retiring(&tx, agent)?;
         }
+        // #115: release any open tasks sticky-to this agent. Without this, a
+        // sticky rework blocks the retiring agent from reaching "retired" (the
+        // sticky carve-out surfaces it as remaining work) and no other agent
+        // can claim it until the window naturally expires.
+        crate::tasks::release_sticky_for_agent(&tx, agent, now)?;
     }
     if max_seen > cursor_now {
         // Same shape as feed::read --ack-through: insert-or-update with MAX(...).
@@ -2171,5 +2176,51 @@ mod tests {
         // Sanity: the constants are what the doc-comment claims.
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS, 5400);
         assert_eq!(crate::agents::DEFAULT_RETIRE_AFTER_TASKS, 8);
+    }
+
+    #[test]
+    fn tick_retiring_releases_sticky_tasks() {
+        // #115 Bug 1: entering any retirement state must release sticky tasks held by
+        // the agent. A sticky task assigned to a retiring agent should become claimable
+        // by others immediately (assignee=NULL, sticky_until=NULL) instead of waiting
+        // for the sticky window to expire.
+        let (_d, mut c) = open_tmp();
+        // Drive agent "R" over budget so the next tick enters retirement.
+        for i in 0..4 {
+            drive_done(&mut c, "R", 1000 + i * 5000, 1000 + i * 5000 + 1800);
+        }
+        // Create a sticky task assigned to "R" (simulates a `changes`-verdict reopen).
+        let sticky_id = make_task(&mut c, "rework-me", 100, None, 25000);
+        c.execute(
+            "UPDATE tasks SET status='open', assignee='R', sticky_until=?1 WHERE id=?2",
+            rusqlite::params![99999_i64, sticky_id],
+        )
+        .unwrap();
+        // Verify pre-condition: task is sticky to R.
+        let pre = tasks::get(&c, sticky_id).unwrap().unwrap();
+        assert_eq!(pre.assignee.as_deref(), Some("R"));
+        assert_eq!(pre.sticky_until, Some(99999));
+
+        // Tick with budgets that trigger retirement (R has 4 tasks done, budget is 4).
+        // The gather phase sees the sticky task as remaining work → "retiring" (not
+        // "retired"). The write phase releases the sticky regardless.
+        let snap = tick_with_budget(&mut c, "R", &[], 30_000, 5400, 4).unwrap();
+        assert_eq!(snap.retire.as_ref().unwrap().status, "retiring");
+
+        // After tick, the sticky task must be released to the pool.
+        let post = tasks::get(&c, sticky_id).unwrap().unwrap();
+        assert_eq!(
+            post.assignee, None,
+            "sticky task must be released on retirement (assignee=NULL)"
+        );
+        assert_eq!(
+            post.sticky_until, None,
+            "sticky task must be released on retirement (sticky_until=NULL)"
+        );
+        // Another agent should be able to claim it.
+        let claimed = tasks::claim(&mut c, "B", Some(sticky_id), &[], 3600, 30_001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.assignee.as_deref(), Some("B"));
     }
 }
