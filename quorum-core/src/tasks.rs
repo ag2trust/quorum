@@ -808,56 +808,94 @@ fn apply_verdict(
             )?;
         }
         "changes" => {
-            // T → open + sticky window + assignee=orig + dedup-append "rework" label. We use
-            // json_insert with a CASE for dedup — appending an already-present "rework"
-            // would accumulate dupes across multiple review rounds for the same task.
-            //
-            // Issue #88: the sticky window length is row-conditional on `priority`. For
-            // `priority >= CRITICAL_PRIORITY_THRESHOLD` we use `STICKY_WINDOW_SECS_CRITICAL`
-            // (≈60s — one fleet beat) so an idle eligible non-orig agent can claim a
-            // master-blocking reopen without waiting out the default 30-minute window. The
-            // CASE is in-SQL so we avoid an extra SELECT round-trip just to read the
-            // priority of the row we're already UPDATEing.
-            let n = tx.execute(
-                "UPDATE tasks SET
-                    status = 'open',
-                    assignee = ?1,
-                    sticky_until = ?2 + CASE
-                        WHEN priority >= ?6 THEN ?7
-                        ELSE ?8
-                    END,
-                    labels = CASE
-                        WHEN labels IS NULL OR labels NOT LIKE '%\"rework\"%'
-                        THEN json_insert(COALESCE(labels, '[]'), '$[#]', ?3)
-                        ELSE labels
-                    END,
-                    updated_at = ?4
-                 WHERE id = ?5 AND status = 'done'",
-                params![
-                    orig,
+            // Issue #115 bug 2: review targets reopen to the pool (any non-author reviewer
+            // can pick them up), not sticky-to-orig (which would lock to one reviewer).
+            let target_labels: Option<String> = tx
+                .query_row(
+                    "SELECT labels FROM tasks WHERE id = ?1",
+                    params![target_t],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let target_is_review = labels_contain_review(&target_labels);
+
+            if target_is_review {
+                // Re-review: reopen to the pool — no sticky window, no assignee.
+                let n = tx.execute(
+                    "UPDATE tasks SET
+                        status = 'open',
+                        assignee = NULL,
+                        sticky_until = NULL,
+                        labels = CASE
+                            WHEN labels IS NULL OR labels NOT LIKE '%\"rework\"%'
+                            THEN json_insert(COALESCE(labels, '[]'), '$[#]', ?1)
+                            ELSE labels
+                        END,
+                        updated_at = ?2
+                     WHERE id = ?3 AND status = 'done'",
+                    params![REWORK_LABEL, now, target_t],
+                )?;
+                if n == 0 {
+                    return Err(QuorumError::Usage(format!(
+                        "verdict 'changes' requires target task#{target_t} to be in 'done' \
+                         (someone changed it under us)"
+                    )));
+                }
+                crate::events::emit(
+                    tx,
+                    "task_reopened",
+                    &lease_target(target_t),
+                    &format!("changes requested by {reviewer} (re-review, open pool)"),
                     now,
-                    REWORK_LABEL,
+                )?;
+            } else {
+                // Implementation rework: sticky to orig author.
+                //
+                // Issue #88: the sticky window length is row-conditional on `priority`. For
+                // `priority >= CRITICAL_PRIORITY_THRESHOLD` we use `STICKY_WINDOW_SECS_CRITICAL`
+                // (≈60s — one fleet beat) so an idle eligible non-orig agent can claim a
+                // master-blocking reopen without waiting out the default 30-minute window.
+                let n = tx.execute(
+                    "UPDATE tasks SET
+                        status = 'open',
+                        assignee = ?1,
+                        sticky_until = ?2 + CASE
+                            WHEN priority >= ?6 THEN ?7
+                            ELSE ?8
+                        END,
+                        labels = CASE
+                            WHEN labels IS NULL OR labels NOT LIKE '%\"rework\"%'
+                            THEN json_insert(COALESCE(labels, '[]'), '$[#]', ?3)
+                            ELSE labels
+                        END,
+                        updated_at = ?4
+                     WHERE id = ?5 AND status = 'done'",
+                    params![
+                        orig,
+                        now,
+                        REWORK_LABEL,
+                        now,
+                        target_t,
+                        CRITICAL_PRIORITY_THRESHOLD,
+                        STICKY_WINDOW_SECS_CRITICAL,
+                        STICKY_WINDOW_SECS
+                    ],
+                )?;
+                if n == 0 {
+                    return Err(QuorumError::Usage(format!(
+                        "verdict 'changes' requires target task#{target_t} to be in 'done' \
+                         (someone changed it under us)"
+                    )));
+                }
+                crate::events::emit(
+                    tx,
+                    "task_reopened",
+                    &lease_target(target_t),
+                    &format!("changes requested by {reviewer} (sticky to {orig})"),
                     now,
-                    target_t,
-                    CRITICAL_PRIORITY_THRESHOLD,
-                    STICKY_WINDOW_SECS_CRITICAL,
-                    STICKY_WINDOW_SECS
-                ],
-            )?;
-            if n == 0 {
-                let _ = ();
-                return Err(QuorumError::Usage(format!(
-                    "verdict 'changes' requires target task#{target_t} to be in 'done' \
-                     (someone changed it under us)"
-                )));
+                )?;
             }
-            crate::events::emit(
-                tx,
-                "task_reopened",
-                &lease_target(target_t),
-                &format!("changes requested by {reviewer} (sticky to {orig})"),
-                now,
-            )?;
         }
         _ => unreachable!("verdict pre-validated upstream"),
     }
@@ -3019,5 +3057,135 @@ mod tests {
         assert!(claim(&mut c, "A", Some(dependent), &[], TTL, 1500)
             .unwrap()
             .is_some());
+    }
+
+    // -- Issue #115: sticky reservations strand re-reviews ---------------------------------
+
+    #[test]
+    fn changes_on_review_target_reopens_to_pool_not_sticky() {
+        // Bug 2: when a `changes` verdict targets a `kind:review` task (re-review), the
+        // target must reopen to the pool (assignee=NULL, sticky_until=NULL) so any
+        // non-author reviewer can pick it up — NOT sticky-to-orig, which would lock
+        // re-reviews to one reviewer forever.
+        let (_d2, mut c2) = open_tmp();
+        // R_target: a review task in `done` status (as if a reviewer just marked it done).
+        let r_target = create(
+            &mut c2,
+            "boss",
+            "review of T",
+            None,
+            0,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        force_review_task(&c2, r_target, "OrigAuthor");
+        // Put it in `done` state (the prerequisite for apply_verdict's `changes` path).
+        c2.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![r_target],
+        )
+        .unwrap();
+
+        // R_outer: a review-of-review task that references r_target.
+        let r_outer = create(
+            &mut c2,
+            "boss",
+            "review of review",
+            None,
+            REVIEW_PRIORITY,
+            Some(r#"["kind:review"]"#),
+            Some(&format!(r#"{{"review_of":{r_target}}}"#)),
+            None,
+            1000,
+        )
+        .unwrap();
+        c2.execute(
+            "UPDATE tasks SET orig='OrigAuthor' WHERE id=?1",
+            params![r_outer],
+        )
+        .unwrap();
+        claim(&mut c2, "Reviewer", Some(r_outer), &[], TTL, 1100).unwrap();
+
+        // Reviewer issues `changes` verdict on R_outer → should reopen R_target to pool.
+        update(
+            &mut c2,
+            "Reviewer",
+            r_outer,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("changes"),
+                ..Default::default()
+            },
+            1200,
+        )
+        .unwrap();
+
+        let target = get(&c2, r_target).unwrap().unwrap();
+        assert_eq!(target.status, "open", "review target must reopen");
+        assert!(
+            target.assignee.is_none(),
+            "review target must have no assignee (pool, not sticky)"
+        );
+        assert!(
+            target.sticky_until.is_none(),
+            "review target must have no sticky window"
+        );
+        assert!(
+            target.labels.as_deref().unwrap().contains(REWORK_LABEL),
+            "rework label must be applied"
+        );
+        // Any agent (not just orig) can claim it immediately.
+        let claimed = claim(&mut c2, "NewReviewer", None, &[], TTL, 1200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, r_target);
+    }
+
+    #[test]
+    fn retired_agent_sticky_tasks_released() {
+        // Bug 1: when an agent retires, any open tasks with sticky_until assigned to
+        // that agent must be released (assignee=NULL, sticky_until=NULL) so they become
+        // claimable by other agents. This mirrors the SQL in sync.rs's retirement path.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 5, None, None, None, 1000).unwrap();
+        // Simulate a post-changes sticky-reopen: task is open, assigned to "RetiredAgent",
+        // sticky until t=5000.
+        force_sticky_reopen(&c, tid, "RetiredAgent", 5000);
+        // Verify the sticky gate blocks other agents before retirement.
+        assert!(
+            claim(&mut c, "Other", None, &[], TTL, 2000)
+                .unwrap()
+                .is_none(),
+            "sticky should block non-orig before retirement release"
+        );
+
+        // Simulate the retirement release (the SQL from sync.rs line 556-560).
+        let now = 2000_i64;
+        c.execute(
+            "UPDATE tasks SET assignee = NULL, sticky_until = NULL, updated_at = ?1
+             WHERE assignee = ?2 AND status = 'open' AND sticky_until IS NOT NULL AND sticky_until > ?1",
+            params![now, "RetiredAgent"],
+        )
+        .unwrap();
+
+        // After retirement release, the task should be claimable by anyone.
+        let t = get(&c, tid).unwrap().unwrap();
+        assert!(
+            t.assignee.is_none(),
+            "assignee must be cleared after retirement release"
+        );
+        assert!(
+            t.sticky_until.is_none(),
+            "sticky_until must be cleared after retirement release"
+        );
+
+        let claimed = claim(&mut c, "Other", None, &[], TTL, 2000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, tid);
+        assert_eq!(claimed.assignee.as_deref(), Some("Other"));
     }
 }
