@@ -14,6 +14,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 directories = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "macros", "io-util", "time", "signal"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -21,3 +23,4 @@ predicates = "3"
 tempfile = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde_json = "1"
+libc = "0.2"

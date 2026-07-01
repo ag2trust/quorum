@@ -10,6 +10,7 @@ mod config;
 mod input;
 mod output;
 mod paths;
+mod serve;
 
 use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
@@ -49,6 +50,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
+        cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
         cli::Command::Help => "help",
@@ -849,6 +851,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 let _ = quorum_core::activity::record_activity(&conn, &session, &tool, now);
             }
             output::emit(&serde_json::json!({ "ok": true }));
+            Ok(0)
+        }
+        cli::Command::Serve { cap } => {
+            let db = paths::db_path()?;
+            serve::run_serve(&db, cap)?;
             Ok(0)
         }
         cli::Command::Help => {
