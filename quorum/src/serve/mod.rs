@@ -22,6 +22,13 @@ fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 /// Configuration for the daemon, resolved from CLI flags / config file.
 pub struct ServeConfig {
     pub db_path: PathBuf,
@@ -171,7 +178,11 @@ async fn tick(
                     stream::Event::Assistant { message } => {
                         if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
                             let preview = if content.len() > 80 {
-                                format!("{}…", &content[..80])
+                                let end = content
+                                    .char_indices()
+                                    .nth(80)
+                                    .map_or(content.len(), |(i, _)| i);
+                                format!("{}…", &content[..end])
                             } else {
                                 content.to_string()
                             };
@@ -202,6 +213,40 @@ async fn tick(
                     agent_name, task.id, task.title
                 ));
 
+                // Claim the task atomically (open → claimed)
+                let p = db_path.clone();
+                let claim_agent = agent_name.clone();
+                let claim_task_id = task.id;
+                let claimed =
+                    tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        let now = now_unix();
+                        tasks::claim(
+                            &mut conn,
+                            &claim_agent,
+                            Some(claim_task_id),
+                            &[],
+                            tasks::DEFAULT_LEASE_TTL_SECS,
+                            now,
+                        )
+                    })
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+
+                match claimed {
+                    Ok(None) => {
+                        log(&format!("task #{} already claimed, skipping", task.id));
+                        name_pool.release(&agent_name);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log(&format!("task #{} claim failed: {e}", task.id));
+                        name_pool.release(&agent_name);
+                        return Ok(());
+                    }
+                    Ok(Some(_)) => {}
+                }
+
                 let session_id = uuid::Uuid::new_v4().to_string();
                 let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task.id);
                 let wt_path = config
@@ -218,6 +263,7 @@ async fn tick(
                     }
                     Err(e) => {
                         log(&format!("worktree provision failed: {e}"));
+                        release_task(&db_path, &agent_name, task.id).await;
                         name_pool.release(&agent_name);
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         return Ok(());
@@ -268,7 +314,8 @@ async fn tick(
                         });
                         if let Err(e) = proc.feed_turn(&turn1.to_string()).await {
                             log(&format!("feed_turn failed: {e}"));
-                            proc.kill();
+                            proc.kill_and_reap().await;
+                            release_task(&db_path, &agent_name, task.id).await;
                             name_pool.release(&agent_name);
                             wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
                             return Ok(());
@@ -286,6 +333,7 @@ async fn tick(
                     }
                     Err(e) => {
                         log(&format!("agent spawn failed: {e}"));
+                        release_task(&db_path, &agent_name, task.id).await;
                         name_pool.release(&agent_name);
                         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
                     }
@@ -298,6 +346,25 @@ async fn tick(
     Ok(())
 }
 
+async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
+    let p = db_path.to_path_buf();
+    let a = agent.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let fields = tasks::TaskUpdate {
+            status: Some("open"),
+            body: None,
+            refs: None,
+            verdict: None,
+        };
+        tasks::update(&mut conn, &a, task_id, &fields, now)?;
+        Ok(())
+    })
+    .await
+    .ok();
+}
+
 async fn teardown(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -306,14 +373,23 @@ async fn teardown(
 ) {
     log(&format!("tearing down agent {}", state.agent_name));
 
-    // Kill the process
-    state.proc.kill();
+    // Kill the process and reap to avoid zombies
+    state.proc.kill_and_reap().await;
 
-    // Delete journal entry
+    // Mark task done (claimed → done)
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
+    let task_id = state.task_id;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let fields = tasks::TaskUpdate {
+            status: Some("done"),
+            body: None,
+            refs: None,
+            verdict: None,
+        };
+        tasks::update(&mut conn, &agent, task_id, &fields, now)?;
         journal::delete(&mut conn, &agent)?;
         Ok(())
     })

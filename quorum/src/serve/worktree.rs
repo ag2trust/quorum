@@ -15,32 +15,6 @@ impl WorktreeManager {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn fetch(&self, repo_dir: &Path) -> Result<(), String> {
-        let _guard = self.lock.lock().await;
-
-        let fetch = Command::new("git")
-            .args([
-                "-C",
-                &repo_dir.to_string_lossy(),
-                "fetch",
-                "origin",
-                "--quiet",
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("git fetch failed: {e}"))?;
-
-        if !fetch.status.success() {
-            return Err(format!(
-                "git fetch failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
-            ));
-        }
-
-        Ok(())
-    }
-
     pub async fn provision(
         &self,
         repo_dir: &Path,

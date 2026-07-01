@@ -51,7 +51,9 @@ impl AgentProc {
 
         unsafe {
             cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -89,17 +91,13 @@ impl AgentProc {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn pid(&self) -> Option<u32> {
-        self.child.id()
-    }
-
-    pub fn kill(self) {
+    pub async fn kill_and_reap(mut self) {
         if let Some(pid) = self.child.id() {
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
         }
-        // Drop closes stdin, which should cause the child to exit.
+        // Reap the child to avoid zombie accumulation
+        let _ = self.child.wait().await;
     }
 }
