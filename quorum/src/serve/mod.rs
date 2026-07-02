@@ -133,24 +133,40 @@ async fn tick(
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     }?;
 
-    // ── Phase 2: Process Done mailbox rows ──────────────────────────────
+    // ── Phase 2: Process mailbox rows ─────────────────────────────────
     for (id, row) in &mailbox_rows {
+        // F3/F9: Consume vestigial non-Done kinds (TaskUpdate, Message).
+        // The daemon does not implement handlers for these — agents use the
+        // CLI (e.g. `task-update`) which writes directly to the DB.
         if row.kind != MailboxKind::Done {
+            log(&format!(
+                "consuming unhandled {:?} mailbox row from {} (not processed by daemon)",
+                row.kind, row.agent
+            ));
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
             continue;
         }
+
+        // ── Done row handling ──
+        // F13: include note in log when present.
+        let note_suffix = row
+            .note
+            .as_ref()
+            .map(|n| format!(", summary={n:?}"))
+            .unwrap_or_default();
 
         // Check reviewer match first (verdict handling)
         if let Some(ref r) = reviewer {
             if row.agent == r.agent_name {
                 log(&format!(
-                    "reviewer {} done (pr={:?}, verdict={:?})",
+                    "reviewer {} done (pr={:?}, verdict={:?}{note_suffix})",
                     r.agent_name, row.pr, row.verdict
                 ));
 
-                if !consume_mailbox_row(&db_path, *id).await {
-                    break;
-                }
-
+                // F8: action runs BEFORE consume — if the action fails,
+                // the row stays unconsumed for diagnostic visibility.
                 match row.verdict.as_deref() {
                     Some("approved") => {
                         let pr_num = row.pr.unwrap_or(0);
@@ -178,11 +194,9 @@ async fn tick(
                                 "PR #{pr_num} merge failed: {} — treating as changes",
                                 merge_result.message
                             ));
-                            // Kill reviewer
                             if let Some(r) = reviewer.take() {
                                 teardown_reviewer(config, wt_mgr, name_pool, r).await;
                             }
-                            // Feed merge-failure rework to the warm worker
                             if let Some(ref mut w) = worker {
                                 let rework_msg = format!(
                                     "Merge of PR #{pr_num} failed: {}\n\n\
@@ -191,7 +205,14 @@ async fn tick(
                                 );
                                 let rework_turn = reviewer::build_rework_turn(&rework_msg);
                                 if let Err(e) = w.proc.feed_turn(&rework_turn).await {
-                                    log(&format!("merge-failure rework feed failed: {e}"));
+                                    log(&format!(
+                                        "merge-failure rework feed failed: {e} — \
+                                         tearing down broken worker"
+                                    ));
+                                    if let Some(w) = worker.take() {
+                                        teardown_worker(config, wt_mgr, name_pool, w, "open")
+                                            .await;
+                                    }
                                 } else {
                                     w.draining = true;
                                     w.pr = None;
@@ -233,22 +254,25 @@ async fn tick(
                             "verdict: changes — feeding rework to worker (feedback: {feedback})"
                         ));
 
-                        // Kill reviewer
                         if let Some(r) = reviewer.take() {
                             teardown_reviewer(config, wt_mgr, name_pool, r).await;
                         }
 
-                        // Feed rework turn to the warm worker
                         if let Some(ref mut w) = worker {
                             let rework_turn = reviewer::build_rework_turn(feedback);
                             if let Err(e) = w.proc.feed_turn(&rework_turn).await {
-                                log(&format!("rework feed_turn failed: {e}"));
+                                log(&format!(
+                                    "rework feed_turn failed: {e} — \
+                                     tearing down broken worker"
+                                ));
+                                if let Some(w) = worker.take() {
+                                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                }
                             } else {
                                 w.draining = true;
                                 w.pr = None;
                                 w.rework_count += 1;
 
-                                // Journal: back to working
                                 let p = db_path.clone();
                                 let entry = JournalEntry {
                                     agent: w.agent_name.clone(),
@@ -286,6 +310,11 @@ async fn tick(
                         }
                     }
                 }
+
+                // F8: consume AFTER the action has completed.
+                if !consume_mailbox_row(&db_path, *id).await {
+                    break;
+                }
                 break;
             }
         }
@@ -294,16 +323,11 @@ async fn tick(
         if let Some(ref w) = worker {
             if row.agent == w.agent_name {
                 log(&format!(
-                    "worker {} done (pr={:?}, verdict={:?})",
-                    w.agent_name, row.pr, row.verdict
+                    "worker {} done (pr={:?}{note_suffix})",
+                    w.agent_name, row.pr,
                 ));
 
-                if !consume_mailbox_row(&db_path, *id).await {
-                    break;
-                }
-
                 if let Some(pr) = row.pr {
-                    // Worker signaled PR ready — keep alive for review
                     if let Some(ref mut w) = worker {
                         w.pr = Some(pr);
                         log(&format!(
@@ -312,13 +336,29 @@ async fn tick(
                         ));
                     }
                 } else {
-                    // No PR — simple done (M1 behavior)
                     if let Some(w) = worker.take() {
                         teardown_worker(config, wt_mgr, name_pool, w, "done").await;
                     }
                 }
+
+                // F8: consume AFTER the action has completed.
+                if !consume_mailbox_row(&db_path, *id).await {
+                    break;
+                }
                 break;
             }
+        }
+
+        // F9: Done row matches neither worker nor reviewer — consume it to
+        // prevent infinite re-polling. With name reuse, a stale verdict left
+        // unconsumed could be applied to a NEW agent that acquired the same
+        // name (phantom completion).
+        log(&format!(
+            "consuming unmatched Done row from {} (matches no active agent)",
+            row.agent
+        ));
+        if !consume_mailbox_row(&db_path, *id).await {
+            break;
         }
     }
 
@@ -503,6 +543,24 @@ async fn spawn_reviewer_for_worker(
         }
     };
 
+    // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
+    {
+        let p = config.db_path.clone();
+        let name = reviewer_name.clone();
+        let stale = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = quorum_core::db::open(&p)?;
+            mailbox::consume_all_for_agent(&mut conn, &name)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+        .unwrap_or(0);
+        if stale > 0 {
+            log(&format!(
+                "consumed {stale} stale mailbox row(s) for {reviewer_name}"
+            ));
+        }
+    }
+
     log(&format!(
         "spawning reviewer {} for PR #{} (worker {})",
         reviewer_name, pr, worker.agent_name
@@ -649,6 +707,24 @@ async fn spawn_worker(
         Some(n) => n,
         None => return Ok(()),
     };
+
+    // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
+    {
+        let p = db_path.clone();
+        let name = agent_name.clone();
+        let stale = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = quorum_core::db::open(&p)?;
+            mailbox::consume_all_for_agent(&mut conn, &name)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+        .unwrap_or(0);
+        if stale > 0 {
+            log(&format!(
+                "consumed {stale} stale mailbox row(s) for {agent_name}"
+            ));
+        }
+    }
 
     log(&format!(
         "spawning agent {} for task #{} ({})",
