@@ -66,6 +66,19 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+/// Per-turn / per-task ceilings. `None` = unlimited.
+/// All limits fail-closed: exceeding kills the agent and releases the task.
+#[derive(Debug, Clone, Default)]
+pub struct CostLimits {
+    pub max_turn_tokens: Option<i64>,
+    pub max_task_tokens: Option<i64>,
+    pub max_turn_cost_usd: Option<f64>,
+    pub max_task_cost_usd: Option<f64>,
+    pub max_turn_wall_secs: Option<u64>,
+    pub max_task_wall_secs: Option<u64>,
+    pub max_rework_rounds: Option<u32>,
+}
+
 /// Configuration for the daemon, resolved from CLI flags / config file.
 pub struct ServeConfig {
     pub db_path: PathBuf,
@@ -80,6 +93,7 @@ pub struct ServeConfig {
     /// Pass `--bare` to spawned agents, stripping operator-local hooks,
     /// plugins, memory, and MCP config. Default: true.
     pub bare_agent: bool,
+    pub limits: CostLimits,
 }
 
 pub fn run_serve(config: ServeConfig) -> Result<()> {
@@ -102,6 +116,9 @@ struct SlotState {
     pr: Option<i64>,
     rework_count: u32,
     cost_tokens: i64,
+    cost_usd: f64,
+    task_started_at: std::time::Instant,
+    turn_started_at: std::time::Instant,
 }
 
 async fn tick_loop(config: ServeConfig) -> Result<()> {
@@ -227,6 +244,26 @@ async fn tick(
 
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
+                            let next_round = workers[wi].rework_count + 1;
+                            if let Some(max) = config.limits.max_rework_rounds {
+                                if next_round > max {
+                                    let breach = LimitBreached::ReworkRounds {
+                                        count: next_round,
+                                        max,
+                                    };
+                                    log(&format!(
+                                        "WATCHDOG: worker {} killed (task #{}) — {}",
+                                        workers[wi].agent_name, workers[wi].task_id, breach
+                                    ));
+                                    let w = workers.remove(wi);
+                                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                    if !consume_mailbox_row(&db_path, *id).await {
+                                        break;
+                                    }
+                                    break;
+                                }
+                            }
+
                             let rework_msg = format!(
                                 "Merge of PR #{pr_num} failed: {}\n\n\
                                  Fix the issue and push again.",
@@ -245,6 +282,7 @@ async fn tick(
                                 w.draining = true;
                                 w.pr = None;
                                 w.rework_count += 1;
+                                w.turn_started_at = std::time::Instant::now();
 
                                 let p = db_path.clone();
                                 let entry = JournalEntry {
@@ -283,6 +321,26 @@ async fn tick(
                     teardown_reviewer(config, wt_mgr, name_pool, r).await;
 
                     if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id) {
+                        let next_round = workers[wi].rework_count + 1;
+                        if let Some(max) = config.limits.max_rework_rounds {
+                            if next_round > max {
+                                let breach = LimitBreached::ReworkRounds {
+                                    count: next_round,
+                                    max,
+                                };
+                                log(&format!(
+                                    "WATCHDOG: worker {} killed (task #{}) — {}",
+                                    workers[wi].agent_name, workers[wi].task_id, breach
+                                ));
+                                let w = workers.remove(wi);
+                                teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                break;
+                            }
+                        }
+
                         let rework_turn = reviewer::build_rework_turn(feedback);
                         if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                             log(&format!(
@@ -296,6 +354,7 @@ async fn tick(
                             w.draining = true;
                             w.pr = None;
                             w.rework_count += 1;
+                            w.turn_started_at = std::time::Instant::now();
 
                             let p = db_path.clone();
                             let entry = JournalEntry {
@@ -382,17 +441,58 @@ async fn tick(
     }
 
     // ── Phase 3: Drain events from active reviewers ────────────────────
-    for r in reviewers.iter_mut() {
-        if r.draining {
-            drain_events(r, &db_path, "reviewer").await?;
+    let mut reviewers_to_kill: Vec<usize> = Vec::new();
+    for (i, r) in reviewers.iter_mut().enumerate() {
+        if !r.draining {
+            continue;
         }
+        // Wall-clock watchdog (checked each tick, even before result arrives)
+        if let Some(breach) = check_wall_clock_limits(&config.limits, r) {
+            log(&format!(
+                "WATCHDOG: reviewer {} killed — {}",
+                r.agent_name, breach
+            ));
+            reviewers_to_kill.push(i);
+            continue;
+        }
+        if let Some(breach) = drain_events(r, &db_path, "reviewer", &config.limits).await? {
+            log(&format!(
+                "WATCHDOG: reviewer {} killed — {}",
+                r.agent_name, breach
+            ));
+            reviewers_to_kill.push(i);
+        }
+    }
+    for &i in reviewers_to_kill.iter().rev() {
+        let dead = reviewers.remove(i);
+        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
-    for w in workers.iter_mut() {
-        if w.draining {
-            drain_events(w, &db_path, "worker").await?;
+    let mut workers_to_kill: Vec<usize> = Vec::new();
+    for (i, w) in workers.iter_mut().enumerate() {
+        if !w.draining {
+            continue;
         }
+        if let Some(breach) = check_wall_clock_limits(&config.limits, w) {
+            log(&format!(
+                "WATCHDOG: worker {} killed (task #{}) — {}",
+                w.agent_name, w.task_id, breach
+            ));
+            workers_to_kill.push(i);
+            continue;
+        }
+        if let Some(breach) = drain_events(w, &db_path, "worker", &config.limits).await? {
+            log(&format!(
+                "WATCHDOG: worker {} killed (task #{}) — {}",
+                w.agent_name, w.task_id, breach
+            ));
+            workers_to_kill.push(i);
+        }
+    }
+    for &i in workers_to_kill.iter().rev() {
+        let dead = workers.remove(i);
+        teardown_worker(config, wt_mgr, name_pool, dead, "open").await;
     }
 
     // ── Phase 4b: Detect dead workers/reviewers ────────────────────────
@@ -504,20 +604,147 @@ async fn consume_mailbox_row(db_path: &std::path::Path, id: i64) -> bool {
     }
 }
 
+/// Reason an agent was killed by a watchdog.
+enum LimitBreached {
+    TurnTokens { turn: i64, max: i64 },
+    TaskTokens { total: i64, max: i64 },
+    TurnCostUsd { turn: f64, max: f64 },
+    TaskCostUsd { total: f64, max: f64 },
+    TurnWallSecs { elapsed: u64, max: u64 },
+    TaskWallSecs { elapsed: u64, max: u64 },
+    ReworkRounds { count: u32, max: u32 },
+}
+
+impl std::fmt::Display for LimitBreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TurnTokens { turn, max } => {
+                write!(f, "turn tokens {turn} exceeded limit {max}")
+            }
+            Self::TaskTokens { total, max } => {
+                write!(f, "task tokens {total} exceeded limit {max}")
+            }
+            Self::TurnCostUsd { turn, max } => {
+                write!(f, "turn cost ${turn:.4} exceeded limit ${max:.4}")
+            }
+            Self::TaskCostUsd { total, max } => {
+                write!(f, "task cost ${total:.4} exceeded limit ${max:.4}")
+            }
+            Self::TurnWallSecs { elapsed, max } => {
+                write!(f, "turn wall-clock {elapsed}s exceeded limit {max}s")
+            }
+            Self::TaskWallSecs { elapsed, max } => {
+                write!(f, "task wall-clock {elapsed}s exceeded limit {max}s")
+            }
+            Self::ReworkRounds { count, max } => {
+                write!(f, "rework rounds {count} exceeded limit {max}")
+            }
+        }
+    }
+}
+
+/// Check per-turn and cumulative limits after a result event.
+fn check_post_result_limits(
+    limits: &CostLimits,
+    turn_tokens: i64,
+    cumulative_tokens: i64,
+    turn_cost_usd: Option<f64>,
+    cumulative_cost_usd: f64,
+    slot: &SlotState,
+) -> Option<LimitBreached> {
+    if let Some(max) = limits.max_turn_tokens {
+        if turn_tokens > max {
+            return Some(LimitBreached::TurnTokens {
+                turn: turn_tokens,
+                max,
+            });
+        }
+    }
+    if let Some(max) = limits.max_task_tokens {
+        if cumulative_tokens > max {
+            return Some(LimitBreached::TaskTokens {
+                total: cumulative_tokens,
+                max,
+            });
+        }
+    }
+    if let Some(max) = limits.max_turn_cost_usd {
+        if let Some(turn_cost) = turn_cost_usd {
+            if turn_cost > max {
+                return Some(LimitBreached::TurnCostUsd {
+                    turn: turn_cost,
+                    max,
+                });
+            }
+        }
+    }
+    if let Some(max) = limits.max_task_cost_usd {
+        if cumulative_cost_usd > max {
+            return Some(LimitBreached::TaskCostUsd {
+                total: cumulative_cost_usd,
+                max,
+            });
+        }
+    }
+    if let Some(max) = limits.max_turn_wall_secs {
+        let elapsed = slot.turn_started_at.elapsed().as_secs();
+        if elapsed > max {
+            return Some(LimitBreached::TurnWallSecs { elapsed, max });
+        }
+    }
+    if let Some(max) = limits.max_task_wall_secs {
+        let elapsed = slot.task_started_at.elapsed().as_secs();
+        if elapsed > max {
+            return Some(LimitBreached::TaskWallSecs { elapsed, max });
+        }
+    }
+    None
+}
+
+/// Check wall-clock limits only (called each tick for slots still draining).
+fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
+    if let Some(max) = limits.max_turn_wall_secs {
+        let elapsed = slot.turn_started_at.elapsed().as_secs();
+        if elapsed > max {
+            return Some(LimitBreached::TurnWallSecs { elapsed, max });
+        }
+    }
+    if let Some(max) = limits.max_task_wall_secs {
+        let elapsed = slot.task_started_at.elapsed().as_secs();
+        if elapsed > max {
+            return Some(LimitBreached::TaskWallSecs { elapsed, max });
+        }
+    }
+    None
+}
+
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
-async fn drain_events(slot: &mut SlotState, db_path: &std::path::Path, role: &str) -> Result<()> {
+/// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
+async fn drain_events(
+    slot: &mut SlotState,
+    db_path: &std::path::Path,
+    role: &str,
+    limits: &CostLimits,
+) -> Result<Option<LimitBreached>> {
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_event()).await
     {
         match &event {
-            stream::Event::Result { usage, .. } => {
+            stream::Event::Result {
+                usage,
+                total_cost_usd,
+                ..
+            } => {
                 let turn_tokens = usage
                     .as_ref()
                     .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
                 slot.cost_tokens += turn_tokens;
+                if let Some(cost) = total_cost_usd {
+                    slot.cost_usd += cost;
+                }
                 log(&format!(
-                    "{role} {} result (turn_tokens={}, cumulative={})",
-                    slot.agent_name, turn_tokens, slot.cost_tokens
+                    "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
+                    slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd
                 ));
 
                 let p = db_path.to_path_buf();
@@ -545,7 +772,16 @@ async fn drain_events(slot: &mut SlotState, db_path: &std::path::Path, role: &st
                 .ok();
 
                 slot.draining = false;
-                break;
+
+                let breach = check_post_result_limits(
+                    limits,
+                    turn_tokens,
+                    slot.cost_tokens,
+                    *total_cost_usd,
+                    slot.cost_usd,
+                    slot,
+                );
+                return Ok(breach);
             }
             stream::Event::Assistant { message } => {
                 if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
@@ -564,7 +800,7 @@ async fn drain_events(slot: &mut SlotState, db_path: &std::path::Path, role: &st
             _ => {}
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 async fn spawn_reviewer_for_worker(
@@ -689,6 +925,7 @@ async fn spawn_reviewer_for_worker(
                 return Ok(());
             }
 
+            let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
                 agent_name: reviewer_name,
                 proc,
@@ -700,6 +937,9 @@ async fn spawn_reviewer_for_worker(
                 pr: Some(pr),
                 rework_count: 0,
                 cost_tokens: 0,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
             });
         }
         Err(e) => {
@@ -874,6 +1114,7 @@ async fn spawn_worker(
                 return Ok(false);
             }
 
+            let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
                 proc,
@@ -885,6 +1126,9 @@ async fn spawn_worker(
                 pr: None,
                 rework_count: 0,
                 cost_tokens: 0,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
             });
         }
         Err(e) => {
@@ -1039,5 +1283,171 @@ mod tests {
         let labels = r#"["tier:opus-46","tier:sonnet-5"]"#;
         let (model, _effort) = labels_to_model_effort(Some(labels));
         assert_eq!(model.as_deref(), Some("opus-46"));
+    }
+
+    fn make_dummy_slot() -> SlotState {
+        use std::time::Instant;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut child = rt.block_on(async {
+            tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        });
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let reader = BufReader::new(stdout).lines();
+        let proc = AgentProc::from_parts(child, stdin, reader);
+        let now = Instant::now();
+        SlotState {
+            agent_name: "Test-1".into(),
+            proc,
+            task_id: 1,
+            session_id: "sess".into(),
+            worktree_path: PathBuf::from("/tmp/test"),
+            branch: "test-branch".into(),
+            draining: false,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 500,
+            cost_usd: 0.01,
+            task_started_at: now,
+            turn_started_at: now,
+        }
+    }
+
+    #[test]
+    fn check_limits_no_limits_returns_none() {
+        let limits = CostLimits::default();
+        let slot = make_dummy_slot();
+        assert!(check_post_result_limits(&limits, 100, 500, Some(0.01), 0.05, &slot).is_none());
+    }
+
+    #[test]
+    fn check_limits_turn_tokens_exceeded() {
+        let limits = CostLimits {
+            max_turn_tokens: Some(100),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        let result = check_post_result_limits(&limits, 200, 500, None, 0.0, &slot);
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("turn tokens"));
+    }
+
+    #[test]
+    fn check_limits_turn_tokens_within_limit() {
+        let limits = CostLimits {
+            max_turn_tokens: Some(500),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        assert!(check_post_result_limits(&limits, 200, 500, None, 0.0, &slot).is_none());
+    }
+
+    #[test]
+    fn check_limits_task_tokens_exceeded() {
+        let limits = CostLimits {
+            max_task_tokens: Some(400),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        let result = check_post_result_limits(&limits, 100, 500, None, 0.0, &slot);
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("task tokens"));
+    }
+
+    #[test]
+    fn check_limits_turn_cost_usd_exceeded() {
+        let limits = CostLimits {
+            max_turn_cost_usd: Some(0.01),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        let result = check_post_result_limits(&limits, 100, 500, Some(0.05), 0.05, &slot);
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("turn cost"));
+    }
+
+    #[test]
+    fn check_limits_task_cost_usd_exceeded() {
+        let limits = CostLimits {
+            max_task_cost_usd: Some(0.10),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        let result = check_post_result_limits(&limits, 100, 500, None, 0.20, &slot);
+        assert!(result.is_some());
+        assert!(result.unwrap().to_string().contains("task cost"));
+    }
+
+    #[test]
+    fn check_limits_turn_cost_usd_ignored_when_absent() {
+        let limits = CostLimits {
+            max_turn_cost_usd: Some(0.01),
+            ..Default::default()
+        };
+        let slot = make_dummy_slot();
+        assert!(check_post_result_limits(&limits, 100, 500, None, 0.0, &slot).is_none());
+    }
+
+    #[test]
+    fn check_wall_clock_no_limits_returns_none() {
+        let limits = CostLimits::default();
+        let slot = make_dummy_slot();
+        assert!(check_wall_clock_limits(&limits, &slot).is_none());
+    }
+
+    #[test]
+    fn limit_breached_display_rework() {
+        let b = LimitBreached::ReworkRounds { count: 4, max: 3 };
+        assert_eq!(b.to_string(), "rework rounds 4 exceeded limit 3");
+    }
+
+    #[test]
+    fn limit_breached_display_all_variants() {
+        let cases: Vec<LimitBreached> = vec![
+            LimitBreached::TurnTokens { turn: 100, max: 50 },
+            LimitBreached::TaskTokens {
+                total: 1000,
+                max: 500,
+            },
+            LimitBreached::TurnCostUsd {
+                turn: 0.10,
+                max: 0.05,
+            },
+            LimitBreached::TaskCostUsd {
+                total: 1.0,
+                max: 0.5,
+            },
+            LimitBreached::TurnWallSecs {
+                elapsed: 120,
+                max: 60,
+            },
+            LimitBreached::TaskWallSecs {
+                elapsed: 3600,
+                max: 1800,
+            },
+            LimitBreached::ReworkRounds { count: 4, max: 3 },
+        ];
+        for c in cases {
+            let s = c.to_string();
+            assert!(s.contains("exceeded limit"), "bad display: {s}");
+        }
+    }
+
+    #[test]
+    fn cost_limits_default_is_unlimited() {
+        let limits = CostLimits::default();
+        assert!(limits.max_turn_tokens.is_none());
+        assert!(limits.max_task_tokens.is_none());
+        assert!(limits.max_turn_cost_usd.is_none());
+        assert!(limits.max_task_cost_usd.is_none());
+        assert!(limits.max_turn_wall_secs.is_none());
+        assert!(limits.max_task_wall_secs.is_none());
+        assert!(limits.max_rework_rounds.is_none());
     }
 }

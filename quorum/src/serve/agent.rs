@@ -98,6 +98,19 @@ impl AgentProc {
         self.child.try_wait()
     }
 
+    #[cfg(test)]
+    pub fn from_parts(
+        child: Child,
+        stdin: tokio::process::ChildStdin,
+        reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    ) -> Self {
+        Self {
+            child,
+            stdin,
+            reader,
+        }
+    }
+
     pub async fn kill_and_reap(mut self) {
         if let Some(pid) = self.child.id() {
             unsafe {

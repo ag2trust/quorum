@@ -899,6 +899,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             merge_token_file,
             merge_cmd,
             no_bare_agent,
+            max_turn_tokens,
+            max_task_tokens,
+            max_turn_cost_usd,
+            max_task_cost_usd,
+            max_turn_wall_secs,
+            max_task_wall_secs,
+            max_rework_rounds,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
@@ -909,6 +916,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         token_file: merge_token_file.map(std::path::PathBuf::from),
                     })
                 };
+            let limits = serve::CostLimits {
+                max_turn_tokens,
+                max_task_tokens,
+                max_turn_cost_usd,
+                max_task_cost_usd,
+                max_turn_wall_secs,
+                max_task_wall_secs,
+                max_rework_rounds,
+            };
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
@@ -920,6 +936,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 effort,
                 merge_executor,
                 bare_agent: !no_bare_agent,
+                limits,
             };
             serve::run_serve(config)?;
             Ok(0)
