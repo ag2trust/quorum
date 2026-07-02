@@ -89,7 +89,8 @@ cargo build --release            # produces target/release/quorum
 cargo test                       # includes the N-process claim race canary
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
-./dev-install.sh                 # build + install to ~/.local/bin + verify
+./preflight.sh                   # all four PR gates (branch base + fmt + clippy + test)
+./dev-install.sh                 # build + install to ~/.local/bin + verify + install git hooks
 ./dev-install.sh --verify-only   # just check the installed binary is current
 quorum init                      # create ~/.quorum/, DB, default config (idempotent)
 quorum help                      # one-call cheat-sheet for agents (alias: help-agent)
@@ -179,6 +180,10 @@ Keep `~/dev/quorum` on `main` clean as the shared fetch target.
 `git show origin/<branch>:<path>`, or a throwaway worktree instead. The CTO rebuilds
 from this tree; leaving it on a feature branch builds the wrong code (observed 2026-06-28).
 
+**Always branch from `origin/main` — never from another feature branch** (#114 shipped
+another PR's commits this way). `preflight.sh` gate 1 and the pre-push hook verify this
+mechanically: more than one distinct co-author session in `origin/main..HEAD` fails the gate.
+
 ### 4. Branch protection: don't rebase just to be current
 
 "Require up-to-date before merging" is **OFF** — an approved + CI-green PR merges even if a
@@ -186,15 +191,47 @@ few commits behind `main`. Don't rebase solely to catch up. "Dismiss stale appro
 commits" stays **ON** — a real push (fix commit, rebase) invalidates the existing approval and
 requires re-review.
 
-### 5. PR verification evidence
+### 5. Preflight gate — green BEFORE `task-update --status done` (HARD RULE)
 
-Every PR must have all three green, with output pasted in the PR body:
+`done` auto-spawns a review task, so marking done with a red branch burns a reviewer
+session on mechanical findings (#112/#114 cost ~5 reviewer sessions in one week). The
+gate is mechanical, not judgment:
 
 ```bash
-cargo test                                        # includes the N-process race canary
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
+rtk proxy ./preflight.sh    # branch-base check + fmt + clippy + test, fail-fast
 ```
+
+Paste the full output — it must end `PREFLIGHT: PASS` — in the PR body under
+`## Verification`. No green preflight → no `done`. The pre-push hook (installed by
+`./dev-install.sh`) re-runs the cheap subset (`--quick`: branch base + fmt) on every
+push; never bypass it with `--no-verify`.
+
+### 6. Test quality bar (authors write to it, reviewers enforce it)
+
+For every test you add, ask: **would this test fail if the feature broke?** If not, it
+isn't a test. Specifically:
+
+- No assertions on log-line presence alone — assert state/behavior (DB row, exit code,
+  JSON field), not that something was printed.
+- Lifecycle / state-machine code needs a **negative-path test**: the transition that
+  must NOT happen (e.g. SIGINT must NOT mark a task done), not only the happy path.
+- Concurrency claims need multi-process tests, run in a loop (see Gotchas — a single
+  green run hides flakiness).
+
+### 7. Async / tokio pitfalls (server & daemon milestones)
+
+Known bug classes from the daemon/server work — treat as checklist items, not judgment
+calls:
+
+- **Never race stateful work inside `select!`.** Every branch must be cancellation-safe:
+  when another branch wins, the losing future is dropped mid-await and any state it
+  half-mutated is corrupt. Move stateful work outside the race or make it atomic.
+- **Signals set flags; they don't cancel or complete work.** A SIGINT/SIGTERM handler
+  records "shutdown requested" — it must never transition task state itself (the
+  SIGINT-marks-done bug class).
+- **Before `done` on any shutdown-path change:** enumerate every shutdown path × every
+  task state and state what happens in each cell (in the PR body or a test). The
+  unenumerated cell is where the bug lives.
 
 ## Local-machine note: RTK compresses Bash output
 

@@ -46,6 +46,17 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
   chmod 0755 "$BINARY"
 fi
 
+# --- Git hooks ---------------------------------------------------------------
+# Point hooks at .githooks (pre-push runs `preflight.sh --quick`: fmt + branch-base
+# check). Repo config is shared by all worktrees, so this covers every agent worktree.
+# Anchor to this script's own directory — running e.g. `--verify-only` from another
+# cwd must not rewire an unrelated repo's hooks.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -d "$SCRIPT_DIR/.githooks" ]; then
+  git -C "$SCRIPT_DIR" config core.hooksPath .githooks
+  printf '=== Git hooks: core.hooksPath -> .githooks ===\n'
+fi
+
 # --- Verify ----------------------------------------------------------------
 printf '=== Verifying installed binary ===\n'
 
