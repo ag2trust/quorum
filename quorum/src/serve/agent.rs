@@ -12,6 +12,7 @@ pub struct AgentSpec {
     pub session_id: String,
     pub worktree: PathBuf,
     pub allowlist: Vec<String>,
+    pub bare: bool,
 }
 
 pub struct AgentProc {
@@ -40,6 +41,10 @@ impl AgentProc {
             .arg(&spec.worktree)
             .arg("--permission-mode")
             .arg("dontAsk");
+
+        if spec.bare {
+            cmd.arg("--bare");
+        }
 
         if !spec.allowlist.is_empty() {
             cmd.arg("--allowedTools").arg(spec.allowlist.join(","));

@@ -107,3 +107,65 @@ fn fake_agent_handles_review_failed() {
     drop(stdin);
     child.wait().unwrap();
 }
+
+#[test]
+fn fake_agent_reports_bare_flag() {
+    let mut child = Command::new(cargo_bin("fake-agent"))
+        .arg("--bare")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn fake-agent");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let turn = serde_json::json!({"type": "user", "message": {"content": "Do the task"}});
+    writeln!(stdin, "{}", turn).unwrap();
+    stdin.flush().unwrap();
+
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(event["type"], "assistant");
+    let content = event["message"]["content"].as_str().unwrap();
+    assert!(
+        content.contains("[bare]"),
+        "turn-1 message should contain [bare] when --bare is passed, got: {content}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn fake_agent_omits_bare_without_flag() {
+    let mut child = Command::new(cargo_bin("fake-agent"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn fake-agent");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let turn = serde_json::json!({"type": "user", "message": {"content": "Do the task"}});
+    writeln!(stdin, "{}", turn).unwrap();
+    stdin.flush().unwrap();
+
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let content = event["message"]["content"].as_str().unwrap();
+    assert!(
+        !content.contains("[bare]"),
+        "turn-1 message should not contain [bare] without the flag, got: {content}"
+    );
+
+    drop(stdin);
+    child.wait().unwrap();
+}

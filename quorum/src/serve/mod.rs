@@ -43,6 +43,9 @@ pub struct ServeConfig {
     pub model: String,
     pub effort: String,
     pub merge_executor: Arc<dyn merge::MergeExecutor>,
+    /// Pass `--bare` to spawned agents, stripping operator-local hooks,
+    /// plugins, memory, and MCP config. Default: true.
+    pub bare_agent: bool,
 }
 
 pub fn run_serve(config: ServeConfig) -> Result<()> {
@@ -520,6 +523,7 @@ async fn spawn_reviewer_for_worker(
         &session_id,
         &wt_path,
         config.agent_bin.as_deref(),
+        config.bare_agent,
     )
     .await
     {
@@ -691,6 +695,7 @@ async fn spawn_worker(
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
         allowlist: vec![],
+        bare: config.bare_agent,
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
         Ok(mut proc) => {
