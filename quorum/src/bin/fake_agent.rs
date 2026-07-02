@@ -26,13 +26,21 @@ fn emit_assistant(text: &str) {
 }
 
 fn emit_result(turn: u32) {
+    let input_tokens = 500 * turn as u64;
+    let output_tokens = 200 * turn as u64;
+    let cost_per_token = 0.00001_f64;
+    let total_cost = (input_tokens + output_tokens) as f64 * cost_per_token;
     let msg = serde_json::json!({
         "type": "result",
         "result": format!("turn-{turn}-complete"),
         "usage": {
-            "input_tokens": 500 * turn as u64,
-            "output_tokens": 200 * turn as u64,
-        }
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+        "total_cost_usd": total_cost,
+        "num_turns": turn,
+        "duration_ms": 1000 * turn as u64,
+        "is_error": false,
     });
     println!("{}", msg);
     io::stdout().flush().ok();

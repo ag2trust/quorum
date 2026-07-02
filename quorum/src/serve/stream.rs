@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     #[serde(rename = "assistant")]
@@ -23,6 +23,14 @@ pub enum Event {
         result: serde_json::Value,
         #[serde(default)]
         usage: Option<Usage>,
+        #[serde(default)]
+        total_cost_usd: Option<f64>,
+        #[serde(default)]
+        num_turns: Option<u64>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        #[serde(default)]
+        is_error: Option<bool>,
     },
     #[serde(other)]
     Other,
@@ -95,6 +103,49 @@ mod tests {
         let event = parse_line(line).unwrap();
         match event {
             Event::Result { usage, .. } => assert!(usage.is_none()),
+            _ => panic!("expected Result event"),
+        }
+    }
+
+    #[test]
+    fn parse_result_with_cost_fields() {
+        let line = r#"{"type":"result","result":"done","usage":{"input_tokens":1000,"output_tokens":500},"total_cost_usd":0.05,"num_turns":3,"duration_ms":12000,"is_error":false}"#;
+        let event = parse_line(line).unwrap();
+        match event {
+            Event::Result {
+                total_cost_usd,
+                num_turns,
+                duration_ms,
+                is_error,
+                ..
+            } => {
+                assert!((total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
+                assert_eq!(num_turns, Some(3));
+                assert_eq!(duration_ms, Some(12000));
+                assert_eq!(is_error, Some(false));
+            }
+            _ => panic!("expected Result event"),
+        }
+    }
+
+    #[test]
+    fn parse_result_without_cost_fields_defaults_none() {
+        let line =
+            r#"{"type":"result","result":"done","usage":{"input_tokens":100,"output_tokens":50}}"#;
+        let event = parse_line(line).unwrap();
+        match event {
+            Event::Result {
+                total_cost_usd,
+                num_turns,
+                duration_ms,
+                is_error,
+                ..
+            } => {
+                assert!(total_cost_usd.is_none());
+                assert!(num_turns.is_none());
+                assert!(duration_ms.is_none());
+                assert!(is_error.is_none());
+            }
             _ => panic!("expected Result event"),
         }
     }

@@ -349,6 +349,27 @@ pub enum Command {
         /// the operator's full Claude config.
         #[arg(long)]
         no_bare_agent: bool,
+        /// Max tokens (input+output) per single turn. Exceeding kills the agent.
+        #[arg(long)]
+        max_turn_tokens: Option<i64>,
+        /// Max cumulative tokens (input+output) per task. Exceeding kills the agent.
+        #[arg(long)]
+        max_task_tokens: Option<i64>,
+        /// Max USD cost per single turn (from stream-json total_cost_usd).
+        #[arg(long)]
+        max_turn_cost_usd: Option<f64>,
+        /// Max cumulative USD cost per task.
+        #[arg(long)]
+        max_task_cost_usd: Option<f64>,
+        /// Max wall-clock seconds per single turn.
+        #[arg(long)]
+        max_turn_wall_secs: Option<u64>,
+        /// Max wall-clock seconds per task (across all turns).
+        #[arg(long)]
+        max_task_wall_secs: Option<u64>,
+        /// Max rework rounds before giving up on a task.
+        #[arg(long)]
+        max_rework_rounds: Option<u32>,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
