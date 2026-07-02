@@ -174,6 +174,11 @@ git worktree remove ~/dev/quorum-wt/<branch>
 
 Keep `~/dev/quorum` on `main` clean as the shared fetch target.
 
+**This includes reviews.** When reviewing a quorum PR via `review-and-merge`, do NOT
+`git checkout` the PR branch in `~/dev/quorum`. Use `gh pr diff --repo ag2trust/quorum`,
+`git show origin/<branch>:<path>`, or a throwaway worktree instead. The CTO rebuilds
+from this tree; leaving it on a feature branch builds the wrong code (observed 2026-06-28).
+
 ### 4. Branch protection: don't rebase just to be current
 
 "Require up-to-date before merging" is **OFF** — an approved + CI-green PR merges even if a
