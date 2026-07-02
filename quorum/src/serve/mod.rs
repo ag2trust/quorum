@@ -301,11 +301,18 @@ async fn tick(
                     }
                     _ => {
                         log(&format!(
-                            "reviewer {} done without verdict — tearing down reviewer only",
+                            "reviewer {} done without verdict — tearing down reviewer, \
+                             clearing PR (worker must re-signal done to retry)",
                             row.agent
                         ));
                         if let Some(r) = reviewer.take() {
                             teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        }
+                        // F7: clear w.pr so Phase 5 does not respawn a reviewer
+                        // every tick. The worker must signal `done --pr` again to
+                        // re-enter review.
+                        if let Some(ref mut w) = worker {
+                            w.pr = None;
                         }
                     }
                 }
@@ -569,8 +576,11 @@ async fn spawn_reviewer_for_worker(
     let branch = reviewer::reviewer_branch(pr, &reviewer_name);
     let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &reviewer_name);
 
+    // F4: provision reviewer worktree from the PR head branch (the worker's
+    // branch), not origin/main, so the reviewer has the code under review
+    // checked out locally.
     match wt_mgr
-        .provision(&config.repo_dir, &branch, &wt_path, "origin/main")
+        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, &worker.branch)
         .await
     {
         Ok(_) => {

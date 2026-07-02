@@ -119,7 +119,7 @@ task status="open" (re-claimable by next daemon run).
 ```
 [worker has PR, no reviewer]
   → acquire reviewer name
-  → provision reviewer worktree (from origin/main)
+  → fetch + provision reviewer worktree (from the PR head branch)
   → journal: phase="reviewing", role="reviewer"
   → spawn reviewer AgentProc, feed review prompt
   → drain events until Result
@@ -248,8 +248,10 @@ headroom for transitions. Names are acquired on spawn and released on teardown.
 - Workers: branch `daemon/{name}-t{task_id}`, path `{base}/{Name}-t{task_id}`
 - Reviewers: branch `review/pr-{pr}-{name}`, path `{base}/pr-{pr}-{Name}`
 
-Worktrees are provisioned from a `base_ref` (typically `origin/main`) and removed
-on teardown. The `WorktreeManager` serializes these operations.
+Worker worktrees are provisioned from `origin/main`. Reviewer worktrees are
+provisioned from the PR head branch (the worker's branch) so the reviewer has
+the code under review checked out locally. The `WorktreeManager` serializes
+these operations.
 
 ---
 
