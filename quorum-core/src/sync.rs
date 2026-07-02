@@ -2298,7 +2298,8 @@ mod tests {
         );
 
         // Run a tick as "Other" — this triggers the offline sticky sweep.
-        let _snap_post = tick_with_budget(&mut c, "Other", &[], now_base, 5400, 8).unwrap();
+        let _snap_post =
+            tick_with_budget(&mut c, "Other", &[], now_base, 5400, 8, i64::MAX).unwrap();
 
         // After tick: the sticky was released, task is now claimable by anyone.
         // Re-gather to see the updated state (tick wrote the release).
@@ -2338,7 +2339,7 @@ mod tests {
         .unwrap();
 
         // Run a tick as "Other".
-        let _snap = tick_with_budget(&mut c, "Other", &[], now_base, 5400, 8).unwrap();
+        let _snap = tick_with_budget(&mut c, "Other", &[], now_base, 5400, 8, i64::MAX).unwrap();
 
         // Sticky must still be in place.
         let task = tasks::get(&c, tid).unwrap().unwrap();
