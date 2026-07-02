@@ -497,3 +497,105 @@ fn merge_failure_feeds_rework_to_worker() {
 
     handle.stop();
 }
+
+#[test]
+fn no_verdict_done_clears_pr_no_respawn_loop() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for no-verdict flow");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals "done with PR" — triggers reviewer spawn
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    // Wait for reviewer to produce its result
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Reviewer signals done WITHOUT a verdict — the `_ =>` branch
+    quorum_done(home.path(), &["--agent", &reviewer_name, "--pr", "1"]);
+
+    // Daemon should tear down the reviewer and clear w.pr
+    assert!(
+        handle.wait_for("clearing PR", 15),
+        "clearing PR log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_reviewer_teardown = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("tearing down reviewer"));
+    assert!(
+        saw_reviewer_teardown,
+        "reviewer teardown not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait 3 seconds (6+ ticks) — if w.pr was NOT cleared, a second reviewer
+    // would spawn within one or two ticks.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Drain any remaining log lines
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
+    // Count reviewer spawn messages — should be exactly 1
+    let spawn_count = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawning reviewer"))
+        .count();
+    assert_eq!(
+        spawn_count, 1,
+        "expected exactly 1 reviewer spawn (no respawn loop), got {spawn_count}. Lines: {:?}",
+        handle.lines
+    );
+
+    // Worker should still be alive (not torn down)
+    let worker_teardowns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("tearing down worker"))
+        .count();
+    assert_eq!(
+        worker_teardowns, 0,
+        "worker should not be torn down on no-verdict. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
