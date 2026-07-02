@@ -1410,10 +1410,7 @@ mod tests {
     #[test]
     fn limit_breached_display_all_variants() {
         let cases: Vec<LimitBreached> = vec![
-            LimitBreached::TurnTokens {
-                turn: 100,
-                max: 50,
-            },
+            LimitBreached::TurnTokens { turn: 100, max: 50 },
             LimitBreached::TaskTokens {
                 total: 1000,
                 max: 500,
