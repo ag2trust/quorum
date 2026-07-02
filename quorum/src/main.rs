@@ -898,8 +898,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent_bin,
             model,
             effort,
+            merge_token_file,
+            merge_cmd,
         } => {
             let db = paths::db_path()?;
+            let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
+                if let Some(cmd) = merge_cmd {
+                    std::sync::Arc::new(serve::merge::CommandMergeExecutor { command: cmd })
+                } else {
+                    std::sync::Arc::new(serve::merge::GhMergeExecutor {
+                        token_file: merge_token_file.map(std::path::PathBuf::from),
+                    })
+                };
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
@@ -909,6 +919,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 agent_bin,
                 model,
                 effort,
+                merge_executor,
             };
             serve::run_serve(config)?;
             Ok(0)
