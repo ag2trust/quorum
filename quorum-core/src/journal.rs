@@ -180,4 +180,33 @@ mod tests {
         let deleted = delete(&mut conn, "Ghost").unwrap();
         assert!(!deleted);
     }
+
+    #[test]
+    fn cost_tokens_accumulates_across_turns_and_rework() {
+        let (mut conn, _dir) = test_conn();
+
+        // Turn 1: initial work costs 1000 tokens
+        let mut entry = sample_entry("Agent-1");
+        entry.cost_tokens = 1000;
+        entry.phase = "awaiting-review".into();
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].cost_tokens, 1000);
+
+        // Rework: cumulative cost preserved (not reset to 0)
+        entry.phase = "working".into();
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].cost_tokens, 1000, "rework must not reset cost");
+
+        // Turn 2: additional 500 tokens, cumulative = 1500
+        entry.cost_tokens = 1500;
+        entry.phase = "awaiting-review".into();
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].cost_tokens, 1500);
+    }
 }

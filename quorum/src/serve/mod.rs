@@ -25,6 +25,40 @@ fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
 }
 
+/// Extract model and effort overrides from a task's labels JSON.
+///
+/// Labels like `tier:opus-46` map to model `opus-46`; `effort:high` maps to effort `high`.
+/// Returns (model_override, effort_override) — `None` means "use the global config value".
+fn labels_to_model_effort(labels_json: Option<&str>) -> (Option<String>, Option<String>) {
+    let json = match labels_json {
+        Some(s) => s,
+        None => return (None, None),
+    };
+    let arr: Vec<String> = match serde_json::from_str(json) {
+        Ok(a) => a,
+        Err(_) => return (None, None),
+    };
+    let mut model = None;
+    let mut effort = None;
+    for label in &arr {
+        if model.is_none() {
+            if let Some(val) = label.strip_prefix("tier:") {
+                if !val.is_empty() {
+                    model = Some(val.to_string());
+                }
+            }
+        }
+        if effort.is_none() {
+            if let Some(val) = label.strip_prefix("effort:") {
+                if !val.is_empty() {
+                    effort = Some(val.to_string());
+                }
+            }
+        }
+    }
+    (model, effort)
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -67,6 +101,7 @@ struct SlotState {
     draining: bool,
     pr: Option<i64>,
     rework_count: u32,
+    cost_tokens: i64,
 }
 
 async fn tick_loop(config: ServeConfig) -> Result<()> {
@@ -227,7 +262,7 @@ async fn tick(
                                         branch: Some(w.branch.clone()),
                                         phase: "working".into(),
                                         expected_signal: Some("done".into()),
-                                        cost_tokens: 0,
+                                        cost_tokens: w.cost_tokens,
                                     };
                                     tokio::task::spawn_blocking(move || -> Result<()> {
                                         let mut conn = quorum_core::db::open(&p)?;
@@ -282,7 +317,7 @@ async fn tick(
                                     branch: Some(w.branch.clone()),
                                     phase: "working".into(),
                                     expected_signal: Some("done".into()),
-                                    cost_tokens: 0,
+                                    cost_tokens: w.cost_tokens,
                                 };
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let mut conn = quorum_core::db::open(&p)?;
@@ -477,12 +512,13 @@ async fn drain_events(slot: &mut SlotState, db_path: &std::path::Path, role: &st
     {
         match &event {
             stream::Event::Result { usage, .. } => {
-                let tokens = usage
+                let turn_tokens = usage
                     .as_ref()
                     .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
+                slot.cost_tokens += turn_tokens;
                 log(&format!(
-                    "{role} {} result (tokens={})",
-                    slot.agent_name, tokens
+                    "{role} {} result (turn_tokens={}, cumulative={})",
+                    slot.agent_name, turn_tokens, slot.cost_tokens
                 ));
 
                 let p = db_path.to_path_buf();
@@ -500,7 +536,7 @@ async fn drain_events(slot: &mut SlotState, db_path: &std::path::Path, role: &st
                     branch: Some(slot.branch.clone()),
                     phase: phase.into(),
                     expected_signal: Some("done".into()),
-                    cost_tokens: tokens,
+                    cost_tokens: slot.cost_tokens,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -670,6 +706,7 @@ async fn spawn_reviewer_for_worker(
                 draining: true,
                 pr: Some(pr),
                 rework_count: 0,
+                cost_tokens: 0,
             });
         }
         Err(e) => {
@@ -816,9 +853,10 @@ async fn spawn_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
+    let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
     let spec = AgentSpec {
-        model: config.model.clone(),
-        effort: config.effort.clone(),
+        model: label_model.unwrap_or_else(|| config.model.clone()),
+        effort: label_effort.unwrap_or_else(|| config.effort.clone()),
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
         allowlist: vec![],
@@ -847,6 +885,7 @@ async fn spawn_worker(
                 draining: true,
                 pr: None,
                 rework_count: 0,
+                cost_tokens: 0,
             });
         }
         Err(e) => {
@@ -951,4 +990,54 @@ async fn teardown_reviewer(
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn labels_to_model_effort_tier_wins_over_global() {
+        let labels = r#"["kind:fix","tier:opus-46"]"#;
+        let (model, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(model.as_deref(), Some("opus-46"));
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn labels_to_model_effort_effort_override() {
+        let labels = r#"["effort:high","tier:sonnet-5"]"#;
+        let (model, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(model.as_deref(), Some("sonnet-5"));
+        assert_eq!(effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn labels_to_model_effort_no_labels() {
+        let (model, effort) = labels_to_model_effort(None);
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn labels_to_model_effort_empty_suffix_ignored() {
+        let labels = r#"["tier:","effort:"]"#;
+        let (model, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn labels_to_model_effort_malformed_json() {
+        let (model, effort) = labels_to_model_effort(Some("not json"));
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn labels_to_model_effort_first_tier_wins() {
+        let labels = r#"["tier:opus-46","tier:sonnet-5"]"#;
+        let (model, _effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(model.as_deref(), Some("opus-46"));
+    }
 }
