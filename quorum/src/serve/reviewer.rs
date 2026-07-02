@@ -71,8 +71,17 @@ pub fn build_worker_turn(agent_name: &str, task_id: i64, title: &str, body: &str
         "type": "user",
         "message": {
             "content": format!(
-                "You are agent {}. Task #{}: {}\n\n{}",
-                agent_name, task_id, title, body
+                "You are agent {agent}. Task #{task_id}: {title}\n\n\
+                 {body}\n\n\
+                 When your work is complete:\n\
+                 1. Push your branch and open a PR with: gh pr create\n\
+                 2. Signal completion with the PR number: quorum done --agent {agent} --pr <PR_NUMBER>\n\
+                 3. Post progress notes by writing text to a temp file, then: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+                 Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+                agent = agent_name,
+                task_id = task_id,
+                title = title,
+                body = body,
             )
         }
     });
@@ -151,6 +160,27 @@ mod tests {
         assert_eq!(parsed["type"], "user");
     }
 
+    #[test]
+    fn worker_turn_contains_pr_done_contract() {
+        let turn = build_worker_turn("W-1", 42, "title", "body");
+        assert!(
+            turn.contains("gh pr create"),
+            "worker template must instruct agent to open a PR"
+        );
+        assert!(
+            turn.contains("quorum done --agent W-1 --pr"),
+            "worker template must instruct agent to signal done with PR number"
+        );
+        assert!(
+            turn.contains("quorum task-update --task-id 42 --agent W-1 --note-file"),
+            "worker template must instruct agent to post progress notes"
+        );
+        assert!(
+            turn.contains("Do NOT mark the task done yourself"),
+            "worker template must warn against manual task-done"
+        );
+    }
+
     /// Extracts every `quorum <subcommand> --<flag>` from all turn-template
     /// strings and validates each subcommand and flag against the clap Command
     /// tree. Catches drift between what templates tell agents to run and what
@@ -174,9 +204,22 @@ mod tests {
 
         let clap_cmd = crate::cli::Cli::command();
 
+        // Extract the text to scan: JSON turn templates embed the content
+        // inside {"message":{"content":"..."}}, with literal newlines escaped
+        // as \n. Parse JSON and pull the content string so we get real lines.
+        fn extract_scannable_text(raw: &str) -> String {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(s) = v["message"]["content"].as_str() {
+                    return s.to_string();
+                }
+            }
+            raw.to_string()
+        }
+
         let mut invocations_checked = 0usize;
         for (template_name, text) in templates {
-            for line in text.lines() {
+            let scannable = extract_scannable_text(text);
+            for line in scannable.lines() {
                 let Some(pos) = line.find("quorum ") else {
                     continue;
                 };
