@@ -1,9 +1,11 @@
-//! M2 tests: reviewer spawn + verdict loop.
+//! M2/M3 tests: reviewer spawn + verdict loop + daemon-owned merge.
 //!
-//! Two scenarios using fake-agent:
-//! 1. approve flow: worker done → reviewer spawns → approved → both torn down
+//! Scenarios using fake-agent:
+//! 1. approve flow: worker done → reviewer spawns → approved → daemon merges → both torn down
 //! 2. changes flow: worker done → reviewer spawns → changes → reviewer killed,
 //!    worker re-fed same PID (warm rework)
+//! 3. merge failure: approved verdict but merge fails → treated as changes,
+//!    worker gets rework turn with merge error
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -64,6 +66,16 @@ impl ServeHandle {
         wt_base: &std::path::Path,
         names: &std::path::Path,
     ) -> Self {
+        Self::start_with_merge(home, repo, wt_base, names, "true")
+    }
+
+    fn start_with_merge(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        merge_cmd: &str,
+    ) -> Self {
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
@@ -79,6 +91,8 @@ impl ServeHandle {
                 &names.to_string_lossy(),
                 "--agent-bin",
                 &fake_agent.to_string_lossy(),
+                "--merge-cmd",
+                merge_cmd,
             ])
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -240,7 +254,12 @@ fn approve_flow_tears_down_both_agents() {
         ],
     );
 
-    // Both should be torn down
+    // Daemon should merge, then tear down both
+    assert!(
+        handle.wait_for("merged", 15),
+        "merge log not seen. Lines: {:?}",
+        handle.lines
+    );
     assert!(
         handle.wait_for("tearing down worker", 15),
         "worker teardown not seen. Lines: {:?}",
@@ -365,6 +384,115 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     assert!(
         !stdout.contains("\"status\":\"done\"") && !stdout.contains("\"status\": \"done\""),
         "task should not be done during rework: {stdout}"
+    );
+
+    handle.stop();
+}
+
+#[test]
+fn merge_failure_feeds_rework_to_worker() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for merge failure flow");
+
+    // Use a merge command that always fails
+    let mut handle = ServeHandle::start_with_merge(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "echo 'merge conflict: base branch was updated' >&2 && exit 1",
+    );
+
+    // Wait for worker to spawn and produce a result
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals "done with PR"
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    // Wait for reviewer to spawn
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    // Wait for reviewer to finish its turn
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Reviewer signals approved verdict — but merge will fail
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+        ],
+    );
+
+    // Merge should fail and daemon should log the failure
+    assert!(
+        handle.wait_for("merge failed", 15),
+        "merge failure not logged. Lines: {:?}",
+        handle.lines
+    );
+
+    // Worker should get rework turn (merge failure is treated as changes)
+    assert!(
+        handle.wait_for("rework", 15),
+        "rework not seen after merge failure. Lines: {:?}",
+        handle.lines
+    );
+
+    // The reviewer should be torn down
+    let saw_reviewer_teardown = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("tearing down reviewer"));
+    assert!(
+        saw_reviewer_teardown,
+        "reviewer teardown not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Task should NOT be done (merge failed, worker is reworking)
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        !stdout.contains("\"status\":\"done\"") && !stdout.contains("\"status\": \"done\""),
+        "task should not be done after merge failure: {stdout}"
     );
 
     handle.stop();

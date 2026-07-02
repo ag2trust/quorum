@@ -1,10 +1,11 @@
 //! Reviewer spawn + verdict handling.
 //!
 //! An ephemeral reviewer agent is spawned in a throwaway worktree at the PR's
-//! head. It runs review-and-merge and signals back via `quorum done --verdict
-//! approved|changes`. The daemon consumes the verdict mailbox row and either
-//! tears down both agents (approved) or feeds a rework turn to the warm worker
-//! (changes).
+//! head. It runs review and signals back via `quorum done --verdict
+//! approved|changes`. The reviewer does NOT merge — merge is the daemon's job
+//! (via MergeExecutor). The daemon consumes the verdict mailbox row and either
+//! merges + tears down both agents (approved) or feeds a rework turn to the
+//! warm worker (changes).
 
 use super::agent::{AgentProc, AgentSpec};
 use std::path::{Path, PathBuf};
@@ -23,8 +24,9 @@ pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
     format!(
         "You are reviewer agent {}. Review PR #{} opened by worker {}.\n\n\
          Run the project's code review process on this PR. When done:\n\
-         - If approved: merge the PR, then run: quorum done --agent {} --pr {} --verdict approved\n\
+         - If approved: run: quorum done --agent {} --pr {} --verdict approved\n\
          - If changes needed: run: quorum done --agent {} --pr {} --verdict changes --feedback \"<your feedback>\"\n\n\
+         Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         spec.reviewer_name,
         spec.pr,
@@ -94,6 +96,11 @@ mod tests {
         assert!(prompt.contains("Reviewer-1"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
+        assert!(
+            !prompt.contains("merge the PR, then"),
+            "reviewer prompt must NOT instruct the reviewer to merge"
+        );
+        assert!(prompt.contains("Do NOT merge the PR yourself"));
     }
 
     #[test]

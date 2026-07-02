@@ -4,6 +4,7 @@
 //! spawns/drives agents, and shuts down cleanly on Ctrl-C. See spec §3.
 
 pub mod agent;
+pub mod merge;
 pub mod names;
 pub mod reviewer;
 pub mod stream;
@@ -17,6 +18,7 @@ use quorum_core::mailbox::{self, MailboxKind};
 use quorum_core::tasks;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use worktree::WorktreeManager;
 
 fn log(msg: &str) {
@@ -40,6 +42,7 @@ pub struct ServeConfig {
     pub agent_bin: Option<String>,
     pub model: String,
     pub effort: String,
+    pub merge_executor: Arc<dyn merge::MergeExecutor>,
 }
 
 pub fn run_serve(config: ServeConfig) -> Result<()> {
@@ -147,12 +150,78 @@ async fn tick(
 
                 match row.verdict.as_deref() {
                     Some("approved") => {
-                        log("verdict: approved — tearing down both agents");
-                        if let Some(r) = reviewer.take() {
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                        }
-                        if let Some(w) = worker.take() {
-                            teardown_worker(config, wt_mgr, name_pool, w, "done").await;
+                        let pr_num = row.pr.unwrap_or(0);
+                        log(&format!("verdict: approved — merging PR #{pr_num}"));
+                        let merge_result = {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            tokio::task::spawn_blocking(move || executor.merge(pr_num, &repo))
+                                .await
+                                .map_err(|e| {
+                                    QuorumError::Io(format!("merge spawn_blocking join: {e}"))
+                                })?
+                        };
+
+                        if merge_result.success {
+                            log(&format!("PR #{pr_num} merged — tearing down both agents"));
+                            if let Some(r) = reviewer.take() {
+                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            }
+                            if let Some(w) = worker.take() {
+                                teardown_worker(config, wt_mgr, name_pool, w, "done").await;
+                            }
+                        } else {
+                            log(&format!(
+                                "PR #{pr_num} merge failed: {} — treating as changes",
+                                merge_result.message
+                            ));
+                            // Kill reviewer
+                            if let Some(r) = reviewer.take() {
+                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            }
+                            // Feed merge-failure rework to the warm worker
+                            if let Some(ref mut w) = worker {
+                                let rework_msg = format!(
+                                    "Merge of PR #{pr_num} failed: {}\n\n\
+                                     Fix the issue and push again.",
+                                    merge_result.message
+                                );
+                                let rework_turn = reviewer::build_rework_turn(&rework_msg);
+                                if let Err(e) = w.proc.feed_turn(&rework_turn).await {
+                                    log(&format!("merge-failure rework feed failed: {e}"));
+                                } else {
+                                    w.draining = true;
+                                    w.pr = None;
+                                    w.rework_count += 1;
+
+                                    let p = db_path.clone();
+                                    let entry = JournalEntry {
+                                        agent: w.agent_name.clone(),
+                                        role: "worker".into(),
+                                        task_id: Some(w.task_id),
+                                        session_id: w.session_id.clone(),
+                                        worktree: Some(w.worktree_path.to_string_lossy().into()),
+                                        branch: Some(w.branch.clone()),
+                                        phase: "working".into(),
+                                        expected_signal: Some("done".into()),
+                                        cost_tokens: 0,
+                                    };
+                                    tokio::task::spawn_blocking(move || -> Result<()> {
+                                        let mut conn = quorum_core::db::open(&p)?;
+                                        journal::upsert(&mut conn, &entry)
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        QuorumError::Io(format!("spawn_blocking join: {e}"))
+                                    })?
+                                    .ok();
+
+                                    log(&format!(
+                                        "worker {} rework #{} (merge failure)",
+                                        w.agent_name, w.rework_count
+                                    ));
+                                }
+                            }
                         }
                     }
                     Some("changes") => {

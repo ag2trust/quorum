@@ -335,6 +335,14 @@ pub enum Command {
         /// Effort level to pass to spawned agents.
         #[arg(long, default_value = "high")]
         effort: String,
+        /// Path to a file containing a GitHub token for merging PRs.
+        /// Read at merge time; never passed to agent processes.
+        #[arg(long)]
+        merge_token_file: Option<String>,
+        /// Override the merge command (for testing). Replaces `{pr}` with the PR number.
+        /// When set, bypasses `gh pr merge` and runs this shell command instead.
+        #[arg(long, hide = true)]
+        merge_cmd: Option<String>,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
