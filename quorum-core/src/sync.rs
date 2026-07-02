@@ -301,8 +301,7 @@ pub fn gather_with_budget(
     // The *effective* status this tick: forward-only progression based on the persisted
     // state PLUS whether the budget is currently exceeded. We never demote (a returning
     // agent doesn't un-retire by losing tasks); only promote.
-    let budget_exceeded =
-        total_active_secs >= budget_active_secs.max(1)
+    let budget_exceeded = total_active_secs >= budget_active_secs.max(1)
         || tasks_completed >= budget_tasks.max(1)
         || total_wall_secs >= budget_wall_secs.max(1);
     let effective_status: &str = if persisted_status == crate::agents::RETIRE_STATUS_RETIRED {
@@ -2243,7 +2242,10 @@ mod tests {
         // now=4000 → wall-clock = 4000 - first_seen. first_seen is the first touch
         // timestamp from drive_done (100). So total_wall = 4000-100 = 3900 > 3600.
         let snap = gather_with_budget(&c, "Idle", &[], 4000, 5400, 8, 3600).unwrap();
-        let r = snap.retire.as_ref().expect("wall-clock budget must trigger retire");
+        let r = snap
+            .retire
+            .as_ref()
+            .expect("wall-clock budget must trigger retire");
         assert_eq!(r.status, "retired");
         assert_eq!(r.total_wall_secs, 3900);
         assert_eq!(r.budget_wall_secs, 3600);
@@ -2258,7 +2260,10 @@ mod tests {
         let (_d, mut c) = open_tmp();
         drive_done(&mut c, "Young", 100, 110);
         let snap = gather_with_budget(&c, "Young", &[], 500, 5400, 8, 3600).unwrap();
-        assert!(snap.retire.is_none(), "agent under wall budget must not retire");
+        assert!(
+            snap.retire.is_none(),
+            "agent under wall budget must not retire"
+        );
     }
 
     #[test]
