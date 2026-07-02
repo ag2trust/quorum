@@ -66,6 +66,19 @@ pub async fn spawn_reviewer(
     AgentProc::spawn(&agent_spec, agent_bin)
 }
 
+pub fn build_worker_turn(agent_name: &str, task_id: i64, title: &str, body: &str) -> String {
+    let turn = serde_json::json!({
+        "type": "user",
+        "message": {
+            "content": format!(
+                "You are agent {}. Task #{}: {}\n\n{}",
+                agent_name, task_id, title, body
+            )
+        }
+    });
+    turn.to_string()
+}
+
 pub fn build_rework_turn(feedback: &str) -> String {
     let turn = serde_json::json!({
         "type": "user",
@@ -125,5 +138,81 @@ mod tests {
         assert!(turn.contains("Fix error handling in main.rs"));
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         assert_eq!(parsed["type"], "user");
+    }
+
+    #[test]
+    fn worker_turn_contains_agent_and_task() {
+        let turn = build_worker_turn("Agent-1", 99, "Fix the bug", "Detailed body text");
+        assert!(turn.contains("Agent-1"));
+        assert!(turn.contains("Task #99"));
+        assert!(turn.contains("Fix the bug"));
+        assert!(turn.contains("Detailed body text"));
+        let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
+        assert_eq!(parsed["type"], "user");
+    }
+
+    /// Extracts every `quorum <subcommand> --<flag>` from all turn-template
+    /// strings and validates each subcommand and flag against the clap Command
+    /// tree. Catches drift between what templates tell agents to run and what
+    /// the binary actually accepts.
+    #[test]
+    fn turn_template_cli_invocations_match_clap_surface() {
+        use clap::CommandFactory;
+
+        let spec = ReviewerSpec {
+            pr: 1,
+            worker_agent: "W".into(),
+            reviewer_name: "R".into(),
+            task_id: 1,
+            branch: "b".into(),
+        };
+        let templates: &[(&str, String)] = &[
+            ("worker", build_worker_turn("A", 1, "t", "b")),
+            ("reviewer", build_review_prompt(&spec)),
+            ("rework", build_rework_turn("fix it")),
+        ];
+
+        let clap_cmd = crate::cli::Cli::command();
+
+        let mut invocations_checked = 0usize;
+        for (template_name, text) in templates {
+            for line in text.lines() {
+                let Some(pos) = line.find("quorum ") else {
+                    continue;
+                };
+                let rest = &line[pos + "quorum ".len()..];
+                let tokens: Vec<&str> = rest.split_whitespace().collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+
+                let subcommand = tokens[0];
+                let sub = clap_cmd.find_subcommand(subcommand);
+                assert!(
+                    sub.is_some(),
+                    "template '{template_name}' references unknown subcommand \
+                     'quorum {subcommand}'"
+                );
+                let sub = sub.unwrap();
+
+                for token in &tokens[1..] {
+                    if let Some(flag) = token.strip_prefix("--") {
+                        let has_flag = sub.get_arguments().any(|a| a.get_long() == Some(flag));
+                        assert!(
+                            has_flag,
+                            "template '{template_name}' references unknown flag \
+                             '--{flag}' on 'quorum {subcommand}'"
+                        );
+                    }
+                }
+                invocations_checked += 1;
+            }
+        }
+
+        assert!(
+            invocations_checked > 0,
+            "no CLI invocations found in any turn template — if templates \
+             no longer embed quorum commands, update or remove this test"
+        );
     }
 }
