@@ -7,7 +7,7 @@
 use crate::clock;
 use crate::db::begin_immediate;
 use crate::error::Result;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -19,11 +19,11 @@ pub struct JournalEntry {
     pub worktree: Option<String>,
     pub branch: Option<String>,
     pub phase: String,
-    pub expected_signal: Option<String>,
     pub cost_tokens: i64,
 }
 
-fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<JournalEntry> {
+#[cfg(test)]
+fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
     Ok(JournalEntry {
         agent: r.get(0)?,
         role: r.get(1)?,
@@ -32,8 +32,7 @@ fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<JournalEntry> {
         worktree: r.get(4)?,
         branch: r.get(5)?,
         phase: r.get(6)?,
-        expected_signal: r.get(7)?,
-        cost_tokens: r.get(8)?,
+        cost_tokens: r.get(7)?,
     })
 }
 
@@ -41,8 +40,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
-        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, expected_signal, cost_tokens, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(agent) DO UPDATE SET
              role = excluded.role,
              task_id = excluded.task_id,
@@ -50,7 +49,6 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
              worktree = excluded.worktree,
              branch = excluded.branch,
              phase = excluded.phase,
-             expected_signal = excluded.expected_signal,
              cost_tokens = excluded.cost_tokens,
              updated_at = excluded.updated_at",
         params![
@@ -61,7 +59,6 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
             entry.worktree,
             entry.branch,
             entry.phase,
-            entry.expected_signal,
             entry.cost_tokens,
             now,
         ],
@@ -70,9 +67,10 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     Ok(())
 }
 
-pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
+#[cfg(test)]
+fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, expected_signal, cost_tokens
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens
          FROM journal
          ORDER BY agent",
     )?;
@@ -111,7 +109,6 @@ mod tests {
             worktree: Some("/tmp/wt/agent-1".into()),
             branch: Some("feat/thing".into()),
             phase: "working".into(),
-            expected_signal: Some("done".into()),
             cost_tokens: 1000,
         }
     }

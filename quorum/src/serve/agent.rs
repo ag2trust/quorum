@@ -11,7 +11,6 @@ pub struct AgentSpec {
     pub effort: String,
     pub session_id: String,
     pub worktree: PathBuf,
-    pub allowlist: Vec<String>,
     pub bare: bool,
 }
 
@@ -44,10 +43,6 @@ impl AgentProc {
 
         if spec.bare {
             cmd.arg("--bare");
-        }
-
-        if !spec.allowlist.is_empty() {
-            cmd.arg("--allowedTools").arg(spec.allowlist.join(","));
         }
 
         cmd.stdin(Stdio::piped())

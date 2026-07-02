@@ -49,6 +49,7 @@ impl Pool {
         }
     }
 
+    #[cfg(test)]
     pub fn in_use_count(&self) -> usize {
         self.in_use.len()
     }

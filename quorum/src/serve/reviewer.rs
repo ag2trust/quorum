@@ -14,10 +14,6 @@ pub struct ReviewerSpec {
     pub pr: i64,
     pub worker_agent: String,
     pub reviewer_name: String,
-    #[allow(dead_code)]
-    pub task_id: i64,
-    #[allow(dead_code)]
-    pub branch: String,
 }
 
 pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
@@ -47,7 +43,6 @@ pub fn reviewer_branch(pr: i64, reviewer_name: &str) -> String {
 }
 
 pub async fn spawn_reviewer(
-    _spec: &ReviewerSpec,
     model: &str,
     effort: &str,
     session_id: &str,
@@ -60,7 +55,6 @@ pub async fn spawn_reviewer(
         effort: effort.to_string(),
         session_id: session_id.to_string(),
         worktree: worktree_path.to_path_buf(),
-        allowlist: vec![],
         bare,
     };
     AgentProc::spawn(&agent_spec, agent_bin)
@@ -111,8 +105,6 @@ mod tests {
             pr: 42,
             worker_agent: "Worker-1".into(),
             reviewer_name: "Reviewer-1".into(),
-            task_id: 10,
-            branch: "feat/something".into(),
         };
         let prompt = build_review_prompt(&spec);
         assert!(prompt.contains("PR #42"));
@@ -193,8 +185,6 @@ mod tests {
             pr: 1,
             worker_agent: "W".into(),
             reviewer_name: "R".into(),
-            task_id: 1,
-            branch: "b".into(),
         };
         let templates: &[(&str, String)] = &[
             ("worker", build_worker_turn("A", 1, "t", "b")),

@@ -14,7 +14,7 @@ use agent::{AgentProc, AgentSpec};
 use names::Pool;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
-use quorum_core::mailbox::{self, MailboxKind};
+use quorum_core::mailbox;
 use quorum_core::tasks;
 use std::io::Write;
 use std::path::PathBuf;
@@ -170,21 +170,6 @@ async fn tick(
 
     // ── Phase 2: Process mailbox rows ─────────────────────────────────
     for (id, row) in &mailbox_rows {
-        // F3/F9: Consume vestigial non-Done kinds (TaskUpdate, Message).
-        // The daemon does not implement handlers for these — agents use the
-        // CLI (e.g. `task-update`) which writes directly to the DB.
-        if row.kind != MailboxKind::Done {
-            log(&format!(
-                "consuming unhandled {:?} mailbox row from {} (not processed by daemon)",
-                row.kind, row.agent
-            ));
-            if !consume_mailbox_row(&db_path, *id).await {
-                break;
-            }
-            continue;
-        }
-
-        // ── Done row handling ──
         // F13: include note in log when present.
         let note_suffix = row
             .note
@@ -261,7 +246,6 @@ async fn tick(
                                         worktree: Some(w.worktree_path.to_string_lossy().into()),
                                         branch: Some(w.branch.clone()),
                                         phase: "working".into(),
-                                        expected_signal: Some("done".into()),
                                         cost_tokens: w.cost_tokens,
                                     };
                                     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -316,7 +300,6 @@ async fn tick(
                                     worktree: Some(w.worktree_path.to_string_lossy().into()),
                                     branch: Some(w.branch.clone()),
                                     phase: "working".into(),
-                                    expected_signal: Some("done".into()),
                                     cost_tokens: w.cost_tokens,
                                 };
                                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -470,8 +453,10 @@ async fn tick(
         }
     }
 
-    // ── Phase 6: Spawn worker if slot empty and under cap ───────────────
-    if worker.is_none() && name_pool.in_use_count() < config.cap {
+    // ── Phase 6: Spawn worker if slot empty ───────────────────────────
+    // Gate on the worker slot, not total in_use_count() — reviewers must
+    // not consume worker capacity (F16).
+    if worker.is_none() {
         spawn_worker(config, wt_mgr, name_pool, worker).await?;
     }
 
@@ -535,7 +520,6 @@ async fn drain_events(slot: &mut SlotState, db_path: &std::path::Path, role: &st
                     worktree: Some(slot.worktree_path.to_string_lossy().into()),
                     branch: Some(slot.branch.clone()),
                     phase: phase.into(),
-                    expected_signal: Some("done".into()),
                     cost_tokens: slot.cost_tokens,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -642,7 +626,6 @@ async fn spawn_reviewer_for_worker(
         worktree: Some(wt_path.to_string_lossy().into()),
         branch: Some(branch.clone()),
         phase: "reviewing".into(),
-        expected_signal: Some("done".into()),
         cost_tokens: 0,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -657,12 +640,9 @@ async fn spawn_reviewer_for_worker(
         pr,
         worker_agent: worker.agent_name.clone(),
         reviewer_name: reviewer_name.clone(),
-        task_id: worker.task_id,
-        branch: worker.branch.clone(),
     };
 
     match reviewer::spawn_reviewer(
-        &spec,
         &config.model,
         &config.effort,
         &session_id,
@@ -842,7 +822,6 @@ async fn spawn_worker(
         worktree: Some(wt_path.to_string_lossy().into()),
         branch: Some(branch.clone()),
         phase: "working".into(),
-        expected_signal: Some("done".into()),
         cost_tokens: 0,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -859,7 +838,6 @@ async fn spawn_worker(
         effort: label_effort.unwrap_or_else(|| config.effort.clone()),
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
-        allowlist: vec![],
         bare: config.bare_agent,
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
