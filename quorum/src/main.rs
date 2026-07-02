@@ -50,6 +50,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
+        cli::Command::Done { .. } => "done",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -853,9 +854,62 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true }));
             Ok(0)
         }
-        cli::Command::Serve { cap } => {
+        cli::Command::Done {
+            agent,
+            pr,
+            summary,
+            verdict,
+            feedback,
+        } => {
+            if let Some(ref v) = verdict {
+                match v.as_str() {
+                    "approved" | "changes" => {}
+                    _ => {
+                        return Err(QuorumError::Usage(format!(
+                            "--verdict must be 'approved' or 'changes', got '{v}'"
+                        )));
+                    }
+                }
+            }
             let db = paths::db_path()?;
-            serve::run_serve(&db, cap)?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let kind = quorum_core::mailbox::MailboxKind::Done;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent,
+                kind,
+                task_id: None,
+                pr,
+                verdict,
+                feedback,
+                note: summary,
+                to_agent: None,
+                payload: None,
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::Serve {
+            cap,
+            repo_dir,
+            worktree_base,
+            names_file,
+            agent_bin,
+            model,
+            effort,
+        } => {
+            let db = paths::db_path()?;
+            let config = serve::ServeConfig {
+                db_path: db,
+                cap,
+                repo_dir: std::path::PathBuf::from(repo_dir),
+                worktree_base: std::path::PathBuf::from(worktree_base),
+                names_file: std::path::PathBuf::from(names_file),
+                agent_bin,
+                model,
+                effort,
+            };
+            serve::run_serve(config)?;
             Ok(0)
         }
         cli::Command::Help => {

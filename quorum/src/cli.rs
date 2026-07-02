@@ -295,12 +295,46 @@ pub enum Command {
         #[arg(long)]
         tool: String,
     },
+    /// Signal task completion (worker) or emit a review verdict (reviewer).
+    /// Writes a mailbox row for the daemon to consume.
+    Done {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        pr: Option<i64>,
+        #[arg(long)]
+        summary: Option<String>,
+        /// Review verdict: approved or changes.
+        #[arg(long)]
+        verdict: Option<String>,
+        /// Review feedback (used with --verdict changes).
+        #[arg(long)]
+        feedback: Option<String>,
+    },
     /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
     /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.
     Serve {
         /// Maximum concurrent worker agents.
         #[arg(long, default_value = "4")]
         cap: usize,
+        /// Path to the git repo the daemon manages.
+        #[arg(long)]
+        repo_dir: String,
+        /// Base directory for agent worktrees.
+        #[arg(long)]
+        worktree_base: String,
+        /// Path to the agent names file (one name per line).
+        #[arg(long)]
+        names_file: String,
+        /// Override the agent binary (default: "claude").
+        #[arg(long)]
+        agent_bin: Option<String>,
+        /// Model to pass to spawned agents.
+        #[arg(long, default_value = "sonnet")]
+        model: String,
+        /// Effort level to pass to spawned agents.
+        #[arg(long, default_value = "high")]
+        effort: String,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
