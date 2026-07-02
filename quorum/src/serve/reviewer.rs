@@ -53,6 +53,7 @@ pub async fn spawn_reviewer(
     session_id: &str,
     worktree_path: &Path,
     agent_bin: Option<&str>,
+    bare: bool,
 ) -> std::io::Result<AgentProc> {
     let agent_spec = AgentSpec {
         model: model.to_string(),
@@ -60,6 +61,7 @@ pub async fn spawn_reviewer(
         session_id: session_id.to_string(),
         worktree: worktree_path.to_path_buf(),
         allowlist: vec![],
+        bare,
     };
     AgentProc::spawn(&agent_spec, agent_bin)
 }

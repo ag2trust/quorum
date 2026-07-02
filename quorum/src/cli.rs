@@ -343,6 +343,12 @@ pub enum Command {
         /// When set, bypasses `gh pr merge` and runs this shell command instead.
         #[arg(long, hide = true)]
         merge_cmd: Option<String>,
+        /// Disable --bare mode for spawned agents. By default, agents are
+        /// spawned with --bare so they do not inherit operator-local hooks,
+        /// plugins, memory, or MCP config. Pass this flag to let agents use
+        /// the operator's full Claude config.
+        #[arg(long)]
+        no_bare_agent: bool,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.

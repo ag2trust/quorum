@@ -36,8 +36,8 @@ fn emit_result(turn: u32) {
 }
 
 fn main() {
-    // Ignore all CLI flags — we only care about stdin/stdout.
-    // The daemon passes --model, --effort, --session-id, etc.
+    let args: Vec<String> = std::env::args().collect();
+    let bare = args.iter().any(|a| a == "--bare");
 
     let stdin = io::stdin();
     let mut turn: u32 = 0;
@@ -60,7 +60,12 @@ fn main() {
         turn += 1;
 
         if turn == 1 {
-            emit_assistant("Working on task...");
+            let msg = if bare {
+                "Working on task... [bare]"
+            } else {
+                "Working on task..."
+            };
+            emit_assistant(msg);
         } else if line.contains("REVIEW FAILED") || line.contains("REVIEW_FAILED") {
             emit_assistant("Fixing review feedback...");
         } else {

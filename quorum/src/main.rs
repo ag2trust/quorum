@@ -900,6 +900,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             effort,
             merge_token_file,
             merge_cmd,
+            no_bare_agent,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
@@ -920,6 +921,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 model,
                 effort,
                 merge_executor,
+                bare_agent: !no_bare_agent,
             };
             serve::run_serve(config)?;
             Ok(0)
