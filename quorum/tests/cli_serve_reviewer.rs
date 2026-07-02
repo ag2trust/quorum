@@ -346,34 +346,63 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
         ],
     );
 
-    // Worker should get rework (the rework turn contains REVIEW FAILED which
-    // the fake-agent responds to with "Fixing review feedback...")
+    // Worker should get rework — wait for the fake-agent to respond
     assert!(
         handle.wait_for("rework", 15),
         "rework not seen. Lines: {:?}",
         handle.lines
     );
 
-    // The worker should produce another result after processing the rework turn
-    // (fake-agent emits "Fixing review feedback..." then a result)
     assert!(
         handle.wait_for("Fixing", 15),
         "worker rework response not seen. Lines: {:?}",
         handle.lines
     );
 
-    // Verify the reviewer was torn down (its name released)
-    let saw_reviewer_teardown = handle
+    // Drain remaining lines
+    std::thread::sleep(Duration::from_millis(500));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
+    // ── State assertions (F12) ──
+
+    // Invariant: same warm worker — exactly 1 worker spawn, 0 worker teardowns
+    let worker_spawns = handle
         .lines
         .iter()
-        .any(|l| l.contains("tearing down reviewer"));
-    assert!(
-        saw_reviewer_teardown,
-        "reviewer teardown not seen. Lines: {:?}",
+        .filter(|l| l.contains("spawning agent"))
+        .count();
+    assert_eq!(
+        worker_spawns, 1,
+        "expected exactly 1 worker spawn (warm rework, no re-spawn), got {worker_spawns}. Lines: {:?}",
         handle.lines
     );
 
-    // Task should NOT be done (still in progress, worker is reworking)
+    let worker_teardowns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("tearing down worker"))
+        .count();
+    assert_eq!(
+        worker_teardowns, 0,
+        "worker should not be torn down during rework. Lines: {:?}",
+        handle.lines
+    );
+
+    // Reviewer must be torn down
+    let reviewer_teardowns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("tearing down reviewer"))
+        .count();
+    assert_eq!(
+        reviewer_teardowns, 1,
+        "reviewer should be torn down after changes verdict. Lines: {:?}",
+        handle.lines
+    );
+
+    // Task status: must still be claimed by the same worker (not done, not open)
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .args(["task-get", "--task-id", "1"])
@@ -381,9 +410,16 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
         .unwrap();
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
-    assert!(
-        !stdout.contains("\"status\":\"done\"") && !stdout.contains("\"status\": \"done\""),
-        "task should not be done during rework: {stdout}"
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        task["status"].as_str(),
+        Some("claimed"),
+        "task must remain claimed during rework, got: {stdout}"
+    );
+    assert_eq!(
+        task["assignee"].as_str(),
+        Some(worker_name.as_str()),
+        "task must remain assigned to the same worker during rework, got: {stdout}"
     );
 
     handle.stop();

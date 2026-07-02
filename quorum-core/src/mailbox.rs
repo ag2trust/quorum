@@ -12,24 +12,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MailboxKind {
     Done,
-    TaskUpdate,
-    Message,
 }
 
 impl MailboxKind {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Done => "done",
-            Self::TaskUpdate => "task_update",
-            Self::Message => "message",
         }
     }
 
     fn from_str(s: &str) -> Option<Self> {
         match s {
             "done" => Some(Self::Done),
-            "task_update" => Some(Self::TaskUpdate),
-            "message" => Some(Self::Message),
             _ => None,
         }
     }
@@ -44,13 +38,11 @@ pub struct MailboxRow {
     pub verdict: Option<String>,
     pub feedback: Option<String>,
     pub note: Option<String>,
-    pub to_agent: Option<String>,
-    pub payload: Option<String>,
 }
 
 fn row_from_sql(r: &Row<'_>) -> rusqlite::Result<(i64, MailboxRow)> {
     let kind_str: String = r.get(2)?;
-    let kind = MailboxKind::from_str(&kind_str).unwrap_or(MailboxKind::Message);
+    let kind = MailboxKind::from_str(&kind_str).unwrap_or(MailboxKind::Done);
     Ok((
         r.get(0)?,
         MailboxRow {
@@ -61,8 +53,6 @@ fn row_from_sql(r: &Row<'_>) -> rusqlite::Result<(i64, MailboxRow)> {
             verdict: r.get(5)?,
             feedback: r.get(6)?,
             note: r.get(7)?,
-            to_agent: r.get(8)?,
-            payload: r.get(9)?,
         },
     ))
 }
@@ -72,8 +62,8 @@ pub fn append(conn: &mut Connection, row: &MailboxRow) -> Result<i64> {
     let tx = begin_immediate(conn)?;
     let id = {
         tx.query_row(
-            "INSERT INTO mailbox (agent, kind, task_id, pr, verdict, feedback, note, to_agent, payload, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO mailbox (agent, kind, task_id, pr, verdict, feedback, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              RETURNING id",
             params![
                 row.agent,
@@ -83,8 +73,6 @@ pub fn append(conn: &mut Connection, row: &MailboxRow) -> Result<i64> {
                 row.verdict,
                 row.feedback,
                 row.note,
-                row.to_agent,
-                row.payload,
                 now,
             ],
             |r| r.get(0),
@@ -96,9 +84,9 @@ pub fn append(conn: &mut Connection, row: &MailboxRow) -> Result<i64> {
 
 pub fn poll_unconsumed(conn: &Connection) -> Result<Vec<(i64, MailboxRow)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, agent, kind, task_id, pr, verdict, feedback, note, to_agent, payload
+        "SELECT id, agent, kind, task_id, pr, verdict, feedback, note
          FROM mailbox
-         WHERE consumed_at IS NULL
+         WHERE consumed_at IS NULL AND kind = 'done'
          ORDER BY id",
     )?;
     let rows = stmt.query_map([], row_from_sql)?;
@@ -156,8 +144,6 @@ mod tests {
             verdict: None,
             feedback: None,
             note: None,
-            to_agent: None,
-            payload: None,
         };
         let id = append(&mut conn, &row).unwrap();
         assert!(id > 0);
@@ -176,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_returns_multiple_ordered_by_id() {
+    fn poll_returns_multiple_done_rows_ordered_by_id() {
         let (mut conn, _dir) = test_conn();
         let row1 = MailboxRow {
             agent: "A".into(),
@@ -186,19 +172,15 @@ mod tests {
             verdict: None,
             feedback: None,
             note: None,
-            to_agent: None,
-            payload: None,
         };
         let row2 = MailboxRow {
             agent: "B".into(),
-            kind: MailboxKind::Message,
-            task_id: None,
+            kind: MailboxKind::Done,
+            task_id: Some(2),
             pr: None,
             verdict: None,
             feedback: None,
-            note: Some("hello".into()),
-            to_agent: Some("A".into()),
-            payload: None,
+            note: None,
         };
         let id1 = append(&mut conn, &row1).unwrap();
         let id2 = append(&mut conn, &row2).unwrap();
@@ -215,14 +197,12 @@ mod tests {
         let (mut conn, _dir) = test_conn();
         let row = MailboxRow {
             agent: "X".into(),
-            kind: MailboxKind::TaskUpdate,
+            kind: MailboxKind::Done,
             task_id: Some(5),
             pr: None,
             verdict: None,
             feedback: None,
             note: None,
-            to_agent: None,
-            payload: None,
         };
         let id1 = append(&mut conn, &row).unwrap();
         let id2 = append(&mut conn, &row).unwrap();
@@ -244,8 +224,6 @@ mod tests {
             verdict: None,
             feedback: None,
             note: None,
-            to_agent: None,
-            payload: None,
         };
         let row_b = MailboxRow {
             agent: "Beta".into(),
@@ -255,8 +233,6 @@ mod tests {
             verdict: None,
             feedback: None,
             note: None,
-            to_agent: None,
-            payload: None,
         };
         append(&mut conn, &row_a).unwrap();
         append(&mut conn, &row_a).unwrap();

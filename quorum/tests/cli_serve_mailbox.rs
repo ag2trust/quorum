@@ -1,8 +1,8 @@
-//! Mailbox consumption correctness tests (audit F8/F9/F13/F3).
+//! Mailbox consumption correctness tests (audit F8/F9/F13).
 //!
 //! Scenarios:
 //! 1. Unmatched Done row is consumed (not re-polled forever) — F9
-//! 2. Non-Done mailbox kinds (TaskUpdate, Message) are consumed — F3/F9
+//! 2. Non-Done mailbox kinds don't interfere with daemon operation
 //! 3. Stale Done row for a reused name is consumed at spawn time,
 //!    preventing phantom verdict — F9
 //! 4. Rework feed failure tears down the broken worker and releases
@@ -240,10 +240,10 @@ fn unmatched_done_row_consumed() {
     );
 }
 
-// ── F3/F9: Non-Done mailbox kinds are consumed ─────────────────────────
+// ── Non-Done mailbox kinds don't interfere with normal operation ───────
 
 #[test]
-fn non_done_mailbox_kinds_consumed() {
+fn non_done_mailbox_rows_do_not_block_daemon() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -259,7 +259,8 @@ fn non_done_mailbox_kinds_consumed() {
 
     seed_task(home.path(), "Task for non-Done kind test");
 
-    // Insert non-Done mailbox rows directly.
+    // Insert non-Done mailbox rows directly — these are vestigial M5
+    // surface that poll_unconsumed no longer queries.
     insert_mailbox_row(home.path(), "SomeAgent", "task_update");
     insert_mailbox_row(home.path(), "SomeAgent", "message");
 
@@ -267,23 +268,14 @@ fn non_done_mailbox_kinds_consumed() {
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Wait for daemon to consume the non-Done rows.
+    // Daemon should spawn a worker normally — non-Done rows don't block it.
     assert!(
-        handle.wait_for("consuming unhandled", 15),
-        "daemon did not log consuming non-Done kind. Lines: {:?}",
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned despite non-Done rows. Lines: {:?}",
         handle.lines
     );
 
-    // Give a moment for both rows to be processed.
-    std::thread::sleep(Duration::from_secs(1));
-
     handle.stop();
-
-    assert_eq!(
-        count_unconsumed(home.path(), "SomeAgent"),
-        0,
-        "non-Done mailbox rows were not consumed"
-    );
 }
 
 // ── F9: Phantom verdict prevention via stale-row drain at spawn ────────

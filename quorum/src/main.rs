@@ -883,8 +883,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 verdict,
                 feedback,
                 note: summary,
-                to_agent: None,
-                payload: None,
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
