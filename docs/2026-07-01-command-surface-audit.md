@@ -9,7 +9,9 @@
 
 ## Methodology
 
-Every command from `quorum help` was grepped across both repos:
+Every subcommand from `quorum --help` was grepped across both repos (a few — `pin`,
+`unpin`, `pins` — are only surfaced by `quorum --help` and not by the `quorum help`
+cheat-sheet, so `--help` is the authoritative inventory source):
 - `~/dev/quorum/{.claude/skills/,docs/,CLAUDE.md}` (quorum repo)
 - `~/dev/ag2trust/{.claude/skills/,docs/,CLAUDE.md}` (parent repo)
 
