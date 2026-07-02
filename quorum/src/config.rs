@@ -25,6 +25,9 @@ pub struct Config {
     /// transitions `active → retiring`. Backstop for short-but-many-task agents whose
     /// per-task seconds stay low while context drift accumulates.
     pub retire_after_tasks: i64,
+    /// Wall-clock lifetime cap: an agent alive longer than this retires regardless of
+    /// task load. Prevents long-running idle sessions from burning tokens indefinitely.
+    pub retire_after_wall_secs: i64,
 }
 
 impl Default for Config {
@@ -40,6 +43,7 @@ impl Default for Config {
             read_limit: quorum_core::feed::DEFAULT_READ_LIMIT,
             retire_after_active_secs: quorum_core::agents::DEFAULT_RETIRE_AFTER_ACTIVE_SECS,
             retire_after_tasks: quorum_core::agents::DEFAULT_RETIRE_AFTER_TASKS,
+            retire_after_wall_secs: quorum_core::agents::DEFAULT_RETIRE_AFTER_WALL_SECS,
         }
     }
 }
@@ -54,6 +58,7 @@ task_lease_ttl_secs      = 3600       # 1h task-claim lease; assignee renews on 
 read_limit               = 100        # default page size for read/peek
 retire_after_active_secs = 5400       # 90 min cumulative active time → retiring (issue #97)
 retire_after_tasks       = 8          # OR 8 completed tasks → retiring (issue #97)
+retire_after_wall_secs   = 3600       # OR 1h wall-clock lifetime → retiring (token budget)
 ";
 
 /// Load config from `path`. Missing file → defaults; malformed → fail loud (exit 3).
@@ -95,6 +100,7 @@ fn validate(cfg: &Config, path: &Path) -> Result<()> {
     for (field, v) in [
         ("retire_after_active_secs", cfg.retire_after_active_secs),
         ("retire_after_tasks", cfg.retire_after_tasks),
+        ("retire_after_wall_secs", cfg.retire_after_wall_secs),
     ] {
         if v <= 0 {
             return Err(QuorumError::Io(format!(
@@ -147,6 +153,7 @@ mod tests {
         assert_eq!(parsed.read_limit, d.read_limit);
         assert_eq!(parsed.retire_after_active_secs, d.retire_after_active_secs);
         assert_eq!(parsed.retire_after_tasks, d.retire_after_tasks);
+        assert_eq!(parsed.retire_after_wall_secs, d.retire_after_wall_secs);
     }
 
     #[test]
