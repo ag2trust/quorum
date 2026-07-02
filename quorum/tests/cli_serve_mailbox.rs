@@ -221,12 +221,7 @@ fn unmatched_done_row_consumed() {
     // Write a Done row for an agent name that will never be assigned.
     quorum_done(home.path(), &["--agent", "GhostAgent"]);
 
-    let mut handle = ServeHandle::start(
-        home.path(),
-        repo_dir.path(),
-        wt_base.path(),
-        &names_file,
-    );
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
     // Wait for the daemon to process the unmatched row.
     assert!(
@@ -270,12 +265,7 @@ fn non_done_mailbox_kinds_consumed() {
 
     assert_eq!(count_unconsumed(home.path(), "SomeAgent"), 2);
 
-    let mut handle = ServeHandle::start(
-        home.path(),
-        repo_dir.path(),
-        wt_base.path(),
-        &names_file,
-    );
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
     // Wait for daemon to consume the non-Done rows.
     assert!(
@@ -329,12 +319,7 @@ fn stale_done_row_drained_on_name_reuse() {
 
     assert_eq!(count_unconsumed(home.path(), "Agent0"), 1);
 
-    let mut handle = ServeHandle::start(
-        home.path(),
-        repo_dir.path(),
-        wt_base.path(),
-        &names_file,
-    );
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
     // The daemon should consume the stale row — either as "unmatched" in
     // Phase 2 (before any worker is spawned) or drained at spawn time.
@@ -405,12 +390,7 @@ fn rework_feed_failure_releases_task() {
 
     seed_task(home.path(), "Task for rework feed failure");
 
-    let mut handle = ServeHandle::start(
-        home.path(),
-        repo_dir.path(),
-        wt_base.path(),
-        &names_file,
-    );
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
     // Wait for worker to spawn and produce a result.
     assert!(

@@ -210,8 +210,7 @@ async fn tick(
                                          tearing down broken worker"
                                     ));
                                     if let Some(w) = worker.take() {
-                                        teardown_worker(config, wt_mgr, name_pool, w, "open")
-                                            .await;
+                                        teardown_worker(config, wt_mgr, name_pool, w, "open").await;
                                     }
                                 } else {
                                     w.draining = true;
