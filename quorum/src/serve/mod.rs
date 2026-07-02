@@ -130,16 +130,23 @@ async fn tick(
                         s.agent_name, row.pr, row.verdict
                     ));
 
-                    // Mark consumed
+                    // Mark consumed. On failure, skip teardown and retry next tick —
+                    // acting on an unacknowledged row would leave it behind to kill a
+                    // future agent that reuses this name.
                     let p = db_path.clone();
                     let mid = *id;
-                    tokio::task::spawn_blocking(move || -> Result<()> {
+                    let consumed = tokio::task::spawn_blocking(move || -> Result<()> {
                         let mut conn = quorum_core::db::open(&p)?;
                         mailbox::mark_consumed(&mut conn, mid)
                     })
                     .await
-                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                    .ok();
+                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+                    if let Err(e) = consumed {
+                        log(&format!(
+                            "mark_consumed failed for mailbox row {id}: {e}; retrying next tick"
+                        ));
+                        break;
+                    }
 
                     // Teardown
                     if let Some(s) = slot.take() {
