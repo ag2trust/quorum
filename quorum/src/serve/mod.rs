@@ -739,9 +739,13 @@ async fn drain_events(
                     .as_ref()
                     .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
                 slot.cost_tokens += turn_tokens;
+                // total_cost_usd is session-cumulative (running total), not per-turn.
+                // Derive per-turn cost as the delta before overwriting the high-water mark.
+                let prev_cost = slot.cost_usd;
                 if let Some(cost) = total_cost_usd {
-                    slot.cost_usd += cost;
+                    slot.cost_usd = *cost;
                 }
+                let turn_cost_usd = total_cost_usd.map(|c| (c - prev_cost).max(0.0));
                 log(&format!(
                     "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
                     slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd
@@ -777,7 +781,7 @@ async fn drain_events(
                     limits,
                     turn_tokens,
                     slot.cost_tokens,
-                    *total_cost_usd,
+                    turn_cost_usd,
                     slot.cost_usd,
                     slot,
                 );

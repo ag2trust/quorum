@@ -461,7 +461,7 @@ fn task_cost_usd_limit_kills_worker() {
 
     seed_task(home.path(), "Task for cost USD limit test");
 
-    // fake-agent turn 1 cost = 700 * 0.00001 = 0.007. Set limit to 0.001.
+    // fake-agent turn 1 cumulative cost = 700 * 0.00001 = 0.007. Set limit to 0.001.
     let mut handle = ServeHandle::start_with_limits(
         home.path(),
         repo_dir.path(),
@@ -502,6 +502,121 @@ fn task_cost_usd_limit_kills_worker() {
         stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
         "task should be released to open after cost limit, got: {stdout}"
     );
+}
+
+#[test]
+fn cumulative_cost_usd_is_high_water_mark_not_summed() {
+    // Regression: total_cost_usd in stream-json is session-cumulative. The
+    // watchdog must treat it as a high-water mark (assign), not sum with +=.
+    // Fake-agent emits cumulative costs: turn 1 = 0.007, turn 2 = 0.021.
+    // Old bug: += would record 0.028 and trip a 0.025 ceiling.
+    // Fix: = records 0.021, which stays under 0.025.
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for cumulative cost regression");
+
+    let mut handle = ServeHandle::start_with_limits(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-task-cost-usd", "0.025"],
+    );
+
+    // Turn 1: worker spawns, emits result with cumulative cost 0.007
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "turn 1 result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals done → reviewer spawns
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Reviewer requests changes → triggers rework (turn 2)
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Needs fixes",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("rework #1 started", 15),
+        "rework not started. Lines: {:?}",
+        handle.lines
+    );
+
+    // Turn 2 result: cumulative cost = 0.021 (under 0.025 limit)
+    assert!(
+        handle.wait_for("result", 15),
+        "turn 2 result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Drain any remaining log lines
+    std::thread::sleep(Duration::from_secs(2));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
+    // With the fix, cost_usd should be 0.021 (the last cumulative value),
+    // NOT 0.028 (the double-counted sum). No watchdog should fire.
+    let saw_watchdog = handle.lines.iter().any(|l| l.contains("WATCHDOG"));
+    assert!(
+        !saw_watchdog,
+        "watchdog should NOT fire — cumulative cost 0.021 < limit 0.025. \
+         If it fired, total_cost_usd is being summed instead of assigned. Lines: {:?}",
+        handle.lines
+    );
+
+    // Verify the logged cost matches the last cumulative value (0.021), not the sum.
+    let cost_line = handle
+        .lines
+        .iter()
+        .rfind(|l| l.contains("cost_usd="))
+        .cloned();
+    if let Some(line) = &cost_line {
+        assert!(
+            line.contains("cost_usd=0.0210"),
+            "logged cost should be 0.0210 (last cumulative), got: {line}"
+        );
+    }
+
+    handle.stop();
 }
 
 #[test]
