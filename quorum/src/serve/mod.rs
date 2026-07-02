@@ -157,7 +157,9 @@ async fn tick(
                     }
                     Some("changes") => {
                         let feedback = row.feedback.as_deref().unwrap_or("Changes requested.");
-                        log(&format!("verdict: changes — feeding rework to worker (feedback: {feedback})"));
+                        log(&format!(
+                            "verdict: changes — feeding rework to worker (feedback: {feedback})"
+                        ));
 
                         // Kill reviewer
                         if let Some(r) = reviewer.take() {
@@ -300,7 +302,9 @@ async fn consume_mailbox_row(db_path: &std::path::Path, id: i64) -> bool {
             false
         }
         Err(e) => {
-            log(&format!("mark_consumed join error for mailbox row {id}: {e}"));
+            log(&format!(
+                "mark_consumed join error for mailbox row {id}: {e}"
+            ));
             false
         }
     }

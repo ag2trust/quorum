@@ -58,17 +58,27 @@ struct ServeHandle {
 }
 
 impl ServeHandle {
-    fn start(home: &std::path::Path, repo: &std::path::Path, wt_base: &std::path::Path, names: &std::path::Path) -> Self {
+    fn start(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+    ) -> Self {
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .args([
                 "serve",
-                "--cap", "1",
-                "--repo-dir", &repo.to_string_lossy(),
-                "--worktree-base", &wt_base.to_string_lossy(),
-                "--names-file", &names.to_string_lossy(),
-                "--agent-bin", &fake_agent.to_string_lossy(),
+                "--cap",
+                "1",
+                "--repo-dir",
+                &repo.to_string_lossy(),
+                "--worktree-base",
+                &wt_base.to_string_lossy(),
+                "--names-file",
+                &names.to_string_lossy(),
+                "--agent-bin",
+                &fake_agent.to_string_lossy(),
             ])
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -86,7 +96,11 @@ impl ServeHandle {
             }
         });
 
-        ServeHandle { child, rx, lines: Vec::new() }
+        ServeHandle {
+            child,
+            rx,
+            lines: Vec::new(),
+        }
     }
 
     fn wait_for(&mut self, needle: &str, timeout_secs: u64) -> bool {
@@ -128,10 +142,20 @@ impl ServeHandle {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
-        .args(["task-create", "--title", title, "--created-by", "TestCreator"])
+        .args([
+            "task-create",
+            "--title",
+            title,
+            "--created-by",
+            "TestCreator",
+        ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "task-create failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "task-create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
@@ -142,7 +166,11 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         .args(&cmd_args)
         .output()
         .unwrap();
-    assert!(out.status.success(), "done failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "done failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -167,11 +195,13 @@ fn approve_flow_tears_down_both_agents() {
     // Wait for worker to spawn and produce a result
     assert!(
         handle.wait_for("spawning agent", 15),
-        "worker not spawned. Lines: {:?}", handle.lines
+        "worker not spawned. Lines: {:?}",
+        handle.lines
     );
     assert!(
         handle.wait_for("result", 15),
-        "worker result not seen. Lines: {:?}", handle.lines
+        "worker result not seen. Lines: {:?}",
+        handle.lines
     );
 
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
@@ -182,7 +212,8 @@ fn approve_flow_tears_down_both_agents() {
     // Wait for reviewer to spawn
     assert!(
         handle.wait_for("spawning reviewer", 15),
-        "reviewer not spawned. Lines: {:?}", handle.lines
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
     );
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
@@ -190,22 +221,30 @@ fn approve_flow_tears_down_both_agents() {
     // Wait for reviewer result
     assert!(
         handle.wait_for("reviewer", 15),
-        "reviewer activity not seen. Lines: {:?}", handle.lines
+        "reviewer activity not seen. Lines: {:?}",
+        handle.lines
     );
     // Give a moment for draining to complete
     std::thread::sleep(Duration::from_secs(1));
 
     // Reviewer signals approved verdict
-    quorum_done(home.path(), &[
-        "--agent", &reviewer_name,
-        "--pr", "1",
-        "--verdict", "approved",
-    ]);
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+        ],
+    );
 
     // Both should be torn down
     assert!(
         handle.wait_for("tearing down worker", 15),
-        "worker teardown not seen. Lines: {:?}", handle.lines
+        "worker teardown not seen. Lines: {:?}",
+        handle.lines
     );
 
     // Verify task is marked done
@@ -247,11 +286,13 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     // Wait for worker to spawn and produce a result
     assert!(
         handle.wait_for("spawning agent", 15),
-        "worker not spawned. Lines: {:?}", handle.lines
+        "worker not spawned. Lines: {:?}",
+        handle.lines
     );
     assert!(
         handle.wait_for("result", 15),
-        "worker result not seen. Lines: {:?}", handle.lines
+        "worker result not seen. Lines: {:?}",
+        handle.lines
     );
 
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
@@ -262,7 +303,8 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     // Wait for reviewer to spawn
     assert!(
         handle.wait_for("spawning reviewer", 15),
-        "reviewer not spawned. Lines: {:?}", handle.lines
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
     );
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
@@ -271,32 +313,45 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     std::thread::sleep(Duration::from_secs(2));
 
     // Reviewer signals changes verdict with feedback
-    quorum_done(home.path(), &[
-        "--agent", &reviewer_name,
-        "--pr", "1",
-        "--verdict", "changes",
-        "--feedback", "Fix the error handling in main.rs",
-    ]);
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix the error handling in main.rs",
+        ],
+    );
 
     // Worker should get rework (the rework turn contains REVIEW FAILED which
     // the fake-agent responds to with "Fixing review feedback...")
     assert!(
         handle.wait_for("rework", 15),
-        "rework not seen. Lines: {:?}", handle.lines
+        "rework not seen. Lines: {:?}",
+        handle.lines
     );
 
     // The worker should produce another result after processing the rework turn
     // (fake-agent emits "Fixing review feedback..." then a result)
     assert!(
         handle.wait_for("Fixing", 15),
-        "worker rework response not seen. Lines: {:?}", handle.lines
+        "worker rework response not seen. Lines: {:?}",
+        handle.lines
     );
 
     // Verify the reviewer was torn down (its name released)
-    let saw_reviewer_teardown = handle.lines.iter().any(|l| l.contains("tearing down reviewer"));
+    let saw_reviewer_teardown = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("tearing down reviewer"));
     assert!(
         saw_reviewer_teardown,
-        "reviewer teardown not seen. Lines: {:?}", handle.lines
+        "reviewer teardown not seen. Lines: {:?}",
+        handle.lines
     );
 
     // Task should NOT be done (still in progress, worker is reworking)
