@@ -355,7 +355,7 @@ pub enum Command {
         /// Max cumulative tokens (input+output) per task. Exceeding kills the agent.
         #[arg(long)]
         max_task_tokens: Option<i64>,
-        /// Max USD cost per single turn (from stream-json total_cost_usd).
+        /// Max USD cost per single turn (delta from session-cumulative total_cost_usd).
         #[arg(long)]
         max_turn_cost_usd: Option<f64>,
         /// Max cumulative USD cost per task.

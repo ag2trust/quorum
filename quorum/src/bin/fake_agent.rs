@@ -25,11 +25,9 @@ fn emit_assistant(text: &str) {
     io::stdout().flush().ok();
 }
 
-fn emit_result(turn: u32) {
+fn emit_result(turn: u32, cumulative_cost: f64) {
     let input_tokens = 500 * turn as u64;
     let output_tokens = 200 * turn as u64;
-    let cost_per_token = 0.00001_f64;
-    let total_cost = (input_tokens + output_tokens) as f64 * cost_per_token;
     let msg = serde_json::json!({
         "type": "result",
         "result": format!("turn-{turn}-complete"),
@@ -37,7 +35,7 @@ fn emit_result(turn: u32) {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
         },
-        "total_cost_usd": total_cost,
+        "total_cost_usd": cumulative_cost,
         "num_turns": turn,
         "duration_ms": 1000 * turn as u64,
         "is_error": false,
@@ -52,6 +50,8 @@ fn main() {
 
     let stdin = io::stdin();
     let mut turn: u32 = 0;
+    let mut cumulative_cost: f64 = 0.0;
+    let cost_per_token = 0.00001_f64;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -89,6 +89,10 @@ fn main() {
             std::process::exit(1);
         }
 
-        emit_result(turn);
+        let input_tokens = 500 * turn as u64;
+        let output_tokens = 200 * turn as u64;
+        cumulative_cost += (input_tokens + output_tokens) as f64 * cost_per_token;
+
+        emit_result(turn, cumulative_cost);
     }
 }
