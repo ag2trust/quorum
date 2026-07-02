@@ -197,8 +197,7 @@ mod tests {
 
                 for token in &tokens[1..] {
                     if let Some(flag) = token.strip_prefix("--") {
-                        let has_flag =
-                            sub.get_arguments().any(|a| a.get_long() == Some(flag));
+                        let has_flag = sub.get_arguments().any(|a| a.get_long() == Some(flag));
                         assert!(
                             has_flag,
                             "template '{template_name}' references unknown flag \
