@@ -46,6 +46,14 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
   chmod 0755 "$BINARY"
 fi
 
+# --- Git hooks ---------------------------------------------------------------
+# Point hooks at .githooks (pre-push runs `preflight.sh --quick`: fmt + branch-base
+# check). Repo config is shared by all worktrees, so this covers every agent worktree.
+if git rev-parse --git-dir >/dev/null 2>&1 && [ -d .githooks ]; then
+  git config core.hooksPath .githooks
+  printf '=== Git hooks: core.hooksPath -> .githooks ===\n'
+fi
+
 # --- Verify ----------------------------------------------------------------
 printf '=== Verifying installed binary ===\n'
 

@@ -1,0 +1,14 @@
+#!/bin/sh
+# pre-push — cheap mechanical gate on every push: branch-base check + cargo fmt.
+#
+# Installed by dev-install.sh via `git config core.hooksPath .githooks` (repo
+# config is shared by all worktrees). The full gate — clippy + tests — is
+# ./preflight.sh, required before `task-update --status done`; this hook only
+# runs the fast subset so pushing stays quick while still catching the two most
+# common review-round wasters: fmt drift and branching from a feature branch.
+#
+# Do NOT bypass with --no-verify — fix the underlying issue instead.
+
+REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$REPO_ROOT" || exit 1
+exec ./preflight.sh --quick
