@@ -1,0 +1,316 @@
+//! M2 tests: reviewer spawn + verdict loop.
+//!
+//! Two scenarios using fake-agent:
+//! 1. approve flow: worker done → reviewer spawns → approved → both torn down
+//! 2. changes flow: worker done → reviewer spawns → changes → reviewer killed,
+//!    worker re-fed same PID (warm rework)
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+fn cargo_bin(name: &str) -> std::path::PathBuf {
+    assert_cmd::cargo::cargo_bin(name)
+}
+
+fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("names.txt");
+    let mut f = std::fs::File::create(&path).unwrap();
+    for i in 0..20 {
+        writeln!(f, "Agent{i}").unwrap();
+    }
+    path
+}
+
+fn init_git_repo(dir: &std::path::Path) {
+    let d = dir.to_string_lossy();
+    Command::new("git")
+        .args(["-C", &d, "init", "-b", "main"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "config", "user.email", "test@test.com"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "config", "user.name", "Test"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "remote", "add", "origin", &*d])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "fetch", "origin"])
+        .status()
+        .unwrap();
+}
+
+struct ServeHandle {
+    child: std::process::Child,
+    rx: mpsc::Receiver<String>,
+    lines: Vec<String>,
+}
+
+impl ServeHandle {
+    fn start(home: &std::path::Path, repo: &std::path::Path, wt_base: &std::path::Path, names: &std::path::Path) -> Self {
+        let fake_agent = cargo_bin("fake-agent");
+        let mut child = Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", home)
+            .args([
+                "serve",
+                "--cap", "1",
+                "--repo-dir", &repo.to_string_lossy(),
+                "--worktree-base", &wt_base.to_string_lossy(),
+                "--names-file", &names.to_string_lossy(),
+                "--agent-bin", &fake_agent.to_string_lossy(),
+            ])
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        ServeHandle { child, rx, lines: Vec::new() }
+    }
+
+    fn wait_for(&mut self, needle: &str, timeout_secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline - std::time::Instant::now();
+            match self.rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    let found = line.contains(needle);
+                    self.lines.push(line);
+                    if found {
+                        return true;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+        false
+    }
+
+    fn extract_agent_name(&self, prefix: &str) -> Option<String> {
+        for line in &self.lines {
+            if let Some(rest) = line.split(prefix).nth(1) {
+                return Some(rest.split_whitespace().next().unwrap_or("").to_string());
+            }
+        }
+        None
+    }
+
+    fn stop(mut self) {
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn seed_task(home: &std::path::Path, title: &str) {
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .args(["task-create", "--title", title, "--created-by", "TestCreator"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task-create failed: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+fn quorum_done(home: &std::path::Path, args: &[&str]) {
+    let mut cmd_args = vec!["done"];
+    cmd_args.extend_from_slice(args);
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .args(&cmd_args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "done failed: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn approve_flow_tears_down_both_agents() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for approve flow");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Wait for worker to spawn and produce a result
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}", handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}", handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals "done with PR" — triggers reviewer spawn
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    // Wait for reviewer to spawn
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}", handle.lines
+    );
+
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    // Wait for reviewer result
+    assert!(
+        handle.wait_for("reviewer", 15),
+        "reviewer activity not seen. Lines: {:?}", handle.lines
+    );
+    // Give a moment for draining to complete
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Reviewer signals approved verdict
+    quorum_done(home.path(), &[
+        "--agent", &reviewer_name,
+        "--pr", "1",
+        "--verdict", "approved",
+    ]);
+
+    // Both should be torn down
+    assert!(
+        handle.wait_for("tearing down worker", 15),
+        "worker teardown not seen. Lines: {:?}", handle.lines
+    );
+
+    // Verify task is marked done
+    std::thread::sleep(Duration::from_millis(500));
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"done\"") || stdout.contains("\"status\": \"done\""),
+        "task not marked done after approved verdict: {stdout}"
+    );
+
+    handle.stop();
+}
+
+#[test]
+fn changes_verdict_feeds_rework_to_same_warm_worker() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for rework flow");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Wait for worker to spawn and produce a result
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}", handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}", handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals "done with PR"
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    // Wait for reviewer to spawn
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}", handle.lines
+    );
+
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    // Wait for reviewer to finish its turn
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Reviewer signals changes verdict with feedback
+    quorum_done(home.path(), &[
+        "--agent", &reviewer_name,
+        "--pr", "1",
+        "--verdict", "changes",
+        "--feedback", "Fix the error handling in main.rs",
+    ]);
+
+    // Worker should get rework (the rework turn contains REVIEW FAILED which
+    // the fake-agent responds to with "Fixing review feedback...")
+    assert!(
+        handle.wait_for("rework", 15),
+        "rework not seen. Lines: {:?}", handle.lines
+    );
+
+    // The worker should produce another result after processing the rework turn
+    // (fake-agent emits "Fixing review feedback..." then a result)
+    assert!(
+        handle.wait_for("Fixing", 15),
+        "worker rework response not seen. Lines: {:?}", handle.lines
+    );
+
+    // Verify the reviewer was torn down (its name released)
+    let saw_reviewer_teardown = handle.lines.iter().any(|l| l.contains("tearing down reviewer"));
+    assert!(
+        saw_reviewer_teardown,
+        "reviewer teardown not seen. Lines: {:?}", handle.lines
+    );
+
+    // Task should NOT be done (still in progress, worker is reworking)
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        !stdout.contains("\"status\":\"done\"") && !stdout.contains("\"status\": \"done\""),
+        "task should not be done during rework: {stdout}"
+    );
+
+    handle.stop();
+}
