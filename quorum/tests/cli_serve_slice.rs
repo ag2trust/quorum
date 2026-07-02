@@ -3,7 +3,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -34,6 +35,15 @@ fn init_git_repo(dir: &std::path::Path) {
         .unwrap();
     Command::new("git")
         .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
+        .status()
+        .unwrap();
+    // Create origin/main ref so `serve` can provision worktrees from it
+    Command::new("git")
+        .args(["-C", &d, "remote", "add", "origin", &*d])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "fetch", "origin"])
         .status()
         .unwrap();
 }
@@ -104,36 +114,46 @@ fn serve_spawns_agent_and_tears_down_on_done() {
         .unwrap();
 
     let stderr = child.stderr.take().unwrap();
-    let reader = BufReader::new(stderr);
 
-    // Collect stderr lines until we see the agent spawn and result
+    // Read stderr on a dedicated thread so timeouts are enforceable
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut saw_spawning = false;
     let mut saw_result = false;
     let mut agent_name = String::new();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut lines = Vec::new();
 
-    let lines: Vec<String> = reader
-        .lines()
-        .take_while(|_| Instant::now() < deadline)
-        .filter_map(|l| l.ok())
-        .take_while(|line| {
-            if line.contains("spawning agent") {
-                saw_spawning = true;
-                if let Some(name) = line.split("spawning agent ").nth(1) {
-                    agent_name = name.split_whitespace().next().unwrap_or("").to_string();
-                }
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(15)) {
+        if line.contains("spawning agent") {
+            saw_spawning = true;
+            if let Some(name) = line.split("spawning agent ").nth(1) {
+                agent_name = name.split_whitespace().next().unwrap_or("").to_string();
             }
-            if line.contains("result") {
-                saw_result = true;
-            }
-            // Stop after we see result (agent finished turn 1)
-            !saw_result
-        })
-        .collect();
+        }
+        if line.contains("result") {
+            saw_result = true;
+        }
+        lines.push(line);
+        if saw_result {
+            break;
+        }
+    }
 
     assert!(
         saw_spawning,
         "serve did not spawn an agent. Lines: {lines:?}"
+    );
+    assert!(
+        saw_result,
+        "agent spawned but did not produce a result event. Lines: {lines:?}"
     );
 
     // Now write a Done mailbox row for that agent

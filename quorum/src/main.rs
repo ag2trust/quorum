@@ -861,6 +861,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             verdict,
             feedback,
         } => {
+            if let Some(ref v) = verdict {
+                match v.as_str() {
+                    "approved" | "changes" => {}
+                    _ => {
+                        return Err(QuorumError::Usage(format!(
+                            "--verdict must be 'approved' or 'changes', got '{v}'"
+                        )));
+                    }
+                }
+            }
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
             let kind = quorum_core::mailbox::MailboxKind::Done;

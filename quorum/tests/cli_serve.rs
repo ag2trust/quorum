@@ -35,6 +35,15 @@ fn init_git_repo(dir: &std::path::Path) {
         .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
         .status()
         .unwrap();
+    // Create origin/main ref so `serve` can provision worktrees from it
+    Command::new("git")
+        .args(["-C", &d, "remote", "add", "origin", &*d])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "fetch", "origin"])
+        .status()
+        .unwrap();
 }
 
 #[test]

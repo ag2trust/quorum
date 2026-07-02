@@ -81,7 +81,11 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
                 }
                 return Ok(());
             }
-            _ = tick(&config, &wt_mgr, &mut name_pool, &mut slot) => {}
+            result = tick(&config, &wt_mgr, &mut name_pool, &mut slot) => {
+                if let Err(e) = result {
+                    log(&format!("tick error: {e}"));
+                }
+            }
         }
     }
 }
@@ -136,10 +140,12 @@ async fn tick(
         }
     }
 
-    // If we have an active agent that's draining, pump events
+    // If we have an active agent that's draining, pump events (bounded per tick)
     if let Some(ref mut s) = slot {
         if s.draining {
-            while let Some(event) = s.proc.next_event().await {
+            while let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), s.proc.next_event()).await
+            {
                 match &event {
                     stream::Event::Result { usage, .. } => {
                         let tokens = usage
