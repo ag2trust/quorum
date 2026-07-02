@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "fake-agent"
-path = "tests/fake_agent_bin.rs"
+path = "src/bin/fake_agent.rs"
 
 [dependencies]
 quorum-core = { path = "../quorum-core" }

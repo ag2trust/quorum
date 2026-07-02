@@ -64,6 +64,20 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
 
+    // SIGINT sets a flag; shutdown happens between ticks. Racing the signal against
+    // tick() in a select! would cancel tick mid-flight at an await point, which can
+    // leak a claimed task (claimed in the DB but slot never assigned, so teardown
+    // has nothing to release) and orphan the spawned agent process. Ticks are
+    // bounded (500ms idle sleep, 5s event timeout), so shutdown latency stays small.
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            sigint.recv().await;
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
     let mut name_pool = Pool::load(&config.names_file, config.cap)
         .map_err(|e| QuorumError::Io(format!("names pool: {e}")))?;
 
@@ -73,19 +87,16 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     log(&format!("serving (cap={})", config.cap));
 
     loop {
-        tokio::select! {
-            _ = sigint.recv() => {
-                log("shutting down (Ctrl-C)");
-                if let Some(s) = slot.take() {
-                    teardown(&config, &wt_mgr, &mut name_pool, s).await;
-                }
-                return Ok(());
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            log("shutting down (Ctrl-C)");
+            if let Some(s) = slot.take() {
+                // Work was interrupted, not completed — release the task back to open.
+                teardown(&config, &wt_mgr, &mut name_pool, s, TaskOutcome::Release).await;
             }
-            result = tick(&config, &wt_mgr, &mut name_pool, &mut slot) => {
-                if let Err(e) = result {
-                    log(&format!("tick error: {e}"));
-                }
-            }
+            return Ok(());
+        }
+        if let Err(e) = tick(&config, &wt_mgr, &mut name_pool, &mut slot).await {
+            log(&format!("tick error: {e}"));
         }
     }
 }
@@ -132,7 +143,7 @@ async fn tick(
 
                     // Teardown
                     if let Some(s) = slot.take() {
-                        teardown(config, wt_mgr, name_pool, s).await;
+                        teardown(config, wt_mgr, name_pool, s, TaskOutcome::Done).await;
                     }
                     break;
                 }
@@ -371,18 +382,34 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
     .ok();
 }
 
+/// Final disposition of the slot's task when tearing down its agent.
+enum TaskOutcome {
+    /// The agent signaled done — mark the task done.
+    Done,
+    /// Work was interrupted (e.g. daemon shutdown) — release the task back to open.
+    Release,
+}
+
 async fn teardown(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     state: SlotState,
+    outcome: TaskOutcome,
 ) {
-    log(&format!("tearing down agent {}", state.agent_name));
+    let status = match outcome {
+        TaskOutcome::Done => "done",
+        TaskOutcome::Release => "open",
+    };
+    log(&format!(
+        "tearing down agent {} (task #{} -> {status})",
+        state.agent_name, state.task_id
+    ));
 
     // Kill the process and reap to avoid zombies
     state.proc.kill_and_reap().await;
 
-    // Mark task done (claimed → done)
+    // Move the task to its final status (claimed → done, or claimed → open on release)
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
     let task_id = state.task_id;
@@ -390,7 +417,7 @@ async fn teardown(
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
         let fields = tasks::TaskUpdate {
-            status: Some("done"),
+            status: Some(status),
             body: None,
             refs: None,
             verdict: None,

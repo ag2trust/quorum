@@ -181,3 +181,103 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     // Exit 0 or signal — both OK for this test
     let _ = status;
 }
+
+#[test]
+fn sigint_during_work_releases_task_back_to_open() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let task_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "task-create",
+            "--title",
+            "Interrupted task",
+            "--created-by",
+            "TestCreator",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        task_out.status.success(),
+        "task-create failed: {}",
+        String::from_utf8_lossy(&task_out.stderr)
+    );
+
+    let fake_agent = cargo_bin("fake-agent");
+    let mut child = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "serve",
+            "--cap",
+            "1",
+            "--repo-dir",
+            &repo_dir.path().to_string_lossy(),
+            "--worktree-base",
+            &wt_base.path().to_string_lossy(),
+            "--names-file",
+            &names_file.to_string_lossy(),
+            "--agent-bin",
+            &fake_agent.to_string_lossy(),
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Wait until the agent is spawned (task is claimed and in progress)
+    let mut saw_spawning = false;
+    let mut lines = Vec::new();
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(15)) {
+        let done = line.contains("spawning agent");
+        lines.push(line);
+        if done {
+            saw_spawning = true;
+            break;
+        }
+    }
+    assert!(
+        saw_spawning,
+        "serve did not spawn an agent. Lines: {lines:?}"
+    );
+
+    // SIGINT mid-work — no Done signal was sent
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+    }
+    child.wait().unwrap();
+
+    // The interrupted task must be released back to open, not marked done
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
+        "task was not released back to open after SIGINT: {stdout}"
+    );
+}
