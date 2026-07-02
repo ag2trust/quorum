@@ -446,7 +446,7 @@ fn rework_feed_failure_releases_task() {
     // Actually, the easiest way: look up the process. Since fake-agent
     // is our child's child, we can find it by name and kill it.
     let pgrep_out = Command::new("pgrep")
-        .args(["-f", &format!("fake-agent.*--session-id")])
+        .args(["-f", "fake-agent.*--session-id"])
         .output();
     if let Ok(out) = pgrep_out {
         let pids = String::from_utf8_lossy(&out.stdout);
