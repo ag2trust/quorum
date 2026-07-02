@@ -33,6 +33,10 @@ fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
 # --- Gate 1: branch base ------------------------------------------------------
 printf '=== preflight 1/4: branch base ===\n'
 git fetch origin --quiet || fail "git fetch origin"
+# Fail loud if origin/main is absent — otherwise the git log pipelines below
+# error mid-pipe, N_SESSIONS silently becomes 0, and the gate passes vacuously.
+git rev-parse --verify --quiet origin/main >/dev/null \
+  || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 if [ "$BRANCH" = "main" ]; then
   printf 'on main — nothing to compare, skipping\n'
@@ -51,6 +55,14 @@ else
     git log origin/main..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
       | sed '/^$/d' | awk '{print $1}' | sort -u
     fail "branch base: ${N_SESSIONS} sessions in origin/main..HEAD — branched from a feature branch? Rebase onto origin/main"
+  fi
+  # Heuristic limit: session attribution rides on Co-Authored-By trailers
+  # (convention-mandatory on every commit, CLAUDE.md §Engineering practices 1).
+  # Trailer-less commits can't be attributed — surface that instead of implying
+  # a clean pass.
+  N_AHEAD=$(git rev-list --count origin/main..HEAD)
+  if [ "$N_SESSIONS" -eq 0 ] && [ "$N_AHEAD" -gt 0 ]; then
+    printf 'note: %s commit(s) ahead carry no Co-Authored-By trailer — sessions unattributable; eyeball the commit list above\n' "$N_AHEAD"
   fi
   printf 'branch base OK (%s session(s) ahead of origin/main)\n' "$N_SESSIONS"
 fi

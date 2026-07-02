@@ -49,8 +49,11 @@ fi
 # --- Git hooks ---------------------------------------------------------------
 # Point hooks at .githooks (pre-push runs `preflight.sh --quick`: fmt + branch-base
 # check). Repo config is shared by all worktrees, so this covers every agent worktree.
-if git rev-parse --git-dir >/dev/null 2>&1 && [ -d .githooks ]; then
-  git config core.hooksPath .githooks
+# Anchor to this script's own directory — running e.g. `--verify-only` from another
+# cwd must not rewire an unrelated repo's hooks.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -d "$SCRIPT_DIR/.githooks" ]; then
+  git -C "$SCRIPT_DIR" config core.hooksPath .githooks
   printf '=== Git hooks: core.hooksPath -> .githooks ===\n'
 fi
 
