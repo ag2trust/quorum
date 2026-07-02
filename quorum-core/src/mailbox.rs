@@ -120,6 +120,20 @@ pub fn mark_consumed(conn: &mut Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Consume all unconsumed mailbox rows for a given agent name. Returns the
+/// number of rows consumed. Used at agent-spawn time to drain stale rows
+/// and prevent phantom verdicts from name reuse.
+pub fn consume_all_for_agent(conn: &mut Connection, agent: &str) -> Result<usize> {
+    let now = clock::now();
+    let tx = begin_immediate(conn)?;
+    let count = tx.execute(
+        "UPDATE mailbox SET consumed_at = ?1 WHERE agent = ?2 AND consumed_at IS NULL",
+        params![now, agent],
+    )?;
+    tx.commit()?;
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +231,42 @@ mod tests {
         let unconsumed = poll_unconsumed(&conn).unwrap();
         assert_eq!(unconsumed.len(), 1);
         assert_eq!(unconsumed[0].0, id2);
+    }
+
+    #[test]
+    fn consume_all_for_agent_drains_only_that_agent() {
+        let (mut conn, _dir) = test_conn();
+        let row_a = MailboxRow {
+            agent: "Alpha".into(),
+            kind: MailboxKind::Done,
+            task_id: Some(1),
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let row_b = MailboxRow {
+            agent: "Beta".into(),
+            kind: MailboxKind::Done,
+            task_id: Some(2),
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        append(&mut conn, &row_a).unwrap();
+        append(&mut conn, &row_a).unwrap();
+        append(&mut conn, &row_b).unwrap();
+
+        let count = consume_all_for_agent(&mut conn, "Alpha").unwrap();
+        assert_eq!(count, 2);
+
+        let unconsumed = poll_unconsumed(&conn).unwrap();
+        assert_eq!(unconsumed.len(), 1);
+        assert_eq!(unconsumed[0].1.agent, "Beta");
     }
 }
