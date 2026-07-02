@@ -824,6 +824,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 now,
                 cfg.retire_after_active_secs,
                 cfg.retire_after_tasks,
+                cfg.retire_after_wall_secs,
             )?;
             output::emit(&snap);
             Ok(0)
