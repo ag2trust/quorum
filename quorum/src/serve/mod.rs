@@ -336,6 +336,48 @@ async fn tick(
         }
     }
 
+    // ── Phase 4b: Detect dead workers/reviewers ─────────────────────────
+    // A crashed or exited agent process leaves the slot pinned: the task is
+    // never released, the name/worktree leak, and Phase 5 (which gates on
+    // !w.draining) never spawns a reviewer. `next_event`/`drain_events` alone
+    // cannot detect this — stdout EOF is a hint but a stuck child can hold
+    // its stdout open. `try_wait` is the authoritative signal.
+    let worker_dead = worker.as_mut().and_then(|w| match w.proc.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => None,
+        Err(e) => {
+            log(&format!("worker {} try_wait error: {e}", w.agent_name));
+            None
+        }
+    });
+    if let Some(status) = worker_dead {
+        if let Some(dead) = worker.take() {
+            log(&format!(
+                "worker {} died mid-task (task #{}, status={:?}) — releasing task/name/worktree",
+                dead.agent_name, dead.task_id, status
+            ));
+            teardown_worker(config, wt_mgr, name_pool, dead, "open").await;
+        }
+    }
+
+    let reviewer_dead = reviewer.as_mut().and_then(|r| match r.proc.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Ok(None) => None,
+        Err(e) => {
+            log(&format!("reviewer {} try_wait error: {e}", r.agent_name));
+            None
+        }
+    });
+    if let Some(status) = reviewer_dead {
+        if let Some(dead) = reviewer.take() {
+            log(&format!(
+                "reviewer {} died (status={:?}) — releasing name/worktree",
+                dead.agent_name, status
+            ));
+            teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+        }
+    }
+
     // ── Phase 5: Spawn reviewer if worker has PR and no reviewer ────────
     if reviewer.is_none() {
         if let Some(ref w) = worker {

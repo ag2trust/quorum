@@ -96,6 +96,13 @@ impl AgentProc {
         }
     }
 
+    /// Non-blocking check for child exit. Returns `Some(status)` if the child
+    /// has already terminated, `None` if still running. `try_wait` also reaps
+    /// the child on the caller's behalf when it has exited.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
     pub async fn kill_and_reap(mut self) {
         if let Some(pid) = self.child.id() {
             unsafe {

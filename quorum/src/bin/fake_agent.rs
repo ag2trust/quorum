@@ -8,6 +8,9 @@
 //! Behaviour:
 //! - Turn 1: emits assistant "Working on task..." + result with usage
 //! - Any turn containing "REVIEW FAILED": emits assistant "Fixing..." + result
+//! - Any turn containing "DIE_MID_TURN": emits assistant, then exits(1) BEFORE
+//!   emitting the result (simulates a crashed agent that never signals done —
+//!   used by the death-detection test).
 //! - Any other turn: emits assistant "Acknowledged" + result
 //! - Stays alive between turns (persistent stdin-fed mode).
 
@@ -59,6 +62,8 @@ fn main() {
 
         turn += 1;
 
+        let die_mid_turn = line.contains("DIE_MID_TURN");
+
         if turn == 1 {
             let msg = if bare {
                 "Working on task... [bare]"
@@ -70,6 +75,10 @@ fn main() {
             emit_assistant("Fixing review feedback...");
         } else {
             emit_assistant("Acknowledged");
+        }
+
+        if die_mid_turn {
+            std::process::exit(1);
         }
 
         emit_result(turn);
