@@ -1028,6 +1028,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_task_wall_secs,
             max_rework_rounds,
             log_dir,
+            self_update_drain,
+            drain_timeout_secs,
+            self_repo,
+            sha_poll_interval_secs,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
@@ -1054,6 +1058,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         .unwrap_or_else(|_| std::path::PathBuf::from(".quorum"))
                         .join("logs")
                 }));
+            let resolved_self_repo = if self_update_drain {
+                self_repo.or_else(|| resolve_gh_repo(&repo_dir))
+            } else {
+                None
+            };
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
@@ -1067,9 +1076,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 bare_agent: !no_bare_agent,
                 limits,
                 log_dir: resolved_log_dir,
+                self_update_drain,
+                drain_timeout_secs,
+                self_repo: resolved_self_repo,
+                sha_poll_interval_secs,
             };
-            serve::run_serve(config)?;
-            Ok(0)
+            Ok(serve::run_serve(config)?)
         }
         cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);

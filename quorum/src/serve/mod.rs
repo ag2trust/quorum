@@ -172,9 +172,19 @@ pub struct ServeConfig {
     pub limits: CostLimits,
     /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
     pub log_dir: Option<PathBuf>,
+    /// When true, the daemon drains and exits 75 when its own repo's main advances.
+    pub self_update_drain: bool,
+    /// Seconds to wait for in-flight agents during drain before SIGTERM.
+    pub drain_timeout_secs: u64,
+    /// Owner/name of the daemon's own repo (e.g. "ag2trust/quorum").
+    pub self_repo: Option<String>,
+    /// Interval between git ls-remote polls for Trigger B (seconds). Default: 60.
+    pub sha_poll_interval_secs: u64,
 }
 
-pub fn run_serve(config: ServeConfig) -> Result<()> {
+pub const EXIT_SELF_UPDATE: i32 = 75;
+
+pub fn run_serve(config: ServeConfig) -> Result<i32> {
     log(&format!("starting (cap={})", config.cap));
 
     let rt = tokio::runtime::Runtime::new()
@@ -199,9 +209,67 @@ pub(crate) struct SlotState {
     turn_started_at: std::time::Instant,
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
+    task_repo: Option<String>,
 }
 
-async fn tick_loop(config: ServeConfig) -> Result<()> {
+/// Snapshot the sha of origin/main via `git ls-remote`. Returns None on any failure.
+fn poll_origin_main_sha(repo_dir: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["ls-remote", "origin", "refs/heads/main"])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.split_whitespace().next().map(|s| s.to_string())
+}
+
+/// Mutable drain state tracked across ticks.
+struct DrainState {
+    draining: bool,
+    drain_started_at: Option<std::time::Instant>,
+    drain_sha: Option<String>,
+    last_sha_poll: Option<std::time::Instant>,
+    known_main_sha: Option<String>,
+}
+
+impl DrainState {
+    fn new() -> Self {
+        Self {
+            draining: false,
+            drain_started_at: None,
+            drain_sha: None,
+            last_sha_poll: None,
+            known_main_sha: None,
+        }
+    }
+
+    fn start_drain(&mut self, sha: &str) {
+        if self.draining {
+            return; // debounce: already draining
+        }
+        self.draining = true;
+        self.drain_started_at = Some(std::time::Instant::now());
+        self.drain_sha = Some(sha.to_string());
+        log(&format!("DRAIN: entering drain mode (sha={sha})"));
+    }
+
+    fn should_poll_sha(&self, interval_secs: u64) -> bool {
+        match self.last_sha_poll {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= interval_secs,
+        }
+    }
+
+    fn timed_out(&self, timeout_secs: u64) -> bool {
+        self.drain_started_at
+            .is_some_and(|t| t.elapsed().as_secs() >= timeout_secs)
+    }
+}
+
+async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
 
@@ -238,6 +306,18 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
     let mut poison_tracker = PoisonTracker::new();
+    let mut drain_state = DrainState::new();
+
+    // Snapshot initial main sha for Trigger B baseline
+    if config.self_update_drain {
+        drain_state.known_main_sha = poll_origin_main_sha(&config.repo_dir);
+        if let Some(ref sha) = drain_state.known_main_sha {
+            log(&format!(
+                "self-update-drain: baseline main sha={}",
+                &sha[..12.min(sha.len())]
+            ));
+        }
+    }
 
     // M7: crash recovery — resume in-flight agents from journal
     if let Err(e) = recovery::recover(
@@ -257,15 +337,72 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     loop {
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
             log("shutting down (Ctrl-C)");
-            // Tear down reviewers first, then workers (spec: reviewer before worker).
             for r in reviewers.drain(..) {
                 teardown_reviewer(&config, &wt_mgr, &mut name_pool, r).await;
             }
             for w in workers.drain(..) {
                 teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
             }
-            return Ok(());
+            return Ok(0);
         }
+
+        // Trigger B: throttled git ls-remote poll for main sha changes
+        if config.self_update_drain
+            && !drain_state.draining
+            && drain_state.should_poll_sha(config.sha_poll_interval_secs)
+        {
+            drain_state.last_sha_poll = Some(std::time::Instant::now());
+            let repo_dir = config.repo_dir.clone();
+            if let Some(new_sha) =
+                tokio::task::spawn_blocking(move || poll_origin_main_sha(&repo_dir))
+                    .await
+                    .ok()
+                    .flatten()
+            {
+                match &drain_state.known_main_sha {
+                    Some(old) if *old != new_sha => {
+                        log(&format!(
+                            "DRAIN: origin/main advanced ({} -> {})",
+                            &old[..12.min(old.len())],
+                            &new_sha[..12.min(new_sha.len())]
+                        ));
+                        drain_state.start_drain(&new_sha);
+                    }
+                    None => {
+                        drain_state.known_main_sha = Some(new_sha);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Drain: check timeout and roster empty
+        if drain_state.draining {
+            if workers.is_empty() && reviewers.is_empty() {
+                let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
+                log(&format!("DRAIN: exiting for self-update -> {sha}"));
+                return Ok(EXIT_SELF_UPDATE);
+            }
+
+            if drain_state.timed_out(config.drain_timeout_secs) {
+                log(&format!(
+                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s)",
+                    config.drain_timeout_secs,
+                    workers.len(),
+                    reviewers.len()
+                ));
+                for r in reviewers.drain(..) {
+                    teardown_reviewer(&config, &wt_mgr, &mut name_pool, r).await;
+                }
+                for w in workers.drain(..) {
+                    teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
+                }
+                let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
+                log(&format!("DRAIN: exiting for self-update -> {sha}"));
+                return Ok(EXIT_SELF_UPDATE);
+            }
+        }
+
         if let Err(e) = tick(
             &config,
             &wt_mgr,
@@ -273,6 +410,7 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
             &mut workers,
             &mut reviewers,
             &mut poison_tracker,
+            &mut drain_state,
         )
         .await
         {
@@ -288,6 +426,7 @@ async fn tick(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
+    drain_state: &mut DrainState,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -386,6 +525,19 @@ async fn tick(
 
                     if merge_result.success {
                         log(&format!("PR #{pr_num} merged — tearing down both agents"));
+                        // Trigger A: check if this merge is for the daemon's own repo
+                        if config.self_update_drain {
+                            if let Some(ref self_repo) = config.self_repo {
+                                let task_repo = workers
+                                    .iter()
+                                    .find(|w| w.task_id == reviewer_task_id)
+                                    .and_then(|w| w.task_repo.as_deref());
+                                if task_repo == Some(self_repo.as_str()) {
+                                    let sha = format!("post-merge-pr-{pr_num}");
+                                    drain_state.start_drain(&sha);
+                                }
+                            }
+                        }
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r).await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -701,6 +853,41 @@ async fn tick(
         teardown_worker(config, wt_mgr, name_pool, dead, "open").await;
     }
 
+    // ── Phase 4a-drain: Tear down idle agents during drain ──────────────
+    // During drain, agents that have finished their current turn (draining=false)
+    // should be torn down immediately — no new reviewers/work will be spawned.
+    if drain_state.draining {
+        let mut drain_workers: Vec<usize> = Vec::new();
+        for (i, w) in workers.iter().enumerate() {
+            if !w.draining {
+                drain_workers.push(i);
+            }
+        }
+        for &i in drain_workers.iter().rev() {
+            let w = workers.remove(i);
+            log(&format!(
+                "DRAIN: tearing down idle worker {} (task #{})",
+                w.agent_name, w.task_id
+            ));
+            teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+        }
+
+        let mut drain_reviewers: Vec<usize> = Vec::new();
+        for (i, r) in reviewers.iter().enumerate() {
+            if !r.draining {
+                drain_reviewers.push(i);
+            }
+        }
+        for &i in drain_reviewers.iter().rev() {
+            let r = reviewers.remove(i);
+            log(&format!(
+                "DRAIN: tearing down idle reviewer {}",
+                r.agent_name
+            ));
+            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+        }
+    }
+
     // ── Phase 4b: Detect dead workers/reviewers ────────────────────────
     // A crashed or exited agent process leaves the slot pinned: the task is
     // never released, the name/worktree leak, and Phase 5 (which gates on
@@ -833,30 +1020,35 @@ async fn tick(
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
     // Each worker that has a PR and no paired reviewer (and is not draining)
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
-    // Collect (pr, task_id, index) for workers needing reviewers, so we don't
-    // hold an immutable borrow on `workers` across the spawn calls.
-    let needs_reviewer: Vec<(i64, i64, usize)> = workers
-        .iter()
-        .enumerate()
-        .filter_map(|(i, w)| {
-            if let Some(pr) = w.pr {
-                if !w.draining && !reviewers.iter().any(|r| r.task_id == w.task_id) {
-                    return Some((pr, w.task_id, i));
+    // Skip during drain — no new work, let existing agents finish.
+    if !drain_state.draining {
+        let needs_reviewer: Vec<(i64, i64, usize)> = workers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| {
+                if let Some(pr) = w.pr {
+                    if !w.draining && !reviewers.iter().any(|r| r.task_id == w.task_id) {
+                        return Some((pr, w.task_id, i));
+                    }
                 }
-            }
-            None
-        })
-        .collect();
-    for (pr, _task_id, wi) in needs_reviewer {
-        spawn_reviewer_for_worker(config, wt_mgr, name_pool, reviewers, pr, &workers[wi]).await?;
+                None
+            })
+            .collect();
+        for (pr, _task_id, wi) in needs_reviewer {
+            spawn_reviewer_for_worker(config, wt_mgr, name_pool, reviewers, pr, &workers[wi])
+                .await?;
+        }
     }
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
     // not consume worker capacity (F16).
-    while workers.len() < config.cap {
-        if !spawn_worker(config, wt_mgr, name_pool, workers, poison_tracker).await? {
-            break;
+    // Skip during drain — no new tasks, let existing agents finish.
+    if !drain_state.draining {
+        while workers.len() < config.cap {
+            if !spawn_worker(config, wt_mgr, name_pool, workers, poison_tracker).await? {
+                break;
+            }
         }
     }
 
@@ -1290,6 +1482,7 @@ async fn spawn_reviewer_for_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: reviewer_session_log,
+                task_repo: None,
             });
         }
         Err(e) => {
@@ -1535,6 +1728,10 @@ async fn spawn_worker(
                 .ok();
             }
 
+            let task_repo = {
+                let repo = quorum_core::branches::repo_from_refs(task.refs.as_deref());
+                Some(repo)
+            };
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
@@ -1552,6 +1749,7 @@ async fn spawn_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: worker_session_log,
+                task_repo,
             });
         }
         Err(e) => {
@@ -1842,6 +2040,7 @@ mod tests {
             turn_started_at: now,
             agent_state: None,
             session_log: None,
+            task_repo: None,
         }
     }
 
@@ -2034,5 +2233,74 @@ mod tests {
         tracker.clear(1);
         assert_eq!(tracker.strikes(1), 0);
         assert_eq!(tracker.strikes(2), 1);
+    }
+
+    // ── Drain state unit tests ────────────────────────────────────────
+
+    #[test]
+    fn drain_state_new_is_not_draining() {
+        let ds = DrainState::new();
+        assert!(!ds.draining);
+        assert!(ds.drain_started_at.is_none());
+        assert!(ds.drain_sha.is_none());
+    }
+
+    #[test]
+    fn drain_state_start_drain_sets_fields() {
+        let mut ds = DrainState::new();
+        ds.start_drain("abc123");
+        assert!(ds.draining);
+        assert!(ds.drain_started_at.is_some());
+        assert_eq!(ds.drain_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn drain_state_debounce_second_start_is_noop() {
+        let mut ds = DrainState::new();
+        ds.start_drain("sha1");
+        let first_started = ds.drain_started_at.unwrap();
+        let first_sha = ds.drain_sha.clone();
+        ds.start_drain("sha2");
+        assert_eq!(ds.drain_started_at.unwrap(), first_started);
+        assert_eq!(ds.drain_sha, first_sha);
+    }
+
+    #[test]
+    fn drain_state_should_poll_sha_initially() {
+        let ds = DrainState::new();
+        assert!(ds.should_poll_sha(60));
+    }
+
+    #[test]
+    fn drain_state_should_poll_sha_throttled() {
+        let mut ds = DrainState::new();
+        ds.last_sha_poll = Some(std::time::Instant::now());
+        assert!(!ds.should_poll_sha(60));
+    }
+
+    #[test]
+    fn drain_state_timed_out_false_when_not_draining() {
+        let ds = DrainState::new();
+        assert!(!ds.timed_out(900));
+    }
+
+    #[test]
+    fn drain_state_timed_out_false_when_within_timeout() {
+        let mut ds = DrainState::new();
+        ds.start_drain("sha");
+        assert!(!ds.timed_out(900));
+    }
+
+    #[test]
+    fn drain_state_timed_out_true_when_expired() {
+        let mut ds = DrainState::new();
+        ds.drain_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
+        assert!(ds.timed_out(900));
+    }
+
+    #[test]
+    fn exit_self_update_is_75() {
+        assert_eq!(EXIT_SELF_UPDATE, 75);
     }
 }

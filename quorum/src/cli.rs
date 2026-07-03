@@ -19,6 +19,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Create ~/.quorum/, the database, and run migrations (idempotent).
     Init,
@@ -400,6 +401,22 @@ pub enum Command {
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]
         log_dir: Option<String>,
+        /// Enable self-update drain mode. When the daemon merges a PR for its
+        /// own repo (or detects main advancing via git ls-remote), it drains
+        /// in-flight agents and exits 75 so a supervisor can rebuild and relaunch.
+        #[arg(long)]
+        self_update_drain: bool,
+        /// Seconds to wait for in-flight agents to finish before force-killing
+        /// them during a drain. Default: 900 (15 minutes).
+        #[arg(long, default_value = "900")]
+        drain_timeout_secs: u64,
+        /// Owner/name of the daemon's own repo (e.g. "ag2trust/quorum").
+        /// Default: derived from --repo-dir's origin remote via `gh repo view`.
+        #[arg(long)]
+        self_repo: Option<String>,
+        /// Interval between git ls-remote sha polls (seconds). Default: 60.
+        #[arg(long, default_value = "60", hide = true)]
+        sha_poll_interval_secs: u64,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
