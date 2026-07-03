@@ -50,6 +50,8 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sync { .. } => "sync",
         cli::Command::Status { .. } => "status",
         cli::Command::Sweep => "sweep",
+        cli::Command::Message { .. } => "message",
+        cli::Command::React { .. } => "react",
         cli::Command::Done { .. } => "done",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
@@ -169,6 +171,27 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
                 a.events_in_window,
                 a.last_tool,
                 fmt_age(a.last_tool_age_secs),
+            );
+        }
+    }
+
+    // --- Daemon in-flight agents (M5 journal view) ---
+    if !s.daemon_agents.is_empty() {
+        println!();
+        println!("## daemon agents (in-flight)");
+        for d in &s.daemon_agents {
+            let task_str = d
+                .task_id
+                .map(|id| format!("task#{id}"))
+                .unwrap_or_else(|| "—".to_string());
+            let state_str = d
+                .agent_state
+                .as_deref()
+                .map(|s| format!("  · state: {s}"))
+                .unwrap_or_default();
+            println!(
+                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{state_str}",
+                d.agent, d.role, task_str, d.phase, d.cost_tokens,
             );
         }
     }
@@ -855,6 +878,68 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true }));
             Ok(0)
         }
+        cli::Command::Message {
+            from,
+            to,
+            body_stdin,
+            body_file,
+        } => {
+            let payload = read_optional_body(body_stdin, body_file)?;
+            let payload = match payload {
+                Some(p) => p,
+                None => {
+                    return Err(QuorumError::Usage(
+                        "message requires --body-stdin or --body-file".into(),
+                    ));
+                }
+            };
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent: from,
+                kind: quorum_core::mailbox::MailboxKind::Message,
+                task_id: None,
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: Some(to),
+                payload: Some(payload),
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::React {
+            agent,
+            task_id,
+            state,
+        } => {
+            match state.as_str() {
+                "blocked" | "failed" | "needs-info" | "note" => {}
+                _ => {
+                    return Err(QuorumError::Usage(format!(
+                        "--state must be 'blocked', 'failed', 'needs-info', or 'note', got '{state}'"
+                    )));
+                }
+            }
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent,
+                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                task_id: Some(task_id),
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: Some(state),
+                to_agent: None,
+                payload: None,
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
         cli::Command::Done {
             agent,
             pr,
@@ -883,6 +968,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 verdict,
                 feedback,
                 note: summary,
+                to_agent: None,
+                payload: None,
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));

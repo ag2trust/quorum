@@ -20,9 +20,9 @@ pub struct JournalEntry {
     pub branch: Option<String>,
     pub phase: String,
     pub cost_tokens: i64,
+    pub agent_state: Option<String>,
 }
 
-#[cfg(test)]
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
     Ok(JournalEntry {
         agent: r.get(0)?,
@@ -33,6 +33,7 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
         branch: r.get(5)?,
         phase: r.get(6)?,
         cost_tokens: r.get(7)?,
+        agent_state: r.get(8)?,
     })
 }
 
@@ -40,8 +41,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
-        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(agent) DO UPDATE SET
              role = excluded.role,
              task_id = excluded.task_id,
@@ -50,6 +51,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
              branch = excluded.branch,
              phase = excluded.phase,
              cost_tokens = excluded.cost_tokens,
+             agent_state = excluded.agent_state,
              updated_at = excluded.updated_at",
         params![
             entry.agent,
@@ -60,6 +62,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
             entry.branch,
             entry.phase,
             entry.cost_tokens,
+            entry.agent_state,
             now,
         ],
     )?;
@@ -67,10 +70,9 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
+pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state
          FROM journal
          ORDER BY agent",
     )?;
@@ -110,6 +112,7 @@ mod tests {
             branch: Some("feat/thing".into()),
             phase: "working".into(),
             cost_tokens: 1000,
+            agent_state: None,
         }
     }
 
@@ -169,6 +172,30 @@ mod tests {
         let in_flight = list_in_flight(&conn).unwrap();
         assert_eq!(in_flight.len(), 1);
         assert_eq!(in_flight[0].agent, "Beta");
+    }
+
+    #[test]
+    fn agent_state_persists_and_updates() {
+        let (mut conn, _dir) = test_conn();
+
+        let mut entry = sample_entry("Agent-1");
+        entry.agent_state = Some("blocked".into());
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].agent_state.as_deref(), Some("blocked"));
+
+        entry.agent_state = Some("needs-info".into());
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].agent_state.as_deref(), Some("needs-info"));
+
+        entry.agent_state = None;
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].agent_state, None);
     }
 
     #[test]

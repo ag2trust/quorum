@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -185,6 +185,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // EXISTS` in SCHEMA_SQL handles fresh DBs and upgrades alike; no ALTER
         // needed. EXPERIMENTAL / opt-in / stats-only — no existing query reads
         // these tables, so absence (or hook never installed) changes nothing.
+        // v13 = M5 messaging + agent state: `journal.agent_state` column for daemon-
+        // tracked agent reactions (blocked/failed/needs-info/note).
+        if current < 13 && !column_exists(conn, "journal", "agent_state")? {
+            conn.execute("ALTER TABLE journal ADD COLUMN agent_state TEXT", [])?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -815,5 +820,55 @@ mod tests {
             .unwrap();
         assert_eq!(status, "active");
         assert!(retired_at.is_none());
+    }
+
+    #[test]
+    fn migrates_v12_to_v13_adds_journal_agent_state() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        // Hand-craft a v12 database with a journal table missing agent_state.
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE journal (
+                 agent      TEXT PRIMARY KEY,
+                 role       TEXT NOT NULL,
+                 task_id    INTEGER,
+                 session_id TEXT NOT NULL,
+                 worktree   TEXT,
+                 branch     TEXT,
+                 phase      TEXT NOT NULL DEFAULT 'working',
+                 cost_tokens INTEGER NOT NULL DEFAULT 0,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO journal(agent, role, task_id, session_id, phase, cost_tokens, updated_at)
+                 VALUES ('W1', 'worker', 42, 'sess-1', 'working', 1000, 100);
+             PRAGMA user_version = 12;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(
+            column_exists(&c, "journal", "agent_state").unwrap(),
+            "agent_state column missing — v12→v13 migration silently skipped"
+        );
+
+        let state: Option<String> = c
+            .query_row(
+                "SELECT agent_state FROM journal WHERE agent='W1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(state.is_none(), "pre-existing row must default to NULL");
     }
 }

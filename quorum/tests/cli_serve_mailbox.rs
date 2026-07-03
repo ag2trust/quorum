@@ -240,10 +240,10 @@ fn unmatched_done_row_consumed() {
     );
 }
 
-// ── Non-Done mailbox kinds don't interfere with normal operation ───────
+// ── Non-Done mailbox kinds are consumed gracefully ────────────────────
 
 #[test]
-fn non_done_mailbox_rows_do_not_block_daemon() {
+fn non_done_mailbox_rows_consumed_gracefully() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -259,8 +259,9 @@ fn non_done_mailbox_rows_do_not_block_daemon() {
 
     seed_task(home.path(), "Task for non-Done kind test");
 
-    // Insert non-Done mailbox rows directly — these are vestigial M5
-    // surface that poll_unconsumed no longer queries.
+    // Insert M5 mailbox rows for an agent with no active worker — the
+    // daemon should consume them (task_update: "no active worker",
+    // message: "no to_agent") and still spawn a worker for the task.
     insert_mailbox_row(home.path(), "SomeAgent", "task_update");
     insert_mailbox_row(home.path(), "SomeAgent", "message");
 
@@ -276,6 +277,12 @@ fn non_done_mailbox_rows_do_not_block_daemon() {
     );
 
     handle.stop();
+
+    assert_eq!(
+        count_unconsumed(home.path(), "SomeAgent"),
+        0,
+        "non-Done mailbox rows were not consumed"
+    );
 }
 
 // ── F9: Phantom verdict prevention via stale-row drain at spawn ────────
