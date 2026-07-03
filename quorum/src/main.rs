@@ -1036,6 +1036,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             self_repo,
             sha_poll_interval_secs,
             only_repo,
+            base_branch,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
@@ -1090,6 +1091,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_timeout_secs,
                 merge_checks_poll_secs,
                 only_repo,
+                base_branch,
             };
             Ok(serve::run_serve(config)?)
         }

@@ -413,7 +413,7 @@ pub enum Command {
         #[arg(long)]
         log_dir: Option<String>,
         /// Enable self-update drain mode. When the daemon merges a PR for its
-        /// own repo (or detects main advancing via git ls-remote), it drains
+        /// own repo (or detects the base branch advancing via git ls-remote), it drains
         /// in-flight agents and exits 75 so a supervisor can rebuild and relaunch.
         #[arg(long)]
         self_update_drain: bool,
@@ -433,6 +433,10 @@ pub enum Command {
         /// Can be specified multiple times to accept several repos.
         #[arg(long)]
         only_repo: Vec<String>,
+        /// Base branch name for sha-polling, worktree provisioning, and merge
+        /// targeting. Use "master" for repos whose trunk is master. Default: main.
+        #[arg(long, default_value = "main")]
+        base_branch: String,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
