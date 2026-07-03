@@ -237,6 +237,8 @@ pub struct ServeConfig {
     pub self_repo: Option<String>,
     /// Interval between git ls-remote polls for Trigger B (seconds). Default: 60.
     pub sha_poll_interval_secs: u64,
+    /// Max seconds to wait for required status checks before merging.
+    pub merge_checks_timeout_secs: u64,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -569,7 +571,143 @@ async fn tick(
             match row.verdict.as_deref() {
                 Some("approved") => {
                     let pr_num = row.pr.unwrap_or(0);
-                    log(&format!("verdict: approved — merging PR #{pr_num}"));
+                    log(&format!(
+                        "verdict: approved — waiting for checks on PR #{pr_num}"
+                    ));
+                    let checks_result = {
+                        let repo = config.repo_dir.clone();
+                        let executor = Arc::clone(&config.merge_executor);
+                        let timeout = config.merge_checks_timeout_secs;
+                        tokio::task::spawn_blocking(move || {
+                            executor.wait_for_checks(pr_num, &repo, timeout)
+                        })
+                        .await
+                        .map_err(|e| QuorumError::Io(format!("checks spawn_blocking join: {e}")))?
+                    };
+
+                    match checks_result {
+                        merge::ChecksResult::Failed(ref names) => {
+                            let name_list = names.join(", ");
+                            log(&format!(
+                                "PR #{pr_num} checks failed ({name_list}) — sending rework"
+                            ));
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                let next_round = workers[wi].rework_count + 1;
+                                if let Some(max) = config.limits.max_rework_rounds {
+                                    if next_round > max {
+                                        let breach = LimitBreached::ReworkRounds {
+                                            count: next_round,
+                                            max,
+                                        };
+                                        log(&format!(
+                                            "WATCHDOG: worker {} killed (task #{}) — {}",
+                                            workers[wi].agent_name, workers[wi].task_id, breach
+                                        ));
+                                        let w = workers.remove(wi);
+                                        teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                        if !consume_mailbox_row(&db_path, *id).await {
+                                            break;
+                                        }
+                                        break;
+                                    }
+                                }
+
+                                let rework_msg = format!(
+                                    "CI checks failed on PR #{pr_num}: {name_list}\n\n\
+                                     Fix the failing checks, run preflight, and push again.",
+                                );
+                                let rework_turn = reviewer::build_rework_turn(
+                                    &workers[wi].agent_name,
+                                    workers[wi].task_id,
+                                    pr_num,
+                                    &rework_msg,
+                                );
+                                if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
+                                    log(&format!(
+                                        "checks-failure rework feed failed: {e} — \
+                                         tearing down broken worker"
+                                    ));
+                                    let w = workers.remove(wi);
+                                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                } else {
+                                    let w = &mut workers[wi];
+                                    w.draining = true;
+                                    w.pr = None;
+                                    w.rework_count += 1;
+                                    w.turn_started_at = std::time::Instant::now();
+
+                                    if let Some(ref mut sl) = w.session_log {
+                                        sl.log_rework(w.rework_count);
+                                    }
+
+                                    let p = db_path.clone();
+                                    let entry = slot_journal_entry(w, "worker", "working");
+                                    tokio::task::spawn_blocking(move || -> Result<()> {
+                                        let mut conn = quorum_core::db::open(&p)?;
+                                        journal::upsert(&mut conn, &entry)
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        QuorumError::Io(format!("spawn_blocking join: {e}"))
+                                    })?
+                                    .ok();
+
+                                    log(&format!(
+                                        "worker {} rework #{} (checks failure)",
+                                        w.agent_name, w.rework_count
+                                    ));
+                                }
+                            }
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        merge::ChecksResult::Timeout => {
+                            log(&format!(
+                                "MERGE BLOCKED: PR #{pr_num} checks timed out after {}s — \
+                                 parking task, tearing down both agents",
+                                config.merge_checks_timeout_secs
+                            ));
+                            let reviewer_name = reviewers[ri].agent_name.clone();
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                let park_body = format!(
+                                    "daemon:merge-blocked | PR #{pr_num} | \
+                                     reviewer={reviewer_name} verdict=approved \
+                                     (task #{reviewer_task_id}) | checks timed out"
+                                );
+                                let w = workers.remove(wi);
+                                teardown_worker_with_body(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    w,
+                                    "cancelled",
+                                    Some(&park_body),
+                                )
+                                .await;
+                            }
+                            reviewer_provision_tracker.clear(reviewer_task_id, pr_num);
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        merge::ChecksResult::Ready => {
+                            log(&format!("PR #{pr_num} checks passed — merging"));
+                        }
+                    }
+
                     let merge_result = {
                         let repo = config.repo_dir.clone();
                         let executor = Arc::clone(&config.merge_executor);

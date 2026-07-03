@@ -352,3 +352,287 @@ fn retryable_merge_sends_rework_turn() {
 
     handle.stop();
 }
+
+// --- Status check wait tests (#166) ---
+
+#[test]
+fn checks_pending_then_success_merges_after_wait() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for checks-wait test");
+
+    let counter_file = home.path().join("checks_counter");
+    std::fs::write(&counter_file, "0").unwrap();
+    let checks_script = format!(
+        r#"COUNT=$(cat {cf}); NEXT=$((COUNT + 1)); echo $NEXT > {cf}; if [ "$COUNT" -lt "2" ]; then exit 1; else exit 0; fi"#,
+        cf = counter_file.display()
+    );
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "echo merged",
+        &[
+            "--checks-cmd",
+            &checks_script,
+            "--merge-checks-timeout-secs",
+            "10",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("checks passed", 15),
+        "checks-passed log not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("merged", 15),
+        "merge not completed. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_merge_blocked = handle.lines.iter().any(|l| l.contains("MERGE BLOCKED"));
+    assert!(
+        !saw_merge_blocked,
+        "should NOT see MERGE BLOCKED after checks pass. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+#[test]
+fn checks_failure_sends_rework_no_merge() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for checks-failure test");
+
+    let checks_script = r#"echo 'test' >&2; echo 'clippy' >&2; exit 2"#;
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "echo merged",
+        &[
+            "--checks-cmd",
+            checks_script,
+            "--merge-checks-timeout-secs",
+            "10",
+            "--max-rework-rounds",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("checks failed", 15),
+        "checks-failed log not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework #1 (checks failure)", 15),
+        "rework turn not sent. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_merge = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("merged") && !l.contains("checks"));
+    assert!(
+        !saw_merge,
+        "merge should NOT be attempted after checks fail. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+#[test]
+fn checks_timeout_parks_task_no_merge() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for checks-timeout test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "echo merged",
+        &["--checks-cmd", "exit 1", "--merge-checks-timeout-secs", "1"],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("MERGE BLOCKED", 15),
+        "MERGE BLOCKED not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.lines.iter().any(|l| l.contains("checks timed out")),
+        "timeout reason not logged. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"cancelled\"") || stdout.contains("\"status\": \"cancelled\""),
+        "task should be parked as cancelled, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("daemon:merge-blocked"),
+        "task body should contain daemon:merge-blocked tag, got: {stdout}"
+    );
+}

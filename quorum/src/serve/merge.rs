@@ -2,6 +2,9 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+const CHECKS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Reviewer lineage passed to the merge executor so the formal GitHub approval
 /// carries the reviewer's identity and task id.
@@ -43,11 +46,25 @@ pub struct MergeResult {
     pub failure_kind: Option<MergeFailureKind>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksResult {
+    /// All required checks passed; safe to merge.
+    Ready,
+    /// One or more checks failed. Contains failing check names.
+    Failed(Vec<String>),
+    /// Timed out waiting for checks to complete.
+    Timeout,
+}
+
 /// Trait for executing PR merges. The default implementation posts a formal
 /// GitHub approval review then calls `gh pr merge`.
 /// Tests inject a mock via `command_override`.
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
+
+    fn wait_for_checks(&self, _pr: i64, _repo_dir: &Path, _timeout_secs: u64) -> ChecksResult {
+        ChecksResult::Ready
+    }
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
@@ -131,6 +148,133 @@ impl GhMergeExecutor {
         let stdout = String::from_utf8_lossy(&output.stdout);
         gh_pr_state_is_merged(&stdout)
     }
+
+    fn poll_checks(&self, pr: i64, repo_dir: &Path) -> ChecksPollResult {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "statusCheckRollup,mergeStateStatus",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => return ChecksPollResult::Pending,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_checks_json(&stdout)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChecksPollResult {
+    Ready,
+    Pending,
+    Failed(Vec<String>),
+}
+
+fn parse_checks_json(json: &str) -> ChecksPollResult {
+    let val: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return ChecksPollResult::Pending,
+    };
+
+    if val.get("mergeStateStatus").and_then(|v| v.as_str()) == Some("CLEAN") {
+        return ChecksPollResult::Ready;
+    }
+
+    let checks = match val.get("statusCheckRollup").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return ChecksPollResult::Ready,
+    };
+
+    if checks.is_empty() {
+        return ChecksPollResult::Ready;
+    }
+
+    let mut failed_names = Vec::new();
+    let mut any_pending = false;
+
+    for check in checks {
+        let name = check
+            .get("name")
+            .or_else(|| check.get("context"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let typename = check.get("__typename").and_then(|v| v.as_str());
+
+        match typename {
+            Some("CheckRun") => {
+                let status = check.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let conclusion = check.get("conclusion").and_then(|v| v.as_str());
+                match status {
+                    "COMPLETED" => match conclusion {
+                        Some("SUCCESS") | Some("NEUTRAL") | Some("SKIPPED") => {}
+                        Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") => {
+                            failed_names.push(name.to_string());
+                        }
+                        _ => {
+                            failed_names.push(name.to_string());
+                        }
+                    },
+                    _ => {
+                        any_pending = true;
+                    }
+                }
+            }
+            Some("StatusContext") => {
+                let state = check.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                match state {
+                    "SUCCESS" => {}
+                    "FAILURE" | "ERROR" => {
+                        failed_names.push(name.to_string());
+                    }
+                    _ => {
+                        any_pending = true;
+                    }
+                }
+            }
+            _ => {
+                let status = check.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let conclusion = check.get("conclusion").and_then(|v| v.as_str());
+                let state = check.get("state").and_then(|v| v.as_str());
+                if status == "COMPLETED" {
+                    match conclusion {
+                        Some("SUCCESS") | Some("NEUTRAL") | Some("SKIPPED") => {}
+                        Some("FAILURE") | Some("TIMED_OUT") | Some("CANCELLED") => {
+                            failed_names.push(name.to_string());
+                        }
+                        _ => {}
+                    }
+                } else if let Some(s) = state {
+                    match s {
+                        "SUCCESS" => {}
+                        "FAILURE" | "ERROR" => {
+                            failed_names.push(name.to_string());
+                        }
+                        _ => {
+                            any_pending = true;
+                        }
+                    }
+                } else if !status.is_empty() {
+                    any_pending = true;
+                }
+            }
+        }
+    }
+
+    if !failed_names.is_empty() {
+        return ChecksPollResult::Failed(failed_names);
+    }
+    if any_pending {
+        return ChecksPollResult::Pending;
+    }
+    ChecksPollResult::Ready
 }
 
 impl MergeExecutor for GhMergeExecutor {
@@ -179,6 +323,24 @@ impl MergeExecutor for GhMergeExecutor {
 
         result
     }
+
+    fn wait_for_checks(&self, pr: i64, repo_dir: &Path, timeout_secs: u64) -> ChecksResult {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+        loop {
+            let poll = self.poll_checks(pr, repo_dir);
+            match poll {
+                ChecksPollResult::Ready => return ChecksResult::Ready,
+                ChecksPollResult::Failed(names) => return ChecksResult::Failed(names),
+                ChecksPollResult::Pending => {
+                    if Instant::now() + CHECKS_POLL_INTERVAL > deadline {
+                        return ChecksResult::Timeout;
+                    }
+                    std::thread::sleep(CHECKS_POLL_INTERVAL);
+                }
+            }
+        }
+    }
 }
 
 /// Mock executor controlled by an env var or a command string.
@@ -186,6 +348,7 @@ impl MergeExecutor for GhMergeExecutor {
 /// QUORUM_MERGE_CMD="false" → always fails.
 pub struct CommandMergeExecutor {
     pub command: String,
+    pub checks_cmd: Option<String>,
 }
 
 impl MergeExecutor for CommandMergeExecutor {
@@ -223,6 +386,46 @@ impl MergeExecutor for CommandMergeExecutor {
             },
         }
     }
+
+    fn wait_for_checks(&self, pr: i64, _repo_dir: &Path, timeout_secs: u64) -> ChecksResult {
+        let cmd_str = match self.checks_cmd {
+            Some(ref c) => c,
+            None => return ChecksResult::Ready,
+        };
+        let expanded = cmd_str.replace("{pr}", &pr.to_string());
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let poll_interval = Duration::from_millis(200);
+
+        loop {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &expanded])
+                .output();
+            match output {
+                Ok(out) => {
+                    let code = out.status.code().unwrap_or(1);
+                    match code {
+                        0 => return ChecksResult::Ready,
+                        2 => {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            let names: Vec<String> = stderr
+                                .lines()
+                                .map(|l| l.trim().to_string())
+                                .filter(|l| !l.is_empty())
+                                .collect();
+                            return ChecksResult::Failed(names);
+                        }
+                        _ => {
+                            if Instant::now() + poll_interval > deadline {
+                                return ChecksResult::Timeout;
+                            }
+                            std::thread::sleep(poll_interval);
+                        }
+                    }
+                }
+                Err(_) => return ChecksResult::Timeout,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +443,7 @@ mod tests {
     fn command_merge_executor_success() {
         let exec = CommandMergeExecutor {
             command: "echo merged PR {pr}".into(),
+            checks_cmd: None,
         };
         let result = exec.merge(42, Path::new("/tmp"), &test_ctx());
         assert!(result.success);
@@ -251,6 +455,7 @@ mod tests {
     fn command_merge_executor_failure() {
         let exec = CommandMergeExecutor {
             command: "echo 'conflict' >&2 && exit 1".into(),
+            checks_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -262,6 +467,7 @@ mod tests {
     fn command_merge_executor_retryable_conflict() {
         let exec = CommandMergeExecutor {
             command: "echo 'merge conflict on file.rs' >&2 && exit 1".into(),
+            checks_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -274,10 +480,23 @@ mod tests {
             command:
                 "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1"
                     .into(),
+            checks_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
         assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+    }
+
+    #[test]
+    fn command_merge_executor_default_checks_ready() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+        };
+        assert_eq!(
+            exec.wait_for_checks(1, Path::new("/tmp"), 10),
+            ChecksResult::Ready
+        );
     }
 
     #[test]
@@ -464,5 +683,230 @@ mod tests {
         };
         let result = exec.merge(155, Path::new("/tmp"), &test_ctx());
         assert!(result.success);
+    }
+
+    // --- parse_checks_json tests ---
+
+    #[test]
+    fn parse_checks_clean_merge_state() {
+        let json = r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Ready);
+    }
+
+    #[test]
+    fn parse_checks_all_success() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"fmt","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","name":"clippy","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}
+            ]
+        }"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Ready);
+    }
+
+    #[test]
+    fn parse_checks_some_pending() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"fmt","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","name":"test","status":"IN_PROGRESS","conclusion":null}
+            ]
+        }"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Pending);
+    }
+
+    #[test]
+    fn parse_checks_failure() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"fmt","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"FAILURE"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_checks_json(json),
+            ChecksPollResult::Failed(vec!["test".into()])
+        );
+    }
+
+    #[test]
+    fn parse_checks_multiple_failures() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"fmt","status":"COMPLETED","conclusion":"FAILURE"},
+                {"__typename":"CheckRun","name":"clippy","status":"COMPLETED","conclusion":"FAILURE"},
+                {"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS"}
+            ]
+        }"#;
+        let result = parse_checks_json(json);
+        match result {
+            ChecksPollResult::Failed(names) => {
+                assert!(names.contains(&"fmt".to_string()));
+                assert!(names.contains(&"clippy".to_string()));
+                assert_eq!(names.len(), 2);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_checks_status_context_success() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"StatusContext","context":"ci/build","state":"SUCCESS"}
+            ]
+        }"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Ready);
+    }
+
+    #[test]
+    fn parse_checks_status_context_failure() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"StatusContext","context":"ci/build","state":"FAILURE"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_checks_json(json),
+            ChecksPollResult::Failed(vec!["ci/build".into()])
+        );
+    }
+
+    #[test]
+    fn parse_checks_status_context_pending() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"StatusContext","context":"ci/build","state":"PENDING"}
+            ]
+        }"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Pending);
+    }
+
+    #[test]
+    fn parse_checks_no_rollup() {
+        let json = r#"{"mergeStateStatus":"BLOCKED"}"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Ready);
+    }
+
+    #[test]
+    fn parse_checks_empty_rollup() {
+        let json = r#"{"mergeStateStatus":"BLOCKED","statusCheckRollup":[]}"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Ready);
+    }
+
+    #[test]
+    fn parse_checks_invalid_json() {
+        assert_eq!(parse_checks_json("not json"), ChecksPollResult::Pending);
+    }
+
+    #[test]
+    fn parse_checks_neutral_and_skipped_pass() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"optional","status":"COMPLETED","conclusion":"NEUTRAL"},
+                {"__typename":"CheckRun","name":"skipped","status":"COMPLETED","conclusion":"SKIPPED"}
+            ]
+        }"#;
+        assert_eq!(parse_checks_json(json), ChecksPollResult::Ready);
+    }
+
+    #[test]
+    fn parse_checks_timed_out_is_failure() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"__typename":"CheckRun","name":"slow-test","status":"COMPLETED","conclusion":"TIMED_OUT"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_checks_json(json),
+            ChecksPollResult::Failed(vec!["slow-test".into()])
+        );
+    }
+
+    // --- Mock executor tests for wait_for_checks ---
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct MockChecksExecutor {
+        results: Vec<ChecksResult>,
+        call_count: AtomicU32,
+        merge_called: AtomicU32,
+    }
+
+    impl MergeExecutor for MockChecksExecutor {
+        fn merge(&self, _pr: i64, _repo_dir: &Path, _ctx: &MergeContext) -> MergeResult {
+            self.merge_called.fetch_add(1, Ordering::SeqCst);
+            MergeResult {
+                success: true,
+                message: "merged".into(),
+                failure_kind: None,
+            }
+        }
+
+        fn wait_for_checks(&self, _pr: i64, _repo_dir: &Path, _timeout_secs: u64) -> ChecksResult {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst) as usize;
+            if idx < self.results.len() {
+                self.results[idx].clone()
+            } else {
+                self.results
+                    .last()
+                    .cloned()
+                    .unwrap_or(ChecksResult::Timeout)
+            }
+        }
+    }
+
+    #[test]
+    fn mock_checks_ready_allows_merge() {
+        let exec = MockChecksExecutor {
+            results: vec![ChecksResult::Ready],
+            call_count: AtomicU32::new(0),
+            merge_called: AtomicU32::new(0),
+        };
+        let checks = exec.wait_for_checks(1, Path::new("/tmp"), 900);
+        assert_eq!(checks, ChecksResult::Ready);
+        let merge = exec.merge(1, Path::new("/tmp"), &test_ctx());
+        assert!(merge.success);
+        assert_eq!(exec.merge_called.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mock_checks_failed_blocks_merge() {
+        let exec = MockChecksExecutor {
+            results: vec![ChecksResult::Failed(vec!["test".into(), "clippy".into()])],
+            call_count: AtomicU32::new(0),
+            merge_called: AtomicU32::new(0),
+        };
+        let checks = exec.wait_for_checks(1, Path::new("/tmp"), 900);
+        match checks {
+            ChecksResult::Failed(names) => {
+                assert!(names.contains(&"test".to_string()));
+                assert!(names.contains(&"clippy".to_string()));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(exec.merge_called.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn mock_checks_timeout_blocks_merge() {
+        let exec = MockChecksExecutor {
+            results: vec![ChecksResult::Timeout],
+            call_count: AtomicU32::new(0),
+            merge_called: AtomicU32::new(0),
+        };
+        let checks = exec.wait_for_checks(1, Path::new("/tmp"), 900);
+        assert_eq!(checks, ChecksResult::Timeout);
+        assert_eq!(exec.merge_called.load(Ordering::SeqCst), 0);
     }
 }

@@ -370,6 +370,11 @@ pub enum Command {
         /// When set, bypasses `gh pr merge` and runs this shell command instead.
         #[arg(long, hide = true)]
         merge_cmd: Option<String>,
+        /// Override check-wait behavior (for testing). Shell command run to poll
+        /// checks; exit 0 = ready, exit 1 = pending, exit 2 = failed (stderr =
+        /// failing check names, one per line). Replaces `{pr}` with the PR number.
+        #[arg(long, hide = true)]
+        checks_cmd: Option<String>,
         /// Disable --bare mode for spawned agents. By default, agents are
         /// spawned with --bare so they do not inherit operator-local hooks,
         /// plugins, memory, or MCP config. Pass this flag to let agents use
@@ -417,6 +422,10 @@ pub enum Command {
         /// Interval between git ls-remote sha polls (seconds). Default: 60.
         #[arg(long, default_value = "60", hide = true)]
         sha_poll_interval_secs: u64,
+        /// Max seconds to wait for required status checks to pass before
+        /// merging an approved PR. Default: 900 (15 minutes).
+        #[arg(long, default_value = "900")]
+        merge_checks_timeout_secs: u64,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.

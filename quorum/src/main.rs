@@ -1019,6 +1019,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             effort,
             merge_token_file,
             merge_cmd,
+            checks_cmd,
             no_bare_agent,
             max_turn_tokens,
             max_task_tokens,
@@ -1032,11 +1033,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             drain_timeout_secs,
             self_repo,
             sha_poll_interval_secs,
+            merge_checks_timeout_secs,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
                 if let Some(cmd) = merge_cmd {
-                    std::sync::Arc::new(serve::merge::CommandMergeExecutor { command: cmd })
+                    std::sync::Arc::new(serve::merge::CommandMergeExecutor {
+                        command: cmd,
+                        checks_cmd,
+                    })
                 } else {
                     std::sync::Arc::new(serve::merge::GhMergeExecutor {
                         token_file: merge_token_file.map(std::path::PathBuf::from),
@@ -1080,6 +1085,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 drain_timeout_secs,
                 self_repo: resolved_self_repo,
                 sha_poll_interval_secs,
+                merge_checks_timeout_secs,
             };
             Ok(serve::run_serve(config)?)
         }
