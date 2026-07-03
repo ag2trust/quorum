@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// Reviewer lineage passed to the merge executor so the formal GitHub approval
 /// carries the reviewer's identity and task id.
@@ -43,15 +44,125 @@ pub struct MergeResult {
     pub failure_kind: Option<MergeFailureKind>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksOutcome {
+    /// All required checks passed — safe to merge.
+    Ready,
+    /// One or more checks failed — names of failing checks included.
+    Failed { failing_checks: Vec<String> },
+    /// Timed out waiting for checks to complete.
+    TimedOut,
+}
+
 /// Trait for executing PR merges. The default implementation posts a formal
 /// GitHub approval review (`gh pr review --approve`) then calls `gh pr merge`.
 /// Tests inject a mock via [`CommandMergeExecutor::command`].
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
+
+    fn wait_for_checks(
+        &self,
+        _pr: i64,
+        _repo_dir: &Path,
+        _timeout_secs: u64,
+        _poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        ChecksOutcome::Ready
+    }
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
     json_output.contains("\"MERGED\"")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChecksQueryResult {
+    AllPassed,
+    SomeFailed(Vec<String>),
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleCheckStatus {
+    Passed,
+    Failed,
+    Pending,
+}
+
+fn parse_checks_json(json_str: &str) -> (Option<String>, Vec<(String, SingleCheckStatus)>) {
+    let val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return (None, Vec::new()),
+    };
+
+    let merge_state = val
+        .get("mergeStateStatus")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let checks = val
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|entry| {
+                    let name = entry
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let conclusion = entry
+                        .get("conclusion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
+                    let check_status = if status != "COMPLETED" {
+                        SingleCheckStatus::Pending
+                    } else {
+                        match conclusion {
+                            "SUCCESS" | "NEUTRAL" | "SKIPPED" => SingleCheckStatus::Passed,
+                            _ => SingleCheckStatus::Failed,
+                        }
+                    };
+
+                    (name, check_status)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    (merge_state, checks)
+}
+
+fn checks_query_from_parsed(
+    merge_state: &Option<String>,
+    checks: &[(String, SingleCheckStatus)],
+) -> ChecksQueryResult {
+    if merge_state.as_deref() == Some("CLEAN") {
+        return ChecksQueryResult::AllPassed;
+    }
+
+    let mut failing = Vec::new();
+    let mut any_pending = false;
+
+    for (name, status) in checks {
+        match status {
+            SingleCheckStatus::Failed => failing.push(name.clone()),
+            SingleCheckStatus::Pending => any_pending = true,
+            SingleCheckStatus::Passed => {}
+        }
+    }
+
+    if !failing.is_empty() {
+        return ChecksQueryResult::SomeFailed(failing);
+    }
+
+    if any_pending {
+        return ChecksQueryResult::Pending;
+    }
+
+    ChecksQueryResult::AllPassed
 }
 
 /// Production executor: posts a formal GitHub approval review, then runs
@@ -131,6 +242,29 @@ impl GhMergeExecutor {
         let stdout = String::from_utf8_lossy(&output.stdout);
         gh_pr_state_is_merged(&stdout)
     }
+
+    fn query_checks(&self, pr: i64, repo_dir: &Path) -> ChecksQueryResult {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "statusCheckRollup,mergeStateStatus",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                return ChecksQueryResult::Pending;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (merge_state, checks) = parse_checks_json(&stdout);
+        checks_query_from_parsed(&merge_state, &checks)
+    }
 }
 
 impl MergeExecutor for GhMergeExecutor {
@@ -179,6 +313,31 @@ impl MergeExecutor for GhMergeExecutor {
 
         result
     }
+
+    fn wait_for_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            match self.query_checks(pr, repo_dir) {
+                ChecksQueryResult::AllPassed => return ChecksOutcome::Ready,
+                ChecksQueryResult::SomeFailed(names) => {
+                    return ChecksOutcome::Failed {
+                        failing_checks: names,
+                    }
+                }
+                ChecksQueryResult::Pending => {}
+            }
+            if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
+                return ChecksOutcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
 }
 
 /// Mock executor controlled by an env var or a command string.
@@ -186,6 +345,37 @@ impl MergeExecutor for GhMergeExecutor {
 /// QUORUM_MERGE_CMD="false" → always fails.
 pub struct CommandMergeExecutor {
     pub command: String,
+    pub checks_cmd: Option<String>,
+}
+
+impl CommandMergeExecutor {
+    fn run_checks_cmd(&self, pr: i64) -> Option<ChecksOutcome> {
+        let cmd_str = self.checks_cmd.as_ref()?;
+        let expanded = cmd_str.replace("{pr}", &pr.to_string());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &expanded])
+            .output()
+            .ok()?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if !output.status.success() {
+            return Some(ChecksOutcome::Ready);
+        }
+
+        let first_line = stdout.lines().next().unwrap_or("");
+        match first_line {
+            "ready" => Some(ChecksOutcome::Ready),
+            "pending" => None,
+            "failed" => {
+                let failing: Vec<String> = stdout.lines().skip(1).map(|s| s.to_string()).collect();
+                Some(ChecksOutcome::Failed {
+                    failing_checks: failing,
+                })
+            }
+            _ => Some(ChecksOutcome::Ready),
+        }
+    }
 }
 
 impl MergeExecutor for CommandMergeExecutor {
@@ -223,6 +413,28 @@ impl MergeExecutor for CommandMergeExecutor {
             },
         }
     }
+
+    fn wait_for_checks(
+        &self,
+        pr: i64,
+        _repo_dir: &Path,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        if self.checks_cmd.is_none() {
+            return ChecksOutcome::Ready;
+        }
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if let Some(outcome) = self.run_checks_cmd(pr) {
+                return outcome;
+            }
+            if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
+                return ChecksOutcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -240,6 +452,7 @@ mod tests {
     fn command_merge_executor_success() {
         let exec = CommandMergeExecutor {
             command: "echo merged PR {pr}".into(),
+            checks_cmd: None,
         };
         let result = exec.merge(42, Path::new("/tmp"), &test_ctx());
         assert!(result.success);
@@ -251,6 +464,7 @@ mod tests {
     fn command_merge_executor_failure() {
         let exec = CommandMergeExecutor {
             command: "echo 'conflict' >&2 && exit 1".into(),
+            checks_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -262,6 +476,7 @@ mod tests {
     fn command_merge_executor_retryable_conflict() {
         let exec = CommandMergeExecutor {
             command: "echo 'merge conflict on file.rs' >&2 && exit 1".into(),
+            checks_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -274,6 +489,7 @@ mod tests {
             command:
                 "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1"
                     .into(),
+            checks_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -464,5 +680,119 @@ mod tests {
         };
         let result = exec.merge(155, Path::new("/tmp"), &test_ctx());
         assert!(result.success);
+    }
+
+    #[test]
+    fn parse_checks_all_success() {
+        let json = r#"{
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [
+                {"name": "fmt", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        assert_eq!(state.as_deref(), Some("CLEAN"));
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::AllPassed);
+    }
+
+    #[test]
+    fn parse_checks_some_pending() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"name": "fmt", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "test", "status": "IN_PROGRESS", "conclusion": ""}
+            ]
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        assert_eq!(state.as_deref(), Some("BLOCKED"));
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::Pending);
+    }
+
+    #[test]
+    fn parse_checks_some_failed() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"name": "fmt", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "clippy", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}
+            ]
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(
+            result,
+            ChecksQueryResult::SomeFailed(vec!["clippy".to_string(), "test".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_checks_invalid_json() {
+        let (state, checks) = parse_checks_json("not json");
+        assert!(state.is_none());
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn parse_checks_skipped_and_neutral_pass() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"name": "optional", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                {"name": "neutral", "status": "COMPLETED", "conclusion": "NEUTRAL"}
+            ]
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::AllPassed);
+    }
+
+    #[test]
+    fn command_checks_cmd_ready() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: Some("echo ready".into()),
+        };
+        let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 5, 1);
+        assert_eq!(outcome, ChecksOutcome::Ready);
+    }
+
+    #[test]
+    fn command_checks_cmd_failed() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: Some("printf 'failed\\nclipper\\ntest'".into()),
+        };
+        let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 5, 1);
+        assert_eq!(
+            outcome,
+            ChecksOutcome::Failed {
+                failing_checks: vec!["clipper".to_string(), "test".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn command_checks_cmd_timeout() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: Some("echo pending".into()),
+        };
+        let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 1, 1);
+        assert_eq!(outcome, ChecksOutcome::TimedOut);
+    }
+
+    #[test]
+    fn command_no_checks_cmd_returns_ready() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+        };
+        let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 5, 1);
+        assert_eq!(outcome, ChecksOutcome::Ready);
     }
 }
