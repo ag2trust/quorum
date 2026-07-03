@@ -149,13 +149,18 @@ This preserves the worker's accumulated context and avoids a cold restart.
 
 The daemon is the sole merge authority. On `verdict=approved`:
 
-1. `merge_executor.merge(pr, repo_dir)` is called.
-2. Production: `GhMergeExecutor` runs `gh pr merge <pr> --merge --delete-branch`
+1. `merge_executor.merge(pr, repo_dir, ctx)` is called with reviewer lineage.
+2. Production: `GhMergeExecutor` posts a formal GitHub approval review (carrying
+   reviewer name + task id), then runs `gh pr merge <pr> --merge --delete-branch`
    with a `GH_TOKEN` read from a file (supports token rotation without restart).
 3. Test: `CommandMergeExecutor` runs an arbitrary shell command with `{pr}`
    placeholder substitution.
-4. On merge failure: treated as `verdict=changes` — reviewer killed, merge error
-   output fed as rework feedback to the warm worker.
+4. On merge failure, the error is classified:
+   - **Retryable** (merge conflict, branch behind base): reviewer killed, rework
+     feedback sent to the warm worker ("Rebase on main, resolve any conflicts").
+   - **PolicyBlocked** (base branch policy, auth failure, infra): both agents
+     killed, task parked as `cancelled` with a `daemon:merge-blocked` body
+     preserving the reviewer verdict. No rework turn, no re-claim loop.
 
 ## Mailbox contract
 

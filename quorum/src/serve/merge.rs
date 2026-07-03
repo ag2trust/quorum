@@ -42,15 +42,17 @@ pub struct MergeResult {
     pub failure_kind: Option<MergeFailureKind>,
 }
 
-/// Trait for executing PR merges. The default implementation calls `gh pr merge`.
+/// Trait for executing PR merges. The default implementation posts a formal
+/// GitHub approval review then calls `gh pr merge`.
 /// Tests inject a mock via `command_override`.
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
 }
 
-/// Production executor: runs `gh pr merge <pr> --merge --delete-branch`.
-/// If `token_file` is set, reads the token at call time and passes it via
-/// `GH_TOKEN` env var. The token is never exposed to agent processes.
+/// Production executor: posts a formal GitHub approval review, then runs
+/// `gh pr merge <pr> --merge --delete-branch`. If `token_file` is set,
+/// reads the token at call time and passes it via `GH_TOKEN` env var.
+/// The token is never exposed to agent processes.
 pub struct GhMergeExecutor {
     pub token_file: Option<std::path::PathBuf>,
 }

@@ -351,15 +351,29 @@ async fn tick(
                                      tearing down both agents",
                                     merge_result.message
                                 ));
+                                let reviewer_name = reviewers[ri].agent_name.clone();
                                 let r = reviewers.remove(ri);
                                 teardown_reviewer(config, wt_mgr, name_pool, r).await;
 
                                 if let Some(wi) =
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
+                                    let park_body = format!(
+                                        "daemon:merge-blocked | PR #{pr_num} | \
+                                         reviewer={reviewer_name} verdict=approved \
+                                         (task #{reviewer_task_id}) | {msg}",
+                                        msg = merge_result.message
+                                    );
                                     let w = workers.remove(wi);
-                                    teardown_worker(config, wt_mgr, name_pool, w, "cancelled")
-                                        .await;
+                                    teardown_worker_with_body(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        w,
+                                        "cancelled",
+                                        Some(&park_body),
+                                    )
+                                    .await;
                                 }
                             }
                             merge::MergeFailureKind::Retryable => {
@@ -1474,8 +1488,19 @@ async fn teardown_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
+    state: SlotState,
+    task_status: &str,
+) {
+    teardown_worker_with_body(config, wt_mgr, name_pool, state, task_status, None).await;
+}
+
+async fn teardown_worker_with_body(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
     mut state: SlotState,
     task_status: &str,
+    body: Option<&str>,
 ) {
     log(&format!(
         "tearing down worker {} (task #{} -> {task_status})",
@@ -1497,12 +1522,13 @@ async fn teardown_worker(
     let agent = state.agent_name.clone();
     let task_id = state.task_id;
     let status = task_status.to_string();
+    let body_owned = body.map(|s| s.to_string());
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
         let fields = tasks::TaskUpdate {
             status: Some(&status),
-            body: None,
+            body: body_owned.as_deref(),
             refs: None,
             verdict: None,
         };
