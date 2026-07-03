@@ -369,7 +369,12 @@ async fn tick(
                                  Fix the issue and push again.",
                                 merge_result.message
                             );
-                            let rework_turn = reviewer::build_rework_turn(&rework_msg);
+                            let rework_turn = reviewer::build_rework_turn(
+                                &workers[wi].agent_name,
+                                workers[wi].task_id,
+                                pr_num,
+                                &rework_msg,
+                            );
                             if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                                 log(&format!(
                                     "merge-failure rework feed failed: {e} — \
@@ -436,7 +441,13 @@ async fn tick(
                             }
                         }
 
-                        let rework_turn = reviewer::build_rework_turn(feedback);
+                        let rework_pr = workers[wi].pr.unwrap_or(0);
+                        let rework_turn = reviewer::build_rework_turn(
+                            &workers[wi].agent_name,
+                            workers[wi].task_id,
+                            rework_pr,
+                            feedback,
+                        );
                         if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                             log(&format!(
                                 "rework feed_turn failed: {e} — \

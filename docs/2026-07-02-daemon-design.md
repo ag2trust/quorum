@@ -137,8 +137,9 @@ On review rejection (`verdict=changes`), the worker process is **not** killed.
 Instead:
 
 1. The reviewer is torn down.
-2. `reviewer::build_rework_turn(feedback)` constructs a user-turn JSON object
-   containing the review feedback.
+2. `reviewer::build_rework_turn(agent_name, task_id, pr, feedback)` constructs a
+   user-turn JSON object containing the review feedback and re-signal instructions
+   (`quorum done --agent <name> --pr <N>`).
 3. The turn is fed to the warm worker via `proc.feed_turn()`.
 4. `rework_count` is incremented; journal resets to `phase="working"`.
 
