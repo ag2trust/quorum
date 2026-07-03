@@ -318,11 +318,15 @@ async fn tick(
                     let merge_result = {
                         let repo = config.repo_dir.clone();
                         let executor = Arc::clone(&config.merge_executor);
-                        tokio::task::spawn_blocking(move || executor.merge(pr_num, &repo))
-                            .await
-                            .map_err(|e| {
-                                QuorumError::Io(format!("merge spawn_blocking join: {e}"))
-                            })?
+                        let merge_ctx = merge::MergeContext {
+                            reviewer_name: reviewers[ri].agent_name.clone(),
+                            review_task_id: reviewer_task_id,
+                        };
+                        tokio::task::spawn_blocking(move || {
+                            executor.merge(pr_num, &repo, &merge_ctx)
+                        })
+                        .await
+                        .map_err(|e| QuorumError::Io(format!("merge spawn_blocking join: {e}")))?
                     };
 
                     if merge_result.success {
