@@ -1,7 +1,7 @@
 # Quorum Agent-Manager Daemon — Design & Plan
 
 **Date:** 2026-07-02
-**Status:** M0–M6 implemented and merged; M7 in review; M3–M4 planned
+**Status:** M0–M7 implemented and merged
 
 ## Overview
 
@@ -235,8 +235,12 @@ Token cost is tracked per-agent via the journal's `cost_tokens` field, accumulat
 `input_tokens + output_tokens` from each `Event::Result::usage`. The `result` event
 in stream-json also carries `total_cost_usd`, `num_turns`, and `duration_ms`.
 
-M4 will add per-turn and per-task cost ceilings that consume these fields directly
-from the existing stream parser — no extra instrumentation needed.
+The daemon enforces fail-closed per-turn and per-task ceilings via `quorum serve`
+flags: `--max-turn-tokens`, `--max-task-tokens`, `--max-turn-cost-usd`,
+`--max-task-cost-usd`, `--max-turn-wall-secs`, `--max-task-wall-secs`, and
+`--max-rework-rounds`. Note that `total_cost_usd` on stream-json result events is
+session-cumulative, so per-turn cost is computed as a delta (high-water mark), not
+summed.
 
 ## Name pool
 
@@ -278,33 +282,33 @@ ephemeral reviewer → reviewer issues `approved`/`changes` verdict → daemon m
 (on approve) or feeds rework turn to warm worker (on changes). Daemon-owned merge
 via `MergeExecutor` trait; reviewer never touches merge credentials.
 
-### M3: Concurrency + scheduler
+### M3: Concurrency + scheduler (merged)
 
 Multi-worker support: run up to `cap` workers concurrently. Priority-based task
 queue pull with tier and dependency awareness. Reviewer slots scale with workers
 (one reviewer per waiting worker above the worker cap).
 
-### M4: Cost + runaway controls
+### M4: Cost + runaway controls (merged)
 
 Per-turn and per-task token and wall-clock watchdogs. Maximum rework rounds. All
 limits fail-closed — exceeding a ceiling kills the agent and releases the task,
 never silently continues. Consumes `total_cost_usd`, `num_turns`, `duration_ms`
 from the existing stream-json `result` events.
 
-### M5: Messaging + agent state agency
+### M5: Messaging + agent state agency (merged)
 
 Message push-as-turn: deliver queued messages to an agent at idle (between turns).
 Agent state reactions: `blocked`, `failed`, `needs-info`, `note` — agents can
 signal non-terminal states that the daemon tracks and surfaces via `quorum status`.
 
-### M6: Logging + live status
+### M6: Logging + live status (merged)
 
 Hierarchical log structure per agent session: `stream.jsonl` (raw events),
 `transcript.md` (human-readable), `meta.json` (summary). Log rotation and GC by
 age/size. Live `quorum status` integration showing in-flight agents, phases,
 costs, and verdicts.
 
-### M7: Crash recovery (in review)
+### M7: Crash recovery (merged)
 
 Journal-driven resurrection on daemon restart: read `list_in_flight()`, reconnect
 to agents via `claude --resume <session_id>`. Process-group cleanup with `killpg`.
