@@ -52,11 +52,7 @@ pub(crate) fn build_resume_turn(entry: &JournalEntry) -> String {
         ),
     };
 
-    let turn = serde_json::json!({
-        "type": "user",
-        "message": { "content": content }
-    });
-    turn.to_string()
+    super::agent::user_turn(&content)
 }
 
 pub(crate) async fn recover(
@@ -374,6 +370,10 @@ mod tests {
         let turn = build_resume_turn(&entry);
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         assert_eq!(parsed["type"], "user");
+        assert_eq!(
+            parsed["message"]["role"], "user",
+            "claude CLI exits 1 on turns without message.role"
+        );
         let content = parsed["message"]["content"].as_str().unwrap();
         assert!(content.contains("interrupted and has been resumed"));
         assert!(content.contains("task #42"));

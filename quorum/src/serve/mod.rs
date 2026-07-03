@@ -669,13 +669,8 @@ async fn tick(
             }
             Some(wi) => {
                 let payload = msg_row.payload.as_deref().unwrap_or("");
-                let turn = serde_json::json!({
-                    "type": "user",
-                    "message": { "content": format!(
-                        "MESSAGE from {}: {payload}", msg_row.agent
-                    ) }
-                });
-                match workers[wi].proc.feed_turn(&turn.to_string()).await {
+                let turn = agent::user_turn(&format!("MESSAGE from {}: {payload}", msg_row.agent));
+                match workers[wi].proc.feed_turn(&turn).await {
                     Ok(()) => {
                         workers[wi].draining = true;
                         workers[wi].turn_started_at = std::time::Instant::now();
@@ -1095,11 +1090,8 @@ async fn spawn_reviewer_for_worker(
     {
         Ok(mut proc) => {
             let prompt = reviewer::build_review_prompt(&spec);
-            let turn1 = serde_json::json!({
-                "type": "user",
-                "message": { "content": prompt }
-            });
-            if let Err(e) = proc.feed_turn(&turn1.to_string()).await {
+            let turn1 = agent::user_turn(&prompt);
+            if let Err(e) = proc.feed_turn(&turn1).await {
                 log(&format!("reviewer feed_turn failed: {e}"));
                 proc.kill_and_reap().await;
                 name_pool.release(&reviewer_name);
