@@ -130,6 +130,9 @@ pub(crate) async fn recover(
                     // Remove from active since we're cleaning it up
                     active_worktrees.retain(|w| w != wt);
                 }
+                if let Some(ref branch) = entry.branch {
+                    wt_mgr.delete_branch(&config.repo_dir, branch).await;
+                }
                 let p = db_path.clone();
                 let agent = entry.agent.clone();
                 tokio::task::spawn_blocking(move || {
@@ -151,8 +154,15 @@ pub(crate) async fn recover(
                                 "recovery: worktree missing for worker {} — releasing task",
                                 entry.agent
                             ));
-                            release_and_cleanup(config, name_pool, &entry.agent, entry.task_id)
-                                .await;
+                            release_and_cleanup(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                &entry.agent,
+                                entry.task_id,
+                                entry.branch.as_deref(),
+                            )
+                            .await;
                             active_worktrees.retain(|w| w != wt);
                             continue;
                         }
@@ -163,7 +173,15 @@ pub(crate) async fn recover(
                             "recovery: no worktree for worker {} — releasing task",
                             entry.agent
                         ));
-                        release_and_cleanup(config, name_pool, &entry.agent, entry.task_id).await;
+                        release_and_cleanup(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            &entry.agent,
+                            entry.task_id,
+                            entry.branch.as_deref(),
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -210,8 +228,15 @@ pub(crate) async fn recover(
                                     entry.agent
                                 ));
                                 proc.kill_and_reap().await;
-                                release_and_cleanup(config, name_pool, &entry.agent, entry.task_id)
-                                    .await;
+                                release_and_cleanup(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    &entry.agent,
+                                    entry.task_id,
+                                    entry.branch.as_deref(),
+                                )
+                                .await;
                                 continue;
                             }
                         }
@@ -269,7 +294,15 @@ pub(crate) async fn recover(
                             "recovery: spawn failed for {} — {e}, releasing task",
                             entry.agent
                         ));
-                        release_and_cleanup(config, name_pool, &entry.agent, entry.task_id).await;
+                        release_and_cleanup(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            &entry.agent,
+                            entry.task_id,
+                            entry.branch.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -314,9 +347,11 @@ pub(crate) async fn recover(
 
 async fn release_and_cleanup(
     config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     agent: &str,
     task_id: Option<i64>,
+    branch: Option<&str>,
 ) {
     let p = config.db_path.clone();
     let a = agent.to_string();
@@ -338,6 +373,9 @@ async fn release_and_cleanup(
     })
     .await
     .ok();
+    if let Some(branch) = branch {
+        wt_mgr.delete_branch(&config.repo_dir, branch).await;
+    }
     name_pool.release(agent);
 }
 

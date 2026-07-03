@@ -1229,6 +1229,7 @@ async fn spawn_reviewer_for_worker(
                 proc.kill_and_reap().await;
                 name_pool.release(&reviewer_name);
                 wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(&config.repo_dir, &branch).await;
                 let p = config.db_path.clone();
                 let rn = reviewer_name.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1295,6 +1296,7 @@ async fn spawn_reviewer_for_worker(
             log(&format!("reviewer spawn failed: {e}"));
             name_pool.release(&reviewer_name);
             wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
             let p = config.db_path.clone();
             let rn = reviewer_name.clone();
             tokio::task::spawn_blocking(move || {
@@ -1498,6 +1500,7 @@ async fn spawn_worker(
                 }
                 name_pool.release(&agent_name);
                 wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(&config.repo_dir, &branch).await;
                 return Ok(false);
             }
 
@@ -1561,6 +1564,7 @@ async fn spawn_worker(
             }
             name_pool.release(&agent_name);
             wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
             return Ok(false);
         }
     }
@@ -1670,6 +1674,7 @@ async fn teardown_worker_with_body(
         .remove(&config.repo_dir, &state.worktree_path)
         .await
         .ok();
+    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("worker {} torn down", state.agent_name));
@@ -1704,6 +1709,7 @@ async fn teardown_reviewer(
         .remove(&config.repo_dir, &state.worktree_path)
         .await
         .ok();
+    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
