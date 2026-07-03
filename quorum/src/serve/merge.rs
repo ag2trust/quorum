@@ -44,8 +44,8 @@ pub struct MergeResult {
 }
 
 /// Trait for executing PR merges. The default implementation posts a formal
-/// GitHub approval review then calls `gh pr merge`.
-/// Tests inject a mock via `command_override`.
+/// GitHub approval review (`gh pr review --approve`) then calls `gh pr merge`.
+/// Tests inject a mock via [`CommandMergeExecutor::command`].
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
 }
