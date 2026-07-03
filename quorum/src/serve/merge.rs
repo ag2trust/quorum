@@ -10,21 +10,49 @@ pub struct MergeContext {
     pub review_task_id: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeFailureKind {
+    /// Worker can fix (merge conflict, branch behind base).
+    Retryable,
+    /// Not worker-fixable (policy blocked, auth failure, infra).
+    PolicyBlocked,
+}
+
+pub fn classify_merge_failure(message: &str) -> MergeFailureKind {
+    let lower = message.to_lowercase();
+    let retryable_patterns = [
+        "merge conflict",
+        "head branch was modified",
+        "branch is behind",
+        "not up to date",
+        "out of date",
+    ];
+    for pat in &retryable_patterns {
+        if lower.contains(pat) {
+            return MergeFailureKind::Retryable;
+        }
+    }
+    MergeFailureKind::PolicyBlocked
+}
+
 #[derive(Debug)]
 pub struct MergeResult {
     pub success: bool,
     pub message: String,
+    pub failure_kind: Option<MergeFailureKind>,
 }
 
-/// Trait for executing PR merges. The default implementation calls `gh pr merge`.
+/// Trait for executing PR merges. The default implementation posts a formal
+/// GitHub approval review then calls `gh pr merge`.
 /// Tests inject a mock via `command_override`.
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
 }
 
-/// Production executor: runs `gh pr merge <pr> --merge --delete-branch`.
-/// If `token_file` is set, reads the token at call time and passes it via
-/// `GH_TOKEN` env var. The token is never exposed to agent processes.
+/// Production executor: posts a formal GitHub approval review, then runs
+/// `gh pr merge <pr> --merge --delete-branch`. If `token_file` is set,
+/// reads the token at call time and passes it via `GH_TOKEN` env var.
+/// The token is never exposed to agent processes.
 pub struct GhMergeExecutor {
     pub token_file: Option<std::path::PathBuf>,
 }
@@ -58,14 +86,22 @@ impl GhMergeExecutor {
                 } else {
                     stderr
                 };
+                let trimmed = message.trim().to_string();
+                let failure_kind = if output.status.success() {
+                    None
+                } else {
+                    Some(classify_merge_failure(&trimmed))
+                };
                 MergeResult {
                     success: output.status.success(),
-                    message: message.trim().to_string(),
+                    message: trimmed,
+                    failure_kind,
                 }
             }
             Err(e) => MergeResult {
                 success: false,
                 message: format!("failed to run gh: {e}"),
+                failure_kind: Some(MergeFailureKind::PolicyBlocked),
             },
         }
     }
@@ -95,6 +131,7 @@ impl MergeExecutor for GhMergeExecutor {
             return MergeResult {
                 success: false,
                 message: format!("approve failed (merge not attempted): {}", approve.message),
+                failure_kind: Some(MergeFailureKind::PolicyBlocked),
             };
         }
 
@@ -124,18 +161,26 @@ impl MergeExecutor for CommandMergeExecutor {
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let message = if out.status.success() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr.trim().to_string()
+                };
+                let failure_kind = if out.status.success() {
+                    None
+                } else {
+                    Some(classify_merge_failure(&message))
+                };
                 MergeResult {
                     success: out.status.success(),
-                    message: if out.status.success() {
-                        stdout.trim().to_string()
-                    } else {
-                        stderr.trim().to_string()
-                    },
+                    message,
+                    failure_kind,
                 }
             }
             Err(e) => MergeResult {
                 success: false,
                 message: format!("merge command failed: {e}"),
+                failure_kind: Some(MergeFailureKind::PolicyBlocked),
             },
         }
     }
@@ -159,6 +204,7 @@ mod tests {
         };
         let result = exec.merge(42, Path::new("/tmp"), &test_ctx());
         assert!(result.success);
+        assert!(result.failure_kind.is_none());
         assert!(result.message.contains("merged PR 42"));
     }
 
@@ -169,7 +215,30 @@ mod tests {
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
+        assert!(result.failure_kind.is_some());
         assert!(result.message.contains("conflict"));
+    }
+
+    #[test]
+    fn command_merge_executor_retryable_conflict() {
+        let exec = CommandMergeExecutor {
+            command: "echo 'merge conflict on file.rs' >&2 && exit 1".into(),
+        };
+        let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
+        assert!(!result.success);
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::Retryable));
+    }
+
+    #[test]
+    fn command_merge_executor_policy_blocked() {
+        let exec = CommandMergeExecutor {
+            command:
+                "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1"
+                    .into(),
+        };
+        let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
+        assert!(!result.success);
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
     }
 
     #[test]
@@ -191,25 +260,74 @@ mod tests {
 
     #[test]
     fn approve_failure_short_circuits_merge() {
-        // Simulate: approve step fails → merge never runs.
-        // Use CommandMergeExecutor with a failing command as a proxy: verify
-        // that GhMergeExecutor's approve-failure path returns a distinct message.
         let ctx = test_ctx();
-
-        // GhMergeExecutor with no gh binary available will fail at approve step.
-        // We verify the error message pattern.
         let exec = GhMergeExecutor {
             token_file: Some(std::path::PathBuf::from("/nonexistent/token")),
         };
         let result = exec.merge(1, Path::new("/tmp"), &ctx);
         assert!(!result.success);
-        // Should fail at approve step (gh not found or approve fails)
-        // and include "approve failed" in the message.
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
         assert!(
             result.message.contains("approve failed")
                 || result.message.contains("failed to run gh"),
             "expected approve-failure message, got: {}",
             result.message
+        );
+    }
+
+    #[test]
+    fn classify_retryable_merge_conflict() {
+        assert_eq!(
+            classify_merge_failure("Merge conflict in src/main.rs"),
+            MergeFailureKind::Retryable,
+        );
+    }
+
+    #[test]
+    fn classify_retryable_branch_behind() {
+        assert_eq!(
+            classify_merge_failure("the branch is behind the base branch"),
+            MergeFailureKind::Retryable,
+        );
+    }
+
+    #[test]
+    fn classify_retryable_head_modified() {
+        assert_eq!(
+            classify_merge_failure("Head branch was modified. Review and try the merge again."),
+            MergeFailureKind::Retryable,
+        );
+    }
+
+    #[test]
+    fn classify_retryable_out_of_date() {
+        assert_eq!(
+            classify_merge_failure("This branch is out of date with the base branch"),
+            MergeFailureKind::Retryable,
+        );
+    }
+
+    #[test]
+    fn classify_policy_blocked() {
+        assert_eq!(
+            classify_merge_failure("not mergeable: the base branch policy prohibits the merge"),
+            MergeFailureKind::PolicyBlocked,
+        );
+    }
+
+    #[test]
+    fn classify_policy_unknown_error() {
+        assert_eq!(
+            classify_merge_failure("some unknown gh error"),
+            MergeFailureKind::PolicyBlocked,
+        );
+    }
+
+    #[test]
+    fn classify_policy_failed_to_run() {
+        assert_eq!(
+            classify_merge_failure("failed to run gh: No such file or directory"),
+            MergeFailureKind::PolicyBlocked,
         );
     }
 }

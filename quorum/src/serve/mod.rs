@@ -339,78 +339,124 @@ async fn tick(
                             teardown_worker(config, wt_mgr, name_pool, w, "done").await;
                         }
                     } else {
-                        log(&format!(
-                            "PR #{pr_num} merge failed: {} — treating as changes",
-                            merge_result.message
-                        ));
-                        let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        let failure_kind = merge_result
+                            .failure_kind
+                            .unwrap_or(merge::MergeFailureKind::PolicyBlocked);
 
-                        if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
-                        {
-                            let next_round = workers[wi].rework_count + 1;
-                            if let Some(max) = config.limits.max_rework_rounds {
-                                if next_round > max {
-                                    let breach = LimitBreached::ReworkRounds {
-                                        count: next_round,
-                                        max,
-                                    };
-                                    log(&format!(
-                                        "WATCHDOG: worker {} killed (task #{}) — {}",
-                                        workers[wi].agent_name, workers[wi].task_id, breach
-                                    ));
+                        match failure_kind {
+                            merge::MergeFailureKind::PolicyBlocked => {
+                                log(&format!(
+                                    "MERGE BLOCKED: PR #{pr_num} merge failed \
+                                     (not worker-fixable): {} — parking task, \
+                                     tearing down both agents",
+                                    merge_result.message
+                                ));
+                                let reviewer_name = reviewers[ri].agent_name.clone();
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
+
+                                if let Some(wi) =
+                                    workers.iter().position(|w| w.task_id == reviewer_task_id)
+                                {
+                                    let park_body = format!(
+                                        "daemon:merge-blocked | PR #{pr_num} | \
+                                         reviewer={reviewer_name} verdict=approved \
+                                         (task #{reviewer_task_id}) | {msg}",
+                                        msg = merge_result.message
+                                    );
                                     let w = workers.remove(wi);
-                                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
-                                    if !consume_mailbox_row(&db_path, *id).await {
-                                        break;
-                                    }
-                                    break;
+                                    teardown_worker_with_body(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        w,
+                                        "cancelled",
+                                        Some(&park_body),
+                                    )
+                                    .await;
                                 }
                             }
-
-                            let rework_msg = format!(
-                                "Merge of PR #{pr_num} failed: {}\n\n\
-                                 Fix the issue and push again.",
-                                merge_result.message
-                            );
-                            let rework_turn = reviewer::build_rework_turn(
-                                &workers[wi].agent_name,
-                                workers[wi].task_id,
-                                pr_num,
-                                &rework_msg,
-                            );
-                            if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
+                            merge::MergeFailureKind::Retryable => {
                                 log(&format!(
-                                    "merge-failure rework feed failed: {e} — \
-                                     tearing down broken worker"
+                                    "PR #{pr_num} merge failed (retryable): {} \
+                                     — sending rework",
+                                    merge_result.message
                                 ));
-                                let w = workers.remove(wi);
-                                teardown_worker(config, wt_mgr, name_pool, w, "open").await;
-                            } else {
-                                let w = &mut workers[wi];
-                                w.draining = true;
-                                w.pr = None;
-                                w.rework_count += 1;
-                                w.turn_started_at = std::time::Instant::now();
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
 
-                                if let Some(ref mut sl) = w.session_log {
-                                    sl.log_rework(w.rework_count);
+                                if let Some(wi) =
+                                    workers.iter().position(|w| w.task_id == reviewer_task_id)
+                                {
+                                    let next_round = workers[wi].rework_count + 1;
+                                    if let Some(max) = config.limits.max_rework_rounds {
+                                        if next_round > max {
+                                            let breach = LimitBreached::ReworkRounds {
+                                                count: next_round,
+                                                max,
+                                            };
+                                            log(&format!(
+                                                "WATCHDOG: worker {} killed (task #{}) — {}",
+                                                workers[wi].agent_name, workers[wi].task_id, breach
+                                            ));
+                                            let w = workers.remove(wi);
+                                            teardown_worker(config, wt_mgr, name_pool, w, "open")
+                                                .await;
+                                            if !consume_mailbox_row(&db_path, *id).await {
+                                                break;
+                                            }
+                                            break;
+                                        }
+                                    }
+
+                                    let rework_msg = format!(
+                                        "Merge of PR #{pr_num} failed: {}\n\n\
+                                         Rebase on main, resolve any conflicts, \
+                                         and push again.",
+                                        merge_result.message
+                                    );
+                                    let rework_turn = reviewer::build_rework_turn(
+                                        &workers[wi].agent_name,
+                                        workers[wi].task_id,
+                                        pr_num,
+                                        &rework_msg,
+                                    );
+                                    if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
+                                        log(&format!(
+                                            "merge-failure rework feed failed: {e} — \
+                                             tearing down broken worker"
+                                        ));
+                                        let w = workers.remove(wi);
+                                        teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                    } else {
+                                        let w = &mut workers[wi];
+                                        w.draining = true;
+                                        w.pr = None;
+                                        w.rework_count += 1;
+                                        w.turn_started_at = std::time::Instant::now();
+
+                                        if let Some(ref mut sl) = w.session_log {
+                                            sl.log_rework(w.rework_count);
+                                        }
+
+                                        let p = db_path.clone();
+                                        let entry = slot_journal_entry(w, "worker", "working");
+                                        tokio::task::spawn_blocking(move || -> Result<()> {
+                                            let mut conn = quorum_core::db::open(&p)?;
+                                            journal::upsert(&mut conn, &entry)
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            QuorumError::Io(format!("spawn_blocking join: {e}"))
+                                        })?
+                                        .ok();
+
+                                        log(&format!(
+                                            "worker {} rework #{} (merge failure)",
+                                            w.agent_name, w.rework_count
+                                        ));
+                                    }
                                 }
-
-                                let p = db_path.clone();
-                                let entry = slot_journal_entry(w, "worker", "working");
-                                tokio::task::spawn_blocking(move || -> Result<()> {
-                                    let mut conn = quorum_core::db::open(&p)?;
-                                    journal::upsert(&mut conn, &entry)
-                                })
-                                .await
-                                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                                .ok();
-
-                                log(&format!(
-                                    "worker {} rework #{} (merge failure)",
-                                    w.agent_name, w.rework_count
-                                ));
                             }
                         }
                     }
@@ -1442,8 +1488,19 @@ async fn teardown_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
+    state: SlotState,
+    task_status: &str,
+) {
+    teardown_worker_with_body(config, wt_mgr, name_pool, state, task_status, None).await;
+}
+
+async fn teardown_worker_with_body(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
     mut state: SlotState,
     task_status: &str,
+    body: Option<&str>,
 ) {
     log(&format!(
         "tearing down worker {} (task #{} -> {task_status})",
@@ -1465,12 +1522,13 @@ async fn teardown_worker(
     let agent = state.agent_name.clone();
     let task_id = state.task_id;
     let status = task_status.to_string();
+    let body_owned = body.map(|s| s.to_string());
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
         let fields = tasks::TaskUpdate {
             status: Some(&status),
-            body: None,
+            body: body_owned.as_deref(),
             refs: None,
             verdict: None,
         };
