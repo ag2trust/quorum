@@ -62,47 +62,35 @@ pub async fn spawn_reviewer(
 }
 
 pub fn build_worker_turn(agent_name: &str, task_id: i64, title: &str, body: &str) -> String {
-    let turn = serde_json::json!({
-        "type": "user",
-        "message": {
-            "content": format!(
-                "You are agent {agent}. Task #{task_id}: {title}\n\n\
-                 {body}\n\n\
-                 When your work is complete:\n\
-                 1. Push your branch and open a PR with: gh pr create\n\
-                 2. Signal completion with the PR number: quorum done --agent {agent} --pr <PR_NUMBER>\n\
-                 3. Post progress notes by writing text to a temp file, then: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
-                 Do NOT mark the task done yourself — the daemon handles task lifecycle.",
-                agent = agent_name,
-                task_id = task_id,
-                title = title,
-                body = body,
-            )
-        }
-    });
-    turn.to_string()
+    super::agent::user_turn(&format!(
+        "You are agent {agent}. Task #{task_id}: {title}\n\n\
+         {body}\n\n\
+         When your work is complete:\n\
+         1. Push your branch and open a PR with: gh pr create\n\
+         2. Signal completion with the PR number: quorum done --agent {agent} --pr <PR_NUMBER>\n\
+         3. Post progress notes by writing text to a temp file, then: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+        agent = agent_name,
+        task_id = task_id,
+        title = title,
+        body = body,
+    ))
 }
 
 pub fn build_rework_turn(agent_name: &str, task_id: i64, pr: i64, feedback: &str) -> String {
-    let turn = serde_json::json!({
-        "type": "user",
-        "message": {
-            "content": format!(
-                "REVIEW FAILED — the reviewer requested changes. Fix the following feedback and push again:\n\n\
-                 {feedback}\n\n\
-                 After fixing and pushing:\n\
-                 1. Run preflight: ./preflight.sh\n\
-                 2. Re-signal completion with your PR number: quorum done --agent {agent} --pr {pr}\n\
-                 3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
-                 Do NOT mark the task done yourself — the daemon handles task lifecycle.",
-                feedback = feedback,
-                agent = agent_name,
-                pr = pr,
-                task_id = task_id,
-            )
-        }
-    });
-    turn.to_string()
+    super::agent::user_turn(&format!(
+        "REVIEW FAILED — the reviewer requested changes. Fix the following feedback and push again:\n\n\
+         {feedback}\n\n\
+         After fixing and pushing:\n\
+         1. Run preflight: ./preflight.sh\n\
+         2. Re-signal completion with your PR number: quorum done --agent {agent} --pr {pr}\n\
+         3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+        feedback = feedback,
+        agent = agent_name,
+        pr = pr,
+        task_id = task_id,
+    ))
 }
 
 #[cfg(test)]
@@ -149,6 +137,10 @@ mod tests {
         assert!(turn.contains("Fix error handling in main.rs"));
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         assert_eq!(parsed["type"], "user");
+        assert_eq!(
+            parsed["message"]["role"], "user",
+            "claude CLI exits 1 on turns without message.role"
+        );
     }
 
     #[test]
@@ -181,6 +173,10 @@ mod tests {
         assert!(turn.contains("Detailed body text"));
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         assert_eq!(parsed["type"], "user");
+        assert_eq!(
+            parsed["message"]["role"], "user",
+            "claude CLI exits 1 on turns without message.role"
+        );
     }
 
     #[test]

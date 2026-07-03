@@ -21,6 +21,17 @@ pub struct AgentProc {
     reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
+/// Build a stream-json user turn. The claude CLI requires `message.role` and
+/// exits 1 on the first message without it — every turn fed to an agent MUST
+/// go through this helper (first live run died instantly on a role-less turn).
+pub fn user_turn(content: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": content }
+    })
+    .to_string()
+}
+
 impl AgentProc {
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
         let bin = agent_bin.unwrap_or("claude");
@@ -51,9 +62,14 @@ impl AgentProc {
             cmd.arg("--bare");
         }
 
+        // Run the agent inside its worktree — `--add-dir` only grants access,
+        // it does not set the working directory (first live run: workers ran
+        // in the daemon's cwd). Inherit stderr so CLI-level failures surface
+        // in the daemon log instead of vanishing (same run: exit-1 cause lost).
+        cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -129,5 +145,22 @@ impl AgentProc {
         }
         // Reap the child to avoid zombie accumulation
         let _ = self.child.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_turn_has_type_role_and_content() {
+        let turn = user_turn("hello world");
+        let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(
+            parsed["message"]["role"], "user",
+            "claude CLI exits 1 on turns without message.role"
+        );
+        assert_eq!(parsed["message"]["content"], "hello world");
     }
 }
