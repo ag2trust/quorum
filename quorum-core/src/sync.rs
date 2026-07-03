@@ -137,7 +137,7 @@ pub struct RetireView {
     /// Budget for `tasks_completed` that triggered retirement (or would have, if the
     /// active-secs budget tripped first).
     pub budget_tasks: i64,
-    /// Wall-clock seconds since `first_seen` — how long this agent has been alive.
+    /// Wall-clock seconds since session start (session-adjusted `first_seen`).
     pub total_wall_secs: i64,
     /// Budget for wall-clock lifetime. Agent retires when `total_wall_secs >= budget_wall_secs`.
     pub budget_wall_secs: i64,
@@ -291,10 +291,14 @@ pub fn gather_with_budget(
     // 1a. Retirement signal (issue #97). Read the agent's persisted retire_status — it may
     //     already have been promoted to 'retiring'/'retired' on a prior tick. Also compute
     //     the load score once; both `retire` AND the next_task gate need it.
+    //     Issue #125: use session-aware read so a returning agent (retired or offline)
+    //     sees reset values matching what touch() will write — prevents insta-retire on
+    //     name reuse.
     let (tasks_completed, total_active_secs) = crate::stats::load_score_for(conn, agent)?;
-    let (persisted_status, persisted_retired_at) = crate::agents::retire_state(conn, agent)?;
-    // Wall-clock lifetime: how long since the agent first appeared.
-    let total_wall_secs = crate::agents::first_seen(conn, agent)?
+    let (persisted_status, persisted_retired_at, effective_first_seen) =
+        crate::agents::session_aware_retire_info(conn, agent, now)?;
+    // Wall-clock lifetime: how long since the (session-adjusted) first_seen.
+    let total_wall_secs = effective_first_seen
         .map(|fs| (now - fs).max(0))
         .unwrap_or(0);
 
@@ -2169,18 +2173,22 @@ mod tests {
         for i in 0..4 {
             drive_done(&mut c, "End", 1000 + i * 5000, 1000 + i * 5000 + 1800);
         }
+        // Keep agent online between last drive_done and the retirement tick.
+        for t in (17800..=29500).step_by(800) {
+            crate::agents::touch(&c, "End", t).unwrap();
+        }
         let snap1 = tick_with_budget(&mut c, "End", &[], 30_000, 5400, 8, i64::MAX).unwrap();
         assert_eq!(snap1.retire.as_ref().unwrap().status, "retired");
-        // First tick: retired_at not yet persisted at the read step (write follows).
         // Verify the persisted state.
         let (st, ts) = crate::agents::retire_state(&c, "End").unwrap();
         assert_eq!(st, "retired");
         let stamped = ts.expect("retired_at must be stamped");
         assert_eq!(stamped, 30_000);
 
-        // Second tick at a later `now` — retire signal should still fire, carry the
-        // ORIGINAL retired_at (idempotent: mark_retired must not re-stamp).
-        let snap2 = tick_with_budget(&mut c, "End", &[], 31_000, 5400, 8, i64::MAX).unwrap();
+        // Second tick within ONLINE_WINDOW — retire signal should still fire, carry the
+        // ORIGINAL retired_at (idempotent: mark_retired must not re-stamp). Gap < 900
+        // so session reset does NOT fire.
+        let snap2 = tick_with_budget(&mut c, "End", &[], 30_800, 5400, 8, i64::MAX).unwrap();
         let r = snap2.retire.as_ref().expect("retire signal still present");
         assert_eq!(r.status, "retired");
         assert_eq!(r.retired_at, Some(30_000));
@@ -2235,12 +2243,16 @@ mod tests {
     fn retire_wall_clock_budget_triggers_retirement() {
         // An agent with minimal task load but alive longer than the wall-clock budget
         // must retire. This is the idle-session backstop: 1 short task, well under
-        // active-secs and tasks-count budgets, but first_seen is >3600s ago.
+        // active-secs and tasks-count budgets, but continuously online past the wall cap.
         let (_d, mut c) = open_tmp();
         // One short task completed early in the agent's life.
         drive_done(&mut c, "Idle", 100, 110);
-        // now=4000 → wall-clock = 4000 - first_seen. first_seen is the first touch
-        // timestamp from drive_done (100). So total_wall = 4000-100 = 3900 > 3600.
+        // Keep agent online with periodic ticks (gap < ONLINE_WINDOW_SECS=900) so the
+        // session is continuous and wall-clock accumulates.
+        for t in (110..=3700).step_by(800) {
+            crate::agents::touch(&c, "Idle", t).unwrap();
+        }
+        // now=4000 → wall-clock = 4000 - first_seen(100) = 3900 > 3600.
         let snap = gather_with_budget(&c, "Idle", &[], 4000, 5400, 8, 3600).unwrap();
         let r = snap
             .retire
@@ -2352,6 +2364,55 @@ mod tests {
             task.sticky_until,
             Some(now_base + 5000),
             "sticky_until must be preserved for online agent"
+        );
+    }
+
+    // --- #125: session reset — reused names must not insta-retire --------------------------
+
+    #[test]
+    fn reused_name_after_retirement_does_not_insta_retire() {
+        // Issue #125 acceptance: agent retires during session 1, then the same name
+        // returns hours later → sync returns NO retire signal; wall budget counts from
+        // the new session start.
+        let (_d, mut c) = open_tmp();
+        // Session 1: agent starts at t=1000 and ticks every 500s (staying online —
+        // gaps < ONLINE_WINDOW_SECS=900) until the wall-clock cap fires.
+        for t in (1000..=4500).step_by(500) {
+            let _ = tick_with_budget(&mut c, "Reuse", &[], t, 5400, 8, 3600).unwrap();
+        }
+        let snap1 = tick_with_budget(&mut c, "Reuse", &[], 4700, 5400, 8, 3600).unwrap();
+        assert_eq!(
+            snap1.retire.as_ref().unwrap().status,
+            "retired",
+            "first session must retire via wall-clock"
+        );
+        // Session 2: same name returns 2 hours later. touch resets the session.
+        let t2 = 4700 + 7200;
+        let _new_task = make_task(&mut c, "fresh-work", 5, None, t2 - 1);
+        let snap2 = tick_with_budget(&mut c, "Reuse", &[], t2, 5400, 8, 3600).unwrap();
+        assert!(
+            snap2.retire.is_none(),
+            "returning agent must NOT be insta-retired — session was reset"
+        );
+        assert!(
+            snap2.next_task.is_some(),
+            "returning agent must see available work"
+        );
+    }
+
+    #[test]
+    fn reused_name_after_offline_gap_resets_wall_clock() {
+        // A name that went offline (no retirement) and returns should have its wall-clock
+        // budget count from the new session, not from original first_seen.
+        let (_d, mut c) = open_tmp();
+        // Session 1: agent at t=1000. No retirement trigger.
+        let _ = tick_with_budget(&mut c, "Gap", &[], 1000, 5400, 8, 3600).unwrap();
+        // Agent goes offline. Returns at t=5000 (4000s gap > ONLINE_WINDOW).
+        // tick at t=5000 should NOT retire: wall = 0 (reset), not 4000.
+        let snap = tick_with_budget(&mut c, "Gap", &[], 5000, 5400, 8, 3600).unwrap();
+        assert!(
+            snap.retire.is_none(),
+            "returning agent after offline gap must not retire from old wall-clock"
         );
     }
 

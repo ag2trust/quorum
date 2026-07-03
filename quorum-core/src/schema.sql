@@ -7,9 +7,9 @@ CREATE TABLE IF NOT EXISTS agents (
     last_seen     INTEGER NOT NULL,
     tier          TEXT,
     -- Agent-retirement state machine (issue #97): 'active' | 'retiring' | 'retired'.
-    -- Transitions are computed inside `sync::tick` from the load_score budget; once an
-    -- agent reaches 'retired' it stays there for this DB's lifetime (a fresh session
-    -- name is a fresh agent row).
+    -- Transitions are computed inside `sync::tick` from the load_score budget.
+    -- Session reset (issue #125): when a returning agent's offline gap >= ONLINE_WINDOW,
+    -- `touch` resets first_seen + retire_status + retired_at — reused names start fresh.
     retire_status TEXT NOT NULL DEFAULT 'active',
     -- Unix-ts the agent reached 'retired' (NULL until then). Surfaced in `quorum status`
     -- under the retired-agents list so the owner sees capacity dropping in real time.
