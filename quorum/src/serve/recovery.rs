@@ -279,6 +279,7 @@ pub(crate) async fn recover(
                             turn_started_at: now_instant,
                             agent_state: entry.agent_state.clone(),
                             session_log,
+                            task_repo: None,
                         });
 
                         log(&format!(
