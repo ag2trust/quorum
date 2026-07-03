@@ -428,6 +428,11 @@ pub enum Command {
         /// Interval between git ls-remote sha polls (seconds). Default: 60.
         #[arg(long, default_value = "60", hide = true)]
         sha_poll_interval_secs: u64,
+        /// Only pull tasks whose refs.repo matches this value (e.g. "ag2trust/quorum").
+        /// Tasks with no refs.repo are skipped when this filter is set.
+        /// Can be specified multiple times to accept several repos.
+        #[arg(long)]
+        only_repo: Vec<String>,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.

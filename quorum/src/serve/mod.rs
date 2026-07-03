@@ -241,12 +241,23 @@ pub struct ServeConfig {
     pub merge_checks_timeout_secs: u64,
     /// Poll interval for status checks (seconds). Default: 30.
     pub merge_checks_poll_secs: u64,
+    /// When non-empty, only pull tasks whose `refs.repo` matches one of these values.
+    /// Tasks with no `refs.repo` are skipped when the filter is set.
+    pub only_repo: Vec<String>,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
-    log(&format!("starting (cap={})", config.cap));
+    if config.only_repo.is_empty() {
+        log(&format!("starting (cap={})", config.cap));
+    } else {
+        log(&format!(
+            "starting (cap={}, only-repo={})",
+            config.cap,
+            config.only_repo.join(",")
+        ));
+    }
 
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
@@ -369,6 +380,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut poison_tracker = PoisonTracker::new();
     let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
+    let mut repo_filter_logged: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -474,6 +486,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             &mut poison_tracker,
             &mut reviewer_provision_tracker,
             &mut drain_state,
+            &mut repo_filter_logged,
         )
         .await
         {
@@ -492,6 +505,7 @@ async fn tick(
     poison_tracker: &mut PoisonTracker,
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
+    repo_filter_logged: &mut std::collections::HashSet<i64>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -1319,7 +1333,16 @@ async fn tick(
     // Skip during drain — no new tasks, let existing agents finish.
     if !drain_state.draining {
         while workers.len() < config.cap {
-            if !spawn_worker(config, wt_mgr, name_pool, workers, poison_tracker).await? {
+            if !spawn_worker(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                poison_tracker,
+                repo_filter_logged,
+            )
+            .await?
+            {
                 break;
             }
         }
@@ -1832,6 +1855,24 @@ async fn spawn_reviewer_for_worker(
     Ok(())
 }
 
+/// Returns true if the task's `refs.repo` passes the `--only-repo` filter.
+/// When the filter is empty (unset), all tasks pass. When set, a task must have a
+/// `refs.repo` that matches one of the allowed repos; tasks with no `refs.repo` are skipped.
+fn task_matches_repo_filter(task: &tasks::Task, only_repo: &[String]) -> bool {
+    if only_repo.is_empty() {
+        return true;
+    }
+    let refs_repo = task
+        .refs
+        .as_deref()
+        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
+        .and_then(|v| v.get("repo").and_then(|r| r.as_str()).map(str::to_string));
+    match refs_repo {
+        Some(repo) => only_repo.iter().any(|allowed| allowed == &repo),
+        None => false,
+    }
+}
+
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 async fn spawn_worker(
@@ -1840,6 +1881,7 @@ async fn spawn_worker(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
+    repo_filter_logged: &mut std::collections::HashSet<i64>,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
     let p = db_path.clone();
@@ -1852,15 +1894,34 @@ async fn spawn_worker(
         .map(|(&id, _)| id)
         .collect();
 
-    let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+    type PullResult = (Option<tasks::Task>, Vec<(i64, String)>);
+    let only_repo = config.only_repo.clone();
+    let (ready_task, skipped) = tokio::task::spawn_blocking(move || -> Result<PullResult> {
         let conn = quorum_core::db::open(&p)?;
         let open = tasks::list(&conn, Some("open"), None, None)?;
-        Ok(open
-            .into_iter()
-            .find(|t| t.ready && !in_flight.contains(&t.id) && !poisoned.contains(&t.id)))
+        let mut skipped: Vec<(i64, String)> = Vec::new();
+        let found = open.into_iter().find(|t| {
+            if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
+                return false;
+            }
+            if !task_matches_repo_filter(t, &only_repo) {
+                skipped.push((t.id, t.title.clone()));
+                return false;
+            }
+            true
+        });
+        Ok((found, skipped))
     })
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
+
+    for (id, title) in skipped {
+        if repo_filter_logged.insert(id) {
+            log(&format!(
+                "skipping task #{id} ({title}): refs.repo does not match --only-repo filter"
+            ));
+        }
+    }
 
     let task = match ready_task {
         Some(t) => t,
@@ -2693,5 +2754,82 @@ mod tests {
             !tracker.is_exhausted(1, 43),
             "different PR on same task must not be exhausted"
         );
+    }
+
+    fn make_task(id: i64, refs: Option<&str>) -> tasks::Task {
+        tasks::Task {
+            id,
+            title: format!("task-{id}"),
+            body: None,
+            status: "open".into(),
+            priority: 0,
+            labels: None,
+            assignee: None,
+            created_by: "test".into(),
+            created_at: 0,
+            updated_at: 0,
+            refs: refs.map(str::to_string),
+            depends_on: None,
+            sticky_until: None,
+            orig: None,
+            ready: true,
+        }
+    }
+
+    #[test]
+    fn repo_filter_empty_passes_all() {
+        let t = make_task(1, Some(r#"{"repo":"ag2trust/quorum"}"#));
+        assert!(task_matches_repo_filter(&t, &[]));
+        let t_none = make_task(2, None);
+        assert!(task_matches_repo_filter(&t_none, &[]));
+    }
+
+    #[test]
+    fn repo_filter_matches_exact_repo() {
+        let filter = vec!["ag2trust/quorum".to_string()];
+        let t = make_task(1, Some(r#"{"repo":"ag2trust/quorum"}"#));
+        assert!(task_matches_repo_filter(&t, &filter));
+    }
+
+    #[test]
+    fn repo_filter_rejects_wrong_repo() {
+        let filter = vec!["ag2trust/quorum".to_string()];
+        let t = make_task(1, Some(r#"{"repo":"ag2trust/other"}"#));
+        assert!(!task_matches_repo_filter(&t, &filter));
+    }
+
+    #[test]
+    fn repo_filter_rejects_no_refs() {
+        let filter = vec!["ag2trust/quorum".to_string()];
+        let t = make_task(1, None);
+        assert!(!task_matches_repo_filter(&t, &filter));
+    }
+
+    #[test]
+    fn repo_filter_rejects_refs_without_repo_key() {
+        let filter = vec!["ag2trust/quorum".to_string()];
+        let t = make_task(1, Some(r#"{"issue":42}"#));
+        assert!(!task_matches_repo_filter(&t, &filter));
+    }
+
+    #[test]
+    fn repo_filter_rejects_malformed_json() {
+        let filter = vec!["ag2trust/quorum".to_string()];
+        let t = make_task(1, Some("not json"));
+        assert!(!task_matches_repo_filter(&t, &filter));
+    }
+
+    #[test]
+    fn repo_filter_multiple_repos() {
+        let filter = vec![
+            "ag2trust/quorum".to_string(),
+            "ag2trust/ag2trust".to_string(),
+        ];
+        let t1 = make_task(1, Some(r#"{"repo":"ag2trust/quorum"}"#));
+        let t2 = make_task(2, Some(r#"{"repo":"ag2trust/ag2trust"}"#));
+        let t3 = make_task(3, Some(r#"{"repo":"ag2trust/other"}"#));
+        assert!(task_matches_repo_filter(&t1, &filter));
+        assert!(task_matches_repo_filter(&t2, &filter));
+        assert!(!task_matches_repo_filter(&t3, &filter));
     }
 }
