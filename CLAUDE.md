@@ -94,7 +94,15 @@ cargo fmt --all
 ./dev-install.sh --verify-only   # just check the installed binary is current
 quorum init                      # create ~/.quorum/, DB, default config (idempotent)
 quorum help                      # one-call cheat-sheet for agents (alias: help-agent)
+scripts/serve-supervisor.sh [flags]  # supervised serve: auto-rebuild on exit 75
 ```
+
+**Supervised launch (recommended).** Use `scripts/serve-supervisor.sh` instead of bare
+`quorum serve` when running with `--self-update-drain`. The supervisor catches exit 75,
+runs `git fetch origin main` + `./dev-install.sh` to rebuild, and relaunches. Build
+failures relaunch the old binary with a loud alert; non-75 exits propagate (no loop).
+A thrash guard caps restarts at 6/hour. This replaces the former manual "rebuild binary
+on quorum merges" standing duty.
 
 **After pulling new source, always run `./dev-install.sh`** — it builds, replaces the
 installed binary at `~/.local/bin/quorum`, and verifies that required subcommands (`sync`,
