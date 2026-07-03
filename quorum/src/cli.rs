@@ -396,6 +396,10 @@ pub enum Command {
         /// Max rework rounds before giving up on a task.
         #[arg(long)]
         max_rework_rounds: Option<u32>,
+        /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
+        /// Defaults to {quorum_home}/logs when omitted.
+        #[arg(long)]
+        log_dir: Option<String>,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.

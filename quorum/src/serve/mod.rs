@@ -7,6 +7,7 @@ pub mod agent;
 pub mod merge;
 pub mod names;
 pub mod reviewer;
+pub mod session_log;
 pub mod stream;
 pub mod worktree;
 
@@ -66,6 +67,25 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
+    JournalEntry {
+        agent: slot.agent_name.clone(),
+        role: role.into(),
+        task_id: Some(slot.task_id),
+        session_id: slot.session_id.clone(),
+        worktree: Some(slot.worktree_path.to_string_lossy().into()),
+        branch: Some(slot.branch.clone()),
+        phase: phase.into(),
+        cost_tokens: slot.cost_tokens,
+        agent_state: slot.agent_state.clone(),
+        cost_usd: slot.cost_usd,
+        log_dir: slot
+            .session_log
+            .as_ref()
+            .map(|l| l.dir().to_string_lossy().into()),
+    }
+}
+
 /// Per-turn / per-task ceilings. `None` = unlimited.
 /// All limits fail-closed: exceeding kills the agent and releases the task.
 #[derive(Debug, Clone, Default)]
@@ -94,6 +114,8 @@ pub struct ServeConfig {
     /// plugins, memory, and MCP config. Default: true.
     pub bare_agent: bool,
     pub limits: CostLimits,
+    /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
+    pub log_dir: Option<PathBuf>,
 }
 
 pub fn run_serve(config: ServeConfig) -> Result<()> {
@@ -120,6 +142,7 @@ struct SlotState {
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
     agent_state: Option<String>,
+    session_log: Option<session_log::SessionLog>,
 }
 
 async fn tick_loop(config: ServeConfig) -> Result<()> {
@@ -142,6 +165,18 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
 
     let mut name_pool = Pool::load(&config.names_file, config.cap)
         .map_err(|e| QuorumError::Io(format!("names pool: {e}")))?;
+
+    if let Some(ref log_dir) = config.log_dir {
+        let max_age = 7 * 24 * 3600; // 7 days
+        match session_log::sweep_logs(log_dir, max_age) {
+            Ok(0) => {}
+            Ok(n) => log(&format!(
+                "swept {n} old session log(s) from {}",
+                log_dir.display()
+            )),
+            Err(e) => log(&format!("log sweep warning: {e}")),
+        }
+    }
 
     let wt_mgr = WorktreeManager::new();
     let mut workers: Vec<SlotState> = Vec::new();
@@ -212,22 +247,12 @@ async fn tick(
                     workers[wi].agent_name, workers[wi].task_id,
                 ));
                 let p = db_path.clone();
-                let entry = JournalEntry {
-                    agent: workers[wi].agent_name.clone(),
-                    role: "worker".into(),
-                    task_id: Some(workers[wi].task_id),
-                    session_id: workers[wi].session_id.clone(),
-                    worktree: Some(workers[wi].worktree_path.to_string_lossy().into()),
-                    branch: Some(workers[wi].branch.clone()),
-                    phase: if workers[wi].draining {
-                        "working"
-                    } else {
-                        "awaiting-review"
-                    }
-                    .into(),
-                    cost_tokens: workers[wi].cost_tokens,
-                    agent_state: workers[wi].agent_state.clone(),
+                let phase = if workers[wi].draining {
+                    "working"
+                } else {
+                    "awaiting-review"
                 };
+                let entry = slot_journal_entry(&workers[wi], "worker", phase);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -342,18 +367,12 @@ async fn tick(
                                 w.rework_count += 1;
                                 w.turn_started_at = std::time::Instant::now();
 
+                                if let Some(ref mut sl) = w.session_log {
+                                    sl.log_rework(w.rework_count);
+                                }
+
                                 let p = db_path.clone();
-                                let entry = JournalEntry {
-                                    agent: w.agent_name.clone(),
-                                    role: "worker".into(),
-                                    task_id: Some(w.task_id),
-                                    session_id: w.session_id.clone(),
-                                    worktree: Some(w.worktree_path.to_string_lossy().into()),
-                                    branch: Some(w.branch.clone()),
-                                    phase: "working".into(),
-                                    cost_tokens: w.cost_tokens,
-                                    agent_state: w.agent_state.clone(),
-                                };
+                                let entry = slot_journal_entry(w, "worker", "working");
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let mut conn = quorum_core::db::open(&p)?;
                                     journal::upsert(&mut conn, &entry)
@@ -415,18 +434,12 @@ async fn tick(
                             w.rework_count += 1;
                             w.turn_started_at = std::time::Instant::now();
 
+                            if let Some(ref mut sl) = w.session_log {
+                                sl.log_rework(w.rework_count);
+                            }
+
                             let p = db_path.clone();
-                            let entry = JournalEntry {
-                                agent: w.agent_name.clone(),
-                                role: "worker".into(),
-                                task_id: Some(w.task_id),
-                                session_id: w.session_id.clone(),
-                                worktree: Some(w.worktree_path.to_string_lossy().into()),
-                                branch: Some(w.branch.clone()),
-                                phase: "working".into(),
-                                cost_tokens: w.cost_tokens,
-                                agent_state: w.agent_state.clone(),
-                            };
+                            let entry = slot_journal_entry(w, "worker", "working");
                             tokio::task::spawn_blocking(move || -> Result<()> {
                                 let mut conn = quorum_core::db::open(&p)?;
                                 journal::upsert(&mut conn, &entry)
@@ -868,23 +881,22 @@ async fn drain_events(
                     slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd
                 ));
 
+                if let Some(ref mut sl) = slot.session_log {
+                    sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                    sl.set_phase(if role == "worker" {
+                        "awaiting-review"
+                    } else {
+                        "reviewing"
+                    });
+                }
+
                 let p = db_path.to_path_buf();
                 let phase = if role == "worker" {
                     "awaiting-review"
                 } else {
                     "reviewing"
                 };
-                let entry = JournalEntry {
-                    agent: slot.agent_name.clone(),
-                    role: role.into(),
-                    task_id: Some(slot.task_id),
-                    session_id: slot.session_id.clone(),
-                    worktree: Some(slot.worktree_path.to_string_lossy().into()),
-                    branch: Some(slot.branch.clone()),
-                    phase: phase.into(),
-                    cost_tokens: slot.cost_tokens,
-                    agent_state: None,
-                };
+                let entry = slot_journal_entry(slot, role, phase);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -920,6 +932,10 @@ async fn drain_events(
                 }
             }
             _ => {}
+        }
+
+        if let Some(ref mut sl) = slot.session_log {
+            sl.log_event(&event);
         }
     }
     Ok(None)
@@ -988,6 +1004,19 @@ async fn spawn_reviewer_for_worker(
         }
     }
 
+    let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
+        session_log::SessionLog::create(
+            ld,
+            &reviewer_name,
+            "reviewer",
+            Some(worker.task_id),
+            &session_id,
+            &branch,
+            now_unix(),
+        )
+        .ok()
+    });
+
     // Journal: phase=reviewing, role=reviewer
     let p = config.db_path.clone();
     let entry = JournalEntry {
@@ -1000,6 +1029,10 @@ async fn spawn_reviewer_for_worker(
         phase: "reviewing".into(),
         cost_tokens: 0,
         agent_state: None,
+        cost_usd: 0.0,
+        log_dir: reviewer_session_log
+            .as_ref()
+            .map(|l| l.dir().to_string_lossy().into()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -1064,6 +1097,7 @@ async fn spawn_reviewer_for_worker(
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
                 agent_state: None,
+                session_log: reviewer_session_log,
             });
         }
         Err(e) => {
@@ -1197,6 +1231,19 @@ async fn spawn_worker(
         }
     }
 
+    let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
+        session_log::SessionLog::create(
+            ld,
+            &agent_name,
+            "worker",
+            Some(task.id),
+            &session_id,
+            &branch,
+            now_unix(),
+        )
+        .ok()
+    });
+
     // Journal: phase=working
     let p = config.db_path.clone();
     let entry = JournalEntry {
@@ -1209,6 +1256,10 @@ async fn spawn_worker(
         phase: "working".into(),
         cost_tokens: 0,
         agent_state: None,
+        cost_usd: 0.0,
+        log_dir: worker_session_log
+            .as_ref()
+            .map(|l| l.dir().to_string_lossy().into()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -1255,6 +1306,7 @@ async fn spawn_worker(
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
                 agent_state: None,
+                session_log: worker_session_log,
             });
         }
         Err(e) => {
@@ -1293,13 +1345,22 @@ async fn teardown_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
-    state: SlotState,
+    mut state: SlotState,
     task_status: &str,
 ) {
     log(&format!(
         "tearing down worker {} (task #{} -> {task_status})",
         state.agent_name, state.task_id
     ));
+
+    let verdict = if task_status == "done" {
+        Some("done")
+    } else {
+        None
+    };
+    if let Some(ref mut sl) = state.session_log {
+        sl.finalize(verdict);
+    }
 
     state.proc.kill_and_reap().await;
 
@@ -1337,9 +1398,13 @@ async fn teardown_reviewer(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
-    state: SlotState,
+    mut state: SlotState,
 ) {
     log(&format!("tearing down reviewer {}", state.agent_name));
+
+    if let Some(ref mut sl) = state.session_log {
+        sl.finalize(None);
+    }
 
     state.proc.kill_and_reap().await;
 
@@ -1443,6 +1508,7 @@ mod tests {
             task_started_at: now,
             turn_started_at: now,
             agent_state: None,
+            session_log: None,
         }
     }
 

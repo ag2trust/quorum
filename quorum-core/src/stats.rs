@@ -154,10 +154,10 @@ pub struct Throughput {
     pub done_stuck_count: i64,
 }
 
-/// M5: daemon in-flight agent view — read from the journal table. Shows workers
+/// Daemon in-flight agent view — read from the journal table. Shows workers
 /// and reviewers currently managed by the daemon, with their phase, cost, and
 /// self-reported agent state (blocked/failed/needs-info/note).
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, PartialEq)]
 pub struct DaemonAgentView {
     pub agent: String,
     pub role: String,
@@ -165,10 +165,12 @@ pub struct DaemonAgentView {
     pub phase: String,
     pub cost_tokens: i64,
     pub agent_state: Option<String>,
+    pub cost_usd: f64,
+    pub log_dir: Option<String>,
 }
 
 /// A point-in-time snapshot of the store.
-#[derive(Debug, Serialize, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, PartialEq, Default)]
 pub struct Stats {
     pub agents_total: i64,
     pub agents_online: i64,
@@ -716,7 +718,6 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
     })
 }
 
-/// M5: daemon in-flight agents from the journal table.
 fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
     let entries = crate::journal::list_in_flight(conn)?;
     Ok(entries
@@ -728,6 +729,8 @@ fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
             phase: e.phase,
             cost_tokens: e.cost_tokens,
             agent_state: e.agent_state,
+            cost_usd: e.cost_usd,
+            log_dir: e.log_dir,
         })
         .collect())
 }
@@ -1497,6 +1500,8 @@ mod tests {
                 phase: "working".into(),
                 cost_tokens: 500,
                 agent_state: Some("blocked".into()),
+                cost_usd: 0.05,
+                log_dir: Some("/tmp/logs/W1-123".into()),
             },
         )
         .unwrap();
@@ -1512,6 +1517,8 @@ mod tests {
                 phase: "reviewing".into(),
                 cost_tokens: 200,
                 agent_state: None,
+                cost_usd: 0.01,
+                log_dir: None,
             },
         )
         .unwrap();
@@ -1522,6 +1529,8 @@ mod tests {
         assert_eq!(w.agent, "W1");
         assert_eq!(w.task_id, Some(10));
         assert_eq!(w.agent_state.as_deref(), Some("blocked"));
+        assert!((w.cost_usd - 0.05).abs() < f64::EPSILON);
+        assert_eq!(w.log_dir.as_deref(), Some("/tmp/logs/W1-123"));
         let r = s
             .daemon_agents
             .iter()
@@ -1529,6 +1538,8 @@ mod tests {
             .unwrap();
         assert_eq!(r.agent, "R1");
         assert_eq!(r.agent_state, None);
+        assert!((r.cost_usd - 0.01).abs() < f64::EPSILON);
+        assert_eq!(r.log_dir, None);
     }
 
     #[test]

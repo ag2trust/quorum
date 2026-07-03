@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -189,6 +189,16 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // tracked agent reactions (blocked/failed/needs-info/note).
         if current < 13 && !column_exists(conn, "journal", "agent_state")? {
             conn.execute("ALTER TABLE journal ADD COLUMN agent_state TEXT", [])?;
+        }
+        // v14 = M6 logging: journal.cost_usd + journal.log_dir for live status display.
+        if current < 14 && !column_exists(conn, "journal", "cost_usd")? {
+            conn.execute(
+                "ALTER TABLE journal ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0.0",
+                [],
+            )?;
+        }
+        if current < 14 && !column_exists(conn, "journal", "log_dir")? {
+            conn.execute("ALTER TABLE journal ADD COLUMN log_dir TEXT", [])?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -870,5 +880,64 @@ mod tests {
             )
             .unwrap();
         assert!(state.is_none(), "pre-existing row must default to NULL");
+    }
+
+    #[test]
+    fn migrates_v13_to_v14_adds_journal_cost_usd_and_log_dir() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE journal (
+                 agent      TEXT PRIMARY KEY,
+                 role       TEXT NOT NULL,
+                 task_id    INTEGER,
+                 session_id TEXT NOT NULL,
+                 worktree   TEXT,
+                 branch     TEXT,
+                 phase      TEXT NOT NULL DEFAULT 'working',
+                 expected_signal TEXT,
+                 cost_tokens INTEGER NOT NULL DEFAULT 0,
+                 agent_state TEXT,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO journal(agent, role, task_id, session_id, phase, cost_tokens, updated_at)
+                 VALUES ('W1', 'worker', 42, 'sess-1', 'working', 1000, 100);
+             PRAGMA user_version = 13;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(
+            column_exists(&c, "journal", "cost_usd").unwrap(),
+            "cost_usd column missing — v13→v14 migration silently skipped"
+        );
+        assert!(
+            column_exists(&c, "journal", "log_dir").unwrap(),
+            "log_dir column missing — v13→v14 migration silently skipped"
+        );
+
+        let (cost_usd, log_dir): (f64, Option<String>) = c
+            .query_row(
+                "SELECT cost_usd, log_dir FROM journal WHERE agent='W1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            (cost_usd - 0.0).abs() < f64::EPSILON,
+            "pre-existing row defaults to 0.0"
+        );
+        assert!(log_dir.is_none(), "pre-existing row must default to NULL");
     }
 }
