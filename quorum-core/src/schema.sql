@@ -215,6 +215,10 @@ CREATE TABLE IF NOT EXISTS journal (
     -- NULL = normal (no reaction signaled). Set by the daemon when processing a
     -- task_update mailbox row; cleared on terminal transitions.
     agent_state     TEXT,
+    -- M6 logging: cumulative USD cost (session-level high-water mark from stream-json).
+    cost_usd        REAL NOT NULL DEFAULT 0.0,
+    -- M6 logging: filesystem path to this agent's session log directory.
+    log_dir         TEXT,
     updated_at      INTEGER NOT NULL
 );
 

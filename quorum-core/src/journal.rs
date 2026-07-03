@@ -10,7 +10,7 @@ use crate::error::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JournalEntry {
     pub agent: String,
     pub role: String,
@@ -21,6 +21,8 @@ pub struct JournalEntry {
     pub phase: String,
     pub cost_tokens: i64,
     pub agent_state: Option<String>,
+    pub cost_usd: f64,
+    pub log_dir: Option<String>,
 }
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
@@ -34,6 +36,8 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
         phase: r.get(6)?,
         cost_tokens: r.get(7)?,
         agent_state: r.get(8)?,
+        cost_usd: r.get(9)?,
+        log_dir: r.get(10)?,
     })
 }
 
@@ -41,8 +45,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
-        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(agent) DO UPDATE SET
              role = excluded.role,
              task_id = excluded.task_id,
@@ -52,6 +56,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
              phase = excluded.phase,
              cost_tokens = excluded.cost_tokens,
              agent_state = excluded.agent_state,
+             cost_usd = excluded.cost_usd,
+             log_dir = excluded.log_dir,
              updated_at = excluded.updated_at",
         params![
             entry.agent,
@@ -63,6 +69,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
             entry.phase,
             entry.cost_tokens,
             entry.agent_state,
+            entry.cost_usd,
+            entry.log_dir,
             now,
         ],
     )?;
@@ -72,7 +80,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
 
 pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir
          FROM journal
          ORDER BY agent",
     )?;
@@ -113,6 +121,8 @@ mod tests {
             phase: "working".into(),
             cost_tokens: 1000,
             agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
         }
     }
 

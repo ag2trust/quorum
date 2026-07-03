@@ -175,7 +175,7 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
         }
     }
 
-    // --- Daemon in-flight agents (M5 journal view) ---
+    // --- Daemon in-flight agents (journal view) ---
     if !s.daemon_agents.is_empty() {
         println!();
         println!("## daemon agents (in-flight)");
@@ -189,8 +189,18 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
                 .as_deref()
                 .map(|s| format!("  · state: {s}"))
                 .unwrap_or_default();
+            let cost_str = if d.cost_usd > 0.0 {
+                format!("  ${:.4}", d.cost_usd)
+            } else {
+                String::new()
+            };
+            let log_str = d
+                .log_dir
+                .as_deref()
+                .map(|p| format!("  log: {p}"))
+                .unwrap_or_default();
             println!(
-                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{state_str}",
+                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{cost_str}{state_str}{log_str}",
                 d.agent, d.role, task_str, d.phase, d.cost_tokens,
             );
         }
@@ -993,6 +1003,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_turn_wall_secs,
             max_task_wall_secs,
             max_rework_rounds,
+            log_dir,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
@@ -1012,6 +1023,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 max_task_wall_secs,
                 max_rework_rounds,
             };
+            let resolved_log_dir =
+                Some(log_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                    paths::home_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from(".quorum"))
+                        .join("logs")
+                }));
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
@@ -1024,6 +1041,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_executor,
                 bare_agent: !no_bare_agent,
                 limits,
+                log_dir: resolved_log_dir,
             };
             serve::run_serve(config)?;
             Ok(0)
