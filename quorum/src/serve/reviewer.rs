@@ -83,13 +83,22 @@ pub fn build_worker_turn(agent_name: &str, task_id: i64, title: &str, body: &str
     turn.to_string()
 }
 
-pub fn build_rework_turn(feedback: &str) -> String {
+pub fn build_rework_turn(agent_name: &str, task_id: i64, pr: i64, feedback: &str) -> String {
     let turn = serde_json::json!({
         "type": "user",
         "message": {
             "content": format!(
-                "REVIEW FAILED — the reviewer requested changes. Fix the following feedback and push again:\n\n{}",
-                feedback
+                "REVIEW FAILED — the reviewer requested changes. Fix the following feedback and push again:\n\n\
+                 {feedback}\n\n\
+                 After fixing and pushing:\n\
+                 1. Run preflight: ./preflight.sh\n\
+                 2. Re-signal completion with your PR number: quorum done --agent {agent} --pr {pr}\n\
+                 3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+                 Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+                feedback = feedback,
+                agent = agent_name,
+                pr = pr,
+                task_id = task_id,
             )
         }
     });
@@ -135,11 +144,32 @@ mod tests {
 
     #[test]
     fn rework_turn_contains_feedback_and_review_failed() {
-        let turn = build_rework_turn("Fix error handling in main.rs");
+        let turn = build_rework_turn("W-1", 42, 99, "Fix error handling in main.rs");
         assert!(turn.contains("REVIEW FAILED"));
         assert!(turn.contains("Fix error handling in main.rs"));
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         assert_eq!(parsed["type"], "user");
+    }
+
+    #[test]
+    fn rework_turn_contains_done_pr_re_signal() {
+        let turn = build_rework_turn("W-1", 42, 99, "fix it");
+        assert!(
+            turn.contains("quorum done --agent W-1 --pr 99"),
+            "rework template must instruct agent to re-signal done with PR number"
+        );
+        assert!(
+            turn.contains("quorum task-update --task-id 42 --agent W-1 --note-file"),
+            "rework template must instruct agent to post progress notes"
+        );
+        assert!(
+            turn.contains("Do NOT mark the task done yourself"),
+            "rework template must warn against manual task-done"
+        );
+        assert!(
+            turn.contains("preflight"),
+            "rework template must instruct agent to run preflight"
+        );
     }
 
     #[test]
@@ -190,7 +220,7 @@ mod tests {
         let templates: &[(&str, String)] = &[
             ("worker", build_worker_turn("A", 1, "t", "b")),
             ("reviewer", build_review_prompt(&spec)),
-            ("rework", build_rework_turn("fix it")),
+            ("rework", build_rework_turn("A", 1, 1, "fix it")),
         ];
 
         let clap_cmd = crate::cli::Cli::command();
