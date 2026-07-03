@@ -229,7 +229,7 @@ pub struct ServeConfig {
     pub limits: CostLimits,
     /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
     pub log_dir: Option<PathBuf>,
-    /// When true, the daemon drains and exits 75 when its own repo's main advances.
+    /// When true, the daemon drains and exits 75 when its own repo's base branch advances.
     pub self_update_drain: bool,
     /// Seconds to wait for in-flight agents during drain before SIGTERM.
     pub drain_timeout_secs: u64,
@@ -244,6 +244,9 @@ pub struct ServeConfig {
     /// When non-empty, only pull tasks whose `refs.repo` matches one of these values.
     /// Tasks with no `refs.repo` are skipped when the filter is set.
     pub only_repo: Vec<String>,
+    /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
+    /// provisioning, and merge targeting.
+    pub base_branch: String,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -284,10 +287,11 @@ pub(crate) struct SlotState {
     task_repo: Option<String>,
 }
 
-/// Snapshot the sha of origin/main via `git ls-remote`. Returns None on any failure.
-fn poll_origin_main_sha(repo_dir: &std::path::Path) -> Option<String> {
+/// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
+fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Option<String> {
+    let refspec = format!("refs/heads/{}", base_branch);
     let output = std::process::Command::new("git")
-        .args(["ls-remote", "origin", "refs/heads/main"])
+        .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
         .output()
         .ok()?;
@@ -304,7 +308,7 @@ struct DrainState {
     drain_started_at: Option<std::time::Instant>,
     drain_sha: Option<String>,
     last_sha_poll: Option<std::time::Instant>,
-    known_main_sha: Option<String>,
+    known_base_sha: Option<String>,
 }
 
 impl DrainState {
@@ -314,7 +318,7 @@ impl DrainState {
             drain_started_at: None,
             drain_sha: None,
             last_sha_poll: None,
-            known_main_sha: None,
+            known_base_sha: None,
         }
     }
 
@@ -384,10 +388,11 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
-        drain_state.known_main_sha = poll_origin_main_sha(&config.repo_dir);
-        if let Some(ref sha) = drain_state.known_main_sha {
+        drain_state.known_base_sha = poll_origin_base_sha(&config.repo_dir, &config.base_branch);
+        if let Some(ref sha) = drain_state.known_base_sha {
             log(&format!(
-                "self-update-drain: baseline main sha={}",
+                "self-update-drain: baseline {} sha={}",
+                config.base_branch,
                 &sha[..12.min(sha.len())]
             ));
         }
@@ -427,23 +432,25 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         {
             drain_state.last_sha_poll = Some(std::time::Instant::now());
             let repo_dir = config.repo_dir.clone();
+            let base_branch = config.base_branch.clone();
             if let Some(new_sha) =
-                tokio::task::spawn_blocking(move || poll_origin_main_sha(&repo_dir))
+                tokio::task::spawn_blocking(move || poll_origin_base_sha(&repo_dir, &base_branch))
                     .await
                     .ok()
                     .flatten()
             {
-                match &drain_state.known_main_sha {
+                match &drain_state.known_base_sha {
                     Some(old) if *old != new_sha => {
                         log(&format!(
-                            "DRAIN: origin/main advanced ({} -> {})",
+                            "DRAIN: origin/{} advanced ({} -> {})",
+                            config.base_branch,
                             &old[..12.min(old.len())],
                             &new_sha[..12.min(new_sha.len())]
                         ));
                         drain_state.start_drain(&new_sha);
                     }
                     None => {
-                        drain_state.known_main_sha = Some(new_sha);
+                        drain_state.known_base_sha = Some(new_sha);
                     }
                     _ => {}
                 }
@@ -872,9 +879,9 @@ async fn tick(
 
                                     let rework_msg = format!(
                                         "Merge of PR #{pr_num} failed: {}\n\n\
-                                         Rebase on main, resolve any conflicts, \
+                                         Rebase on {}, resolve any conflicts, \
                                          and push again.",
-                                        merge_result.message
+                                        merge_result.message, config.base_branch
                                     );
                                     let rework_turn = reviewer::build_rework_turn(
                                         &workers[wi].agent_name,
@@ -1996,7 +2003,12 @@ async fn spawn_worker(
         .join(format!("{}-t{}", agent_name, task.id));
 
     match wt_mgr
-        .provision(&config.repo_dir, &branch, &wt_path, "origin/main")
+        .provision(
+            &config.repo_dir,
+            &branch,
+            &wt_path,
+            &format!("origin/{}", config.base_branch),
+        )
         .await
     {
         Ok(_) => {

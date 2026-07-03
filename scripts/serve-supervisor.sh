@@ -2,7 +2,7 @@
 # serve-supervisor.sh — rebuild-verify-relaunch wrapper for quorum serve.
 #
 # Runs `quorum serve "$@"` in a loop. On exit 75 (self-update drain):
-#   1. git fetch origin main
+#   1. git fetch origin $QUORUM_BASE_BRANCH (default: main)
 #   2. ./dev-install.sh (build + verify)
 #   3. On success: relaunch new binary
 #   4. On failure: alert loudly, relaunch OLD binary (no retry until sha changes)
@@ -16,6 +16,7 @@
 # Env overrides:
 #   QUORUM_REPO_DIR          repo to fetch from (default: script's own repo root)
 #   QUORUM_SERVE_BIN         binary to run (default: quorum, found via PATH)
+#   QUORUM_BASE_BRANCH       branch to fetch on rebuild (default: main)
 #   QUORUM_THRASH_MAX        max restarts per hour (default: 6)
 #   QUORUM_THRASH_WINDOW     thrash window in seconds (default: 3600)
 
@@ -23,6 +24,7 @@ set -u
 
 REPO_DIR="${QUORUM_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 SERVE_BIN="${QUORUM_SERVE_BIN:-quorum}"
+BASE_BRANCH="${QUORUM_BASE_BRANCH:-main}"
 THRASH_MAX="${QUORUM_THRASH_MAX:-6}"
 THRASH_WINDOW="${QUORUM_THRASH_WINDOW:-3600}"
 
@@ -70,7 +72,7 @@ while true; do
       fi
 
       printf 'SUPERVISOR: exit 75 — self-update drain; fetching and rebuilding\n' >&2
-      git -C "$REPO_DIR" fetch origin main 2>&1
+      git -C "$REPO_DIR" fetch origin "$BASE_BRANCH" 2>&1
 
       if ( cd "$REPO_DIR" && ./dev-install.sh ); then
         printf 'SUPERVISOR: rebuild OK — relaunching\n' >&2
