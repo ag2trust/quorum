@@ -943,6 +943,90 @@ fn apply_verdict(
     Ok(())
 }
 
+/// Auto-resolve a review task that was just spawned for a daemon-merged task.
+/// When the daemon reviews+merges a PR in-cycle, `teardown_worker("done")` atomically
+/// spawns a `kind:review` task. This function finds that review, claims it as
+/// `resolver_agent`, and immediately applies verdict "approve" — chaining the original
+/// task to "closed" without spawning a redundant reviewer.
+///
+/// Returns `Ok(Some(review_id))` if resolved, `Ok(None)` if no matching review found.
+pub fn auto_resolve_review(
+    conn: &mut Connection,
+    source_task_id: i64,
+    resolver_agent: &str,
+    note: &str,
+    now: i64,
+) -> Result<Option<i64>> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, resolver_agent, now)?;
+
+    let review_row: Option<(i64, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT id, refs, orig FROM tasks
+             WHERE status='open' AND labels LIKE '%\"kind:review\"%'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+
+    let Some((review_id, refs_str, orig_opt)) = review_row else {
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    if extract_review_of(&refs_str) != Some(source_task_id) {
+        tx.commit()?;
+        return Ok(None);
+    }
+
+    let n = tx.execute(
+        "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
+         WHERE id=?3 AND status='open'",
+        params![resolver_agent, now, review_id],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+
+    let target = lease_target(review_id);
+    tx.execute(
+        "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+        params![target, resolver_agent, now, now + 3600],
+    )?;
+
+    tx.execute(
+        "UPDATE tasks SET status='done', body=?1, updated_at=?2
+         WHERE id=?3 AND assignee=?4 AND status='claimed'",
+        params![note, now, review_id, resolver_agent],
+    )?;
+    deactivate_lease(&tx, review_id, now)?;
+
+    crate::events::emit(
+        &tx,
+        "task_done",
+        &lease_target(review_id),
+        &format!("auto-resolved by daemon (in-cycle review for task#{source_task_id})"),
+        now,
+    )?;
+
+    if let Some(orig) = orig_opt {
+        apply_verdict(&tx, "approve", source_task_id, resolver_agent, &orig, now)?;
+    }
+
+    crate::events::emit(
+        &tx,
+        "review_auto_resolved",
+        &lease_target(review_id),
+        &format!("daemon auto-resolved review#{review_id} for task#{source_task_id}"),
+        now,
+    )?;
+
+    tx.commit()?;
+    Ok(Some(review_id))
+}
+
 /// List tasks, optionally filtered by status, label, and/or assignee. Read-only.
 pub fn list(
     conn: &Connection,
@@ -3358,5 +3442,130 @@ mod tests {
             reviews.is_empty(),
             "cancelling a non-review task must not spawn a review"
         );
+    }
+
+    // ── auto_resolve_review tests (#162) ─────────────────────────────────
+
+    #[test]
+    fn auto_resolve_review_resolves_spawned_review_and_closes_original() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "implement feature",
+            None,
+            50,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker-1", Some(tid), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "worker-1",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert_eq!(reviews.len(), 1, "done must auto-spawn a review task");
+
+        let resolved = auto_resolve_review(
+            &mut c,
+            tid,
+            "daemon-reviewer",
+            "auto-resolved: in-cycle review",
+            1003,
+        )
+        .unwrap();
+        assert!(resolved.is_some(), "must resolve the review task");
+        let review_id = resolved.unwrap();
+        assert_eq!(review_id, reviews[0].id);
+
+        let review = get(&c, review_id).unwrap().unwrap();
+        assert_eq!(review.status, "done");
+        assert_eq!(
+            review.body.as_deref(),
+            Some("auto-resolved: in-cycle review")
+        );
+
+        let original = get(&c, tid).unwrap().unwrap();
+        assert_eq!(
+            original.status, "closed",
+            "original must be chained to closed"
+        );
+    }
+
+    #[test]
+    fn auto_resolve_review_returns_none_when_no_review_exists() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        let result = auto_resolve_review(&mut c, tid, "daemon", "note", 1001).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn auto_resolve_review_ignores_review_for_different_source() {
+        let (_d, mut c) = open_tmp();
+        let t1 = create(&mut c, "boss", "T1", None, 50, None, None, None, 1000).unwrap();
+        let t2 = create(&mut c, "boss", "T2", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(t1), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "A",
+            t1,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let result = auto_resolve_review(&mut c, t2, "daemon", "note", 1003).unwrap();
+        assert_eq!(
+            result, None,
+            "must not resolve a review for a different source"
+        );
+
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert_eq!(reviews.len(), 1, "the review task must remain open");
+    }
+
+    #[test]
+    fn auto_resolve_review_idempotent_second_call_returns_none() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let first = auto_resolve_review(&mut c, tid, "daemon", "note", 1003).unwrap();
+        assert!(first.is_some());
+
+        let second = auto_resolve_review(&mut c, tid, "daemon", "note", 1004).unwrap();
+        assert_eq!(second, None, "second call must be a no-op");
     }
 }

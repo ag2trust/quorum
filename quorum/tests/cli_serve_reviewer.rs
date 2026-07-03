@@ -266,7 +266,7 @@ fn approve_flow_tears_down_both_agents() {
         handle.lines
     );
 
-    // Verify task is marked done
+    // Verify task is closed (done → review auto-resolved → closed, #162)
     std::thread::sleep(Duration::from_millis(500));
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -276,8 +276,8 @@ fn approve_flow_tears_down_both_agents() {
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
-        stdout.contains("\"status\":\"done\"") || stdout.contains("\"status\": \"done\""),
-        "task not marked done after approved verdict: {stdout}"
+        stdout.contains("\"status\":\"closed\"") || stdout.contains("\"status\": \"closed\""),
+        "task not closed after in-cycle merge + auto-resolve: {stdout}"
     );
 
     handle.stop();
