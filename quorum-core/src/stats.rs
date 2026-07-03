@@ -154,6 +154,19 @@ pub struct Throughput {
     pub done_stuck_count: i64,
 }
 
+/// M5: daemon in-flight agent view — read from the journal table. Shows workers
+/// and reviewers currently managed by the daemon, with their phase, cost, and
+/// self-reported agent state (blocked/failed/needs-info/note).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DaemonAgentView {
+    pub agent: String,
+    pub role: String,
+    pub task_id: Option<i64>,
+    pub phase: String,
+    pub cost_tokens: i64,
+    pub agent_state: Option<String>,
+}
+
 /// A point-in-time snapshot of the store.
 #[derive(Debug, Serialize, PartialEq, Eq, Default)]
 pub struct Stats {
@@ -188,6 +201,9 @@ pub struct Stats {
     /// PostToolUse hook. Stats-only; never read by routing/claim code.
     /// Empty when the hook isn't installed.
     pub activity: Vec<crate::activity::ActivityView>,
+    /// M5: daemon in-flight agents from the journal table. Empty when the
+    /// daemon isn't running (journal has no rows).
+    pub daemon_agents: Vec<DaemonAgentView>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -254,6 +270,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     // Issue #101 (experimental): stats-only PostToolUse hook activity. Empty
     // vec when no events recorded — section is suppressed in the renderer.
     let activity = crate::activity::activity_summary(conn, now)?;
+    let daemon_agents = daemon_agents_view(conn)?;
 
     Ok(Stats {
         agents_total,
@@ -272,6 +289,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         agent_load_scores,
         retired_agents,
         activity,
+        daemon_agents,
     })
 }
 
@@ -696,6 +714,22 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
         oldest_done_awaiting_review_secs,
         done_stuck_count,
     })
+}
+
+/// M5: daemon in-flight agents from the journal table.
+fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
+    let entries = crate::journal::list_in_flight(conn)?;
+    Ok(entries
+        .into_iter()
+        .map(|e| DaemonAgentView {
+            agent: e.agent,
+            role: e.role,
+            task_id: e.task_id,
+            phase: e.phase,
+            cost_tokens: e.cost_tokens,
+            agent_state: e.agent_state,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -1446,6 +1480,55 @@ mod tests {
         let (_d, c) = open_tmp();
         let (tasks, secs) = load_score_for(&c, "Never").unwrap();
         assert_eq!((tasks, secs), (0, 0));
+    }
+
+    #[test]
+    fn daemon_agents_view_reads_journal_with_agent_state() {
+        let (_d, mut c) = open_tmp();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "W1".into(),
+                role: "worker".into(),
+                task_id: Some(10),
+                session_id: "sess-1".into(),
+                worktree: Some("/tmp/wt/w1".into()),
+                branch: Some("feat/thing".into()),
+                phase: "working".into(),
+                cost_tokens: 500,
+                agent_state: Some("blocked".into()),
+            },
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(10),
+                session_id: "sess-2".into(),
+                worktree: Some("/tmp/wt/r1".into()),
+                branch: Some("review/thing".into()),
+                phase: "reviewing".into(),
+                cost_tokens: 200,
+                agent_state: None,
+            },
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.daemon_agents.len(), 2);
+        let w = s.daemon_agents.iter().find(|d| d.role == "worker").unwrap();
+        assert_eq!(w.agent, "W1");
+        assert_eq!(w.task_id, Some(10));
+        assert_eq!(w.agent_state.as_deref(), Some("blocked"));
+        let r = s
+            .daemon_agents
+            .iter()
+            .find(|d| d.role == "reviewer")
+            .unwrap();
+        assert_eq!(r.agent, "R1");
+        assert_eq!(r.agent_state, None);
     }
 
     #[test]

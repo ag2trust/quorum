@@ -70,6 +70,13 @@ CONTROL (emergency halt; non-expiring — only `resume` clears)
   quorum resume [--agent <id>] --by <id>                    # clear; emits stop_cleared event (exit 1 = nothing set)
   quorum stops                                              # list active stops
 
+DAEMON IPC (M5 — agent-to-agent messaging + state reactions)
+  quorum message --from <id> --to <id> --body-stdin  # send a message to another daemon-managed agent;
+                                                      # daemon delivers as a turn when the target is idle
+  quorum react   --agent <id> --task-id <n> --state <s>
+                                                      # signal non-terminal state: blocked, failed, needs-info, note
+                                                      # daemon tracks per-slot and surfaces via `quorum status`
+
 OPS
   quorum status [--watch] [--json] [--agents]    # health snapshot; --agents = agent presence (online/offline)
   quorum sweep                                # reclaim expired rows + checkpoint WAL (control state is NOT swept)

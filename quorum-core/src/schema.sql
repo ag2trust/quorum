@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 12). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 13). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -211,6 +211,10 @@ CREATE TABLE IF NOT EXISTS journal (
     phase           TEXT NOT NULL,
     expected_signal TEXT,
     cost_tokens     INTEGER NOT NULL DEFAULT 0,
+    -- M5 agent state reaction: 'blocked', 'failed', 'needs-info', or free-text note.
+    -- NULL = normal (no reaction signaled). Set by the daemon when processing a
+    -- task_update mailbox row; cleared on terminal transitions.
+    agent_state     TEXT,
     updated_at      INTEGER NOT NULL
 );
 

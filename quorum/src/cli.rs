@@ -295,6 +295,32 @@ pub enum Command {
         #[arg(long)]
         tool: String,
     },
+    /// Send a message to another daemon-managed agent. The daemon delivers
+    /// the payload as a turn when the target agent is idle. Body (free text)
+    /// via --body-stdin or --body-file.
+    Message {
+        /// Sender agent name.
+        #[arg(long)]
+        from: String,
+        /// Target agent name.
+        #[arg(long)]
+        to: String,
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+    },
+    /// Signal a non-terminal agent state to the daemon. The daemon tracks
+    /// the state and surfaces it via `quorum status`.
+    React {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: i64,
+        /// One of: blocked, failed, needs-info, note.
+        #[arg(long)]
+        state: String,
+    },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// Writes a mailbox row for the daemon to consume.
     Done {

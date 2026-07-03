@@ -119,6 +119,7 @@ struct SlotState {
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
+    agent_state: Option<String>,
 }
 
 async fn tick_loop(config: ServeConfig) -> Result<()> {
@@ -195,7 +196,64 @@ async fn tick(
     }?;
 
     // ── Phase 2: Process mailbox rows ─────────────────────────────────
+    // Partition by kind: done rows process first (one-per-tick), task_update
+    // rows process inline (lightweight), message rows defer to Phase 4c
+    // (deliver at idle after draining).
+    let mut pending_messages: Vec<(i64, &mailbox::MailboxRow)> = Vec::new();
+
     for (id, row) in &mailbox_rows {
+        // M5: task_update rows — track agent state reactions.
+        if row.kind == mailbox::MailboxKind::TaskUpdate {
+            if let Some(wi) = workers.iter_mut().position(|w| w.agent_name == row.agent) {
+                let state_str = row.note.as_deref().unwrap_or("note");
+                workers[wi].agent_state = Some(state_str.to_string());
+                log(&format!(
+                    "worker {} state: {state_str} (task #{})",
+                    workers[wi].agent_name, workers[wi].task_id,
+                ));
+                let p = db_path.clone();
+                let entry = JournalEntry {
+                    agent: workers[wi].agent_name.clone(),
+                    role: "worker".into(),
+                    task_id: Some(workers[wi].task_id),
+                    session_id: workers[wi].session_id.clone(),
+                    worktree: Some(workers[wi].worktree_path.to_string_lossy().into()),
+                    branch: Some(workers[wi].branch.clone()),
+                    phase: if workers[wi].draining {
+                        "working"
+                    } else {
+                        "awaiting-review"
+                    }
+                    .into(),
+                    cost_tokens: workers[wi].cost_tokens,
+                    agent_state: workers[wi].agent_state.clone(),
+                };
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    journal::upsert(&mut conn, &entry)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok();
+            } else {
+                log(&format!(
+                    "consuming unmatched task_update from {} (no active worker)",
+                    row.agent
+                ));
+            }
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+            continue;
+        }
+
+        // M5: message rows — collect for delivery at idle (Phase 4c).
+        if row.kind == mailbox::MailboxKind::Message {
+            pending_messages.push((*id, row));
+            continue;
+        }
+
+        // kind=done — existing lifecycle processing below.
         let note_suffix = row
             .note
             .as_ref()
@@ -294,6 +352,7 @@ async fn tick(
                                     branch: Some(w.branch.clone()),
                                     phase: "working".into(),
                                     cost_tokens: w.cost_tokens,
+                                    agent_state: w.agent_state.clone(),
                                 };
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let mut conn = quorum_core::db::open(&p)?;
@@ -366,6 +425,7 @@ async fn tick(
                                 branch: Some(w.branch.clone()),
                                 phase: "working".into(),
                                 cost_tokens: w.cost_tokens,
+                                agent_state: w.agent_state.clone(),
                             };
                             tokio::task::spawn_blocking(move || -> Result<()> {
                                 let mut conn = quorum_core::db::open(&p)?;
@@ -542,6 +602,63 @@ async fn tick(
     for &i in dead_reviewers.iter().rev() {
         let dead = reviewers.remove(i);
         teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+    }
+
+    // ── Phase 4c: Deliver queued messages to idle workers (M5) ──────────
+    // Messages are delivered "at idle" — only when the worker is between turns
+    // (draining=false). If the target is still draining, the message stays
+    // unconsumed and retries next tick.
+    for (msg_id, msg_row) in &pending_messages {
+        let target = match &msg_row.to_agent {
+            Some(t) => t,
+            None => {
+                log(&format!(
+                    "consuming message from {} with no to_agent",
+                    msg_row.agent
+                ));
+                consume_mailbox_row(&db_path, *msg_id).await;
+                continue;
+            }
+        };
+
+        let wi = workers.iter().position(|w| w.agent_name == *target);
+        match wi {
+            Some(wi) if workers[wi].draining => {
+                // Target is mid-turn — leave unconsumed, retry next tick.
+            }
+            Some(wi) => {
+                let payload = msg_row.payload.as_deref().unwrap_or("");
+                let turn = serde_json::json!({
+                    "type": "user",
+                    "message": { "content": format!(
+                        "MESSAGE from {}: {payload}", msg_row.agent
+                    ) }
+                });
+                match workers[wi].proc.feed_turn(&turn.to_string()).await {
+                    Ok(()) => {
+                        workers[wi].draining = true;
+                        workers[wi].turn_started_at = std::time::Instant::now();
+                        log(&format!(
+                            "delivered message from {} to {} (task #{})",
+                            msg_row.agent, target, workers[wi].task_id,
+                        ));
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "message delivery to {} failed: {e} — tearing down broken worker",
+                            target,
+                        ));
+                        let w = workers.remove(wi);
+                        teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                    }
+                }
+                consume_mailbox_row(&db_path, *msg_id).await;
+            }
+            None => {
+                log(&format!("consuming message to {target} (no active worker)"));
+                consume_mailbox_row(&db_path, *msg_id).await;
+            }
+        }
     }
 
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
@@ -766,6 +883,7 @@ async fn drain_events(
                     branch: Some(slot.branch.clone()),
                     phase: phase.into(),
                     cost_tokens: slot.cost_tokens,
+                    agent_state: None,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -881,6 +999,7 @@ async fn spawn_reviewer_for_worker(
         branch: Some(branch.clone()),
         phase: "reviewing".into(),
         cost_tokens: 0,
+        agent_state: None,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -944,6 +1063,7 @@ async fn spawn_reviewer_for_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                agent_state: None,
             });
         }
         Err(e) => {
@@ -1088,6 +1208,7 @@ async fn spawn_worker(
         branch: Some(branch.clone()),
         phase: "working".into(),
         cost_tokens: 0,
+        agent_state: None,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -1133,6 +1254,7 @@ async fn spawn_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                agent_state: None,
             });
         }
         Err(e) => {
@@ -1320,6 +1442,7 @@ mod tests {
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
+            agent_state: None,
         }
     }
 
