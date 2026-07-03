@@ -105,6 +105,63 @@ impl WorktreeManager {
         Ok(wt_path)
     }
 
+    pub async fn gc_orphaned(
+        &self,
+        repo_dir: &Path,
+        worktree_base: &Path,
+        active_worktrees: &[&str],
+    ) -> Vec<String> {
+        let _guard = self.lock.lock().await;
+
+        // Prune stale git worktree entries first
+        let _ = Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "worktree", "prune"])
+            .output()
+            .await;
+
+        let entries = match std::fs::read_dir(worktree_base) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut removed = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let path_str = path.to_string_lossy().to_string();
+            if active_worktrees.iter().any(|a| *a == path_str) {
+                continue;
+            }
+
+            let rm = Command::new("git")
+                .args([
+                    "-C",
+                    &repo_dir.to_string_lossy(),
+                    "worktree",
+                    "remove",
+                    &path_str,
+                    "--force",
+                ])
+                .output()
+                .await;
+
+            match rm {
+                Ok(out) if out.status.success() => {
+                    removed.push(path_str);
+                }
+                _ => {
+                    // If git worktree remove fails, try plain directory removal
+                    if std::fs::remove_dir_all(&path).is_ok() {
+                        removed.push(path_str);
+                    }
+                }
+            }
+        }
+        removed
+    }
+
     pub async fn remove(&self, repo_dir: &Path, worktree_dir: &Path) -> Result<(), String> {
         let _guard = self.lock.lock().await;
 
@@ -250,5 +307,40 @@ mod tests {
         );
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn gc_removes_orphaned_worktrees() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_base = tempfile::tempdir().unwrap();
+        let mgr = WorktreeManager::new();
+
+        // Create two worktrees
+        let wt1 = wt_base.path().join("active-wt");
+        let wt2 = wt_base.path().join("orphan-wt");
+        mgr.provision(repo_dir.path(), "branch-active", &wt1, "main")
+            .await
+            .unwrap();
+        mgr.provision(repo_dir.path(), "branch-orphan", &wt2, "main")
+            .await
+            .unwrap();
+        assert!(wt1.exists());
+        assert!(wt2.exists());
+
+        // GC with only wt1 as active — wt2 should be removed
+        let active = vec![wt1.to_string_lossy().to_string()];
+        let active_refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
+        let removed = mgr
+            .gc_orphaned(repo_dir.path(), wt_base.path(), &active_refs)
+            .await;
+
+        assert_eq!(removed.len(), 1);
+        assert!(wt1.exists(), "active worktree should NOT be removed");
+        assert!(!wt2.exists(), "orphaned worktree should be removed");
+
+        // Clean up
+        mgr.remove(repo_dir.path(), &wt1).await.ok();
     }
 }

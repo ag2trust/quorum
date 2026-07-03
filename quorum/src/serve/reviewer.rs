@@ -56,6 +56,7 @@ pub async fn spawn_reviewer(
         session_id: session_id.to_string(),
         worktree: worktree_path.to_path_buf(),
         bare,
+        resume: false,
     };
     AgentProc::spawn(&agent_spec, agent_bin)
 }

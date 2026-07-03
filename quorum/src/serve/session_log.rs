@@ -86,6 +86,72 @@ impl SessionLog {
         })
     }
 
+    pub fn reopen(dir: &Path) -> io::Result<Self> {
+        if !dir.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("session log dir not found: {}", dir.display()),
+            ));
+        }
+
+        let stream_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("stream.jsonl"))?;
+
+        let mut transcript_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("transcript.md"))?;
+
+        writeln!(transcript_file, "\n# Resumed after daemon restart\n")?;
+
+        let meta = Self::read_meta(dir);
+
+        Ok(SessionLog {
+            dir: dir.to_path_buf(),
+            stream_file,
+            transcript_file,
+            meta,
+        })
+    }
+
+    fn read_meta(dir: &Path) -> SessionMeta {
+        let meta_path = dir.join("meta.json");
+        if let Ok(data) = fs::read_to_string(&meta_path) {
+            if let Ok(m) = serde_json::from_str::<serde_json::Value>(&data) {
+                return SessionMeta {
+                    agent: m["agent"].as_str().unwrap_or("unknown").to_string(),
+                    role: m["role"].as_str().unwrap_or("worker").to_string(),
+                    task_id: m["task_id"].as_i64(),
+                    session_id: m["session_id"].as_str().unwrap_or("").to_string(),
+                    branch: m["branch"].as_str().unwrap_or("").to_string(),
+                    start_time: m["start_time"].as_i64().unwrap_or(0),
+                    end_time: None,
+                    cost_tokens: m["cost_tokens"].as_i64().unwrap_or(0),
+                    cost_usd: m["cost_usd"].as_f64().unwrap_or(0.0),
+                    final_phase: m["final_phase"].as_str().unwrap_or("working").to_string(),
+                    verdict: None,
+                    rework_count: m["rework_count"].as_u64().unwrap_or(0) as u32,
+                };
+            }
+        }
+        SessionMeta {
+            agent: String::new(),
+            role: "worker".to_string(),
+            task_id: None,
+            session_id: String::new(),
+            branch: String::new(),
+            start_time: 0,
+            end_time: None,
+            cost_tokens: 0,
+            cost_usd: 0.0,
+            final_phase: "working".to_string(),
+            verdict: None,
+            rework_count: 0,
+        }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }

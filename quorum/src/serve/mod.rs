@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod merge;
 pub mod names;
+pub mod recovery;
 pub mod reviewer;
 pub mod session_log;
 pub mod stream;
@@ -83,6 +84,9 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
             .session_log
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
+        pid: slot.proc.pid(),
+        pr: slot.pr,
+        rework_count: slot.rework_count as i32,
     }
 }
 
@@ -127,7 +131,7 @@ pub fn run_serve(config: ServeConfig) -> Result<()> {
     rt.block_on(tick_loop(config))
 }
 
-struct SlotState {
+pub(crate) struct SlotState {
     agent_name: String,
     proc: AgentProc,
     task_id: i64,
@@ -181,6 +185,11 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     let wt_mgr = WorktreeManager::new();
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
+
+    // M7: crash recovery — resume in-flight agents from journal
+    if let Err(e) = recovery::recover(&config, &wt_mgr, &mut name_pool, &mut workers, &mut reviewers).await {
+        log(&format!("recovery failed: {e} — starting fresh"));
+    }
 
     log(&format!("serving (cap={})", config.cap));
 
@@ -1021,7 +1030,7 @@ async fn spawn_reviewer_for_worker(
         .ok()
     });
 
-    // Journal: phase=reviewing, role=reviewer
+    // Journal: phase=reviewing, role=reviewer (pid filled after spawn)
     let p = config.db_path.clone();
     let entry = JournalEntry {
         agent: reviewer_name.clone(),
@@ -1037,6 +1046,9 @@ async fn spawn_reviewer_for_worker(
         log_dir: reviewer_session_log
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
+        pid: None,
+        pr: Some(pr),
+        rework_count: 0,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -1083,6 +1095,37 @@ async fn spawn_reviewer_for_worker(
                 .await
                 .ok();
                 return Ok(());
+            }
+
+            // M7: persist PID immediately so crash recovery can clean up
+            let spawn_pid = proc.pid();
+            {
+                let p = config.db_path.clone();
+                let pid_entry = JournalEntry {
+                    agent: reviewer_name.clone(),
+                    role: "reviewer".into(),
+                    task_id: Some(worker.task_id),
+                    session_id: session_id.clone(),
+                    worktree: Some(wt_path.to_string_lossy().into()),
+                    branch: Some(branch.clone()),
+                    phase: "reviewing".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: reviewer_session_log
+                        .as_ref()
+                        .map(|l| l.dir().to_string_lossy().into()),
+                    pid: spawn_pid,
+                    pr: Some(pr),
+                    rework_count: 0,
+                };
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    journal::upsert(&mut conn, &pid_entry)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok();
             }
 
             let now_instant = std::time::Instant::now();
@@ -1248,7 +1291,7 @@ async fn spawn_worker(
         .ok()
     });
 
-    // Journal: phase=working
+    // Journal: phase=working (pid filled after spawn)
     let p = config.db_path.clone();
     let entry = JournalEntry {
         agent: agent_name.clone(),
@@ -1264,6 +1307,9 @@ async fn spawn_worker(
         log_dir: worker_session_log
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
+        pid: None,
+        pr: None,
+        rework_count: 0,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -1280,6 +1326,7 @@ async fn spawn_worker(
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
         bare: config.bare_agent,
+        resume: false,
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
         Ok(mut proc) => {
@@ -1292,6 +1339,37 @@ async fn spawn_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
                 return Ok(false);
+            }
+
+            // M7: persist PID immediately so crash recovery can clean up
+            let spawn_pid = proc.pid();
+            {
+                let p = db_path.clone();
+                let pid_entry = JournalEntry {
+                    agent: agent_name.clone(),
+                    role: "worker".into(),
+                    task_id: Some(task.id),
+                    session_id: session_id.clone(),
+                    worktree: Some(wt_path.to_string_lossy().into()),
+                    branch: Some(branch.clone()),
+                    phase: "working".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: worker_session_log
+                        .as_ref()
+                        .map(|l| l.dir().to_string_lossy().into()),
+                    pid: spawn_pid,
+                    pr: None,
+                    rework_count: 0,
+                };
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    journal::upsert(&mut conn, &pid_entry)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok();
             }
 
             let now_instant = std::time::Instant::now();

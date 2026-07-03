@@ -219,6 +219,12 @@ CREATE TABLE IF NOT EXISTS journal (
     cost_usd        REAL NOT NULL DEFAULT 0.0,
     -- M6 logging: filesystem path to this agent's session log directory.
     log_dir         TEXT,
+    -- M7 crash recovery: process group ID for stale-process cleanup on restart.
+    pid             INTEGER,
+    -- M7 crash recovery: PR number (workers in awaiting-review phase).
+    pr              INTEGER,
+    -- M7 crash recovery: rework round counter for limit enforcement across restarts.
+    rework_count    INTEGER NOT NULL DEFAULT 0,
     updated_at      INTEGER NOT NULL
 );
 
