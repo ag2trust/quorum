@@ -49,6 +49,19 @@ impl Pool {
         }
     }
 
+    pub fn reclaim(&mut self, name: &str) -> bool {
+        if self.in_use.contains(name) {
+            return true;
+        }
+        if let Some(idx) = self.available.iter().position(|n| n == name) {
+            let name = self.available.remove(idx);
+            self.in_use.insert(name);
+            true
+        } else {
+            false
+        }
+    }
+
     #[cfg(test)]
     pub fn in_use_count(&self) -> usize {
         self.in_use.len()
@@ -128,6 +141,44 @@ mod tests {
             assert!(pool.acquire().is_some());
         }
         assert!(pool.acquire().is_none());
+    }
+
+    #[test]
+    fn reclaim_moves_name_to_in_use() {
+        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+        let (_f, path) = write_names_file(&names);
+        let mut pool = Pool::load(&path, 4).unwrap();
+
+        assert!(pool.reclaim("C"));
+        assert_eq!(pool.in_use_count(), 1);
+
+        // C is not acquirable — it's already in use
+        let acquired: Vec<String> = (0..8).filter_map(|_| pool.acquire()).collect();
+        assert_eq!(acquired.len(), 8);
+        assert!(!acquired.contains(&"C".to_string()));
+
+        // Release C
+        pool.release("C");
+        assert_eq!(pool.in_use_count(), 8);
+    }
+
+    #[test]
+    fn reclaim_unknown_name_returns_false() {
+        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+        let (_f, path) = write_names_file(&names);
+        let mut pool = Pool::load(&path, 4).unwrap();
+        assert!(!pool.reclaim("Unknown"));
+    }
+
+    #[test]
+    fn reclaim_already_in_use_returns_true() {
+        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+        let (_f, path) = write_names_file(&names);
+        let mut pool = Pool::load(&path, 4).unwrap();
+        pool.acquire().unwrap();
+        let first = pool.acquire().unwrap();
+        assert!(pool.reclaim(&first));
+        assert_eq!(pool.in_use_count(), 2);
     }
 
     #[test]

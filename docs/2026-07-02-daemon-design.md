@@ -1,7 +1,7 @@
 # Quorum Agent-Manager Daemon — Design & Plan
 
 **Date:** 2026-07-02
-**Status:** M0–M2 implemented and merged; M3–M7 planned
+**Status:** M0–M6 implemented and merged; M7 in review; M3–M4 planned
 
 ## Overview
 
@@ -303,9 +303,19 @@ Hierarchical log structure per agent session: `stream.jsonl` (raw events),
 age/size. Live `quorum status` integration showing in-flight agents, phases,
 costs, and verdicts.
 
-### M7: Crash recovery
+### M7: Crash recovery (in review)
 
 Journal-driven resurrection on daemon restart: read `list_in_flight()`, reconnect
 to agents via `claude --resume <session_id>`. Process-group cleanup with `killpg`.
 Resume-turn templates for re-orienting a resumed agent. Name reconciliation
 (reclaim names from journal). Worktree GC for orphaned worktrees.
+
+**Schema v15** adds `pid` (process group ID), `pr` (PR number), and
+`rework_count` to the journal table for full crash-recovery state.
+
+**Implementation:** `recovery::recover()` is called on daemon startup before
+the tick loop. Workers are resumed with `--resume`; reviewers are torn down
+(ephemeral — Phase 5 respawns fresh ones). `AgentSpec::resume` controls
+`--resume` vs `--session-id` flag selection. `Pool::reclaim()` reclaims
+names from journal entries. `WorktreeManager::gc_orphaned()` removes
+worktrees not referenced by active journal entries.

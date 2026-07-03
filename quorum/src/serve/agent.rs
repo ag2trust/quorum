@@ -12,6 +12,7 @@ pub struct AgentSpec {
     pub session_id: String,
     pub worktree: PathBuf,
     pub bare: bool,
+    pub resume: bool,
 }
 
 pub struct AgentProc {
@@ -33,10 +34,15 @@ impl AgentProc {
             .arg("--model")
             .arg(&spec.model)
             .arg("--effort")
-            .arg(&spec.effort)
-            .arg("--session-id")
-            .arg(&spec.session_id)
-            .arg("--add-dir")
+            .arg(&spec.effort);
+
+        if spec.resume {
+            cmd.arg("--resume").arg(&spec.session_id);
+        } else {
+            cmd.arg("--session-id").arg(&spec.session_id);
+        }
+
+        cmd.arg("--add-dir")
             .arg(&spec.worktree)
             .arg("--permission-mode")
             .arg("dontAsk");
@@ -89,6 +95,10 @@ impl AgentProc {
                 Err(_) => return None,
             }
         }
+    }
+
+    pub fn pid(&self) -> Option<i32> {
+        self.child.id().map(|id| id as i32)
     }
 
     /// Non-blocking check for child exit. Returns `Some(status)` if the child

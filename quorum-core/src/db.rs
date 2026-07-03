@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -199,6 +199,21 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         }
         if current < 14 && !column_exists(conn, "journal", "log_dir")? {
             conn.execute("ALTER TABLE journal ADD COLUMN log_dir TEXT", [])?;
+        }
+        // v15 = M7 crash recovery: journal.pid, journal.pr, journal.rework_count
+        // for process-group cleanup, PR tracking, and rework-limit enforcement
+        // across daemon restarts.
+        if current < 15 && !column_exists(conn, "journal", "pid")? {
+            conn.execute("ALTER TABLE journal ADD COLUMN pid INTEGER", [])?;
+        }
+        if current < 15 && !column_exists(conn, "journal", "pr")? {
+            conn.execute("ALTER TABLE journal ADD COLUMN pr INTEGER", [])?;
+        }
+        if current < 15 && !column_exists(conn, "journal", "rework_count")? {
+            conn.execute(
+                "ALTER TABLE journal ADD COLUMN rework_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -939,5 +954,71 @@ mod tests {
             "pre-existing row defaults to 0.0"
         );
         assert!(log_dir.is_none(), "pre-existing row must default to NULL");
+    }
+
+    #[test]
+    fn migrates_v14_to_v15_adds_journal_m7_columns() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE journal (
+                 agent      TEXT PRIMARY KEY,
+                 role       TEXT NOT NULL,
+                 task_id    INTEGER,
+                 session_id TEXT NOT NULL,
+                 worktree   TEXT,
+                 branch     TEXT,
+                 phase      TEXT NOT NULL DEFAULT 'working',
+                 expected_signal TEXT,
+                 cost_tokens INTEGER NOT NULL DEFAULT 0,
+                 agent_state TEXT,
+                 cost_usd   REAL NOT NULL DEFAULT 0.0,
+                 log_dir    TEXT,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO journal(agent, role, task_id, session_id, phase, cost_tokens, updated_at)
+                 VALUES ('W1', 'worker', 42, 'sess-1', 'working', 1000, 100);
+             PRAGMA user_version = 14;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(
+            column_exists(&c, "journal", "pid").unwrap(),
+            "pid column missing — v14→v15 migration silently skipped"
+        );
+        assert!(
+            column_exists(&c, "journal", "pr").unwrap(),
+            "pr column missing — v14→v15 migration silently skipped"
+        );
+        assert!(
+            column_exists(&c, "journal", "rework_count").unwrap(),
+            "rework_count column missing — v14→v15 migration silently skipped"
+        );
+
+        let (pid, pr, rework_count): (Option<i32>, Option<i64>, i32) = c
+            .query_row(
+                "SELECT pid, pr, rework_count FROM journal WHERE agent='W1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(pid.is_none(), "pre-existing row must default pid to NULL");
+        assert!(pr.is_none(), "pre-existing row must default pr to NULL");
+        assert_eq!(
+            rework_count, 0,
+            "pre-existing row must default rework_count to 0"
+        );
     }
 }

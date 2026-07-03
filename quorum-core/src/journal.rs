@@ -23,6 +23,9 @@ pub struct JournalEntry {
     pub agent_state: Option<String>,
     pub cost_usd: f64,
     pub log_dir: Option<String>,
+    pub pid: Option<i32>,
+    pub pr: Option<i64>,
+    pub rework_count: i32,
 }
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
@@ -38,6 +41,9 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
         agent_state: r.get(8)?,
         cost_usd: r.get(9)?,
         log_dir: r.get(10)?,
+        pid: r.get(11)?,
+        pr: r.get(12)?,
+        rework_count: r.get(13)?,
     })
 }
 
@@ -45,8 +51,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
-        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(agent) DO UPDATE SET
              role = excluded.role,
              task_id = excluded.task_id,
@@ -58,6 +64,9 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
              agent_state = excluded.agent_state,
              cost_usd = excluded.cost_usd,
              log_dir = excluded.log_dir,
+             pid = excluded.pid,
+             pr = excluded.pr,
+             rework_count = excluded.rework_count,
              updated_at = excluded.updated_at",
         params![
             entry.agent,
@@ -71,6 +80,9 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
             entry.agent_state,
             entry.cost_usd,
             entry.log_dir,
+            entry.pid,
+            entry.pr,
+            entry.rework_count,
             now,
         ],
     )?;
@@ -80,7 +92,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
 
 pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count
          FROM journal
          ORDER BY agent",
     )?;
@@ -123,6 +135,9 @@ mod tests {
             agent_state: None,
             cost_usd: 0.0,
             log_dir: None,
+            pid: None,
+            pr: None,
+            rework_count: 0,
         }
     }
 
@@ -213,6 +228,32 @@ mod tests {
         let (mut conn, _dir) = test_conn();
         let deleted = delete(&mut conn, "Ghost").unwrap();
         assert!(!deleted);
+    }
+
+    #[test]
+    fn m7_fields_persist_and_update() {
+        let (mut conn, _dir) = test_conn();
+
+        let mut entry = sample_entry("Agent-1");
+        entry.pid = Some(12345);
+        entry.pr = Some(42);
+        entry.rework_count = 2;
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].pid, Some(12345));
+        assert_eq!(entries[0].pr, Some(42));
+        assert_eq!(entries[0].rework_count, 2);
+
+        entry.pid = Some(99999);
+        entry.pr = None;
+        entry.rework_count = 3;
+        upsert(&mut conn, &entry).unwrap();
+
+        let entries = list_in_flight(&conn).unwrap();
+        assert_eq!(entries[0].pid, Some(99999));
+        assert_eq!(entries[0].pr, None);
+        assert_eq!(entries[0].rework_count, 3);
     }
 
     #[test]

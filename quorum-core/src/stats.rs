@@ -1502,6 +1502,9 @@ mod tests {
                 agent_state: Some("blocked".into()),
                 cost_usd: 0.05,
                 log_dir: Some("/tmp/logs/W1-123".into()),
+                pid: None,
+                pr: None,
+                rework_count: 0,
             },
         )
         .unwrap();
@@ -1519,6 +1522,9 @@ mod tests {
                 agent_state: None,
                 cost_usd: 0.01,
                 log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
             },
         )
         .unwrap();
