@@ -70,10 +70,31 @@ pub struct AgentView {
 /// so both writes join the caller's atomic txn. Pure reads must NOT call this.
 pub fn touch(conn: &Connection, id: &str, now: i64) -> Result<()> {
     // 1. Presence bump (always — auto-create row if first time).
+    //    Session reset (issue #125): when the agent has been offline for >= ONLINE_WINDOW_SECS,
+    //    this is a new session — reset first_seen + retire_status so the wall-clock budget
+    //    measures SESSION age, not NAME age. A retired agent that continues ticking (within
+    //    window, processing the retire signal) keeps its retired state — the offline gap is
+    //    the sole signal for "returning name = new session."
     conn.execute(
         "INSERT INTO agents(id, first_seen, last_seen) VALUES (?1, ?2, ?2)
-         ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen",
-        params![id, now],
+         ON CONFLICT(id) DO UPDATE SET
+           last_seen = excluded.last_seen,
+           first_seen = CASE
+             WHEN (?2 - agents.last_seen) >= ?3
+             THEN excluded.first_seen
+             ELSE agents.first_seen
+           END,
+           retire_status = CASE
+             WHEN (?2 - agents.last_seen) >= ?3
+             THEN 'active'
+             ELSE agents.retire_status
+           END,
+           retired_at = CASE
+             WHEN (?2 - agents.last_seen) >= ?3
+             THEN NULL
+             ELSE agents.retired_at
+           END",
+        params![id, now, ONLINE_WINDOW_SECS],
     )?;
     // 2. Auto-renew this agent's live leases (#55). Monotonic via MAX so an explicit long
     //    TTL is never shortened. Lapsed (expires_at <= now) rows are deliberately not
@@ -124,6 +145,41 @@ pub fn first_seen(conn: &Connection, id: &str) -> Result<Option<i64>> {
         )
         .ok();
     Ok(row)
+}
+
+/// Session-aware read of retirement state and first_seen (issue #125). When the agent is
+/// returning from retirement or an offline gap, returns the values that `touch` WILL write
+/// (active/None/now) rather than the stale persisted values. This lets `gather_with_budget`
+/// (read phase) agree with the `touch` reset (write phase) that follows it in `tick`.
+pub fn session_aware_retire_info(
+    conn: &Connection,
+    id: &str,
+    now: i64,
+) -> Result<(String, Option<i64>, Option<i64>)> {
+    let row = conn
+        .query_row(
+            "SELECT retire_status, retired_at, first_seen, last_seen FROM agents WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .ok();
+    match row {
+        Some((status, retired_at, fs, ls)) => {
+            if (now - ls) >= ONLINE_WINDOW_SECS {
+                Ok((RETIRE_STATUS_ACTIVE.to_string(), None, Some(now)))
+            } else {
+                Ok((status, retired_at, Some(fs)))
+            }
+        }
+        None => Ok((RETIRE_STATUS_ACTIVE.to_string(), None, None)),
+    }
 }
 
 /// Promote the agent to `retiring`. No-op if already retiring or retired (the state machine
@@ -239,7 +295,8 @@ mod tests {
     fn second_touch_updates_last_seen_not_first_seen() {
         let (_d, c) = open_tmp();
         touch(&c, "Cy", 1000).unwrap();
-        touch(&c, "Cy", 2000).unwrap();
+        // Gap must be < ONLINE_WINDOW_SECS so session reset doesn't fire.
+        touch(&c, "Cy", 1500).unwrap();
         let (first, last): (i64, i64) = c
             .query_row(
                 "SELECT first_seen, last_seen FROM agents WHERE id='Cy'",
@@ -248,7 +305,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, 1000);
-        assert_eq!(last, 2000);
+        assert_eq!(last, 1500);
     }
 
     #[test]
@@ -458,5 +515,115 @@ mod tests {
         mark_retired(&c, "Z", 200).unwrap();
         mark_retiring(&c, "Z").unwrap();
         assert_eq!(retire_state(&c, "Z").unwrap().0, RETIRE_STATUS_RETIRED);
+    }
+
+    // -- Session reset on returning agent (issue #125) ------------------------------------
+
+    #[test]
+    fn touch_resets_session_for_retired_agent_after_offline_gap() {
+        // A retired agent that returns after an offline gap must start a fresh session:
+        // first_seen reset to now, retire_status back to active, retired_at cleared.
+        let (_d, c) = open_tmp();
+        touch(&c, "Rex", 1000).unwrap();
+        mark_retired(&c, "Rex", 1500).unwrap();
+        // Rex returns after being offline for > ONLINE_WINDOW_SECS.
+        touch(&c, "Rex", 1000 + ONLINE_WINDOW_SECS + 1).unwrap();
+        let (first, last): (i64, i64) = c
+            .query_row(
+                "SELECT first_seen, last_seen FROM agents WHERE id='Rex'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let expected = 1000 + ONLINE_WINDOW_SECS + 1;
+        assert_eq!(
+            first, expected,
+            "first_seen must reset to now on returning retired agent"
+        );
+        assert_eq!(last, expected);
+        let (st, ts) = retire_state(&c, "Rex").unwrap();
+        assert_eq!(
+            st, RETIRE_STATUS_ACTIVE,
+            "retire_status must reset to active"
+        );
+        assert!(ts.is_none(), "retired_at must be cleared");
+    }
+
+    #[test]
+    fn retired_agent_still_ticking_within_window_stays_retired() {
+        // A retired agent that continues ticking (processing the retire signal, about
+        // to sign off) must NOT have its retirement reset — only the offline gap triggers
+        // session reset, not retire_status alone.
+        let (_d, c) = open_tmp();
+        touch(&c, "Steady", 1000).unwrap();
+        mark_retired(&c, "Steady", 1500).unwrap();
+        // Steady ticks once more within the online window (processing retire signal).
+        touch(&c, "Steady", 1000 + ONLINE_WINDOW_SECS - 1).unwrap();
+        let (st, _) = retire_state(&c, "Steady").unwrap();
+        assert_eq!(
+            st, RETIRE_STATUS_RETIRED,
+            "retired agent ticking within window must stay retired"
+        );
+    }
+
+    #[test]
+    fn touch_resets_session_for_offline_agent() {
+        // An agent that went offline (last_seen older than ONLINE_WINDOW_SECS) and comes
+        // back is starting a new session — first_seen must reset so the wall-clock budget
+        // counts from the new session, not the original name creation.
+        let (_d, c) = open_tmp();
+        touch(&c, "Ollie", 1000).unwrap();
+        // Ollie returns after being offline for longer than the online window.
+        touch(&c, "Ollie", 1000 + ONLINE_WINDOW_SECS + 1).unwrap();
+        let first: i64 = c
+            .query_row("SELECT first_seen FROM agents WHERE id='Ollie'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            first,
+            1000 + ONLINE_WINDOW_SECS + 1,
+            "first_seen must reset when agent returns after offline gap"
+        );
+    }
+
+    #[test]
+    fn touch_does_not_reset_session_for_active_online_agent() {
+        // An agent that is still online (touched recently) must NOT have first_seen reset
+        // — the session is continuous, not a new one.
+        let (_d, c) = open_tmp();
+        touch(&c, "Connie", 1000).unwrap();
+        touch(&c, "Connie", 1000 + ONLINE_WINDOW_SECS - 1).unwrap();
+        let first: i64 = c
+            .query_row("SELECT first_seen FROM agents WHERE id='Connie'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            first, 1000,
+            "first_seen must NOT reset for continuously online agent"
+        );
+    }
+
+    #[test]
+    fn touch_resets_retiring_agent_that_went_offline() {
+        // An agent in "retiring" state that went offline and comes back should also get
+        // a session reset — a new session shouldn't inherit the old session's drain state.
+        let (_d, c) = open_tmp();
+        touch(&c, "Drain", 1000).unwrap();
+        mark_retiring(&c, "Drain").unwrap();
+        // Drain goes offline and returns after the window.
+        touch(&c, "Drain", 1000 + ONLINE_WINDOW_SECS + 1).unwrap();
+        let (st, _) = retire_state(&c, "Drain").unwrap();
+        assert_eq!(
+            st, RETIRE_STATUS_ACTIVE,
+            "retiring agent returning after offline must reset"
+        );
+        let first: i64 = c
+            .query_row("SELECT first_seen FROM agents WHERE id='Drain'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(first, 1000 + ONLINE_WINDOW_SECS + 1);
     }
 }
