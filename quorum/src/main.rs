@@ -404,6 +404,30 @@ fn parse_ttl(s: &str) -> Result<i64> {
         .ok_or_else(|| QuorumError::Usage(format!("duration too large (max {MAX_TTL_SECS}s): {s}")))
 }
 
+fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let nwo = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if nwo.contains('/') {
+        Some(nwo)
+    } else {
+        None
+    }
+}
+
 fn dispatch(cmd: cli::Command) -> Result<i32> {
     let now = quorum_core::clock::now();
     match cmd {
@@ -1012,6 +1036,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 } else {
                     std::sync::Arc::new(serve::merge::GhMergeExecutor {
                         token_file: merge_token_file.map(std::path::PathBuf::from),
+                        gh_repo: resolve_gh_repo(&repo_dir),
                     })
                 };
             let limits = serve::CostLimits {
