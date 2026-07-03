@@ -1653,6 +1653,7 @@ async fn teardown_worker_with_body(
         .remove(&config.repo_dir, &state.worktree_path)
         .await
         .ok();
+    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("worker {} torn down", state.agent_name));
@@ -1687,6 +1688,7 @@ async fn teardown_reviewer(
         .remove(&config.repo_dir, &state.worktree_path)
         .await
         .ok();
+    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));

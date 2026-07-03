@@ -187,6 +187,30 @@ impl WorktreeManager {
 
         Ok(())
     }
+
+    /// Delete a local branch. Best-effort: logs but does not propagate errors
+    /// (the branch may not exist if the worktree was never fully provisioned).
+    pub async fn delete_branch(&self, repo_dir: &Path, branch: &str) {
+        let _guard = self.lock.lock().await;
+
+        let out = Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "branch", "-D", branch])
+            .output()
+            .await;
+
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                if !stderr.contains("not found") {
+                    eprintln!("warn: git branch -D {branch} failed: {stderr}");
+                }
+            }
+            Err(e) => {
+                eprintln!("warn: git branch -D {branch} failed: {e}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +331,54 @@ mod tests {
         );
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn provision_remove_delete_branch_then_reprovision() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("worker-wt");
+        let branch = "daemon/bellows-t42";
+
+        let mgr = WorktreeManager::new();
+
+        // First cycle: provision, remove worktree, delete branch
+        mgr.provision(repo_dir.path(), branch, &wt_path, "main")
+            .await
+            .expect("first provision should succeed");
+        assert!(wt_path.exists());
+
+        mgr.remove(repo_dir.path(), &wt_path)
+            .await
+            .expect("remove should succeed");
+        mgr.delete_branch(repo_dir.path(), branch).await;
+        assert!(!wt_path.exists());
+
+        // Second cycle: same branch name must succeed
+        let result = mgr
+            .provision(repo_dir.path(), branch, &wt_path, "main")
+            .await;
+        assert!(
+            result.is_ok(),
+            "re-provision with same branch should succeed after delete_branch: {:?}",
+            result.err()
+        );
+        assert!(wt_path.exists());
+
+        mgr.remove(repo_dir.path(), &wt_path).await.ok();
+        mgr.delete_branch(repo_dir.path(), branch).await;
+    }
+
+    #[tokio::test]
+    async fn delete_branch_nonexistent_does_not_error() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let mgr = WorktreeManager::new();
+        // Should not panic or error — best-effort
+        mgr.delete_branch(repo_dir.path(), "no-such-branch").await;
     }
 
     #[tokio::test]
