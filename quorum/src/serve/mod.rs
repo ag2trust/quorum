@@ -25,6 +25,7 @@ use std::sync::Arc;
 use worktree::WorktreeManager;
 
 const MAX_POISON_STRIKES: u32 = 3;
+const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 
 struct PoisonTracker {
     strikes: HashMap<i64, u32>,
@@ -55,6 +56,62 @@ impl PoisonTracker {
     #[cfg(test)]
     fn strikes(&self, task_id: i64) -> u32 {
         self.strikes.get(&task_id).copied().unwrap_or(0)
+    }
+}
+
+struct ReviewerProvisionTracker {
+    strikes: HashMap<(i64, i64), u32>,
+}
+
+impl ReviewerProvisionTracker {
+    fn new() -> Self {
+        Self {
+            strikes: HashMap::new(),
+        }
+    }
+
+    fn record_strike(&mut self, task_id: i64, pr: i64) -> u32 {
+        let count = self.strikes.entry((task_id, pr)).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    fn clear(&mut self, task_id: i64, pr: i64) {
+        self.strikes.remove(&(task_id, pr));
+    }
+
+    fn is_exhausted(&self, task_id: i64, pr: i64) -> bool {
+        self.strikes.get(&(task_id, pr)).copied().unwrap_or(0) >= MAX_REVIEWER_PROVISION_STRIKES
+    }
+
+    #[cfg(test)]
+    fn strikes(&self, task_id: i64, pr: i64) -> u32 {
+        self.strikes.get(&(task_id, pr)).copied().unwrap_or(0)
+    }
+}
+
+fn query_pr_head_ref(pr: i64, repo_dir: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName",
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -306,6 +363,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
     let mut poison_tracker = PoisonTracker::new();
+    let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
 
     // Snapshot initial main sha for Trigger B baseline
@@ -410,6 +468,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             &mut workers,
             &mut reviewers,
             &mut poison_tracker,
+            &mut reviewer_provision_tracker,
             &mut drain_state,
         )
         .await
@@ -419,6 +478,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -426,6 +486,7 @@ async fn tick(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
+    reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
@@ -538,6 +599,7 @@ async fn tick(
                                 }
                             }
                         }
+                        let reviewer_agent = reviewers[ri].agent_name.clone();
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r).await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -545,6 +607,40 @@ async fn tick(
                             let w = workers.remove(wi);
                             teardown_worker(config, wt_mgr, name_pool, w, "done").await;
                         }
+                        // #162: auto-resolve the vestigial review task spawned by
+                        // teardown_worker("done"). The in-cycle reviewer already
+                        // approved; a second review would be redundant.
+                        {
+                            let p = db_path.clone();
+                            let agent = reviewer_agent.clone();
+                            let task_id = reviewer_task_id;
+                            let note = format!(
+                                "daemon: auto-resolved — PR #{pr_num} already reviewed \
+                                 by {agent} and merged in-cycle"
+                            );
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                let mut conn = quorum_core::db::open(&p)?;
+                                let now = now_unix();
+                                tasks::auto_resolve_review(&mut conn, task_id, &agent, &note, now)
+                            })
+                            .await
+                            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+                            match resolved {
+                                Ok(Some(review_id)) => {
+                                    log(&format!(
+                                        "auto-resolved vestigial review task #{review_id} \
+                                         for task #{task_id}"
+                                    ));
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    log(&format!(
+                                        "auto-resolve review for task #{task_id} failed: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        reviewer_provision_tracker.clear(reviewer_task_id, pr_num);
                     } else {
                         let failure_kind = merge_result
                             .failure_kind
@@ -1034,9 +1130,42 @@ async fn tick(
                 None
             })
             .collect();
-        for (pr, _task_id, wi) in needs_reviewer {
-            spawn_reviewer_for_worker(config, wt_mgr, name_pool, reviewers, pr, &workers[wi])
-                .await?;
+        let mut parked_workers: Vec<usize> = Vec::new();
+        for (pr, task_id, wi) in &needs_reviewer {
+            if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
+                log(&format!(
+                    "reviewer provision exhausted for task #{task_id} PR #{pr} \
+                     — parking worker"
+                ));
+                parked_workers.push(*wi);
+                continue;
+            }
+            spawn_reviewer_for_worker(
+                config,
+                wt_mgr,
+                name_pool,
+                reviewers,
+                reviewer_provision_tracker,
+                *pr,
+                &workers[*wi],
+            )
+            .await?;
+        }
+        for &wi in parked_workers.iter().rev() {
+            let w = workers.remove(wi);
+            let pr = w.pr.unwrap_or(0);
+            teardown_worker_with_body(
+                config,
+                wt_mgr,
+                name_pool,
+                w,
+                "cancelled",
+                Some(&format!(
+                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
+                     time(s) for PR #{pr} — parking task"
+                )),
+            )
+            .await;
         }
     }
 
@@ -1298,6 +1427,7 @@ async fn spawn_reviewer_for_worker(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     reviewers: &mut Vec<SlotState>,
+    provision_tracker: &mut ReviewerProvisionTracker,
     pr: i64,
     worker: &SlotState,
 ) -> Result<()> {
@@ -1339,22 +1469,75 @@ async fn spawn_reviewer_for_worker(
     // F4: provision reviewer worktree from the PR head branch (the worker's
     // branch), not origin/main, so the reviewer has the code under review
     // checked out locally.
-    match wt_mgr
+    // #162: if the worker's branch fails, fall back to the PR's actual head
+    // ref from GitHub (covers review tasks where the worker never pushed).
+    let provision_result = wt_mgr
         .fetch_and_provision(&config.repo_dir, &branch, &wt_path, &worker.branch)
-        .await
-    {
-        Ok(_) => {
+        .await;
+    let provision_ok = match provision_result {
+        Ok(_) => true,
+        Err(ref e) => {
             log(&format!(
-                "reviewer worktree provisioned at {}",
-                wt_path.display()
+                "reviewer worktree provision failed for branch '{}': {e} — \
+                 trying gh pr view fallback",
+                worker.branch
+            ));
+            let pr_num = pr;
+            let repo_dir = config.repo_dir.clone();
+            let fallback_ref =
+                tokio::task::spawn_blocking(move || query_pr_head_ref(pr_num, &repo_dir))
+                    .await
+                    .ok()
+                    .flatten();
+            if let Some(ref head_ref) = fallback_ref {
+                if head_ref != &worker.branch {
+                    log(&format!(
+                        "PR #{pr} head ref from GitHub: '{head_ref}' (worker branch: '{}')",
+                        worker.branch
+                    ));
+                    match wt_mgr
+                        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, head_ref)
+                        .await
+                    {
+                        Ok(_) => true,
+                        Err(e2) => {
+                            log(&format!(
+                                "reviewer worktree provision failed with fallback ref too: {e2}"
+                            ));
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            } else {
+                log("gh pr view fallback returned no head ref");
+                false
+            }
+        }
+    };
+    if !provision_ok {
+        let task_id = worker.task_id;
+        let strikes = provision_tracker.record_strike(task_id, pr);
+        log(&format!(
+            "reviewer provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
+             for task #{task_id} PR #{pr}"
+        ));
+        if strikes >= MAX_REVIEWER_PROVISION_STRIKES {
+            log(&format!(
+                "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
+                 {strikes} consecutive provision failures for PR #{pr}"
             ));
         }
-        Err(e) => {
-            log(&format!("reviewer worktree provision failed: {e}"));
-            name_pool.release(&reviewer_name);
-            return Ok(());
-        }
+        name_pool.release(&reviewer_name);
+        return Ok(());
+    } else {
+        provision_tracker.clear(worker.task_id, pr);
     }
+    log(&format!(
+        "reviewer worktree provisioned at {}",
+        wt_path.display()
+    ));
 
     let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
@@ -2302,5 +2485,69 @@ mod tests {
     #[test]
     fn exit_self_update_is_75() {
         assert_eq!(EXIT_SELF_UPDATE, 75);
+    }
+
+    // ── ReviewerProvisionTracker tests (#162) ────────────────────────────
+
+    #[test]
+    fn reviewer_provision_tracker_new_is_clean() {
+        let tracker = ReviewerProvisionTracker::new();
+        assert_eq!(tracker.strikes(1, 42), 0);
+        assert!(!tracker.is_exhausted(1, 42));
+    }
+
+    #[test]
+    fn reviewer_provision_tracker_records_strikes() {
+        let mut tracker = ReviewerProvisionTracker::new();
+        assert_eq!(tracker.record_strike(1, 42), 1);
+        assert_eq!(tracker.record_strike(1, 42), 2);
+        assert_eq!(tracker.record_strike(1, 42), 3);
+        assert_eq!(tracker.strikes(1, 42), 3);
+    }
+
+    #[test]
+    fn reviewer_provision_tracker_exhausted_at_threshold() {
+        let mut tracker = ReviewerProvisionTracker::new();
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES - 1 {
+            tracker.record_strike(1, 42);
+        }
+        assert!(!tracker.is_exhausted(1, 42));
+        tracker.record_strike(1, 42);
+        assert!(tracker.is_exhausted(1, 42));
+    }
+
+    #[test]
+    fn reviewer_provision_tracker_clear_resets() {
+        let mut tracker = ReviewerProvisionTracker::new();
+        tracker.record_strike(1, 42);
+        tracker.record_strike(1, 42);
+        tracker.clear(1, 42);
+        assert_eq!(tracker.strikes(1, 42), 0);
+        assert!(!tracker.is_exhausted(1, 42));
+    }
+
+    #[test]
+    fn reviewer_provision_tracker_independent_keys() {
+        let mut tracker = ReviewerProvisionTracker::new();
+        tracker.record_strike(1, 42);
+        tracker.record_strike(1, 42);
+        tracker.record_strike(2, 43);
+        assert_eq!(tracker.strikes(1, 42), 2);
+        assert_eq!(tracker.strikes(2, 43), 1);
+        assert!(!tracker.is_exhausted(1, 42));
+        assert!(!tracker.is_exhausted(2, 43));
+    }
+
+    #[test]
+    fn reviewer_provision_tracker_same_task_different_pr() {
+        let mut tracker = ReviewerProvisionTracker::new();
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            tracker.record_strike(1, 42);
+        }
+        assert!(tracker.is_exhausted(1, 42));
+        assert!(
+            !tracker.is_exhausted(1, 43),
+            "different PR on same task must not be exhausted"
+        );
     }
 }
