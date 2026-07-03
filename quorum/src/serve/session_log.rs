@@ -291,6 +291,34 @@ mod tests {
     }
 
     #[test]
+    fn result_event_appears_in_stream_and_transcript() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+
+        let result_event = Event::Result {
+            result: serde_json::json!({}),
+            usage: Some(super::super::stream::Usage {
+                input_tokens: 200,
+                output_tokens: 100,
+            }),
+            total_cost_usd: Some(0.0123),
+            num_turns: Some(1),
+            duration_ms: Some(5000),
+            is_error: Some(false),
+        };
+        log.log_event(&result_event);
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert_eq!(stream.lines().count(), 1);
+        assert!(stream.contains("\"result\""));
+
+        let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
+        assert!(transcript.contains("300 tokens"));
+        assert!(transcript.contains("$0.0123"));
+    }
+
+    #[test]
     fn log_rework_writes_header() {
         let dir = TempDir::new().unwrap();
         let mut log =

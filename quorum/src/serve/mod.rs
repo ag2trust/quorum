@@ -907,6 +907,10 @@ async fn drain_events(
 
                 slot.draining = false;
 
+                if let Some(ref mut sl) = slot.session_log {
+                    sl.log_event(&event);
+                }
+
                 let breach = check_post_result_limits(
                     limits,
                     turn_tokens,
