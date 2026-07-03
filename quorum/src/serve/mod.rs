@@ -18,10 +18,45 @@ use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::mailbox;
 use quorum_core::tasks;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use worktree::WorktreeManager;
+
+const MAX_POISON_STRIKES: u32 = 3;
+
+struct PoisonTracker {
+    strikes: HashMap<i64, u32>,
+}
+
+impl PoisonTracker {
+    fn new() -> Self {
+        Self {
+            strikes: HashMap::new(),
+        }
+    }
+
+    fn record_strike(&mut self, task_id: i64) -> u32 {
+        let count = self.strikes.entry(task_id).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    fn clear(&mut self, task_id: i64) {
+        self.strikes.remove(&task_id);
+    }
+
+    #[cfg(test)]
+    fn is_poisoned(&self, task_id: i64) -> bool {
+        self.strikes.get(&task_id).copied().unwrap_or(0) >= MAX_POISON_STRIKES
+    }
+
+    #[cfg(test)]
+    fn strikes(&self, task_id: i64) -> u32 {
+        self.strikes.get(&task_id).copied().unwrap_or(0)
+    }
+}
 
 fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
@@ -185,6 +220,7 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     let wt_mgr = WorktreeManager::new();
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
+    let mut poison_tracker = PoisonTracker::new();
 
     // M7: crash recovery — resume in-flight agents from journal
     if let Err(e) = recovery::recover(
@@ -219,6 +255,7 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
             &mut name_pool,
             &mut workers,
             &mut reviewers,
+            &mut poison_tracker,
         )
         .await
         {
@@ -233,6 +270,7 @@ async fn tick(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
+    poison_tracker: &mut PoisonTracker,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -668,10 +706,38 @@ async fn tick(
             }
         }
     }
-    // Remove in reverse order to preserve indices.
     for &i in dead_workers.iter().rev() {
         let dead = workers.remove(i);
-        teardown_worker(config, wt_mgr, name_pool, dead, "open").await;
+        let instant_death = dead.cost_tokens == 0;
+        if instant_death {
+            let strikes = poison_tracker.record_strike(dead.task_id);
+            if strikes >= MAX_POISON_STRIKES {
+                let task_id = dead.task_id;
+                teardown_worker_with_body(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    "cancelled",
+                    Some(&format!(
+                        "daemon: poisoned — worker died {strikes} time(s) without producing output"
+                    )),
+                )
+                .await;
+                log(&format!(
+                    "POISON: task #{task_id} cancelled after {strikes} strikes"
+                ));
+            } else {
+                log(&format!(
+                    "POISON: task #{} strike {strikes}/{MAX_POISON_STRIKES}",
+                    dead.task_id
+                ));
+                teardown_worker(config, wt_mgr, name_pool, dead, "open").await;
+            }
+        } else {
+            poison_tracker.clear(dead.task_id);
+            teardown_worker(config, wt_mgr, name_pool, dead, "open").await;
+        }
     }
 
     let mut dead_reviewers: Vec<usize> = Vec::new();
@@ -772,7 +838,7 @@ async fn tick(
     // Gate on worker count, not total in_use_count() — reviewers must
     // not consume worker capacity (F16).
     while workers.len() < config.cap {
-        if !spawn_worker(config, wt_mgr, name_pool, workers).await? {
+        if !spawn_worker(config, wt_mgr, name_pool, workers, poison_tracker).await? {
             break;
         }
     }
@@ -1234,19 +1300,25 @@ async fn spawn_worker(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
+    poison_tracker: &mut PoisonTracker,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
     let p = db_path.clone();
 
-    // Collect task_ids already in flight to skip them.
     let in_flight: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+    let poisoned: Vec<i64> = poison_tracker
+        .strikes
+        .iter()
+        .filter(|(_, &s)| s >= MAX_POISON_STRIKES)
+        .map(|(&id, _)| id)
+        .collect();
 
     let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
         let open = tasks::list(&conn, Some("open"), None, None)?;
         Ok(open
             .into_iter()
-            .find(|t| t.ready && !in_flight.contains(&t.id)))
+            .find(|t| t.ready && !in_flight.contains(&t.id) && !poisoned.contains(&t.id)))
     })
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
@@ -1332,7 +1404,12 @@ async fn spawn_worker(
         }
         Err(e) => {
             log(&format!("worktree provision failed: {e}"));
-            release_task(&db_path, &agent_name, task.id).await;
+            let strikes = poison_tracker.record_strike(task.id);
+            if strikes >= MAX_POISON_STRIKES {
+                poison_task(&db_path, &agent_name, task.id, strikes).await;
+            } else {
+                release_task(&db_path, &agent_name, task.id).await;
+            }
             name_pool.release(&agent_name);
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             return Ok(false);
@@ -1396,7 +1473,12 @@ async fn spawn_worker(
             if let Err(e) = proc.feed_turn(&turn1).await {
                 log(&format!("feed_turn failed: {e}"));
                 proc.kill_and_reap().await;
-                release_task(&db_path, &agent_name, task.id).await;
+                let strikes = poison_tracker.record_strike(task.id);
+                if strikes >= MAX_POISON_STRIKES {
+                    poison_task(&db_path, &agent_name, task.id, strikes).await;
+                } else {
+                    release_task(&db_path, &agent_name, task.id).await;
+                }
                 name_pool.release(&agent_name);
                 wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
                 return Ok(false);
@@ -1454,7 +1536,12 @@ async fn spawn_worker(
         }
         Err(e) => {
             log(&format!("agent spawn failed: {e}"));
-            release_task(&db_path, &agent_name, task.id).await;
+            let strikes = poison_tracker.record_strike(task.id);
+            if strikes >= MAX_POISON_STRIKES {
+                poison_task(&db_path, &agent_name, task.id, strikes).await;
+            } else {
+                release_task(&db_path, &agent_name, task.id).await;
+            }
             name_pool.release(&agent_name);
             wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
             return Ok(false);
@@ -1473,6 +1560,29 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
         let fields = tasks::TaskUpdate {
             status: Some("open"),
             body: None,
+            refs: None,
+            verdict: None,
+        };
+        tasks::update(&mut conn, &a, task_id, &fields, now)?;
+        Ok(())
+    })
+    .await
+    .ok();
+}
+
+async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strikes: u32) {
+    log(&format!(
+        "POISON: task #{task_id} cancelled after {strikes} consecutive instant-death failures"
+    ));
+    let p = db_path.to_path_buf();
+    let a = agent.to_string();
+    let body = format!("daemon: poisoned — worker died {strikes} time(s) without producing output");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let fields = tasks::TaskUpdate {
+            status: Some("cancelled"),
+            body: Some(&body),
             refs: None,
             verdict: None,
         };
@@ -1797,5 +1907,64 @@ mod tests {
         assert!(limits.max_turn_wall_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
         assert!(limits.max_rework_rounds.is_none());
+    }
+
+    #[test]
+    fn poison_tracker_new_is_clean() {
+        let tracker = PoisonTracker::new();
+        assert_eq!(tracker.strikes(42), 0);
+        assert!(!tracker.is_poisoned(42));
+    }
+
+    #[test]
+    fn poison_tracker_records_strikes() {
+        let mut tracker = PoisonTracker::new();
+        assert_eq!(tracker.record_strike(1), 1);
+        assert_eq!(tracker.record_strike(1), 2);
+        assert_eq!(tracker.record_strike(1), 3);
+        assert_eq!(tracker.strikes(1), 3);
+    }
+
+    #[test]
+    fn poison_tracker_poisoned_at_threshold() {
+        let mut tracker = PoisonTracker::new();
+        for _ in 0..MAX_POISON_STRIKES - 1 {
+            tracker.record_strike(1);
+        }
+        assert!(!tracker.is_poisoned(1));
+        tracker.record_strike(1);
+        assert!(tracker.is_poisoned(1));
+    }
+
+    #[test]
+    fn poison_tracker_clear_resets() {
+        let mut tracker = PoisonTracker::new();
+        tracker.record_strike(1);
+        tracker.record_strike(1);
+        tracker.clear(1);
+        assert_eq!(tracker.strikes(1), 0);
+        assert!(!tracker.is_poisoned(1));
+    }
+
+    #[test]
+    fn poison_tracker_independent_tasks() {
+        let mut tracker = PoisonTracker::new();
+        tracker.record_strike(1);
+        tracker.record_strike(1);
+        tracker.record_strike(2);
+        assert_eq!(tracker.strikes(1), 2);
+        assert_eq!(tracker.strikes(2), 1);
+        assert!(!tracker.is_poisoned(1));
+        assert!(!tracker.is_poisoned(2));
+    }
+
+    #[test]
+    fn poison_tracker_clear_does_not_affect_other_tasks() {
+        let mut tracker = PoisonTracker::new();
+        tracker.record_strike(1);
+        tracker.record_strike(2);
+        tracker.clear(1);
+        assert_eq!(tracker.strikes(1), 0);
+        assert_eq!(tracker.strikes(2), 1);
     }
 }
