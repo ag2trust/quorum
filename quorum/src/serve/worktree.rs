@@ -330,7 +330,7 @@ mod tests {
         assert!(wt2.exists());
 
         // GC with only wt1 as active — wt2 should be removed
-        let active = vec![wt1.to_string_lossy().to_string()];
+        let active = [wt1.to_string_lossy().to_string()];
         let active_refs: Vec<&str> = active.iter().map(|s| s.as_str()).collect();
         let removed = mgr
             .gc_orphaned(repo_dir.path(), wt_base.path(), &active_refs)

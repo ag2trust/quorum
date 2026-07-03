@@ -15,7 +15,7 @@ use super::worktree::WorktreeManager;
 use super::{log, ServeConfig, SlotState};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::mailbox;
-use quorum_core::{error::Result, error::QuorumError};
+use quorum_core::{error::QuorumError, error::Result};
 use std::path::PathBuf;
 
 fn kill_stale_process_group(pid: Option<i32>) {
@@ -64,7 +64,7 @@ pub(crate) async fn recover(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
-    reviewers: &mut Vec<SlotState>,
+    _reviewers: &mut [SlotState],
 ) -> Result<()> {
     let db_path = config.db_path.clone();
     let entries = {
@@ -126,8 +126,7 @@ pub(crate) async fn recover(
                 // Phase 5 will spawn fresh ones if workers have PRs.
                 log(&format!(
                     "recovery: tearing down stale reviewer {} (task #{:?})",
-                    entry.agent,
-                    entry.task_id
+                    entry.agent, entry.task_id
                 ));
                 if let Some(ref wt) = entry.worktree {
                     let wt_path = PathBuf::from(wt);
@@ -215,21 +214,17 @@ pub(crate) async fn recover(
                                     entry.agent
                                 ));
                                 proc.kill_and_reap().await;
-                                release_and_cleanup(
-                                    config,
-                                    name_pool,
-                                    &entry.agent,
-                                    entry.task_id,
-                                )
-                                .await;
+                                release_and_cleanup(config, name_pool, &entry.agent, entry.task_id)
+                                    .await;
                                 continue;
                             }
                         }
 
                         // Re-open session log if log_dir is known
-                        let session_log = entry.log_dir.as_ref().and_then(|ld| {
-                            SessionLog::reopen(&PathBuf::from(ld)).ok()
-                        });
+                        let session_log = entry
+                            .log_dir
+                            .as_ref()
+                            .and_then(|ld| SessionLog::reopen(&PathBuf::from(ld)).ok());
 
                         // Update journal with new PID
                         let new_pid = proc.pid();
@@ -314,9 +309,8 @@ pub(crate) async fn recover(
     }
 
     log(&format!(
-        "recovery: complete — {} worker(s), {} reviewer(s) in flight",
-        workers.len(),
-        reviewers.len()
+        "recovery: complete — {} worker(s) resumed",
+        workers.len()
     ));
 
     Ok(())

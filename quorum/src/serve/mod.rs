@@ -187,7 +187,15 @@ async fn tick_loop(config: ServeConfig) -> Result<()> {
     let mut reviewers: Vec<SlotState> = Vec::new();
 
     // M7: crash recovery — resume in-flight agents from journal
-    if let Err(e) = recovery::recover(&config, &wt_mgr, &mut name_pool, &mut workers, &mut reviewers).await {
+    if let Err(e) = recovery::recover(
+        &config,
+        &wt_mgr,
+        &mut name_pool,
+        &mut workers,
+        &mut reviewers,
+    )
+    .await
+    {
         log(&format!("recovery failed: {e} — starting fresh"));
     }
 

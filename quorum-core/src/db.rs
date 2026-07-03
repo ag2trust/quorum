@@ -1016,6 +1016,9 @@ mod tests {
             .unwrap();
         assert!(pid.is_none(), "pre-existing row must default pid to NULL");
         assert!(pr.is_none(), "pre-existing row must default pr to NULL");
-        assert_eq!(rework_count, 0, "pre-existing row must default rework_count to 0");
+        assert_eq!(
+            rework_count, 0,
+            "pre-existing row must default rework_count to 0"
+        );
     }
 }
