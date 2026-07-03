@@ -62,9 +62,26 @@ fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
 }
 
+/// Map a tier label suffix to a full Claude model ID.
+/// Returns `None` (fall back to global default) for unknown tiers.
+fn tier_to_model_id(tier: &str) -> Option<String> {
+    match tier {
+        "opus-46" => Some("claude-opus-4-6".into()),
+        "opus-47" => Some("claude-opus-4-7".into()),
+        "opus-48" => Some("claude-opus-4-8".into()),
+        "sonnet-5" => Some("claude-sonnet-5".into()),
+        unknown => {
+            log(&format!(
+                "unknown tier label '{unknown}', falling back to global model"
+            ));
+            None
+        }
+    }
+}
+
 /// Extract model and effort overrides from a task's labels JSON.
 ///
-/// Labels like `tier:opus-46` map to model `opus-46`; `effort:high` maps to effort `high`.
+/// Labels like `tier:opus-46` map to model `claude-opus-4-6`; `effort:high` maps to effort `high`.
 /// Returns (model_override, effort_override) — `None` means "use the global config value".
 fn labels_to_model_effort(labels_json: Option<&str>) -> (Option<String>, Option<String>) {
     let json = match labels_json {
@@ -81,7 +98,7 @@ fn labels_to_model_effort(labels_json: Option<&str>) -> (Option<String>, Option<
         if model.is_none() {
             if let Some(val) = label.strip_prefix("tier:") {
                 if !val.is_empty() {
-                    model = Some(val.to_string());
+                    model = tier_to_model_id(val);
                 }
             }
         }
@@ -1697,10 +1714,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn labels_to_model_effort_tier_wins_over_global() {
+    fn tier_to_model_id_opus_46() {
+        assert_eq!(
+            tier_to_model_id("opus-46").as_deref(),
+            Some("claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn tier_to_model_id_opus_47() {
+        assert_eq!(
+            tier_to_model_id("opus-47").as_deref(),
+            Some("claude-opus-4-7")
+        );
+    }
+
+    #[test]
+    fn tier_to_model_id_opus_48() {
+        assert_eq!(
+            tier_to_model_id("opus-48").as_deref(),
+            Some("claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn tier_to_model_id_sonnet_5() {
+        assert_eq!(
+            tier_to_model_id("sonnet-5").as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn tier_to_model_id_unknown_returns_none() {
+        assert_eq!(tier_to_model_id("gpt-5"), None);
+    }
+
+    #[test]
+    fn labels_to_model_effort_tier_maps_to_full_id() {
         let labels = r#"["kind:fix","tier:opus-46"]"#;
         let (model, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model.as_deref(), Some("opus-46"));
+        assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
         assert_eq!(effort, None);
     }
 
@@ -1708,7 +1762,7 @@ mod tests {
     fn labels_to_model_effort_effort_override() {
         let labels = r#"["effort:high","tier:sonnet-5"]"#;
         let (model, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model.as_deref(), Some("sonnet-5"));
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(effort.as_deref(), Some("high"));
     }
 
@@ -1738,7 +1792,15 @@ mod tests {
     fn labels_to_model_effort_first_tier_wins() {
         let labels = r#"["tier:opus-46","tier:sonnet-5"]"#;
         let (model, _effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model.as_deref(), Some("opus-46"));
+        assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn labels_to_model_effort_unknown_tier_falls_back() {
+        let labels = r#"["tier:unknown-model"]"#;
+        let (model, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(model, None);
+        assert_eq!(effort, None);
     }
 
     fn make_dummy_slot() -> SlotState {
