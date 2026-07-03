@@ -370,6 +370,17 @@ pub enum Command {
         /// When set, bypasses `gh pr merge` and runs this shell command instead.
         #[arg(long, hide = true)]
         merge_cmd: Option<String>,
+        /// Override the checks command (for testing). Replaces `{pr}` with the PR number.
+        /// stdout first line: "ready"|"pending"|"failed"; if "failed", subsequent lines
+        /// are failing check names.
+        #[arg(long, hide = true)]
+        merge_checks_cmd: Option<String>,
+        /// Seconds to wait for required status checks before merging. Default: 900.
+        #[arg(long, default_value = "900")]
+        merge_checks_timeout_secs: u64,
+        /// Poll interval for status checks (seconds). Default: 30.
+        #[arg(long, default_value = "30", hide = true)]
+        merge_checks_poll_secs: u64,
         /// Disable --bare mode for spawned agents. By default, agents are
         /// spawned with --bare so they do not inherit operator-local hooks,
         /// plugins, memory, or MCP config. Pass this flag to let agents use
