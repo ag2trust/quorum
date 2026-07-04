@@ -351,8 +351,9 @@ pub enum Command {
         #[arg(long)]
         worktree_base: String,
         /// Path to the agent names file (one name per line).
+        /// When absent, names are auto-generated.
         #[arg(long)]
-        names_file: String,
+        names_file: Option<String>,
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
