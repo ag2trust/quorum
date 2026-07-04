@@ -375,6 +375,10 @@ pub enum Command {
         /// are failing check names.
         #[arg(long, hide = true)]
         merge_checks_cmd: Option<String>,
+        /// Override the mergeability check command (for testing). Replaces `{pr}` with the
+        /// PR number. stdout: "conflicting" => PR has conflicts; anything else => mergeable.
+        #[arg(long, hide = true)]
+        merge_mergeability_cmd: Option<String>,
         /// Seconds to wait for required status checks before merging. Default: 900.
         #[arg(long, default_value = "900")]
         merge_checks_timeout_secs: u64,

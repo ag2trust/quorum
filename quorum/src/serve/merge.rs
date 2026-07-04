@@ -28,6 +28,8 @@ pub fn classify_merge_failure(message: &str) -> MergeFailureKind {
         "branch is behind",
         "not up to date",
         "out of date",
+        "not mergeable",
+        "cannot be cleanly created",
     ];
     for pat in &retryable_patterns {
         if lower.contains(pat) {
@@ -35,6 +37,14 @@ pub fn classify_merge_failure(message: &str) -> MergeFailureKind {
         }
     }
     MergeFailureKind::PolicyBlocked
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeabilityState {
+    /// PR can be merged (or state is unknown/not checked).
+    Mergeable,
+    /// PR has conflicts with the base branch.
+    Conflicting,
 }
 
 #[derive(Debug)]
@@ -68,6 +78,13 @@ pub trait MergeExecutor: Send + Sync {
         _poll_interval_secs: u64,
     ) -> ChecksOutcome {
         ChecksOutcome::Ready
+    }
+
+    /// Pre-merge mergeability check. Returns `Conflicting` if the PR has
+    /// conflicts with the base branch, allowing the daemon to skip the
+    /// approve+checks cycle and go straight to a rework round.
+    fn check_mergeability(&self, _pr: i64, _repo_dir: &Path) -> MergeabilityState {
+        MergeabilityState::Mergeable
     }
 }
 
@@ -267,6 +284,17 @@ impl GhMergeExecutor {
     }
 }
 
+fn parse_mergeability(json_str: &str) -> MergeabilityState {
+    let val: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return MergeabilityState::Mergeable,
+    };
+    match val.get("mergeStateStatus").and_then(|v| v.as_str()) {
+        Some("DIRTY") => MergeabilityState::Conflicting,
+        _ => MergeabilityState::Mergeable,
+    }
+}
+
 impl MergeExecutor for GhMergeExecutor {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
         let pr_str = pr.to_string();
@@ -338,6 +366,20 @@ impl MergeExecutor for GhMergeExecutor {
             std::thread::sleep(Duration::from_secs(poll_interval_secs));
         }
     }
+
+    fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> MergeabilityState {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr_str, "--json", "mergeStateStatus"],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => return MergeabilityState::Mergeable,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_mergeability(&stdout)
+    }
 }
 
 /// Mock executor controlled by an env var or a command string.
@@ -346,6 +388,7 @@ impl MergeExecutor for GhMergeExecutor {
 pub struct CommandMergeExecutor {
     pub command: String,
     pub checks_cmd: Option<String>,
+    pub mergeability_cmd: Option<String>,
 }
 
 impl CommandMergeExecutor {
@@ -435,6 +478,26 @@ impl MergeExecutor for CommandMergeExecutor {
             std::thread::sleep(Duration::from_secs(poll_interval_secs));
         }
     }
+
+    fn check_mergeability(&self, pr: i64, _repo_dir: &Path) -> MergeabilityState {
+        let Some(ref cmd_str) = self.mergeability_cmd else {
+            return MergeabilityState::Mergeable;
+        };
+        let expanded = cmd_str.replace("{pr}", &pr.to_string());
+        let output = std::process::Command::new("sh")
+            .args(["-c", &expanded])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match stdout.as_str() {
+                    "conflicting" => MergeabilityState::Conflicting,
+                    _ => MergeabilityState::Mergeable,
+                }
+            }
+            _ => MergeabilityState::Mergeable,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +516,7 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "echo merged PR {pr}".into(),
             checks_cmd: None,
+            mergeability_cmd: None,
         };
         let result = exec.merge(42, Path::new("/tmp"), &test_ctx());
         assert!(result.success);
@@ -465,6 +529,7 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "echo 'conflict' >&2 && exit 1".into(),
             checks_cmd: None,
+            mergeability_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -477,6 +542,7 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "echo 'merge conflict on file.rs' >&2 && exit 1".into(),
             checks_cmd: None,
+            mergeability_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -486,10 +552,9 @@ mod tests {
     #[test]
     fn command_merge_executor_policy_blocked() {
         let exec = CommandMergeExecutor {
-            command:
-                "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1"
-                    .into(),
+            command: "echo 'the base branch policy prohibits the merge' >&2 && exit 1".into(),
             checks_cmd: None,
+            mergeability_cmd: None,
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
@@ -564,9 +629,28 @@ mod tests {
     }
 
     #[test]
+    fn classify_retryable_not_mergeable() {
+        assert_eq!(
+            classify_merge_failure("not mergeable: the merge commit cannot be cleanly created"),
+            MergeFailureKind::Retryable,
+        );
+    }
+
+    #[test]
+    fn classify_retryable_cannot_be_cleanly_created() {
+        assert_eq!(
+            classify_merge_failure(
+                "Pull request #42 is not mergeable: \
+                 the merge commit cannot be cleanly created"
+            ),
+            MergeFailureKind::Retryable,
+        );
+    }
+
+    #[test]
     fn classify_policy_blocked() {
         assert_eq!(
-            classify_merge_failure("not mergeable: the base branch policy prohibits the merge"),
+            classify_merge_failure("the base branch policy prohibits the merge"),
             MergeFailureKind::PolicyBlocked,
         );
     }
@@ -756,6 +840,7 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "true".into(),
             checks_cmd: Some("echo ready".into()),
+            mergeability_cmd: None,
         };
         let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 5, 1);
         assert_eq!(outcome, ChecksOutcome::Ready);
@@ -766,6 +851,7 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "true".into(),
             checks_cmd: Some("printf 'failed\\nclipper\\ntest'".into()),
+            mergeability_cmd: None,
         };
         let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 5, 1);
         assert_eq!(
@@ -781,6 +867,7 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "true".into(),
             checks_cmd: Some("echo pending".into()),
+            mergeability_cmd: None,
         };
         let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 1, 1);
         assert_eq!(outcome, ChecksOutcome::TimedOut);
@@ -791,8 +878,90 @@ mod tests {
         let exec = CommandMergeExecutor {
             command: "true".into(),
             checks_cmd: None,
+            mergeability_cmd: None,
         };
         let outcome = exec.wait_for_checks(1, Path::new("/tmp"), 5, 1);
         assert_eq!(outcome, ChecksOutcome::Ready);
+    }
+
+    #[test]
+    fn parse_mergeability_dirty() {
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"DIRTY"}"#),
+            MergeabilityState::Conflicting,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_clean() {
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"CLEAN"}"#),
+            MergeabilityState::Mergeable,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_blocked() {
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"BLOCKED"}"#),
+            MergeabilityState::Mergeable,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_behind() {
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"BEHIND"}"#),
+            MergeabilityState::Mergeable,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_invalid_json() {
+        assert_eq!(parse_mergeability("not json"), MergeabilityState::Mergeable,);
+    }
+
+    #[test]
+    fn parse_mergeability_missing_field() {
+        assert_eq!(parse_mergeability(r#"{}"#), MergeabilityState::Mergeable,);
+    }
+
+    #[test]
+    fn command_mergeability_conflicting() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: Some("echo conflicting".into()),
+        };
+        assert_eq!(
+            exec.check_mergeability(1, Path::new("/tmp")),
+            MergeabilityState::Conflicting,
+        );
+    }
+
+    #[test]
+    fn command_mergeability_mergeable() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: Some("echo mergeable".into()),
+        };
+        assert_eq!(
+            exec.check_mergeability(1, Path::new("/tmp")),
+            MergeabilityState::Mergeable,
+        );
+    }
+
+    #[test]
+    fn command_mergeability_none_returns_mergeable() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: None,
+        };
+        assert_eq!(
+            exec.check_mergeability(1, Path::new("/tmp")),
+            MergeabilityState::Mergeable,
+        );
     }
 }

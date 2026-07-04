@@ -594,6 +594,105 @@ async fn tick(
             match row.verdict.as_deref() {
                 Some("approved") => {
                     let pr_num = row.pr.unwrap_or(0);
+
+                    // Pre-merge mergeability check: if the PR is conflicting
+                    // (base moved since branch cut), skip the approve+checks
+                    // cycle and go straight to a rework round (#171).
+                    let mergeability = {
+                        let repo = config.repo_dir.clone();
+                        let executor = Arc::clone(&config.merge_executor);
+                        tokio::task::spawn_blocking(move || {
+                            executor.check_mergeability(pr_num, &repo)
+                        })
+                        .await
+                        .map_err(|e| {
+                            QuorumError::Io(format!("mergeability spawn_blocking join: {e}"))
+                        })?
+                    };
+
+                    if mergeability == merge::MergeabilityState::Conflicting {
+                        log(&format!(
+                            "PR #{pr_num} is CONFLICTING — sending rework \
+                             (skipping approve+checks)"
+                        ));
+                        let r = reviewers.remove(ri);
+                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+
+                        if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
+                        {
+                            let next_round = workers[wi].rework_count + 1;
+                            if let Some(max) = config.limits.max_rework_rounds {
+                                if next_round > max {
+                                    let breach = LimitBreached::ReworkRounds {
+                                        count: next_round,
+                                        max,
+                                    };
+                                    log(&format!(
+                                        "WATCHDOG: worker {} killed (task #{}) — {}",
+                                        workers[wi].agent_name, workers[wi].task_id, breach
+                                    ));
+                                    let w = workers.remove(wi);
+                                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                                    if !consume_mailbox_row(&db_path, *id).await {
+                                        break;
+                                    }
+                                    break;
+                                }
+                            }
+
+                            let rework_msg = format!(
+                                "PR #{pr_num} has conflicts with {} \
+                                 (a sibling PR likely merged first).\n\n\
+                                 Rebase on {}, resolve conflicts, \
+                                 and push again.",
+                                config.base_branch, config.base_branch
+                            );
+                            let rework_turn = reviewer::build_rework_turn(
+                                &workers[wi].agent_name,
+                                workers[wi].task_id,
+                                pr_num,
+                                &rework_msg,
+                            );
+                            if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
+                                log(&format!(
+                                    "mergeability rework feed failed: {e} — \
+                                     tearing down broken worker"
+                                ));
+                                let w = workers.remove(wi);
+                                teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                            } else {
+                                let w = &mut workers[wi];
+                                w.draining = true;
+                                w.pr = None;
+                                w.rework_count += 1;
+                                w.turn_started_at = std::time::Instant::now();
+
+                                if let Some(ref mut sl) = w.session_log {
+                                    sl.log_rework(w.rework_count);
+                                }
+
+                                let p = db_path.clone();
+                                let entry = slot_journal_entry(w, "worker", "working");
+                                tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let mut conn = quorum_core::db::open(&p)?;
+                                    journal::upsert(&mut conn, &entry)
+                                })
+                                .await
+                                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                                .ok();
+
+                                log(&format!(
+                                    "worker {} rework #{} (pre-merge conflict)",
+                                    w.agent_name, w.rework_count
+                                ));
+                            }
+                        }
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                        continue;
+                    }
+
                     log(&format!(
                         "verdict: approved — waiting for checks on PR #{pr_num}"
                     ));

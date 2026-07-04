@@ -564,7 +564,7 @@ pub fn update(
     let n = match fields.status {
         Some("open") => {
             // Release: assignee guard, status=claimed. Nulls assignee + sticky.
-            tx.execute(
+            let rows = tx.execute(
                 "UPDATE tasks SET
                     status='open', assignee=NULL, sticky_until=NULL,
                     body  = COALESCE(?3, body),
@@ -572,7 +572,26 @@ pub fn update(
                     updated_at = ?5
                  WHERE id=?1 AND assignee=?6 AND status='claimed'",
                 params![id, "open", fields.body, fields.refs, now, agent],
-            )?
+            )?;
+            if rows == 0 {
+                // #171: allow reopening daemon-parked tasks (cancelled with
+                // daemon:merge-blocked body). Creator or (former) assignee
+                // can reopen so operators/daemon can unpark without rebuilding
+                // the task chain.
+                tx.execute(
+                    "UPDATE tasks SET
+                        status='open', assignee=NULL, sticky_until=NULL,
+                        body  = COALESCE(?3, body),
+                        refs  = COALESCE(?4, refs),
+                        updated_at = ?5
+                     WHERE id=?1 AND (created_by=?6 OR assignee=?6)
+                           AND status='cancelled'
+                           AND body LIKE 'daemon:merge-blocked%'",
+                    params![id, "open", fields.body, fields.refs, now, agent],
+                )?
+            } else {
+                rows
+            }
         }
         Some("cancelled") => {
             // Cancel: creator OR assignee, non-terminal status.
@@ -3567,5 +3586,166 @@ mod tests {
 
         let second = auto_resolve_review(&mut c, tid, "daemon", "note", 1004).unwrap();
         assert_eq!(second, None, "second call must be a no-op");
+    }
+
+    #[test]
+    fn reopen_cancelled_merge_blocked_task() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        // Cancel with daemon:merge-blocked body (simulates daemon parking).
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("daemon:merge-blocked | PR #42 | some detail"),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "cancelled");
+
+        // Assignee can reopen.
+        let t = update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+    }
+
+    #[test]
+    fn reopen_cancelled_merge_blocked_by_creator() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("daemon:merge-blocked | PR #7"),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Creator can reopen.
+        let t = update(
+            &mut c,
+            "boss",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+    }
+
+    #[test]
+    fn reopen_cancelled_without_merge_blocked_body_fails() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        // Cancel without the merge-blocked marker.
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("cancelled for other reasons"),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Attempt to reopen — should fail (no merge-blocked body).
+        let err = update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn reopen_cancelled_merge_blocked_by_stranger_fails() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("daemon:merge-blocked | PR #7"),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Stranger (neither creator nor assignee) cannot reopen.
+        let err = update(
+            &mut c,
+            "stranger",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::NotHolder));
     }
 }

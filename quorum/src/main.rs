@@ -1020,6 +1020,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             merge_token_file,
             merge_cmd,
             merge_checks_cmd,
+            merge_mergeability_cmd,
             merge_checks_timeout_secs,
             merge_checks_poll_secs,
             no_bare_agent,
@@ -1044,6 +1045,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     std::sync::Arc::new(serve::merge::CommandMergeExecutor {
                         command: cmd,
                         checks_cmd: merge_checks_cmd,
+                        mergeability_cmd: merge_mergeability_cmd,
                     })
                 } else {
                     std::sync::Arc::new(serve::merge::GhMergeExecutor {
