@@ -1,8 +1,9 @@
-//! Integration tests for self-update drain mode (issue #159).
+//! Integration tests for SIGINT/SIGTERM drain mode (issue #173).
 //!
-//! Verifies: Trigger A (self-repo merge → drain → exit 75), negative path
-//! (other-repo merge does NOT trigger drain), drain timeout path, and
-//! queued tasks survive restart.
+//! Verifies:
+//! 1. First SIGINT enters drain (no new claims, in-flight agents finish), exits 0.
+//! 2. Second SIGINT during drain forces immediate teardown, exits 0.
+//! 3. SIGINT-drain exit code (0) does NOT trigger supervisor relaunch (only 75 does).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -62,11 +63,10 @@ impl ServeHandle {
         repo: &std::path::Path,
         wt_base: &std::path::Path,
         names: &std::path::Path,
-        merge_cmd: &str,
         extra_args: &[&str],
     ) -> Self {
         let fake_agent = cargo_bin("fake-agent");
-        let mut args: Vec<String> = vec![
+        let mut args = vec![
             "serve",
             "--cap",
             "1",
@@ -79,11 +79,11 @@ impl ServeHandle {
             "--agent-bin",
             &fake_agent.to_string_lossy(),
             "--merge-cmd",
-            merge_cmd,
+            "true",
         ]
         .into_iter()
         .map(|s| s.to_string())
-        .collect();
+        .collect::<Vec<_>>();
         for a in extra_args {
             args.push(a.to_string());
         }
@@ -137,15 +137,25 @@ impl ServeHandle {
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
         loop {
             match self.child.try_wait().unwrap() {
-                Some(status) => return Some(status),
+                Some(status) => {
+                    self.drain_remaining();
+                    return Some(status);
+                }
                 None => {
                     if std::time::Instant::now() > deadline {
                         self.child.kill().ok();
+                        self.drain_remaining();
                         return self.child.wait().ok();
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
+        }
+    }
+
+    fn drain_remaining(&mut self) {
+        while let Ok(line) = self.rx.recv_timeout(Duration::from_millis(200)) {
+            self.lines.push(line);
         }
     }
 
@@ -158,15 +168,18 @@ impl ServeHandle {
         None
     }
 
-    fn stop(mut self) {
+    fn send_sigint(&self) {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
         }
-        let _ = self.child.wait();
+    }
+
+    fn has_line_containing(&self, needle: &str) -> bool {
+        self.lines.iter().any(|l| l.contains(needle))
     }
 }
 
-fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
+fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .args([
@@ -175,8 +188,6 @@ fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
             title,
             "--created-by",
             "TestCreator",
-            "--refs",
-            refs,
         ])
         .output()
         .unwrap();
@@ -202,9 +213,10 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
-/// Self-repo merge triggers drain → roster empties → exit 75.
+/// First SIGINT with an in-flight agent enters drain mode. The agent finishes
+/// its turn, then the daemon tears it down and exits 0 (not 75).
 #[test]
-fn self_repo_merge_drains_and_exits_75() {
+fn sigint_drains_in_flight_agent_and_exits_0() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -218,26 +230,14 @@ fn self_repo_merge_drains_and_exits_75() {
         .status()
         .unwrap();
 
-    seed_task_with_refs(
-        home.path(),
-        "Self-repo task",
-        r#"{"repo":"test-owner/test-repo"}"#,
-    );
+    seed_task(home.path(), "Drain test task");
 
-    // merge-cmd: "true" — always succeeds
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        "true",
-        &[
-            "--self-update-drain",
-            "--self-repo",
-            "test-owner/test-repo",
-            "--drain-timeout-secs",
-            "10",
-        ],
+        &[],
     );
 
     assert!(
@@ -256,63 +256,44 @@ fn self_repo_merge_drains_and_exits_75() {
         handle.lines
     );
 
-    // Agent done with a PR → triggers reviewer spawn → reviewer approves → merge → drain
-    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
+    // Agent is mid-task (fake-agent stays alive between turns). Send SIGINT.
+    handle.send_sigint();
 
-    // Wait for reviewer to produce a result
     assert!(
-        handle.wait_for("reviewer", 15),
-        "reviewer was not spawned: {:?}",
+        handle.wait_for("draining", 5),
+        "did not see drain message: {:?}",
         handle.lines
     );
 
-    // Get reviewer name from "spawning reviewer" line
-    let reviewer_name = handle
-        .extract_agent_name("spawning reviewer ")
-        .expect("could not extract reviewer name");
+    // Complete the agent's task so it becomes idle → drain tears it down.
+    quorum_done(home.path(), &["--agent", &agent_name]);
 
+    // Daemon should tear down the idle worker and exit.
     assert!(
-        handle.wait_for("result", 15),
-        "reviewer did not produce result: {:?}",
+        handle.wait_for("DRAIN: tearing down idle worker", 10),
+        "did not see idle worker teardown: {:?}",
         handle.lines
     );
 
-    // Reviewer done with approved verdict
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &reviewer_name,
-            "--pr",
-            "42",
-            "--verdict",
-            "approved",
-        ],
-    );
-
-    // Should see drain log and exit 75
-    assert!(
-        handle.wait_for("DRAIN:", 15),
-        "did not see DRAIN log: {:?}",
-        handle.lines
-    );
-
-    let status = handle
-        .wait_exit(10)
-        .expect("serve did not exit after drain");
-
+    let status = handle.wait_exit(10).expect("serve did not exit");
     assert_eq!(
         status.code(),
-        Some(75),
-        "expected exit 75, got {:?}. Lines: {:?}",
+        Some(0),
+        "expected exit 0, got {:?}. Lines: {:?}",
         status.code(),
+        handle.lines
+    );
+
+    assert!(
+        !handle.has_line_containing("exiting 75"),
+        "SIGINT drain must NOT exit 75 (supervisor would relaunch). Lines: {:?}",
         handle.lines
     );
 }
 
-/// Non-self-repo merge does NOT trigger drain.
+/// Second SIGINT while already draining forces immediate teardown.
 #[test]
-fn other_repo_merge_does_not_drain() {
+fn double_sigint_forces_immediate_teardown() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -326,26 +307,14 @@ fn other_repo_merge_does_not_drain() {
         .status()
         .unwrap();
 
-    // Task refs point to a DIFFERENT repo
-    seed_task_with_refs(
-        home.path(),
-        "Other-repo task",
-        r#"{"repo":"other-owner/other-repo"}"#,
-    );
+    seed_task(home.path(), "Double SIGINT task");
 
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        "true",
-        &[
-            "--self-update-drain",
-            "--self-repo",
-            "test-owner/test-repo",
-            "--drain-timeout-secs",
-            "5",
-        ],
+        &[],
     );
 
     assert!(
@@ -353,10 +322,6 @@ fn other_repo_merge_does_not_drain() {
         "did not spawn agent: {:?}",
         handle.lines
     );
-
-    let agent_name = handle
-        .extract_agent_name("spawning agent ")
-        .expect("could not extract agent name");
 
     assert!(
         handle.wait_for("result", 15),
@@ -364,60 +329,42 @@ fn other_repo_merge_does_not_drain() {
         handle.lines
     );
 
-    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "99"]);
+    // First SIGINT → drain
+    handle.send_sigint();
 
     assert!(
-        handle.wait_for("reviewer", 15),
-        "reviewer was not spawned: {:?}",
+        handle.wait_for("draining", 5),
+        "did not see drain message after first SIGINT: {:?}",
         handle.lines
     );
 
-    let reviewer_name = handle
-        .extract_agent_name("spawning reviewer ")
-        .expect("could not extract reviewer name");
+    // Brief pause so the daemon processes the drain state before second signal.
+    std::thread::sleep(Duration::from_millis(200));
 
-    assert!(
-        handle.wait_for("result", 15),
-        "reviewer did not produce result: {:?}",
+    // Second SIGINT → force shutdown
+    handle.send_sigint();
+
+    let status = handle
+        .wait_exit(5)
+        .expect("serve did not exit after double SIGINT");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected exit 0 on double SIGINT, got {:?}. Lines: {:?}",
+        status.code(),
         handle.lines
     );
 
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &reviewer_name,
-            "--pr",
-            "99",
-            "--verdict",
-            "approved",
-        ],
-    );
-
-    // After merge, should see "merged" but NOT "DRAIN"
     assert!(
-        handle.wait_for("merged", 15),
-        "did not see merge: {:?}",
+        handle.has_line_containing("force shutdown"),
+        "expected 'force shutdown' log. Lines: {:?}",
         handle.lines
     );
-
-    // Give it a moment to confirm no drain was triggered
-    std::thread::sleep(Duration::from_secs(1));
-
-    let drain_found = handle.lines.iter().any(|l| l.contains("DRAIN:"));
-    assert!(
-        !drain_found,
-        "DRAIN was triggered for a non-self-repo merge! Lines: {:?}",
-        handle.lines
-    );
-
-    handle.stop();
 }
 
-/// Drain timeout force-kills remaining agents and still exits 75.
-/// Uses Trigger B (sha change) to start drain while agent is mid-turn.
+/// SIGINT with no in-flight agents exits immediately with 0.
 #[test]
-fn drain_timeout_force_kills_and_exits_75() {
+fn sigint_no_agents_exits_immediately() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -431,92 +378,30 @@ fn drain_timeout_force_kills_and_exits_75() {
         .status()
         .unwrap();
 
-    seed_task_with_refs(
-        home.path(),
-        "Long running task",
-        r#"{"repo":"test-owner/test-repo"}"#,
-    );
-    seed_task_with_refs(
-        home.path(),
-        "Second task queued",
-        r#"{"repo":"test-owner/test-repo"}"#,
-    );
-
-    // fake-agent completes its turn quickly, but we won't send `done`, so the agent
-    // stays alive between turns. However the slot's `draining` becomes false after result.
-    // The Phase 4a-drain logic will tear down idle agents during drain. To test the
-    // timeout path, we need an agent that's still mid-turn (draining=true on the slot).
-    //
-    // The fake-agent auto-completes its turn, so we rely on timing: if drain triggers
-    // BEFORE the result event drains, the slot is still draining=true. With
-    // sha-poll-interval-secs=1, we advance main immediately after spawn.
+    // No tasks seeded — daemon will be idle.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        "true",
-        &[
-            "--self-update-drain",
-            "--self-repo",
-            "test-owner/test-repo",
-            "--drain-timeout-secs",
-            "3",
-            "--sha-poll-interval-secs",
-            "1",
-        ],
+        &[],
     );
 
     assert!(
-        handle.wait_for("spawning agent", 15),
-        "did not spawn agent: {:?}",
+        handle.wait_for("serving", 5),
+        "did not see 'serving' banner: {:?}",
         handle.lines
     );
 
-    // Advance origin/main to trigger Trigger B
-    let d = repo_dir.path().to_string_lossy().to_string();
-    Command::new("git")
-        .args(["-C", &d, "commit", "--allow-empty", "-m", "advance main"])
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["-C", &d, "fetch", "origin"])
-        .status()
-        .unwrap();
-
-    // The daemon should either:
-    // (a) drain the idle agent immediately via Phase 4a-drain, or
-    // (b) timeout after 3s if the agent is still mid-turn
-    // Either way, it exits 75.
-    assert!(
-        handle.wait_for("DRAIN: all agents finished", 20)
-            || handle.wait_for("DRAIN: exiting 75", 5),
-        "did not see drain exit log: {:?}",
-        handle.lines
-    );
+    handle.send_sigint();
 
     let status = handle
-        .wait_exit(10)
-        .expect("serve did not exit after drain");
-
-    assert_eq!(
-        status.code(),
-        Some(75),
-        "expected exit 75, got {:?}. Lines: {:?}",
+        .wait_exit(5)
+        .expect("serve did not exit after SIGINT");
+    assert!(
+        status.success(),
+        "expected exit 0 with no agents, got {:?}. Lines: {:?}",
         status.code(),
         handle.lines
-    );
-
-    // Verify queued task (#2) is still open (claimable after restart)
-    let get_out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .args(["task-get", "--task-id", "2"])
-        .output()
-        .unwrap();
-    assert!(get_out.status.success());
-    let stdout = String::from_utf8_lossy(&get_out.stdout);
-    assert!(
-        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
-        "queued task was not left open for next generation: {stdout}"
     );
 }
