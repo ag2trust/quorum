@@ -302,9 +302,17 @@ fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Option
     stdout.split_whitespace().next().map(|s| s.to_string())
 }
 
+/// Why the daemon entered drain mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainSource {
+    SelfUpdate,
+    Signal,
+}
+
 /// Mutable drain state tracked across ticks.
 struct DrainState {
     draining: bool,
+    drain_source: Option<DrainSource>,
     drain_started_at: Option<std::time::Instant>,
     drain_sha: Option<String>,
     last_sha_poll: Option<std::time::Instant>,
@@ -315,6 +323,7 @@ impl DrainState {
     fn new() -> Self {
         Self {
             draining: false,
+            drain_source: None,
             drain_started_at: None,
             drain_sha: None,
             last_sha_poll: None,
@@ -323,13 +332,25 @@ impl DrainState {
     }
 
     fn start_drain(&mut self, sha: &str) {
+        self.start_drain_with_source(sha, DrainSource::SelfUpdate);
+    }
+
+    fn start_drain_with_source(&mut self, sha: &str, source: DrainSource) {
         if self.draining {
             return; // debounce: already draining
         }
         self.draining = true;
+        self.drain_source = Some(source);
         self.drain_started_at = Some(std::time::Instant::now());
         self.drain_sha = Some(sha.to_string());
         log(&format!("DRAIN: entering drain mode (sha={sha})"));
+    }
+
+    fn exit_code(&self) -> i32 {
+        match self.drain_source {
+            Some(DrainSource::SelfUpdate) => EXIT_SELF_UPDATE,
+            _ => 0,
+        }
     }
 
     fn should_poll_sha(&self, interval_secs: u64) -> bool {
@@ -348,18 +369,28 @@ impl DrainState {
 async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| QuorumError::Io(format!("failed to register SIGTERM handler: {e}")))?;
 
-    // SIGINT sets a flag; shutdown happens between ticks. Racing the signal against
-    // tick() in a select! would cancel tick mid-flight at an await point, which can
-    // leak a claimed task (claimed in the DB but slot never assigned, so teardown
-    // has nothing to release) and orphan the spawned agent process. Ticks are
-    // bounded (500ms idle sleep, 5s event timeout), so shutdown latency stays small.
-    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Signal counter: 0 = running, 1 = drain requested, 2+ = force shutdown.
+    // First SIGINT/SIGTERM enters drain mode (in-flight agents finish their turn);
+    // second signal forces immediate teardown. Shutdown happens between ticks —
+    // racing the signal against tick() in a select! would cancel tick mid-flight
+    // at an await point, which can leak a claimed task and orphan agent processes.
+    let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     {
-        let shutdown = shutdown.clone();
+        let sc = signal_count.clone();
         tokio::spawn(async move {
-            sigint.recv().await;
-            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            loop {
+                tokio::select! {
+                    _ = sigint.recv() => {}
+                    _ = sigterm.recv() => {}
+                }
+                let prev = sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if prev >= 1 {
+                    break; // already draining; second signal recorded, stop listening
+                }
+            }
         });
     }
 
@@ -414,8 +445,15 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     log(&format!("serving (cap={})", config.cap));
 
     loop {
-        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            log("shutting down (Ctrl-C)");
+        let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Second signal (or first signal with no in-flight agents): immediate teardown.
+        if sig >= 2 || (sig >= 1 && workers.is_empty() && reviewers.is_empty()) {
+            if sig >= 2 {
+                log("force shutdown (second signal)");
+            } else {
+                log("shutting down (signal, no in-flight agents)");
+            }
             for r in reviewers.drain(..) {
                 teardown_reviewer(&config, &wt_mgr, &mut name_pool, r).await;
             }
@@ -423,6 +461,12 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                 teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
             }
             return Ok(0);
+        }
+
+        // First signal: enter drain mode (let in-flight agents finish).
+        if sig >= 1 && !drain_state.draining {
+            log("SIGINT: draining \u{2014} in-flight agents will finish; Ctrl+C again to force immediate shutdown");
+            drain_state.start_drain_with_source("signal", DrainSource::Signal);
         }
 
         // Trigger B: throttled git ls-remote poll for main sha changes
@@ -460,12 +504,16 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         // Drain: check timeout and roster empty
         if drain_state.draining {
             if workers.is_empty() && reviewers.is_empty() {
+                let exit = drain_state.exit_code();
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
-                log(&format!("DRAIN: exiting for self-update -> {sha}"));
-                return Ok(EXIT_SELF_UPDATE);
+                log(&format!(
+                    "DRAIN: all agents finished (sha={sha}), exiting {exit}"
+                ));
+                return Ok(exit);
             }
 
             if drain_state.timed_out(config.drain_timeout_secs) {
+                let exit = drain_state.exit_code();
                 log(&format!(
                     "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s)",
                     config.drain_timeout_secs,
@@ -479,8 +527,8 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                     teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
                 }
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
-                log(&format!("DRAIN: exiting for self-update -> {sha}"));
-                return Ok(EXIT_SELF_UPDATE);
+                log(&format!("DRAIN: exiting {exit} (sha={sha})"));
+                return Ok(exit);
             }
         }
 
