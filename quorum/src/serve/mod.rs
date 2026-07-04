@@ -218,7 +218,7 @@ pub struct ServeConfig {
     pub cap: usize,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
-    pub names_file: PathBuf,
+    pub names_file: Option<PathBuf>,
     pub agent_bin: Option<String>,
     pub model: String,
     pub effort: String,
@@ -394,8 +394,15 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         });
     }
 
-    let mut name_pool = Pool::load(&config.names_file, config.cap)
-        .map_err(|e| QuorumError::Io(format!("names pool: {e}")))?;
+    let mut name_pool = match config.names_file {
+        Some(ref path) => {
+            Pool::load(path, config.cap).map_err(|e| QuorumError::Io(format!("names pool: {e}")))?
+        }
+        None => {
+            log("no names file provided; using auto-generated names");
+            Pool::generated()
+        }
+    };
 
     if let Some(ref log_dir) = config.log_dir {
         let max_age = 7 * 24 * 3600; // 7 days
@@ -1752,13 +1759,18 @@ async fn spawn_reviewer_for_worker(
     pr: i64,
     worker: &SlotState,
 ) -> Result<()> {
-    let reviewer_name = match name_pool.acquire() {
-        Some(n) => n,
+    let (reviewer_name, generated) = match name_pool.acquire() {
+        Some(pair) => pair,
         None => {
             log("no name available for reviewer");
             return Ok(());
         }
     };
+    if generated {
+        log(&format!(
+            "pool exhausted; generated reviewer name {reviewer_name}"
+        ));
+    }
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
@@ -2082,10 +2094,15 @@ async fn spawn_worker(
         None => return Ok(false),
     };
 
-    let agent_name = match name_pool.acquire() {
-        Some(n) => n,
+    let (agent_name, generated) = match name_pool.acquire() {
+        Some(pair) => pair,
         None => return Ok(false),
     };
+    if generated {
+        log(&format!(
+            "pool exhausted; generated worker name {agent_name}"
+        ));
+    }
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
