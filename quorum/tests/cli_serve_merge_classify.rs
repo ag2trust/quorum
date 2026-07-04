@@ -278,6 +278,96 @@ fn policy_blocked_merge_parks_task_no_rework() {
 }
 
 #[test]
+fn conflicting_pr_skips_merge_sends_rework() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for conflicting PR test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--max-rework-rounds",
+            "1",
+            "--merge-mergeability-cmd",
+            "echo conflicting",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("CONFLICTING", 15),
+        "CONFLICTING log not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework #1 (pre-merge conflict)", 15),
+        "rework turn not sent for pre-merge conflict. Lines: {:?}",
+        handle.lines
+    );
+
+    // Merge was never attempted (merge-cmd is "true" — if it ran, we'd
+    // see a merge log line but no CONFLICTING skip).
+    let saw_merge = handle.lines.iter().any(|l| l.contains("merged"));
+    assert!(
+        !saw_merge,
+        "merge should NOT have been attempted. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+#[test]
 fn retryable_merge_sends_rework_turn() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
