@@ -438,6 +438,12 @@ pub enum Command {
         /// Can be specified multiple times to accept several repos.
         #[arg(long)]
         only_repo: Vec<String>,
+        /// Map a repo slug to a local clone directory for multi-repo provisioning.
+        /// Format: "owner/name=/path/to/clone". Repeatable. When a task's refs.repo
+        /// matches a key, that directory is used for git fetch / worktree operations
+        /// instead of --repo-dir.
+        #[arg(long)]
+        repo_dir_map: Vec<String>,
         /// Base branch name for sha-polling, worktree provisioning, and merge
         /// targeting. Use "master" for repos whose trunk is master. Default: main.
         #[arg(long, default_value = "main")]
