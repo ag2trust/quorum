@@ -437,6 +437,12 @@ pub enum Command {
         /// Can be specified multiple times to accept several repos.
         #[arg(long)]
         only_repo: Vec<String>,
+        /// Map a refs.repo slug to a local clone directory for multi-repo operation.
+        /// Format: "owner/repo=/path/to/clone". Can be specified multiple times.
+        /// Reviewer and worker provisioning resolve the task's refs.repo against this
+        /// map; unmatched repos fall back to --repo-dir.
+        #[arg(long)]
+        repo_clone: Vec<String>,
         /// Base branch name for sha-polling, worktree provisioning, and merge
         /// targeting. Use "master" for repos whose trunk is master. Default: main.
         #[arg(long, default_value = "main")]

@@ -87,6 +87,20 @@ pub trait MergeExecutor: Send + Sync {
     }
 }
 
+#[cfg(test)]
+pub struct NoopMergeExecutor;
+
+#[cfg(test)]
+impl MergeExecutor for NoopMergeExecutor {
+    fn merge(&self, _pr: i64, _repo_dir: &Path, _ctx: &MergeContext) -> MergeResult {
+        MergeResult {
+            success: true,
+            message: "noop".into(),
+            failure_kind: None,
+        }
+    }
+}
+
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
     json_output.contains("\"MERGED\"")
 }

@@ -90,17 +90,33 @@ impl ReviewerProvisionTracker {
     }
 }
 
-fn query_pr_head_ref(pr: i64, repo_dir: &std::path::Path) -> Option<String> {
+/// Resolve the local clone directory for a given `refs.repo` slug. Falls back
+/// to `config.repo_dir` when no explicit mapping exists.
+fn resolve_clone_dir<'a>(config: &'a ServeConfig, refs_repo: Option<&str>) -> &'a std::path::Path {
+    if let Some(repo) = refs_repo {
+        if let Some(dir) = config.repo_clone_dirs.get(repo) {
+            return dir.as_path();
+        }
+    }
+    &config.repo_dir
+}
+
+fn query_pr_head_ref(pr: i64, repo_dir: &std::path::Path, gh_repo: Option<&str>) -> Option<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        pr.to_string(),
+        "--json".to_string(),
+        "headRefName".to_string(),
+        "--jq".to_string(),
+        ".headRefName".to_string(),
+    ];
+    if let Some(repo) = gh_repo {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
     let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr.to_string(),
-            "--json",
-            "headRefName",
-            "--jq",
-            ".headRefName",
-        ])
+        .args(&args)
         .current_dir(repo_dir)
         .output()
         .ok()?;
@@ -247,6 +263,10 @@ pub struct ServeConfig {
     /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
     /// provisioning, and merge targeting.
     pub base_branch: String,
+    /// Maps refs.repo slugs (e.g. "ag2trust/quorum") to local clone directories.
+    /// Worker and reviewer provisioning resolve against this; unmatched repos fall
+    /// back to `repo_dir`.
+    pub repo_clone_dirs: HashMap<String, PathBuf>,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -1790,26 +1810,32 @@ async fn spawn_reviewer_for_worker(
     // F4: provision reviewer worktree from the PR head branch (the worker's
     // branch), not origin/main, so the reviewer has the code under review
     // checked out locally.
+    // #180: resolve the clone dir from the task's refs.repo (same as worker).
+    let task_repo_slug = worker.task_repo.as_deref();
+    let clone_dir = resolve_clone_dir(config, task_repo_slug);
     // #162: if the worker's branch fails, fall back to the PR's actual head
     // ref from GitHub (covers review tasks where the worker never pushed).
     let provision_result = wt_mgr
-        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, &worker.branch)
+        .fetch_and_provision(clone_dir, &branch, &wt_path, &worker.branch)
         .await;
     let provision_ok = match provision_result {
         Ok(_) => true,
         Err(ref e) => {
             log(&format!(
-                "reviewer worktree provision failed for branch '{}': {e} — \
+                "reviewer worktree provision failed for branch '{}' in {}: {e} — \
                  trying gh pr view fallback",
-                worker.branch
+                worker.branch,
+                clone_dir.display()
             ));
             let pr_num = pr;
-            let repo_dir = config.repo_dir.clone();
-            let fallback_ref =
-                tokio::task::spawn_blocking(move || query_pr_head_ref(pr_num, &repo_dir))
-                    .await
-                    .ok()
-                    .flatten();
+            let fallback_repo_dir = clone_dir.to_path_buf();
+            let gh_repo_flag = task_repo_slug.map(str::to_string);
+            let fallback_ref = tokio::task::spawn_blocking(move || {
+                query_pr_head_ref(pr_num, &fallback_repo_dir, gh_repo_flag.as_deref())
+            })
+            .await
+            .ok()
+            .flatten();
             if let Some(ref head_ref) = fallback_ref {
                 if head_ref != &worker.branch {
                     log(&format!(
@@ -1817,7 +1843,7 @@ async fn spawn_reviewer_for_worker(
                         worker.branch
                     ));
                     match wt_mgr
-                        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, head_ref)
+                        .fetch_and_provision(clone_dir, &branch, &wt_path, head_ref)
                         .await
                     {
                         Ok(_) => true,
@@ -1842,7 +1868,9 @@ async fn spawn_reviewer_for_worker(
         let strikes = provision_tracker.record_strike(task_id, pr);
         log(&format!(
             "reviewer provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-             for task #{task_id} PR #{pr}"
+             for task #{task_id} PR #{pr} (repo={}, dir={})",
+            task_repo_slug.unwrap_or("<none>"),
+            clone_dir.display()
         ));
         if strikes >= MAX_REVIEWER_PROVISION_STRIKES {
             log(&format!(
@@ -1924,8 +1952,8 @@ async fn spawn_reviewer_for_worker(
                 log(&format!("reviewer feed_turn failed: {e}"));
                 proc.kill_and_reap().await;
                 name_pool.release(&reviewer_name);
-                wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+                wt_mgr.remove(clone_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(clone_dir, &branch).await;
                 let p = config.db_path.clone();
                 let rn = reviewer_name.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1986,14 +2014,14 @@ async fn spawn_reviewer_for_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: reviewer_session_log,
-                task_repo: None,
+                task_repo: worker.task_repo.clone(),
             });
         }
         Err(e) => {
             log(&format!("reviewer spawn failed: {e}"));
             name_pool.release(&reviewer_name);
-            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+            wt_mgr.remove(clone_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(clone_dir, &branch).await;
             let p = config.db_path.clone();
             let rn = reviewer_name.clone();
             tokio::task::spawn_blocking(move || {
@@ -2149,9 +2177,13 @@ async fn spawn_worker(
         .worktree_base
         .join(format!("{}-t{}", agent_name, task.id));
 
+    // #180: resolve clone dir from the task's refs.repo for multi-repo parity.
+    let worker_task_repo = quorum_core::branches::repo_from_refs(task.refs.as_deref());
+    let worker_clone_dir = resolve_clone_dir(config, Some(&worker_task_repo));
+
     match wt_mgr
         .provision(
-            &config.repo_dir,
+            worker_clone_dir,
             &branch,
             &wt_path,
             &format!("origin/{}", config.base_branch),
@@ -2239,8 +2271,8 @@ async fn spawn_worker(
                     release_task(&db_path, &agent_name, task.id).await;
                 }
                 name_pool.release(&agent_name);
-                wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+                wt_mgr.remove(worker_clone_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(worker_clone_dir, &branch).await;
                 return Ok(false);
             }
 
@@ -2308,8 +2340,8 @@ async fn spawn_worker(
                 release_task(&db_path, &agent_name, task.id).await;
             }
             name_pool.release(&agent_name);
-            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+            wt_mgr.remove(worker_clone_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(worker_clone_dir, &branch).await;
             return Ok(false);
         }
     }
@@ -2415,11 +2447,9 @@ async fn teardown_worker_with_body(
     .await
     .ok();
 
-    wt_mgr
-        .remove(&config.repo_dir, &state.worktree_path)
-        .await
-        .ok();
-    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
+    let clone_dir = resolve_clone_dir(config, state.task_repo.as_deref());
+    wt_mgr.remove(clone_dir, &state.worktree_path).await.ok();
+    wt_mgr.delete_branch(clone_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("worker {} torn down", state.agent_name));
@@ -2450,11 +2480,9 @@ async fn teardown_reviewer(
     .await
     .ok();
 
-    wt_mgr
-        .remove(&config.repo_dir, &state.worktree_path)
-        .await
-        .ok();
-    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
+    let clone_dir = resolve_clone_dir(config, state.task_repo.as_deref());
+    wt_mgr.remove(clone_dir, &state.worktree_path).await.ok();
+    wt_mgr.delete_branch(clone_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
@@ -2990,5 +3018,83 @@ mod tests {
         assert!(task_matches_repo_filter(&t1, &filter));
         assert!(task_matches_repo_filter(&t2, &filter));
         assert!(!task_matches_repo_filter(&t3, &filter));
+    }
+
+    // ── resolve_clone_dir tests (#180) ──────────────────────────────────
+
+    fn make_config_with_clones(clones: &[(&str, &str)]) -> ServeConfig {
+        let mut repo_clone_dirs = HashMap::new();
+        for (slug, path) in clones {
+            repo_clone_dirs.insert(slug.to_string(), PathBuf::from(path));
+        }
+        ServeConfig {
+            db_path: PathBuf::from("/tmp/q.db"),
+            cap: 1,
+            repo_dir: PathBuf::from("/default/repo"),
+            worktree_base: PathBuf::from("/tmp/wt"),
+            names_file: PathBuf::from("/tmp/names"),
+            agent_bin: None,
+            model: "sonnet".into(),
+            effort: "high".into(),
+            merge_executor: std::sync::Arc::new(super::merge::NoopMergeExecutor),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 900,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 900,
+            merge_checks_poll_secs: 30,
+            only_repo: vec![],
+            repo_clone_dirs,
+            base_branch: "main".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_clone_dir_falls_back_to_repo_dir() {
+        let config = make_config_with_clones(&[]);
+        assert_eq!(
+            resolve_clone_dir(&config, None),
+            std::path::Path::new("/default/repo"),
+        );
+        assert_eq!(
+            resolve_clone_dir(&config, Some("unknown/repo")),
+            std::path::Path::new("/default/repo"),
+        );
+    }
+
+    #[test]
+    fn resolve_clone_dir_uses_mapping() {
+        let config = make_config_with_clones(&[
+            ("ag2trust/ag2trust", "/home/dev/ag2trust"),
+            ("ag2trust/quorum", "/home/dev/quorum"),
+        ]);
+        assert_eq!(
+            resolve_clone_dir(&config, Some("ag2trust/ag2trust")),
+            std::path::Path::new("/home/dev/ag2trust"),
+        );
+        assert_eq!(
+            resolve_clone_dir(&config, Some("ag2trust/quorum")),
+            std::path::Path::new("/home/dev/quorum"),
+        );
+        assert_eq!(
+            resolve_clone_dir(&config, Some("other/repo")),
+            std::path::Path::new("/default/repo"),
+            "unmapped repo falls back to default repo_dir"
+        );
+    }
+
+    #[test]
+    fn resolve_clone_dir_reviewer_uses_same_path_as_worker() {
+        let config = make_config_with_clones(&[("ag2trust/ag2trust", "/home/dev/ag2trust")]);
+        let task_repo = Some("ag2trust/ag2trust");
+        let worker_dir = resolve_clone_dir(&config, task_repo);
+        let reviewer_dir = resolve_clone_dir(&config, task_repo);
+        assert_eq!(
+            worker_dir, reviewer_dir,
+            "reviewer must resolve to the same clone dir as the worker for the same refs.repo"
+        );
     }
 }

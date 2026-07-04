@@ -1037,6 +1037,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             self_repo,
             sha_poll_interval_secs,
             only_repo,
+            repo_clone,
             base_branch,
         } => {
             let db = paths::db_path()?;
@@ -1073,6 +1074,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             } else {
                 None
             };
+            let mut repo_clone_dirs = std::collections::HashMap::new();
+            for entry in &repo_clone {
+                if let Some((slug, path)) = entry.split_once('=') {
+                    if !slug.is_empty() && !path.is_empty() {
+                        repo_clone_dirs.insert(slug.to_string(), std::path::PathBuf::from(path));
+                    }
+                }
+            }
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
@@ -1093,6 +1102,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_timeout_secs,
                 merge_checks_poll_secs,
                 only_repo,
+                repo_clone_dirs,
                 base_branch,
             };
             Ok(serve::run_serve(config)?)
