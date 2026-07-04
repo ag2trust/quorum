@@ -28,7 +28,6 @@ pub fn classify_merge_failure(message: &str) -> MergeFailureKind {
         "branch is behind",
         "not up to date",
         "out of date",
-        "not mergeable",
         "cannot be cleanly created",
     ];
     for pat in &retryable_patterns {
@@ -552,7 +551,9 @@ mod tests {
     #[test]
     fn command_merge_executor_policy_blocked() {
         let exec = CommandMergeExecutor {
-            command: "echo 'the base branch policy prohibits the merge' >&2 && exit 1".into(),
+            command:
+                "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1"
+                    .into(),
             checks_cmd: None,
             mergeability_cmd: None,
         };
@@ -629,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_retryable_not_mergeable() {
+    fn classify_retryable_cannot_be_cleanly_created() {
         assert_eq!(
             classify_merge_failure("not mergeable: the merge commit cannot be cleanly created"),
             MergeFailureKind::Retryable,
@@ -637,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_retryable_cannot_be_cleanly_created() {
+    fn classify_retryable_cannot_be_cleanly_created_with_pr_prefix() {
         assert_eq!(
             classify_merge_failure(
                 "Pull request #42 is not mergeable: \
@@ -650,7 +651,7 @@ mod tests {
     #[test]
     fn classify_policy_blocked() {
         assert_eq!(
-            classify_merge_failure("the base branch policy prohibits the merge"),
+            classify_merge_failure("not mergeable: the base branch policy prohibits the merge"),
             MergeFailureKind::PolicyBlocked,
         );
     }

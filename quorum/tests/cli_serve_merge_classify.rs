@@ -205,7 +205,7 @@ fn policy_blocked_merge_parks_task_no_rework() {
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        "echo 'the base branch policy prohibits the merge' >&2 && exit 1",
+        "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1",
         &[],
     );
 
