@@ -309,6 +309,38 @@ fn validate_depends_on(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// Tier suffixes recognized by `serve`'s `tier_to_model_id` (quorum/src/serve/mod.rs). Kept in
+/// sync manually — quorum-core can't depend on the `quorum` bin crate. A tier outside this list
+/// isn't rejected (serve falls back to the global default model), just warned about here so a
+/// typo is caught at create time rather than silently routing to the wrong model.
+const KNOWN_TIERS: &[&str] = &["opus-46", "opus-47", "opus-48", "sonnet-5"];
+
+/// Validate `--labels` at the boundary: parse as a JSON array of strings and return a clean
+/// usage error if it doesn't (parity with `validate_depends_on`). A bare comma string like
+/// `"tier:opus-46,effort:medium"` used to be accepted and stored as one malformed label,
+/// silently defeating serve's tier/effort routing — reject it before it lands.
+///
+/// Also warns (does not fail) on unrecognized `tier:*` values, printed to stderr so a typoed
+/// tier is caught at create time instead of only discovered when serve falls back silently.
+fn validate_labels(s: &str) -> Result<()> {
+    let labels: Vec<String> = serde_json::from_str(s).map_err(|e| {
+        QuorumError::Usage(format!(
+            "--labels must be a JSON array of strings (e.g. '[\"tier:opus-46\",\"effort:medium\"]'): {e}"
+        ))
+    })?;
+    for label in &labels {
+        if let Some(tier) = label.strip_prefix("tier:") {
+            if !tier.is_empty() && !KNOWN_TIERS.contains(&tier) {
+                eprintln!(
+                    "warn: unrecognized tier '{tier}' in --labels (known: {}); serve will fall back to the global default model",
+                    KNOWN_TIERS.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compute whether a task's deps are all `closed`. `None`/empty deps = ready.
 ///
 /// Issue #2 alignment: a dependent unblocks only when every dep is **`closed`** (reviewed +
@@ -337,6 +369,10 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
 /// `depends_on` is a JSON array of task ids this task waits on (e.g. `"[1,3]"`); `None` =
 /// no deps. Validated at the boundary as a JSON array of i64 — malformed input is rejected
 /// with a usage error (exit 2) BEFORE the row lands, so no read path can be poisoned.
+///
+/// `labels` is a JSON array of strings (e.g. `'["tier:opus-46","effort:medium"]'`); `None` =
+/// no labels. Validated at the boundary the same way — malformed input (e.g. a bare comma
+/// string) is rejected with a usage error (exit 2) before it lands.
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     conn: &mut Connection,
@@ -349,9 +385,13 @@ pub fn create(
     depends_on: Option<&str>,
     now: i64,
 ) -> Result<i64> {
-    // Reject malformed depends_on at the boundary. See validate_depends_on for why.
+    // Reject malformed depends_on/labels at the boundary. See validate_depends_on/validate_labels
+    // for why.
     if let Some(s) = depends_on {
         validate_depends_on(s)?;
+    }
+    if let Some(s) = labels {
+        validate_labels(s)?;
     }
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, created_by, now)?;
@@ -1957,6 +1997,90 @@ mod tests {
             None,
             None,
             Some("[1]"),
+            1000
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn create_rejects_malformed_labels_before_storing() {
+        // Repro 2026-07-04: `--labels 'tier:opus-46,effort:medium'` (comma string, not JSON
+        // array) was silently accepted and stored as one malformed label. Fix: parity with
+        // validate_depends_on — reject at the boundary, never store it.
+        let (_d, mut c) = open_tmp();
+        let err = create(
+            &mut c,
+            "boss",
+            "bad",
+            None,
+            0,
+            Some("tier:opus-46,effort:medium"),
+            None,
+            None,
+            1000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "got {err:?}");
+        assert_eq!(list(&c, None, None, None).unwrap().len(), 0);
+        // Other malformed shapes — string, object, array-of-numbers — all rejected.
+        for bad in &["garbage", "{}", "[1, 2]", r#"["one","#] {
+            assert!(matches!(
+                create(&mut c, "boss", "x", None, 0, Some(bad), None, None, 1000).unwrap_err(),
+                QuorumError::Usage(_)
+            ));
+        }
+        // Empty array and well-formed labels still accepted.
+        assert!(create(
+            &mut c,
+            "boss",
+            "ok-empty",
+            None,
+            0,
+            Some("[]"),
+            None,
+            None,
+            1000
+        )
+        .is_ok());
+        assert!(create(
+            &mut c,
+            "boss",
+            "ok-one",
+            None,
+            0,
+            Some(r#"["ui"]"#),
+            None,
+            None,
+            1000
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn create_accepts_known_tier_and_does_not_warn_reject_unknown() {
+        // Bonus behavior: unknown tier:* is a warning, not a rejection — create still succeeds.
+        let (_d, mut c) = open_tmp();
+        assert!(create(
+            &mut c,
+            "boss",
+            "known-tier",
+            None,
+            0,
+            Some(r#"["tier:opus-46"]"#),
+            None,
+            None,
+            1000
+        )
+        .is_ok());
+        assert!(create(
+            &mut c,
+            "boss",
+            "unknown-tier",
+            None,
+            0,
+            Some(r#"["tier:not-a-real-tier"]"#),
+            None,
+            None,
             1000
         )
         .is_ok());
