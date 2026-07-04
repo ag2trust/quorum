@@ -1078,7 +1078,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 cap,
                 repo_dir: std::path::PathBuf::from(repo_dir),
                 worktree_base: std::path::PathBuf::from(worktree_base),
-                names_file: std::path::PathBuf::from(names_file),
+                names_file: names_file.map(std::path::PathBuf::from),
                 agent_bin,
                 model,
                 effort,

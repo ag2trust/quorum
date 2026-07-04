@@ -218,7 +218,7 @@ pub struct ServeConfig {
     pub cap: usize,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
-    pub names_file: PathBuf,
+    pub names_file: Option<PathBuf>,
     pub agent_bin: Option<String>,
     pub model: String,
     pub effort: String,
@@ -394,8 +394,15 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         });
     }
 
-    let mut name_pool = Pool::load(&config.names_file, config.cap)
-        .map_err(|e| QuorumError::Io(format!("names pool: {e}")))?;
+    let mut name_pool = match &config.names_file {
+        Some(path) => {
+            Pool::load(path, config.cap).map_err(|e| QuorumError::Io(format!("names pool: {e}")))?
+        }
+        None => {
+            log("no names file provided — using auto-generated names");
+            Pool::new_generated()
+        }
+    };
 
     if let Some(ref log_dir) = config.log_dir {
         let max_age = 7 * 24 * 3600; // 7 days
@@ -1752,13 +1759,14 @@ async fn spawn_reviewer_for_worker(
     pr: i64,
     worker: &SlotState,
 ) -> Result<()> {
-    let reviewer_name = match name_pool.acquire() {
-        Some(n) => n,
-        None => {
-            log("no name available for reviewer");
-            return Ok(());
-        }
-    };
+    let acquire_result = name_pool.acquire();
+    if acquire_result.is_generated() && name_pool.has_file() {
+        log(&format!(
+            "names pool exhausted, generated fallback reviewer name: {}",
+            acquire_result.name()
+        ));
+    }
+    let reviewer_name = acquire_result.into_name();
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
@@ -2082,10 +2090,14 @@ async fn spawn_worker(
         None => return Ok(false),
     };
 
-    let agent_name = match name_pool.acquire() {
-        Some(n) => n,
-        None => return Ok(false),
-    };
+    let acquire_result = name_pool.acquire();
+    if acquire_result.is_generated() && name_pool.has_file() {
+        log(&format!(
+            "names pool exhausted, generated fallback name: {}",
+            acquire_result.name()
+        ));
+    }
+    let agent_name = acquire_result.into_name();
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {

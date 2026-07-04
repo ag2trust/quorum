@@ -93,24 +93,8 @@ pub(crate) async fn recover(
     let mut active_worktrees: Vec<String> = Vec::new();
 
     for entry in &entries {
-        // Reclaim the name
-        if !name_pool.reclaim(&entry.agent) {
-            log(&format!(
-                "recovery: name {} not in pool — skipping (journal stale?)",
-                entry.agent
-            ));
-            // Clean up the stale journal entry
-            let p = db_path.clone();
-            let agent = entry.agent.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = journal::delete(&mut conn, &agent);
-                }
-            })
-            .await
-            .ok();
-            continue;
-        }
+        // Reclaim the name (always succeeds — generated names are tracked on reclaim)
+        name_pool.reclaim(&entry.agent);
 
         if let Some(ref wt) = entry.worktree {
             active_worktrees.push(wt.clone());
