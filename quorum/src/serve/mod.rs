@@ -90,6 +90,49 @@ impl ReviewerProvisionTracker {
     }
 }
 
+/// Lifetime roster of agent names this daemon has ever owned.
+///
+/// Under a multi-instance topology (one shared SQLite mailbox, per-repo daemons)
+/// a mailbox row whose `agent` matches no live worker/reviewer usually means
+/// "belongs to the OTHER daemon's agent", not "phantom row". Consuming such a
+/// row destroys the sibling daemon's lifecycle signal (#181).
+///
+/// The roster tracks every agent name this daemon has ever spawned or resumed —
+/// entries are inserted at spawn/recover and NEVER removed (so recently-torn-down
+/// names still register as "ours"). The phantom-row GC guarantee from #133 is
+/// preserved WITHIN an instance: our own past-agent rows still get consumed;
+/// rows for names we have never owned are left for the owning instance to
+/// process (or for TTL/sweep to reap if truly orphaned).
+pub(crate) struct LifetimeRoster {
+    names: std::collections::HashSet<String>,
+    logged_foreign: std::collections::HashSet<String>,
+}
+
+impl LifetimeRoster {
+    fn new() -> Self {
+        Self {
+            names: std::collections::HashSet::new(),
+            logged_foreign: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Register an agent name as owned by this daemon (permanent — never removed).
+    pub(crate) fn register(&mut self, name: &str) {
+        self.names.insert(name.to_string());
+    }
+
+    /// True if this daemon has ever owned this agent name.
+    pub(crate) fn owns(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// Record that we have logged a "foreign row" for this agent (debounce).
+    /// Returns true the first time an agent is seen, false on subsequent calls.
+    fn log_foreign_once(&mut self, name: &str) -> bool {
+        self.logged_foreign.insert(name.to_string())
+    }
+}
+
 fn query_pr_head_ref(pr: i64, repo_dir: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new("gh")
         .args([
@@ -423,6 +466,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
     let mut repo_filter_logged: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut lifetime_roster = LifetimeRoster::new();
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -443,6 +487,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         &mut name_pool,
         &mut workers,
         &mut reviewers,
+        &mut lifetime_roster,
     )
     .await
     {
@@ -549,6 +594,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             &mut reviewer_provision_tracker,
             &mut drain_state,
             &mut repo_filter_logged,
+            &mut lifetime_roster,
         )
         .await
         {
@@ -568,6 +614,7 @@ async fn tick(
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
     repo_filter_logged: &mut std::collections::HashSet<i64>,
+    lifetime_roster: &mut LifetimeRoster,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -612,11 +659,20 @@ async fn tick(
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
                 .ok();
-            } else {
+            } else if lifetime_roster.owns(&row.agent) {
                 log(&format!(
                     "consuming unmatched task_update from {} (no active worker)",
                     row.agent
                 ));
+            } else {
+                // #181: row belongs to another daemon's agent — leave it.
+                if lifetime_roster.log_foreign_once(&row.agent) {
+                    log(&format!(
+                        "leaving task_update from {} unconsumed (not in this instance's roster)",
+                        row.agent
+                    ));
+                }
+                continue;
             }
             if !consume_mailbox_row(&db_path, *id).await {
                 break;
@@ -1200,16 +1256,29 @@ async fn tick(
             break;
         }
 
-        // F9: Done row matches neither worker nor reviewer — consume it to
-        // prevent infinite re-polling. With name reuse, a stale verdict left
-        // unconsumed could be applied to a NEW agent that acquired the same
-        // name (phantom completion).
-        log(&format!(
-            "consuming unmatched Done row from {} (matches no active agent)",
-            row.agent
-        ));
-        if !consume_mailbox_row(&db_path, *id).await {
-            break;
+        // F9 + #181: Done row matches neither worker nor reviewer.
+        //
+        // If this daemon has ever owned the agent name, the row is a phantom
+        // from a prior turn we own — consume it (F9) so it doesn't re-poll and
+        // so a future name-reuse doesn't fire a phantom verdict.
+        //
+        // If this daemon has NEVER owned the name, the row belongs to another
+        // instance's agent (two-instance topology, shared SQLite queue) — leave
+        // it for the owning daemon to process (#181). Consuming would destroy
+        // the sibling's lifecycle signal.
+        if lifetime_roster.owns(&row.agent) {
+            log(&format!(
+                "consuming unmatched Done row from {} (matches no active agent)",
+                row.agent
+            ));
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+        } else if lifetime_roster.log_foreign_once(&row.agent) {
+            log(&format!(
+                "leaving Done row from {} unconsumed (not in this instance's roster)",
+                row.agent
+            ));
         }
     }
 
@@ -1426,8 +1495,16 @@ async fn tick(
                 consume_mailbox_row(&db_path, *msg_id).await;
             }
             None => {
-                log(&format!("consuming message to {target} (no active worker)"));
-                consume_mailbox_row(&db_path, *msg_id).await;
+                // #181: only reap messages addressed to agents we've ever owned.
+                // Otherwise the row belongs to another instance's worker — leave it.
+                if lifetime_roster.owns(target) {
+                    log(&format!("consuming message to {target} (no active worker)"));
+                    consume_mailbox_row(&db_path, *msg_id).await;
+                } else if lifetime_roster.log_foreign_once(target) {
+                    log(&format!(
+                        "leaving message to {target} unconsumed (not in this instance's roster)"
+                    ));
+                }
             }
         }
     }
@@ -1465,6 +1542,7 @@ async fn tick(
                 name_pool,
                 reviewers,
                 reviewer_provision_tracker,
+                lifetime_roster,
                 *pr,
                 &workers[*wi],
             )
@@ -1501,6 +1579,7 @@ async fn tick(
                 workers,
                 poison_tracker,
                 repo_filter_logged,
+                lifetime_roster,
             )
             .await?
             {
@@ -1750,12 +1829,14 @@ async fn drain_events(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_reviewer_for_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     reviewers: &mut Vec<SlotState>,
     provision_tracker: &mut ReviewerProvisionTracker,
+    lifetime_roster: &mut LifetimeRoster,
     pr: i64,
     worker: &SlotState,
 ) -> Result<()> {
@@ -1767,6 +1848,9 @@ async fn spawn_reviewer_for_worker(
         ));
     }
     let reviewer_name = acquire_result.into_name();
+    // #181: register in the lifetime roster BEFORE any DB work so any concurrent
+    // sibling daemon polling us now can see we own this name via future rows.
+    lifetime_roster.register(&reviewer_name);
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
@@ -2037,6 +2121,7 @@ fn task_matches_repo_filter(task: &tasks::Task, only_repo: &[String]) -> bool {
 
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -2044,6 +2129,7 @@ async fn spawn_worker(
     workers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
     repo_filter_logged: &mut std::collections::HashSet<i64>,
+    lifetime_roster: &mut LifetimeRoster,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
     let p = db_path.clone();
@@ -2098,6 +2184,9 @@ async fn spawn_worker(
         ));
     }
     let agent_name = acquire_result.into_name();
+    // #181: register in the lifetime roster BEFORE any DB work so we know this
+    // name belongs to us for the rest of the daemon's life.
+    lifetime_roster.register(&agent_name);
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
