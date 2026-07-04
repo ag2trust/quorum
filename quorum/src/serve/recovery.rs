@@ -12,11 +12,19 @@ use super::agent::{AgentProc, AgentSpec};
 use super::names::Pool;
 use super::session_log::SessionLog;
 use super::worktree::WorktreeManager;
-use super::{log, ServeConfig, SlotState};
+use super::{log, PendingReview, ServeConfig, SlotState};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::mailbox;
 use quorum_core::{error::QuorumError, error::Result};
 use std::path::PathBuf;
+
+/// #178: true iff this journal entry represents a worker that finished its
+/// work and delivered a PR — the daemon should NOT respawn a worker for it on
+/// restart; instead spawn a reviewer for the recorded PR. Callers must also
+/// ensure `role == "worker"`.
+pub(crate) fn is_awaiting_review_with_pr(entry: &JournalEntry) -> bool {
+    entry.phase == "awaiting-review" && entry.pr.is_some()
+}
 
 fn kill_stale_process_group(pid: Option<i32>) {
     if let Some(pid) = pid {
@@ -61,6 +69,7 @@ pub(crate) async fn recover(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     _reviewers: &mut [SlotState],
+    pending_reviews: &mut Vec<PendingReview>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
     let entries = {
@@ -145,6 +154,43 @@ pub(crate) async fn recover(
                 name_pool.release(&entry.agent);
             }
             "worker" => {
+                // #178: done-awaiting-review, PR recorded → skip worker respawn.
+                // The task pipeline position is durable across restart: keep the
+                // journal entry, keep the task claimed, and add to pending_reviews
+                // so the next tick provisions a reviewer for the recorded PR.
+                // Without this, restart would tear the resumed idle worker down
+                // as "open" (Phase 4b dead-worker), reverting the task and
+                // producing duplicate PRs when a fresh worker re-executes.
+                if is_awaiting_review_with_pr(entry) {
+                    let wt = entry
+                        .worktree
+                        .clone()
+                        .unwrap_or_else(|| String::from("(unknown)"));
+                    let branch = entry
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| String::from("(unknown)"));
+                    let task_id = entry.task_id.unwrap_or(0);
+                    let pr = entry.pr.unwrap_or(0);
+                    log(&format!(
+                        "recovery: worker {} in awaiting-review (task #{task_id}, PR #{pr}) \
+                         — resuming at review stage, no worker respawn",
+                        entry.agent
+                    ));
+                    // Keep worktree in active_worktrees so GC doesn't remove it
+                    // (reviewer may need the branch; kept via journal entry).
+                    let _ = wt;
+                    pending_reviews.push(PendingReview {
+                        agent_name: entry.agent.clone(),
+                        task_id,
+                        session_id: entry.session_id.clone(),
+                        worktree_path: PathBuf::from(entry.worktree.clone().unwrap_or_default()),
+                        branch,
+                        pr,
+                    });
+                    continue;
+                }
+
                 // Verify the worktree still exists
                 let wt_path = match &entry.worktree {
                     Some(wt) => {
@@ -438,5 +484,31 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         let content = parsed["message"]["content"].as_str().unwrap();
         assert!(content.contains("custom-phase"));
+    }
+
+    #[test]
+    fn awaiting_review_with_pr_classifies_pending() {
+        let entry = sample_entry("W1", "worker", "awaiting-review");
+        assert!(entry.pr.is_some());
+        assert!(is_awaiting_review_with_pr(&entry));
+    }
+
+    #[test]
+    fn awaiting_review_without_pr_not_pending() {
+        // Pre-#178 journal entries or a race where drain_events wrote the
+        // awaiting-review phase but the done --pr row hadn't been processed
+        // yet: entry.pr is None. Recovery must fall back to the standard
+        // resume path (spawn worker with --resume) rather than routing to
+        // pending_reviews (which would leave the task orphaned — no PR to
+        // review against).
+        let mut entry = sample_entry("W1", "worker", "awaiting-review");
+        entry.pr = None;
+        assert!(!is_awaiting_review_with_pr(&entry));
+    }
+
+    #[test]
+    fn working_phase_not_pending() {
+        let entry = sample_entry("W1", "worker", "working");
+        assert!(!is_awaiting_review_with_pr(&entry));
     }
 }
