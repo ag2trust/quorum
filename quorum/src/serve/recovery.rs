@@ -12,7 +12,7 @@ use super::agent::{AgentProc, AgentSpec};
 use super::names::Pool;
 use super::session_log::SessionLog;
 use super::worktree::WorktreeManager;
-use super::{log, ServeConfig, SlotState};
+use super::{log, LifetimeRoster, ServeConfig, SlotState};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::mailbox;
 use quorum_core::{error::QuorumError, error::Result};
@@ -61,6 +61,7 @@ pub(crate) async fn recover(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     _reviewers: &mut [SlotState],
+    lifetime_roster: &mut LifetimeRoster,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
     let entries = {
@@ -95,6 +96,9 @@ pub(crate) async fn recover(
     for entry in &entries {
         // Reclaim the name (always succeeds — generated names are tracked on reclaim)
         name_pool.reclaim(&entry.agent);
+        // #181: register recovered agent name as owned by this instance so
+        // its subsequent mailbox rows are consumable (not left for a sibling).
+        lifetime_roster.register(&entry.agent);
 
         if let Some(ref wt) = entry.worktree {
             active_worktrees.push(wt.clone());
