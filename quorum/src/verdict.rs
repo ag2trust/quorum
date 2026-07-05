@@ -140,6 +140,67 @@ pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
     }
 }
 
+/// #228: what a restarted daemon must do with a durable approval record,
+/// decided purely from persisted, instance-independent state (never the
+/// in-memory reviewer roster). See [`dispose_approval`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApprovalDisposition {
+    /// Valid attested approval, reviewer ≠ author, and the approved head SHA
+    /// still matches the PR's live head → merge, then close the task.
+    Merge,
+    /// The approval was for a superseded diff (head SHA moved) → return the
+    /// task to review; do NOT merge a diff no reviewer approved.
+    Demote(String),
+    /// The record is not a trustworthy approval (attestation-less/forged, or a
+    /// self-review) → refuse. Preserves crash-recovery safety on a true crash.
+    Reject(String),
+}
+
+/// #228 recovery gate: decide what to do with a durable approval record on
+/// restart, from persisted state alone. This is what replaces roster-scoped
+/// verdict consumption for the merge path — a restarted instance with an empty
+/// roster can still act on its own prior instance's approval, while a
+/// genuinely foreign/forged/stale row is refused.
+///
+/// Trust is granted iff (all must hold):
+/// - the record is a well-formed attested approval (#226 `{blocking:0}`
+///   contract: `verdict == "approved"` AND `blocking_count == 0`), AND
+/// - `reviewer != author` (no self-review), AND
+/// - `approved_head_sha == current_head_sha` (the reviewer's approval binds to
+///   the exact commit; a moved head auto-invalidates — subsumes #206 defect C).
+pub fn dispose_approval(
+    verdict: &str,
+    blocking_count: i64,
+    reviewer: &str,
+    author: &str,
+    approved_head_sha: &str,
+    current_head_sha: &str,
+) -> ApprovalDisposition {
+    // 1. Attestation: only an approved verdict with zero attested blocking
+    //    findings is an approval at all. Anything else is forged/garbage.
+    if verdict != "approved" || blocking_count != 0 {
+        return ApprovalDisposition::Reject(format!(
+            "not an attested zero-blocking approval (verdict={verdict:?}, \
+             blocking={blocking_count}) — refusing to merge on it (#228/#206)"
+        ));
+    }
+    // 2. Self-review: a reviewer may never approve their own authored PR.
+    if reviewer == author {
+        return ApprovalDisposition::Reject(format!(
+            "self-review refused: reviewer '{reviewer}' is the PR author (#228)"
+        ));
+    }
+    // 3. SHA-binding: the approval is for a specific commit. If the PR head has
+    //    moved since, the approved diff is superseded — return to review.
+    if approved_head_sha != current_head_sha {
+        return ApprovalDisposition::Demote(format!(
+            "approved head {approved_head_sha} != current head {current_head_sha} \
+             — diff superseded since approval; returning to review (#228)"
+        ));
+    }
+    ApprovalDisposition::Merge
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +384,77 @@ mod tests {
         let g = gate(None, None);
         assert_eq!(g.verdict, None);
         assert!(g.demotion_reason.is_none());
+    }
+
+    // --- dispose_approval: the #228 restart-recovery trust gate ---
+
+    /// Acceptance #228: an attested approval by a reviewer (≠ author) whose
+    /// approved head SHA matches the PR's current head → MERGE. Crucially the
+    /// reviewer here need NOT be in any live roster — the decision is purely a
+    /// function of the durable record + the PR's current head.
+    #[test]
+    fn dispose_merges_matching_attested_approval() {
+        let d = dispose_approval(
+            "approved",
+            0,
+            "Grommet-d14",
+            "Bellows-d11",
+            "2c0c833",
+            "2c0c833",
+        );
+        assert_eq!(d, ApprovalDisposition::Merge);
+    }
+
+    /// Acceptance #228: a stale approval (PR head moved since approval) must
+    /// NOT merge — it demotes back to review.
+    #[test]
+    fn dispose_demotes_stale_approval_when_head_moved() {
+        let d = dispose_approval(
+            "approved",
+            0,
+            "Grommet-d14",
+            "Bellows-d11",
+            "old_sha",
+            "new_sha",
+        );
+        match d {
+            ApprovalDisposition::Demote(reason) => assert!(reason.contains("superseded")),
+            other => panic!("expected Demote, got {other:?}"),
+        }
+    }
+
+    /// Acceptance #228: a self-review (reviewer == author) approval is refused
+    /// even when perfectly attested and SHA-matched.
+    #[test]
+    fn dispose_rejects_self_review() {
+        let d = dispose_approval("approved", 0, "Bellows-d11", "Bellows-d11", "abc", "abc");
+        match d {
+            ApprovalDisposition::Reject(reason) => assert!(reason.contains("self-review")),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// Acceptance #228: crash-recovery safety — a forged/attestation-less row
+    /// (verdict not approved, or nonzero blocking) is refused, so a true crash
+    /// can never merge on a row that never passed the #226 gate.
+    #[test]
+    fn dispose_rejects_non_attested_verdict() {
+        // Not an approval verdict at all.
+        let d = dispose_approval("changes", 0, "R", "A", "abc", "abc");
+        assert!(matches!(d, ApprovalDisposition::Reject(_)));
+        // Approval spelling but nonzero blocking findings — forged attestation.
+        let d = dispose_approval("approved", 2, "R", "A", "abc", "abc");
+        assert!(matches!(d, ApprovalDisposition::Reject(_)));
+    }
+
+    /// A SHA mismatch is checked AFTER attestation/self-review, but a forged
+    /// row with a mismatched head is still rejected (not merged), preserving
+    /// safety regardless of ordering.
+    #[test]
+    fn dispose_rejects_forged_even_with_head_mismatch() {
+        let d = dispose_approval("approve", 0, "R", "A", "old", "new");
+        // "approve" (passive spelling) is NOT the canonical attested verdict
+        // stored in the durable record — records always store "approved".
+        assert!(matches!(d, ApprovalDisposition::Reject(_)));
     }
 }

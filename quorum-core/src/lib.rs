@@ -4,6 +4,7 @@
 
 pub mod activity;
 pub mod agents;
+pub mod approvals;
 pub mod branches;
 pub mod claims;
 pub mod clock;

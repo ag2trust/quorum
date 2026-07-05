@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 17;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -230,6 +230,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 [],
             )?;
         }
+        // v17 = #228 durable, instance-independent approval record: the
+        // `approvals` table lets a self-update-drain restart reconstruct
+        // "merge this approved PR" from persisted state instead of stranding it.
+        // Net-new table + index — the `CREATE TABLE IF NOT EXISTS` /
+        // `CREATE INDEX IF NOT EXISTS` in SCHEMA_SQL (which runs above) handles
+        // fresh DBs and upgrades alike, so no explicit ALTER is needed here.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1035,5 +1041,54 @@ mod tests {
             rework_count, 0,
             "pre-existing row must default rework_count to 0"
         );
+    }
+
+    #[test]
+    fn migrates_v16_to_v17_adds_approvals_table() {
+        // #228: a v16 DB (no `approvals` table, user_version=16) with a seeded
+        // journal row must gain the durable approvals table on open, without
+        // disturbing existing data.
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE journal (
+                 agent TEXT PRIMARY KEY, role TEXT NOT NULL, task_id INTEGER,
+                 session_id TEXT NOT NULL, worktree TEXT, branch TEXT,
+                 phase TEXT NOT NULL DEFAULT 'working', expected_signal TEXT,
+                 cost_tokens INTEGER NOT NULL DEFAULT 0, agent_state TEXT,
+                 cost_usd REAL NOT NULL DEFAULT 0.0, log_dir TEXT, pid INTEGER,
+                 pr INTEGER, rework_count INTEGER NOT NULL DEFAULT 0,
+                 instance_id TEXT, updated_at INTEGER NOT NULL
+             );
+             INSERT INTO journal(agent, role, session_id, phase, updated_at)
+                 VALUES ('W1', 'worker', 'sess-1', 'awaiting-review', 100);
+             PRAGMA user_version = 16;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        // approvals table now exists and starts empty.
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM approvals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        // Pre-existing journal row untouched.
+        let phase: String = c
+            .query_row("SELECT phase FROM journal WHERE agent='W1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(phase, "awaiting-review");
     }
 }
