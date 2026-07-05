@@ -61,12 +61,22 @@ impl Pool {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect();
 
+        if names.is_empty() {
+            return Err(format!(
+                "names file {} is empty (no usable names)",
+                path.display()
+            ));
+        }
+
         let required = 2 * cap + 1;
         if names.len() < required {
-            return Err(format!(
-                "names file has {} names, need >2*cap ({required}) for cap={cap}",
-                names.len()
-            ));
+            let deficit = required - names.len();
+            eprintln!(
+                "WARNING: names file has {} names, need {} (2*cap+1) for cap={cap}; \
+                 {deficit} names will be auto-generated on demand",
+                names.len(),
+                required
+            );
         }
 
         Ok(Self {
@@ -204,10 +214,23 @@ mod tests {
     }
 
     #[test]
-    fn too_few_names_errors() {
+    fn too_few_names_warns_but_loads() {
         let (_f, path) = write_names_file(&["A", "B", "C"]);
+        let pool = Pool::load(&path, 4).unwrap();
+        assert!(pool.has_file());
+        assert_eq!(pool.available.len(), 3);
+    }
+
+    #[test]
+    fn empty_file_errors() {
+        let (_f, path) = write_names_file(&[]);
         let result = Pool::load(&path, 4);
         assert!(result.is_err());
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for empty file"),
+        };
+        assert!(err.contains("empty"));
     }
 
     #[test]
@@ -324,7 +347,20 @@ mod tests {
 
     #[test]
     fn startup_check_only_when_file_given() {
+        // No file: generated-only pool, no startup check
         let pool = Pool::new_generated();
         assert!(!pool.has_file());
+
+        // Small file: warns but starts successfully, falls back to generation
+        let (_f, path) = write_names_file(&["Alpha", "Beta"]);
+        let mut pool = Pool::load(&path, 4).unwrap();
+        assert!(pool.has_file());
+        // Exhaust file names, then get generated
+        let r1 = pool.acquire();
+        let r2 = pool.acquire();
+        assert!(!r1.is_generated());
+        assert!(!r2.is_generated());
+        let r3 = pool.acquire();
+        assert!(r3.is_generated());
     }
 }
