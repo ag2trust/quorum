@@ -168,6 +168,48 @@ pub struct DaemonAgentView {
     pub cost_usd: f64,
     pub log_dir: Option<String>,
     pub last_activity_age_secs: Option<i64>,
+    pub task_title: Option<String>,
+    pub tier_eff: Option<String>,
+    pub pr: Option<i64>,
+    pub rework_count: i32,
+}
+
+/// Individual claimable task for the QUEUE section (#204 cockpit).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct QueueTask {
+    pub id: i64,
+    pub title: String,
+    pub tier_eff: String,
+    pub priority: i64,
+    pub pr: Option<i64>,
+}
+
+/// Task pipeline row: every non-closed task + tasks closed/merged in the last hour (#204).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PipelineTask {
+    pub id: i64,
+    pub title: String,
+    pub status: String,
+    pub pr: Option<i64>,
+    pub blocked: bool,
+}
+
+/// Deduped error for the ERRORS section — groups repeated messages.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DedupedError {
+    pub detail: String,
+    pub source: String,
+    pub count: i64,
+    pub latest_age_secs: i64,
+}
+
+/// Health verdict for the status header.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default)]
+pub enum HealthVerdict {
+    #[default]
+    OnTrack,
+    Attention,
+    Stalled,
 }
 
 /// A point-in-time snapshot of the store.
@@ -193,20 +235,27 @@ pub struct Stats {
     /// Issue #77: throughput / review-loop-stall metrics.
     pub throughput: Throughput,
     /// Issue #95 Phase 1: per-agent cumulative work signal (tasks completed + active secs).
-    /// Surfaced for owner-side fleet management; also consumed by the issue #97 retirement
-    /// mechanic. Empty when no agent has completed work yet.
     pub agent_load_scores: Vec<AgentLoadScore>,
-    /// Issue #97: agents whose `retire_status = 'retired'`, newest first. Surfaces in the
-    /// retired-agents section of `quorum status` so the operator can see capacity drop and
-    /// re-spin replacements.
+    /// Issue #97: agents whose `retire_status = 'retired'`, newest first.
     pub retired_agents: Vec<RetiredAgentView>,
-    /// Issue #101 (experimental): per-agent activity summary from the
-    /// PostToolUse hook. Stats-only; never read by routing/claim code.
-    /// Empty when the hook isn't installed.
+    /// Issue #101 (experimental): per-agent activity summary from the PostToolUse hook.
     pub activity: Vec<crate::activity::ActivityView>,
-    /// M5: daemon in-flight agents from the journal table. Empty when the
-    /// daemon isn't running (journal has no rows).
+    /// M5: daemon in-flight agents from the journal table.
     pub daemon_agents: Vec<DaemonAgentView>,
+    /// #204: individual claimable tasks for QUEUE section.
+    pub queue_tasks: Vec<QueueTask>,
+    /// #204: task pipeline view (all active + recently closed).
+    pub pipeline: Vec<PipelineTask>,
+    /// #204: deduped errors from last hour.
+    pub recent_errors: Vec<DedupedError>,
+    /// #204: count of older errors silenced (>1h).
+    pub older_errors_silenced: i64,
+    /// #204: health verdict.
+    pub health: HealthVerdict,
+    /// #204: stalled agent count (activity age > 2m).
+    pub stalled_count: i64,
+    /// #204: total session cost (sum of journal cost_usd).
+    pub session_cost: f64,
 }
 
 /// Gather a snapshot. Read-only.
@@ -274,6 +323,19 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     // vec when no events recorded — section is suppressed in the renderer.
     let activity = crate::activity::activity_summary(conn, now)?;
     let daemon_agents = daemon_agents_view(conn)?;
+    let queue_tasks_list = queue_tasks(conn)?;
+    let pipeline = pipeline_tasks(conn, now)?;
+    let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
+    let health = compute_health(&daemon_agents, !recent_errors.is_empty());
+    let stalled_count = daemon_agents
+        .iter()
+        .filter(|d| d.role == "worker")
+        .filter(|d| {
+            matches!(d.last_activity_age_secs, Some(age) if age > 120)
+                || d.last_activity_age_secs.is_none()
+        })
+        .count() as i64;
+    let session_cost: f64 = daemon_agents.iter().map(|d| d.cost_usd).sum();
 
     Ok(Stats {
         agents_total,
@@ -293,6 +355,13 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         retired_agents,
         activity,
         daemon_agents,
+        queue_tasks: queue_tasks_list,
+        pipeline,
+        recent_errors,
+        older_errors_silenced,
+        health,
+        stalled_count,
+        session_cost,
     })
 }
 
@@ -721,23 +790,229 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
 
 fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
     let entries = crate::journal::list_in_flight(conn)?;
-    Ok(entries
-        .into_iter()
-        .map(|e| {
-            let last_activity_age_secs = e.log_dir.as_deref().and_then(stream_jsonl_age_secs);
-            DaemonAgentView {
-                agent: e.agent,
-                role: e.role,
-                task_id: e.task_id,
-                phase: e.phase,
-                cost_tokens: e.cost_tokens,
-                agent_state: e.agent_state,
-                cost_usd: e.cost_usd,
-                log_dir: e.log_dir,
-                last_activity_age_secs,
+    let mut views = Vec::with_capacity(entries.len());
+    for e in entries {
+        let last_activity_age_secs = e.log_dir.as_deref().and_then(stream_jsonl_age_secs);
+        let (task_title, tier_eff) = if let Some(tid) = e.task_id {
+            match conn.query_row(
+                "SELECT title, labels FROM tasks WHERE id=?1",
+                params![tid],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            ) {
+                Ok((title, labels)) => {
+                    let te = tier_eff_label(labels.as_deref());
+                    (Some(title), Some(te))
+                }
+                Err(_) => (None, None),
             }
-        })
-        .collect())
+        } else {
+            (None, None)
+        };
+        views.push(DaemonAgentView {
+            agent: e.agent,
+            role: e.role,
+            task_id: e.task_id,
+            phase: e.phase,
+            cost_tokens: e.cost_tokens,
+            agent_state: e.agent_state,
+            cost_usd: e.cost_usd,
+            log_dir: e.log_dir,
+            last_activity_age_secs,
+            task_title,
+            tier_eff,
+            pr: e.pr,
+            rework_count: e.rework_count,
+        });
+    }
+    Ok(views)
+}
+
+/// Build a compact `tier·eff` label from a task's JSON labels array.
+/// e.g. `["tier:opus-46","effort:high"]` → `"opus46·hi"`.
+pub fn tier_eff_label(labels_json: Option<&str>) -> String {
+    let s = match labels_json {
+        Some(s) => s,
+        None => return "—".to_string(),
+    };
+    let v: serde_json::Value = match serde_json::from_str(s) {
+        Ok(v) => v,
+        Err(_) => return "—".to_string(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return "—".to_string(),
+    };
+    let mut tier_part = String::new();
+    let mut eff_part = String::new();
+    for item in arr {
+        if let Some(t) = item.as_str() {
+            if let Some(rest) = t.strip_prefix("tier:") {
+                tier_part = rest.replace('-', "");
+            } else if let Some(rest) = t.strip_prefix("effort:") {
+                eff_part = match rest {
+                    "high" => "hi".to_string(),
+                    "medium" | "med" => "md".to_string(),
+                    "low" => "lo".to_string(),
+                    other => other.to_string(),
+                };
+            }
+        }
+    }
+    if tier_part.is_empty() && eff_part.is_empty() {
+        return "—".to_string();
+    }
+    if eff_part.is_empty() {
+        return tier_part;
+    }
+    if tier_part.is_empty() {
+        return eff_part;
+    }
+    format!("{tier_part}·{eff_part}")
+}
+
+/// Individual claimable tasks for the QUEUE section (#204).
+fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, labels, priority, refs, depends_on FROM tasks WHERE status='open'
+         ORDER BY priority DESC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut result = Vec::new();
+    for (id, title, labels, priority, refs, depends_on) in rows {
+        if !crate::tasks::compute_ready(conn, &depends_on)? {
+            continue;
+        }
+        let claimed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE target='task#'||?1 AND active=1)",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if claimed {
+            continue;
+        }
+        result.push(QueueTask {
+            id,
+            title,
+            tier_eff: tier_eff_label(labels.as_deref()),
+            priority,
+            pr: extract_pr_from_refs(refs.as_deref()),
+        });
+    }
+    Ok(result)
+}
+
+fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
+    let s = refs_json?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("pr")?.as_i64()
+}
+
+/// Task pipeline view: all non-closed tasks + tasks closed in the last hour (#204).
+fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
+    let hour_ago = now - 3600;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, status, refs, depends_on FROM tasks
+         WHERE status != 'closed'
+         UNION ALL
+         SELECT id, title, status, refs, depends_on FROM tasks
+         WHERE status = 'closed' AND updated_at > ?1
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![hour_ago], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut result = Vec::new();
+    for (id, title, status, refs, depends_on) in rows {
+        let pr = extract_pr_from_refs(refs.as_deref());
+        let blocked = if status == "open" {
+            !crate::tasks::compute_ready(conn, &depends_on)?
+        } else {
+            false
+        };
+        result.push(PipelineTask {
+            id,
+            title,
+            status,
+            pr,
+            blocked,
+        });
+    }
+    Ok(result)
+}
+
+/// Deduped errors from the last hour, with a count of older silenced errors (#204).
+fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64)> {
+    let hour_ago = now - 3600;
+    let mut stmt = conn.prepare(
+        "SELECT detail, source, COUNT(*) as cnt, MAX(ts) as latest_ts
+         FROM errors
+         WHERE expires_at > ?1 AND ts > ?2
+         GROUP BY detail, source
+         ORDER BY latest_ts DESC
+         LIMIT 10",
+    )?;
+    let recent = stmt
+        .query_map(params![now, hour_ago], |r| {
+            Ok(DedupedError {
+                detail: r.get(0)?,
+                source: r.get(1)?,
+                count: r.get(2)?,
+                latest_age_secs: (now - r.get::<_, i64>(3)?).max(0),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let older: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM errors WHERE expires_at > ?1 AND ts <= ?2",
+        params![now, hour_ago],
+        |r| r.get(0),
+    )?;
+    Ok((recent, older))
+}
+
+/// Compute the health verdict (#204).
+fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> HealthVerdict {
+    let has_dead = daemon_agents
+        .iter()
+        .filter(|d| d.role == "worker")
+        .any(|d| match d.last_activity_age_secs {
+            Some(age) => age > 120,
+            None => true,
+        });
+    if has_dead {
+        return HealthVerdict::Stalled;
+    }
+    let has_stalling = daemon_agents
+        .iter()
+        .filter(|d| d.role == "worker")
+        .any(|d| match d.last_activity_age_secs {
+            Some(age) => age > 30,
+            None => false,
+        });
+    if has_stalling || errors_recent {
+        return HealthVerdict::Attention;
+    }
+    HealthVerdict::OnTrack
 }
 
 fn stream_jsonl_age_secs(log_dir: &str) -> Option<i64> {

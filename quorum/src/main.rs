@@ -6,6 +6,7 @@
 
 mod cheatsheet;
 mod cli;
+mod cockpit;
 mod config;
 mod input;
 mod output;
@@ -61,252 +62,6 @@ fn command_source(cmd: &cli::Command) -> &'static str {
     }
 }
 
-/// Render seconds as a compact "N(s|m|h|d) ago" form. Falls back to integer seconds for
-/// non-positive inputs (clock skew). Used throughout the dashboard so every age column
-/// reads the same way.
-fn fmt_age(secs: i64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h", secs / 3600)
-    } else {
-        format!("{}d", secs / 86400)
-    }
-}
-
-/// Render a stats snapshot as the operator dashboard (issue #77).
-/// One-shot plain text — greppable. Section headers + simple alignment, no color or
-/// box-drawing (the watch loop also uses this; keep it terminal-portable).
-fn print_status_table(s: &quorum_core::stats::Stats) {
-    // --- Header: top-line counts ---
-    println!("# quorum status");
-    println!(
-        "agents : {} online / {} total · messages : {} live · claims : {} active · errors : {} live",
-        s.agents_online,
-        s.agents_total,
-        s.messages_live,
-        s.claims_active,
-        s.errors_live,
-    );
-    let tasks = if s.tasks.is_empty() {
-        "none".to_string()
-    } else {
-        s.tasks
-            .iter()
-            .map(|t| format!("{}={}", t.status, t.count))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    println!("tasks  : {tasks}");
-
-    // --- Agents online (by tier) ---
-    // Issue #97 scoreboard: each row reports cumulative completed-tasks + active-time
-    // alongside the retire status. A `retiring` tag flags agents that are draining; a
-    // `retired` row never appears here (filtered out of `agents` and surfaced under
-    // `## retired agents` instead).
-    println!();
-    println!("## agents online (by tier)");
-    if s.agents.is_empty() {
-        println!("  (none)");
-    } else {
-        let mut current_tier = String::new();
-        for a in &s.agents {
-            if a.tier != current_tier {
-                current_tier = a.tier.clone();
-                println!("  [{current_tier}]");
-            }
-            let task_str = match &a.current_task {
-                Some(t) => format!("task#{} {}", t.id, t.title),
-                None => "idle".to_string(),
-            };
-            let retire_tag = match a.retire_status.as_str() {
-                "retiring" => "  · ⚠ retiring",
-                _ => "",
-            };
-            println!(
-                "    {:<24} last_seen {:>4} ago  ·  tasks {:>2}  ·  active {:>5}  ·  {}{}",
-                a.id,
-                fmt_age(a.last_seen_age_secs),
-                a.tasks_completed,
-                fmt_age(a.total_active_secs),
-                task_str,
-                retire_tag,
-            );
-        }
-    }
-
-    // --- Retired agents (issue #97) ---
-    if !s.retired_agents.is_empty() {
-        println!();
-        println!("## retired agents (capacity dropped)");
-        for r in &s.retired_agents {
-            println!(
-                "  {:<24} [{:<14}] retired {:>5} ago  ·  tasks {:>2}  ·  active {}",
-                r.id,
-                r.tier,
-                fmt_age(r.retired_age_secs),
-                r.tasks_completed,
-                fmt_age(r.total_active_secs),
-            );
-        }
-    }
-
-    // --- PostToolUse activity (experimental, issue #101) ---
-    // Only printed when the optional Claude Code hook has fired at least once
-    // and rows are still within the 24h activity TTL. Stats-only — never reflects
-    // claim/routing state. An empty section means "hook not installed" or "no
-    // tool-use in the last day," not "agent idle in the coordination sense."
-    if !s.activity.is_empty() {
-        println!();
-        println!("## activity (PostToolUse hook, experimental — stats only)");
-        for a in &s.activity {
-            let who = a
-                .agent_name
-                .as_deref()
-                .unwrap_or("(unknown: session not registered)");
-            println!(
-                "  {:<32} {:>3} events / 24h  ·  last {:<10} {:>4} ago",
-                who,
-                a.events_in_window,
-                a.last_tool,
-                fmt_age(a.last_tool_age_secs),
-            );
-        }
-    }
-
-    // --- Daemon in-flight agents (journal view) ---
-    if !s.daemon_agents.is_empty() {
-        println!();
-        println!("## daemon agents (in-flight)");
-        for d in &s.daemon_agents {
-            let task_str = d
-                .task_id
-                .map(|id| format!("task#{id}"))
-                .unwrap_or_else(|| "—".to_string());
-            let state_str = d
-                .agent_state
-                .as_deref()
-                .map(|s| format!("  · state: {s}"))
-                .unwrap_or_default();
-            let cost_str = if d.cost_usd > 0.0 {
-                format!("  ${:.4}", d.cost_usd)
-            } else {
-                String::new()
-            };
-            let log_str = d
-                .log_dir
-                .as_deref()
-                .map(|p| format!("  log: {p}"))
-                .unwrap_or_default();
-            let activity_str = match d.last_activity_age_secs {
-                Some(age) => format!("  · last activity: {} ago", fmt_age(age)),
-                None => String::new(),
-            };
-            println!(
-                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{cost_str}{state_str}{activity_str}{log_str}",
-                d.agent, d.role, task_str, d.phase, d.cost_tokens,
-            );
-        }
-    }
-
-    // --- Queue by tier (ready/claimable only, #86) ---
-    println!();
-    println!("## queue (claimable tasks by required tier)");
-    if s.queue_by_tier.is_empty() {
-        println!("  (empty)");
-    } else {
-        for q in &s.queue_by_tier {
-            println!("  {:<18} {} open", q.tier, q.open);
-        }
-    }
-
-    // --- Blocked tasks (#86) ---
-    if !s.blocked.is_empty() {
-        println!();
-        println!("## blocked (waiting on dependencies)");
-        for b in &s.blocked {
-            let deps: Vec<String> = b.waiting_on.iter().map(|d| format!("#{d}")).collect();
-            println!(
-                "  #{:<5} ⛔ waiting on {}  — {}",
-                b.id,
-                deps.join(", "),
-                b.title
-            );
-        }
-    }
-
-    // --- Active claims with TTL ---
-    println!();
-    println!("## active claims (soonest to expire)");
-    if s.claim_ttls.is_empty() {
-        println!("  (none)");
-    } else {
-        for c in &s.claim_ttls {
-            let flag = if c.expires_in_secs < 60 {
-                "  ⚠ <1m"
-            } else {
-                ""
-            };
-            println!(
-                "  {:<24} held by {:<20} expires in {}{flag}",
-                c.target,
-                c.holder,
-                fmt_age(c.expires_in_secs)
-            );
-        }
-    }
-
-    // --- Throughput ---
-    println!();
-    println!("## throughput");
-    println!(
-        "  closed in last hour     : {}",
-        s.throughput.closed_last_hour
-    );
-    println!(
-        "  done awaiting review    : {}",
-        s.throughput.done_awaiting_review
-    );
-    match s.throughput.oldest_done_awaiting_review_secs {
-        Some(age) => println!("  oldest done             : {} ago", fmt_age(age)),
-        None => println!("  oldest done             : —"),
-    }
-    if s.throughput.done_stuck_count > 0 {
-        println!(
-            "  ⚠ done stuck > 30m      : {}",
-            s.throughput.done_stuck_count
-        );
-    }
-
-    // --- Recent feed messages ---
-    println!();
-    println!("## recent feed (newest first)");
-    if s.recent_messages.is_empty() {
-        println!("  (none)");
-    } else {
-        for m in &s.recent_messages {
-            println!(
-                "  [{:>4} ago] {} ({}): {}",
-                fmt_age(m.age_secs),
-                m.author,
-                m.kind,
-                m.body_preview
-            );
-        }
-    }
-
-    // --- Last errors ---
-    if !s.last_errors.is_empty() {
-        println!();
-        println!("## last errors");
-        for e in &s.last_errors {
-            println!("  [{}] {}: {}", e.ts, e.source, e.detail);
-        }
-    }
-}
-
 /// `status --watch`: re-render every ~1.5s. Opens a FRESH short-lived connection per tick and
 /// closes it — never holds a transaction across ticks, which would pin the WAL (see CLAUDE.md).
 fn watch_status(online_window: i64) -> Result<()> {
@@ -315,8 +70,8 @@ fn watch_status(online_window: i64) -> Result<()> {
         let conn = quorum_core::db::open(&paths::db_path()?)?;
         let s = quorum_core::stats::stats(&conn, now, online_window)?;
         drop(conn); // close before sleeping; do not hold across ticks
-        print!("\x1b[2J\x1b[H"); // clear screen + home
-        print_status_table(&s);
+        print!("\x1b[2J\x1b[H");
+        cockpit::render(&s);
         std::io::Write::flush(&mut std::io::stdout()).ok();
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
@@ -786,14 +541,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             }
             if watch {
                 watch_status(cfg.online_window_secs)?;
-                Ok(0) // unreachable in practice (loop until interrupted)
+                Ok(0)
             } else {
                 let conn = quorum_core::db::open(&paths::db_path()?)?;
                 let s = quorum_core::stats::stats(&conn, now, cfg.online_window_secs)?;
                 if json {
                     output::emit(&s);
                 } else {
-                    print_status_table(&s);
+                    cockpit::render(&s);
                 }
                 Ok(0)
             }
