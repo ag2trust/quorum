@@ -828,7 +828,19 @@ async fn tick(
 
             match gated.verdict.as_deref() {
                 Some("approved") => {
-                    let pr_num = row.pr.unwrap_or(0);
+                    let Some(pr_num) = row.pr else {
+                        log(&format!(
+                            "WARN: reviewer {} approved but missing PR number \
+                             — skipping merge",
+                            reviewers[ri].agent_name
+                        ));
+                        let r = reviewers.remove(ri);
+                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                        continue;
+                    };
 
                     // Pre-merge mergeability check: if the PR is conflicting
                     // (base moved since branch cut), skip the approve+checks
@@ -1544,7 +1556,13 @@ async fn tick(
                             }
                         }
 
-                        let rework_pr = workers[wi].pr.unwrap_or(0);
+                        let rework_pr = workers[wi].pr.unwrap_or_else(|| {
+                            log(&format!(
+                                "WARN: worker {} rework has no PR number",
+                                workers[wi].agent_name
+                            ));
+                            0
+                        });
                         let rework_turn = reviewer::build_rework_turn(
                             &workers[wi].agent_name,
                             workers[wi].task_id,
@@ -2032,7 +2050,9 @@ async fn tick(
         }
         for &wi in parked_workers.iter().rev() {
             let w = workers.remove(wi);
-            let pr = w.pr.unwrap_or(0);
+            let pr_label =
+                w.pr.map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| "unknown".to_string());
             teardown_worker_with_body(
                 config,
                 wt_mgr,
@@ -2040,7 +2060,7 @@ async fn tick(
                 w,
                 "cancelled",
                 Some(&format!(
-                    "{}provision-exhausted | PR #{pr} | \
+                    "{}provision-exhausted | PR {pr_label} | \
                      reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
                     tasks::PARKED_BODY_PREFIX
                 )),

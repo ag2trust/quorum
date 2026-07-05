@@ -602,3 +602,93 @@ fn checks_pending_then_ready_merges_after_wait() {
 
     handle.stop();
 }
+
+/// #223: approved verdict with no PR number must warn and skip merge,
+/// not call merge with PR #0.
+#[test]
+fn approved_without_pr_skips_merge() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for missing-PR test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            "echo ready",
+            "--merge-checks-timeout-secs",
+            "10",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Reviewer signals approved WITHOUT --pr (the bug trigger).
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("missing PR number", 15),
+        "expected missing-PR warning log. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_merge_attempt = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("proceeding to merge") || l.contains("waiting for checks"));
+    assert!(
+        !saw_merge_attempt,
+        "merge should NOT be attempted without PR number. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
