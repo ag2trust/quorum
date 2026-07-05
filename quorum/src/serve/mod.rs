@@ -225,7 +225,12 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
+fn slot_journal_entry(
+    slot: &SlotState,
+    role: &str,
+    phase: &str,
+    instance_id: &str,
+) -> JournalEntry {
     JournalEntry {
         agent: slot.agent_name.clone(),
         role: role.into(),
@@ -244,6 +249,7 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
         pid: slot.proc.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
+        instance_id: Some(instance_id.to_string()),
     }
 }
 
@@ -299,6 +305,22 @@ pub struct ServeConfig {
     /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
     /// provisioning, and merge targeting.
     pub base_branch: String,
+    /// #190: unique identity for this daemon instance. Stamped on every journal
+    /// row this daemon writes; recovery filters to this value so a restart never
+    /// kills/reclaims a sibling instance's live workers. Derived by [`derive_instance_id`]
+    /// from the canonical `worktree_base` (each daemon must have a distinct base).
+    pub instance_id: String,
+}
+
+/// #190: derive a stable instance identity from the daemon's `worktree_base`.
+/// Uses `canonicalize` when the directory exists (resolves `..`/symlinks); falls
+/// back to lossy string form otherwise. Distinct `worktree_base` per daemon →
+/// distinct `instance_id` → journal scoping works.
+pub fn derive_instance_id(worktree_base: &Path) -> String {
+    match std::fs::canonicalize(worktree_base) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => worktree_base.to_string_lossy().into_owned(),
+    }
 }
 
 /// Resolve the local clone directory for a given repo slug.
@@ -671,7 +693,7 @@ async fn tick(
                 } else {
                     "awaiting-review"
                 };
-                let entry = slot_journal_entry(&workers[wi], "worker", phase);
+                let entry = slot_journal_entry(&workers[wi], "worker", phase, &config.instance_id);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -803,7 +825,8 @@ async fn tick(
                                 }
 
                                 let p = db_path.clone();
-                                let entry = slot_journal_entry(w, "worker", "working");
+                                let entry =
+                                    slot_journal_entry(w, "worker", "working", &config.instance_id);
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let mut conn = quorum_core::db::open(&p)?;
                                     journal::upsert(&mut conn, &entry)
@@ -900,7 +923,12 @@ async fn tick(
                                     }
 
                                     let p = db_path.clone();
-                                    let entry = slot_journal_entry(w, "worker", "working");
+                                    let entry = slot_journal_entry(
+                                        w,
+                                        "worker",
+                                        "working",
+                                        &config.instance_id,
+                                    );
                                     tokio::task::spawn_blocking(move || -> Result<()> {
                                         let mut conn = quorum_core::db::open(&p)?;
                                         journal::upsert(&mut conn, &entry)
@@ -1138,7 +1166,12 @@ async fn tick(
                                         }
 
                                         let p = db_path.clone();
-                                        let entry = slot_journal_entry(w, "worker", "working");
+                                        let entry = slot_journal_entry(
+                                            w,
+                                            "worker",
+                                            "working",
+                                            &config.instance_id,
+                                        );
                                         tokio::task::spawn_blocking(move || -> Result<()> {
                                             let mut conn = quorum_core::db::open(&p)?;
                                             journal::upsert(&mut conn, &entry)
@@ -1215,7 +1248,8 @@ async fn tick(
                             }
 
                             let p = db_path.clone();
-                            let entry = slot_journal_entry(w, "worker", "working");
+                            let entry =
+                                slot_journal_entry(w, "worker", "working", &config.instance_id);
                             tokio::task::spawn_blocking(move || -> Result<()> {
                                 let mut conn = quorum_core::db::open(&p)?;
                                 journal::upsert(&mut conn, &entry)
@@ -1317,7 +1351,9 @@ async fn tick(
             reviewers_to_kill.push(i);
             continue;
         }
-        if let Some(breach) = drain_events(r, &db_path, "reviewer", &config.limits).await? {
+        if let Some(breach) =
+            drain_events(r, &db_path, "reviewer", &config.limits, &config.instance_id).await?
+        {
             log(&format!(
                 "WATCHDOG: reviewer {} killed — {}",
                 r.agent_name, breach
@@ -1344,7 +1380,9 @@ async fn tick(
             workers_to_kill.push(i);
             continue;
         }
-        if let Some(breach) = drain_events(w, &db_path, "worker", &config.limits).await? {
+        if let Some(breach) =
+            drain_events(w, &db_path, "worker", &config.limits, &config.instance_id).await?
+        {
             log(&format!(
                 "WATCHDOG: worker {} killed (task #{}) — {}",
                 w.agent_name, w.task_id, breach
@@ -1759,6 +1797,7 @@ async fn drain_events(
     db_path: &std::path::Path,
     role: &str,
     limits: &CostLimits,
+    instance_id: &str,
 ) -> Result<Option<LimitBreached>> {
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_event()).await
@@ -1800,7 +1839,7 @@ async fn drain_events(
                 } else {
                     "reviewing"
                 };
-                let entry = slot_journal_entry(slot, role, phase);
+                let entry = slot_journal_entry(slot, role, phase, instance_id);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -2010,6 +2049,7 @@ async fn spawn_reviewer_for_worker(
         pid: None,
         pr: Some(pr),
         rework_count: 0,
+        instance_id: Some(config.instance_id.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -2077,6 +2117,7 @@ async fn spawn_reviewer_for_worker(
                     pid: spawn_pid,
                     pr: Some(pr),
                     rework_count: 0,
+                    instance_id: Some(config.instance_id.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -2337,6 +2378,7 @@ async fn spawn_worker(
         pid: None,
         pr: None,
         rework_count: 0,
+        instance_id: Some(config.instance_id.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -2395,6 +2437,7 @@ async fn spawn_worker(
                     pid: spawn_pid,
                     pr: None,
                     rework_count: 0,
+                    instance_id: Some(config.instance_id.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -3148,6 +3191,7 @@ mod tests {
             only_repo: vec![],
             repo_dir_map: map,
             base_branch: "main".into(),
+            instance_id: "/tmp/wt".into(),
         }
     }
 

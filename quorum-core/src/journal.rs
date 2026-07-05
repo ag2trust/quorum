@@ -26,6 +26,12 @@ pub struct JournalEntry {
     pub pid: Option<i32>,
     pub pr: Option<i64>,
     pub rework_count: i32,
+    /// #190: identifies the daemon instance that owns this row. Recovery filters on
+    /// this so a restart never kills/reclaims a sibling instance's live workers.
+    /// `None` only on pre-v16 rows from an older binary — recovery adopts them if
+    /// their `worktree` lives under this instance's `worktree_base` (see
+    /// `adopt_null_instance_rows`).
+    pub instance_id: Option<String>,
 }
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
@@ -44,6 +50,7 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
         pid: r.get(11)?,
         pr: r.get(12)?,
         rework_count: r.get(13)?,
+        instance_id: r.get(14)?,
     })
 }
 
@@ -51,8 +58,8 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
-        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "INSERT INTO journal (agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, instance_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(agent) DO UPDATE SET
              role = excluded.role,
              task_id = excluded.task_id,
@@ -67,6 +74,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
              pid = excluded.pid,
              pr = excluded.pr,
              rework_count = excluded.rework_count,
+             instance_id = excluded.instance_id,
              updated_at = excluded.updated_at",
         params![
             entry.agent,
@@ -83,6 +91,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
             entry.pid,
             entry.pr,
             entry.rework_count,
+            entry.instance_id,
             now,
         ],
     )?;
@@ -92,7 +101,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
 
 pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, instance_id
          FROM journal
          ORDER BY agent",
     )?;
@@ -102,6 +111,60 @@ pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
         result.push(r?);
     }
     Ok(result)
+}
+
+/// #190: List only journal entries owned by `instance_id`. Rows written by another
+/// daemon instance are left for the owning instance's recovery to reclaim — the
+/// third leg of the instance-scoping family (#181 mailbox, #178 resume, #190 recovery).
+///
+/// This is the ONLY read the daemon's `recover()` should use — the unscoped
+/// [`list_in_flight`] is retained for `quorum status` and diagnostics.
+pub fn list_in_flight_for_instance(
+    conn: &Connection,
+    instance_id: &str,
+) -> Result<Vec<JournalEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, instance_id
+         FROM journal
+         WHERE instance_id = ?1
+         ORDER BY agent",
+    )?;
+    let rows = stmt.query_map(params![instance_id], entry_from_row)?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+/// #190 transitional: on first startup after v15→v16 upgrade, adopt NULL-instance
+/// rows whose `worktree` lives under this instance's `worktree_base`. Once adopted,
+/// they participate in scoped recovery via [`list_in_flight_for_instance`]. Bounded
+/// by the LIKE prefix so it can NEVER touch a sibling's rows.
+///
+/// Returns the number of rows adopted. Safe to call every startup: after the first
+/// run this instance's rows are all stamped; NULLs left in the table belong to
+/// worktrees outside our base (nothing adopted).
+pub fn adopt_null_instance_rows(
+    conn: &mut Connection,
+    instance_id: &str,
+    worktree_base: &str,
+) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    // Anchor the LIKE to a directory-boundary prefix so `/tmp/wt-a` never matches
+    // rows whose worktree lives under `/tmp/wt-ab`. We match either
+    // `<base>/<anything>` or an exact `<base>` value.
+    let prefix = format!("{}/%", worktree_base.trim_end_matches('/'));
+    let exact = worktree_base.trim_end_matches('/').to_string();
+    let n = tx.execute(
+        "UPDATE journal SET instance_id = ?1
+         WHERE instance_id IS NULL
+           AND worktree IS NOT NULL
+           AND (worktree LIKE ?2 OR worktree = ?3)",
+        params![instance_id, prefix, exact],
+    )?;
+    tx.commit()?;
+    Ok(n)
 }
 
 pub fn delete(conn: &mut Connection, agent: &str) -> Result<bool> {
@@ -138,6 +201,7 @@ mod tests {
             pid: None,
             pr: None,
             rework_count: 0,
+            instance_id: Some("/tmp/wt".into()),
         }
     }
 
@@ -254,6 +318,115 @@ mod tests {
         assert_eq!(entries[0].pid, Some(99999));
         assert_eq!(entries[0].pr, None);
         assert_eq!(entries[0].rework_count, 3);
+    }
+
+    #[test]
+    fn list_in_flight_for_instance_scopes_by_instance_id() {
+        // #190: sibling instances must not see each other's rows.
+        let (mut conn, _dir) = test_conn();
+
+        let mut a = sample_entry("Aardvark-a");
+        a.instance_id = Some("/tmp/wt-a".into());
+        a.worktree = Some("/tmp/wt-a/task-1".into());
+        upsert(&mut conn, &a).unwrap();
+
+        let mut b = sample_entry("Beluga-b");
+        b.instance_id = Some("/tmp/wt-b".into());
+        b.worktree = Some("/tmp/wt-b/task-2".into());
+        upsert(&mut conn, &b).unwrap();
+
+        let for_a = list_in_flight_for_instance(&conn, "/tmp/wt-a").unwrap();
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].agent, "Aardvark-a");
+
+        let for_b = list_in_flight_for_instance(&conn, "/tmp/wt-b").unwrap();
+        assert_eq!(for_b.len(), 1);
+        assert_eq!(for_b[0].agent, "Beluga-b");
+
+        // Unscoped list still sees both (used by `quorum status`).
+        let all = list_in_flight(&conn).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn list_in_flight_for_instance_excludes_null_and_foreign() {
+        let (mut conn, _dir) = test_conn();
+
+        let mut ours = sample_entry("Ours");
+        ours.instance_id = Some("/tmp/wt-a".into());
+        upsert(&mut conn, &ours).unwrap();
+
+        let mut null = sample_entry("Null");
+        null.instance_id = None;
+        upsert(&mut conn, &null).unwrap();
+
+        let mut foreign = sample_entry("Foreign");
+        foreign.instance_id = Some("/tmp/wt-b".into());
+        upsert(&mut conn, &foreign).unwrap();
+
+        let for_a = list_in_flight_for_instance(&conn, "/tmp/wt-a").unwrap();
+        assert_eq!(for_a.len(), 1);
+        assert_eq!(for_a[0].agent, "Ours");
+    }
+
+    #[test]
+    fn adopt_null_rows_matches_worktree_prefix() {
+        let (mut conn, _dir) = test_conn();
+
+        // NULL row under our base — should be adopted.
+        let mut mine = sample_entry("Mine");
+        mine.instance_id = None;
+        mine.worktree = Some("/tmp/wt-a/task-1".into());
+        upsert(&mut conn, &mine).unwrap();
+
+        // NULL row under a sibling's base — MUST NOT be adopted.
+        let mut sibling = sample_entry("Sibling");
+        sibling.instance_id = None;
+        sibling.worktree = Some("/tmp/wt-b/task-2".into());
+        upsert(&mut conn, &sibling).unwrap();
+
+        // Already-stamped row — untouched.
+        let mut stamped = sample_entry("Stamped");
+        stamped.instance_id = Some("/tmp/other".into());
+        stamped.worktree = Some("/tmp/wt-a/task-3".into());
+        upsert(&mut conn, &stamped).unwrap();
+
+        let n = adopt_null_instance_rows(&mut conn, "/tmp/wt-a", "/tmp/wt-a").unwrap();
+        assert_eq!(n, 1, "only the NULL row under our base is adopted");
+
+        let for_a = list_in_flight_for_instance(&conn, "/tmp/wt-a").unwrap();
+        let agents: Vec<_> = for_a.iter().map(|e| e.agent.as_str()).collect();
+        assert_eq!(agents, ["Mine"]);
+
+        // Sibling still NULL — untouched.
+        let all = list_in_flight(&conn).unwrap();
+        let sibling_row = all.iter().find(|e| e.agent == "Sibling").unwrap();
+        assert!(sibling_row.instance_id.is_none());
+    }
+
+    #[test]
+    fn adopt_null_rows_prefix_boundary_safe() {
+        // A base of "/tmp/wt-a" must not match rows under "/tmp/wt-ab".
+        let (mut conn, _dir) = test_conn();
+
+        let mut a = sample_entry("A");
+        a.instance_id = None;
+        a.worktree = Some("/tmp/wt-a/task".into());
+        upsert(&mut conn, &a).unwrap();
+
+        let mut ab = sample_entry("AB");
+        ab.instance_id = None;
+        ab.worktree = Some("/tmp/wt-ab/task".into());
+        upsert(&mut conn, &ab).unwrap();
+
+        let n = adopt_null_instance_rows(&mut conn, "/tmp/wt-a", "/tmp/wt-a").unwrap();
+        assert_eq!(n, 1);
+        let all = list_in_flight(&conn).unwrap();
+        let ab_row = all.iter().find(|e| e.agent == "AB").unwrap();
+        assert!(
+            ab_row.instance_id.is_none(),
+            "wt-ab must not be adopted by wt-a"
+        );
     }
 
     #[test]

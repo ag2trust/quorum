@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -212,6 +212,21 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 15 && !column_exists(conn, "journal", "rework_count")? {
             conn.execute(
                 "ALTER TABLE journal ADD COLUMN rework_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // v16 = #190 instance-scoped recovery: journal.instance_id so a daemon
+        // restart never kills/reclaims a sibling instance's in-flight workers.
+        // Nullable — pre-v16 rows have NULL and recovery falls back to worktree-prefix
+        // matching. Index accelerates the per-instance list_in_flight query. The
+        // index is created here (not in SCHEMA_SQL) because SCHEMA_SQL runs BEFORE
+        // this ALTER — an index on a not-yet-present column would fail there.
+        if current < 16 {
+            if !column_exists(conn, "journal", "instance_id")? {
+                conn.execute("ALTER TABLE journal ADD COLUMN instance_id TEXT", [])?;
+            }
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS journal_instance ON journal(instance_id)",
                 [],
             )?;
         }
