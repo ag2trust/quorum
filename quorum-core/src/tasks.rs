@@ -46,6 +46,10 @@ pub const STICKY_WINDOW_SECS: i64 = 1800;
 /// reviewer→author) typically still gets the first claim.
 pub const STICKY_WINDOW_SECS_CRITICAL: i64 = 60;
 
+/// Body prefix for all daemon-parked tasks. Any cancelled task whose body starts with this
+/// prefix is reopenable by creator or (former) assignee (#182).
+pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
+
 /// Priority threshold at and above which a task is treated as critical for sticky-fallback
 /// (issue #88). Tasks created with `priority >= CRITICAL_PRIORITY_THRESHOLD` get the
 /// shortened sticky window on `changes`-verdict reopens. Set comfortably above realistic
@@ -614,10 +618,12 @@ pub fn update(
                 params![id, "open", fields.body, fields.refs, now, agent],
             )?;
             if rows == 0 {
-                // #171: allow reopening daemon-parked tasks (cancelled with
-                // daemon:merge-blocked body). Creator or (former) assignee
+                // #171/#182: allow reopening daemon-parked tasks (cancelled
+                // with PARKED_BODY_PREFIX body). Creator or (former) assignee
                 // can reopen so operators/daemon can unpark without rebuilding
-                // the task chain.
+                // the task chain. Covers all park reasons (merge-blocked,
+                // provision-exhausted, future flavors).
+                let like_pat = format!("{}%", PARKED_BODY_PREFIX);
                 tx.execute(
                     "UPDATE tasks SET
                         status='open', assignee=NULL, sticky_until=NULL,
@@ -626,8 +632,8 @@ pub fn update(
                         updated_at = ?5
                      WHERE id=?1 AND (created_by=?6 OR assignee=?6)
                            AND status='cancelled'
-                           AND body LIKE 'daemon:merge-blocked%'",
-                    params![id, "open", fields.body, fields.refs, now, agent],
+                           AND body LIKE ?7",
+                    params![id, "open", fields.body, fields.refs, now, agent, like_pat],
                 )?
             } else {
                 rows
@@ -3713,21 +3719,20 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_merge_blocked_task() {
+    fn reopen_parked_merge_blocked_by_assignee() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .unwrap();
 
-        // Cancel with daemon:merge-blocked body (simulates daemon parking).
         update(
             &mut c,
             "A",
             id,
             &TaskUpdate {
                 status: Some("cancelled"),
-                body: Some("daemon:merge-blocked | PR #42 | some detail"),
+                body: Some("daemon:parked:merge-blocked | PR #42 | some detail"),
                 refs: None,
                 verdict: None,
             },
@@ -3756,7 +3761,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_merge_blocked_by_creator() {
+    fn reopen_parked_merge_blocked_by_creator() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
@@ -3769,7 +3774,7 @@ mod tests {
             id,
             &TaskUpdate {
                 status: Some("cancelled"),
-                body: Some("daemon:merge-blocked | PR #7"),
+                body: Some("daemon:parked:merge-blocked | PR #7"),
                 refs: None,
                 verdict: None,
             },
@@ -3795,14 +3800,96 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_without_merge_blocked_body_fails() {
+    fn reopen_parked_provision_exhausted_by_assignee() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .unwrap();
 
-        // Cancel without the merge-blocked marker.
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some(
+                    "daemon:parked:provision-exhausted | PR #99 | \
+                     reviewer provision failed 3 time(s)",
+                ),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        let t = update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+    }
+
+    #[test]
+    fn reopen_parked_provision_exhausted_by_creator() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some(
+                    "daemon:parked:provision-exhausted | PR #99 | \
+                     reviewer provision failed 3 time(s)",
+                ),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        let t = update(
+            &mut c,
+            "boss",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+    }
+
+    #[test]
+    fn reopen_cancelled_without_parked_prefix_fails() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
         update(
             &mut c,
             "A",
@@ -3817,7 +3904,6 @@ mod tests {
         )
         .unwrap();
 
-        // Attempt to reopen — should fail (no merge-blocked body).
         let err = update(
             &mut c,
             "A",
@@ -3835,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_merge_blocked_by_stranger_fails() {
+    fn reopen_parked_by_stranger_fails() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
@@ -3848,7 +3934,7 @@ mod tests {
             id,
             &TaskUpdate {
                 status: Some("cancelled"),
-                body: Some("daemon:merge-blocked | PR #7"),
+                body: Some("daemon:parked:merge-blocked | PR #7"),
                 refs: None,
                 verdict: None,
             },
@@ -3856,7 +3942,6 @@ mod tests {
         )
         .unwrap();
 
-        // Stranger (neither creator nor assignee) cannot reopen.
         let err = update(
             &mut c,
             "stranger",
@@ -3871,5 +3956,106 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn reopen_parked_task_deps_survive_and_unblock() {
+        let (_d, mut c) = open_tmp();
+        // Create parent task, then a dependent task.
+        let parent = create(&mut c, "boss", "parent", None, 0, None, None, None, 1000).unwrap();
+        let deps = format!("[{parent}]");
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&deps),
+            1000,
+        )
+        .unwrap();
+
+        // Child should not be ready (parent not closed).
+        let ct = get(&c, child).unwrap().unwrap();
+        assert!(!ct.ready);
+
+        // Claim and park the parent.
+        let _ = claim(&mut c, "A", Some(parent), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        update(
+            &mut c,
+            "A",
+            parent,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("daemon:parked:provision-exhausted | PR #10 | details"),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Child still not ready (parent is cancelled, not closed).
+        let ct = get(&c, child).unwrap().unwrap();
+        assert!(!ct.ready);
+
+        // Creator reopens parked parent.
+        update(
+            &mut c,
+            "boss",
+            parent,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        let pt = get(&c, parent).unwrap().unwrap();
+        assert_eq!(pt.status, "open");
+
+        // Claim parent, mark done (auto-spawns review), then approve via review task.
+        let _ = claim(&mut c, "B", Some(parent), &[], TTL, 1003)
+            .unwrap()
+            .unwrap();
+        update(
+            &mut c,
+            "B",
+            parent,
+            &TaskUpdate {
+                status: Some("done"),
+                ..Default::default()
+            },
+            1004,
+        )
+        .unwrap();
+        let review = last_review_task(&c);
+        let _ = claim(&mut c, "reviewer", Some(review.id), &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+        update(
+            &mut c,
+            "reviewer",
+            review.id,
+            &TaskUpdate {
+                status: Some("done"),
+                verdict: Some("approve"),
+                ..Default::default()
+            },
+            1006,
+        )
+        .unwrap();
+        let pt = get(&c, parent).unwrap().unwrap();
+        assert_eq!(pt.status, "closed");
+
+        // NOW the child should be ready.
+        let ct = get(&c, child).unwrap().unwrap();
+        assert!(ct.ready);
     }
 }
