@@ -74,6 +74,9 @@ established it.
    forward-only idempotent migrations (`CREATE … IF NOT EXISTS`, additive `ALTER`) under the
    write lock; **refuse and fail loud (exit 3) if binary < db_version.** This is the defense
    against "correct in repo, wrong against the running file" drift (see Practices §3).
+   One-shot commands exit 3 as above; the long-lived `serve` loop instead catches
+   `SchemaTooNew` at tick and exits 75 (`EXIT_SELF_UPDATE`) so the supervisor rebuilds and
+   relaunches on a current binary rather than fail-looping (see `classify_tick_error`).
 9. **Cursor advance is monotonic:** `SET last_seq = MAX(last_seq, ?)`, never a bare set
    (concurrent/out-of-order acks must not move it backward). Delivery is at-least-once;
    consumers must be idempotent on `seq`.

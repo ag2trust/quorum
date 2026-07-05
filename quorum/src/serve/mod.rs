@@ -494,9 +494,10 @@ impl DrainState {
 /// newer than this binary (M)` and doing no work.
 ///
 /// The only recovery is to exit with [`EXIT_SELF_UPDATE`] so `serve-supervisor.sh` fetches,
-/// rebuilds, and relaunches on a current binary. This reuses the self-update exit path but
-/// skips the graceful worker drain (teardown writes to the DB, which would also fail against
-/// a too-new schema); in-flight workers are re-adopted from the journal on restart.
+/// rebuilds, and relaunches on a current binary. This reuses the self-update exit path.
+/// In-flight agents can't be gracefully drained (teardown writes to the DB, which would also
+/// fail against a too-new schema), so they are force-killed before exit and their tasks are
+/// re-adopted from the journal on restart.
 #[derive(Debug, PartialEq, Eq)]
 enum TickErrorAction {
     /// Transient — log and continue to the next tick.
@@ -506,9 +507,21 @@ enum TickErrorAction {
 }
 
 fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
+    // Exhaustive on purpose — no `_` arm. A new `QuorumError` variant must force a
+    // compile-time decision here; silently defaulting an unknown variant to `Continue`
+    // would risk re-introducing the exact live-lock this function exists to prevent.
     match e {
+        // Unrecoverable: this binary is older than the on-disk schema, and migrations are
+        // forward-only. Retrying can never succeed — exit so the supervisor rebuilds.
         QuorumError::SchemaTooNew { .. } => TickErrorAction::ExitSelfUpdate,
-        _ => TickErrorAction::Continue,
+        // Transient / retryable: a lost race, momentary lock contention, or a one-off
+        // I/O or DB hiccup that a later tick may clear.
+        QuorumError::NotHolder
+        | QuorumError::Usage(_)
+        | QuorumError::BadInput(_)
+        | QuorumError::Busy
+        | QuorumError::Db(_)
+        | QuorumError::Io(_) => TickErrorAction::Continue,
     }
 }
 
@@ -755,6 +768,21 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                          schema; exiting {EXIT_SELF_UPDATE} so the supervisor rebuilds and \
                          relaunches on a current binary"
                     ));
+                    // Force-kill in-flight agents before exiting. They run in their own
+                    // process groups (setpgid, no Drop), so a bare return orphans them —
+                    // the relaunched daemon would re-adopt the same tasks and race
+                    // live-but-unsupervised agents on the same worktrees/branches. We
+                    // can't gracefully teardown (that writes to the DB, which also fails
+                    // against a too-new schema); just reap the processes and release their
+                    // names. Journal recovery reclaims the tasks on restart.
+                    for r in reviewers.drain(..) {
+                        r.proc.kill_and_reap().await;
+                        name_pool.release(&r.agent_name);
+                    }
+                    for w in workers.drain(..) {
+                        w.proc.kill_and_reap().await;
+                        name_pool.release(&w.agent_name);
+                    }
                     return Ok(EXIT_SELF_UPDATE);
                 }
                 TickErrorAction::Continue => log(&format!("tick error: {e}")),
