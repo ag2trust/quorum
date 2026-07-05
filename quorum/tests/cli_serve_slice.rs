@@ -6,6 +6,23 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Kill-on-drop guard for a serve child process.
+struct ServeGuard {
+    child: std::process::Child,
+}
+
+impl Drop for ServeGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let pid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
+
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
@@ -92,6 +109,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     );
 
     // Start serve with fake-agent
+    let sentinel = tempfile::tempdir().unwrap();
     let fake_agent = cargo_bin("fake-agent");
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -107,6 +125,8 @@ fn serve_spawns_agent_and_tears_down_on_done() {
             &names_file.to_string_lossy(),
             "--agent-bin",
             &fake_agent.to_string_lossy(),
+            "--exit-when-gone",
+            &sentinel.path().to_string_lossy(),
         ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
@@ -114,6 +134,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
         .unwrap();
 
     let stderr = child.stderr.take().unwrap();
+    let mut _guard = ServeGuard { child };
 
     // Read stderr on a dedicated thread so timeouts are enforceable
     let (tx, rx) = mpsc::channel::<String>();
@@ -175,9 +196,9 @@ fn serve_spawns_agent_and_tears_down_on_done() {
 
     // Kill the serve process
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        libc::kill(_guard.child.id() as libc::pid_t, libc::SIGINT);
     }
-    let status = child.wait().unwrap();
+    let status = _guard.child.wait().unwrap();
     // Exit 0 or signal — both OK for this test
     let _ = status;
 }
@@ -214,6 +235,7 @@ fn sigint_during_work_releases_task_back_to_open() {
         String::from_utf8_lossy(&task_out.stderr)
     );
 
+    let sentinel = tempfile::tempdir().unwrap();
     let fake_agent = cargo_bin("fake-agent");
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -229,6 +251,8 @@ fn sigint_during_work_releases_task_back_to_open() {
             &names_file.to_string_lossy(),
             "--agent-bin",
             &fake_agent.to_string_lossy(),
+            "--exit-when-gone",
+            &sentinel.path().to_string_lossy(),
         ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
@@ -236,6 +260,7 @@ fn sigint_during_work_releases_task_back_to_open() {
         .unwrap();
 
     let stderr = child.stderr.take().unwrap();
+    let mut _guard = ServeGuard { child };
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
@@ -264,9 +289,9 @@ fn sigint_during_work_releases_task_back_to_open() {
 
     // SIGINT mid-work — no Done signal was sent
     unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
+        libc::kill(_guard.child.id() as libc::pid_t, libc::SIGINT);
     }
-    child.wait().unwrap();
+    _guard.child.wait().unwrap();
 
     // The interrupted task must be released back to open, not marked done
     let get_out = Command::new(cargo_bin("quorum"))

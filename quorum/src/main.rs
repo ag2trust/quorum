@@ -811,6 +811,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             only_repo,
             repo_dir_map,
             base_branch,
+            exit_when_gone,
         } => {
             let db = paths::db_path()?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
@@ -879,6 +880,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir_map: parsed_repo_dir_map,
                 base_branch,
                 instance_id,
+                exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
             };
             Ok(serve::run_serve(config)?)
         }

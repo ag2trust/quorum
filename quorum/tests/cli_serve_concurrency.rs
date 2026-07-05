@@ -51,6 +51,20 @@ struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
+    /// #201: sentinel file whose presence keeps the serve process alive.
+    _sentinel: Option<tempfile::TempDir>,
+}
+
+impl Drop for ServeHandle {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let pid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl ServeHandle {
@@ -72,6 +86,8 @@ impl ServeHandle {
         cap: usize,
         merge_cmd: &str,
     ) -> Self {
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
@@ -89,6 +105,8 @@ impl ServeHandle {
                 &fake_agent.to_string_lossy(),
                 "--merge-cmd",
                 merge_cmd,
+                "--exit-when-gone",
+                &sentinel_path,
             ])
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -110,6 +128,7 @@ impl ServeHandle {
             child,
             rx,
             lines: Vec::new(),
+            _sentinel: Some(sentinel),
         }
     }
 
@@ -641,4 +660,100 @@ fn each_worker_gets_own_reviewer() {
     );
 
     handle.stop();
+}
+
+// ── #201: Sentinel self-termination ───────────────────────────────────
+
+#[test]
+fn sentinel_gone_terminates_serve_and_children() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task A");
+
+    // Create a separate sentinel dir we can drop manually.
+    let sentinel = tempfile::tempdir().unwrap();
+    let sentinel_path = sentinel.path().to_string_lossy().to_string();
+
+    let fake_agent = cargo_bin("fake-agent");
+    let mut child = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "serve",
+            "--cap",
+            "1",
+            "--repo-dir",
+            &repo_dir.path().to_string_lossy(),
+            "--worktree-base",
+            &wt_base.path().to_string_lossy(),
+            "--names-file",
+            &names_file.to_string_lossy(),
+            "--agent-bin",
+            &fake_agent.to_string_lossy(),
+            "--merge-cmd",
+            "true",
+            "--exit-when-gone",
+            &sentinel_path,
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Wait for serve to boot.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut booted = false;
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains("serving") {
+                    booted = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(booted, "serve did not boot");
+
+    // Simulate parent death: remove the sentinel directory.
+    drop(sentinel);
+
+    // Serve should exit within a few seconds (tick interval is 500ms).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_status) => return,
+            None => {
+                if std::time::Instant::now() > deadline {
+                    child.kill().ok();
+                    let _ = child.wait();
+                    panic!("serve did not exit within 10s after sentinel removal");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }

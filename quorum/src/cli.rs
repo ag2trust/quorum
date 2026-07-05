@@ -459,6 +459,12 @@ pub enum Command {
         /// targeting. Use "master" for repos whose trunk is master. Default: main.
         #[arg(long, default_value = "main")]
         base_branch: String,
+        /// Path to a sentinel file. When set, serve polls for this file's
+        /// existence every tick and initiates shutdown when it disappears.
+        /// Used by test fixtures to self-terminate when the parent test
+        /// process dies and its tempdir is cleaned up.
+        #[arg(long, hide = true)]
+        exit_when_gone: Option<String>,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
