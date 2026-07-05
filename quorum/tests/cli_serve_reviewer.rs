@@ -272,6 +272,8 @@ fn approve_flow_tears_down_both_agents() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -511,6 +513,8 @@ fn merge_failure_feeds_rework_to_worker() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -790,4 +794,88 @@ fn reviewer_provision_uses_repo_dir_map_for_cross_repo_task() {
         libc::kill(child.id() as libc::pid_t, libc::SIGINT);
     }
     let _ = child.wait();
+}
+
+/// #206: an `approved` verdict that did NOT come through the validated CLI —
+/// no zero-blocking attestation payload on the mailbox row — must be demoted
+/// to `changes` at the daemon boundary and fed back as rework, never merged.
+/// This replays the #198 shape (a merge-caliber verdict the review's own
+/// findings contradicted) at the mailbox level.
+#[test]
+fn unattested_approved_verdict_is_demoted_to_changes() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for verdict-gate flow");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Bypass the CLI's #206 validation: write the approved-verdict mailbox row
+    // directly, with NO attestation payload.
+    let conn = rusqlite::Connection::open(home.path().join("quorum.db")).unwrap();
+    conn.execute(
+        "INSERT INTO mailbox (agent, kind, pr, verdict, created_at) \
+         VALUES (?1, 'done', 1, 'approved', 1700000000)",
+        rusqlite::params![reviewer_name],
+    )
+    .unwrap();
+
+    // The gate must demote and route to rework instead of merging.
+    assert!(
+        handle.wait_for("VERDICT GATE", 15),
+        "verdict-gate demotion log not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework", 15),
+        "demoted verdict did not produce a rework turn. Lines: {:?}",
+        handle.lines
+    );
+
+    // Drain remaining lines, then assert nothing was merged.
+    std::thread::sleep(Duration::from_millis(500));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+    assert!(
+        !handle.lines.iter().any(|l| l.contains("merged")),
+        "unattested approved verdict must never reach merge. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
 }

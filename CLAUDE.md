@@ -167,7 +167,14 @@ co-author) — only `--admin` clears it, which requires owner intervention.
 | `brevitize`    | `gh pr review --approve` + `gh pr merge`|
 
 Self-merge is blocked at the **session** level: the PR footer `🤖 <Name>` + `Co-Authored-By`
-trailers identify the author session. A reviewer must be a different session than the author.
+trailers identify the author session. A reviewer must be a different session than the author —
+and different from the **deliverer**: whoever signaled the task's `done` (e.g. adopted the PR)
+is disqualified from reviewing it, even if the git author is someone else (#206).
+
+**Verdict contract (#206):** reviews classify findings BLOCKING/advisory and the verdict is
+derived, not chosen — `--verdict approved` requires `--blocking 0`; any blocking finding
+requires `--verdict changes --feedback`. See `.claude/skills/pr-review/SKILL.md` (invoke the
+`pr-review` skill when reviewing). The daemon demotes unattested approvals to `changes`.
 
 ### 3. Work in your own git worktree
 

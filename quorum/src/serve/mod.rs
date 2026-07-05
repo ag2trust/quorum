@@ -793,7 +793,20 @@ async fn tick(
                 reviewers[ri].agent_name, row.pr, row.verdict
             ));
 
-            match row.verdict.as_deref() {
+            // #206: gate the verdict before acting on it. An `approved` row
+            // without the zero-blocking attestation payload (i.e. one that
+            // did not come through the validated CLI, or that attests
+            // blocking findings) is demoted to `changes` — the daemon never
+            // merges on it.
+            let gated = crate::verdict::gate(row.verdict.as_deref(), row.payload.as_deref());
+            if let Some(reason) = &gated.demotion_reason {
+                log(&format!(
+                    "VERDICT GATE: reviewer {} — {}",
+                    reviewers[ri].agent_name, reason
+                ));
+            }
+
+            match gated.verdict.as_deref() {
                 Some("approved") => {
                     let pr_num = row.pr.unwrap_or(0);
 
@@ -1446,10 +1459,41 @@ async fn tick(
                     }
                 }
                 Some("changes") => {
-                    let feedback = row.feedback.as_deref().unwrap_or("Changes requested.");
+                    // On a #206 demotion the row carries no reviewer feedback;
+                    // the demotion reason is the actionable message.
+                    let feedback = gated
+                        .demotion_reason
+                        .as_deref()
+                        .or(row.feedback.as_deref())
+                        .unwrap_or("Changes requested.");
                     log(&format!(
                         "verdict: changes — feeding rework to worker (feedback: {feedback})"
                     ));
+
+                    // #206: mirror the changes verdict to GitHub as a formal
+                    // REQUEST_CHANGES review — a durable, merge-visible record.
+                    // Best-effort: a gh failure must never block the rework path.
+                    if let Some(pr_num) = row.pr {
+                        let repo = config.repo_dir.clone();
+                        let executor = Arc::clone(&config.merge_executor);
+                        let fb = feedback.to_string();
+                        match tokio::task::spawn_blocking(move || {
+                            executor.request_changes(pr_num, &repo, &fb)
+                        })
+                        .await
+                        {
+                            Ok(r) if r.success => {
+                                log(&format!("posted REQUEST_CHANGES on PR #{pr_num}"));
+                            }
+                            Ok(r) => log(&format!(
+                                "REQUEST_CHANGES on PR #{pr_num} failed (non-blocking): {}",
+                                r.message
+                            )),
+                            Err(e) => log(&format!(
+                                "REQUEST_CHANGES spawn_blocking join failed (non-blocking): {e}"
+                            )),
+                        }
+                    }
 
                     let r = reviewers.remove(ri);
                     teardown_reviewer(config, wt_mgr, name_pool, r).await;
@@ -1590,6 +1634,17 @@ async fn tick(
                 "worker {} done (pr={:?}{note_suffix})",
                 workers[wi].agent_name, row.pr,
             ));
+
+            // #206 defense-in-depth: verdicts are only actionable from the
+            // task's spawned reviewer (matched above). A worker posting one
+            // is trying to review its own delivery — surface it loudly.
+            if row.verdict.is_some() {
+                log(&format!(
+                    "INTEGRITY: worker {} posted a verdict ({:?}) on its own \
+                     delivery — ignored (#206: the deliverer cannot review)",
+                    workers[wi].agent_name, row.verdict
+                ));
+            }
 
             if let Some(pr) = row.pr {
                 workers[wi].pr = Some(pr);

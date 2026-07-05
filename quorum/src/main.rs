@@ -11,6 +11,7 @@ mod input;
 mod output;
 mod paths;
 mod serve;
+mod verdict;
 
 use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
@@ -570,9 +571,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             note_stdin,
             note_file,
             verdict,
+            blocking,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
             let note = read_optional_note(note_stdin, note_file)?;
+            // #206: same findings/verdict consistency contract as `done`.
+            // Feedback travels via review comments in the passive flow, so it
+            // is not required here.
+            verdict::validate(verdict.as_deref(), blocking, None, false)
+                .map_err(QuorumError::Usage)?;
             // `--verdict` is a field update too — it drives the review-task done branch in
             // tasks::update (issue #10). Treat it as part of the field-update bundle so a
             // bare `task-update --verdict approve --status done` is accepted as one call.
@@ -984,6 +991,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             summary,
             verdict,
             feedback,
+            blocking,
         } => {
             if let Some(ref v) = verdict {
                 match v.as_str() {
@@ -995,6 +1003,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     }
                 }
             }
+            // #206: the verdict must be consistent with the review's own
+            // findings — `approved` needs an explicit zero-blocking
+            // attestation, `changes` needs actionable feedback.
+            verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
+                .map_err(QuorumError::Usage)?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
             let kind = quorum_core::mailbox::MailboxKind::Done;
@@ -1007,7 +1020,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 feedback,
                 note: summary,
                 to_agent: None,
-                payload: None,
+                payload: verdict::attestation_payload(blocking),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));

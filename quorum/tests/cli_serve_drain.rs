@@ -287,6 +287,8 @@ fn self_repo_merge_drains_and_exits_75() {
             "42",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -391,6 +393,8 @@ fn other_repo_merge_does_not_drain() {
             "99",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 

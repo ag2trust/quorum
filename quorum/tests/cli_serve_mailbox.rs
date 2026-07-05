@@ -478,7 +478,16 @@ fn stale_done_row_drained_on_name_reuse() {
     // new worker that acquires "Agent0".
     quorum_done(
         home.path(),
-        &["--agent", "Agent0", "--verdict", "approved", "--pr", "99"],
+        &[
+            "--agent",
+            "Agent0",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+            "--pr",
+            "99",
+        ],
     );
 
     assert_eq!(count_unconsumed(home.path(), "Agent0"), 1);

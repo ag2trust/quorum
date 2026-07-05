@@ -112,6 +112,11 @@ pub enum Command {
         /// changes. Required on review tasks, rejected on non-review.
         #[arg(long)]
         verdict: Option<String>,
+        /// Count of BLOCKING findings in your review (#206). `--verdict approve`
+        /// requires `--blocking 0` — any blocking finding requires
+        /// `--verdict changes`.
+        #[arg(long)]
+        blocking: Option<u32>,
     },
     /// List tasks, optionally filtered by status/label/assignee. `--brief` returns summary rows
     /// (no body) for a token-cheap queue scan; the full body is one `task-get <id>` away.
@@ -334,9 +339,15 @@ pub enum Command {
         /// Review verdict: approved or changes.
         #[arg(long)]
         verdict: Option<String>,
-        /// Review feedback (used with --verdict changes).
+        /// Review feedback (required with --verdict changes — it becomes the
+        /// worker's rework instructions).
         #[arg(long)]
         feedback: Option<String>,
+        /// Count of BLOCKING findings in your review (#206). `--verdict approved`
+        /// requires `--blocking 0` — any blocking finding requires
+        /// `--verdict changes`.
+        #[arg(long)]
+        blocking: Option<u32>,
     },
     /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
     /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.

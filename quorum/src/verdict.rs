@@ -1,0 +1,255 @@
+//! Review-verdict discipline (#206).
+//!
+//! PR #198 merged over two blocking findings because the verdict was a free
+//! string the reviewer chose separately from the review it wrote — nothing
+//! bound the findings to the verdict. This module makes the contract
+//! executable at two boundaries:
+//!
+//! - CLI ([`validate`]): `--verdict approved` requires an explicit
+//!   `--blocking 0` attestation (the count of blocking findings in the
+//!   review); any nonzero count is refused — a blocking finding REQUIRES
+//!   `--verdict changes`.
+//! - Daemon ([`gate`]): an `approved` mailbox row that lacks the attestation
+//!   payload (written by any path other than the validated CLI) is demoted to
+//!   `changes` instead of merged.
+
+/// CLI-boundary validation of the verdict/blocking/feedback argument bundle.
+///
+/// `changes_requires_feedback` is true for `quorum done` (daemon flow — the
+/// feedback becomes the worker's rework turn) and false for
+/// `quorum task-update` (passive flow — feedback travels via review comments
+/// and task notes).
+pub fn validate(
+    verdict: Option<&str>,
+    blocking: Option<u32>,
+    feedback: Option<&str>,
+    changes_requires_feedback: bool,
+) -> Result<(), String> {
+    match verdict {
+        None => {
+            if blocking.is_some() {
+                return Err("--blocking is a review attestation and requires --verdict".to_string());
+            }
+            Ok(())
+        }
+        Some("approved") | Some("approve") => match blocking {
+            Some(0) => Ok(()),
+            Some(n) => Err(format!(
+                "cannot approve with {n} blocking finding(s) — a blocking finding \
+                 requires --verdict changes with the findings as feedback"
+            )),
+            None => Err(
+                "an approve verdict requires the attestation --blocking 0 (the count of \
+                 BLOCKING findings in your review; any blocking finding requires \
+                 --verdict changes instead)"
+                    .to_string(),
+            ),
+        },
+        Some("changes") => {
+            if changes_requires_feedback && feedback.is_none_or(|f| f.trim().is_empty()) {
+                return Err(
+                    "--verdict changes requires --feedback describing what must be fixed \
+                     (it becomes the worker's rework instructions)"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        // Unknown spellings are rejected by the caller's enum check; treat
+        // them as no-attestation-needed here.
+        Some(_) => Ok(()),
+    }
+}
+
+/// Serialized attestation for the mailbox `payload` column: `{"blocking":N}`.
+/// `None` when no attestation was supplied.
+pub fn attestation_payload(blocking: Option<u32>) -> Option<String> {
+    blocking.map(|n| format!("{{\"blocking\":{n}}}"))
+}
+
+/// Outcome of gating a mailbox verdict at the daemon boundary.
+#[derive(Debug)]
+pub struct GatedVerdict {
+    /// The verdict the daemon should act on (possibly demoted).
+    pub verdict: Option<String>,
+    /// Set when an `approved` verdict was demoted to `changes`; explains why
+    /// and doubles as the rework feedback.
+    pub demotion_reason: Option<String>,
+}
+
+/// Daemon-boundary gate: `approved` is only actionable with a payload
+/// attesting zero blocking findings. Anything else that claims `approved`
+/// (missing payload, unparseable payload, nonzero count) is demoted to
+/// `changes` so the daemon never merges on it. `changes` and non-verdicts
+/// pass through untouched.
+pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
+    if verdict != Some("approved") {
+        return GatedVerdict {
+            verdict: verdict.map(str::to_string),
+            demotion_reason: None,
+        };
+    }
+
+    let blocking = payload
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("blocking").and_then(|b| b.as_u64()));
+
+    match blocking {
+        Some(0) => GatedVerdict {
+            verdict: Some("approved".to_string()),
+            demotion_reason: None,
+        },
+        Some(n) => GatedVerdict {
+            verdict: Some("changes".to_string()),
+            demotion_reason: Some(format!(
+                "approved verdict demoted to changes: the reviewer attested {n} BLOCKING \
+                 finding(s) — a blocking finding cannot be approved over (#206). \
+                 Re-signal done to trigger a fresh review after addressing the findings."
+            )),
+        },
+        None => GatedVerdict {
+            verdict: Some("changes".to_string()),
+            demotion_reason: Some(
+                "approved verdict demoted to changes: missing the zero-blocking-findings \
+                 attestation (--blocking 0). The verdict did not come through the \
+                 validated CLI path (#206). Re-signal done to trigger a fresh review."
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- validate: the #198 regression contract ---
+
+    #[test]
+    fn approved_without_blocking_attestation_is_refused() {
+        let err = validate(Some("approved"), None, None, true).unwrap_err();
+        assert!(
+            err.contains("--blocking 0"),
+            "error must tell the reviewer how to attest: {err}"
+        );
+    }
+
+    /// #198 regression: a review with blocking findings must not be able to
+    /// signal `approved` — the exact sequence that shipped #205's bugs.
+    #[test]
+    fn approved_with_nonzero_blocking_findings_is_refused() {
+        let err = validate(Some("approved"), Some(2), None, true).unwrap_err();
+        assert!(
+            err.contains("changes"),
+            "error must redirect to --verdict changes: {err}"
+        );
+    }
+
+    #[test]
+    fn approved_with_zero_blocking_attestation_passes() {
+        assert!(validate(Some("approved"), Some(0), None, true).is_ok());
+    }
+
+    #[test]
+    fn approve_passive_spelling_gets_same_contract() {
+        assert!(validate(Some("approve"), None, None, false).is_err());
+        assert!(validate(Some("approve"), Some(0), None, false).is_ok());
+    }
+
+    #[test]
+    fn changes_requires_feedback_in_daemon_flow() {
+        let err = validate(Some("changes"), Some(1), None, true).unwrap_err();
+        assert!(err.contains("--feedback"), "got: {err}");
+        assert!(validate(
+            Some("changes"),
+            Some(1),
+            Some("fix the LIKE escaping"),
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn changes_feedback_optional_in_passive_flow() {
+        assert!(validate(Some("changes"), None, None, false).is_ok());
+    }
+
+    #[test]
+    fn changes_with_blank_feedback_is_refused_in_daemon_flow() {
+        assert!(validate(Some("changes"), None, Some("   "), true).is_err());
+    }
+
+    #[test]
+    fn no_verdict_passes_without_attestation() {
+        // Plain worker `done --pr N`.
+        assert!(validate(None, None, None, true).is_ok());
+    }
+
+    #[test]
+    fn blocking_without_verdict_is_refused() {
+        assert!(validate(None, Some(0), None, true).is_err());
+    }
+
+    // --- attestation payload ---
+
+    #[test]
+    fn attestation_payload_roundtrip() {
+        assert_eq!(
+            attestation_payload(Some(0)).as_deref(),
+            Some("{\"blocking\":0}")
+        );
+        assert_eq!(
+            attestation_payload(Some(3)).as_deref(),
+            Some("{\"blocking\":3}")
+        );
+        assert_eq!(attestation_payload(None), None);
+    }
+
+    // --- gate: daemon-boundary demotion ---
+
+    #[test]
+    fn gate_passes_attested_approved() {
+        let g = gate(Some("approved"), Some("{\"blocking\":0}"));
+        assert_eq!(g.verdict.as_deref(), Some("approved"));
+        assert!(g.demotion_reason.is_none());
+    }
+
+    #[test]
+    fn gate_demotes_unattested_approved_to_changes() {
+        let g = gate(Some("approved"), None);
+        assert_eq!(g.verdict.as_deref(), Some("changes"));
+        assert!(g.demotion_reason.is_some());
+    }
+
+    #[test]
+    fn gate_demotes_approved_with_nonzero_blocking() {
+        let g = gate(Some("approved"), Some("{\"blocking\":2}"));
+        assert_eq!(g.verdict.as_deref(), Some("changes"));
+        let reason = g.demotion_reason.unwrap();
+        assert!(
+            reason.contains('2'),
+            "reason should cite the count: {reason}"
+        );
+    }
+
+    #[test]
+    fn gate_demotes_approved_with_garbage_payload() {
+        let g = gate(Some("approved"), Some("not json"));
+        assert_eq!(g.verdict.as_deref(), Some("changes"));
+        assert!(g.demotion_reason.is_some());
+    }
+
+    #[test]
+    fn gate_passes_changes_through_untouched() {
+        let g = gate(Some("changes"), None);
+        assert_eq!(g.verdict.as_deref(), Some("changes"));
+        assert!(g.demotion_reason.is_none());
+    }
+
+    #[test]
+    fn gate_passes_non_verdict_through() {
+        let g = gate(None, None);
+        assert_eq!(g.verdict, None);
+        assert!(g.demotion_reason.is_none());
+    }
+}
