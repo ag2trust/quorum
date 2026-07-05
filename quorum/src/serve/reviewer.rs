@@ -7,7 +7,7 @@
 //! merges + tears down both agents (approved) or feeds a rework turn to the
 //! warm worker (changes).
 
-use super::agent::{AgentProc, AgentSpec};
+use super::agent::{AgentProc, AgentSpec, ALLOWED_TOOLS};
 use std::path::{Path, PathBuf};
 
 pub struct ReviewerSpec {
@@ -68,6 +68,7 @@ pub async fn spawn_reviewer(
         worktree: worktree_path.to_path_buf(),
         bare,
         resume: false,
+        allowed_tools: ALLOWED_TOOLS.to_string(),
     };
     AgentProc::spawn(&agent_spec, agent_bin)
 }

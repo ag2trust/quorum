@@ -13,6 +13,7 @@ pub struct AgentSpec {
     pub worktree: PathBuf,
     pub bare: bool,
     pub resume: bool,
+    pub allowed_tools: String,
 }
 
 pub struct AgentProc {
@@ -69,7 +70,7 @@ impl AgentProc {
             .arg("--permission-mode")
             .arg("dontAsk")
             .arg("--allowedTools")
-            .arg(ALLOWED_TOOLS);
+            .arg(&spec.allowed_tools);
 
         if spec.bare {
             cmd.arg("--bare");
@@ -171,6 +172,31 @@ mod tests {
     #[test]
     fn allowed_tools_include_skill() {
         assert!(ALLOWED_TOOLS.split(',').any(|t| t == "Skill"));
+    }
+
+    /// #220: allowed_tools flows through AgentSpec — a custom list must reach
+    /// the spawn site unchanged (not silently replaced by the default constant).
+    #[test]
+    fn agent_spec_carries_allowed_tools() {
+        let spec = AgentSpec {
+            model: "opus".into(),
+            effort: "high".into(),
+            session_id: "sid".into(),
+            worktree: PathBuf::from("/tmp"),
+            bare: false,
+            resume: false,
+            allowed_tools: "Bash,Read".to_string(),
+        };
+        assert_eq!(spec.allowed_tools, "Bash,Read");
+    }
+
+    /// Default ALLOWED_TOOLS constant contains the baseline tool set.
+    #[test]
+    fn default_allowed_tools_contains_baseline() {
+        let tools: Vec<&str> = ALLOWED_TOOLS.split(',').collect();
+        for expected in ["Bash", "Read", "Edit", "Write", "Glob", "Grep"] {
+            assert!(tools.contains(&expected), "missing {expected}");
+        }
     }
 
     #[test]
