@@ -210,7 +210,7 @@ fn labels_to_model_effort(labels_json: Option<&str>) -> (Option<String>, Option<
         }
         if effort.is_none() {
             if let Some(val) = label.strip_prefix("effort:") {
-                if !val.is_empty() {
+                if val == "medium" || val == "high" {
                     effort = Some(val.to_string());
                 }
             }
@@ -3588,6 +3588,25 @@ mod tests {
         let (model, effort) = labels_to_model_effort(Some(labels));
         assert_eq!(model, None);
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn labels_to_model_effort_rejects_invalid_effort() {
+        let labels = r#"["effort:low"]"#;
+        let (_, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(effort, None, "effort:low must be rejected");
+
+        let labels = r#"["effort:max"]"#;
+        let (_, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(effort, None, "effort:max must be rejected");
+
+        let labels = r#"["effort:medium"]"#;
+        let (_, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(effort.as_deref(), Some("medium"));
+
+        let labels = r#"["effort:high"]"#;
+        let (_, effort) = labels_to_model_effort(Some(labels));
+        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     fn make_dummy_slot() -> SlotState {
