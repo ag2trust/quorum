@@ -614,10 +614,9 @@ pub fn update(
                 params![id, "open", fields.body, fields.refs, now, agent],
             )?;
             if rows == 0 {
-                // #171: allow reopening daemon-parked tasks (cancelled with
-                // daemon:merge-blocked body). Creator or (former) assignee
-                // can reopen so operators/daemon can unpark without rebuilding
-                // the task chain.
+                // #171/#182: allow reopening any daemon-parked task (cancelled
+                // with a `daemon:parked | <reason>` body). Creator or (former)
+                // assignee can reopen; deps stay intact so dependents unstrand.
                 tx.execute(
                     "UPDATE tasks SET
                         status='open', assignee=NULL, sticky_until=NULL,
@@ -626,7 +625,7 @@ pub fn update(
                         updated_at = ?5
                      WHERE id=?1 AND (created_by=?6 OR assignee=?6)
                            AND status='cancelled'
-                           AND body LIKE 'daemon:merge-blocked%'",
+                           AND body LIKE 'daemon:parked |%'",
                     params![id, "open", fields.body, fields.refs, now, agent],
                 )?
             } else {
@@ -3713,21 +3712,21 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_merge_blocked_task() {
+    fn reopen_parked_merge_blocked_task() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .unwrap();
 
-        // Cancel with daemon:merge-blocked body (simulates daemon parking).
+        // Cancel with daemon:parked body (simulates daemon parking via merge-blocked).
         update(
             &mut c,
             "A",
             id,
             &TaskUpdate {
                 status: Some("cancelled"),
-                body: Some("daemon:merge-blocked | PR #42 | some detail"),
+                body: Some("daemon:parked | merge-blocked | PR #42 | some detail"),
                 refs: None,
                 verdict: None,
             },
@@ -3756,7 +3755,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_merge_blocked_by_creator() {
+    fn reopen_parked_merge_blocked_by_creator() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
@@ -3769,7 +3768,7 @@ mod tests {
             id,
             &TaskUpdate {
                 status: Some("cancelled"),
-                body: Some("daemon:merge-blocked | PR #7"),
+                body: Some("daemon:parked | merge-blocked | PR #7"),
                 refs: None,
                 verdict: None,
             },
@@ -3795,14 +3794,99 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_without_merge_blocked_body_fails() {
+    fn reopen_parked_provision_exhausted_by_assignee() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .unwrap();
 
-        // Cancel without the merge-blocked marker.
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some(
+                    "daemon:parked | provision-exhausted | PR #99 | \
+                     reviewer provision failed 3 time(s)",
+                ),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Assignee can reopen provision-exhausted park.
+        let t = update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+    }
+
+    #[test]
+    fn reopen_parked_provision_exhausted_by_creator() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some(
+                    "daemon:parked | provision-exhausted | PR #99 | \
+                     reviewer provision failed 3 time(s)",
+                ),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Creator can reopen provision-exhausted park.
+        let t = update(
+            &mut c,
+            "boss",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+    }
+
+    #[test]
+    fn reopen_cancelled_without_parked_body_fails() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        // Cancel without the daemon:parked marker.
         update(
             &mut c,
             "A",
@@ -3817,7 +3901,7 @@ mod tests {
         )
         .unwrap();
 
-        // Attempt to reopen — should fail (no merge-blocked body).
+        // Attempt to reopen — should fail (no daemon:parked body).
         let err = update(
             &mut c,
             "A",
@@ -3835,7 +3919,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_merge_blocked_by_stranger_fails() {
+    fn reopen_parked_by_stranger_fails() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
@@ -3848,7 +3932,7 @@ mod tests {
             id,
             &TaskUpdate {
                 status: Some("cancelled"),
-                body: Some("daemon:merge-blocked | PR #7"),
+                body: Some("daemon:parked | merge-blocked | PR #7"),
                 refs: None,
                 verdict: None,
             },
@@ -3871,5 +3955,85 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn reopen_parked_task_deps_survive_and_unblock() {
+        let (_d, mut c) = open_tmp();
+        // Create parent task and a dependent (depends_on is a JSON array string).
+        let parent = create(&mut c, "boss", "parent", None, 0, None, None, None, 1000).unwrap();
+        let dep_json = format!("[{parent}]");
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&dep_json),
+            1000,
+        )
+        .unwrap();
+
+        // Claim and park the parent.
+        let _ = claim(&mut c, "A", Some(parent), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        update(
+            &mut c,
+            "A",
+            parent,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("daemon:parked | provision-exhausted | PR #5 | failed 3x"),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Child should be blocked (parent is cancelled).
+        let claimed = claim(&mut c, "B", Some(child), &[], TTL, 1002);
+        assert!(
+            claimed.is_err() || claimed.unwrap().is_none(),
+            "child should be blocked while parent is parked"
+        );
+
+        // Reopen the parent.
+        update(
+            &mut c,
+            "boss",
+            parent,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1003,
+        )
+        .unwrap();
+
+        // Complete the parent: claim → force-close via SQL (test shortcut).
+        let _ = claim(&mut c, "A", Some(parent), &[], TTL, 1004)
+            .unwrap()
+            .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='closed' WHERE id=?1",
+            params![parent],
+        )
+        .unwrap();
+
+        // Parent should now be closed.
+        let p = get(&c, parent).unwrap().unwrap();
+        assert_eq!(p.status, "closed");
+
+        // Child should now be claimable (dep satisfied).
+        let claimed = claim(&mut c, "B", Some(child), &[], TTL, 1008)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, child);
     }
 }

@@ -936,7 +936,7 @@ async fn tick(
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
                                 let park_body = format!(
-                                    "daemon:merge-blocked | PR #{pr_num} | \
+                                    "daemon:parked | merge-blocked | PR #{pr_num} | \
                                      reviewer={reviewer_name} verdict=approved \
                                      (task #{reviewer_task_id}) | checks timed out \
                                      after {}s",
@@ -1057,7 +1057,7 @@ async fn tick(
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
                                     let park_body = format!(
-                                        "daemon:merge-blocked | PR #{pr_num} | \
+                                        "daemon:parked | merge-blocked | PR #{pr_num} | \
                                          reviewer={reviewer_name} verdict=approved \
                                          (task #{reviewer_task_id}) | {msg}",
                                         msg = merge_result.message
@@ -1578,8 +1578,8 @@ async fn tick(
                 w,
                 "cancelled",
                 Some(&format!(
-                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
-                     time(s) for PR #{pr} — parking task"
+                    "daemon:parked | provision-exhausted | PR #{pr} | \
+                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)"
                 )),
             )
             .await;

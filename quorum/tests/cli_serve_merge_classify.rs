@@ -272,8 +272,8 @@ fn policy_blocked_merge_parks_task_no_rework() {
         "task should be parked as cancelled, got: {stdout}"
     );
     assert!(
-        stdout.contains("daemon:merge-blocked"),
-        "task body should contain daemon:merge-blocked tag, got: {stdout}"
+        stdout.contains("daemon:parked | merge-blocked"),
+        "task body should contain daemon:parked | merge-blocked tag, got: {stdout}"
     );
 }
 
