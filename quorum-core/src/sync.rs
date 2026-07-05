@@ -517,7 +517,8 @@ pub fn tick_with_budget(
 }
 
 /// #121: run the lease reaper in a short write txn before the read-only `gather`.
-/// Cheap: one bounded UPDATE over expired leases. By running before `gather`, a reaped
+/// Bounded SELECT of lapsed tasks + per-row UPDATEs (task reset, claim deactivation)
+/// and event emissions, capped at `SWEEP_LIMIT`. By running before `gather`, a reaped
 /// task surfaces as `next_task` in the same tick — the agent doesn't have to wait an
 /// extra round-trip to see reclaimed work.
 fn reap_before_gather(conn: &mut Connection, now: i64) -> Result<()> {
