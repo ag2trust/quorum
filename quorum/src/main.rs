@@ -194,13 +194,17 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
             } else {
                 String::new()
             };
+            let activity_str = match d.last_activity_secs {
+                Some(secs) => format!("  · last activity: {}s ago", secs),
+                None => String::new(),
+            };
             let log_str = d
                 .log_dir
                 .as_deref()
                 .map(|p| format!("  log: {p}"))
                 .unwrap_or_default();
             println!(
-                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{cost_str}{state_str}{log_str}",
+                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{cost_str}{state_str}{activity_str}{log_str}",
                 d.agent, d.role, task_str, d.phase, d.cost_tokens,
             );
         }

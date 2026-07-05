@@ -167,6 +167,9 @@ pub struct DaemonAgentView {
     pub agent_state: Option<String>,
     pub cost_usd: f64,
     pub log_dir: Option<String>,
+    /// Seconds since last write to stream.jsonl (filesystem mtime). `None` when
+    /// `log_dir` is absent or the file doesn't exist yet.
+    pub last_activity_secs: Option<i64>,
 }
 
 /// A point-in-time snapshot of the store.
@@ -722,17 +725,29 @@ fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
     let entries = crate::journal::list_in_flight(conn)?;
     Ok(entries
         .into_iter()
-        .map(|e| DaemonAgentView {
-            agent: e.agent,
-            role: e.role,
-            task_id: e.task_id,
-            phase: e.phase,
-            cost_tokens: e.cost_tokens,
-            agent_state: e.agent_state,
-            cost_usd: e.cost_usd,
-            log_dir: e.log_dir,
+        .map(|e| {
+            let last_activity_secs = e.log_dir.as_deref().and_then(stream_jsonl_age_secs);
+            DaemonAgentView {
+                agent: e.agent,
+                role: e.role,
+                task_id: e.task_id,
+                phase: e.phase,
+                cost_tokens: e.cost_tokens,
+                agent_state: e.agent_state,
+                cost_usd: e.cost_usd,
+                log_dir: e.log_dir,
+                last_activity_secs,
+            }
         })
         .collect())
+}
+
+fn stream_jsonl_age_secs(log_dir: &str) -> Option<i64> {
+    let path = std::path::Path::new(log_dir).join("stream.jsonl");
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
+    let age = modified.elapsed().ok()?;
+    Some(age.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -1557,5 +1572,22 @@ mod tests {
         let (tasks, secs) = load_score_for(&c, "X").unwrap();
         assert_eq!(tasks, 2);
         assert_eq!(secs, 60);
+    }
+
+    #[test]
+    fn stream_jsonl_age_returns_some_for_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream_path = dir.path().join("stream.jsonl");
+        std::fs::write(&stream_path, "{}\n").unwrap();
+
+        let age = super::stream_jsonl_age_secs(dir.path().to_str().unwrap());
+        assert!(age.is_some());
+        assert!(age.unwrap() < 2);
+    }
+
+    #[test]
+    fn stream_jsonl_age_returns_none_for_missing_dir() {
+        let age = super::stream_jsonl_age_secs("/nonexistent/path/xyz");
+        assert!(age.is_none());
     }
 }
