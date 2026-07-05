@@ -2909,6 +2909,9 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
+            if quorum_core::stats::has_label(t.labels.as_deref(), "kind:review") {
+                return false;
+            }
             if !task_matches_repo_filter(t, &only_repo) {
                 skipped.push((t.id, t.title.clone()));
                 return false;
