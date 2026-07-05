@@ -1578,8 +1578,8 @@ async fn tick(
                 w,
                 "cancelled",
                 Some(&format!(
-                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
-                     time(s) for PR #{pr} — parking task"
+                    "daemon:provision-exhausted | PR #{pr} | \
+                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)"
                 )),
             )
             .await;

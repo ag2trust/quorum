@@ -614,10 +614,10 @@ pub fn update(
                 params![id, "open", fields.body, fields.refs, now, agent],
             )?;
             if rows == 0 {
-                // #171: allow reopening daemon-parked tasks (cancelled with
-                // daemon:merge-blocked body). Creator or (former) assignee
-                // can reopen so operators/daemon can unpark without rebuilding
-                // the task chain.
+                // #171/#182: allow reopening any daemon-parked task (cancelled
+                // with a `daemon:` body prefix). Covers merge-blocked,
+                // provision-exhausted, and future park flavors. Creator or
+                // (former) assignee can reopen; deps stay intact.
                 tx.execute(
                     "UPDATE tasks SET
                         status='open', assignee=NULL, sticky_until=NULL,
@@ -626,7 +626,7 @@ pub fn update(
                         updated_at = ?5
                      WHERE id=?1 AND (created_by=?6 OR assignee=?6)
                            AND status='cancelled'
-                           AND body LIKE 'daemon:merge-blocked%'",
+                           AND body LIKE 'daemon:%'",
                     params![id, "open", fields.body, fields.refs, now, agent],
                 )?
             } else {
@@ -3795,14 +3795,14 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_without_merge_blocked_body_fails() {
+    fn reopen_cancelled_without_daemon_body_fails() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
         let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
             .unwrap()
             .unwrap();
 
-        // Cancel without the merge-blocked marker.
+        // Cancel without a daemon: prefix.
         update(
             &mut c,
             "A",
@@ -3817,7 +3817,7 @@ mod tests {
         )
         .unwrap();
 
-        // Attempt to reopen — should fail (no merge-blocked body).
+        // Attempt to reopen — should fail (no daemon: body).
         let err = update(
             &mut c,
             "A",
@@ -3871,5 +3871,144 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, QuorumError::NotHolder));
+    }
+
+    #[test]
+    fn reopen_cancelled_provision_exhausted_task() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
+        let _ = claim(&mut c, "A", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+
+        // Park with provision-exhausted body.
+        update(
+            &mut c,
+            "A",
+            id,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some(
+                    "daemon:provision-exhausted | PR #99 | reviewer provision failed 3 time(s)",
+                ),
+                refs: None,
+                verdict: None,
+            },
+            1001,
+        )
+        .unwrap();
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "cancelled");
+
+        // Creator can reopen.
+        let t = update(
+            &mut c,
+            "boss",
+            id,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+    }
+
+    #[test]
+    fn reopen_daemon_parked_dep_chain_survives() {
+        let (_d, mut c) = open_tmp();
+        // Create parent task and a dependent.
+        let parent = create(&mut c, "boss", "parent", None, 0, None, None, None, 1000).unwrap();
+        let deps = format!("[{parent}]");
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&deps),
+            1000,
+        )
+        .unwrap();
+
+        // Child should be blocked (parent not closed).
+        let ct = get(&c, child).unwrap().unwrap();
+        assert!(!ct.ready);
+        assert!(claim(&mut c, "X", Some(child), &[], TTL, 1000)
+            .unwrap()
+            .is_none());
+
+        // Claim and daemon-park the parent.
+        let _ = claim(&mut c, "A", Some(parent), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        update(
+            &mut c,
+            "A",
+            parent,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                body: Some("daemon:provision-exhausted | PR #5 | failed 3 time(s)"),
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        // Child still blocked (cancelled dep is unmet).
+        assert!(claim(&mut c, "X", Some(child), &[], TTL, 1003)
+            .unwrap()
+            .is_none());
+
+        // Creator reopens the parked parent.
+        let t = update(
+            &mut c,
+            "boss",
+            parent,
+            &TaskUpdate {
+                status: Some("open"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1004,
+        )
+        .unwrap();
+        assert_eq!(t.status, "open");
+
+        // Drive parent to closed: claim → done → close.
+        let _ = claim(&mut c, "B", Some(parent), &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+        update(
+            &mut c,
+            "B",
+            parent,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1006,
+        )
+        .unwrap();
+        auto_resolve_review(&mut c, parent, "reviewer", "lgtm", 1007).unwrap();
+        let pt = get(&c, parent).unwrap().unwrap();
+        assert_eq!(pt.status, "closed");
+
+        // Child is now ready and claimable.
+        let ct = get(&c, child).unwrap().unwrap();
+        assert!(ct.ready);
+        assert!(claim(&mut c, "X", Some(child), &[], TTL, 1008)
+            .unwrap()
+            .is_some());
     }
 }
