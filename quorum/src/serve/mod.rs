@@ -372,6 +372,35 @@ pub(crate) struct SlotState {
     task_repo: Option<String>,
 }
 
+/// A worker task that has already delivered a PR (`done --pr N`) and is
+/// awaiting review, but does NOT have a live worker child process.
+///
+/// #178: On daemon restart, an awaiting-review-with-PR journal entry is
+/// resurrected as a `PendingReview` rather than a `--resume`d worker slot,
+/// so the daemon provisions a reviewer against the recorded PR instead of
+/// respawning a worker (which would either sit idle burning session context
+/// or, if the resume failed, get reaped and cause task re-execution and
+/// duplicate PRs).
+///
+/// If the reviewer verdict comes back as `changes` (or any rework path), a
+/// `--resume` worker is spawned lazily at that moment from the stored
+/// session_id, and the pending review is promoted to a full `SlotState`.
+pub(crate) struct PendingReview {
+    agent_name: String,
+    task_id: i64,
+    pr: i64,
+    session_id: String,
+    worktree_path: PathBuf,
+    branch: String,
+    rework_count: u32,
+    cost_tokens: i64,
+    cost_usd: f64,
+    agent_state: Option<String>,
+    log_dir: Option<PathBuf>,
+    task_repo: Option<String>,
+    task_started_at: std::time::Instant,
+}
+
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
 fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Option<String> {
     let refspec = format!("refs/heads/{}", base_branch);
@@ -504,6 +533,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let wt_mgr = WorktreeManager::new();
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
+    let mut pending_reviews: Vec<PendingReview> = Vec::new();
     let mut poison_tracker = PoisonTracker::new();
     let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
@@ -529,6 +559,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         &mut name_pool,
         &mut workers,
         &mut reviewers,
+        &mut pending_reviews,
         &mut lifetime_roster,
     )
     .await
@@ -542,7 +573,12 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
 
         // Second signal (or first signal with no in-flight agents): immediate teardown.
-        if sig >= 2 || (sig >= 1 && workers.is_empty() && reviewers.is_empty()) {
+        if sig >= 2
+            || (sig >= 1
+                && workers.is_empty()
+                && reviewers.is_empty()
+                && pending_reviews.is_empty())
+        {
             if sig >= 2 {
                 log("force shutdown (second signal)");
             } else {
@@ -553,6 +589,11 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             }
             for w in workers.drain(..) {
                 teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
+            }
+            // #178: pending reviews left dangling on force-shutdown — release
+            // the task back to open so a future daemon can pick it up cleanly.
+            for p in pending_reviews.drain(..) {
+                teardown_pending_review(&config, &wt_mgr, &mut name_pool, p, "open", None).await;
             }
             return Ok(0);
         }
@@ -597,7 +638,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
 
         // Drain: check timeout and roster empty
         if drain_state.draining {
-            if workers.is_empty() && reviewers.is_empty() {
+            if workers.is_empty() && reviewers.is_empty() && pending_reviews.is_empty() {
                 let exit = drain_state.exit_code();
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
                 log(&format!(
@@ -609,16 +650,22 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             if drain_state.timed_out(config.drain_timeout_secs) {
                 let exit = drain_state.exit_code();
                 log(&format!(
-                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s)",
+                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s), \
+                     {} pending review(s)",
                     config.drain_timeout_secs,
                     workers.len(),
-                    reviewers.len()
+                    reviewers.len(),
+                    pending_reviews.len(),
                 ));
                 for r in reviewers.drain(..) {
                     teardown_reviewer(&config, &wt_mgr, &mut name_pool, r).await;
                 }
                 for w in workers.drain(..) {
                     teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
+                }
+                for p in pending_reviews.drain(..) {
+                    teardown_pending_review(&config, &wt_mgr, &mut name_pool, p, "open", None)
+                        .await;
                 }
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
                 log(&format!("DRAIN: exiting {exit} (sha={sha})"));
@@ -632,6 +679,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             &mut name_pool,
             &mut workers,
             &mut reviewers,
+            &mut pending_reviews,
             &mut poison_tracker,
             &mut reviewer_provision_tracker,
             &mut drain_state,
@@ -652,6 +700,7 @@ async fn tick(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
+    pending_reviews: &mut Vec<PendingReview>,
     poison_tracker: &mut PoisonTracker,
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
@@ -840,6 +889,57 @@ async fn tick(
                                     w.agent_name, w.rework_count
                                 ));
                             }
+                        } else if let Some(pi) = pending_reviews
+                            .iter()
+                            .position(|p| p.task_id == reviewer_task_id)
+                        {
+                            // #178: recovered pending review — spawn --resume worker
+                            // lazily to handle the rework turn.
+                            let pending = pending_reviews.remove(pi);
+                            let next_round = pending.rework_count + 1;
+                            if let Some(max) = config.limits.max_rework_rounds {
+                                if next_round > max {
+                                    let breach = LimitBreached::ReworkRounds {
+                                        count: next_round,
+                                        max,
+                                    };
+                                    log(&format!(
+                                        "WATCHDOG: pending review {} killed (task #{}) — {}",
+                                        pending.agent_name, pending.task_id, breach
+                                    ));
+                                    teardown_pending_review(
+                                        config, wt_mgr, name_pool, pending, "open", None,
+                                    )
+                                    .await;
+                                    if !consume_mailbox_row(&db_path, *id).await {
+                                        break;
+                                    }
+                                    break;
+                                }
+                            }
+                            let rework_msg = format!(
+                                "PR #{pr_num} has conflicts with {} \
+                                 (a sibling PR likely merged first).\n\n\
+                                 Rebase on {}, resolve conflicts, \
+                                 and push again.",
+                                config.base_branch, config.base_branch
+                            );
+                            let rework_turn = reviewer::build_rework_turn(
+                                &pending.agent_name,
+                                pending.task_id,
+                                pr_num,
+                                &rework_msg,
+                            );
+                            spawn_resume_worker_for_pending(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                workers,
+                                pending,
+                                &rework_turn,
+                                next_round,
+                            )
+                            .await?;
                         }
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
@@ -944,6 +1044,52 @@ async fn tick(
                                         w.agent_name, w.rework_count
                                     ));
                                 }
+                            } else if let Some(pi) = pending_reviews
+                                .iter()
+                                .position(|p| p.task_id == reviewer_task_id)
+                            {
+                                let pending = pending_reviews.remove(pi);
+                                let next_round = pending.rework_count + 1;
+                                if let Some(max) = config.limits.max_rework_rounds {
+                                    if next_round > max {
+                                        let breach = LimitBreached::ReworkRounds {
+                                            count: next_round,
+                                            max,
+                                        };
+                                        log(&format!(
+                                            "WATCHDOG: pending review {} killed (task #{}) — {}",
+                                            pending.agent_name, pending.task_id, breach
+                                        ));
+                                        teardown_pending_review(
+                                            config, wt_mgr, name_pool, pending, "open", None,
+                                        )
+                                        .await;
+                                        if !consume_mailbox_row(&db_path, *id).await {
+                                            break;
+                                        }
+                                        break;
+                                    }
+                                }
+                                let rework_msg = format!(
+                                    "CI checks failed for PR #{pr_num}: {names}\n\n\
+                                     Fix the failing checks and push again.",
+                                );
+                                let rework_turn = reviewer::build_rework_turn(
+                                    &pending.agent_name,
+                                    pending.task_id,
+                                    pr_num,
+                                    &rework_msg,
+                                );
+                                spawn_resume_worker_for_pending(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    workers,
+                                    pending,
+                                    &rework_turn,
+                                    next_round,
+                                )
+                                .await?;
                             }
                             if !consume_mailbox_row(&db_path, *id).await {
                                 break;
@@ -976,6 +1122,27 @@ async fn tick(
                                     wt_mgr,
                                     name_pool,
                                     w,
+                                    "cancelled",
+                                    Some(&park_body),
+                                )
+                                .await;
+                            } else if let Some(pi) = pending_reviews
+                                .iter()
+                                .position(|p| p.task_id == reviewer_task_id)
+                            {
+                                let park_body = format!(
+                                    "daemon:merge-blocked | PR #{pr_num} | \
+                                     reviewer={reviewer_name} verdict=approved \
+                                     (task #{reviewer_task_id}) | checks timed out \
+                                     after {}s",
+                                    config.merge_checks_timeout_secs
+                                );
+                                let pending = pending_reviews.remove(pi);
+                                teardown_pending_review(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    pending,
                                     "cancelled",
                                     Some(&park_body),
                                 )
@@ -1015,7 +1182,13 @@ async fn tick(
                                 let task_repo = workers
                                     .iter()
                                     .find(|w| w.task_id == reviewer_task_id)
-                                    .and_then(|w| w.task_repo.as_deref());
+                                    .and_then(|w| w.task_repo.as_deref())
+                                    .or_else(|| {
+                                        pending_reviews
+                                            .iter()
+                                            .find(|p| p.task_id == reviewer_task_id)
+                                            .and_then(|p| p.task_repo.as_deref())
+                                    });
                                 if task_repo == Some(self_repo.as_str()) {
                                     let sha = format!("post-merge-pr-{pr_num}");
                                     drain_state.start_drain(&sha);
@@ -1029,6 +1202,15 @@ async fn tick(
                         {
                             let w = workers.remove(wi);
                             teardown_worker(config, wt_mgr, name_pool, w, "done").await;
+                        } else if let Some(pi) = pending_reviews
+                            .iter()
+                            .position(|p| p.task_id == reviewer_task_id)
+                        {
+                            let pending = pending_reviews.remove(pi);
+                            teardown_pending_review(
+                                config, wt_mgr, name_pool, pending, "done", None,
+                            )
+                            .await;
                         }
                         // #162: auto-resolve the vestigial review task spawned by
                         // teardown_worker("done"). The in-cycle reviewer already
@@ -1096,6 +1278,26 @@ async fn tick(
                                         wt_mgr,
                                         name_pool,
                                         w,
+                                        "cancelled",
+                                        Some(&park_body),
+                                    )
+                                    .await;
+                                } else if let Some(pi) = pending_reviews
+                                    .iter()
+                                    .position(|p| p.task_id == reviewer_task_id)
+                                {
+                                    let park_body = format!(
+                                        "daemon:merge-blocked | PR #{pr_num} | \
+                                         reviewer={reviewer_name} verdict=approved \
+                                         (task #{reviewer_task_id}) | {msg}",
+                                        msg = merge_result.message
+                                    );
+                                    let pending = pending_reviews.remove(pi);
+                                    teardown_pending_review(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        pending,
                                         "cancelled",
                                         Some(&park_body),
                                     )
@@ -1187,6 +1389,55 @@ async fn tick(
                                             w.agent_name, w.rework_count
                                         ));
                                     }
+                                } else if let Some(pi) = pending_reviews
+                                    .iter()
+                                    .position(|p| p.task_id == reviewer_task_id)
+                                {
+                                    let pending = pending_reviews.remove(pi);
+                                    let next_round = pending.rework_count + 1;
+                                    if let Some(max) = config.limits.max_rework_rounds {
+                                        if next_round > max {
+                                            let breach = LimitBreached::ReworkRounds {
+                                                count: next_round,
+                                                max,
+                                            };
+                                            log(&format!(
+                                                "WATCHDOG: pending review {} killed \
+                                                 (task #{}) — {}",
+                                                pending.agent_name, pending.task_id, breach
+                                            ));
+                                            teardown_pending_review(
+                                                config, wt_mgr, name_pool, pending, "open", None,
+                                            )
+                                            .await;
+                                            if !consume_mailbox_row(&db_path, *id).await {
+                                                break;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    let rework_msg = format!(
+                                        "Merge of PR #{pr_num} failed: {}\n\n\
+                                         Rebase on {}, resolve any conflicts, \
+                                         and push again.",
+                                        merge_result.message, config.base_branch
+                                    );
+                                    let rework_turn = reviewer::build_rework_turn(
+                                        &pending.agent_name,
+                                        pending.task_id,
+                                        pr_num,
+                                        &rework_msg,
+                                    );
+                                    spawn_resume_worker_for_pending(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        workers,
+                                        pending,
+                                        &rework_turn,
+                                        next_round,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -1263,6 +1514,51 @@ async fn tick(
                                 w.agent_name, w.rework_count
                             ));
                         }
+                    } else if let Some(pi) = pending_reviews
+                        .iter()
+                        .position(|p| p.task_id == reviewer_task_id)
+                    {
+                        // #178: recovered pending review — spawn --resume worker
+                        // lazily to receive the "changes" rework turn.
+                        let pending = pending_reviews.remove(pi);
+                        let next_round = pending.rework_count + 1;
+                        if let Some(max) = config.limits.max_rework_rounds {
+                            if next_round > max {
+                                let breach = LimitBreached::ReworkRounds {
+                                    count: next_round,
+                                    max,
+                                };
+                                log(&format!(
+                                    "WATCHDOG: pending review {} killed (task #{}) — {}",
+                                    pending.agent_name, pending.task_id, breach
+                                ));
+                                teardown_pending_review(
+                                    config, wt_mgr, name_pool, pending, "open", None,
+                                )
+                                .await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                break;
+                            }
+                        }
+                        let rework_pr = pending.pr;
+                        let rework_turn = reviewer::build_rework_turn(
+                            &pending.agent_name,
+                            pending.task_id,
+                            rework_pr,
+                            feedback,
+                        );
+                        spawn_resume_worker_for_pending(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            workers,
+                            pending,
+                            &rework_turn,
+                            next_round,
+                        )
+                        .await?;
                     }
                 }
                 _ => {
@@ -1295,6 +1591,27 @@ async fn tick(
 
             if let Some(pr) = row.pr {
                 workers[wi].pr = Some(pr);
+                // #178: persist PR to journal so a restart resumes at the
+                // review stage instead of re-executing the task from
+                // scratch. Without this, a daemon crash between `done` and
+                // reviewer provisioning loses the pipeline position and
+                // duplicate PRs get produced. Do this BEFORE the "ready
+                // for review" log so tests / operators can rely on the log
+                // as evidence that the pipeline position is durable.
+                let p = db_path.clone();
+                let entry = slot_journal_entry(
+                    &workers[wi],
+                    "worker",
+                    "awaiting-review",
+                    &config.instance_id,
+                );
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    journal::upsert(&mut conn, &entry)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok();
                 log(&format!(
                     "worker {} PR #{} ready for review",
                     workers[wi].agent_name, pr
@@ -1427,6 +1744,26 @@ async fn tick(
                 r.agent_name
             ));
             teardown_reviewer(config, wt_mgr, name_pool, r).await;
+        }
+
+        // #178: pending_reviews without a paired reviewer are idle by
+        // definition; during drain no new reviewers will be provisioned.
+        // Release the task back to `open` so a future daemon picks up at
+        // the review stage on restart. (If a reviewer IS paired, wait for
+        // its verdict — that path drains normally through the reviewer.)
+        let mut drain_pending: Vec<usize> = Vec::new();
+        for (i, p) in pending_reviews.iter().enumerate() {
+            if !reviewers.iter().any(|r| r.task_id == p.task_id) {
+                drain_pending.push(i);
+            }
+        }
+        for &i in drain_pending.iter().rev() {
+            let p = pending_reviews.remove(i);
+            log(&format!(
+                "DRAIN: releasing pending review {} (task #{})",
+                p.agent_name, p.task_id
+            ));
+            teardown_pending_review(config, wt_mgr, name_pool, p, "open", None).await;
         }
     }
 
@@ -1571,8 +1908,12 @@ async fn tick(
     // Each worker that has a PR and no paired reviewer (and is not draining)
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
     // Skip during drain — no new work, let existing agents finish.
+    //
+    // #178: `pending_reviews` (restart-resurrected awaiting-review slots
+    // with no live worker process) are also eligible — Phase 5 provisions
+    // reviewers for them the same way as for live workers.
     if !drain_state.draining {
-        let needs_reviewer: Vec<(i64, i64, usize)> = workers
+        let needs_reviewer_from_workers: Vec<(i64, i64, usize)> = workers
             .iter()
             .enumerate()
             .filter_map(|(i, w)| {
@@ -1585,7 +1926,7 @@ async fn tick(
             })
             .collect();
         let mut parked_workers: Vec<usize> = Vec::new();
-        for (pr, task_id, wi) in &needs_reviewer {
+        for (pr, task_id, wi) in &needs_reviewer_from_workers {
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "reviewer provision exhausted for task #{task_id} PR #{pr} \
@@ -1594,6 +1935,7 @@ async fn tick(
                 parked_workers.push(*wi);
                 continue;
             }
+            let counterpart: ReviewCounterpart = (&workers[*wi]).into();
             spawn_reviewer_for_worker(
                 config,
                 wt_mgr,
@@ -1602,7 +1944,7 @@ async fn tick(
                 reviewer_provision_tracker,
                 lifetime_roster,
                 *pr,
-                &workers[*wi],
+                counterpart,
             )
             .await?;
         }
@@ -1622,12 +1964,70 @@ async fn tick(
             )
             .await;
         }
+
+        // Provision reviewers for restart-recovered pending reviews (#178).
+        let needs_reviewer_from_pending: Vec<(i64, i64, usize)> = pending_reviews
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                if !reviewers.iter().any(|r| r.task_id == p.task_id) {
+                    Some((p.pr, p.task_id, i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut parked_pending: Vec<usize> = Vec::new();
+        for (pr, task_id, pi) in &needs_reviewer_from_pending {
+            if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
+                log(&format!(
+                    "reviewer provision exhausted for task #{task_id} PR #{pr} \
+                     — parking pending review"
+                ));
+                parked_pending.push(*pi);
+                continue;
+            }
+            let counterpart: ReviewCounterpart = (&pending_reviews[*pi]).into();
+            spawn_reviewer_for_worker(
+                config,
+                wt_mgr,
+                name_pool,
+                reviewers,
+                reviewer_provision_tracker,
+                lifetime_roster,
+                *pr,
+                counterpart,
+            )
+            .await?;
+        }
+        for &pi in parked_pending.iter().rev() {
+            let p = pending_reviews.remove(pi);
+            let pr = p.pr;
+            teardown_pending_review(
+                config,
+                wt_mgr,
+                name_pool,
+                p,
+                "cancelled",
+                Some(&format!(
+                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
+                     time(s) for PR #{pr} — parking task"
+                )),
+            )
+            .await;
+        }
     }
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
     // not consume worker capacity (F16).
     // Skip during drain — no new tasks, let existing agents finish.
+    //
+    // #178: pending_reviews (restart-recovered awaiting-review slots) are
+    // passed in so their task_ids are excluded from claimable tasks — a
+    // task whose lease was reaped to `open` while the daemon was down
+    // must NOT be re-claimed by a fresh worker if a pending review is
+    // handling it (would cause duplicate PRs, the very bug #178 fixes).
     if !drain_state.draining {
         while workers.len() < config.cap {
             if !spawn_worker(
@@ -1635,6 +2035,7 @@ async fn tick(
                 wt_mgr,
                 name_pool,
                 workers,
+                pending_reviews,
                 poison_tracker,
                 repo_filter_logged,
                 lifetime_roster,
@@ -1888,6 +2289,38 @@ async fn drain_events(
     Ok(None)
 }
 
+/// A minimal view of the reviewer's counterpart — the agent whose PR is
+/// under review. Works for both a live worker `SlotState` and a
+/// `PendingReview` recovered from journal.
+struct ReviewCounterpart<'a> {
+    agent_name: &'a str,
+    task_id: i64,
+    branch: &'a str,
+    task_repo: Option<&'a str>,
+}
+
+impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
+    fn from(w: &'a SlotState) -> Self {
+        Self {
+            agent_name: &w.agent_name,
+            task_id: w.task_id,
+            branch: &w.branch,
+            task_repo: w.task_repo.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a PendingReview> for ReviewCounterpart<'a> {
+    fn from(p: &'a PendingReview) -> Self {
+        Self {
+            agent_name: &p.agent_name,
+            task_id: p.task_id,
+            branch: &p.branch,
+            task_repo: p.task_repo.as_deref(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_reviewer_for_worker(
     config: &ServeConfig,
@@ -1897,7 +2330,7 @@ async fn spawn_reviewer_for_worker(
     provision_tracker: &mut ReviewerProvisionTracker,
     lifetime_roster: &mut LifetimeRoster,
     pr: i64,
-    worker: &SlotState,
+    worker: ReviewCounterpart<'_>,
 ) -> Result<()> {
     let acquire_result = name_pool.acquire();
     if acquire_result.is_generated() && name_pool.has_file() {
@@ -1945,9 +2378,9 @@ async fn spawn_reviewer_for_worker(
     // branch lives on the task's repo remote, not necessarily config.repo_dir.
     // #162: if the worker's branch fails, fall back to the PR's actual head
     // ref from GitHub (covers review tasks where the worker never pushed).
-    let task_repo_dir = resolve_repo_dir(config, worker.task_repo.as_deref());
+    let task_repo_dir = resolve_repo_dir(config, worker.task_repo);
     let provision_result = wt_mgr
-        .fetch_and_provision(task_repo_dir, &branch, &wt_path, &worker.branch)
+        .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
         .await;
     let provision_ok = match provision_result {
         Ok(_) => true,
@@ -1960,7 +2393,7 @@ async fn spawn_reviewer_for_worker(
             ));
             let pr_num = pr;
             let repo_dir_for_gh = task_repo_dir.to_path_buf();
-            let gh_repo = worker.task_repo.clone();
+            let gh_repo = worker.task_repo.map(String::from);
             let fallback_ref = tokio::task::spawn_blocking(move || {
                 query_pr_head_ref(pr_num, &repo_dir_for_gh, gh_repo.as_deref())
             })
@@ -1968,7 +2401,7 @@ async fn spawn_reviewer_for_worker(
             .ok()
             .flatten();
             if let Some(ref head_ref) = fallback_ref {
-                if head_ref != &worker.branch {
+                if head_ref != worker.branch {
                     log(&format!(
                         "PR #{pr} head ref from GitHub: '{head_ref}' (worker branch: '{}')",
                         worker.branch
@@ -2061,7 +2494,7 @@ async fn spawn_reviewer_for_worker(
 
     let spec = reviewer::ReviewerSpec {
         pr,
-        worker_agent: worker.agent_name.clone(),
+        worker_agent: worker.agent_name.to_string(),
         reviewer_name: reviewer_name.clone(),
     };
 
@@ -2145,7 +2578,7 @@ async fn spawn_reviewer_for_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: reviewer_session_log,
-                task_repo: worker.task_repo.clone(),
+                task_repo: worker.task_repo.map(String::from),
             });
         }
         Err(e) => {
@@ -2194,6 +2627,7 @@ async fn spawn_worker(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
+    pending_reviews: &[PendingReview],
     poison_tracker: &mut PoisonTracker,
     repo_filter_logged: &mut std::collections::HashSet<i64>,
     lifetime_roster: &mut LifetimeRoster,
@@ -2201,7 +2635,8 @@ async fn spawn_worker(
     let db_path = config.db_path.clone();
     let p = db_path.clone();
 
-    let in_flight: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+    let mut in_flight: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+    in_flight.extend(pending_reviews.iter().map(|p| p.task_id));
     let poisoned: Vec<i64> = poison_tracker
         .strikes
         .iter()
@@ -2627,6 +3062,181 @@ async fn teardown_reviewer(
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
+}
+
+/// Tear down a pending review (no live process): update task status, delete
+/// journal, remove worktree/branch, release the name. Mirrors
+/// `teardown_worker` but skips the process kill (there's no proc).
+async fn teardown_pending_review(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    state: PendingReview,
+    task_status: &str,
+    body: Option<&str>,
+) {
+    log(&format!(
+        "tearing down pending review for {} (task #{} -> {task_status})",
+        state.agent_name, state.task_id
+    ));
+
+    let p = config.db_path.clone();
+    let agent = state.agent_name.clone();
+    let task_id = state.task_id;
+    let status = task_status.to_string();
+    let body_owned = body.map(|s| s.to_string());
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let fields = tasks::TaskUpdate {
+            status: Some(&status),
+            body: body_owned.as_deref(),
+            refs: None,
+            verdict: None,
+        };
+        tasks::update(&mut conn, &agent, task_id, &fields, now)?;
+        journal::delete(&mut conn, &agent)?;
+        Ok(())
+    })
+    .await
+    .ok();
+
+    wt_mgr
+        .remove(&config.repo_dir, &state.worktree_path)
+        .await
+        .ok();
+    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
+
+    name_pool.release(&state.agent_name);
+    log(&format!(
+        "pending review for {} torn down",
+        state.agent_name
+    ));
+}
+
+/// Spawn a `--resume` worker from a `PendingReview` and feed it a rework
+/// turn, promoting the pending review into a live `SlotState` in `workers`.
+///
+/// #178: used when a reviewer verdict requires the worker to do more work
+/// (changes / conflict rework / checks failure / retryable merge failure)
+/// but the daemon restarted and no worker process is currently alive for
+/// this task. The session_id from the pending review is what `--resume`
+/// picks up, preserving the worker's original context.
+///
+/// Returns `Ok(true)` on success (pending removed, worker pushed). Returns
+/// `Ok(false)` if spawn or feed_turn failed — the pending review is torn
+/// down with the task released back to `open` so it can be retried.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_resume_worker_for_pending(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    pending: PendingReview,
+    rework_turn: &str,
+    new_rework_count: u32,
+) -> Result<bool> {
+    log(&format!(
+        "spawning --resume worker for pending review {} (task #{}, session {})",
+        pending.agent_name, pending.task_id, pending.session_id
+    ));
+
+    let spec = AgentSpec {
+        model: config.model.clone(),
+        effort: config.effort.clone(),
+        session_id: pending.session_id.clone(),
+        worktree: pending.worktree_path.clone(),
+        bare: config.bare_agent,
+        resume: true,
+    };
+
+    let mut proc = match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            log(&format!(
+                "resume-worker spawn failed for pending {} (task #{}): {e} — \
+                 releasing task",
+                pending.agent_name, pending.task_id
+            ));
+            teardown_pending_review(config, wt_mgr, name_pool, pending, "open", None).await;
+            return Ok(false);
+        }
+    };
+
+    if let Err(e) = proc.feed_turn(rework_turn).await {
+        log(&format!(
+            "resume-worker feed_turn failed for pending {} (task #{}): {e} — \
+             releasing task",
+            pending.agent_name, pending.task_id
+        ));
+        proc.kill_and_reap().await;
+        teardown_pending_review(config, wt_mgr, name_pool, pending, "open", None).await;
+        return Ok(false);
+    }
+
+    // Reopen the session log if we have one
+    let session_log = pending
+        .log_dir
+        .as_ref()
+        .and_then(|ld| session_log::SessionLog::reopen(ld).ok());
+
+    let now_instant = std::time::Instant::now();
+    let mut slot = SlotState {
+        agent_name: pending.agent_name.clone(),
+        proc,
+        task_id: pending.task_id,
+        session_id: pending.session_id.clone(),
+        worktree_path: pending.worktree_path.clone(),
+        branch: pending.branch.clone(),
+        draining: true,
+        pr: None,
+        rework_count: new_rework_count,
+        cost_tokens: pending.cost_tokens,
+        cost_usd: pending.cost_usd,
+        task_started_at: pending.task_started_at,
+        turn_started_at: now_instant,
+        agent_state: pending.agent_state.clone(),
+        session_log,
+        task_repo: pending.task_repo.clone(),
+    };
+
+    if let Some(ref mut sl) = slot.session_log {
+        sl.log_rework(slot.rework_count);
+    }
+
+    // Persist journal update to reflect worker is back at working phase.
+    let p = config.db_path.clone();
+    let pid = slot.proc.pid();
+    let entry = JournalEntry {
+        agent: slot.agent_name.clone(),
+        role: "worker".into(),
+        task_id: Some(slot.task_id),
+        session_id: slot.session_id.clone(),
+        worktree: Some(slot.worktree_path.to_string_lossy().into()),
+        branch: Some(slot.branch.clone()),
+        phase: "working".into(),
+        cost_tokens: slot.cost_tokens,
+        agent_state: slot.agent_state.clone(),
+        cost_usd: slot.cost_usd,
+        log_dir: slot
+            .session_log
+            .as_ref()
+            .map(|l| l.dir().to_string_lossy().into()),
+        pid,
+        pr: None,
+        rework_count: slot.rework_count as i32,
+        instance_id: Some(config.instance_id.clone()),
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+    .ok();
+
+    workers.push(slot);
+    Ok(true)
 }
 
 #[cfg(test)]
