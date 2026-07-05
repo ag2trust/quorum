@@ -70,7 +70,7 @@ fn watch_status(online_window: i64) -> Result<()> {
         let conn = quorum_core::db::open(&paths::db_path()?)?;
         let s = quorum_core::stats::stats(&conn, now, online_window)?;
         drop(conn); // close before sleeping; do not hold across ticks
-        print!("\x1b[2J\x1b[H");
+        print!("\x1b[H\x1b[J");
         cockpit::render(&s);
         std::io::Write::flush(&mut std::io::stdout()).ok();
         std::thread::sleep(std::time::Duration::from_millis(1500));

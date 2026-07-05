@@ -402,40 +402,6 @@ fn pipeline_state(p: &PipelineTask, in_review: bool, sty: &Style) -> (String, St
         };
         return (icon, "in review".to_string());
     }
-    if p.blocked {
-        let icon = if sty.color {
-            "⛔".to_string()
-        } else {
-            "[blocked]".to_string()
-        };
-        return (icon, "blocked".to_string());
-    }
-    if p.status == "open" {
-        let claimed = false; // open tasks in pipeline — could check assignee
-        if claimed {
-            let icon = if sty.color {
-                "◐".to_string()
-            } else {
-                "[claimed]".to_string()
-            };
-            return (icon, "claimed".to_string());
-        }
-        let icon = if sty.color {
-            "○".to_string()
-        } else {
-            "[ ]".to_string()
-        };
-        return (icon, "open".to_string());
-    }
-    if p.status == "parked" {
-        let icon = if sty.color {
-            "⏸".to_string()
-        } else {
-            "[parked]".to_string()
-        };
-        return (icon, "parked".to_string());
-    }
-    // Fallback for any other status (e.g. claimed tasks are status=open+assignee)
     let icon = if sty.color {
         "◐".to_string()
     } else {
@@ -617,26 +583,6 @@ mod tests {
         assert_eq!(icon, "[merged]");
         assert_eq!(label, "merged");
 
-        let open = PipelineTask {
-            id: 2,
-            title: "t".into(),
-            status: "open".into(),
-            pr: None,
-            blocked: false,
-        };
-        let (icon, _) = pipeline_state(&open, false, &sty);
-        assert_eq!(icon, "[ ]");
-
-        let blocked = PipelineTask {
-            id: 3,
-            title: "t".into(),
-            status: "open".into(),
-            pr: None,
-            blocked: true,
-        };
-        let (icon, _) = pipeline_state(&blocked, false, &sty);
-        assert_eq!(icon, "[blocked]");
-
         let in_review = PipelineTask {
             id: 4,
             title: "t".into(),
@@ -646,6 +592,17 @@ mod tests {
         };
         let (icon, _) = pipeline_state(&in_review, true, &sty);
         assert_eq!(icon, "[review]");
+
+        let done_no_reviewer = PipelineTask {
+            id: 5,
+            title: "t".into(),
+            status: "done".into(),
+            pr: Some(99),
+            blocked: false,
+        };
+        let (icon, label) = pipeline_state(&done_no_reviewer, false, &sty);
+        assert_eq!(icon, "[review]");
+        assert_eq!(label, "in review");
     }
 
     #[test]

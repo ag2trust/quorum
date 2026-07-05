@@ -184,7 +184,7 @@ pub struct QueueTask {
     pub pr: Option<i64>,
 }
 
-/// Task pipeline row: every non-closed task + tasks closed/merged in the last hour (#204).
+/// Task pipeline row: `done` (awaiting review) + tasks closed/merged in the last hour (#204).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct PipelineTask {
     pub id: i64,
@@ -920,12 +920,13 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
     v.get("pr")?.as_i64()
 }
 
-/// Task pipeline view: all non-closed tasks + tasks closed in the last hour (#204).
+/// Task pipeline view: tasks in active lifecycle stages + recently closed (#204).
+/// Excludes `open` (already in QUEUE/BLOCKED), `cancelled`, and `parked`.
 fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let hour_ago = now - 3600;
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs, depends_on FROM tasks
-         WHERE status != 'closed'
+         WHERE status = 'done'
          UNION ALL
          SELECT id, title, status, refs, depends_on FROM tasks
          WHERE status = 'closed' AND updated_at > ?1
@@ -943,19 +944,14 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut result = Vec::new();
-    for (id, title, status, refs, depends_on) in rows {
+    for (id, title, status, refs, _depends_on) in rows {
         let pr = extract_pr_from_refs(refs.as_deref());
-        let blocked = if status == "open" {
-            !crate::tasks::compute_ready(conn, &depends_on)?
-        } else {
-            false
-        };
         result.push(PipelineTask {
             id,
             title,
             status,
             pr,
-            blocked,
+            blocked: false,
         });
     }
     Ok(result)
