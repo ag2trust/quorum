@@ -484,6 +484,34 @@ impl DrainState {
     }
 }
 
+/// How the tick loop should react to an error returned by [`tick`].
+///
+/// Most tick errors are transient (a lost claim race, a momentary `SQLITE_BUSY`) and the
+/// loop should log and retry on the next tick. But [`QuorumError::SchemaTooNew`] means the
+/// on-disk DB was migrated by a *newer* binary than the one running: retrying can never
+/// succeed, because this binary fundamentally cannot read the schema. Left unhandled it
+/// live-locks — the daemon ticks forever, logging `tick error: db schema version N is
+/// newer than this binary (M)` and doing no work.
+///
+/// The only recovery is to exit with [`EXIT_SELF_UPDATE`] so `serve-supervisor.sh` fetches,
+/// rebuilds, and relaunches on a current binary. This reuses the self-update exit path but
+/// skips the graceful worker drain (teardown writes to the DB, which would also fail against
+/// a too-new schema); in-flight workers are re-adopted from the journal on restart.
+#[derive(Debug, PartialEq, Eq)]
+enum TickErrorAction {
+    /// Transient — log and continue to the next tick.
+    Continue,
+    /// Unrecoverable binary/schema mismatch — exit so the supervisor rebuilds.
+    ExitSelfUpdate,
+}
+
+fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
+    match e {
+        QuorumError::SchemaTooNew { .. } => TickErrorAction::ExitSelfUpdate,
+        _ => TickErrorAction::Continue,
+    }
+}
+
 async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -720,7 +748,17 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         )
         .await
         {
-            log(&format!("tick error: {e}"));
+            match classify_tick_error(&e) {
+                TickErrorAction::ExitSelfUpdate => {
+                    log(&format!(
+                        "SCHEMA: {e} — this binary is outdated relative to the on-disk \
+                         schema; exiting {EXIT_SELF_UPDATE} so the supervisor rebuilds and \
+                         relaunches on a current binary"
+                    ));
+                    return Ok(EXIT_SELF_UPDATE);
+                }
+                TickErrorAction::Continue => log(&format!("tick error: {e}")),
+            }
         }
     }
 }
@@ -3838,6 +3876,33 @@ mod tests {
     #[test]
     fn exit_self_update_is_75() {
         assert_eq!(EXIT_SELF_UPDATE, 75);
+    }
+
+    // ── Tick error classification (schema-too-new self-update) ───────────
+
+    #[test]
+    fn schema_too_new_tick_error_exits_for_self_update() {
+        // A newer binary migrated the DB past what this binary understands. Retrying can
+        // never succeed — the loop must exit 75 so the supervisor rebuilds/relaunches.
+        let e = QuorumError::SchemaTooNew { db: 17, bin: 16 };
+        assert_eq!(classify_tick_error(&e), TickErrorAction::ExitSelfUpdate);
+    }
+
+    #[test]
+    fn transient_tick_errors_continue() {
+        // Everything that can plausibly succeed on a later tick must NOT exit the loop.
+        assert_eq!(
+            classify_tick_error(&QuorumError::Busy),
+            TickErrorAction::Continue
+        );
+        assert_eq!(
+            classify_tick_error(&QuorumError::NotHolder),
+            TickErrorAction::Continue
+        );
+        assert_eq!(
+            classify_tick_error(&QuorumError::Io("transient".into())),
+            TickErrorAction::Continue
+        );
     }
 
     // ── ReviewerProvisionTracker tests (#162) ────────────────────────────
