@@ -936,10 +936,11 @@ async fn tick(
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
                                 let park_body = format!(
-                                    "daemon:merge-blocked | PR #{pr_num} | \
+                                    "{}merge-blocked | PR #{pr_num} | \
                                      reviewer={reviewer_name} verdict=approved \
                                      (task #{reviewer_task_id}) | checks timed out \
                                      after {}s",
+                                    tasks::PARKED_BODY_PREFIX,
                                     config.merge_checks_timeout_secs
                                 );
                                 let w = workers.remove(wi);
@@ -1057,9 +1058,10 @@ async fn tick(
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
                                     let park_body = format!(
-                                        "daemon:merge-blocked | PR #{pr_num} | \
+                                        "{}merge-blocked | PR #{pr_num} | \
                                          reviewer={reviewer_name} verdict=approved \
                                          (task #{reviewer_task_id}) | {msg}",
+                                        tasks::PARKED_BODY_PREFIX,
                                         msg = merge_result.message
                                     );
                                     let w = workers.remove(wi);
@@ -1578,8 +1580,9 @@ async fn tick(
                 w,
                 "cancelled",
                 Some(&format!(
-                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
-                     time(s) for PR #{pr} — parking task"
+                    "{}provision-exhausted | PR #{pr} | \
+                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
+                    tasks::PARKED_BODY_PREFIX
                 )),
             )
             .await;

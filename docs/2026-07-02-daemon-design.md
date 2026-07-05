@@ -159,7 +159,7 @@ The daemon is the sole merge authority. On `verdict=approved`:
    - **Retryable** (merge conflict, branch behind base): reviewer killed, rework
      feedback sent to the warm worker ("Rebase on main, resolve any conflicts").
    - **PolicyBlocked** (base branch policy, auth failure, infra): both agents
-     killed, task parked as `cancelled` with a `daemon:merge-blocked` body
+     killed, task parked as `cancelled` with a `daemon:parked:merge-blocked` body
      preserving the reviewer verdict. No rework turn, no re-claim loop.
 
 ## Mailbox contract
