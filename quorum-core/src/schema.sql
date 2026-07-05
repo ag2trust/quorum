@@ -225,8 +225,17 @@ CREATE TABLE IF NOT EXISTS journal (
     pr              INTEGER,
     -- M7 crash recovery: rework round counter for limit enforcement across restarts.
     rework_count    INTEGER NOT NULL DEFAULT 0,
+    -- #190 instance scoping: identifies the daemon instance that owns this entry so
+    -- crash recovery in a sibling instance never kills/reclaims another daemon's live
+    -- workers or agent names. Derived from the daemon's canonical worktree_base path.
+    -- NULL only on pre-v16 rows written by an older binary (transitional — recovery
+    -- adopts NULL rows whose worktree lives under our worktree_base).
+    instance_id     TEXT,
     updated_at      INTEGER NOT NULL
 );
+-- Note: the instance_id index is created in the v16 migration branch, not here,
+-- because SCHEMA_SQL runs BEFORE the ALTER TABLE that adds the column on an
+-- upgrading v15 DB; CREATE INDEX on a not-yet-present column would fail.
 
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).

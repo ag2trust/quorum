@@ -1505,6 +1505,7 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                instance_id: Some("/tmp/wt".into()),
             },
         )
         .unwrap();
@@ -1525,6 +1526,7 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                instance_id: Some("/tmp/wt".into()),
             },
         )
         .unwrap();

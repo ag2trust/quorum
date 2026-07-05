@@ -1,12 +1,15 @@
 //! M7 crash recovery: journal-driven resurrection on daemon restart.
 //!
-//! On startup, reads `list_in_flight()` from the journal. For each entry:
+//! On startup, reads `list_in_flight_for_instance()` from the journal
+//! (#190: SCOPED to this daemon's `instance_id` so recovery never touches a
+//! sibling daemon's live workers, names, or roster). For each entry:
 //! - Kills any stale process group (best-effort, via stored PID)
 //! - Reclaims the agent name in the pool
 //! - Workers: resumes via `claude --resume <session_id>`, feeds a resume turn
 //! - Reviewers: tears down (ephemeral — Phase 5 respawns fresh ones)
 //!
 //! Orphaned worktrees (present on disk but absent from journal) are GC'd.
+//! GC is naturally scoped: it only scans this instance's `worktree_base`.
 
 use super::agent::{AgentProc, AgentSpec};
 use super::names::Pool;
@@ -66,11 +69,27 @@ pub(crate) async fn recover(
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
+    let instance_id = config.instance_id.clone();
+    let worktree_base = config.worktree_base.to_string_lossy().into_owned();
+    // #190: filter to THIS instance's rows so recovery never kills/reclaims a
+    // sibling daemon's live workers or hijacks their names.
+    //
+    // First adopt any NULL-instance rows whose worktree lives under our
+    // worktree_base — this handles the v15→v16 upgrade transition. The prefix
+    // bound ensures we can NEVER adopt a sibling's rows even during migration.
     let entries = {
         let p = db_path.clone();
+        let iid = instance_id.clone();
+        let wb = worktree_base.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<JournalEntry>> {
-            let conn = quorum_core::db::open(&p)?;
-            journal::list_in_flight(&conn)
+            let mut conn = quorum_core::db::open(&p)?;
+            let adopted = journal::adopt_null_instance_rows(&mut conn, &iid, &wb)?;
+            if adopted > 0 {
+                super::log(&format!(
+                    "recovery: adopted {adopted} pre-v16 journal row(s) under {wb}"
+                ));
+            }
+            journal::list_in_flight_for_instance(&conn, &iid)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
@@ -81,8 +100,9 @@ pub(crate) async fn recover(
     }
 
     log(&format!(
-        "recovery: found {} in-flight journal entries",
-        entries.len()
+        "recovery: found {} in-flight journal entries for instance {}",
+        entries.len(),
+        instance_id,
     ));
 
     // Phase 1: Kill stale process groups
@@ -437,6 +457,7 @@ mod tests {
             pid: Some(12345),
             pr: Some(10),
             rework_count: 1,
+            instance_id: Some("/tmp/wt".into()),
         }
     }
 
@@ -475,5 +496,61 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         let content = parsed["message"]["content"].as_str().unwrap();
         assert!(content.contains("custom-phase"));
+    }
+
+    /// #190 acceptance: when a daemon runs recovery, it MUST NOT even see
+    /// journal rows owned by a sibling instance. This is enforced at the SQL
+    /// filter (list_in_flight_for_instance) — so verify at the recovery-entry
+    /// layer that a sibling's row simply doesn't show up.
+    #[test]
+    fn recovery_sees_only_own_instance_rows() {
+        use quorum_core::db;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+
+        // Sibling instance's live worker — under a DIFFERENT worktree_base.
+        let mut sibling = sample_entry("Fathom-d13", "worker", "working");
+        sibling.instance_id = Some("/tmp/wt-sibling".into());
+        sibling.worktree = Some("/tmp/wt-sibling/task-64".into());
+        sibling.pid = Some(999_991); // fake PID we assert never gets killpg'd
+        journal::upsert(&mut conn, &sibling).unwrap();
+
+        // Our instance's own row.
+        let mut ours = sample_entry("Skiff-d15", "worker", "working");
+        ours.instance_id = Some("/tmp/wt-ours".into());
+        ours.worktree = Some("/tmp/wt-ours/task-78".into());
+        journal::upsert(&mut conn, &ours).unwrap();
+
+        // A stray NULL row that lives OUTSIDE our worktree_base — must NOT be
+        // adopted by us (that would recreate the #190 bug during migration).
+        let mut foreign_null = sample_entry("Ghost", "worker", "working");
+        foreign_null.instance_id = None;
+        foreign_null.worktree = Some("/tmp/wt-sibling/task-orphan".into());
+        journal::upsert(&mut conn, &foreign_null).unwrap();
+
+        let adopted =
+            journal::adopt_null_instance_rows(&mut conn, "/tmp/wt-ours", "/tmp/wt-ours").unwrap();
+        assert_eq!(adopted, 0, "sibling-base NULL row must not be adopted");
+
+        let for_us = journal::list_in_flight_for_instance(&conn, "/tmp/wt-ours").unwrap();
+        assert_eq!(
+            for_us.len(),
+            1,
+            "recovery must see only OUR row; got {:?}",
+            for_us.iter().map(|e| &e.agent).collect::<Vec<_>>()
+        );
+        assert_eq!(for_us[0].agent, "Skiff-d15");
+
+        // Sibling row is still there, still stamped with sibling's identity.
+        let all = journal::list_in_flight(&conn).unwrap();
+        let sib = all.iter().find(|e| e.agent == "Fathom-d13").unwrap();
+        assert_eq!(sib.instance_id.as_deref(), Some("/tmp/wt-sibling"));
+        assert_eq!(sib.pid, Some(999_991));
+
+        // Foreign NULL row is still NULL — not stolen by us.
+        let ghost = all.iter().find(|e| e.agent == "Ghost").unwrap();
+        assert!(ghost.instance_id.is_none());
     }
 }

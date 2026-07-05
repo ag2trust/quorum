@@ -1082,11 +1082,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         Some((key.to_string(), std::path::PathBuf::from(val)))
                     })
                     .collect();
+            let worktree_base_path = std::path::PathBuf::from(worktree_base);
+            let instance_id = serve::derive_instance_id(&worktree_base_path);
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
                 repo_dir: std::path::PathBuf::from(repo_dir),
-                worktree_base: std::path::PathBuf::from(worktree_base),
+                worktree_base: worktree_base_path,
                 names_file: names_file.map(std::path::PathBuf::from),
                 agent_bin,
                 model,
@@ -1104,6 +1106,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 only_repo,
                 repo_dir_map: parsed_repo_dir_map,
                 base_branch,
+                instance_id,
             };
             Ok(serve::run_serve(config)?)
         }
