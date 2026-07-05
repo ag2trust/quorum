@@ -459,7 +459,12 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
 
     let mut name_pool = match &config.names_file {
         Some(path) => {
-            Pool::load(path, config.cap).map_err(|e| QuorumError::Io(format!("names pool: {e}")))?
+            let (pool, warning) = Pool::load(path, config.cap)
+                .map_err(|e| QuorumError::Io(format!("names pool: {e}")))?;
+            if let Some(msg) = warning {
+                log(&format!("WARNING: {msg}"));
+            }
+            pool
         }
         None => {
             log("no names file provided — using auto-generated names");

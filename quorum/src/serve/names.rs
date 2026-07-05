@@ -51,7 +51,7 @@ impl Pool {
         }
     }
 
-    pub fn load(path: &Path, cap: usize) -> Result<Self, String> {
+    pub fn load(path: &Path, cap: usize) -> Result<(Self, Option<String>), String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read names file {}: {e}", path.display()))?;
 
@@ -61,19 +61,32 @@ impl Pool {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect();
 
-        let required = 2 * cap + 1;
-        if names.len() < required {
+        if names.is_empty() {
             return Err(format!(
-                "names file has {} names, need >2*cap ({required}) for cap={cap}",
-                names.len()
+                "names file {} is empty (no non-blank, non-comment lines)",
+                path.display()
             ));
         }
 
-        Ok(Self {
-            available: names,
-            in_use: HashSet::new(),
-            has_file: true,
-        })
+        let required = 2 * cap + 1;
+        let warning = if names.len() < required {
+            let deficit = required - names.len();
+            Some(format!(
+                "names file has {} names, need {} for cap={cap} — {} will be auto-generated on demand",
+                names.len(), required, deficit
+            ))
+        } else {
+            None
+        };
+
+        Ok((
+            Self {
+                available: names,
+                in_use: HashSet::new(),
+                has_file: true,
+            },
+            warning,
+        ))
     }
 
     pub fn acquire(&mut self) -> AcquireResult {
@@ -192,7 +205,7 @@ mod tests {
             })
             .collect();
         let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
+        let mut pool = Pool::load(&path, 4).unwrap().0;
 
         let result = pool.acquire();
         assert!(!result.is_generated());
@@ -204,10 +217,30 @@ mod tests {
     }
 
     #[test]
-    fn too_few_names_errors() {
+    fn too_few_names_warns_and_supplements() {
         let (_f, path) = write_names_file(&["A", "B", "C"]);
-        let result = Pool::load(&path, 4);
-        assert!(result.is_err());
+        let (mut pool, warning) = Pool::load(&path, 4).unwrap();
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("auto-generated"));
+        assert!(pool.has_file());
+
+        // File names come first
+        for _ in 0..3 {
+            let r = pool.acquire();
+            assert!(!r.is_generated());
+        }
+        // Then generated names kick in
+        let r = pool.acquire();
+        assert!(r.is_generated());
+    }
+
+    #[test]
+    fn empty_file_errors() {
+        let (_f, path) = write_names_file(&["# comment only"]);
+        let err = Pool::load(&path, 4)
+            .err()
+            .expect("should error on empty file");
+        assert!(err.contains("empty"));
     }
 
     #[test]
@@ -228,7 +261,7 @@ mod tests {
             })
             .collect();
         let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
+        let mut pool = Pool::load(&path, 4).unwrap().0;
 
         for _ in 0..10 {
             let r = pool.acquire();
@@ -268,7 +301,7 @@ mod tests {
     fn reclaim_moves_name_to_in_use() {
         let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
         let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
+        let mut pool = Pool::load(&path, 4).unwrap().0;
 
         assert!(pool.reclaim("C"));
         assert_eq!(pool.in_use_count(), 1);
@@ -288,7 +321,7 @@ mod tests {
     fn reclaim_unknown_name_tracks_it() {
         let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
         let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
+        let mut pool = Pool::load(&path, 4).unwrap().0;
         assert!(pool.reclaim("Unknown"));
         assert_eq!(pool.in_use_count(), 1);
     }
@@ -297,7 +330,7 @@ mod tests {
     fn reclaim_already_in_use_returns_true() {
         let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
         let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
+        let mut pool = Pool::load(&path, 4).unwrap().0;
         pool.acquire();
         let first = pool.acquire().into_name();
         assert!(pool.reclaim(&first));
@@ -308,7 +341,7 @@ mod tests {
     fn comments_and_blanks_skipped() {
         let (_f, path) =
             write_names_file(&["# comment", "A", "", "B", "C", "D", "E", "F", "G", "H", "I"]);
-        let pool = Pool::load(&path, 4).unwrap();
+        let pool = Pool::load(&path, 4).unwrap().0;
         assert_eq!(pool.available.len(), 9);
     }
 
@@ -326,5 +359,18 @@ mod tests {
     fn startup_check_only_when_file_given() {
         let pool = Pool::new_generated();
         assert!(!pool.has_file());
+
+        // Small file: warns but succeeds
+        let (_f, path) = write_names_file(&["X", "Y"]);
+        let (pool, warning) = Pool::load(&path, 4).unwrap();
+        assert!(pool.has_file());
+        assert!(warning.is_some());
+
+        // Ample file: no warning
+        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
+        let (_f2, path2) = write_names_file(&names);
+        let (pool2, warning2) = Pool::load(&path2, 4).unwrap();
+        assert!(pool2.has_file());
+        assert!(warning2.is_none());
     }
 }
