@@ -188,6 +188,9 @@ impl SessionLog {
             }
             Event::Other => {}
         }
+
+        let _ = self.transcript_file.flush();
+        let _ = self.stream_file.flush();
     }
 
     pub fn set_phase(&mut self, phase: &str) {
@@ -392,5 +395,30 @@ mod tests {
         log.log_rework(2);
         let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
         assert!(transcript.contains("Rework round 2"));
+    }
+
+    #[test]
+    fn log_event_flushes_immediately() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+
+        let event = Event::ToolUse {
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "cargo test"}),
+        };
+        log.log_event(&event);
+
+        // Read from a separate file handle — verifies data is flushed to OS
+        let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
+        assert!(
+            transcript.contains("Tool: `Bash`"),
+            "transcript must be visible to other readers immediately after log_event"
+        );
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert!(
+            stream.contains("tool_use"),
+            "stream.jsonl must be visible immediately after log_event"
+        );
     }
 }

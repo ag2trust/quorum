@@ -167,6 +167,7 @@ pub struct DaemonAgentView {
     pub agent_state: Option<String>,
     pub cost_usd: f64,
     pub log_dir: Option<String>,
+    pub last_activity_age_secs: Option<i64>,
 }
 
 /// A point-in-time snapshot of the store.
@@ -722,17 +723,29 @@ fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
     let entries = crate::journal::list_in_flight(conn)?;
     Ok(entries
         .into_iter()
-        .map(|e| DaemonAgentView {
-            agent: e.agent,
-            role: e.role,
-            task_id: e.task_id,
-            phase: e.phase,
-            cost_tokens: e.cost_tokens,
-            agent_state: e.agent_state,
-            cost_usd: e.cost_usd,
-            log_dir: e.log_dir,
+        .map(|e| {
+            let last_activity_age_secs = e.log_dir.as_deref().and_then(stream_jsonl_age_secs);
+            DaemonAgentView {
+                agent: e.agent,
+                role: e.role,
+                task_id: e.task_id,
+                phase: e.phase,
+                cost_tokens: e.cost_tokens,
+                agent_state: e.agent_state,
+                cost_usd: e.cost_usd,
+                log_dir: e.log_dir,
+                last_activity_age_secs,
+            }
         })
         .collect())
+}
+
+fn stream_jsonl_age_secs(log_dir: &str) -> Option<i64> {
+    let path = std::path::Path::new(log_dir).join("stream.jsonl");
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let age = mtime.elapsed().ok()?;
+    Some(age.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -1548,6 +1561,44 @@ mod tests {
         assert_eq!(r.agent_state, None);
         assert!((r.cost_usd - 0.01).abs() < f64::EPSILON);
         assert_eq!(r.log_dir, None);
+        // Non-existent log_dir → last_activity_age_secs is None
+        assert_eq!(w.last_activity_age_secs, None);
+        assert_eq!(r.last_activity_age_secs, None);
+    }
+
+    #[test]
+    fn daemon_agents_view_reports_liveness_from_stream_mtime() {
+        let (d, mut c) = open_tmp();
+        let log_dir = d.path().join("Agent-1000");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("stream.jsonl"), "{}").unwrap();
+
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "Agent".into(),
+                role: "worker".into(),
+                task_id: Some(1),
+                session_id: "s".into(),
+                worktree: None,
+                branch: None,
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: Some(log_dir.to_str().unwrap().to_string()),
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                instance_id: None,
+            },
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.daemon_agents.len(), 1);
+        let age = s.daemon_agents[0].last_activity_age_secs.unwrap();
+        assert!((0..5).contains(&age), "expected recent mtime, got {age}s");
     }
 
     #[test]
