@@ -920,12 +920,13 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
     v.get("pr")?.as_i64()
 }
 
-/// Task pipeline view: all non-closed tasks + tasks closed in the last hour (#204).
+/// Task pipeline view: tasks in active lifecycle stages + recently closed (#204).
+/// Excludes `open` (already in QUEUE/BLOCKED), `cancelled`, and `parked`.
 fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let hour_ago = now - 3600;
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs, depends_on FROM tasks
-         WHERE status != 'closed'
+         WHERE status = 'done'
          UNION ALL
          SELECT id, title, status, refs, depends_on FROM tasks
          WHERE status = 'closed' AND updated_at > ?1
