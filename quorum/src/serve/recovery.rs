@@ -12,7 +12,7 @@ use super::agent::{AgentProc, AgentSpec};
 use super::names::Pool;
 use super::session_log::SessionLog;
 use super::worktree::WorktreeManager;
-use super::{log, LifetimeRoster, ServeConfig, SlotState};
+use super::{log, LifetimeRoster, PendingReview, ServeConfig, SlotState};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::mailbox;
 use quorum_core::{error::QuorumError, error::Result};
@@ -55,12 +55,14 @@ pub(crate) fn build_resume_turn(entry: &JournalEntry) -> String {
     super::agent::user_turn(&content)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     _reviewers: &mut [SlotState],
+    pending_reviews: &mut Vec<PendingReview>,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
@@ -191,6 +193,53 @@ pub(crate) async fn recover(
                             entry.agent
                         ));
                     }
+                }
+
+                // #178: Worker in `awaiting-review` with a recorded PR means
+                // "task pipeline position = review stage." Do NOT respawn a
+                // worker process (either the resumed session sits idle and
+                // wastes context, or if the CLI can't resume it dies and the
+                // task gets reaped to `open`, producing a duplicate PR on
+                // re-execution). Instead, register a `PendingReview` so
+                // Phase 5 provisions a reviewer directly against the
+                // recorded PR. A `--resume` worker is spawned lazily later
+                // if the reviewer asks for changes.
+                if let (true, Some(pr)) = (entry.phase == "awaiting-review", entry.pr) {
+                    // Persist journal (no PID, phase already awaiting-review).
+                    let p = db_path.clone();
+                    let mut refreshed = entry.clone();
+                    refreshed.pid = None;
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        journal::upsert(&mut conn, &refreshed)
+                    })
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                    .ok();
+
+                    pending_reviews.push(PendingReview {
+                        agent_name: entry.agent.clone(),
+                        task_id: entry.task_id.unwrap_or(0),
+                        pr,
+                        session_id: entry.session_id.clone(),
+                        worktree_path: wt_path,
+                        branch: entry.branch.clone().unwrap_or_default(),
+                        rework_count: entry.rework_count as u32,
+                        cost_tokens: entry.cost_tokens,
+                        cost_usd: entry.cost_usd,
+                        agent_state: entry.agent_state.clone(),
+                        log_dir: entry.log_dir.as_ref().map(PathBuf::from),
+                        task_repo: None,
+                        task_started_at: std::time::Instant::now(),
+                    });
+                    log(&format!(
+                        "recovery: resuming task #{} at REVIEW stage \
+                         (worker {}, PR #{}) — awaiting reviewer provision",
+                        entry.task_id.unwrap_or(0),
+                        entry.agent,
+                        pr,
+                    ));
+                    continue;
                 }
 
                 // Spawn with --resume
