@@ -2165,6 +2165,7 @@ enum LimitBreached {
     TurnTokens { turn: i64, max: i64 },
     TaskTokens { total: i64, max: i64 },
     TurnCostUsd { turn: f64, max: f64 },
+    TurnCostUsdMissing { max: f64 },
     TaskCostUsd { total: f64, max: f64 },
     TurnWallSecs { elapsed: u64, max: u64 },
     TaskWallSecs { elapsed: u64, max: u64 },
@@ -2182,6 +2183,9 @@ impl std::fmt::Display for LimitBreached {
             }
             Self::TurnCostUsd { turn, max } => {
                 write!(f, "turn cost ${turn:.4} exceeded limit ${max:.4}")
+            }
+            Self::TurnCostUsdMissing { max } => {
+                write!(f, "turn cost unavailable (fail-closed); limit ${max:.4}")
             }
             Self::TaskCostUsd { total, max } => {
                 write!(f, "task cost ${total:.4} exceeded limit ${max:.4}")
@@ -2225,13 +2229,17 @@ fn check_post_result_limits(
         }
     }
     if let Some(max) = limits.max_turn_cost_usd {
-        if let Some(turn_cost) = turn_cost_usd {
-            if turn_cost > max {
+        match turn_cost_usd {
+            Some(turn_cost) if turn_cost > max => {
                 return Some(LimitBreached::TurnCostUsd {
                     turn: turn_cost,
                     max,
                 });
             }
+            None => {
+                return Some(LimitBreached::TurnCostUsdMissing { max });
+            }
+            _ => {}
         }
     }
     if let Some(max) = limits.max_task_cost_usd {
@@ -3519,11 +3527,24 @@ mod tests {
     }
 
     #[test]
-    fn check_limits_turn_cost_usd_ignored_when_absent() {
+    fn check_limits_turn_cost_usd_fail_closed_when_none() {
         let limits = CostLimits {
             max_turn_cost_usd: Some(0.01),
             ..Default::default()
         };
+        let slot = make_dummy_slot();
+        let result = check_post_result_limits(&limits, 100, 500, None, 0.0, &slot);
+        assert!(result.is_some(), "must fail-closed when cost is None");
+        let msg = result.unwrap().to_string();
+        assert!(
+            msg.contains("unavailable") && msg.contains("fail-closed"),
+            "expected fail-closed message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_limits_turn_cost_usd_passes_when_no_limit_set() {
+        let limits = CostLimits::default();
         let slot = make_dummy_slot();
         assert!(check_post_result_limits(&limits, 100, 500, None, 0.0, &slot).is_none());
     }
@@ -3571,6 +3592,12 @@ mod tests {
             let s = c.to_string();
             assert!(s.contains("exceeded limit"), "bad display: {s}");
         }
+        let missing = LimitBreached::TurnCostUsdMissing { max: 0.01 };
+        let s = missing.to_string();
+        assert!(
+            s.contains("fail-closed"),
+            "TurnCostUsdMissing display must say fail-closed: {s}"
+        );
     }
 
     #[test]
