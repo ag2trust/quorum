@@ -1,6 +1,6 @@
 //! Daemon mailbox: agent-pushed control events consumed by the daemon tick loop.
 //!
-//! Each agent CLI invocation (`done`/`task-update`/`post`) writes one row; the daemon
+//! Each agent CLI invocation (`done`/`task-update`/`message`) writes one row; the daemon
 //! polls unconsumed rows each tick and marks them consumed after acting. See spec §12.
 
 use crate::clock;
