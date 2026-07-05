@@ -63,6 +63,19 @@ struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
+    _sentinel: Option<tempfile::TempDir>,
+}
+
+impl Drop for ServeHandle {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let pid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl ServeHandle {
@@ -72,6 +85,8 @@ impl ServeHandle {
         wt_base: &std::path::Path,
         names: &std::path::Path,
     ) -> Self {
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
@@ -89,6 +104,8 @@ impl ServeHandle {
                 &fake_agent.to_string_lossy(),
                 "--merge-cmd",
                 "true",
+                "--exit-when-gone",
+                &sentinel_path,
             ])
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -110,6 +127,7 @@ impl ServeHandle {
             child,
             rx,
             lines: Vec::new(),
+            _sentinel: Some(sentinel),
         }
     }
 

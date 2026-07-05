@@ -57,6 +57,19 @@ struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
+    _sentinel: Option<tempfile::TempDir>,
+}
+
+impl Drop for ServeHandle {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let pid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl ServeHandle {
@@ -76,6 +89,8 @@ impl ServeHandle {
         names: &std::path::Path,
         merge_cmd: &str,
     ) -> Self {
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
@@ -93,6 +108,8 @@ impl ServeHandle {
                 &fake_agent.to_string_lossy(),
                 "--merge-cmd",
                 merge_cmd,
+                "--exit-when-gone",
+                &sentinel_path,
             ])
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -114,6 +131,7 @@ impl ServeHandle {
             child,
             rx,
             lines: Vec::new(),
+            _sentinel: Some(sentinel),
         }
     }
 
@@ -692,6 +710,8 @@ fn reviewer_provision_uses_repo_dir_map_for_cross_repo_task() {
     );
 
     // Start daemon with --repo-dir-map mapping "test/cross-repo" to task_repo's path
+    let sentinel = tempfile::tempdir().unwrap();
+    let sentinel_path = sentinel.path().to_string_lossy().to_string();
     let fake_agent = cargo_bin("fake-agent");
     let repo_dir_map_val = format!("test/cross-repo={}", task_repo.path().display());
     let mut child = Command::new(cargo_bin("quorum"))
@@ -712,6 +732,8 @@ fn reviewer_provision_uses_repo_dir_map_for_cross_repo_task() {
             "true",
             "--repo-dir-map",
             &repo_dir_map_val,
+            "--exit-when-gone",
+            &sentinel_path,
         ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())

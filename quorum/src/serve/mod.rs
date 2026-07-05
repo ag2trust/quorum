@@ -310,6 +310,9 @@ pub struct ServeConfig {
     /// kills/reclaims a sibling instance's live workers. Derived by [`derive_instance_id`]
     /// from the canonical `worktree_base` (each daemon must have a distinct base).
     pub instance_id: String,
+    /// When set, serve polls for this file's existence every tick and initiates
+    /// shutdown when it disappears (#201: test fixture self-termination).
+    pub exit_when_gone: Option<PathBuf>,
 }
 
 /// #190: derive a stable instance identity from the daemon's `worktree_base`.
@@ -602,6 +605,23 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         if sig >= 1 && !drain_state.draining {
             log("SIGINT: draining \u{2014} in-flight agents will finish; Ctrl+C again to force immediate shutdown");
             drain_state.start_drain_with_source("signal", DrainSource::Signal);
+        }
+
+        // #201: sentinel file disappeared — parent test process died.
+        // Force-kill all children immediately (no graceful drain — the test is gone).
+        if let Some(ref sentinel) = config.exit_when_gone {
+            if !sentinel.exists() {
+                log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
+                for r in reviewers.drain(..) {
+                    r.proc.kill_and_reap().await;
+                    name_pool.release(&r.agent_name);
+                }
+                for w in workers.drain(..) {
+                    w.proc.kill_and_reap().await;
+                    name_pool.release(&w.agent_name);
+                }
+                return Ok(1);
+            }
         }
 
         // Trigger B: throttled git ls-remote poll for main sha changes
@@ -3865,6 +3885,7 @@ mod tests {
             repo_dir_map: map,
             base_branch: "main".into(),
             instance_id: "/tmp/wt".into(),
+            exit_when_gone: None,
         }
     }
 

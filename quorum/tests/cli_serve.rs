@@ -62,6 +62,9 @@ fn serve_boots_and_stops_on_sigint() {
         .unwrap();
     assert!(init_status.success(), "init failed");
 
+    let sentinel = tempfile::tempdir().unwrap();
+    let sentinel_path = sentinel.path().to_string_lossy().to_string();
+
     let mut child = Command::new(cargo_bin())
         .env("QUORUM_HOME", home.path())
         .args([
@@ -74,6 +77,8 @@ fn serve_boots_and_stops_on_sigint() {
             &wt_base.path().to_string_lossy(),
             "--names-file",
             &names_file.to_string_lossy(),
+            "--exit-when-gone",
+            &sentinel_path,
         ])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())

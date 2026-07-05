@@ -70,6 +70,19 @@ struct BareServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
+    _sentinel: Option<tempfile::TempDir>,
+}
+
+impl Drop for BareServeHandle {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let pid = self.child.id() as libc::pid_t;
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = self.child.wait();
+        }
+    }
 }
 
 impl BareServeHandle {
@@ -80,6 +93,7 @@ impl BareServeHandle {
         names: &std::path::Path,
         extra_args: &[&str],
     ) -> Self {
+        let sentinel = tempfile::tempdir().unwrap();
         let fake_agent = cargo_bin("fake-agent");
         let mut cmd = Command::new(cargo_bin("quorum"));
         cmd.env("QUORUM_HOME", home)
@@ -93,7 +107,9 @@ impl BareServeHandle {
             .arg("--names-file")
             .arg(names)
             .arg("--agent-bin")
-            .arg(&fake_agent);
+            .arg(&fake_agent)
+            .arg("--exit-when-gone")
+            .arg(sentinel.path());
         for a in extra_args {
             cmd.arg(a);
         }
@@ -118,6 +134,7 @@ impl BareServeHandle {
             child,
             rx,
             lines: Vec::new(),
+            _sentinel: Some(sentinel),
         }
     }
 
