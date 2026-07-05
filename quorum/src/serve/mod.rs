@@ -20,7 +20,7 @@ use quorum_core::mailbox;
 use quorum_core::tasks;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use worktree::WorktreeManager;
 
@@ -133,17 +133,22 @@ impl LifetimeRoster {
     }
 }
 
-fn query_pr_head_ref(pr: i64, repo_dir: &std::path::Path) -> Option<String> {
+fn query_pr_head_ref(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        pr.to_string(),
+        "--json".to_string(),
+        "headRefName".to_string(),
+        "--jq".to_string(),
+        ".headRefName".to_string(),
+    ];
+    if let Some(repo) = gh_repo {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
     let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr.to_string(),
-            "--json",
-            "headRefName",
-            "--jq",
-            ".headRefName",
-        ])
+        .args(&args)
         .current_dir(repo_dir)
         .output()
         .ok()?;
@@ -287,9 +292,24 @@ pub struct ServeConfig {
     /// When non-empty, only pull tasks whose `refs.repo` matches one of these values.
     /// Tasks with no `refs.repo` are skipped when the filter is set.
     pub only_repo: Vec<String>,
+    /// Maps repo slug (e.g. "ag2trust/quorum") to its local clone directory.
+    /// Used to resolve the correct git directory for fetch/worktree operations
+    /// when a task's `refs.repo` differs from `repo_dir`.
+    pub repo_dir_map: HashMap<String, PathBuf>,
     /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
     /// provisioning, and merge targeting.
     pub base_branch: String,
+}
+
+/// Resolve the local clone directory for a given repo slug.
+/// Returns the mapped directory if available, otherwise falls back to `config.repo_dir`.
+pub fn resolve_repo_dir<'a>(config: &'a ServeConfig, repo: Option<&str>) -> &'a Path {
+    if let Some(repo_name) = repo {
+        if let Some(dir) = config.repo_dir_map.get(repo_name) {
+            return dir.as_path();
+        }
+    }
+    &config.repo_dir
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -1882,26 +1902,32 @@ async fn spawn_reviewer_for_worker(
     // F4: provision reviewer worktree from the PR head branch (the worker's
     // branch), not origin/main, so the reviewer has the code under review
     // checked out locally.
+    // #180: resolve the correct clone directory from refs.repo — the worker's
+    // branch lives on the task's repo remote, not necessarily config.repo_dir.
     // #162: if the worker's branch fails, fall back to the PR's actual head
     // ref from GitHub (covers review tasks where the worker never pushed).
+    let task_repo_dir = resolve_repo_dir(config, worker.task_repo.as_deref());
     let provision_result = wt_mgr
-        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, &worker.branch)
+        .fetch_and_provision(task_repo_dir, &branch, &wt_path, &worker.branch)
         .await;
     let provision_ok = match provision_result {
         Ok(_) => true,
         Err(ref e) => {
             log(&format!(
-                "reviewer worktree provision failed for branch '{}': {e} — \
+                "reviewer worktree provision failed for branch '{}' in {}: {e} — \
                  trying gh pr view fallback",
-                worker.branch
+                worker.branch,
+                task_repo_dir.display()
             ));
             let pr_num = pr;
-            let repo_dir = config.repo_dir.clone();
-            let fallback_ref =
-                tokio::task::spawn_blocking(move || query_pr_head_ref(pr_num, &repo_dir))
-                    .await
-                    .ok()
-                    .flatten();
+            let repo_dir_for_gh = task_repo_dir.to_path_buf();
+            let gh_repo = worker.task_repo.clone();
+            let fallback_ref = tokio::task::spawn_blocking(move || {
+                query_pr_head_ref(pr_num, &repo_dir_for_gh, gh_repo.as_deref())
+            })
+            .await
+            .ok()
+            .flatten();
             if let Some(ref head_ref) = fallback_ref {
                 if head_ref != &worker.branch {
                     log(&format!(
@@ -1909,7 +1935,7 @@ async fn spawn_reviewer_for_worker(
                         worker.branch
                     ));
                     match wt_mgr
-                        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, head_ref)
+                        .fetch_and_provision(task_repo_dir, &branch, &wt_path, head_ref)
                         .await
                     {
                         Ok(_) => true,
@@ -2016,8 +2042,8 @@ async fn spawn_reviewer_for_worker(
                 log(&format!("reviewer feed_turn failed: {e}"));
                 proc.kill_and_reap().await;
                 name_pool.release(&reviewer_name);
-                wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
                 let p = config.db_path.clone();
                 let rn = reviewer_name.clone();
                 tokio::task::spawn_blocking(move || {
@@ -2078,14 +2104,14 @@ async fn spawn_reviewer_for_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: reviewer_session_log,
-                task_repo: None,
+                task_repo: worker.task_repo.clone(),
             });
         }
         Err(e) => {
             log(&format!("reviewer spawn failed: {e}"));
             name_pool.release(&reviewer_name);
-            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(task_repo_dir, &branch).await;
             let p = config.db_path.clone();
             let rn = reviewer_name.clone();
             tokio::task::spawn_blocking(move || {
@@ -2244,6 +2270,9 @@ async fn spawn_worker(
         Ok(Some(_)) => {}
     }
 
+    let task_repo_name = quorum_core::branches::repo_from_refs(task.refs.as_deref());
+    let worker_repo_dir = resolve_repo_dir(config, Some(&task_repo_name));
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task.id);
     let wt_path = config
@@ -2252,7 +2281,7 @@ async fn spawn_worker(
 
     match wt_mgr
         .provision(
-            &config.repo_dir,
+            worker_repo_dir,
             &branch,
             &wt_path,
             &format!("origin/{}", config.base_branch),
@@ -2340,8 +2369,8 @@ async fn spawn_worker(
                     release_task(&db_path, &agent_name, task.id).await;
                 }
                 name_pool.release(&agent_name);
-                wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+                wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(worker_repo_dir, &branch).await;
                 return Ok(false);
             }
 
@@ -2409,8 +2438,8 @@ async fn spawn_worker(
                 release_task(&db_path, &agent_name, task.id).await;
             }
             name_pool.release(&agent_name);
-            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+            wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(worker_repo_dir, &branch).await;
             return Ok(false);
         }
     }
@@ -2516,11 +2545,9 @@ async fn teardown_worker_with_body(
     .await
     .ok();
 
-    wt_mgr
-        .remove(&config.repo_dir, &state.worktree_path)
-        .await
-        .ok();
-    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
+    let repo_dir = resolve_repo_dir(config, state.task_repo.as_deref());
+    wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
+    wt_mgr.delete_branch(repo_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("worker {} torn down", state.agent_name));
@@ -2551,11 +2578,9 @@ async fn teardown_reviewer(
     .await
     .ok();
 
-    wt_mgr
-        .remove(&config.repo_dir, &state.worktree_path)
-        .await
-        .ok();
-    wt_mgr.delete_branch(&config.repo_dir, &state.branch).await;
+    let repo_dir = resolve_repo_dir(config, state.task_repo.as_deref());
+    wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
+    wt_mgr.delete_branch(repo_dir, &state.branch).await;
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
@@ -3091,5 +3116,76 @@ mod tests {
         assert!(task_matches_repo_filter(&t1, &filter));
         assert!(task_matches_repo_filter(&t2, &filter));
         assert!(!task_matches_repo_filter(&t3, &filter));
+    }
+
+    // ── resolve_repo_dir tests (#180) ─────────────────────────────────────
+
+    fn make_config_with_map(map: HashMap<String, PathBuf>) -> ServeConfig {
+        use std::sync::Arc;
+        ServeConfig {
+            db_path: PathBuf::from("/tmp/q.db"),
+            cap: 1,
+            repo_dir: PathBuf::from("/home/user/dev/quorum"),
+            worktree_base: PathBuf::from("/tmp/wt"),
+            names_file: None,
+            agent_bin: None,
+            model: "sonnet".into(),
+            effort: "high".into(),
+            merge_executor: Arc::new(merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 900,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 900,
+            merge_checks_poll_secs: 30,
+            only_repo: vec![],
+            repo_dir_map: map,
+            base_branch: "main".into(),
+        }
+    }
+
+    #[test]
+    fn resolve_repo_dir_empty_map_falls_back_to_default() {
+        let config = make_config_with_map(HashMap::new());
+        let result = resolve_repo_dir(&config, Some("ag2trust/ag2trust"));
+        assert_eq!(result, Path::new("/home/user/dev/quorum"));
+    }
+
+    #[test]
+    fn resolve_repo_dir_none_repo_falls_back_to_default() {
+        let config = make_config_with_map(HashMap::new());
+        let result = resolve_repo_dir(&config, None);
+        assert_eq!(result, Path::new("/home/user/dev/quorum"));
+    }
+
+    #[test]
+    fn resolve_repo_dir_mapped_repo_returns_mapped_dir() {
+        let mut map = HashMap::new();
+        map.insert(
+            "ag2trust/ag2trust".to_string(),
+            PathBuf::from("/home/user/dev/ag2trust"),
+        );
+        let config = make_config_with_map(map);
+        let result = resolve_repo_dir(&config, Some("ag2trust/ag2trust"));
+        assert_eq!(result, Path::new("/home/user/dev/ag2trust"));
+    }
+
+    #[test]
+    fn resolve_repo_dir_unmapped_repo_falls_back_to_default() {
+        let mut map = HashMap::new();
+        map.insert(
+            "ag2trust/ag2trust".to_string(),
+            PathBuf::from("/home/user/dev/ag2trust"),
+        );
+        let config = make_config_with_map(map);
+        let result = resolve_repo_dir(&config, Some("ag2trust/other"));
+        assert_eq!(result, Path::new("/home/user/dev/quorum"));
     }
 }

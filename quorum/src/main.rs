@@ -1037,6 +1037,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             self_repo,
             sha_poll_interval_secs,
             only_repo,
+            repo_dir_map,
             base_branch,
         } => {
             let db = paths::db_path()?;
@@ -1073,6 +1074,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             } else {
                 None
             };
+            let parsed_repo_dir_map: std::collections::HashMap<String, std::path::PathBuf> =
+                repo_dir_map
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let (key, val) = entry.split_once('=')?;
+                        Some((key.to_string(), std::path::PathBuf::from(val)))
+                    })
+                    .collect();
             let config = serve::ServeConfig {
                 db_path: db,
                 cap,
@@ -1093,6 +1102,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_checks_timeout_secs,
                 merge_checks_poll_secs,
                 only_repo,
+                repo_dir_map: parsed_repo_dir_map,
                 base_branch,
             };
             Ok(serve::run_serve(config)?)
