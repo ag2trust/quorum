@@ -4,6 +4,7 @@
 //! spawns/drives agents, and shuts down cleanly on Ctrl-C. See spec §3.
 
 pub mod agent;
+pub mod approvals;
 pub mod merge;
 pub mod names;
 pub mod recovery;
@@ -550,6 +551,17 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                 &sha[..12.min(sha.len())]
             ));
         }
+    }
+
+    // #228: approval recovery — merge already-approved PRs from durable,
+    // instance-independent state BEFORE journal-driven worker resume, so a
+    // self-update-drain restart merges the approved PR instead of re-working it.
+    // Runs first so approved tasks are closed (and their journal rows dropped)
+    // before recovery::recover could resume a worker for them.
+    if let Err(e) =
+        approvals::recover(&config.db_path, &config.repo_dir, &config.merge_executor).await
+    {
+        log(&format!("approval recovery failed: {e} — continuing"));
     }
 
     // M7: crash recovery — resume in-flight agents from journal
@@ -1174,6 +1186,55 @@ async fn tick(
                         }
                     }
 
+                    // #228: persist the approval durably (instance-independent)
+                    // BEFORE merging, so a self-update-drain restart that lands
+                    // between approval and merge reconstructs "merge this PR"
+                    // from state instead of re-working the task. The record is
+                    // deleted right after a successful merge below. Best-effort:
+                    // a capture failure must not block the merge.
+                    {
+                        let reviewer_name = reviewers[ri].agent_name.clone();
+                        let author = workers
+                            .iter()
+                            .find(|w| w.task_id == reviewer_task_id)
+                            .map(|w| w.agent_name.clone())
+                            .or_else(|| {
+                                pending_reviews
+                                    .iter()
+                                    .find(|p| p.task_id == reviewer_task_id)
+                                    .map(|p| p.agent_name.clone())
+                            });
+                        if let Some(author) = author {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            let head = tokio::task::spawn_blocking(move || {
+                                executor.head_sha(pr_num, &repo)
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(head) = head {
+                                let p = db_path.clone();
+                                let record = quorum_core::approvals::Approval {
+                                    pr_number: pr_num,
+                                    task_id: reviewer_task_id,
+                                    author,
+                                    reviewer: reviewer_name,
+                                    verdict: "approved".to_string(),
+                                    blocking_count: 0,
+                                    approved_head_sha: head,
+                                };
+                                tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let mut conn = quorum_core::db::open(&p)?;
+                                    quorum_core::approvals::record(&mut conn, &record)
+                                })
+                                .await
+                                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                                .ok();
+                            }
+                        }
+                    }
+
                     let merge_result = {
                         let repo = config.repo_dir.clone();
                         let executor = Arc::clone(&config.merge_executor);
@@ -1187,6 +1248,23 @@ async fn tick(
                         .await
                         .map_err(|e| QuorumError::Io(format!("merge spawn_blocking join: {e}")))?
                     };
+
+                    // #228: the merge was attempted by this live instance —
+                    // whatever the outcome (merged / reworked / parked), the
+                    // durable "awaiting merge" record has served its purpose.
+                    // Drop it so restart recovery never re-merges a PR this
+                    // instance already handled.
+                    {
+                        let p = db_path.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            quorum_core::approvals::delete(&mut conn, pr_num)?;
+                            Ok(())
+                        })
+                        .await
+                        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                        .ok();
+                    }
 
                     if merge_result.success {
                         log(&format!("PR #{pr_num} merged — tearing down both agents"));

@@ -86,6 +86,16 @@ pub trait MergeExecutor: Send + Sync {
         MergeabilityState::Mergeable
     }
 
+    /// Current head commit SHA of the PR's branch (`headRefOid`). Used by #228
+    /// restart recovery to SHA-bind a durable approval to the exact diff the
+    /// reviewer approved: a moved head auto-invalidates the approval. Returns
+    /// `None` if the head can't be determined (e.g. PR gone / gh error) — the
+    /// caller then leaves the record for a later startup rather than merging
+    /// blind. Default `None` so mock executors opt in explicitly.
+    fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+        None
+    }
+
     /// Post a formal REQUEST_CHANGES review on the PR — the durable
     /// GitHub-side record of a `changes` verdict (#206). Best-effort: the
     /// caller logs failures and proceeds with rework regardless. Default
@@ -390,6 +400,32 @@ impl MergeExecutor for GhMergeExecutor {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_mergeability(&stdout)
+    }
+
+    fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "headRefOid",
+                "--jq",
+                ".headRefOid",
+            ],
+            repo_dir,
+        );
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     }
 
     fn request_changes(&self, pr: i64, repo_dir: &Path, feedback: &str) -> MergeResult {

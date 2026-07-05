@@ -237,6 +237,26 @@ CREATE TABLE IF NOT EXISTS journal (
 -- because SCHEMA_SQL runs BEFORE the ALTER TABLE that adds the column on an
 -- upgrading v15 DB; CREATE INDEX on a not-yet-present column would fail.
 
+-- #228 durable approval record: an attested `approved` review verdict persisted
+-- against the PR/task, INSTANCE-INDEPENDENT (no instance_id column, by design).
+-- A `--self-update-drain` restart that lands between approval and merge must be
+-- able to reconstruct "merge this PR" from durable state alone — an
+-- instance-scoped mailbox row can't survive a roster reset. Recovery merges iff
+-- the record is a well-formed attested approval, reviewer != author, and
+-- `approved_head_sha` still matches the PR's live head (see verdict::dispose_approval).
+-- Keyed by pr_number: at most one live approval per PR. Deleted on merge / demote / reject.
+CREATE TABLE IF NOT EXISTS approvals (
+    pr_number         INTEGER PRIMARY KEY,
+    task_id           INTEGER NOT NULL,
+    author            TEXT NOT NULL,
+    reviewer          TEXT NOT NULL,
+    verdict           TEXT NOT NULL,
+    blocking_count    INTEGER NOT NULL,
+    approved_head_sha TEXT NOT NULL,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS approvals_task ON approvals(task_id);
+
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).
 -- Stats-only; never read by claim/routing/sign-off code paths. TTL'd.

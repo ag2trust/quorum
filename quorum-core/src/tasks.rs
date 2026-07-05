@@ -1008,6 +1008,37 @@ fn apply_verdict(
     Ok(())
 }
 
+/// #228 recovery: unconditionally close a task whose PR was merged, from any
+/// non-terminal state. Used when a restarted daemon merges a durably-approved
+/// PR (see `serve::approvals::recover`): there is no live worker/reviewer slot
+/// and no in-cycle review task to chain through `auto_resolve_review`, so this
+/// closes the task directly, clears its assignee, and deactivates its lease so
+/// a future claim can never resurrect merged work. Idempotent — returns whether
+/// a row transitioned to `closed`.
+pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let n = tx.execute(
+        "UPDATE tasks SET status='closed', assignee=NULL, sticky_until=NULL,
+            body=?2, updated_at=?3
+         WHERE id=?1 AND status NOT IN ('closed', 'cancelled')",
+        params![id, note, now],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Ok(false);
+    }
+    deactivate_lease(&tx, id, now)?;
+    crate::events::emit(
+        &tx,
+        "task_closed",
+        &lease_target(id),
+        &format!("closed on merge (recovery): {note}"),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Auto-resolve a review task that was just spawned for a daemon-merged task.
 /// When the daemon reviews+merges a PR in-cycle, `teardown_worker("done")` atomically
 /// spawns a `kind:review` task. This function finds that review, claims it as
@@ -3652,6 +3683,42 @@ mod tests {
             original.status, "closed",
             "original must be chained to closed"
         );
+    }
+
+    #[test]
+    fn close_after_merge_closes_task_from_any_non_terminal_state() {
+        // #228 recovery: after a restarted daemon merges a durably-approved PR,
+        // it closes the task directly — regardless of whether the task is still
+        // `claimed` by a dead worker or was reaped back to `open`. Idempotent.
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "impl", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "worker-1", Some(tid), &[], TTL, 1001).unwrap();
+        assert_eq!(get(&c, tid).unwrap().unwrap().status, "claimed");
+
+        let changed = close_after_merge(
+            &mut c,
+            tid,
+            "daemon: PR #208 merged on restart recovery",
+            1002,
+        )
+        .unwrap();
+        assert!(changed);
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "closed");
+        assert_eq!(t.assignee, None, "assignee cleared on close");
+
+        // Idempotent: a second call is a no-op (already terminal).
+        assert!(!close_after_merge(&mut c, tid, "again", 1003).unwrap());
+
+        // The lease is gone so a future claim can never resurrect a merged task.
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
+                params![lease_target(tid)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "lease must be deactivated");
     }
 
     #[test]
