@@ -42,7 +42,7 @@ fn status_json_and_table() {
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("claims : 1 active"));
+        .stdout(predicates::str::contains("WORKING"));
 }
 
 #[test]
@@ -91,22 +91,13 @@ fn status_dashboard_emits_all_sections() {
         .arg("status")
         .assert()
         .success()
-        // Section headers (load-bearing — agents grep for these).
-        .stdout(predicates::str::contains("## agents online (by tier)"))
-        .stdout(predicates::str::contains(
-            "## queue (claimable tasks by required tier)",
-        ))
-        .stdout(predicates::str::contains(
-            "## active claims (soonest to expire)",
-        ))
-        .stdout(predicates::str::contains("## throughput"))
-        .stdout(predicates::str::contains("## recent feed"))
-        // Data sanity: tier:opus-47 surfaced from the open task we created.
-        .stdout(predicates::str::contains("tier:opus-47"))
-        // Claim with TTL surfaced (the claimed task's lease, target task#2).
-        .stdout(predicates::str::contains("task#2"))
-        // Recent feed message body surfaced.
-        .stdout(predicates::str::contains("hello world"));
+        .stdout(predicates::str::contains("WORKING"))
+        .stdout(predicates::str::contains("QUEUE"))
+        .stdout(predicates::str::contains("BLOCKED"))
+        .stdout(predicates::str::contains("PIPELINE"))
+        .stdout(predicates::str::contains("ERRORS"))
+        .stdout(predicates::str::contains("ship-it"))
+        .stdout(predicates::str::contains("opus47"));
 }
 
 #[test]
@@ -183,15 +174,16 @@ fn status_json_includes_dashboard_fields() {
 
 #[test]
 fn status_dashboard_handles_empty_db() {
-    // Defensive: with no data, every section should render its (none)/(empty) sentinel.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path()).arg("init").assert().success();
     quorum(home.path())
         .arg("status")
         .assert()
         .success()
-        .stdout(predicates::str::contains("## agents online (by tier)"))
-        .stdout(predicates::str::contains("## recent feed"));
+        .stdout(predicates::str::contains("WORKING"))
+        .stdout(predicates::str::contains("idle"))
+        .stdout(predicates::str::contains("QUEUE"))
+        .stdout(predicates::str::contains("ERRORS"));
 }
 
 #[test]
@@ -353,11 +345,30 @@ fn status_watch_emits_output_before_kill() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("agents"),
-        "expected status table, got: {stdout}"
+        stdout.contains("WORKING"),
+        "expected WORKING section, got: {stdout}"
     );
     assert!(
-        stdout.contains("claims"),
-        "expected claims line in status table"
+        stdout.contains("PIPELINE"),
+        "expected PIPELINE section in status table"
     );
+}
+
+#[test]
+fn status_no_color_emits_no_ansi() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    let out = quorum(home.path())
+        .env("NO_COLOR", "1")
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains('\x1b'),
+        "NO_COLOR=1 must suppress all ANSI escape codes, got: {stdout}"
+    );
+    assert!(stdout.contains("WORKING"), "sections must still render");
 }
