@@ -20,7 +20,10 @@ pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
     format!(
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
          Invoke the `pr-review` skill (via the Skill tool) and follow it. If the skill \
-         is unavailable in this worktree, apply the contract below directly.\n\n\
+         is unavailable in this worktree, run the project's code review process \
+         directly: read the full PR diff and surrounding code (never the diff hunks \
+         alone), check the repo CLAUDE.md invariants, and check the PR's verification \
+         evidence — then apply the contract below.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
@@ -136,6 +139,12 @@ mod tests {
         assert!(
             prompt.contains("NOT review input"),
             "prompt must warn that author/deliverer comments are not review input"
+        );
+        // Review #226 finding 6: the skill-unavailable fallback must still
+        // demand a substantive review, not just the verdict mechanics.
+        assert!(
+            prompt.contains("full PR diff") && prompt.contains("CLAUDE.md"),
+            "fallback path must instruct a substantive review (diff + invariants)"
         );
         assert!(
             !prompt.contains("merge the PR, then"),

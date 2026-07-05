@@ -1459,13 +1459,18 @@ async fn tick(
                     }
                 }
                 Some("changes") => {
-                    // On a #206 demotion the row carries no reviewer feedback;
-                    // the demotion reason is the actionable message.
-                    let feedback = gated
-                        .demotion_reason
-                        .as_deref()
-                        .or(row.feedback.as_deref())
-                        .unwrap_or("Changes requested.");
+                    // On a #206 demotion the demotion reason leads, but any
+                    // feedback the row carried is appended — never dropped —
+                    // so the worker still sees the reviewer's actual notes.
+                    let feedback_owned = match (&gated.demotion_reason, &row.feedback) {
+                        (Some(reason), Some(fb)) => {
+                            format!("{reason}\n\nReviewer feedback:\n{fb}")
+                        }
+                        (Some(reason), None) => reason.clone(),
+                        (None, Some(fb)) => fb.clone(),
+                        (None, None) => "Changes requested.".to_string(),
+                    };
+                    let feedback = feedback_owned.as_str();
                     log(&format!(
                         "verdict: changes — feeding rework to worker (feedback: {feedback})"
                     ));

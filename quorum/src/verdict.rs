@@ -46,6 +46,14 @@ pub fn validate(
             ),
         },
         Some("changes") => {
+            if blocking == Some(0) {
+                return Err(
+                    "a changes verdict with --blocking 0 contradicts the contract — zero \
+                     blocking findings means --verdict approved --blocking 0; if something \
+                     must be fixed before merge, count it as blocking"
+                        .to_string(),
+                );
+            }
             if changes_requires_feedback && feedback.is_none_or(|f| f.trim().is_empty()) {
                 return Err(
                     "--verdict changes requires --feedback describing what must be fixed \
@@ -55,8 +63,9 @@ pub fn validate(
             }
             Ok(())
         }
-        // Unknown spellings are rejected by the caller's enum check; treat
-        // them as no-attestation-needed here.
+        // Unknown spellings carry no attestation semantics here: the `done`
+        // path enum-checks them before calling validate; the `task-update`
+        // path defers spelling validation to quorum-core's verdict handling.
         Some(_) => Ok(()),
     }
 }
@@ -64,7 +73,7 @@ pub fn validate(
 /// Serialized attestation for the mailbox `payload` column: `{"blocking":N}`.
 /// `None` when no attestation was supplied.
 pub fn attestation_payload(blocking: Option<u32>) -> Option<String> {
-    blocking.map(|n| format!("{{\"blocking\":{n}}}"))
+    blocking.map(|n| serde_json::json!({ "blocking": n }).to_string())
 }
 
 /// Outcome of gating a mailbox verdict at the daemon boundary.
@@ -83,7 +92,11 @@ pub struct GatedVerdict {
 /// `changes` so the daemon never merges on it. `changes` and non-verdicts
 /// pass through untouched.
 pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
-    if verdict != Some("approved") {
+    // Both spellings are approval claims ("approve" is the passive-flow
+    // spelling); canonicalize so a raw mailbox row can't slip past the gate
+    // into the daemon's "done without verdict" catch-all.
+    let is_approval = matches!(verdict, Some("approved") | Some("approve"));
+    if !is_approval {
         return GatedVerdict {
             verdict: verdict.map(str::to_string),
             demotion_reason: None,
@@ -164,6 +177,20 @@ mod tests {
         assert!(validate(Some("approve"), Some(0), None, false).is_ok());
     }
 
+    /// Review #226 finding 3: attesting zero blocking findings while
+    /// requesting changes contradicts the derived-verdict contract — zero
+    /// blocking means approved. (`--blocking` omitted stays allowed: the
+    /// passive flow doesn't attest on changes.)
+    #[test]
+    fn changes_with_zero_blocking_attestation_is_refused() {
+        let err = validate(Some("changes"), Some(0), Some("nits only"), true).unwrap_err();
+        assert!(
+            err.contains("approved"),
+            "error must redirect to --verdict approved: {err}"
+        );
+        assert!(validate(Some("changes"), None, Some("fix X"), true).is_ok());
+    }
+
     #[test]
     fn changes_requires_feedback_in_daemon_flow() {
         let err = validate(Some("changes"), Some(1), None, true).unwrap_err();
@@ -219,6 +246,29 @@ mod tests {
     fn gate_passes_attested_approved() {
         let g = gate(Some("approved"), Some("{\"blocking\":0}"));
         assert_eq!(g.verdict.as_deref(), Some("approved"));
+        assert!(g.demotion_reason.is_none());
+    }
+
+    /// Review #226 finding 1 (CONFIRMED): a raw mailbox row using the
+    /// passive-flow spelling `approve` must not slip past the gate into the
+    /// daemon's "done without verdict" catch-all — it is an approval claim
+    /// and gets the same attestation treatment, canonicalized to `approved`.
+    #[test]
+    fn gate_treats_approve_spelling_as_approval_claim() {
+        let g = gate(Some("approve"), None);
+        assert_eq!(
+            g.verdict.as_deref(),
+            Some("changes"),
+            "unattested 'approve' must demote, not fall through"
+        );
+        assert!(g.demotion_reason.is_some());
+
+        let g = gate(Some("approve"), Some("{\"blocking\":0}"));
+        assert_eq!(
+            g.verdict.as_deref(),
+            Some("approved"),
+            "attested 'approve' must canonicalize to 'approved'"
+        );
         assert!(g.demotion_reason.is_none());
     }
 

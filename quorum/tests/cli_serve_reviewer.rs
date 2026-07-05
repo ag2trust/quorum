@@ -877,5 +877,27 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
         handle.lines
     );
 
+    // State assertion (review #226 finding 2): merge-absence must hold in the
+    // DB, not just the log stream — a merged task would be closed; a demoted
+    // one stays claimed by the same worker for the rework round.
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        task["status"].as_str(),
+        Some("claimed"),
+        "demoted verdict must leave the task claimed (rework), not closed: {stdout}"
+    );
+    assert_eq!(
+        task["assignee"].as_str(),
+        Some(worker_name.as_str()),
+        "task must remain assigned to the delivering worker during rework: {stdout}"
+    );
+
     handle.stop();
 }
