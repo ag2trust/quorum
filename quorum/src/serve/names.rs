@@ -61,12 +61,23 @@ impl Pool {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect();
 
+        if names.is_empty() {
+            return Err(format!(
+                "names file {} is empty (no usable names after filtering comments/blanks)",
+                path.display()
+            ));
+        }
+
         let required = 2 * cap + 1;
         if names.len() < required {
-            return Err(format!(
-                "names file has {} names, need >2*cap ({required}) for cap={cap}",
-                names.len()
-            ));
+            let deficit = required - names.len();
+            eprintln!(
+                "warn: names file has {} names, need {} for cap={}; {} names will be auto-generated on demand",
+                names.len(),
+                required,
+                cap,
+                deficit,
+            );
         }
 
         Ok(Self {
@@ -204,10 +215,19 @@ mod tests {
     }
 
     #[test]
-    fn too_few_names_errors() {
+    fn too_few_names_warns_but_succeeds() {
         let (_f, path) = write_names_file(&["A", "B", "C"]);
+        let pool = Pool::load(&path, 4).unwrap();
+        assert!(pool.has_file());
+        assert_eq!(pool.available.len(), 3);
+    }
+
+    #[test]
+    fn empty_names_file_errors() {
+        let (_f, path) = write_names_file(&["# just a comment", "", "  "]);
         let result = Pool::load(&path, 4);
-        assert!(result.is_err());
+        let err = result.err().expect("should fail for empty file");
+        assert!(err.contains("empty"), "error was: {err}");
     }
 
     #[test]
@@ -324,7 +344,20 @@ mod tests {
 
     #[test]
     fn startup_check_only_when_file_given() {
+        // No file: generated-only pool starts fine
         let pool = Pool::new_generated();
         assert!(!pool.has_file());
+
+        // Small file: starts and supplements with generated names
+        let (_f, path) = write_names_file(&["Alpha", "Beta", "Gamma"]);
+        let mut pool = Pool::load(&path, 4).unwrap();
+        assert!(pool.has_file());
+        // Exhaust the file names, then get generated ones
+        for _ in 0..3 {
+            let r = pool.acquire();
+            assert!(!r.is_generated());
+        }
+        let gen = pool.acquire();
+        assert!(gen.is_generated());
     }
 }
