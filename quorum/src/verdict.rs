@@ -107,15 +107,23 @@ pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
                  Re-signal done to trigger a fresh review after addressing the findings."
             )),
         },
-        None => GatedVerdict {
-            verdict: Some("changes".to_string()),
-            demotion_reason: Some(
-                "approved verdict demoted to changes: missing the zero-blocking-findings \
-                 attestation (--blocking 0). The verdict did not come through the \
-                 validated CLI path (#206). Re-signal done to trigger a fresh review."
-                    .to_string(),
-            ),
-        },
+        None => {
+            // Covers both a missing payload and a malformed one (bad JSON or
+            // no numeric `blocking` key) — name which so the log is accurate.
+            let what = if payload.is_none() {
+                "missing"
+            } else {
+                "invalid"
+            };
+            GatedVerdict {
+                verdict: Some("changes".to_string()),
+                demotion_reason: Some(format!(
+                    "approved verdict demoted to changes: {what} zero-blocking-findings \
+                     attestation (--blocking 0). The verdict did not come through the \
+                     validated CLI path (#206). Re-signal done to trigger a fresh review."
+                )),
+            }
+        }
     }
 }
 
@@ -236,7 +244,21 @@ mod tests {
     fn gate_demotes_approved_with_garbage_payload() {
         let g = gate(Some("approved"), Some("not json"));
         assert_eq!(g.verdict.as_deref(), Some("changes"));
-        assert!(g.demotion_reason.is_some());
+        let reason = g.demotion_reason.unwrap();
+        assert!(
+            reason.contains("invalid"),
+            "a malformed payload must be reported as invalid, not missing: {reason}"
+        );
+    }
+
+    #[test]
+    fn gate_demotion_reason_says_missing_when_no_payload() {
+        let g = gate(Some("approved"), None);
+        let reason = g.demotion_reason.unwrap();
+        assert!(
+            reason.contains("missing"),
+            "an absent payload must be reported as missing: {reason}"
+        );
     }
 
     #[test]
