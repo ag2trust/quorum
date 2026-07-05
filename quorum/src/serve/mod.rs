@@ -244,6 +244,7 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
         pid: slot.proc.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
+        updated_at: None,
     }
 }
 
@@ -2010,6 +2011,7 @@ async fn spawn_reviewer_for_worker(
         pid: None,
         pr: Some(pr),
         rework_count: 0,
+        updated_at: None,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -2077,6 +2079,7 @@ async fn spawn_reviewer_for_worker(
                     pid: spawn_pid,
                     pr: Some(pr),
                     rework_count: 0,
+                    updated_at: None,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -2337,6 +2340,7 @@ async fn spawn_worker(
         pid: None,
         pr: None,
         rework_count: 0,
+        updated_at: None,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -2395,6 +2399,7 @@ async fn spawn_worker(
                     pid: spawn_pid,
                     pr: None,
                     rework_count: 0,
+                    updated_at: None,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;

@@ -26,6 +26,7 @@ pub struct JournalEntry {
     pub pid: Option<i32>,
     pub pr: Option<i64>,
     pub rework_count: i32,
+    pub updated_at: Option<i64>,
 }
 
 fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
@@ -44,6 +45,7 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<JournalEntry> {
         pid: r.get(11)?,
         pr: r.get(12)?,
         rework_count: r.get(13)?,
+        updated_at: r.get(14).ok(),
     })
 }
 
@@ -92,7 +94,7 @@ pub fn upsert(conn: &mut Connection, entry: &JournalEntry) -> Result<()> {
 
 pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count
+        "SELECT agent, role, task_id, session_id, worktree, branch, phase, cost_tokens, agent_state, cost_usd, log_dir, pid, pr, rework_count, updated_at
          FROM journal
          ORDER BY agent",
     )?;
@@ -138,6 +140,7 @@ mod tests {
             pid: None,
             pr: None,
             rework_count: 0,
+            updated_at: None,
         }
     }
 

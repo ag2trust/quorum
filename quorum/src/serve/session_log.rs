@@ -188,6 +188,9 @@ impl SessionLog {
             }
             Event::Other => {}
         }
+
+        let _ = self.transcript_file.flush();
+        let _ = self.stream_file.flush();
     }
 
     pub fn set_phase(&mut self, phase: &str) {

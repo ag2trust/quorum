@@ -388,6 +388,7 @@ mod tests {
             pid: Some(12345),
             pr: Some(10),
             rework_count: 1,
+            updated_at: None,
         }
     }
 

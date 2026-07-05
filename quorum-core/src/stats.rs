@@ -167,6 +167,9 @@ pub struct DaemonAgentView {
     pub agent_state: Option<String>,
     pub cost_usd: f64,
     pub log_dir: Option<String>,
+    /// Seconds since last journal update (proxy for liveness). `None` when
+    /// `updated_at` is missing (pre-migration rows).
+    pub last_activity_secs: Option<i64>,
 }
 
 /// A point-in-time snapshot of the store.
@@ -272,7 +275,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     // Issue #101 (experimental): stats-only PostToolUse hook activity. Empty
     // vec when no events recorded — section is suppressed in the renderer.
     let activity = crate::activity::activity_summary(conn, now)?;
-    let daemon_agents = daemon_agents_view(conn)?;
+    let daemon_agents = daemon_agents_view(conn, now)?;
 
     Ok(Stats {
         agents_total,
@@ -718,19 +721,23 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
     })
 }
 
-fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
+fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView>> {
     let entries = crate::journal::list_in_flight(conn)?;
     Ok(entries
         .into_iter()
-        .map(|e| DaemonAgentView {
-            agent: e.agent,
-            role: e.role,
-            task_id: e.task_id,
-            phase: e.phase,
-            cost_tokens: e.cost_tokens,
-            agent_state: e.agent_state,
-            cost_usd: e.cost_usd,
-            log_dir: e.log_dir,
+        .map(|e| {
+            let last_activity_secs = e.updated_at.map(|ts| (now - ts).max(0));
+            DaemonAgentView {
+                agent: e.agent,
+                role: e.role,
+                task_id: e.task_id,
+                phase: e.phase,
+                cost_tokens: e.cost_tokens,
+                agent_state: e.agent_state,
+                cost_usd: e.cost_usd,
+                log_dir: e.log_dir,
+                last_activity_secs,
+            }
         })
         .collect())
 }
@@ -1505,6 +1512,7 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                updated_at: None,
             },
         )
         .unwrap();
@@ -1525,6 +1533,7 @@ mod tests {
                 pid: None,
                 pr: None,
                 rework_count: 0,
+                updated_at: None,
             },
         )
         .unwrap();
@@ -1537,6 +1546,10 @@ mod tests {
         assert_eq!(w.agent_state.as_deref(), Some("blocked"));
         assert!((w.cost_usd - 0.05).abs() < f64::EPSILON);
         assert_eq!(w.log_dir.as_deref(), Some("/tmp/logs/W1-123"));
+        assert!(
+            w.last_activity_secs.is_some(),
+            "last_activity_secs must be populated from journal.updated_at"
+        );
         let r = s
             .daemon_agents
             .iter()
@@ -1546,6 +1559,7 @@ mod tests {
         assert_eq!(r.agent_state, None);
         assert!((r.cost_usd - 0.01).abs() < f64::EPSILON);
         assert_eq!(r.log_dir, None);
+        assert!(r.last_activity_secs.is_some());
     }
 
     #[test]
