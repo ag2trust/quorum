@@ -199,8 +199,12 @@ fn print_status_table(s: &quorum_core::stats::Stats) {
                 .as_deref()
                 .map(|p| format!("  log: {p}"))
                 .unwrap_or_default();
+            let activity_str = match d.last_activity_age_secs {
+                Some(age) => format!("  · last activity: {} ago", fmt_age(age)),
+                None => String::new(),
+            };
             println!(
-                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{cost_str}{state_str}{log_str}",
+                "  {:<24} {:<8} {:<18} phase={:<16} tokens={}{cost_str}{state_str}{activity_str}{log_str}",
                 d.agent, d.role, task_str, d.phase, d.cost_tokens,
             );
         }
