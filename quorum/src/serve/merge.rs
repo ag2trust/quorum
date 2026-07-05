@@ -205,11 +205,15 @@ pub struct GhMergeExecutor {
 
 impl GhMergeExecutor {
     fn read_token(&self) -> Option<String> {
-        self.token_file.as_ref().and_then(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
+        self.token_file
+            .as_ref()
+            .and_then(|p| match std::fs::read_to_string(p) {
+                Ok(s) => Some(s.trim().to_string()),
+                Err(e) => {
+                    eprintln!("warn: failed to read merge-token file {}: {e}", p.display());
+                    None
+                }
+            })
     }
 }
 
@@ -956,6 +960,36 @@ mod tests {
     #[test]
     fn parse_mergeability_missing_field() {
         assert_eq!(parse_mergeability(r#"{}"#), MergeabilityState::Mergeable,);
+    }
+
+    #[test]
+    fn read_token_returns_none_on_missing_file() {
+        let exec = GhMergeExecutor {
+            token_file: Some(std::path::PathBuf::from("/nonexistent/path/token")),
+            gh_repo: None,
+        };
+        assert!(exec.read_token().is_none());
+    }
+
+    #[test]
+    fn read_token_reads_and_trims_valid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "  my-secret-token \n").unwrap();
+        let exec = GhMergeExecutor {
+            token_file: Some(token_path),
+            gh_repo: None,
+        };
+        assert_eq!(exec.read_token().unwrap(), "my-secret-token");
+    }
+
+    #[test]
+    fn read_token_returns_none_when_no_file_configured() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: None,
+        };
+        assert!(exec.read_token().is_none());
     }
 
     #[test]
