@@ -2942,6 +2942,7 @@ async fn spawn_worker(
         worktree: wt_path.clone(),
         bare: config.bare_agent,
         resume: false,
+        allowed_tools: agent::ALLOWED_TOOLS.to_string(),
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
         Ok(mut proc) => {
@@ -3259,6 +3260,7 @@ async fn spawn_resume_worker_for_pending(
         worktree: pending.worktree_path.clone(),
         bare: config.bare_agent,
         resume: true,
+        allowed_tools: agent::ALLOWED_TOOLS.to_string(),
     };
 
     let mut proc = match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {

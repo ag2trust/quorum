@@ -11,7 +11,7 @@
 //! Orphaned worktrees (present on disk but absent from journal) are GC'd.
 //! GC is naturally scoped: it only scans this instance's `worktree_base`.
 
-use super::agent::{AgentProc, AgentSpec};
+use super::agent::{AgentProc, AgentSpec, ALLOWED_TOOLS};
 use super::names::Pool;
 use super::session_log::SessionLog;
 use super::worktree::WorktreeManager;
@@ -270,6 +270,7 @@ pub(crate) async fn recover(
                     worktree: wt_path.clone(),
                     bare: config.bare_agent,
                     resume: true,
+                    allowed_tools: ALLOWED_TOOLS.to_string(),
                 };
 
                 match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
