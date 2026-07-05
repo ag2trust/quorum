@@ -242,6 +242,8 @@ fn policy_blocked_merge_parks_task_no_rework() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -341,6 +343,8 @@ fn conflicting_pr_skips_merge_sends_rework() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -426,6 +430,8 @@ fn retryable_merge_sends_rework_turn() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 

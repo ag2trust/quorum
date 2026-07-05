@@ -21,6 +21,12 @@ pub struct AgentProc {
     reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
+/// Tool allowlist for spawned agents (dontAsk auto-denies everything else).
+/// `Skill` is required so reviewers can invoke the pinned `pr-review` skill
+/// (#206) — without it the Skill call is silently denied and the review
+/// degrades to an unstructured read.
+pub(crate) const ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch,Skill";
+
 /// Build a stream-json user turn. The claude CLI requires `message.role` and
 /// exits 1 on the first message without it — every turn fed to an agent MUST
 /// go through this helper (first live run died instantly on a role-less turn).
@@ -63,7 +69,7 @@ impl AgentProc {
             .arg("--permission-mode")
             .arg("dontAsk")
             .arg("--allowedTools")
-            .arg("Bash,Read,Edit,Write,Glob,Grep,TodoWrite,WebFetch");
+            .arg(ALLOWED_TOOLS);
 
         if spec.bare {
             cmd.arg("--bare");
@@ -158,6 +164,14 @@ impl AgentProc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #206: reviewers are instructed to invoke the pinned `pr-review` skill;
+    /// without `Skill` in the allowlist the invocation is auto-denied under
+    /// dontAsk and the review silently degrades to an unstructured read.
+    #[test]
+    fn allowed_tools_include_skill() {
+        assert!(ALLOWED_TOOLS.split(',').any(|t| t == "Skill"));
+    }
 
     #[test]
     fn user_turn_has_type_role_and_content() {

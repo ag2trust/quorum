@@ -252,6 +252,8 @@ fn checks_pass_then_merge_succeeds() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -337,6 +339,8 @@ fn checks_fail_sends_rework() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -427,6 +431,8 @@ fn checks_timeout_parks_task() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 
@@ -542,6 +548,8 @@ fn checks_pending_then_ready_merges_after_wait() {
             "1",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ],
     );
 

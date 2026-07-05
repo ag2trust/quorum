@@ -46,6 +46,8 @@ fn done_with_verdict() {
             "55",
             "--verdict",
             "approved",
+            "--blocking",
+            "0",
         ])
         .assert()
         .success()
@@ -78,4 +80,89 @@ fn done_with_changes_and_feedback() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\":true"));
+}
+
+// --- #206 verdict discipline: the verdict must match the review's findings ---
+
+/// #198 regression: the reviewer wrote two BLOCKING findings and then signaled
+/// `approved`; the merge shipped the bugs (#205). An approve carrying a
+/// nonzero blocking count must be refused at the CLI.
+#[test]
+fn done_approved_with_blocking_findings_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "done",
+            "--agent",
+            "Reviewer-1",
+            "--pr",
+            "198",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "2",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--verdict changes"));
+}
+
+#[test]
+fn done_approved_without_blocking_attestation_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "done",
+            "--agent",
+            "Reviewer-1",
+            "--pr",
+            "55",
+            "--verdict",
+            "approved",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--blocking 0"));
+}
+
+#[test]
+fn done_changes_without_feedback_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "done",
+            "--agent",
+            "Reviewer-1",
+            "--pr",
+            "60",
+            "--verdict",
+            "changes",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--feedback"));
 }
