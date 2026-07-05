@@ -1056,17 +1056,18 @@ pub fn auto_resolve_review(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, resolver_agent, now)?;
 
-    let review_row: Option<(i64, Option<String>, Option<String>)> = tx
+    let review_row: Option<(i64, String, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT id, refs, orig FROM tasks
-             WHERE status='open' AND labels LIKE '%\"kind:review\"%'
+            "SELECT id, status, refs, orig FROM tasks
+             WHERE status IN ('open','claimed','done')
+               AND labels LIKE '%\"kind:review\"%'
              ORDER BY id DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
 
-    let Some((review_id, refs_str, orig_opt)) = review_row else {
+    let Some((review_id, review_status, refs_str, orig_opt)) = review_row else {
         tx.commit()?;
         return Ok(None);
     };
@@ -1076,32 +1077,35 @@ pub fn auto_resolve_review(
         return Ok(None);
     }
 
-    let n = tx.execute(
-        "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
-         WHERE id=?3 AND status='open'",
-        params![resolver_agent, now, review_id],
-    )?;
-    if n == 0 {
-        tx.commit()?;
-        return Ok(None);
+    if review_status == "open" {
+        let n = tx.execute(
+            "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
+             WHERE id=?3 AND status='open'",
+            params![resolver_agent, now, review_id],
+        )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let target = lease_target(review_id);
+        tx.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+            params![target, resolver_agent, now, now + 3600],
+        )?;
     }
 
-    let target = lease_target(review_id);
     tx.execute(
-        "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
-        params![target, resolver_agent, now, now + 3600],
+        "UPDATE tasks SET status='closed', body=?1, updated_at=?2
+         WHERE id=?3 AND status IN ('open','claimed','done')",
+        params![note, now, review_id],
     )?;
 
-    tx.execute(
-        "UPDATE tasks SET status='done', body=?1, updated_at=?2
-         WHERE id=?3 AND assignee=?4 AND status='claimed'",
-        params![note, now, review_id, resolver_agent],
-    )?;
     deactivate_lease(&tx, review_id, now)?;
 
     crate::events::emit(
         &tx,
-        "task_done",
+        "review_auto_resolved",
         &lease_target(review_id),
         &format!("auto-resolved by daemon (in-cycle review for task#{source_task_id})"),
         now,
@@ -1110,14 +1114,6 @@ pub fn auto_resolve_review(
     if let Some(orig) = orig_opt {
         apply_verdict(&tx, "approve", source_task_id, resolver_agent, &orig, now)?;
     }
-
-    crate::events::emit(
-        &tx,
-        "review_auto_resolved",
-        &lease_target(review_id),
-        &format!("daemon auto-resolved review#{review_id} for task#{source_task_id}"),
-        now,
-    )?;
 
     tx.commit()?;
     Ok(Some(review_id))
@@ -3672,7 +3668,7 @@ mod tests {
         assert_eq!(review_id, reviews[0].id);
 
         let review = get(&c, review_id).unwrap().unwrap();
-        assert_eq!(review.status, "done");
+        assert_eq!(review.status, "closed");
         assert_eq!(
             review.body.as_deref(),
             Some("auto-resolved: in-cycle review")
