@@ -8,6 +8,7 @@ pub mod approvals;
 pub mod merge;
 pub mod names;
 pub mod recovery;
+pub mod render;
 pub mod reviewer;
 pub mod session_log;
 pub mod stream;

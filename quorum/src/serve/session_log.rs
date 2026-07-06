@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::render;
 use super::stream::Event;
 
 pub struct SessionLog {
@@ -161,32 +162,8 @@ impl SessionLog {
             let _ = writeln!(self.stream_file, "{json}");
         }
 
-        match event {
-            Event::Assistant { message } => {
-                if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                    let _ = writeln!(self.transcript_file, "## Assistant\n\n{content}\n");
-                }
-            }
-            Event::ToolUse { name, .. } => {
-                let _ = writeln!(self.transcript_file, "> Tool: `{name}`\n");
-            }
-            Event::Result {
-                usage,
-                total_cost_usd,
-                ..
-            } => {
-                let tokens = usage
-                    .as_ref()
-                    .map_or(0, |u| u.input_tokens + u.output_tokens);
-                let cost_str = total_cost_usd
-                    .map(|c| format!(" · ${c:.4}"))
-                    .unwrap_or_default();
-                let _ = writeln!(
-                    self.transcript_file,
-                    "---\n*Turn complete: {tokens} tokens{cost_str}*\n"
-                );
-            }
-            Event::Other => {}
+        if let Some(rendered) = render::render_event(event) {
+            let _ = writeln!(self.transcript_file, "{rendered}");
         }
 
         let _ = self.transcript_file.flush();
@@ -319,7 +296,7 @@ mod tests {
 
         let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
         assert!(transcript.contains("Hello world"));
-        assert!(transcript.contains("Tool: `Bash`"));
+        assert!(transcript.contains("> Bash:"));
     }
 
     #[test]
@@ -388,6 +365,33 @@ mod tests {
     }
 
     #[test]
+    fn assistant_array_content_renders_to_transcript() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+
+        let event = Event::Assistant {
+            message: serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "I'll check the code."},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/src/main.rs"}},
+                ]
+            }),
+        };
+        log.log_event(&event);
+
+        let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
+        assert!(
+            transcript.contains("I'll check the code."),
+            "array text blocks must render: {transcript}"
+        );
+        assert!(
+            transcript.contains("> Read: main.rs"),
+            "array tool_use blocks must render: {transcript}"
+        );
+    }
+
+    #[test]
     fn log_rework_writes_header() {
         let dir = TempDir::new().unwrap();
         let mut log =
@@ -412,7 +416,7 @@ mod tests {
         // Read from a separate file handle — verifies data is flushed to OS
         let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
         assert!(
-            transcript.contains("Tool: `Bash`"),
+            transcript.contains("> Bash:"),
             "transcript must be visible to other readers immediately after log_event"
         );
         let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();

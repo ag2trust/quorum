@@ -58,6 +58,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
+        cli::Command::Tail { .. } => "tail",
         cli::Command::Help => "help",
     }
 }
@@ -870,6 +871,67 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
             };
             Ok(serve::run_serve(config)?)
+        }
+        cli::Command::Tail { agent, follow, raw } => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let entries = quorum_core::journal::list_in_flight(&conn)?;
+            let entry = entries.iter().find(|e| e.agent == agent);
+            let log_dir = entry.and_then(|e| e.log_dir.as_deref()).ok_or_else(|| {
+                QuorumError::Usage(format!(
+                    "no active session log for agent '{agent}' (agent unknown or no log dir)"
+                ))
+            })?;
+            let stream_path = std::path::Path::new(log_dir).join("stream.jsonl");
+            if !stream_path.exists() {
+                return Err(QuorumError::Usage(format!(
+                    "stream.jsonl not found at {}",
+                    stream_path.display()
+                )));
+            }
+            drop(conn);
+
+            use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+            let print_from = |file: &mut std::fs::File| -> std::io::Result<()> {
+                let reader = BufReader::new(file.try_clone()?);
+                for line in reader.lines() {
+                    let line = line?;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if raw {
+                        println!("{line}");
+                    } else if let Some(event) = serve::stream::parse_line(&line) {
+                        if let Some(rendered) = serve::render::render_event(&event) {
+                            print!("{rendered}");
+                        }
+                    }
+                }
+                Ok(())
+            };
+
+            let mut file =
+                std::fs::File::open(&stream_path).map_err(|e| QuorumError::Io(e.to_string()))?;
+            print_from(&mut file).map_err(|e| QuorumError::Io(e.to_string()))?;
+
+            if follow {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let pos = file
+                        .stream_position()
+                        .map_err(|e| QuorumError::Io(e.to_string()))?;
+                    let meta = file
+                        .metadata()
+                        .map_err(|e| QuorumError::Io(e.to_string()))?;
+                    if meta.len() > pos {
+                        file.seek(SeekFrom::Start(pos))
+                            .map_err(|e| QuorumError::Io(e.to_string()))?;
+                        print_from(&mut file).map_err(|e| QuorumError::Io(e.to_string()))?;
+                    }
+                }
+            }
+
+            Ok(0)
         }
         cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);
