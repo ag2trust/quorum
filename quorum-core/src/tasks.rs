@@ -1056,17 +1056,18 @@ pub fn auto_resolve_review(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, resolver_agent, now)?;
 
-    let review_row: Option<(i64, Option<String>, Option<String>)> = tx
+    let review_row: Option<(i64, String, Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT id, refs, orig FROM tasks
-             WHERE status='open' AND labels LIKE '%\"kind:review\"%'
+            "SELECT id, status, refs, orig FROM tasks
+             WHERE status IN ('open','claimed','done')
+               AND labels LIKE '%\"kind:review\"%'
              ORDER BY id DESC LIMIT 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
 
-    let Some((review_id, refs_str, orig_opt)) = review_row else {
+    let Some((review_id, review_status, refs_str, orig_opt)) = review_row else {
         tx.commit()?;
         return Ok(None);
     };
@@ -1076,32 +1077,35 @@ pub fn auto_resolve_review(
         return Ok(None);
     }
 
-    let n = tx.execute(
-        "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
-         WHERE id=?3 AND status='open'",
-        params![resolver_agent, now, review_id],
-    )?;
-    if n == 0 {
-        tx.commit()?;
-        return Ok(None);
+    if review_status == "open" {
+        let n = tx.execute(
+            "UPDATE tasks SET status='claimed', assignee=?1, updated_at=?2
+             WHERE id=?3 AND status='open'",
+            params![resolver_agent, now, review_id],
+        )?;
+        if n == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let target = lease_target(review_id);
+        tx.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+            params![target, resolver_agent, now, now + 3600],
+        )?;
     }
 
-    let target = lease_target(review_id);
     tx.execute(
-        "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
-        params![target, resolver_agent, now, now + 3600],
+        "UPDATE tasks SET status='closed', body=?1, updated_at=?2
+         WHERE id=?3 AND status IN ('open','claimed','done')",
+        params![note, now, review_id],
     )?;
 
-    tx.execute(
-        "UPDATE tasks SET status='done', body=?1, updated_at=?2
-         WHERE id=?3 AND assignee=?4 AND status='claimed'",
-        params![note, now, review_id, resolver_agent],
-    )?;
     deactivate_lease(&tx, review_id, now)?;
 
     crate::events::emit(
         &tx,
-        "task_done",
+        "review_auto_resolved",
         &lease_target(review_id),
         &format!("auto-resolved by daemon (in-cycle review for task#{source_task_id})"),
         now,
@@ -1110,14 +1114,6 @@ pub fn auto_resolve_review(
     if let Some(orig) = orig_opt {
         apply_verdict(&tx, "approve", source_task_id, resolver_agent, &orig, now)?;
     }
-
-    crate::events::emit(
-        &tx,
-        "review_auto_resolved",
-        &lease_target(review_id),
-        &format!("daemon auto-resolved review#{review_id} for task#{source_task_id}"),
-        now,
-    )?;
 
     tx.commit()?;
     Ok(Some(review_id))
@@ -3672,7 +3668,7 @@ mod tests {
         assert_eq!(review_id, reviews[0].id);
 
         let review = get(&c, review_id).unwrap().unwrap();
-        assert_eq!(review.status, "done");
+        assert_eq!(review.status, "closed");
         assert_eq!(
             review.body.as_deref(),
             Some("auto-resolved: in-cycle review")
@@ -3783,6 +3779,75 @@ mod tests {
 
         let second = auto_resolve_review(&mut c, tid, "daemon", "note", 1004).unwrap();
         assert_eq!(second, None, "second call must be a no-op");
+    }
+
+    #[test]
+    fn auto_resolve_review_handles_already_claimed_review() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert_eq!(reviews.len(), 1, "done must auto-spawn a review task");
+        let rid = reviews[0].id;
+
+        claim(&mut c, "reviewer-X", Some(rid), &[], TTL, 1003).unwrap();
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "claimed");
+
+        let resolved = auto_resolve_review(&mut c, tid, "daemon", "auto-resolved", 1004).unwrap();
+        assert!(resolved.is_some(), "must resolve a claimed review task");
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "closed");
+    }
+
+    #[test]
+    fn auto_resolve_review_handles_already_done_review() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert_eq!(reviews.len(), 1);
+        let rid = reviews[0].id;
+
+        claim(&mut c, "reviewer-X", Some(rid), &[], TTL, 1003).unwrap();
+        // Advance review task to done directly — simulates a reviewer completing
+        // their review before auto_resolve runs (the exact production scenario).
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1 WHERE id=?2",
+            params![1004, rid],
+        )
+        .unwrap();
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "done");
+
+        let resolved = auto_resolve_review(&mut c, tid, "daemon", "auto-resolved", 1005).unwrap();
+        assert!(resolved.is_some(), "must resolve a done review task");
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "closed");
     }
 
     #[test]
