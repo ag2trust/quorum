@@ -3782,6 +3782,75 @@ mod tests {
     }
 
     #[test]
+    fn auto_resolve_review_handles_already_claimed_review() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert_eq!(reviews.len(), 1, "done must auto-spawn a review task");
+        let rid = reviews[0].id;
+
+        claim(&mut c, "reviewer-X", Some(rid), &[], TTL, 1003).unwrap();
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "claimed");
+
+        let resolved = auto_resolve_review(&mut c, tid, "daemon", "auto-resolved", 1004).unwrap();
+        assert!(resolved.is_some(), "must resolve a claimed review task");
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "closed");
+    }
+
+    #[test]
+    fn auto_resolve_review_handles_already_done_review() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(&mut c, "boss", "T", None, 50, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(tid), &[], TTL, 1001).unwrap();
+        update(
+            &mut c,
+            "A",
+            tid,
+            &TaskUpdate {
+                status: Some("done"),
+                body: None,
+                refs: None,
+                verdict: None,
+            },
+            1002,
+        )
+        .unwrap();
+
+        let reviews = list(&c, Some("open"), Some(REVIEW_LABEL), None).unwrap();
+        assert_eq!(reviews.len(), 1);
+        let rid = reviews[0].id;
+
+        claim(&mut c, "reviewer-X", Some(rid), &[], TTL, 1003).unwrap();
+        // Advance review task to done directly — simulates a reviewer completing
+        // their review before auto_resolve runs (the exact production scenario).
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1 WHERE id=?2",
+            params![1004, rid],
+        )
+        .unwrap();
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "done");
+
+        let resolved = auto_resolve_review(&mut c, tid, "daemon", "auto-resolved", 1005).unwrap();
+        assert!(resolved.is_some(), "must resolve a done review task");
+        assert_eq!(get(&c, rid).unwrap().unwrap().status, "closed");
+    }
+
+    #[test]
     fn reopen_parked_merge_blocked_by_assignee() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "task1", None, 0, None, None, None, 1000).unwrap();
