@@ -11,7 +11,7 @@
 
 use crate::error::Result;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
 pub const RECENT_MSG_LIMIT: i64 = 5;
@@ -19,6 +19,18 @@ pub const RECENT_MSG_LIMIT: i64 = 5;
 pub const MSG_PREVIEW_CHARS: usize = 80;
 /// A `done` task older than this is "stuck awaiting review" — surfaces stalled review loops.
 pub const DONE_STUCK_THRESHOLD_SECS: i64 = 30 * 60;
+
+/// Sidecar file written by the daemon per agent slot — carries live progress
+/// stats that the status reader picks up without a DB schema change.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DaemonLiveStats {
+    pub tools: u32,
+    pub now: String,
+    pub evm: f64,
+    pub up_secs: u64,
+    pub mid_turn_tok: i64,
+    pub spawn_epoch: i64,
+}
 
 /// Per-status task count.
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -172,6 +184,10 @@ pub struct DaemonAgentView {
     pub tier_eff: Option<String>,
     pub pr: Option<i64>,
     pub rework_count: i32,
+    pub tool_count: u32,
+    pub now_label: Option<String>,
+    pub events_per_min: Option<f64>,
+    pub uptime_secs: Option<i64>,
 }
 
 /// Individual claimable task for the QUEUE section (#204 cockpit).
@@ -322,7 +338,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     // Issue #101 (experimental): stats-only PostToolUse hook activity. Empty
     // vec when no events recorded — section is suppressed in the renderer.
     let activity = crate::activity::activity_summary(conn, now)?;
-    let daemon_agents = daemon_agents_view(conn)?;
+    let daemon_agents = daemon_agents_view(conn, now)?;
     let queue_tasks_list = queue_tasks(conn)?;
     let pipeline = pipeline_tasks(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
@@ -331,7 +347,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         .iter()
         .filter(|d| d.role == "worker")
         .filter(|d| {
-            matches!(d.last_activity_age_secs, Some(age) if age > 120)
+            matches!(d.last_activity_age_secs, Some(age) if age > 180)
                 || d.last_activity_age_secs.is_none()
         })
         .count() as i64;
@@ -789,11 +805,16 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
     })
 }
 
-fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
+fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView>> {
     let entries = crate::journal::list_in_flight(conn)?;
     let mut views = Vec::with_capacity(entries.len());
     for e in entries {
-        let last_activity_age_secs = e.log_dir.as_deref().and_then(stream_jsonl_age_secs);
+        let live = e.log_dir.as_deref().and_then(read_live_stats);
+        let last_activity_age_secs = if live.is_some() {
+            e.log_dir.as_deref().and_then(live_sidecar_age_secs)
+        } else {
+            e.log_dir.as_deref().and_then(stream_jsonl_age_secs)
+        };
         let (task_title, tier_eff) = if let Some(tid) = e.task_id {
             match conn.query_row(
                 "SELECT title, labels FROM tasks WHERE id=?1",
@@ -809,12 +830,34 @@ fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
         } else {
             (None, None)
         };
+        let (tool_count, now_label, events_per_min, uptime_secs, mid_turn_tok) =
+            if let Some(ref ls) = live {
+                let up = if ls.spawn_epoch > 0 {
+                    Some(now - ls.spawn_epoch)
+                } else {
+                    None
+                };
+                (
+                    ls.tools,
+                    if ls.now.is_empty() {
+                        None
+                    } else {
+                        Some(ls.now.clone())
+                    },
+                    Some(ls.evm),
+                    up,
+                    ls.mid_turn_tok,
+                )
+            } else {
+                (0, None, None, None, 0)
+            };
+        let display_tokens = e.cost_tokens + mid_turn_tok;
         views.push(DaemonAgentView {
             agent: e.agent,
             role: e.role,
             task_id: e.task_id,
             phase: e.phase,
-            cost_tokens: e.cost_tokens,
+            cost_tokens: display_tokens,
             agent_state: e.agent_state,
             cost_usd: e.cost_usd,
             log_dir: e.log_dir,
@@ -823,6 +866,10 @@ fn daemon_agents_view(conn: &Connection) -> Result<Vec<DaemonAgentView>> {
             tier_eff,
             pr: e.pr,
             rework_count: e.rework_count,
+            tool_count,
+            now_label,
+            events_per_min,
+            uptime_secs,
         });
     }
     Ok(views)
@@ -988,12 +1035,13 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
 }
 
 /// Compute the health verdict (#204).
+/// Thresholds: 60s silent → attention, 180s silent → stalled.
 fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> HealthVerdict {
     let has_dead = daemon_agents
         .iter()
         .filter(|d| d.role == "worker")
         .any(|d| match d.last_activity_age_secs {
-            Some(age) => age > 120,
+            Some(age) => age > 180,
             None => true,
         });
     if has_dead {
@@ -1003,7 +1051,7 @@ fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> Hea
         .iter()
         .filter(|d| d.role == "worker")
         .any(|d| match d.last_activity_age_secs {
-            Some(age) => age > 30,
+            Some(age) => age > 60,
             None => false,
         });
     if has_stalling || errors_recent {
@@ -1018,6 +1066,20 @@ fn stream_jsonl_age_secs(log_dir: &str) -> Option<i64> {
     let mtime = meta.modified().ok()?;
     let age = mtime.elapsed().ok()?;
     Some(age.as_secs() as i64)
+}
+
+fn live_sidecar_age_secs(log_dir: &str) -> Option<i64> {
+    let path = std::path::Path::new(log_dir).join("_daemon_live.json");
+    let meta = std::fs::metadata(&path).ok()?;
+    let mtime = meta.modified().ok()?;
+    let age = mtime.elapsed().ok()?;
+    Some(age.as_secs() as i64)
+}
+
+fn read_live_stats(log_dir: &str) -> Option<DaemonLiveStats> {
+    let path = std::path::Path::new(log_dir).join("_daemon_live.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 #[cfg(test)]
@@ -1894,5 +1956,87 @@ mod tests {
         let (tasks, secs) = load_score_for(&c, "X").unwrap();
         assert_eq!(tasks, 2);
         assert_eq!(secs, 60);
+    }
+
+    #[test]
+    fn daemon_live_stats_serde_roundtrip() {
+        let stats = DaemonLiveStats {
+            tools: 27,
+            now: "Bash: cargo test".into(),
+            evm: 14.5,
+            up_secs: 240,
+            mid_turn_tok: 18000,
+            spawn_epoch: 1720300000,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let back: DaemonLiveStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tools, 27);
+        assert_eq!(back.now, "Bash: cargo test");
+        assert!((back.evm - 14.5).abs() < f64::EPSILON);
+        assert_eq!(back.up_secs, 240);
+        assert_eq!(back.mid_turn_tok, 18000);
+        assert_eq!(back.spawn_epoch, 1720300000);
+    }
+
+    #[test]
+    fn read_live_stats_from_sidecar_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stats = DaemonLiveStats {
+            tools: 5,
+            now: "Read: foo.rs".into(),
+            evm: 3.0,
+            up_secs: 60,
+            mid_turn_tok: 500,
+            spawn_epoch: 1720300000,
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        std::fs::write(dir.path().join("_daemon_live.json"), json).unwrap();
+        let read = read_live_stats(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(read.tools, 5);
+        assert_eq!(read.now, "Read: foo.rs");
+    }
+
+    #[test]
+    fn read_live_stats_missing_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_live_stats(dir.path().to_str().unwrap()).is_none());
+    }
+
+    #[test]
+    fn compute_health_new_thresholds() {
+        let worker = |age: Option<i64>| DaemonAgentView {
+            agent: "W".into(),
+            role: "worker".into(),
+            task_id: Some(1),
+            phase: "working".into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
+            last_activity_age_secs: age,
+            task_title: None,
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
+        };
+        assert_eq!(
+            compute_health(&[worker(Some(50))], false),
+            HealthVerdict::OnTrack,
+            "50s should be on-track (threshold is 60s)"
+        );
+        assert_eq!(
+            compute_health(&[worker(Some(90))], false),
+            HealthVerdict::Attention,
+            "90s should be attention (was stalled at old 120s threshold)"
+        );
+        assert_eq!(
+            compute_health(&[worker(Some(200))], false),
+            HealthVerdict::Stalled,
+            "200s should be stalled"
+        );
     }
 }

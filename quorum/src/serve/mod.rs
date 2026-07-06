@@ -20,8 +20,9 @@ use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::Event;
 use quorum_core::mailbox;
+use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -362,6 +363,58 @@ fn pid_is_alive(pid: i64) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+pub(crate) struct LiveStats {
+    tool_count: u32,
+    now_label: String,
+    event_times: VecDeque<std::time::Instant>,
+    mid_turn_tokens: i64,
+    spawn_epoch: i64,
+}
+
+impl LiveStats {
+    fn new() -> Self {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        Self {
+            tool_count: 0,
+            now_label: String::new(),
+            event_times: VecDeque::new(),
+            mid_turn_tokens: 0,
+            spawn_epoch: epoch,
+        }
+    }
+
+    fn record_event(&mut self) {
+        let now = std::time::Instant::now();
+        self.event_times.push_back(now);
+        while let Some(front) = self.event_times.front() {
+            if now.duration_since(*front).as_secs() > 60 {
+                self.event_times.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn events_per_min(&self) -> f64 {
+        let now = std::time::Instant::now();
+        self.event_times
+            .iter()
+            .filter(|t| now.duration_since(**t).as_secs() <= 60)
+            .count() as f64
+    }
+
+    fn uptime_secs(&self) -> u64 {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        (now_epoch - self.spawn_epoch).max(0) as u64
+    }
+}
+
 pub(crate) struct SlotState {
     agent_name: String,
     proc: AgentProc,
@@ -378,6 +431,7 @@ pub(crate) struct SlotState {
     turn_started_at: std::time::Instant,
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
+    live_stats: LiveStats,
 }
 
 /// A worker task that has already delivered a PR (`done --pr N`) and is
@@ -2573,6 +2627,9 @@ async fn drain_events(
                 .ok();
 
                 slot.draining = false;
+                slot.live_stats.mid_turn_tokens = 0;
+                slot.live_stats.record_event();
+                write_live_sidecar(slot);
 
                 if let Some(ref mut sl) = slot.session_log {
                     sl.log_event(&event);
@@ -2601,6 +2658,27 @@ async fn drain_events(
                     };
                     log(&format!("{role} {}: {preview}", slot.agent_name));
                 }
+                if let Some(usage) = message.get("usage") {
+                    let input = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let output = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if input + output > 0 {
+                        slot.live_stats.mid_turn_tokens = input + output;
+                    }
+                }
+                slot.live_stats.record_event();
+                write_live_sidecar(slot);
+            }
+            stream::Event::ToolUse { name, input } => {
+                slot.live_stats.tool_count += 1;
+                slot.live_stats.now_label = now_label(name, input);
+                slot.live_stats.record_event();
+                write_live_sidecar(slot);
             }
             _ => {}
         }
@@ -2610,6 +2688,59 @@ async fn drain_events(
         }
     }
     Ok(None)
+}
+
+fn write_live_sidecar(slot: &SlotState) {
+    if let Some(ref sl) = slot.session_log {
+        let path = sl.dir().join("_daemon_live.json");
+        let stats = DaemonLiveStats {
+            tools: slot.live_stats.tool_count,
+            now: slot.live_stats.now_label.clone(),
+            evm: slot.live_stats.events_per_min(),
+            up_secs: slot.live_stats.uptime_secs(),
+            mid_turn_tok: slot.live_stats.mid_turn_tokens,
+            spawn_epoch: slot.live_stats.spawn_epoch,
+        };
+        if let Ok(json) = serde_json::to_string(&stats) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+}
+
+fn now_label(name: &str, input: &serde_json::Value) -> String {
+    let snippet = match name {
+        "Bash" => input
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|c| c.split_whitespace().take(3).collect::<Vec<_>>().join(" ")),
+        "Read" | "Write" | "Edit" => input
+            .get("file_path")
+            .and_then(|p| p.as_str())
+            .map(|p| p.rsplit('/').next().unwrap_or(p).to_string()),
+        "Grep" => input
+            .get("pattern")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string()),
+        "Glob" => input
+            .get("pattern")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string()),
+        "Agent" => input
+            .get("description")
+            .and_then(|d| d.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    };
+    let full = match snippet {
+        Some(s) => format!("{name}: {s}"),
+        None => name.to_string(),
+    };
+    if full.chars().count() <= 24 {
+        full
+    } else {
+        let t: String = full.chars().take(23).collect();
+        format!("{t}…")
+    }
 }
 
 /// A minimal view of the reviewer's counterpart — the agent whose PR is
@@ -2897,6 +3028,7 @@ async fn spawn_reviewer_for_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: reviewer_session_log,
+                live_stats: LiveStats::new(),
             });
         }
         Err(e) => {
@@ -3192,6 +3324,7 @@ async fn spawn_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: worker_session_log,
+                live_stats: LiveStats::new(),
             });
         }
         Err(e) => {
@@ -3598,6 +3731,7 @@ async fn spawn_resume_worker_for_pending(
         turn_started_at: now_instant,
         agent_state: pending.agent_state.clone(),
         session_log,
+        live_stats: LiveStats::new(),
     };
 
     if let Some(ref mut sl) = slot.session_log {
@@ -3784,6 +3918,7 @@ mod tests {
             turn_started_at: now,
             agent_state: None,
             session_log: None,
+            live_stats: LiveStats::new(),
         }
     }
 
@@ -4147,5 +4282,46 @@ mod tests {
             !tracker.is_exhausted(1, 43),
             "different PR on same task must not be exhausted"
         );
+    }
+
+    #[test]
+    fn now_label_bash_command() {
+        let input = serde_json::json!({"command": "cargo test"});
+        assert_eq!(now_label("Bash", &input), "Bash: cargo test");
+    }
+
+    #[test]
+    fn now_label_read_file() {
+        let input = serde_json::json!({"file_path": "/foo/bar/stats.rs"});
+        assert_eq!(now_label("Read", &input), "Read: stats.rs");
+    }
+
+    #[test]
+    fn now_label_truncation() {
+        let input = serde_json::json!({"command": "cargo build --all-targets --features bundled"});
+        let label = now_label("Bash", &input);
+        assert!(label.chars().count() <= 24, "label too long: {label}");
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn now_label_unknown_tool() {
+        let input = serde_json::json!({});
+        assert_eq!(now_label("UnknownTool", &input), "UnknownTool");
+    }
+
+    #[test]
+    fn live_stats_event_ring_buffer() {
+        let mut ls = LiveStats::new();
+        for _ in 0..5 {
+            ls.record_event();
+        }
+        assert_eq!(ls.events_per_min(), 5.0);
+    }
+
+    #[test]
+    fn live_stats_uptime_is_nonnegative() {
+        let ls = LiveStats::new();
+        assert!(ls.uptime_secs() < 2);
     }
 }
