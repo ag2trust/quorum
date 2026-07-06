@@ -1071,3 +1071,10 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 8
 5. **sticky_until undocumented:** Baseline audit noted `sticky_until` is live in code
    (sync.rs, schema.sql, db.rs) but absent from the design spec. No downstream audit
    filed this as a finding. Flagged for owner: should this be a docs candidate?
+
+---
+
+## Run log: issue filing (2026-07-06)
+
+**Agent:** Hoist-d24 (task #23)
+**Result:** No-op — 0 of 37 candidates marked `FILE: yes`. All entries remain `FILE: pending`. No GitHub issues filed.
