@@ -33,6 +33,7 @@ pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
 
 const KNOWN_TIERS: &[&str] = &["opus-46", "opus-47", "opus-48", "sonnet-5"];
+const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
 
 pub fn lease_target(id: i64) -> String {
     format!("task#{id}")
@@ -230,6 +231,15 @@ fn validate_labels(s: &str) -> Result<()> {
                      serve will fall back to the global default model",
                     KNOWN_TIERS.join(", ")
                 );
+            }
+        }
+        if let Some(effort) = label.strip_prefix("effort:") {
+            if !effort.is_empty() && !KNOWN_EFFORTS.contains(&effort) {
+                return Err(QuorumError::Usage(format!(
+                    "invalid effort '{effort}' in --labels; only {} are accepted \
+                     (serve rejects anything else at dispatch)",
+                    KNOWN_EFFORTS.join(", ")
+                )));
             }
         }
     }
@@ -1976,5 +1986,48 @@ mod tests {
         assert_eq!(extract_pr_number(&Some(r#"{"pr":"99"}"#.into())), Some(99),);
         assert_eq!(extract_pr_number(&None), None);
         assert_eq!(extract_pr_number(&Some(r#"{"branch":"foo"}"#.into())), None,);
+    }
+
+    #[test]
+    fn validate_labels_accepts_known_efforts() {
+        assert!(validate_labels(r#"["effort:medium"]"#).is_ok());
+        assert!(validate_labels(r#"["effort:high"]"#).is_ok());
+        assert!(validate_labels(r#"["tier:opus-46","effort:medium"]"#).is_ok());
+    }
+
+    #[test]
+    fn validate_labels_rejects_effort_low() {
+        let err = validate_labels(r#"["effort:low"]"#).unwrap_err();
+        assert!(
+            matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort 'low'")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_labels_rejects_effort_max() {
+        assert!(validate_labels(r#"["effort:max"]"#).is_err());
+    }
+
+    #[test]
+    fn create_rejects_effort_low_at_task_create() {
+        let (_d, mut c) = open_tmp();
+        let err = create(
+            &mut c,
+            "boss",
+            "bad-effort",
+            None,
+            0,
+            Some(r#"["effort:low"]"#),
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort")),
+            "task-create must reject effort:low, got {err:?}"
+        );
     }
 }
