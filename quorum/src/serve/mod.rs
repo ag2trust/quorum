@@ -681,7 +681,61 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
 
     log(&format!("serving (cap={})", config.cap));
 
+    // Standalone heartbeat task — refreshes the daemon lock every 10s,
+    // independent of tick() duration. Detects lock theft (0-row refresh)
+    // and signals the main loop to exit immediately.
+    let lock_stolen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let db = config.db_path.clone();
+        let pid = daemon_pid;
+        let stolen = lock_stolen.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let db2 = db.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || -> std::result::Result<usize, String> {
+                        let conn = quorum_core::db::open(&db2).map_err(|e| e.to_string())?;
+                        let now = now_unix();
+                        quorum_core::daemon_lock::refresh(&conn, pid, now)
+                            .map_err(|e| e.to_string())
+                    })
+                    .await;
+                match result {
+                    Ok(Ok(0)) => {
+                        log("FATAL: daemon lock stolen — another daemon owns this DB; exiting immediately");
+                        stolen.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(Err(e)) => {
+                        log(&format!("heartbeat refresh error: {e}"));
+                    }
+                    Err(e) => {
+                        log(&format!("heartbeat spawn_blocking join error: {e}"));
+                    }
+                    Ok(Ok(_)) => {}
+                }
+            }
+        });
+    }
+
     loop {
+        // Check if heartbeat task detected lock theft.
+        if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
+            log("daemon lock stolen — tearing down and exiting");
+            for r in reviewers.drain(..) {
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+            }
+            for w in workers.drain(..) {
+                teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
+            }
+            for p in pending_reviews.drain(..) {
+                teardown_pending_review(config, &wt_mgr, &mut name_pool, p, "open", None).await;
+            }
+            return Ok(1);
+        }
         let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
 
         // Second signal (or first signal with no in-flight agents): immediate teardown.
@@ -843,17 +897,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             }
         }
 
-        // Refresh the daemon lock heartbeat so a competing daemon sees us as live.
-        {
-            let db = config.db_path.clone();
-            let pid = daemon_pid;
-            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = quorum_core::db::open(&db)?;
-                let now = now_unix();
-                quorum_core::daemon_lock::refresh(&conn, pid, now)
-            })
-            .await;
-        }
+        // Heartbeat is refreshed by the standalone heartbeat_task (see above).
     }
 }
 
