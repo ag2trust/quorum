@@ -481,6 +481,29 @@ pub fn apply_event(
         .ok_or_else(|| QuorumError::Usage(format!("task {id} not found")))?;
 
     let status = task.status.parse::<Status>().map_err(QuorumError::Usage)?;
+
+    match event {
+        Event::SignaledDone { .. } | Event::ReworkPushed => {
+            if task.author.as_deref() != Some(agent) {
+                tx.commit()?;
+                return Err(QuorumError::NotHolder);
+            }
+        }
+        Event::VerdictApprove | Event::VerdictChanges => {
+            if task.reviewer.as_deref() != Some(agent) {
+                tx.commit()?;
+                return Err(QuorumError::NotHolder);
+            }
+        }
+        Event::Claimed { .. }
+        | Event::ReviewerAttached { .. }
+        | Event::LeaseExpired
+        | Event::AgentFailed { .. }
+        | Event::Cancelled { .. }
+        | Event::MergeSucceeded
+        | Event::MergeFailed { .. } => {}
+    }
+
     let view = TaskView {
         status,
         author: task.author.clone(),
@@ -1234,6 +1257,135 @@ mod tests {
         assert_eq!(r.task.status, "cancelled");
         assert!(r.effects.contains(&Effect::ReleaseLease));
         assert!(!has_live_lease(&c, id, 1001));
+    }
+
+    // ── apply_event caller authorization ──────────────────────────────────
+
+    #[test]
+    fn apply_event_stale_agent_signaled_done_rejected() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        // Stale agent B tries to fire SignaledDone on A's task
+        let err = apply_event(
+            &mut c,
+            "B",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        );
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
+    }
+
+    #[test]
+    fn apply_event_stale_agent_rework_pushed_rejected() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
+        // Stale agent B tries ReworkPushed on A's task
+        let err = apply_event(&mut c, "B", id, &Event::ReworkPushed, 1004);
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
+    }
+
+    #[test]
+    fn apply_event_verdict_from_non_reviewer_rejected() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        // Non-reviewer X tries to approve
+        let err = apply_event(&mut c, "X", id, &Event::VerdictApprove, 1003);
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
+        // Non-reviewer X tries to request changes
+        let err = apply_event(&mut c, "X", id, &Event::VerdictChanges, 1003);
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
+    }
+
+    #[test]
+    fn apply_event_system_events_accept_any_caller() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        // System agent fires AgentFailed — should succeed even though "system" isn't the assignee
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::AgentFailed {
+                reason: "crashed".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "open");
+    }
+
+    #[test]
+    fn apply_event_signaled_done_after_reclaim_rejected() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // A claims and works
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        // A's lease expires (simulate via AgentFailed → open)
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::AgentFailed {
+                reason: "lease expired".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        // B reclaims
+        claim(&mut c, "B", Some(id), &[], TTL, 1002).unwrap();
+        // Stale A fires SignaledDone — must be rejected
+        let err = apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "50".to_string(),
+            },
+            1003,
+        );
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
+        // B's SignaledDone works
+        let r = apply_event(
+            &mut c,
+            "B",
+            id,
+            &Event::SignaledDone {
+                pr: "51".to_string(),
+            },
+            1004,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
     }
 
     // ── review-only task ────────────────────────────────────────────────────

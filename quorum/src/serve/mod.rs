@@ -3113,6 +3113,16 @@ async fn spawn_reviewer_for_worker(
                 .ok();
             }
 
+            fire_event(
+                &config.db_path,
+                &reviewer_name,
+                worker.task_id,
+                &Event::ReviewerAttached {
+                    agent: reviewer_name.clone(),
+                },
+            )
+            .await;
+
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
                 agent_name: reviewer_name,
