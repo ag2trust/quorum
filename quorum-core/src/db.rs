@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -236,6 +236,75 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // Net-new table + index — the `CREATE TABLE IF NOT EXISTS` /
         // `CREATE INDEX IF NOT EXISTS` in SCHEMA_SQL (which runs above) handles
         // fresh DBs and upgrades alike, so no explicit ALTER is needed here.
+
+        // v18 = per-repo DB refactor (2/3): strip repo columns from
+        // task_branches and instance_id from journal. With one DB per repo,
+        // these columns are dead. Recreate task_branches without `repo`;
+        // recreate journal without `instance_id`.
+        if current < 18 {
+            // task_branches: drop `repo`, UNIQUE(task_id,repo) → UNIQUE(task_id),
+            // UNIQUE(repo,branch) → UNIQUE(branch).
+            if column_exists(conn, "task_branches", "repo")? {
+                conn.execute_batch(
+                    "CREATE TABLE task_branches_new (
+                         id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                         task_id      INTEGER NOT NULL UNIQUE,
+                         branch       TEXT NOT NULL UNIQUE,
+                         worktree     TEXT NOT NULL,
+                         allocated_by TEXT NOT NULL,
+                         allocated_at INTEGER NOT NULL
+                     );
+                     INSERT INTO task_branches_new(id, task_id, branch, worktree, allocated_by, allocated_at)
+                         SELECT id, task_id, branch, worktree, allocated_by, allocated_at
+                         FROM task_branches;
+                     DROP TABLE task_branches;
+                     ALTER TABLE task_branches_new RENAME TO task_branches;
+                     CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);",
+                )?;
+            }
+            // journal: drop `instance_id` + its index.
+            if column_exists(conn, "journal", "instance_id")? {
+                conn.execute("DROP INDEX IF EXISTS journal_instance", [])?;
+                // Build the SELECT dynamically: `expected_signal` was never
+                // added via ALTER (only in SCHEMA_SQL) so pre-v17 upgrades
+                // may lack it. Use NULL in that case.
+                let has_expected_signal = column_exists(conn, "journal", "expected_signal")?;
+                let es_expr = if has_expected_signal {
+                    "expected_signal"
+                } else {
+                    "NULL"
+                };
+                conn.execute_batch(&format!(
+                    "CREATE TABLE journal_new (
+                         agent           TEXT PRIMARY KEY,
+                         role            TEXT NOT NULL,
+                         task_id         INTEGER,
+                         session_id      TEXT NOT NULL,
+                         worktree        TEXT,
+                         branch          TEXT,
+                         phase           TEXT NOT NULL,
+                         expected_signal TEXT,
+                         cost_tokens     INTEGER NOT NULL DEFAULT 0,
+                         agent_state     TEXT,
+                         cost_usd        REAL NOT NULL DEFAULT 0.0,
+                         log_dir         TEXT,
+                         pid             INTEGER,
+                         pr              INTEGER,
+                         rework_count    INTEGER NOT NULL DEFAULT 0,
+                         updated_at      INTEGER NOT NULL
+                     );
+                     INSERT INTO journal_new(agent, role, task_id, session_id, worktree, branch,
+                         phase, expected_signal, cost_tokens, agent_state, cost_usd, log_dir,
+                         pid, pr, rework_count, updated_at)
+                         SELECT agent, role, task_id, session_id, worktree, branch,
+                             phase, {es_expr}, cost_tokens, agent_state, cost_usd, log_dir,
+                             pid, pr, rework_count, updated_at
+                         FROM journal;
+                     DROP TABLE journal;
+                     ALTER TABLE journal_new RENAME TO journal;"
+                ))?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -724,7 +793,9 @@ mod tests {
             n, 1,
             "task_branches table must exist after v8 → v9 migration"
         );
-        // (b) UNIQUE indices present (the load-bearing invariants of #98).
+        // (b) UNIQUE constraints present (the load-bearing invariants of #98).
+        // After v18 migration, task_branches has UNIQUE(task_id) + UNIQUE(branch)
+        // as inline column constraints, plus the explicit task_branches_task index.
         let idx_count: i64 = c
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='index' AND tbl_name='task_branches'",
@@ -733,8 +804,8 @@ mod tests {
             )
             .unwrap();
         assert!(
-            idx_count >= 2,
-            "expected ≥2 indices on task_branches (UNIQUE(task_id,repo), UNIQUE(repo,branch)); got {idx_count}"
+            idx_count >= 1,
+            "expected ≥1 index on task_branches; got {idx_count}"
         );
         // (c) Pre-existing tasks row untouched.
         let (title, status): (String, String) = c
@@ -1090,5 +1161,97 @@ mod tests {
             })
             .unwrap();
         assert_eq!(phase, "awaiting-review");
+    }
+
+    #[test]
+    fn migrates_v17_to_v18_strips_repo_and_instance_id() {
+        // Per-repo DB refactor (2/3): a v17 DB must drop task_branches.repo
+        // and journal.instance_id on open, preserving existing data.
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE task_branches (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id INTEGER NOT NULL,
+                 repo TEXT NOT NULL,
+                 branch TEXT NOT NULL,
+                 worktree TEXT NOT NULL,
+                 allocated_by TEXT NOT NULL,
+                 allocated_at INTEGER NOT NULL,
+                 UNIQUE(task_id, repo),
+                 UNIQUE(repo, branch)
+             );
+             INSERT INTO task_branches(task_id, repo, branch, worktree, allocated_by, allocated_at)
+                 VALUES (1, 'ag2trust/quorum', 'feat/thing-w1', '/tmp/wt/thing-w1', 'W1', 100);
+             CREATE TABLE journal (
+                 agent TEXT PRIMARY KEY, role TEXT NOT NULL, task_id INTEGER,
+                 session_id TEXT NOT NULL, worktree TEXT, branch TEXT,
+                 phase TEXT NOT NULL DEFAULT 'working', expected_signal TEXT,
+                 cost_tokens INTEGER NOT NULL DEFAULT 0, agent_state TEXT,
+                 cost_usd REAL NOT NULL DEFAULT 0.0, log_dir TEXT, pid INTEGER,
+                 pr INTEGER, rework_count INTEGER NOT NULL DEFAULT 0,
+                 instance_id TEXT, updated_at INTEGER NOT NULL
+             );
+             INSERT INTO journal(agent, role, session_id, phase, instance_id, updated_at)
+                 VALUES ('W1', 'worker', 'sess-1', 'working', '/tmp/wt', 100);
+             PRAGMA user_version = 17;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // task_branches: repo column gone, data preserved.
+        assert!(
+            !column_exists(&c, "task_branches", "repo").unwrap(),
+            "repo column must be dropped from task_branches"
+        );
+        let (branch, worktree): (String, String) = c
+            .query_row(
+                "SELECT branch, worktree FROM task_branches WHERE task_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(branch, "feat/thing-w1");
+        assert_eq!(worktree, "/tmp/wt/thing-w1");
+
+        // UNIQUE(task_id) enforced: duplicate task_id rejected.
+        let dup = c.execute(
+            "INSERT INTO task_branches(task_id, branch, worktree, allocated_by, allocated_at)
+             VALUES (1, 'feat/other', '/tmp/wt/other', 'W2', 200)",
+            [],
+        );
+        assert!(dup.is_err(), "UNIQUE(task_id) must reject duplicate");
+
+        // UNIQUE(branch) enforced: duplicate branch rejected.
+        let dup = c.execute(
+            "INSERT INTO task_branches(task_id, branch, worktree, allocated_by, allocated_at)
+             VALUES (2, 'feat/thing-w1', '/tmp/wt/other2', 'W2', 200)",
+            [],
+        );
+        assert!(dup.is_err(), "UNIQUE(branch) must reject duplicate");
+
+        // journal: instance_id column gone, data preserved.
+        assert!(
+            !column_exists(&c, "journal", "instance_id").unwrap(),
+            "instance_id column must be dropped from journal"
+        );
+        let phase: String = c
+            .query_row("SELECT phase FROM journal WHERE agent='W1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(phase, "working");
     }
 }

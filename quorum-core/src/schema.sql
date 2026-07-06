@@ -133,30 +133,26 @@ CREATE TABLE IF NOT EXISTS pinned (
     body    TEXT NOT NULL
 );
 
--- Per-(task, project) branch allocations (issue #98). One row = the recommended
--- branch + worktree path for an agent claiming this task in this project. Lifetime
--- matches the task itself: persists across release/reopen so a rework re-claim
--- returns the SAME branch (no reconstruction, no guessing).
+-- Per-task branch allocations (issue #98). One row = the recommended branch +
+-- worktree path for an agent claiming this task. Lifetime matches the task itself:
+-- persists across release/reopen so a rework re-claim returns the SAME branch
+-- (no reconstruction, no guessing).
 --
--- UNIQUE(task_id, repo): one allocation per (task, project) — caller will INSERT
--- OR IGNORE then SELECT, so a fresh task allocates and a re-claim reuses without
--- a TOCTOU race.
--- UNIQUE(repo, branch): centralized anti-collision — quorum is the single
--- registry of in-use names, so two tasks in the same project can never share a
--- branch even if their titles slugify identically.
+-- UNIQUE(task_id): one allocation per task — caller will INSERT OR IGNORE then
+-- SELECT, so a fresh task allocates and a re-claim reuses without a TOCTOU race.
+-- UNIQUE(branch): centralized anti-collision — quorum is the single registry of
+-- in-use names, so two tasks can never share a branch even if their titles slugify
+-- identically.
 --
 -- Sweeper does NOT TTL these (no expires_at) — same posture as task_notes:
 -- durable context for the next picker-upper after the original assignee is lost.
 CREATE TABLE IF NOT EXISTS task_branches (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id      INTEGER NOT NULL,
-    repo         TEXT NOT NULL,
-    branch       TEXT NOT NULL,
+    task_id      INTEGER NOT NULL UNIQUE,
+    branch       TEXT NOT NULL UNIQUE,
     worktree     TEXT NOT NULL,
     allocated_by TEXT NOT NULL,
-    allocated_at INTEGER NOT NULL,
-    UNIQUE(task_id, repo),
-    UNIQUE(repo, branch)
+    allocated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);
 
@@ -225,26 +221,16 @@ CREATE TABLE IF NOT EXISTS journal (
     pr              INTEGER,
     -- M7 crash recovery: rework round counter for limit enforcement across restarts.
     rework_count    INTEGER NOT NULL DEFAULT 0,
-    -- #190 instance scoping: identifies the daemon instance that owns this entry so
-    -- crash recovery in a sibling instance never kills/reclaims another daemon's live
-    -- workers or agent names. Derived from the daemon's canonical worktree_base path.
-    -- NULL only on pre-v16 rows written by an older binary (transitional — recovery
-    -- adopts NULL rows whose worktree lives under our worktree_base).
-    instance_id     TEXT,
     updated_at      INTEGER NOT NULL
 );
--- Note: the instance_id index is created in the v16 migration branch, not here,
--- because SCHEMA_SQL runs BEFORE the ALTER TABLE that adds the column on an
--- upgrading v15 DB; CREATE INDEX on a not-yet-present column would fail.
 
 -- #228 durable approval record: an attested `approved` review verdict persisted
--- against the PR/task, INSTANCE-INDEPENDENT (no instance_id column, by design).
--- A `--self-update-drain` restart that lands between approval and merge must be
--- able to reconstruct "merge this PR" from durable state alone — an
--- instance-scoped mailbox row can't survive a roster reset. Recovery merges iff
--- the record is a well-formed attested approval, reviewer != author, and
--- `approved_head_sha` still matches the PR's live head (see verdict::dispose_approval).
--- Keyed by pr_number: at most one live approval per PR. Deleted on merge / demote / reject.
+-- against the PR/task. A `--self-update-drain` restart that lands between approval
+-- and merge must be able to reconstruct "merge this PR" from durable state alone.
+-- Recovery merges iff the record is a well-formed attested approval, reviewer !=
+-- author, and `approved_head_sha` still matches the PR's live head (see
+-- verdict::dispose_approval). Keyed by pr_number: at most one live approval per PR.
+-- Deleted on merge / demote / reject.
 CREATE TABLE IF NOT EXISTS approvals (
     pr_number         INTEGER PRIMARY KEY,
     task_id           INTEGER NOT NULL,
