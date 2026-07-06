@@ -325,8 +325,16 @@ reviewer normally.
 ## Verification
 
 ```
-$ cargo test --workspace
+$ ./preflight.sh
+=== preflight 1/4: branch base ===
+branch base OK (1 session(s) ahead of origin/main)
+=== preflight 2/4: cargo fmt --all -- --check ===
+fmt OK
+=== preflight 3/4: cargo clippy --all-targets -- -D warnings ===
+clippy OK
+=== preflight 4/4: cargo test --workspace ===
 test result: ok. 306 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+PREFLIGHT: PASS (all 4 gates green)
 ```
 
 No source code was modified.
