@@ -345,7 +345,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let health = compute_health(&daemon_agents, !recent_errors.is_empty());
     let stalled_count = daemon_agents
         .iter()
-        .filter(|d| d.role == "worker")
+        .filter(|d| is_stall_eligible(d))
         .filter(|d| {
             matches!(d.last_activity_age_secs, Some(age) if age > 180)
                 || d.last_activity_age_secs.is_none()
@@ -1036,10 +1036,14 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
 
 /// Compute the health verdict (#204).
 /// Thresholds: 60s silent → attention, 180s silent → stalled.
+fn is_stall_eligible(d: &DaemonAgentView) -> bool {
+    d.role == "worker" && d.phase != "awaiting-review"
+}
+
 fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> HealthVerdict {
     let has_dead = daemon_agents
         .iter()
-        .filter(|d| d.role == "worker")
+        .filter(|d| is_stall_eligible(d))
         .any(|d| match d.last_activity_age_secs {
             Some(age) => age > 180,
             None => true,
@@ -1049,7 +1053,7 @@ fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> Hea
     }
     let has_stalling = daemon_agents
         .iter()
-        .filter(|d| d.role == "worker")
+        .filter(|d| is_stall_eligible(d))
         .any(|d| match d.last_activity_age_secs {
             Some(age) => age > 60,
             None => false,
@@ -2038,5 +2042,87 @@ mod tests {
             HealthVerdict::Stalled,
             "200s should be stalled"
         );
+    }
+
+    fn make_daemon_agent(role: &str, phase: &str, age: Option<i64>) -> DaemonAgentView {
+        DaemonAgentView {
+            agent: format!("{role}-1"),
+            role: role.into(),
+            task_id: Some(1),
+            phase: phase.into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
+            last_activity_age_secs: age,
+            task_title: None,
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
+        }
+    }
+
+    #[test]
+    fn awaiting_review_worker_not_stalled() {
+        let w = make_daemon_agent("worker", "awaiting-review", Some(300));
+        assert_eq!(
+            compute_health(&[w], false),
+            HealthVerdict::OnTrack,
+            "awaiting-review worker with 300s silence must not trigger stalled"
+        );
+    }
+
+    #[test]
+    fn working_worker_stalled_after_180s() {
+        let w = make_daemon_agent("worker", "working", Some(200));
+        assert_eq!(
+            compute_health(&[w], false),
+            HealthVerdict::Stalled,
+            "working worker with 200s silence must be stalled"
+        );
+    }
+
+    #[test]
+    fn reviewer_not_counted_for_stall() {
+        let r = make_daemon_agent("reviewer", "reviewing", Some(300));
+        assert_eq!(
+            compute_health(&[r], false),
+            HealthVerdict::OnTrack,
+            "reviewer with 300s silence must not trigger stalled (not a worker)"
+        );
+    }
+
+    #[test]
+    fn mixed_fleet_isolation() {
+        let awaiting = make_daemon_agent("worker", "awaiting-review", Some(300));
+        let active = make_daemon_agent("worker", "working", Some(30));
+        let reviewer = make_daemon_agent("reviewer", "reviewing", Some(400));
+        assert_eq!(
+            compute_health(&[awaiting, active, reviewer], false),
+            HealthVerdict::OnTrack,
+            "only the active worker matters; awaiting-review and reviewer are excluded"
+        );
+    }
+
+    #[test]
+    fn stalled_count_skips_awaiting_review() {
+        let awaiting = make_daemon_agent("worker", "awaiting-review", Some(300));
+        let stalled_worker = make_daemon_agent("worker", "working", Some(200));
+        let healthy_worker = make_daemon_agent("worker", "working", Some(30));
+        let reviewer = make_daemon_agent("reviewer", "reviewing", Some(500));
+        let agents = [awaiting, stalled_worker, healthy_worker, reviewer];
+        let count = agents
+            .iter()
+            .filter(|d| is_stall_eligible(d))
+            .filter(|d| {
+                matches!(d.last_activity_age_secs, Some(age) if age > 180)
+                    || d.last_activity_age_secs.is_none()
+            })
+            .count() as i64;
+        assert_eq!(count, 1, "only the stalled working worker counts");
     }
 }
