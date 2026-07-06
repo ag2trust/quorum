@@ -226,12 +226,7 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-fn slot_journal_entry(
-    slot: &SlotState,
-    role: &str,
-    phase: &str,
-    instance_id: &str,
-) -> JournalEntry {
+fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
     JournalEntry {
         agent: slot.agent_name.clone(),
         role: role.into(),
@@ -250,7 +245,6 @@ fn slot_journal_entry(
         pid: slot.proc.pid(),
         pr: slot.pr,
         rework_count: slot.rework_count as i32,
-        instance_id: Some(instance_id.to_string()),
     }
 }
 
@@ -302,25 +296,9 @@ pub struct ServeConfig {
     /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
     /// provisioning, and merge targeting.
     pub base_branch: String,
-    /// #190: unique identity for this daemon instance. Stamped on every journal
-    /// row this daemon writes; recovery filters to this value so a restart never
-    /// kills/reclaims a sibling instance's live workers. Derived by [`derive_instance_id`]
-    /// from the canonical `worktree_base` (each daemon must have a distinct base).
-    pub instance_id: String,
     /// When set, serve polls for this file's existence every tick and initiates
     /// shutdown when it disappears (#201: test fixture self-termination).
     pub exit_when_gone: Option<PathBuf>,
-}
-
-/// #190: derive a stable instance identity from the daemon's `worktree_base`.
-/// Uses `canonicalize` when the directory exists (resolves `..`/symlinks); falls
-/// back to lossy string form otherwise. Distinct `worktree_base` per daemon →
-/// distinct `instance_id` → journal scoping works.
-pub fn derive_instance_id(worktree_base: &Path) -> String {
-    match std::fs::canonicalize(worktree_base) {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(_) => worktree_base.to_string_lossy().into_owned(),
-    }
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -353,7 +331,6 @@ pub(crate) struct SlotState {
     turn_started_at: std::time::Instant,
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
-    task_repo: Option<String>,
 }
 
 /// A worker task that has already delivered a PR (`done --pr N`) and is
@@ -381,7 +358,6 @@ pub(crate) struct PendingReview {
     cost_usd: f64,
     agent_state: Option<String>,
     log_dir: Option<PathBuf>,
-    task_repo: Option<String>,
     task_started_at: std::time::Instant,
 }
 
@@ -817,7 +793,7 @@ async fn tick(
                 } else {
                     "awaiting-review"
                 };
-                let entry = slot_journal_entry(&workers[wi], "worker", phase, &config.instance_id);
+                let entry = slot_journal_entry(&workers[wi], "worker", phase);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -976,8 +952,7 @@ async fn tick(
                                 }
 
                                 let p = db_path.clone();
-                                let entry =
-                                    slot_journal_entry(w, "worker", "working", &config.instance_id);
+                                let entry = slot_journal_entry(w, "worker", "working");
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let mut conn = quorum_core::db::open(&p)?;
                                     journal::upsert(&mut conn, &entry)
@@ -1129,12 +1104,7 @@ async fn tick(
                                     }
 
                                     let p = db_path.clone();
-                                    let entry = slot_journal_entry(
-                                        w,
-                                        "worker",
-                                        "working",
-                                        &config.instance_id,
-                                    );
+                                    let entry = slot_journal_entry(w, "worker", "working");
                                     tokio::task::spawn_blocking(move || -> Result<()> {
                                         let mut conn = quorum_core::db::open(&p)?;
                                         journal::upsert(&mut conn, &entry)
@@ -1351,24 +1321,11 @@ async fn tick(
 
                     if merge_result.success {
                         log(&format!("PR #{pr_num} merged — tearing down both agents"));
-                        // Trigger A: check if this merge is for the daemon's own repo
-                        if config.self_update_drain {
-                            if let Some(ref self_repo) = config.self_repo {
-                                let task_repo = workers
-                                    .iter()
-                                    .find(|w| w.task_id == reviewer_task_id)
-                                    .and_then(|w| w.task_repo.as_deref())
-                                    .or_else(|| {
-                                        pending_reviews
-                                            .iter()
-                                            .find(|p| p.task_id == reviewer_task_id)
-                                            .and_then(|p| p.task_repo.as_deref())
-                                    });
-                                if task_repo == Some(self_repo.as_str()) {
-                                    let sha = format!("post-merge-pr-{pr_num}");
-                                    drain_state.start_drain(&sha);
-                                }
-                            }
+                        // Trigger A: per-repo daemon — every merged PR is for
+                        // this repo, so any merge triggers self-update drain.
+                        if config.self_update_drain && config.self_repo.is_some() {
+                            let sha = format!("post-merge-pr-{pr_num}");
+                            drain_state.start_drain(&sha);
                         }
                         let reviewer_agent = reviewers[ri].agent_name.clone();
                         let r = reviewers.remove(ri);
@@ -1546,12 +1503,7 @@ async fn tick(
                                         }
 
                                         let p = db_path.clone();
-                                        let entry = slot_journal_entry(
-                                            w,
-                                            "worker",
-                                            "working",
-                                            &config.instance_id,
-                                        );
+                                        let entry = slot_journal_entry(w, "worker", "working");
                                         tokio::task::spawn_blocking(move || -> Result<()> {
                                             let mut conn = quorum_core::db::open(&p)?;
                                             journal::upsert(&mut conn, &entry)
@@ -1723,8 +1675,7 @@ async fn tick(
                             }
 
                             let p = db_path.clone();
-                            let entry =
-                                slot_journal_entry(w, "worker", "working", &config.instance_id);
+                            let entry = slot_journal_entry(w, "worker", "working");
                             tokio::task::spawn_blocking(move || -> Result<()> {
                                 let mut conn = quorum_core::db::open(&p)?;
                                 journal::upsert(&mut conn, &entry)
@@ -1836,12 +1787,7 @@ async fn tick(
                 // for review" log so tests / operators can rely on the log
                 // as evidence that the pipeline position is durable.
                 let p = db_path.clone();
-                let entry = slot_journal_entry(
-                    &workers[wi],
-                    "worker",
-                    "awaiting-review",
-                    &config.instance_id,
-                );
+                let entry = slot_journal_entry(&workers[wi], "worker", "awaiting-review");
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -1905,9 +1851,7 @@ async fn tick(
             reviewers_to_kill.push(i);
             continue;
         }
-        if let Some(breach) =
-            drain_events(r, &db_path, "reviewer", &config.limits, &config.instance_id).await?
-        {
+        if let Some(breach) = drain_events(r, &db_path, "reviewer", &config.limits).await? {
             log(&format!(
                 "WATCHDOG: reviewer {} killed — {}",
                 r.agent_name, breach
@@ -1934,9 +1878,7 @@ async fn tick(
             workers_to_kill.push(i);
             continue;
         }
-        if let Some(breach) =
-            drain_events(w, &db_path, "worker", &config.limits, &config.instance_id).await?
-        {
+        if let Some(breach) = drain_events(w, &db_path, "worker", &config.limits).await? {
             log(&format!(
                 "WATCHDOG: worker {} killed (task #{}) — {}",
                 w.agent_name, w.task_id, breach
@@ -2445,7 +2387,6 @@ async fn drain_events(
     db_path: &std::path::Path,
     role: &str,
     limits: &CostLimits,
-    instance_id: &str,
 ) -> Result<Option<LimitBreached>> {
     while let Ok(Some(event)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_event()).await
@@ -2487,7 +2428,7 @@ async fn drain_events(
                 } else {
                     "reviewing"
                 };
-                let entry = slot_journal_entry(slot, role, phase, instance_id);
+                let entry = slot_journal_entry(slot, role, phase);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &entry)
@@ -2543,7 +2484,6 @@ struct ReviewCounterpart<'a> {
     agent_name: &'a str,
     task_id: i64,
     branch: &'a str,
-    task_repo: Option<&'a str>,
 }
 
 impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
@@ -2552,7 +2492,6 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
             agent_name: &w.agent_name,
             task_id: w.task_id,
             branch: &w.branch,
-            task_repo: w.task_repo.as_deref(),
         }
     }
 }
@@ -2563,7 +2502,6 @@ impl<'a> From<&'a PendingReview> for ReviewCounterpart<'a> {
             agent_name: &p.agent_name,
             task_id: p.task_id,
             branch: &p.branch,
-            task_repo: p.task_repo.as_deref(),
         }
     }
 }
@@ -2640,9 +2578,9 @@ async fn spawn_reviewer_for_worker(
             ));
             let pr_num = pr;
             let repo_dir_for_gh = task_repo_dir.to_path_buf();
-            let gh_repo = worker.task_repo.map(String::from);
+            let gh_repo = config.repo.clone();
             let fallback_ref = tokio::task::spawn_blocking(move || {
-                query_pr_head_ref(pr_num, &repo_dir_for_gh, gh_repo.as_deref())
+                query_pr_head_ref(pr_num, &repo_dir_for_gh, Some(&gh_repo))
             })
             .await
             .ok()
@@ -2729,7 +2667,6 @@ async fn spawn_reviewer_for_worker(
         pid: None,
         pr: Some(pr),
         rework_count: 0,
-        instance_id: Some(config.instance_id.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -2798,7 +2735,6 @@ async fn spawn_reviewer_for_worker(
                     pid: spawn_pid,
                     pr: Some(pr),
                     rework_count: 0,
-                    instance_id: Some(config.instance_id.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -2826,7 +2762,6 @@ async fn spawn_reviewer_for_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: reviewer_session_log,
-                task_repo: worker.task_repo.map(String::from),
             });
         }
         Err(e) => {
@@ -3029,7 +2964,6 @@ async fn spawn_worker(
         pid: None,
         pr: None,
         rework_count: 0,
-        instance_id: Some(config.instance_id.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -3096,7 +3030,6 @@ async fn spawn_worker(
                     pid: spawn_pid,
                     pr: None,
                     rework_count: 0,
-                    instance_id: Some(config.instance_id.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -3107,10 +3040,6 @@ async fn spawn_worker(
                 .ok();
             }
 
-            let task_repo = {
-                let repo = quorum_core::branches::repo_from_refs(task.refs.as_deref());
-                Some(repo)
-            };
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
@@ -3128,7 +3057,6 @@ async fn spawn_worker(
                 turn_started_at: now_instant,
                 agent_state: None,
                 session_log: worker_session_log,
-                task_repo,
             });
         }
         Err(e) => {
@@ -3423,7 +3351,6 @@ async fn spawn_resume_worker_for_pending(
         turn_started_at: now_instant,
         agent_state: pending.agent_state.clone(),
         session_log,
-        task_repo: pending.task_repo.clone(),
     };
 
     if let Some(ref mut sl) = slot.session_log {
@@ -3451,7 +3378,6 @@ async fn spawn_resume_worker_for_pending(
         pid,
         pr: None,
         rework_count: slot.rework_count as i32,
-        instance_id: Some(config.instance_id.clone()),
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -3611,7 +3537,6 @@ mod tests {
             turn_started_at: now,
             agent_state: None,
             session_log: None,
-            task_repo: None,
         }
     }
 

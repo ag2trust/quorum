@@ -388,7 +388,6 @@ mod tests {
                 pid: None,
                 pr: Some(pr),
                 rework_count: 0,
-                instance_id: Some("/old-instance".into()),
             },
         )
         .unwrap();

@@ -1,20 +1,20 @@
-//! Per-(task, project) branch + worktree allocation (issue #98).
+//! Per-task branch + worktree allocation (issue #98).
 //!
 //! Centralizes anti-collision branch naming so it lives in ONE place instead of every agent
-//! constructing it from a convention. Quorum knows the task, the claiming agent, and the
-//! project (`refs.repo`) — so it's the right allocator.
+//! constructing it from a convention. Quorum knows the task and the claiming agent — so
+//! it's the right allocator.
 //!
-//! The contract on `allocate_for_task` is idempotent on `(task_id, repo)`:
-//! - **Fresh task** → derive a new `<type>/<slug>-<agent-lc>` branch + per-project worktree
-//!   dir, insert into `task_branches`, return with `existed=false`.
+//! The contract on `allocate_for_task` is idempotent on `task_id`:
+//! - **Fresh task** → derive a new `<type>/<slug>-<agent-lc>` branch + worktree dir, insert
+//!   into `task_branches`, return with `existed=false`.
 //! - **Reopened (rework) task** → row already exists from the original claim → return the
 //!   SAME branch + worktree with `existed=true`, so the agent re-creates its worktree on
 //!   the existing PR branch (no reconstruction, no guessing).
 //!
-//! The UNIQUE indices on the table guarantee one allocation per (task, project) AND that
-//! two tasks in the same project can never share a branch — even if their titles slugify
-//! identically (the agent-name suffix avoids it for distinct agents; the unique index is
-//! the defense for the pathological case of two same-named agents on different tasks).
+//! The UNIQUE indices on the table guarantee one allocation per task AND that two tasks can
+//! never share a branch — even if their titles slugify identically (the agent-name suffix
+//! avoids it for distinct agents; the unique index is the defense for the pathological case
+//! of two same-named agents on different tasks).
 
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -29,23 +29,18 @@ pub struct BranchAllocation {
     pub existed: bool,
 }
 
-/// The default repo when a task's `refs.repo` is missing or unparseable. Matches the
-/// ag2trust CLAUDE.md multi-repo recipe: empty/missing `refs.repo` ⇒ behave against
-/// `ag2trust/ag2trust` (the "default" project).
-pub const DEFAULT_REPO: &str = "ag2trust/ag2trust";
-
 /// Maximum slugified-title length before the agent suffix is appended. Long enough to keep
 /// titles human-recognizable, short enough that the full branch fits comfortably below the
 /// 250-char Git ref limit even with a long agent name. (50 + slash + type + dash + agent =
 /// well under 100 in practice.)
 const SLUG_MAX: usize = 50;
 
-/// Look up an existing allocation for `(task_id, repo)`. Read-only — no allocation.
-pub fn lookup(conn: &Connection, task_id: i64, repo: &str) -> Result<Option<BranchAllocation>> {
+/// Look up an existing allocation for `task_id`. Read-only — no allocation.
+pub fn lookup(conn: &Connection, task_id: i64) -> Result<Option<BranchAllocation>> {
     Ok(conn
         .query_row(
-            "SELECT branch, worktree FROM task_branches WHERE task_id=?1 AND repo=?2",
-            params![task_id, repo],
+            "SELECT branch, worktree FROM task_branches WHERE task_id=?1",
+            params![task_id],
             |r| {
                 Ok(BranchAllocation {
                     branch: r.get(0)?,
@@ -57,7 +52,10 @@ pub fn lookup(conn: &Connection, task_id: i64, repo: &str) -> Result<Option<Bran
         .optional()?)
 }
 
-/// Allocate or reuse a branch+worktree for `(task_id, repo)`. Idempotent.
+/// Allocate or reuse a branch+worktree for `task_id`. Idempotent.
+///
+/// `worktree_base` is the directory under which agent worktrees are created (e.g.
+/// `~/dev/quorum-wt`). The basename of the branch is appended to form the full path.
 ///
 /// `branch_hint` overrides the slugified title for the topic portion (still combined with
 /// the derived type prefix and agent suffix). Pass `None` to derive from the title.
@@ -69,7 +67,7 @@ pub fn lookup(conn: &Connection, task_id: i64, repo: &str) -> Result<Option<Bran
 pub fn allocate_for_task(
     conn: &mut Connection,
     task_id: i64,
-    repo: &str,
+    worktree_base: &str,
     allocator: &str,
     title: &str,
     labels: Option<&str>,
@@ -77,15 +75,15 @@ pub fn allocate_for_task(
     now: i64,
 ) -> Result<BranchAllocation> {
     // Hot path: existing allocation (rework / re-claim) — one read, no write lock.
-    if let Some(existing) = lookup(conn, task_id, repo)? {
+    if let Some(existing) = lookup(conn, task_id)? {
         return Ok(existing);
     }
     // Cold path: fresh allocation. Take the write lock and insert with collision retry —
-    // the UNIQUE(repo, branch) index guards against the (unlikely) case of two tasks
-    // resolving to the same `<type>/<slug>-<agent>` name (e.g., two agents with the same
-    // sanitized name, two tasks with the same title). On a hit, append a numeric suffix
-    // and retry. The bound is tiny (3 tries) — if we burn through it, the agent will
-    // re-call with a different topic/hint.
+    // the UNIQUE(branch) index guards against the (unlikely) case of two tasks resolving
+    // to the same `<type>/<slug>-<agent>` name (e.g., two agents with the same sanitized
+    // name, two tasks with the same title). On a hit, append a numeric suffix and retry.
+    // The bound is tiny (3 tries) — if we burn through it, the agent will re-call with a
+    // different topic/hint.
     let topic = branch_hint
         .filter(|h| !h.trim().is_empty())
         .map(slugify)
@@ -98,8 +96,8 @@ pub fn allocate_for_task(
     // BEGIN IMMEDIATE. (Common pattern in quorum; same shape as task-claim's recheck.)
     if let Some(existing) = tx
         .query_row(
-            "SELECT branch, worktree FROM task_branches WHERE task_id=?1 AND repo=?2",
-            params![task_id, repo],
+            "SELECT branch, worktree FROM task_branches WHERE task_id=?1",
+            params![task_id],
             |r| {
                 Ok(BranchAllocation {
                     branch: r.get(0)?,
@@ -116,11 +114,11 @@ pub fn allocate_for_task(
     let mut branch = base_branch.clone();
     let mut attempt = 0u32;
     loop {
-        let worktree = worktree_path(repo, &branch);
+        let worktree = worktree_path(worktree_base, &branch);
         let res = tx.execute(
-            "INSERT INTO task_branches(task_id, repo, branch, worktree, allocated_by, allocated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![task_id, repo, branch, worktree, allocator, now],
+            "INSERT INTO task_branches(task_id, branch, worktree, allocated_by, allocated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![task_id, branch, worktree, allocator, now],
         );
         match res {
             Ok(_) => {
@@ -134,9 +132,6 @@ pub fn allocate_for_task(
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE && attempt < 3 =>
             {
-                // (repo, branch) collision — extremely rare with agent suffixes. Append
-                // a numeric suffix and retry. The (task_id, repo) UNIQUE can't hit here
-                // because we just verified above that no row exists.
                 attempt += 1;
                 branch = format!("{base_branch}-{attempt}");
             }
@@ -145,38 +140,14 @@ pub fn allocate_for_task(
     }
 }
 
-/// Per-project worktree directory convention. Recommendation, not mandate — the agent may
-/// override locally, but defaulting here keeps the convention consistent across the fleet.
-///
-/// - `ag2trust/ag2trust` (and any repo without a specific override) → `.claude/worktrees/<basename>`
-///   (relative to the repo root; the harness creates worktrees here).
-/// - `ag2trust/quorum` → `~/dev/quorum-wt/<basename>` (sibling clone, per quorum CLAUDE.md §3).
-///
-/// `basename` is the branch name with the type prefix stripped (e.g.
-/// `feat/foo-larkspur` → `foo-larkspur`), so the path stays short and Git-safe.
-pub fn worktree_path(repo: &str, branch: &str) -> String {
+/// Worktree path for a branch allocation. `worktree_base` is the caller-supplied base
+/// directory (e.g. from `--worktree-base`). `basename` is the branch name with the type
+/// prefix stripped (e.g. `feat/foo-larkspur` → `foo-larkspur`), so the path stays short
+/// and Git-safe.
+pub fn worktree_path(worktree_base: &str, branch: &str) -> String {
     let basename = branch.rsplit_once('/').map(|(_, b)| b).unwrap_or(branch);
-    match repo {
-        "ag2trust/quorum" => format!("~/dev/quorum-wt/{basename}"),
-        _ => format!(".claude/worktrees/{basename}"),
-    }
-}
-
-/// Extract the project (`refs.repo`) from a task's `refs` JSON string. Returns
-/// [`DEFAULT_REPO`] when refs is missing, unparseable, or has no `repo` field — same
-/// fallback as the ag2trust CLAUDE.md multi-repo recipe.
-pub fn repo_from_refs(refs: Option<&str>) -> String {
-    let Some(refs) = refs else {
-        return DEFAULT_REPO.to_string();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs) else {
-        return DEFAULT_REPO.to_string();
-    };
-    v.get("repo")
-        .and_then(|r| r.as_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| DEFAULT_REPO.to_string())
+    let base = worktree_base.trim_end_matches('/');
+    format!("{base}/{basename}")
 }
 
 /// Optional `branch_hint` field inside a task's `refs` JSON. Lets the task creator
@@ -327,31 +298,14 @@ mod tests {
     }
 
     #[test]
-    fn worktree_path_per_project() {
+    fn worktree_path_uses_base_and_strips_prefix() {
         assert_eq!(
-            worktree_path("ag2trust/quorum", "feat/foo-bar"),
+            worktree_path("~/dev/quorum-wt", "feat/foo-bar"),
             "~/dev/quorum-wt/foo-bar"
         );
-        assert_eq!(
-            worktree_path("ag2trust/ag2trust", "fix/baz-qux"),
-            ".claude/worktrees/baz-qux"
-        );
-        // Unknown repo → default convention.
-        assert_eq!(
-            worktree_path("other/thing", "feat/x"),
-            ".claude/worktrees/x"
-        );
-    }
-
-    #[test]
-    fn repo_from_refs_extracts_or_defaults() {
-        assert_eq!(
-            repo_from_refs(Some(r#"{"repo":"ag2trust/quorum"}"#)),
-            "ag2trust/quorum"
-        );
-        assert_eq!(repo_from_refs(Some(r#"{"issue":42}"#)), DEFAULT_REPO);
-        assert_eq!(repo_from_refs(Some("not json")), DEFAULT_REPO);
-        assert_eq!(repo_from_refs(None), DEFAULT_REPO);
+        assert_eq!(worktree_path("/tmp/wt", "fix/baz-qux"), "/tmp/wt/baz-qux");
+        // Trailing slash on base is trimmed.
+        assert_eq!(worktree_path("/tmp/wt/", "feat/x"), "/tmp/wt/x");
     }
 
     #[test]
@@ -370,7 +324,7 @@ mod tests {
         let a = allocate_for_task(
             &mut conn,
             42,
-            "ag2trust/quorum",
+            "/tmp/wt",
             "Larkspur-q8X",
             "[quorum] something cool",
             Some("[\"kind:enhancement\"]"),
@@ -380,7 +334,7 @@ mod tests {
         .unwrap();
         assert!(!a.existed);
         assert_eq!(a.branch, "feat/something-cool-larkspur-q8x");
-        assert_eq!(a.worktree, "~/dev/quorum-wt/something-cool-larkspur-q8x");
+        assert_eq!(a.worktree, "/tmp/wt/something-cool-larkspur-q8x");
     }
 
     #[test]
@@ -389,7 +343,7 @@ mod tests {
         let first = allocate_for_task(
             &mut conn,
             7,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Larkspur-q8X",
             "Fix the thing",
             Some("[\"kind:bug\"]"),
@@ -402,7 +356,7 @@ mod tests {
         let second = allocate_for_task(
             &mut conn,
             7,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Brioche-x82f",
             "Fix the thing",
             Some("[\"kind:bug\"]"),
@@ -416,12 +370,12 @@ mod tests {
     }
 
     #[test]
-    fn allocate_same_title_different_repos_both_allocate() {
+    fn allocate_same_title_different_tasks_gets_suffix() {
         let (_dir, mut conn) = fresh_db();
         let a = allocate_for_task(
             &mut conn,
             1,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Larkspur-q8X",
             "Same title",
             None,
@@ -432,7 +386,7 @@ mod tests {
         let b = allocate_for_task(
             &mut conn,
             2,
-            "ag2trust/quorum",
+            "/tmp/wt",
             "Larkspur-q8X",
             "Same title",
             None,
@@ -441,21 +395,22 @@ mod tests {
         )
         .unwrap();
         assert!(!a.existed && !b.existed);
-        // Same branch string is fine across DIFFERENT repos — the UNIQUE is (repo, branch).
-        assert_eq!(a.branch, b.branch);
-        // Worktree convention differs.
-        assert_ne!(a.worktree, b.worktree);
+        // Same slug → UNIQUE(branch) collision → numeric suffix on second.
+        assert_ne!(a.branch, b.branch);
+        assert!(
+            b.branch.ends_with("-1"),
+            "expected numeric suffix, got {}",
+            b.branch
+        );
     }
 
     #[test]
-    fn allocate_collision_within_repo_gets_numeric_suffix() {
-        // Force a collision by allocating two tasks that resolve to the same `<type>/<slug>-<agent>`
-        // — same allocator, same title, same labels, same repo.
+    fn allocate_collision_gets_numeric_suffix() {
         let (_dir, mut conn) = fresh_db();
         let a = allocate_for_task(
             &mut conn,
             10,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Larkspur-q8X",
             "Collide me",
             None,
@@ -466,7 +421,7 @@ mod tests {
         let b = allocate_for_task(
             &mut conn,
             11,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Larkspur-q8X",
             "Collide me",
             None,
@@ -488,7 +443,7 @@ mod tests {
         let a = allocate_for_task(
             &mut conn,
             5,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Larkspur-q8X",
             "Some really long noisy title",
             Some("[\"kind:enhancement\"]"),
@@ -505,7 +460,7 @@ mod tests {
         let _ = allocate_for_task(
             &mut conn,
             33,
-            "ag2trust/ag2trust",
+            "/tmp/wt",
             "Larkspur-q8X",
             "title",
             None,
@@ -513,10 +468,10 @@ mod tests {
             100,
         )
         .unwrap();
-        let got = lookup(&conn, 33, "ag2trust/ag2trust").unwrap().unwrap();
+        let got = lookup(&conn, 33).unwrap().unwrap();
         assert!(got.existed);
         assert!(got.branch.starts_with("chore/title-"));
-        // Different repo → no allocation yet.
-        assert!(lookup(&conn, 33, "ag2trust/quorum").unwrap().is_none());
+        // Different task → no allocation.
+        assert!(lookup(&conn, 34).unwrap().is_none());
     }
 }
