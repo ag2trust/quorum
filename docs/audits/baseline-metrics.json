@@ -1,0 +1,51 @@
+{
+  "date": "2026-07-06",
+  "schema_version": 18,
+  "rust_files": 71,
+  "total_lines": 33696,
+  "source_lines": 16353,
+  "test_count": 302,
+  "cargo_test": "ok",
+  "clippy_standard_warnings": 0,
+  "clippy_pedantic_nursery_warnings": 517,
+  "dead_code_warnings": 0,
+  "unused_dependencies": 0,
+  "todo_fixme_hack_xxx": 0,
+  "coverage": {
+    "total_line_pct": 86.16,
+    "total_function_pct": 87.57,
+    "total_region_pct": 85.11,
+    "files_under_50_pct": [
+      {"file": "quorum/src/serve/recovery.rs", "line_pct": 21.47}
+    ],
+    "files_under_80_pct": [
+      {"file": "quorum/src/serve/recovery.rs", "line_pct": 21.47},
+      {"file": "quorum/src/serve/mod.rs", "line_pct": 65.09},
+      {"file": "quorum/src/main.rs", "line_pct": 77.20},
+      {"file": "quorum/src/serve/session_log.rs", "line_pct": 75.81}
+    ]
+  },
+  "stale_vocabulary": {
+    "in_code": [
+      {"term": "closed", "file": "quorum/src/cockpit.rs", "lines": [389, 578], "note": "stale: not a lifecycle state (terminals are done/failed/cancelled)"},
+      {"term": "sticky_until", "files": ["quorum-core/src/schema.sql", "quorum-core/src/sync.rs", "quorum-core/src/db.rs"], "note": "LIVE in schema+sync, but undocumented in design spec — drift"},
+      {"term": "instance_id", "files": ["quorum-core/src/db.rs"], "note": "migration history only (v16 adds, v18 drops) — not stale"}
+    ],
+    "in_docs_only": [
+      {"term": "kind:review", "files": ["docs/2026-06-26-review-as-task-plan.md", "docs/2026-06-23-quorum-design.md"]},
+      {"term": "review_of", "files": ["docs/2026-06-26-review-as-task-plan.md"]},
+      {"term": "REVIEW_LABEL", "files": ["docs/2026-06-26-review-as-task-plan.md"]},
+      {"term": "sticky_until", "files": ["docs/2026-06-26-review-as-task-plan.md"]},
+      {"term": "instance_id", "files": ["CLAUDE.md"]}
+    ],
+    "not_found": ["auto_resolve_review", "only_repo", "repo_dir_map", "repo_from_refs", "DEFAULT_REPO"]
+  },
+  "top_churn_files": [
+    {"file": "quorum/src/serve/mod.rs", "commits": 4, "lines": 4151},
+    {"file": "quorum/src/serve/render.rs", "commits": 3, "lines": 277},
+    {"file": "quorum/src/main.rs", "commits": 3, "lines": 995},
+    {"file": "quorum/src/cli.rs", "commits": 3, "lines": 476},
+    {"file": "quorum/tests/cli_serve_reviewer.rs", "commits": 2, "lines": 765},
+    {"file": "quorum-core/src/lifecycle.rs", "commits": 2, "lines": 944}
+  ]
+}
