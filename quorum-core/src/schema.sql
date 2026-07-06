@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 15). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 19). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -242,6 +242,15 @@ CREATE TABLE IF NOT EXISTS approvals (
     created_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS approvals_task ON approvals(task_id);
+
+-- Single-daemon-per-DB guard. At most one row (id=1). The daemon acquires this
+-- on startup, refreshes heartbeat_at on every tick, and deletes on clean shutdown.
+-- A second daemon checks this row to decide whether to take over (stale/dead) or exit.
+CREATE TABLE IF NOT EXISTS daemon_lock (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    pid           INTEGER NOT NULL,
+    heartbeat_at  INTEGER NOT NULL
+);
 
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).

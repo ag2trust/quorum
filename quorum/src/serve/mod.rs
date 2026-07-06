@@ -303,16 +303,62 @@ pub struct ServeConfig {
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
 
+const DAEMON_LOCK_STALE_SECS: i64 = 30;
+
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     log(&format!(
         "starting (cap={}, repo={})",
         config.cap, config.repo
     ));
 
+    let daemon_pid = std::process::id() as i64;
+    let now = now_unix();
+
+    // Acquire the single-daemon-per-DB lock. The check + acquire is atomic
+    // (single BEGIN IMMEDIATE) to prevent TOCTOU races between two daemons
+    // starting simultaneously.
+    {
+        let mut conn = quorum_core::db::open(&config.db_path)?;
+        match quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            now,
+            DAEMON_LOCK_STALE_SECS,
+            pid_is_alive,
+        )? {
+            quorum_core::daemon_lock::AcquireResult::Acquired => {}
+            quorum_core::daemon_lock::AcquireResult::Held {
+                holder_pid,
+                heartbeat_age,
+            } => {
+                return Err(QuorumError::Usage(format!(
+                    "another daemon (pid {holder_pid}) is already serving this DB — \
+                     heartbeat {heartbeat_age}s ago. Stop it first or wait for it to exit"
+                )));
+            }
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
 
-    rt.block_on(tick_loop(config))
+    let result = rt.block_on(tick_loop(&config, daemon_pid));
+
+    // Release the lock on clean shutdown (best-effort).
+    if let Ok(conn) = quorum_core::db::open(&config.db_path) {
+        let _ = quorum_core::daemon_lock::release(&conn, daemon_pid);
+    }
+
+    result
+}
+
+fn pid_is_alive(pid: i64) -> bool {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    // EPERM means the process exists but we lack permission — still alive.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 pub(crate) struct SlotState {
@@ -481,7 +527,7 @@ fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
     }
 }
 
-async fn tick_loop(config: ServeConfig) -> Result<i32> {
+async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -565,7 +611,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
 
     // M7: crash recovery — resume in-flight agents from journal
     if let Err(e) = recovery::recover(
-        &config,
+        config,
         &wt_mgr,
         &mut name_pool,
         &mut workers,
@@ -596,15 +642,15 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                 log("shutting down (signal, no in-flight agents)");
             }
             for r in reviewers.drain(..) {
-                teardown_reviewer(&config, &wt_mgr, &mut name_pool, r).await;
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
             }
             for w in workers.drain(..) {
-                teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
+                teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
             }
             // #178: pending reviews left dangling on force-shutdown — release
             // the task back to open so a future daemon can pick it up cleanly.
             for p in pending_reviews.drain(..) {
-                teardown_pending_review(&config, &wt_mgr, &mut name_pool, p, "open", None).await;
+                teardown_pending_review(config, &wt_mgr, &mut name_pool, p, "open", None).await;
             }
             return Ok(0);
         }
@@ -686,14 +732,13 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                     pending_reviews.len(),
                 ));
                 for r in reviewers.drain(..) {
-                    teardown_reviewer(&config, &wt_mgr, &mut name_pool, r).await;
+                    teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
                 }
                 for w in workers.drain(..) {
-                    teardown_worker(&config, &wt_mgr, &mut name_pool, w, "open").await;
+                    teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
                 }
                 for p in pending_reviews.drain(..) {
-                    teardown_pending_review(&config, &wt_mgr, &mut name_pool, p, "open", None)
-                        .await;
+                    teardown_pending_review(config, &wt_mgr, &mut name_pool, p, "open", None).await;
                 }
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
                 log(&format!("DRAIN: exiting {exit} (sha={sha})"));
@@ -702,7 +747,7 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
         }
 
         if let Err(e) = tick(
-            &config,
+            config,
             &wt_mgr,
             &mut name_pool,
             &mut workers,
@@ -741,6 +786,18 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
                 }
                 TickErrorAction::Continue => log(&format!("tick error: {e}")),
             }
+        }
+
+        // Refresh the daemon lock heartbeat so a competing daemon sees us as live.
+        {
+            let db = config.db_path.clone();
+            let pid = daemon_pid;
+            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                let conn = quorum_core::db::open(&db)?;
+                let now = now_unix();
+                quorum_core::daemon_lock::refresh(&conn, pid, now)
+            })
+            .await;
         }
     }
 }

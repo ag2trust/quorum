@@ -9,6 +9,7 @@ pub mod branches;
 pub mod claims;
 pub mod clock;
 pub mod control;
+pub mod daemon_lock;
 pub mod db;
 pub mod errlog;
 pub mod error;
