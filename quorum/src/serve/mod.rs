@@ -977,6 +977,8 @@ async fn tick(
                                 workers[wi].task_id,
                                 pr_num,
                                 &rework_msg,
+                                workers[wi].cost_usd,
+                                config.limits.max_task_cost_usd,
                             );
                             if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                                 log(&format!(
@@ -1052,6 +1054,8 @@ async fn tick(
                                 pending.task_id,
                                 pr_num,
                                 &rework_msg,
+                                pending.cost_usd,
+                                config.limits.max_task_cost_usd,
                             );
                             spawn_resume_worker_for_pending(
                                 config,
@@ -1126,6 +1130,8 @@ async fn tick(
                                     workers[wi].task_id,
                                     pr_num,
                                     &rework_msg,
+                                    workers[wi].cost_usd,
+                                    config.limits.max_task_cost_usd,
                                 );
                                 if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                                     log(&format!(
@@ -1202,6 +1208,8 @@ async fn tick(
                                     pending.task_id,
                                     pr_num,
                                     &rework_msg,
+                                    pending.cost_usd,
+                                    config.limits.max_task_cost_usd,
                                 );
                                 spawn_resume_worker_for_pending(
                                     config,
@@ -1539,6 +1547,8 @@ async fn tick(
                                         workers[wi].task_id,
                                         pr_num,
                                         &rework_msg,
+                                        workers[wi].cost_usd,
+                                        config.limits.max_task_cost_usd,
                                     );
                                     if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                                         log(&format!(
@@ -1618,6 +1628,8 @@ async fn tick(
                                         pending.task_id,
                                         pr_num,
                                         &rework_msg,
+                                        pending.cost_usd,
+                                        config.limits.max_task_cost_usd,
                                     );
                                     spawn_resume_worker_for_pending(
                                         config,
@@ -1712,6 +1724,8 @@ async fn tick(
                             workers[wi].task_id,
                             rework_pr,
                             feedback,
+                            workers[wi].cost_usd,
+                            config.limits.max_task_cost_usd,
                         );
                         if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
                             log(&format!(
@@ -1781,6 +1795,8 @@ async fn tick(
                             pending.task_id,
                             rework_pr,
                             feedback,
+                            pending.cost_usd,
+                            config.limits.max_task_cost_usd,
                         );
                         spawn_resume_worker_for_pending(
                             config,
@@ -3094,7 +3110,13 @@ async fn spawn_worker(
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
         Ok(mut proc) => {
             let body = task.body.as_deref().unwrap_or(&task.title);
-            let turn1 = reviewer::build_worker_turn(&agent_name, task.id, &task.title, body);
+            let turn1 = reviewer::build_worker_turn(
+                &agent_name,
+                task.id,
+                &task.title,
+                body,
+                config.limits.max_task_cost_usd,
+            );
             if let Err(e) = proc.feed_turn(&turn1).await {
                 log(&format!("feed_turn failed: {e}"));
                 proc.kill_and_reap().await;

@@ -73,10 +73,43 @@ pub async fn spawn_reviewer(
     AgentProc::spawn(&agent_spec, agent_bin)
 }
 
-pub fn build_worker_turn(agent_name: &str, task_id: i64, title: &str, body: &str) -> String {
+/// Budget status line for worker turns. Workers self-regulate against the task
+/// ceiling instead of discovering it by being killed mid-task (task burned $8
+/// on a 32-subagent fan-out without ever knowing a ceiling existed). Empty when
+/// no ceiling is configured.
+fn budget_line(spent_usd: f64, max_task_cost_usd: Option<f64>) -> String {
+    match max_task_cost_usd {
+        Some(max) => format!(
+            "\n\nBudget: ${spent_usd:.2} spent of a ${max:.2} task ceiling — exceeding \
+             the ceiling kills this session and fails the task."
+        ),
+        None => String::new(),
+    }
+}
+
+/// Token-economy guidance for spawned workers. A daemon worker is a batch
+/// process: nobody waits on wall-clock, so parallel subagent fan-out buys
+/// nothing and multiplies cost (each subagent re-pays full boot context).
+const WORKING_STYLE: &str =
+    "Working style — you are a batch worker; wall-clock is cheap, tokens are not:\n\
+     - Do ALL edits, fixes, and mechanical work directly in this session. Do NOT fan out \
+     subagents (Agent/Task tool) to parallelize them — each subagent re-pays your full \
+     context as a boot tax and shares no cache with its siblings.\n\
+     - A subagent is justified ONLY to quarantine bulky read-only exploration (many-file \
+     reads that would bloat your context) behind a short returned conclusion, and rarely \
+     more than one or two per task.";
+
+pub fn build_worker_turn(
+    agent_name: &str,
+    task_id: i64,
+    title: &str,
+    body: &str,
+    max_task_cost_usd: Option<f64>,
+) -> String {
     super::agent::user_turn(&format!(
         "You are agent {agent}. Task #{task_id}: {title}\n\n\
          {body}\n\n\
+         {working_style}{budget}\n\n\
          When your work is complete:\n\
          1. Push your branch and open a PR with: gh pr create\n\
          2. Signal completion with the PR number: quorum done --agent {agent} --pr <PR_NUMBER>\n\
@@ -86,13 +119,23 @@ pub fn build_worker_turn(agent_name: &str, task_id: i64, title: &str, body: &str
         task_id = task_id,
         title = title,
         body = body,
+        working_style = WORKING_STYLE,
+        budget = budget_line(0.0, max_task_cost_usd),
     ))
 }
 
-pub fn build_rework_turn(agent_name: &str, task_id: i64, pr: i64, feedback: &str) -> String {
+pub fn build_rework_turn(
+    agent_name: &str,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+    spent_usd: f64,
+    max_task_cost_usd: Option<f64>,
+) -> String {
     super::agent::user_turn(&format!(
         "REVIEW FAILED — the reviewer requested changes. Fix the following feedback and push again:\n\n\
          {feedback}\n\n\
+         Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and pushing:\n\
          1. Run preflight: ./preflight.sh\n\
          2. Re-signal completion with your PR number: quorum done --agent {agent} --pr {pr}\n\
@@ -102,6 +145,7 @@ pub fn build_rework_turn(agent_name: &str, task_id: i64, pr: i64, feedback: &str
         agent = agent_name,
         pr = pr,
         task_id = task_id,
+        budget = budget_line(spent_usd, max_task_cost_usd),
     ))
 }
 
@@ -169,8 +213,23 @@ mod tests {
 
     #[test]
     fn rework_turn_contains_feedback_and_review_failed() {
-        let turn = build_rework_turn("W-1", 42, 99, "Fix error handling in main.rs");
+        let turn = build_rework_turn(
+            "W-1",
+            42,
+            99,
+            "Fix error handling in main.rs",
+            1.25,
+            Some(50.0),
+        );
         assert!(turn.contains("REVIEW FAILED"));
+        assert!(
+            turn.contains("$1.25") && turn.contains("$50.00"),
+            "rework template must state spent budget against the ceiling"
+        );
+        assert!(
+            turn.contains("do not spawn subagents"),
+            "rework template must forbid subagent fan-out"
+        );
         assert!(turn.contains("Fix error handling in main.rs"));
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         assert_eq!(parsed["type"], "user");
@@ -182,7 +241,11 @@ mod tests {
 
     #[test]
     fn rework_turn_contains_done_pr_re_signal() {
-        let turn = build_rework_turn("W-1", 42, 99, "fix it");
+        let turn = build_rework_turn("W-1", 42, 99, "fix it", 0.0, None);
+        assert!(
+            !turn.contains("Budget:"),
+            "no budget line when no ceiling is configured"
+        );
         assert!(
             turn.contains("quorum done --agent W-1 --pr 99"),
             "rework template must instruct agent to re-signal done with PR number"
@@ -203,7 +266,7 @@ mod tests {
 
     #[test]
     fn worker_turn_contains_agent_and_task() {
-        let turn = build_worker_turn("Agent-1", 99, "Fix the bug", "Detailed body text");
+        let turn = build_worker_turn("Agent-1", 99, "Fix the bug", "Detailed body text", None);
         assert!(turn.contains("Agent-1"));
         assert!(turn.contains("Task #99"));
         assert!(turn.contains("Fix the bug"));
@@ -218,7 +281,19 @@ mod tests {
 
     #[test]
     fn worker_turn_contains_pr_done_contract() {
-        let turn = build_worker_turn("W-1", 42, "title", "body");
+        let turn = build_worker_turn("W-1", 42, "title", "body", Some(50.0));
+        assert!(
+            turn.contains("Working style"),
+            "worker template must carry the batch-worker token-economy guidance"
+        );
+        assert!(
+            turn.contains("Do NOT fan out"),
+            "worker template must forbid subagent fan-out for mechanical work"
+        );
+        assert!(
+            turn.contains("$0.00") && turn.contains("$50.00"),
+            "worker template must state the budget ceiling when configured"
+        );
         assert!(
             turn.contains("gh pr create"),
             "worker template must instruct agent to open a PR"
@@ -251,9 +326,9 @@ mod tests {
             reviewer_name: "R".into(),
         };
         let templates: &[(&str, String)] = &[
-            ("worker", build_worker_turn("A", 1, "t", "b")),
+            ("worker", build_worker_turn("A", 1, "t", "b", None)),
             ("reviewer", build_review_prompt(&spec)),
-            ("rework", build_rework_turn("A", 1, 1, "fix it")),
+            ("rework", build_rework_turn("A", 1, 1, "fix it", 0.0, None)),
         ];
 
         let clap_cmd = crate::cli::Cli::command();
