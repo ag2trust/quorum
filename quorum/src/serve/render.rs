@@ -253,13 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn truncate_multibyte_utf8_does_not_panic() {
-        let event = Event::ToolUse {
-            name: "Bash".into(),
-            input: json!({"command": "echo héllo wörld über alles café"}),
-        };
-        let rendered = render_event(&event).unwrap();
-        assert!(rendered.contains("> Bash:"));
+    fn truncate_multibyte_utf8() {
+        assert_eq!(truncate("héllo", 3), "hél…");
+        assert_eq!(truncate("café", 4), "café");
+        assert_eq!(truncate("café", 3), "caf…");
+        // emoji (4-byte chars) — must not panic at any max
+        let emoji = "🎉🎊🎈🎁";
+        assert_eq!(truncate(emoji, 2), "🎉🎊…");
+        assert_eq!(truncate(emoji, 1), "🎉…");
+        assert_eq!(truncate(emoji, 4), "🎉🎊🎈🎁");
     }
 
     #[test]
