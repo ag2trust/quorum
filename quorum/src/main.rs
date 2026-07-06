@@ -166,7 +166,7 @@ fn parse_ttl(s: &str) -> Result<i64> {
 }
 
 fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
-    let output = std::process::Command::new("gh")
+    let child = std::process::Command::new("gh")
         .args([
             "repo",
             "view",
@@ -176,16 +176,53 @@ fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
             ".nameWithOwner",
         ])
         .current_dir(repo_dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let nwo = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let nwo = wait_child_stdout(child, std::time::Duration::from_secs(15))?;
+    let nwo = nwo.trim().to_string();
     if nwo.contains('/') {
         Some(nwo)
     } else {
         None
+    }
+}
+
+/// Wait for a spawned child with a timeout. Returns stdout on success, None on
+/// failure/timeout. On timeout the child is killed and a warning is emitted.
+fn wait_child_stdout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read as _;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    let mut buf = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let _ = stdout.read_to_string(&mut buf);
+                    }
+                    return Some(buf);
+                }
+                return None;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                eprintln!(
+                    "WARN: resolve_gh_repo: subprocess timed out after {timeout:?}, \
+                     falling back to None"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) => return None,
+        }
     }
 }
 
@@ -954,7 +991,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ttl;
+    use super::{parse_ttl, wait_child_stdout};
 
     #[test]
     fn parse_ttl_units() {
@@ -991,5 +1028,44 @@ mod tests {
             super::MAX_TTL_SECS
         );
         assert_eq!(parse_ttl("30d").unwrap(), 30 * 86_400);
+    }
+
+    #[test]
+    fn wait_child_stdout_returns_output_on_fast_exit() {
+        let child = std::process::Command::new("echo")
+            .arg("hello")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = wait_child_stdout(child, std::time::Duration::from_secs(5));
+        assert_eq!(result.unwrap().trim(), "hello");
+    }
+
+    #[test]
+    fn wait_child_stdout_returns_none_on_failure() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = wait_child_stdout(child, std::time::Duration::from_secs(5));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn wait_child_stdout_kills_on_timeout() {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let result = wait_child_stdout(child, std::time::Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "timed-out child must return None");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must not wait for the full sleep; elapsed: {elapsed:?}"
+        );
     }
 }
