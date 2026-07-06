@@ -460,6 +460,19 @@ pub enum Command {
         #[arg(long, hide = true)]
         exit_when_gone: Option<String>,
     },
+    /// Stream rendered events from an agent's session log. Resolves the agent's
+    /// latest session log directory via the journal. Default: print events so far
+    /// and exit. `--follow` keeps tailing until Ctrl-C.
+    Tail {
+        /// Agent name whose session log to tail.
+        agent: String,
+        /// Keep following new events (like `tail -f`).
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Emit raw JSONL lines instead of rendered text.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]
