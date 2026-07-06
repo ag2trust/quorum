@@ -447,8 +447,8 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     );
     assert_eq!(
         task["assignee"].as_str(),
-        Some(worker_name.as_str()),
-        "task must remain assigned to the same worker during rework, got: {stdout}"
+        task["reviewer"].as_str(),
+        "during rework, assignee must be the reviewer (set via ReviewerAttached), got: {stdout}"
     );
 
     handle.stop();
@@ -757,8 +757,8 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     );
     assert_eq!(
         task["assignee"].as_str(),
-        Some(worker_name.as_str()),
-        "task must remain assigned to the delivering worker during rework: {stdout}"
+        task["reviewer"].as_str(),
+        "during rework, assignee must be the reviewer (set via ReviewerAttached): {stdout}"
     );
 
     handle.stop();
