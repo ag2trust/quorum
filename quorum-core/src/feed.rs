@@ -22,7 +22,9 @@ pub const DEFAULT_MESSAGE_TTL_SECS: i64 = 48 * 3600;
 pub const DEFAULT_READ_LIMIT: i64 = 100;
 
 /// Valid message kinds.
-pub const KINDS: &[&str] = &["info", "request", "claim", "done", "hello", "critical"];
+pub const KINDS: &[&str] = &[
+    "info", "request", "claim", "done", "hello", "critical", "alert",
+];
 
 /// A feed message.
 #[derive(Debug, Serialize, PartialEq, Eq)]

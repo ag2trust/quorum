@@ -542,6 +542,35 @@ pub fn apply_event(
                     assignee = None;
                 }
             }
+            Effect::NotifyOwner { reason } => {
+                let alert_body = format!("task #{id}: {reason}");
+                let expires_at = now + crate::feed::DEFAULT_MESSAGE_TTL_SECS;
+                tx.execute(
+                    "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        now,
+                        agent,
+                        crate::feed::DEFAULT_TOPIC,
+                        "alert",
+                        alert_body,
+                        format!("task:{id}"),
+                        expires_at,
+                        task.created_by
+                    ],
+                )?;
+            }
+            Effect::PostFindingsNote => {
+                tx.execute(
+                    "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        now,
+                        agent,
+                        "review-only task failed: reviewer requested changes"
+                    ],
+                )?;
+            }
             _ => {}
         }
     }
@@ -1748,6 +1777,113 @@ mod tests {
             1000,
         );
         assert!(matches!(err, Err(QuorumError::Usage(_))));
+    }
+
+    // ── metadata update ─────────────────────────────────────────────────────
+
+    // ── effect dispatch: NotifyOwner + PostFindingsNote ────────────────────
+
+    #[test]
+    fn rework_cap_exceeded_posts_alert_to_creator() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        c.execute(
+            "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+            params![crate::lifecycle::REWORK_CAP as i64, id],
+        )
+        .unwrap();
+
+        let r = apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
+        assert_eq!(r.task.status, "failed");
+        assert!(r
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+
+        let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
+        let alert = msgs
+            .iter()
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .expect("alert message to creator missing");
+        assert!(
+            alert.body.contains("rework cap"),
+            "alert body should mention rework cap: {}",
+            alert.body
+        );
+        assert!(alert
+            .refs
+            .as_deref()
+            .unwrap()
+            .contains(&format!("task:{id}")));
+    }
+
+    #[test]
+    fn review_only_verdict_changes_posts_findings_note() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "review PR #50",
+            None,
+            100,
+            None,
+            None,
+            None,
+            Some(50),
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1001).unwrap();
+
+        let r = apply_event(&mut c, "R", id, &Event::VerdictChanges, 1002).unwrap();
+        assert_eq!(r.task.status, "failed");
+        assert!(r.effects.contains(&Effect::PostFindingsNote));
+
+        let detail = get_with_notes(&c, id).unwrap().unwrap();
+        let note = detail
+            .notes
+            .iter()
+            .find(|n| n.body.contains("review-only"))
+            .expect("findings note missing");
+        assert!(note.body.contains("requested changes"));
+    }
+
+    #[test]
+    fn agent_failed_from_working_posts_alert_to_creator() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+
+        let r = apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::AgentFailed {
+                reason: "OOM killed".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "open");
+
+        let msgs = crate::feed::peek(&c, None, None, 10, 1001).unwrap();
+        let alert = msgs
+            .iter()
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .expect("alert message to creator missing");
+        assert!(alert.body.contains("OOM killed"));
     }
 
     // ── metadata update ─────────────────────────────────────────────────────
