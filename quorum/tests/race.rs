@@ -15,12 +15,14 @@ fn n_processes_exactly_one_winner() {
     assert_cmd::Command::cargo_bin("quorum")
         .unwrap()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
     assert_cmd::Command::cargo_bin("quorum")
         .unwrap()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-create", "--created-by", "boss", "--title", "race-me"])
         .assert()
         .success();
@@ -34,6 +36,7 @@ fn n_processes_exactly_one_winner() {
         .map(|i| {
             Command::new(&bin)
                 .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
                 .args([
                     "task-claim",
                     "--agent",
@@ -59,7 +62,7 @@ fn n_processes_exactly_one_winner() {
     assert_eq!(wins, 1, "exactly one process must win the claim");
 
     // And the store agrees: exactly one active lease row for the task.
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let active: i64 = conn
         .query_row(
             "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",

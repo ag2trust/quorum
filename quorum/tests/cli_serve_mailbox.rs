@@ -89,8 +89,11 @@ impl ServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .args([
                 "serve",
+                "--repo",
+                "test/repo",
                 "--cap",
                 "1",
                 "--repo-dir",
@@ -167,6 +170,7 @@ impl ServeHandle {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -188,6 +192,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -200,7 +205,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
 
 /// Insert a raw mailbox row directly via the quorum DB (bypasses CLI).
 fn insert_mailbox_row(home: &std::path::Path, agent: &str, kind: &str) {
-    let db_path = home.join("quorum.db");
+    let db_path = home.join("repos/test__repo/quorum.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
         "INSERT INTO mailbox (agent, kind, created_at) VALUES (?1, ?2, strftime('%s','now'))",
@@ -211,7 +216,7 @@ fn insert_mailbox_row(home: &std::path::Path, agent: &str, kind: &str) {
 
 /// Count unconsumed mailbox rows for a given agent.
 fn count_unconsumed(home: &std::path::Path, agent: &str) -> usize {
-    let db_path = home.join("quorum.db");
+    let db_path = home.join("repos/test__repo/quorum.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.query_row(
         "SELECT COUNT(*) FROM mailbox WHERE agent = ?1 AND consumed_at IS NULL",
@@ -239,6 +244,7 @@ fn unmatched_done_row_left_for_other_instance() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -292,6 +298,7 @@ fn phantom_done_row_for_owned_name_still_consumed() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -378,6 +385,7 @@ fn two_daemons_do_not_consume_sibling_signals() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -428,6 +436,7 @@ fn non_done_mailbox_rows_dont_block_daemon() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -485,6 +494,7 @@ fn stale_done_row_drained_on_name_reuse() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -541,6 +551,7 @@ fn stale_done_row_drained_on_name_reuse() {
     // not applied).
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();
@@ -567,6 +578,7 @@ fn rework_feed_failure_releases_task() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -665,6 +677,7 @@ fn rework_feed_failure_releases_task() {
     // Task must be back to open (not stranded in claimed/in-progress).
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();

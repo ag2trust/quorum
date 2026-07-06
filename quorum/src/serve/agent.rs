@@ -14,6 +14,7 @@ pub struct AgentSpec {
     pub bare: bool,
     pub resume: bool,
     pub allowed_tools: String,
+    pub env_vars: Vec<(String, String)>,
 }
 
 pub struct AgentProc {
@@ -76,10 +77,10 @@ impl AgentProc {
             cmd.arg("--bare");
         }
 
-        // Run the agent inside its worktree — `--add-dir` only grants access,
-        // it does not set the working directory (first live run: workers ran
-        // in the daemon's cwd). Inherit stderr so CLI-level failures surface
-        // in the daemon log instead of vanishing (same run: exit-1 cause lost).
+        for (k, v) in &spec.env_vars {
+            cmd.env(k, v);
+        }
+
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -186,6 +187,7 @@ mod tests {
             bare: false,
             resume: false,
             allowed_tools: "Bash,Read".to_string(),
+            env_vars: vec![],
         };
         assert_eq!(spec.allowed_tools, "Bash,Read");
     }

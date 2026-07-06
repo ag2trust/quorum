@@ -7,7 +7,7 @@ use std::process::{Command as Proc, Stdio};
 
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
-    c.env("QUORUM_HOME", home);
+    c.env("QUORUM_HOME", home).env("QUORUM_REPO", "test/repo");
     c
 }
 
@@ -100,7 +100,7 @@ fn normal_misses_do_not_log_errors() {
         .assert()
         .code(1);
     // none of those normal misses are errors
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
         .unwrap();
@@ -292,7 +292,7 @@ fn reaper_reclaims_lapsed_lease_via_cli() {
         .success()
         .stdout(predicates::str::contains("reclaimed").not());
     // No errors logged (reaping is normal operation).
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
         .unwrap();
@@ -446,7 +446,7 @@ fn note_on_missing_task_is_exit_1_not_an_error() {
         .assert()
         .code(1);
     // and nothing logged to errors
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let n: i64 = conn
         .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
         .unwrap();
@@ -496,6 +496,7 @@ fn concurrent_task_claim_one_winner() {
         .map(|i| {
             Proc::new(&bin)
                 .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
                 .args(["task-claim", "--agent", &format!("a{i}"), "--task-id", "1"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -525,7 +526,7 @@ fn concurrent_task_claim_one_winner() {
     // Storage agrees: exactly one active lease row for task#1, the same property the claims
     // canary asserts for an arbitrary target. Catches a half-applied claim (status UPDATE
     // wins, lease INSERT fails) that the win-count check can't see.
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let active: i64 = conn
         .query_row(
             "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
@@ -652,6 +653,7 @@ fn concurrent_match_label_claim_one_winner() {
         .map(|i| {
             Proc::new(&bin)
                 .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
                 .args([
                     "task-claim",
                     "--agent",
@@ -684,7 +686,7 @@ fn concurrent_match_label_claim_one_winner() {
             "loser must exit 1 (clean lost-race), got {code}"
         );
     }
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let active: i64 = conn
         .query_row(
             "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",

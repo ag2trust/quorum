@@ -57,6 +57,7 @@ fn serve_boots_and_stops_on_sigint() {
 
     let init_status = Command::new(cargo_bin())
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -67,8 +68,11 @@ fn serve_boots_and_stops_on_sigint() {
 
     let mut child = Command::new(cargo_bin())
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",

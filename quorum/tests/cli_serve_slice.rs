@@ -77,6 +77,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     // Init quorum DB
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -84,6 +85,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     // Seed a task
     let mut task_child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -113,8 +115,11 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     let fake_agent = cargo_bin("fake-agent");
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",
@@ -181,6 +186,7 @@ fn serve_spawns_agent_and_tears_down_on_done() {
     if !agent_name.is_empty() {
         let done_out = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
             .args(["done", "--agent", &agent_name, "--pr", "1"])
             .output()
             .unwrap();
@@ -214,12 +220,14 @@ fn sigint_during_work_releases_task_back_to_open() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
 
     let task_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -239,8 +247,11 @@ fn sigint_during_work_releases_task_back_to_open() {
     let fake_agent = cargo_bin("fake-agent");
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",
@@ -296,6 +307,7 @@ fn sigint_during_work_releases_task_back_to_open() {
     // The interrupted task must be released back to open, not marked done
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();

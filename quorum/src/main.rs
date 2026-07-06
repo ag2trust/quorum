@@ -808,12 +808,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             drain_timeout_secs,
             self_repo,
             sha_poll_interval_secs,
-            only_repo,
-            repo_dir_map,
+            repo,
             base_branch,
             exit_when_gone,
         } => {
-            let db = paths::db_path()?;
+            let db = paths::ensure_repo_dir(&repo)?;
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
                 if let Some(cmd) = merge_cmd {
                     std::sync::Arc::new(serve::merge::CommandMergeExecutor {
@@ -847,14 +846,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             } else {
                 None
             };
-            let parsed_repo_dir_map: std::collections::HashMap<String, std::path::PathBuf> =
-                repo_dir_map
-                    .into_iter()
-                    .filter_map(|entry| {
-                        let (key, val) = entry.split_once('=')?;
-                        Some((key.to_string(), std::path::PathBuf::from(val)))
-                    })
-                    .collect();
             let worktree_base_path = std::path::PathBuf::from(worktree_base);
             let instance_id = serve::derive_instance_id(&worktree_base_path);
             let config = serve::ServeConfig {
@@ -876,8 +867,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 sha_poll_interval_secs,
                 merge_checks_timeout_secs,
                 merge_checks_poll_secs,
-                only_repo,
-                repo_dir_map: parsed_repo_dir_map,
+                repo,
                 base_branch,
                 instance_id,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),

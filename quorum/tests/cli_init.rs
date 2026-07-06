@@ -5,6 +5,7 @@ use assert_cmd::Command;
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
     c.env("QUORUM_HOME", home);
+    c.env("QUORUM_REPO", "test/repo");
     c
 }
 
@@ -14,10 +15,11 @@ fn init_creates_db() {
     Command::cargo_bin("quorum")
         .unwrap()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
-    assert!(home.path().join("quorum.db").exists());
+    assert!(home.path().join("repos/test__repo/quorum.db").exists());
 }
 
 #[test]
@@ -44,7 +46,8 @@ fn init_on_drifted_db_reports_migrated_from() {
     // Simulate the cutover incident: DB at v4 (no control table, no sticky_until/orig).
     // Running init with the current binary must retrofit the schema and report the migration.
     let home = tempfile::tempdir().unwrap();
-    let db_path = home.path().join("quorum.db");
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
@@ -105,6 +108,7 @@ fn init_is_idempotent() {
         Command::cargo_bin("quorum")
             .unwrap()
             .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
             .arg("init")
             .assert()
             .success();
@@ -131,6 +135,7 @@ fn concurrent_init_is_safe() {
                     Command::cargo_bin("quorum")
                         .unwrap()
                         .env("QUORUM_HOME", &p)
+                        .env("QUORUM_REPO", "test/repo")
                         .arg("init")
                         .assert()
                         .success();
@@ -140,7 +145,7 @@ fn concurrent_init_is_safe() {
         for h in handles {
             h.join().unwrap();
         }
-        assert!(home.path().join("quorum.db").exists());
+        assert!(home.path().join("repos/test__repo/quorum.db").exists());
     }
 }
 
@@ -198,7 +203,7 @@ fn reset_yes_wipes_to_clean_db() {
         .assert()
         .success()
         .stdout(predicates::str::contains("[]"));
-    assert!(home.path().join("quorum.db").exists());
+    assert!(home.path().join("repos/test__repo/quorum.db").exists());
 }
 
 #[test]
@@ -211,5 +216,5 @@ fn reset_yes_on_fresh_home_succeeds() {
         .assert()
         .success()
         .stdout(predicates::str::contains("\"reset\":true"));
-    assert!(home.path().join("quorum.db").exists());
+    assert!(home.path().join("repos/test__repo/quorum.db").exists());
 }

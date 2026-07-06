@@ -444,17 +444,11 @@ pub enum Command {
         /// Interval between git ls-remote sha polls (seconds). Default: 60.
         #[arg(long, default_value = "60", hide = true)]
         sha_poll_interval_secs: u64,
-        /// Only pull tasks whose refs.repo matches this value (e.g. "ag2trust/quorum").
-        /// Tasks with no refs.repo are skipped when this filter is set.
-        /// Can be specified multiple times to accept several repos.
+        /// Repo this daemon manages (e.g. "ag2trust/quorum"). Required.
+        /// The daemon opens this repo's per-repo DB and sets QUORUM_REPO for
+        /// all spawned workers/reviewers.
         #[arg(long)]
-        only_repo: Vec<String>,
-        /// Map a repo slug to a local clone directory for multi-repo provisioning.
-        /// Format: "owner/name=/path/to/clone". Repeatable. When a task's refs.repo
-        /// matches a key, that directory is used for git fetch / worktree operations
-        /// instead of --repo-dir.
-        #[arg(long)]
-        repo_dir_map: Vec<String>,
+        repo: String,
         /// Base branch name for sha-polling, worktree provisioning, and merge
         /// targeting. Use "master" for repos whose trunk is master. Default: main.
         #[arg(long, default_value = "main")]

@@ -83,6 +83,8 @@ impl ServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut args: Vec<String> = vec![
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",
@@ -107,6 +109,7 @@ impl ServeHandle {
 
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -187,6 +190,7 @@ impl ServeHandle {
 fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -210,6 +214,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -232,6 +237,7 @@ fn self_repo_merge_drains_and_exits_75() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -342,6 +348,7 @@ fn other_repo_merge_does_not_drain() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -449,6 +456,7 @@ fn drain_timeout_force_kills_and_exits_75() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -532,6 +540,7 @@ fn drain_timeout_force_kills_and_exits_75() {
     // Verify queued task (#2) is still open (claimable after restart)
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "2"])
         .output()
         .unwrap();

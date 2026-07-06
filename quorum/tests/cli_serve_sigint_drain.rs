@@ -83,6 +83,8 @@ impl ServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",
@@ -107,6 +109,7 @@ impl ServeHandle {
 
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -200,6 +203,7 @@ impl ServeHandle {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -221,6 +225,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -244,6 +249,7 @@ fn sigint_drains_in_flight_agent_and_exits_0() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -321,6 +327,7 @@ fn double_sigint_forces_immediate_teardown() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -392,6 +399,7 @@ fn sigint_no_agents_exits_immediately() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();

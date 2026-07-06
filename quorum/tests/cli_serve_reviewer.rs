@@ -94,8 +94,11 @@ impl ServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .args([
                 "serve",
+                "--repo",
+                "test/repo",
                 "--cap",
                 "1",
                 "--repo-dir",
@@ -174,33 +177,13 @@ impl ServeHandle {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
             title,
             "--created-by",
             "TestCreator",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "task-create failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
-    let out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home)
-        .args([
-            "task-create",
-            "--title",
-            title,
-            "--created-by",
-            "TestCreator",
-            "--refs",
-            refs,
         ])
         .output()
         .unwrap();
@@ -216,6 +199,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -237,6 +221,7 @@ fn approve_flow_tears_down_both_agents() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -311,6 +296,7 @@ fn approve_flow_tears_down_both_agents() {
     std::thread::sleep(Duration::from_millis(500));
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();
@@ -335,6 +321,7 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -446,6 +433,7 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     // Task status: must still be claimed by the same worker (not done, not open)
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();
@@ -477,6 +465,7 @@ fn merge_failure_feeds_rework_to_worker() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -564,6 +553,7 @@ fn merge_failure_feeds_rework_to_worker() {
     // Task should NOT be done (merge failed, worker is reworking)
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();
@@ -588,6 +578,7 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -679,145 +670,6 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
     handle.stop();
 }
 
-/// #180: reviewer provision must resolve refs.repo via --repo-dir-map instead
-/// of always fetching from the daemon's base --repo-dir. When a task's refs.repo
-/// maps to a different directory, the reviewer worktree must be provisioned from
-/// that directory — otherwise `git fetch origin <branch>` fails because the branch
-/// doesn't exist on the default repo's remote.
-#[test]
-fn reviewer_provision_uses_repo_dir_map_for_cross_repo_task() {
-    let home = tempfile::tempdir().unwrap();
-    // Two separate repos: daemon base repo and the task's target repo.
-    let daemon_repo = tempfile::tempdir().unwrap();
-    let task_repo = tempfile::tempdir().unwrap();
-    let wt_base = tempfile::tempdir().unwrap();
-
-    init_git_repo(daemon_repo.path());
-    init_git_repo(task_repo.path());
-    let names_file = write_names_file(home.path());
-
-    Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .arg("init")
-        .status()
-        .unwrap();
-
-    // Create task with refs.repo pointing to "test/cross-repo"
-    seed_task_with_refs(
-        home.path(),
-        "Cross-repo task",
-        r#"{"repo":"test/cross-repo"}"#,
-    );
-
-    // Start daemon with --repo-dir-map mapping "test/cross-repo" to task_repo's path
-    let sentinel = tempfile::tempdir().unwrap();
-    let sentinel_path = sentinel.path().to_string_lossy().to_string();
-    let fake_agent = cargo_bin("fake-agent");
-    let repo_dir_map_val = format!("test/cross-repo={}", task_repo.path().display());
-    let mut child = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .args([
-            "serve",
-            "--cap",
-            "1",
-            "--repo-dir",
-            &daemon_repo.path().to_string_lossy(),
-            "--worktree-base",
-            &wt_base.path().to_string_lossy(),
-            "--names-file",
-            &names_file.to_string_lossy(),
-            "--agent-bin",
-            &fake_agent.to_string_lossy(),
-            "--merge-cmd",
-            "true",
-            "--repo-dir-map",
-            &repo_dir_map_val,
-            "--exit-when-gone",
-            &sentinel_path,
-        ])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    let stderr = child.stderr.take().unwrap();
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let mut lines: Vec<String> = Vec::new();
-
-    let wait_for = |lines: &mut Vec<String>, rx: &mpsc::Receiver<String>, needle: &str| -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        while std::time::Instant::now() < deadline {
-            let remaining = deadline - std::time::Instant::now();
-            match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    let found = line.contains(needle);
-                    lines.push(line);
-                    if found {
-                        return true;
-                    }
-                }
-                Err(_) => return false,
-            }
-        }
-        false
-    };
-
-    // Wait for worker to spawn (should provision from task_repo, not daemon_repo)
-    assert!(
-        wait_for(&mut lines, &rx, "spawning agent"),
-        "worker not spawned. Lines: {:?}",
-        lines
-    );
-    assert!(
-        wait_for(&mut lines, &rx, "result"),
-        "worker result not seen. Lines: {:?}",
-        lines
-    );
-
-    // Extract worker name
-    let worker_name = lines
-        .iter()
-        .find_map(|l| l.split("spawning agent ").nth(1))
-        .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
-        .unwrap();
-
-    // The worker's branch was created inside task_repo. Signal done with PR.
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
-
-    // Reviewer must provision its worktree from task_repo (where the branch exists).
-    // If it tries daemon_repo, the fetch will fail and we'd see provision strikes.
-    assert!(
-        wait_for(&mut lines, &rx, "reviewer worktree provisioned"),
-        "reviewer worktree not provisioned — likely failed due to wrong repo dir. Lines: {:?}",
-        lines
-    );
-
-    // Verify: no provision failure messages
-    let provision_failures = lines
-        .iter()
-        .filter(|l| l.contains("reviewer worktree provision failed"))
-        .count();
-    assert_eq!(
-        provision_failures, 0,
-        "reviewer provision should not fail with correct repo-dir-map. Lines: {:?}",
-        lines
-    );
-
-    // Clean up
-    unsafe {
-        libc::kill(child.id() as libc::pid_t, libc::SIGINT);
-    }
-    let _ = child.wait();
-}
-
 /// #206: an `approved` verdict that did NOT come through the validated CLI —
 /// no zero-blocking attestation payload on the mailbox row — must be demoted
 /// to `changes` at the daemon boundary and fed back as rework, never merged.
@@ -834,6 +686,7 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -868,7 +721,7 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
 
     // Bypass the CLI's #206 validation: write the approved-verdict mailbox row
     // directly, with NO attestation payload.
-    let conn = rusqlite::Connection::open(home.path().join("quorum.db")).unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("repos/test__repo/quorum.db")).unwrap();
     conn.execute(
         "INSERT INTO mailbox (agent, kind, pr, verdict, created_at) \
          VALUES (?1, 'done', 1, 'approved', 1700000000)",
@@ -904,6 +757,7 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     // one stays claimed by the same worker for the rework round.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();

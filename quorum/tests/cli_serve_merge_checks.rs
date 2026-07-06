@@ -85,6 +85,8 @@ impl ServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",
@@ -109,6 +111,7 @@ impl ServeHandle {
 
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -173,6 +176,7 @@ impl ServeHandle {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -194,6 +198,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -216,6 +221,7 @@ fn checks_pass_then_merge_succeeds() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -301,6 +307,7 @@ fn checks_fail_sends_rework() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -395,6 +402,7 @@ fn checks_timeout_parks_task() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -479,6 +487,7 @@ fn checks_timeout_parks_task() {
 
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();
@@ -510,6 +519,7 @@ fn checks_pending_then_ready_merges_after_wait() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -616,6 +626,7 @@ fn approved_without_pr_skips_merge() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();

@@ -7,6 +7,7 @@ use assert_cmd::Command;
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
     c.env("QUORUM_HOME", home);
+    c.env("QUORUM_REPO", "test/repo");
     c
 }
 
@@ -272,7 +273,7 @@ fn wal_stays_small_with_short_lived_connections() {
             .assert()
             .success();
     }
-    let wal = home.path().join("quorum.db-wal");
+    let wal = home.path().join("repos/test__repo/quorum.db-wal");
     let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
     assert!(
         size < 100_000,
@@ -286,7 +287,7 @@ fn migration_refusal_exits_3_on_newer_schema() {
     // Create a valid DB first...
     quorum(home.path()).arg("init").assert().success();
     // ...then bump user_version past what this binary understands.
-    let db_path = home.path().join("quorum.db");
+    let db_path = home.path().join("repos/test__repo/quorum.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute_batch("PRAGMA user_version = 999").unwrap();
     drop(conn);
@@ -331,6 +332,7 @@ fn status_watch_emits_output_before_kill() {
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["status", "--watch"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
