@@ -314,32 +314,29 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     let daemon_pid = std::process::id() as i64;
     let now = now_unix();
 
-    // Acquire the single-daemon-per-DB lock.
+    // Acquire the single-daemon-per-DB lock. The check + acquire is atomic
+    // (single BEGIN IMMEDIATE) to prevent TOCTOU races between two daemons
+    // starting simultaneously.
     {
         let mut conn = quorum_core::db::open(&config.db_path)?;
-        if let Some(holder) = quorum_core::daemon_lock::current_holder(&conn)? {
-            let heartbeat_age = now - holder.heartbeat_at;
-            let pid_alive = pid_is_alive(holder.pid);
-            if pid_alive && heartbeat_age < DAEMON_LOCK_STALE_SECS {
+        match quorum_core::daemon_lock::try_acquire(
+            &mut conn,
+            daemon_pid,
+            now,
+            DAEMON_LOCK_STALE_SECS,
+            pid_is_alive,
+        )? {
+            quorum_core::daemon_lock::AcquireResult::Acquired => {}
+            quorum_core::daemon_lock::AcquireResult::Held {
+                holder_pid,
+                heartbeat_age,
+            } => {
                 return Err(QuorumError::Usage(format!(
-                    "another daemon (pid {}) is already serving this DB — \
-                     heartbeat {}s ago. Stop it first or wait for it to exit",
-                    holder.pid, heartbeat_age
+                    "another daemon (pid {holder_pid}) is already serving this DB — \
+                     heartbeat {heartbeat_age}s ago. Stop it first or wait for it to exit"
                 )));
             }
-            if pid_alive {
-                log(&format!(
-                    "taking over from stale daemon pid {} (heartbeat {}s ago)",
-                    holder.pid, heartbeat_age
-                ));
-            } else {
-                log(&format!(
-                    "taking over from dead daemon pid {} (process not found)",
-                    holder.pid
-                ));
-            }
         }
-        quorum_core::daemon_lock::force_acquire(&mut conn, daemon_pid, now)?;
     }
 
     let rt = tokio::runtime::Runtime::new()
