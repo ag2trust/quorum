@@ -14,21 +14,14 @@ pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
 /// Max rows reclaimed per table by an opportunistic sweep-on-write.
 pub const SWEEP_LIMIT: usize = 100;
 
-/// Reaper: return any `claimed` task whose lease has lapsed (no active, unexpired lease on
-/// `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed` event per
-/// task to the event log (NOT to the message feed — events live separate from messaging per
-/// issue #4 so auto-events don't drown agent-to-agent messages).
-///
-/// Runs inside the caller's write transaction as part of [`sweep_on_write`] — this is how a
-/// lost agent's work re-enters the queue with no background daemon. Lease expiry boundary
-/// matches the rest of the engine: a lease is live iff `expires_at > now`.
+/// Reaper: return any `working` or `rework` task whose lease has lapsed (no active, unexpired
+/// lease on `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed`
+/// event per task to the event log.
 pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    // Snapshot lapsed-claimed tasks first (we need the about-to-be-cleared assignee for the
-    // event body). The correlated `'task#' || tasks.id` rebuilds the lease target per row.
     let lapsed: Vec<(i64, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT id, assignee FROM tasks
-             WHERE status='claimed' AND NOT EXISTS (
+             WHERE status IN ('working', 'rework') AND NOT EXISTS (
                  SELECT 1 FROM claims c
                  WHERE c.target = 'task#' || tasks.id AND c.active=1 AND c.expires_at > ?1
              )
@@ -154,14 +147,14 @@ mod tests {
     fn reaper_returns_lapsed_claimed_task_to_open_with_event() {
         let (_d, mut c) = open_tmp();
         // A claimed task with a short lease (dead at 1100).
-        let id =
-            crate::tasks::create(&mut c, "boss", "x", None, 0, None, None, None, 1000).unwrap();
+        let id = crate::tasks::create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000)
+            .unwrap();
         crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
         // Before expiry: reaper leaves it alone.
         reap_lapsed_tasks(&c, 1050, SWEEP_LIMIT).unwrap();
         assert_eq!(
             crate::tasks::get(&c, id).unwrap().unwrap().status,
-            "claimed"
+            "working"
         );
         // After the lease lapses: reaper returns it to open, clears assignee, emits a
         // `task_reclaimed` event to the EVENT LOG (not the message feed).
@@ -253,6 +246,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 1000,
             )
             .unwrap();
@@ -272,15 +266,15 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        let claimed: i64 = c
+        let working: i64 = c
             .query_row(
-                "SELECT count(*) FROM tasks WHERE status='claimed'",
+                "SELECT count(*) FROM tasks WHERE status='working'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(open, 2, "exactly 2 reaped to open");
-        assert_eq!(claimed, 3, "3 remain claimed (limit respected)");
+        assert_eq!(working, 3, "3 remain working (limit respected)");
         // Second call reaps 2 more.
         reap_lapsed_tasks(&c, 1100, 2).unwrap();
         let open2: i64 = c

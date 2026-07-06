@@ -365,7 +365,8 @@ mod tests {
     }
 
     fn seed_task(conn: &mut rusqlite::Connection, title: &str, worker: &str) -> i64 {
-        let tid = tasks::create(conn, "boss", title, None, 50, None, None, None, 1000).unwrap();
+        let tid =
+            tasks::create(conn, "boss", title, None, 50, None, None, None, None, 1000).unwrap();
         tasks::claim(conn, worker, Some(tid), &[], 3600, 1001).unwrap();
         tid
     }
@@ -430,7 +431,7 @@ mod tests {
         assert_eq!(outcome.merged, 1, "matching approval must merge");
         // Task closed, approval consumed, journal cleaned.
         let conn = db::open(&db_path).unwrap();
-        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "closed");
+        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get(&conn, 208).unwrap().is_none());
         assert!(journal::list_in_flight(&conn).unwrap().is_empty());
     }
@@ -468,7 +469,7 @@ mod tests {
         assert_eq!(outcome.demoted, 1);
         let conn = db::open(&db_path).unwrap();
         // Task NOT closed — it stays claimed for normal re-review.
-        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "closed");
+        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get(&conn, 208).unwrap().is_none());
     }
 
@@ -503,7 +504,7 @@ mod tests {
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.rejected, 1, "self-review must be rejected");
         let conn = db::open(&db_path).unwrap();
-        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "closed");
+        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get(&conn, 208).unwrap().is_none());
     }
 
@@ -544,7 +545,7 @@ mod tests {
         assert_eq!(outcome.adopted, 1, "stranded verdict must be adopted");
         assert_eq!(outcome.merged, 1, "adopted approval must merge");
         let conn = db::open(&db_path).unwrap();
-        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "closed");
+        assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         // Mailbox row consumed.
         assert!(mailbox::poll_unconsumed(&conn)
             .unwrap()
@@ -586,7 +587,7 @@ mod tests {
         assert_eq!(outcome.adopted, 0, "unattested verdict must not be adopted");
         assert_eq!(outcome.merged, 0);
         let conn = db::open(&db_path).unwrap();
-        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "closed");
+        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
     }
 
     /// A conflicting PR (base moved) is not merged even with a valid approval —
@@ -622,7 +623,7 @@ mod tests {
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.deferred, 1);
         let conn = db::open(&db_path).unwrap();
-        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "closed");
+        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get(&conn, 208).unwrap().is_none());
     }
 }

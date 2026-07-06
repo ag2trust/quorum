@@ -414,8 +414,8 @@ mod tests {
         // an arbitrary `pr#` lock still does.
         let (_d, mut c) = open_tmp();
         claim(&mut c, "A", "pr#7", 100, 1000).unwrap(); // arbitrary lock -> visible
-        let id =
-            crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, 1000).unwrap();
+        let id = crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000)
+            .unwrap();
         crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap(); // task lease -> hidden
         let all = list(&c, None, 1050).unwrap();
         assert_eq!(all.len(), 1, "only the arbitrary lock should list");

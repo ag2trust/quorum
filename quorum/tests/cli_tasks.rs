@@ -263,7 +263,7 @@ fn reaper_reclaims_lapsed_lease_via_cli() {
         ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("\"status\":\"claimed\""));
+        .stdout(predicates::str::contains("\"status\":\"working\""));
     // Let the 1s lease lapse, then make any write to trigger sweep-on-write.
     std::thread::sleep(std::time::Duration::from_millis(2100));
     quorum(home.path())
@@ -425,7 +425,7 @@ fn note_with_status_done_from_nonassignee_aborts_before_adding_note() {
         .args(["task-get", "--task-id", "1"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("\"status\":\"claimed\""))
+        .stdout(predicates::str::contains("\"status\":\"working\""))
         .stdout(predicates::str::contains("\"notes\":[]"))
         .stdout(predicates::str::contains("shouldnt land").not());
 }
@@ -589,7 +589,7 @@ fn match_label_end_to_end() {
         .success()
         // #64 compact write response: title is no longer in the success JSON. Verify
         // the right task was claimed via `task-get` (full record) instead.
-        .stdout(predicates::str::contains("\"status\":\"claimed\""));
+        .stdout(predicates::str::contains("\"status\":\"working\""));
     quorum(home.path())
         .args(["task-get", "--task-id", "2"])
         .assert()
@@ -771,7 +771,7 @@ fn depends_on_gates_claim_end_to_end() {
         .assert()
         .code(1);
 
-    // Submitting dep as `done` is NOT enough — gate is on `closed` per #9/#10 alignment.
+    // Mark dep as done — `done` is the terminal state that ungates dependents.
     quorum(home.path())
         .args([
             "task-update",
@@ -784,29 +784,12 @@ fn depends_on_gates_claim_end_to_end() {
         ])
         .assert()
         .success();
-    // `done` auto-spawns a review task (issue #10 Phase 2). B (not the orig) sees and claims
-    // it — that's the new top-priority work, REVIEW_PRIORITY=1000 beats the dep's priority.
-    // #64 compact write response omits labels; we verify `refs.review_of` (which IS in the
-    // compact shape since refs stays) and use `task-get` to check the label.
+    // Now the dependent (task 2) is unblocked — B can claim it.
     quorum(home.path())
         .args(["task-claim", "--agent", "B"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("review_of"));
-    // Find the just-claimed review task id (B should be the assignee).
-    quorum(home.path())
-        .args(["task-list", "--assignee", "B"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("kind:review"));
-    // With the review claimed and `dep` still `done` (not `closed`), the dependent stays
-    // gated for everyone — the dep-gate's "closed-not-done" boundary holds even after the
-    // review-as-task layer.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "C"])
-        .assert()
-        .code(1)
-        .stdout(predicates::str::contains("no claimable task"));
+        .stdout(predicates::str::contains("\"id\":2"));
 }
 
 #[test]

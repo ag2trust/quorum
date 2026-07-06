@@ -303,8 +303,8 @@ fn approve_flow_tears_down_both_agents() {
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
-        stdout.contains("\"status\":\"closed\"") || stdout.contains("\"status\": \"closed\""),
-        "task not closed after in-cycle merge + auto-resolve: {stdout}"
+        stdout.contains("\"status\":\"done\"") || stdout.contains("\"status\": \"done\""),
+        "task not done after in-cycle merge + auto-resolve: {stdout}"
     );
 
     handle.stop();
@@ -442,8 +442,8 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("claimed"),
-        "task must remain claimed during rework, got: {stdout}"
+        Some("working"),
+        "task must remain working during rework, got: {stdout}"
     );
     assert_eq!(
         task["assignee"].as_str(),
@@ -766,8 +766,8 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("claimed"),
-        "demoted verdict must leave the task claimed (rework), not closed: {stdout}"
+        Some("working"),
+        "demoted verdict must leave the task working (rework), not done: {stdout}"
     );
     assert_eq!(
         task["assignee"].as_str(),

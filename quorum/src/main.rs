@@ -250,6 +250,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             refs,
             body_stdin,
             depends_on,
+            review_pr,
             body_file,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
@@ -263,6 +264,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 labels.as_deref(),
                 refs.as_deref(),
                 depends_on.as_deref(),
+                review_pr,
                 now,
             )?;
             output::emit(&serde_json::json!({ "id": id }));
@@ -330,14 +332,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
             let note = read_optional_note(note_stdin, note_file)?;
-            // #206: same findings/verdict consistency contract as `done`.
-            // Feedback travels via review comments in the passive flow, so it
-            // is not required here.
             verdict::validate(verdict.as_deref(), blocking, None, false)
                 .map_err(QuorumError::Usage)?;
-            // `--verdict` is a field update too — it drives the review-task done branch in
-            // tasks::update (issue #10). Treat it as part of the field-update bundle so a
-            // bare `task-update --verdict approve --status done` is accepted as one call.
             let has_field_update =
                 status.is_some() || refs.is_some() || body.is_some() || verdict.is_some();
             if !has_field_update && note.is_none() {
@@ -348,30 +344,36 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            // Field updates first (assignee-gated under #14's lifecycle: only `--status done`
-            // and free-text `--body-*`/`--refs`/`--verdict` are accepted). If the caller
-            // isn't the holder we abort before adding the note, so `--note-* + --status done`
-            // from a non-assignee is a single coherent failure rather than a half-applied
-            // operation.
-            let task = if has_field_update {
+            let (task, effects) = if let Some(v) = &verdict {
+                let event = match v.as_str() {
+                    "approve" | "approved" => quorum_core::lifecycle::Event::VerdictApprove,
+                    "changes" => quorum_core::lifecycle::Event::VerdictChanges,
+                    _ => {
+                        return Err(QuorumError::Usage(format!(
+                            "--verdict must be 'approve' or 'changes' (got '{v}')"
+                        )));
+                    }
+                };
+                let r = quorum_core::tasks::apply_event(&mut conn, &agent, task_id, &event, now)?;
+                (r.task, r.effects)
+            } else if has_field_update {
                 let fields = quorum_core::tasks::TaskUpdate {
                     status: status.as_deref(),
                     body: body.as_deref(),
                     refs: refs.as_deref(),
-                    verdict: verdict.as_deref(),
+                    verdict: None,
                 };
-                quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?
+                let t = quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?;
+                (t, vec![])
             } else {
                 match quorum_core::tasks::get(&conn, task_id)? {
-                    Some(t) => t,
+                    Some(t) => (t, vec![]),
                     None => {
                         output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
                         return Ok(1);
                     }
                 }
             };
-            // Note path: any agent may add a note; no assignee guard. Capture the
-            // note's id so the compact response surfaces it without a re-read (#64).
             let note_id: Option<i64> = if let Some(body) = note {
                 match quorum_core::tasks::add_note(&mut conn, &agent, task_id, &body, now)? {
                     Some(id) => Some(id),
@@ -383,10 +385,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             } else {
                 None
             };
-            // Issue #64: compact success — omit `body` (caller wrote it) and surface
-            // `note_id` if a breadcrumb landed this call.
             let mut compact = quorum_core::tasks::TaskCompact::from(&task);
             compact.note_id = note_id;
+            compact.effects = effects
+                .iter()
+                .map(quorum_core::tasks::effect_name)
+                .collect();
             output::emit(&compact);
             Ok(0)
         }
