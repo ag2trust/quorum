@@ -763,3 +763,234 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
 
     handle.stop();
 }
+
+/// C6 regression: after a rework cycle, the worker re-signals done (ReworkPushed).
+/// The lifecycle emits ResumeReviewer. The daemon must tear down the existing
+/// reviewer (which stayed alive per sticky-agent policy) so Phase 5 respawns a
+/// fresh one — otherwise the idle reviewer blocks respawn and the task deadlocks.
+#[test]
+fn rework_resignal_spawns_fresh_reviewer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for rework re-signal flow");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Worker spawns and produces a result
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals done with PR
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    // Reviewer spawns
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    // Wait for reviewer to produce its result
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Reviewer signals changes verdict → triggers rework
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix error handling",
+        ],
+    );
+
+    // Worker gets rework turn and responds
+    assert!(
+        handle.wait_for("rework", 15),
+        "rework not initiated. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("Fixing", 15),
+        "worker rework response not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait for worker to finish its rework turn (drain_events sets draining=false)
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Worker re-signals done with PR (rework pushed)
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    // The fix: ResumeReviewer effect tears down the old reviewer
+    assert!(
+        handle.wait_for("tearing down reviewer", 15),
+        "old reviewer not torn down after rework re-signal. Lines: {:?}",
+        handle.lines
+    );
+
+    // Phase 5 spawns a fresh reviewer
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "fresh reviewer not spawned after rework re-signal. Lines: {:?}",
+        handle.lines
+    );
+
+    // Drain remaining lines
+    std::thread::sleep(Duration::from_millis(500));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
+    // Exactly 2 reviewer spawns: first review + post-rework re-review
+    let reviewer_spawns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawning reviewer"))
+        .count();
+    assert_eq!(
+        reviewer_spawns, 2,
+        "expected 2 reviewer spawns (original + post-rework), got {reviewer_spawns}. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+/// C3 regression: if a task is externally cancelled while the worker is still
+/// active, the worker's done signal must NOT set worker.pr or spawn a reviewer.
+/// The daemon must detect the rejected lifecycle transition and clean up the slot.
+#[test]
+fn cancelled_task_done_signal_no_reviewer_spawn() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for cancelled-done flow");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Worker spawns and produces a result
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Cancel the task externally (creator can cancel)
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-update",
+            "--agent",
+            "TestCreator",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "task cancel failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Worker signals done with PR (doesn't know task was cancelled)
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    // Daemon should detect the rejected transition and clean up
+    assert!(
+        handle.wait_for("lifecycle rejected", 15),
+        "lifecycle rejection not logged. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("tearing down worker", 15),
+        "worker teardown not seen after cancelled task. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait a few ticks to confirm no reviewer spawns
+    std::thread::sleep(Duration::from_secs(3));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
+    // No reviewer should have been spawned
+    let reviewer_spawns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawning reviewer"))
+        .count();
+    assert_eq!(
+        reviewer_spawns, 0,
+        "no reviewer should spawn for a cancelled task, got {reviewer_spawns}. Lines: {:?}",
+        handle.lines
+    );
+
+    // Task should remain cancelled
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        task["status"].as_str(),
+        Some("cancelled"),
+        "task must remain cancelled, got: {stdout}"
+    );
+
+    handle.stop();
+}

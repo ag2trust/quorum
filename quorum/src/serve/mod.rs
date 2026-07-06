@@ -18,7 +18,7 @@ use agent::{AgentProc, AgentSpec};
 use names::Pool;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
-use quorum_core::lifecycle::Event;
+use quorum_core::lifecycle::{Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
@@ -998,6 +998,12 @@ async fn tick(
                         log("VerdictApprove transition failed — skipping merge");
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        // C3 belt-and-suspenders: clear worker.pr so Phase 5
+                        // doesn't spawn another reviewer for a rejected task.
+                        if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
+                        {
+                            workers[wi].pr = None;
+                        }
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -1874,8 +1880,6 @@ async fn tick(
             }
 
             if let Some(pr) = row.pr {
-                workers[wi].pr = Some(pr);
-
                 // Fire the appropriate lifecycle event based on whether
                 // this is the first done signal or a rework-pushed.
                 let event = if workers[wi].rework_count > 0 {
@@ -1883,7 +1887,7 @@ async fn tick(
                 } else {
                     Event::SignaledDone { pr: pr.to_string() }
                 };
-                fire_event(
+                let tr = fire_event(
                     &db_path,
                     &workers[wi].agent_name,
                     workers[wi].task_id,
@@ -1891,23 +1895,77 @@ async fn tick(
                 )
                 .await;
 
-                // Worker stays alive (sticky-agent policy).
-                // #178: persist PR to journal so a restart resumes at the
-                // review stage instead of re-executing the task from
-                // scratch.
-                let p = db_path.clone();
-                let entry = slot_journal_entry(&workers[wi], "worker", "awaiting-review");
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    journal::upsert(&mut conn, &entry)
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
-                log(&format!(
-                    "worker {} PR #{} ready for review",
-                    workers[wi].agent_name, pr
-                ));
+                match tr {
+                    Some(tr) => {
+                        workers[wi].pr = Some(pr);
+
+                        // Dispatch lifecycle effects.
+                        for effect in &tr.effects {
+                            match effect {
+                                Effect::ResumeReviewer => {
+                                    // C6: tear down existing reviewer so Phase 5
+                                    // respawns a fresh one with current PR context.
+                                    if let Some(ri) = reviewers
+                                        .iter()
+                                        .position(|r| r.task_id == workers[wi].task_id)
+                                    {
+                                        log(&format!(
+                                            "ResumeReviewer: tearing down reviewer \
+                                             for task #{}",
+                                            workers[wi].task_id
+                                        ));
+                                        let r = reviewers.remove(ri);
+                                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    }
+                                }
+                                other => {
+                                    log(&format!(
+                                        "WARN: unhandled effect {} at done-signal site",
+                                        tasks::effect_name(other)
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Worker stays alive (sticky-agent policy).
+                        // #178: persist PR to journal so a restart resumes at the
+                        // review stage instead of re-executing the task from
+                        // scratch.
+                        let p = db_path.clone();
+                        let entry = slot_journal_entry(&workers[wi], "worker", "awaiting-review");
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            journal::upsert(&mut conn, &entry)
+                        })
+                        .await
+                        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                        .ok();
+                        log(&format!(
+                            "worker {} PR #{} ready for review",
+                            workers[wi].agent_name, pr
+                        ));
+                    }
+                    None => {
+                        // C3: transition rejected (e.g. task externally
+                        // cancelled). Do NOT set worker.pr — clean up instead.
+                        log(&format!(
+                            "lifecycle rejected at done signal for worker {} \
+                             — cleaning up slot",
+                            workers[wi].agent_name
+                        ));
+                        let w = workers.remove(wi);
+                        fire_event(
+                            &db_path,
+                            &w.agent_name,
+                            w.task_id,
+                            &Event::AgentFailed {
+                                reason: "lifecycle transition rejected at done signal".into(),
+                            },
+                        )
+                        .await;
+                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                    }
+                }
             } else {
                 // Done without PR — close directly (no review needed).
                 let w = workers.remove(wi);
