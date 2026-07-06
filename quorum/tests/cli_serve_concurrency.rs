@@ -91,8 +91,11 @@ impl ServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .args([
                 "serve",
+                "--repo",
+                "test/repo",
                 "--cap",
                 &cap.to_string(),
                 "--repo-dir",
@@ -202,6 +205,7 @@ impl ServeHandle {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -221,6 +225,7 @@ fn seed_task(home: &std::path::Path, title: &str) {
 fn seed_task_with_priority(home: &std::path::Path, title: &str, priority: i64) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -244,6 +249,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(&cmd_args)
         .output()
         .unwrap();
@@ -257,6 +263,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
 fn get_task_status(home: &std::path::Path, task_id: i64) -> String {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", &task_id.to_string()])
         .output()
         .unwrap();
@@ -279,6 +286,7 @@ fn cap_2_spawns_two_workers_concurrently() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -330,6 +338,7 @@ fn cap_limits_concurrent_workers() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -380,6 +389,7 @@ fn higher_priority_task_spawns_first() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -426,6 +436,7 @@ fn one_worker_done_does_not_affect_other() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -491,6 +502,7 @@ fn sigint_releases_all_workers_to_open() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -540,6 +552,7 @@ fn freed_slot_picks_up_next_task() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -613,6 +626,7 @@ fn each_worker_gets_own_reviewer() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -675,6 +689,7 @@ fn sentinel_gone_terminates_serve_and_children() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -688,8 +703,11 @@ fn sentinel_gone_terminates_serve_and_children() {
     let fake_agent = cargo_bin("fake-agent");
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",

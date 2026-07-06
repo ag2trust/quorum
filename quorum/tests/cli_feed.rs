@@ -9,6 +9,7 @@ use std::process::{Command as Proc, Stdio};
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
     c.env("QUORUM_HOME", home);
+    c.env("QUORUM_REPO", "test/repo");
     c
 }
 
@@ -173,6 +174,7 @@ fn concurrent_acks_leave_cursor_at_max() {
         .map(|a| {
             Proc::new(&bin)
                 .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
                 .args(["read", "--agent", "B", "--ack-through", &a.to_string()])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -184,7 +186,7 @@ fn concurrent_acks_leave_cursor_at_max() {
         c.wait_with_output().unwrap();
     }
 
-    let conn = quorum_core::db::open(&home.path().join("quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
     let last: i64 = conn
         .query_row(
             "SELECT last_seq FROM cursors WHERE agent_id='B' AND topic='hub'",

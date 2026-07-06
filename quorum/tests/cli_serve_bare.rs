@@ -50,6 +50,7 @@ fn init_git_repo(dir: &std::path::Path) {
 fn seed_task(home: &std::path::Path, title: &str) {
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -97,7 +98,10 @@ impl BareServeHandle {
         let fake_agent = cargo_bin("fake-agent");
         let mut cmd = Command::new(cargo_bin("quorum"));
         cmd.env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
             .arg("serve")
+            .arg("--repo")
+            .arg("test/repo")
             .arg("--cap")
             .arg("1")
             .arg("--repo-dir")
@@ -176,6 +180,7 @@ fn serve_passes_bare_to_agent_by_default() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -210,6 +215,7 @@ fn serve_omits_bare_with_no_bare_agent_flag() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();

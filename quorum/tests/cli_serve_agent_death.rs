@@ -80,6 +80,7 @@ fn worker_dying_mid_task_releases_task_and_slot() {
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .status()
         .unwrap();
@@ -87,6 +88,7 @@ fn worker_dying_mid_task_releases_task_and_slot() {
     // Seed a task whose body triggers fake-agent to exit(1) mid-turn.
     let mut task_child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "task-create",
             "--title",
@@ -116,8 +118,11 @@ fn worker_dying_mid_task_releases_task_and_slot() {
     let fake_agent = cargo_bin("fake-agent");
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "serve",
+            "--repo",
+            "test/repo",
             "--cap",
             "1",
             "--repo-dir",
@@ -195,6 +200,7 @@ fn worker_dying_mid_task_releases_task_and_slot() {
     // Task must be back to open (not stuck claimed).
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["task-get", "--task-id", "1"])
         .output()
         .unwrap();

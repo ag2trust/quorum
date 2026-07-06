@@ -11,6 +11,7 @@ use predicates::prelude::PredicateBooleanExt;
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
     c.env("QUORUM_HOME", home);
+    c.env("QUORUM_REPO", "test/repo");
     c
 }
 

@@ -296,13 +296,9 @@ pub struct ServeConfig {
     pub merge_checks_timeout_secs: u64,
     /// Poll interval for status checks (seconds). Default: 30.
     pub merge_checks_poll_secs: u64,
-    /// When non-empty, only pull tasks whose `refs.repo` matches one of these values.
-    /// Tasks with no `refs.repo` are skipped when the filter is set.
-    pub only_repo: Vec<String>,
-    /// Maps repo slug (e.g. "ag2trust/quorum") to its local clone directory.
-    /// Used to resolve the correct git directory for fetch/worktree operations
-    /// when a task's `refs.repo` differs from `repo_dir`.
-    pub repo_dir_map: HashMap<String, PathBuf>,
+    /// The repo this daemon manages (e.g. "ag2trust/quorum"). Set via `--repo`.
+    /// Injected as `QUORUM_REPO` into spawned workers/reviewers.
+    pub repo: String,
     /// Base branch name (e.g. "main" or "master") for sha-polling, worktree
     /// provisioning, and merge targeting.
     pub base_branch: String,
@@ -327,29 +323,13 @@ pub fn derive_instance_id(worktree_base: &Path) -> String {
     }
 }
 
-/// Resolve the local clone directory for a given repo slug.
-/// Returns the mapped directory if available, otherwise falls back to `config.repo_dir`.
-pub fn resolve_repo_dir<'a>(config: &'a ServeConfig, repo: Option<&str>) -> &'a Path {
-    if let Some(repo_name) = repo {
-        if let Some(dir) = config.repo_dir_map.get(repo_name) {
-            return dir.as_path();
-        }
-    }
-    &config.repo_dir
-}
-
 pub const EXIT_SELF_UPDATE: i32 = 75;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
-    if config.only_repo.is_empty() {
-        log(&format!("starting (cap={})", config.cap));
-    } else {
-        log(&format!(
-            "starting (cap={}, only-repo={})",
-            config.cap,
-            config.only_repo.join(",")
-        ));
-    }
+    log(&format!(
+        "starting (cap={}, repo={})",
+        config.cap, config.repo
+    ));
 
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
@@ -582,7 +562,6 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
     let mut poison_tracker = PoisonTracker::new();
     let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
-    let mut repo_filter_logged: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut lifetime_roster = LifetimeRoster::new();
 
     // Snapshot initial main sha for Trigger B baseline
@@ -756,7 +735,6 @@ async fn tick_loop(config: ServeConfig) -> Result<i32> {
             &mut poison_tracker,
             &mut reviewer_provision_tracker,
             &mut drain_state,
-            &mut repo_filter_logged,
             &mut lifetime_roster,
         )
         .await
@@ -802,7 +780,6 @@ async fn tick(
     poison_tracker: &mut PoisonTracker,
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
-    repo_filter_logged: &mut std::collections::HashSet<i64>,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
@@ -2300,7 +2277,6 @@ async fn tick(
                 workers,
                 pending_reviews,
                 poison_tracker,
-                repo_filter_logged,
                 lifetime_roster,
             )
             .await?
@@ -2649,7 +2625,7 @@ async fn spawn_reviewer_for_worker(
     // branch lives on the task's repo remote, not necessarily config.repo_dir.
     // #162: if the worker's branch fails, fall back to the PR's actual head
     // ref from GitHub (covers review tasks where the worker never pushed).
-    let task_repo_dir = resolve_repo_dir(config, worker.task_repo);
+    let task_repo_dir = &config.repo_dir;
     let provision_result = wt_mgr
         .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
         .await;
@@ -2776,6 +2752,7 @@ async fn spawn_reviewer_for_worker(
         &wt_path,
         config.agent_bin.as_deref(),
         config.bare_agent,
+        vec![("QUORUM_REPO".into(), config.repo.clone())],
     )
     .await
     {
@@ -2872,24 +2849,6 @@ async fn spawn_reviewer_for_worker(
     Ok(())
 }
 
-/// Returns true if the task's `refs.repo` passes the `--only-repo` filter.
-/// When the filter is empty (unset), all tasks pass. When set, a task must have a
-/// `refs.repo` that matches one of the allowed repos; tasks with no `refs.repo` are skipped.
-fn task_matches_repo_filter(task: &tasks::Task, only_repo: &[String]) -> bool {
-    if only_repo.is_empty() {
-        return true;
-    }
-    let refs_repo = task
-        .refs
-        .as_deref()
-        .and_then(|r| serde_json::from_str::<serde_json::Value>(r).ok())
-        .and_then(|v| v.get("repo").and_then(|r| r.as_str()).map(str::to_string));
-    match refs_repo {
-        Some(repo) => only_repo.iter().any(|allowed| allowed == &repo),
-        None => false,
-    }
-}
-
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 #[allow(clippy::too_many_arguments)]
@@ -2900,7 +2859,6 @@ async fn spawn_worker(
     workers: &mut Vec<SlotState>,
     pending_reviews: &[PendingReview],
     poison_tracker: &mut PoisonTracker,
-    repo_filter_logged: &mut std::collections::HashSet<i64>,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
@@ -2915,12 +2873,9 @@ async fn spawn_worker(
         .map(|(&id, _)| id)
         .collect();
 
-    type PullResult = (Option<tasks::Task>, Vec<(i64, String)>);
-    let only_repo = config.only_repo.clone();
-    let (ready_task, skipped) = tokio::task::spawn_blocking(move || -> Result<PullResult> {
+    let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
         let open = tasks::list(&conn, Some("open"), None, None)?;
-        let mut skipped: Vec<(i64, String)> = Vec::new();
         let found = open.into_iter().find(|t| {
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
@@ -2928,24 +2883,12 @@ async fn spawn_worker(
             if quorum_core::stats::has_label(t.labels.as_deref(), "kind:review") {
                 return false;
             }
-            if !task_matches_repo_filter(t, &only_repo) {
-                skipped.push((t.id, t.title.clone()));
-                return false;
-            }
             true
         });
-        Ok((found, skipped))
+        Ok(found)
     })
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
-
-    for (id, title) in skipped {
-        if repo_filter_logged.insert(id) {
-            log(&format!(
-                "skipping task #{id} ({title}): refs.repo does not match --only-repo filter"
-            ));
-        }
-    }
 
     let task = match ready_task {
         Some(t) => t,
@@ -3020,8 +2963,7 @@ async fn spawn_worker(
         Ok(Some(_)) => {}
     }
 
-    let task_repo_name = quorum_core::branches::repo_from_refs(task.refs.as_deref());
-    let worker_repo_dir = resolve_repo_dir(config, Some(&task_repo_name));
+    let worker_repo_dir = &config.repo_dir;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task.id);
@@ -3106,6 +3048,7 @@ async fn spawn_worker(
         bare: config.bare_agent,
         resume: false,
         allowed_tools: agent::ALLOWED_TOOLS.to_string(),
+        env_vars: vec![("QUORUM_REPO".into(), config.repo.clone())],
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
         Ok(mut proc) => {
@@ -3304,7 +3247,7 @@ async fn teardown_worker_with_body(
     .await
     .ok();
 
-    let repo_dir = resolve_repo_dir(config, state.task_repo.as_deref());
+    let repo_dir = &config.repo_dir;
     wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
     wt_mgr.delete_branch(repo_dir, &state.branch).await;
 
@@ -3337,7 +3280,7 @@ async fn teardown_reviewer(
     .await
     .ok();
 
-    let repo_dir = resolve_repo_dir(config, state.task_repo.as_deref());
+    let repo_dir = &config.repo_dir;
     wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
     wt_mgr.delete_branch(repo_dir, &state.branch).await;
 
@@ -3430,6 +3373,7 @@ async fn spawn_resume_worker_for_pending(
         bare: config.bare_agent,
         resume: true,
         allowed_tools: agent::ALLOWED_TOOLS.to_string(),
+        env_vars: vec![("QUORUM_REPO".into(), config.repo.clone())],
     };
 
     let mut proc = match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
@@ -4039,155 +3983,5 @@ mod tests {
             !tracker.is_exhausted(1, 43),
             "different PR on same task must not be exhausted"
         );
-    }
-
-    fn make_task(id: i64, refs: Option<&str>) -> tasks::Task {
-        tasks::Task {
-            id,
-            title: format!("task-{id}"),
-            body: None,
-            status: "open".into(),
-            priority: 0,
-            labels: None,
-            assignee: None,
-            created_by: "test".into(),
-            created_at: 0,
-            updated_at: 0,
-            refs: refs.map(str::to_string),
-            depends_on: None,
-            sticky_until: None,
-            orig: None,
-            ready: true,
-        }
-    }
-
-    #[test]
-    fn repo_filter_empty_passes_all() {
-        let t = make_task(1, Some(r#"{"repo":"ag2trust/quorum"}"#));
-        assert!(task_matches_repo_filter(&t, &[]));
-        let t_none = make_task(2, None);
-        assert!(task_matches_repo_filter(&t_none, &[]));
-    }
-
-    #[test]
-    fn repo_filter_matches_exact_repo() {
-        let filter = vec!["ag2trust/quorum".to_string()];
-        let t = make_task(1, Some(r#"{"repo":"ag2trust/quorum"}"#));
-        assert!(task_matches_repo_filter(&t, &filter));
-    }
-
-    #[test]
-    fn repo_filter_rejects_wrong_repo() {
-        let filter = vec!["ag2trust/quorum".to_string()];
-        let t = make_task(1, Some(r#"{"repo":"ag2trust/other"}"#));
-        assert!(!task_matches_repo_filter(&t, &filter));
-    }
-
-    #[test]
-    fn repo_filter_rejects_no_refs() {
-        let filter = vec!["ag2trust/quorum".to_string()];
-        let t = make_task(1, None);
-        assert!(!task_matches_repo_filter(&t, &filter));
-    }
-
-    #[test]
-    fn repo_filter_rejects_refs_without_repo_key() {
-        let filter = vec!["ag2trust/quorum".to_string()];
-        let t = make_task(1, Some(r#"{"issue":42}"#));
-        assert!(!task_matches_repo_filter(&t, &filter));
-    }
-
-    #[test]
-    fn repo_filter_rejects_malformed_json() {
-        let filter = vec!["ag2trust/quorum".to_string()];
-        let t = make_task(1, Some("not json"));
-        assert!(!task_matches_repo_filter(&t, &filter));
-    }
-
-    #[test]
-    fn repo_filter_multiple_repos() {
-        let filter = vec![
-            "ag2trust/quorum".to_string(),
-            "ag2trust/ag2trust".to_string(),
-        ];
-        let t1 = make_task(1, Some(r#"{"repo":"ag2trust/quorum"}"#));
-        let t2 = make_task(2, Some(r#"{"repo":"ag2trust/ag2trust"}"#));
-        let t3 = make_task(3, Some(r#"{"repo":"ag2trust/other"}"#));
-        assert!(task_matches_repo_filter(&t1, &filter));
-        assert!(task_matches_repo_filter(&t2, &filter));
-        assert!(!task_matches_repo_filter(&t3, &filter));
-    }
-
-    // ── resolve_repo_dir tests (#180) ─────────────────────────────────────
-
-    fn make_config_with_map(map: HashMap<String, PathBuf>) -> ServeConfig {
-        use std::sync::Arc;
-        ServeConfig {
-            db_path: PathBuf::from("/tmp/q.db"),
-            cap: 1,
-            repo_dir: PathBuf::from("/home/user/dev/quorum"),
-            worktree_base: PathBuf::from("/tmp/wt"),
-            names_file: None,
-            agent_bin: None,
-            model: "sonnet".into(),
-            effort: "high".into(),
-            merge_executor: Arc::new(merge::CommandMergeExecutor {
-                command: "true".into(),
-                checks_cmd: None,
-                mergeability_cmd: None,
-            }),
-            bare_agent: true,
-            limits: CostLimits::default(),
-            log_dir: None,
-            self_update_drain: false,
-            drain_timeout_secs: 900,
-            self_repo: None,
-            sha_poll_interval_secs: 60,
-            merge_checks_timeout_secs: 900,
-            merge_checks_poll_secs: 30,
-            only_repo: vec![],
-            repo_dir_map: map,
-            base_branch: "main".into(),
-            instance_id: "/tmp/wt".into(),
-            exit_when_gone: None,
-        }
-    }
-
-    #[test]
-    fn resolve_repo_dir_empty_map_falls_back_to_default() {
-        let config = make_config_with_map(HashMap::new());
-        let result = resolve_repo_dir(&config, Some("ag2trust/ag2trust"));
-        assert_eq!(result, Path::new("/home/user/dev/quorum"));
-    }
-
-    #[test]
-    fn resolve_repo_dir_none_repo_falls_back_to_default() {
-        let config = make_config_with_map(HashMap::new());
-        let result = resolve_repo_dir(&config, None);
-        assert_eq!(result, Path::new("/home/user/dev/quorum"));
-    }
-
-    #[test]
-    fn resolve_repo_dir_mapped_repo_returns_mapped_dir() {
-        let mut map = HashMap::new();
-        map.insert(
-            "ag2trust/ag2trust".to_string(),
-            PathBuf::from("/home/user/dev/ag2trust"),
-        );
-        let config = make_config_with_map(map);
-        let result = resolve_repo_dir(&config, Some("ag2trust/ag2trust"));
-        assert_eq!(result, Path::new("/home/user/dev/ag2trust"));
-    }
-
-    #[test]
-    fn resolve_repo_dir_unmapped_repo_falls_back_to_default() {
-        let mut map = HashMap::new();
-        map.insert(
-            "ag2trust/ag2trust".to_string(),
-            PathBuf::from("/home/user/dev/ag2trust"),
-        );
-        let config = make_config_with_map(map);
-        let result = resolve_repo_dir(&config, Some("ag2trust/other"));
-        assert_eq!(result, Path::new("/home/user/dev/quorum"));
     }
 }

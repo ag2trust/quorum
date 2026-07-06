@@ -13,12 +13,14 @@ fn done_writes_mailbox_row() {
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args(["done", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .success()
@@ -32,12 +34,14 @@ fn done_with_verdict() {
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "done",
             "--agent",
@@ -60,12 +64,14 @@ fn done_with_changes_and_feedback() {
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "done",
             "--agent",
@@ -93,12 +99,14 @@ fn done_approved_with_blocking_findings_is_refused() {
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "done",
             "--agent",
@@ -121,12 +129,14 @@ fn done_approved_without_blocking_attestation_is_refused() {
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "done",
             "--agent",
@@ -147,12 +157,14 @@ fn done_changes_without_feedback_is_refused() {
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .arg("init")
         .assert()
         .success();
 
     quorum()
         .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
         .args([
             "done",
             "--agent",
