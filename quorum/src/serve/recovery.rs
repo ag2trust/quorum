@@ -15,8 +15,9 @@ use super::session_log::SessionLog;
 use super::worktree::WorktreeManager;
 use super::{log, LifetimeRoster, PendingReview, ServeConfig, SlotState};
 use quorum_core::journal::{self, JournalEntry};
+use quorum_core::lifecycle::Event;
 use quorum_core::mailbox;
-use quorum_core::{error::QuorumError, error::Result};
+use quorum_core::{error::QuorumError, error::Result, tasks};
 use std::path::PathBuf;
 
 fn kill_stale_process_group(pid: Option<i32>) {
@@ -77,21 +78,21 @@ pub(crate) async fn recover(
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     }?;
 
-    if entries.is_empty() {
-        return Ok(());
+    if !entries.is_empty() {
+        log(&format!(
+            "recovery: found {} in-flight journal entries",
+            entries.len(),
+        ));
     }
-
-    log(&format!(
-        "recovery: found {} in-flight journal entries",
-        entries.len(),
-    ));
 
     // Phase 1: Kill stale process groups
-    for entry in &entries {
-        kill_stale_process_group(entry.pid);
+    if !entries.is_empty() {
+        for entry in &entries {
+            kill_stale_process_group(entry.pid);
+        }
+        // Brief pause to let processes exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    // Brief pause to let processes exit
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Phase 2: Reclaim names + process entries
     let mut active_worktrees: Vec<String> = Vec::new();
@@ -377,9 +378,122 @@ pub(crate) async fn recover(
         ));
     }
 
+    // Phase 4: Rescue orphaned in-review tasks (C7)
+    // Tasks stuck in `in-review` with no journal row and no live reviewer are
+    // invisible to the journal-driven recovery above. Scan for them and
+    // register a PendingReview so Phase 5 provisions a reviewer.
+    let journal_task_ids: std::collections::HashSet<i64> = pending_reviews
+        .iter()
+        .map(|p| p.task_id)
+        .chain(workers.iter().map(|w| w.task_id))
+        .collect();
+    {
+        let p = db_path.clone();
+        let orphans =
+            tokio::task::spawn_blocking(move || -> Result<Vec<quorum_core::tasks::Task>> {
+                let conn = quorum_core::db::open(&p)?;
+                quorum_core::tasks::list(&conn, Some("in-review"), None, None)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .unwrap_or_default();
+
+        for task in orphans {
+            if journal_task_ids.contains(&task.id) {
+                continue;
+            }
+            let pr_str = quorum_core::tasks::extract_pr_number(&task.refs);
+            let Some(pr_num) = pr_str else {
+                log(&format!(
+                    "recovery: orphaned in-review task #{} has no PR ref — firing AgentFailed",
+                    task.id
+                ));
+                let p2 = db_path.clone();
+                let tid = task.id;
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut conn) = quorum_core::db::open(&p2) {
+                        let now = crate::serve::now_unix();
+                        let event = Event::AgentFailed {
+                            reason: "orphaned in-review task with no PR on recovery".into(),
+                        };
+                        match tasks::apply_event(&mut conn, "daemon", tid, &event, now) {
+                            Ok(tr) => {
+                                log(&format!(
+                                    "recovery: orphan task #{tid} -> {} via AgentFailed",
+                                    tr.task.status,
+                                ));
+                            }
+                            Err(e) => {
+                                log(&format!(
+                                    "recovery: orphan AgentFailed failed for task #{tid}: {e}",
+                                ));
+                            }
+                        }
+                    }
+                })
+                .await
+                .ok();
+                continue;
+            };
+
+            log(&format!(
+                "recovery: rescuing orphaned in-review task #{} (PR #{pr_num}) — registering PendingReview",
+                task.id,
+            ));
+
+            let agent_name = format!("orphan-rescue-{}", task.id);
+            name_pool.reclaim(&agent_name);
+            lifetime_roster.register(&agent_name);
+
+            let worktree_path = config.worktree_base.join(&agent_name);
+            let branch = format!("orphan-rescue-task-{}", task.id);
+
+            let p2 = db_path.clone();
+            let entry = JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task.id),
+                session_id: String::new(),
+                worktree: Some(worktree_path.to_string_lossy().into()),
+                branch: Some(branch.clone()),
+                phase: "awaiting-review".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(pr_num),
+                rework_count: task.rework_round as i32,
+            };
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&p2)?;
+                journal::upsert(&mut conn, &entry)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .ok();
+
+            pending_reviews.push(PendingReview {
+                agent_name,
+                task_id: task.id,
+                pr: pr_num,
+                session_id: String::new(),
+                worktree_path,
+                branch,
+                rework_count: task.rework_round as u32,
+                cost_tokens: 0,
+                cost_usd: 0.0,
+                agent_state: None,
+                log_dir: None,
+                task_started_at: std::time::Instant::now(),
+            });
+        }
+    }
+
     log(&format!(
-        "recovery: complete — {} worker(s) resumed",
-        workers.len()
+        "recovery: complete — {} worker(s) resumed, {} pending review(s)",
+        workers.len(),
+        pending_reviews.len(),
     ));
 
     Ok(())
@@ -400,15 +514,26 @@ async fn release_and_cleanup(
         if let Ok(mut conn) = quorum_core::db::open(&p) {
             if let Some(task_id) = tid {
                 let now = crate::serve::now_unix();
-                let fields = quorum_core::tasks::TaskUpdate {
-                    status: Some("open"),
-                    body: None,
-                    refs: None,
-                    verdict: None,
+                let event = Event::AgentFailed {
+                    reason: "worktree missing on recovery".into(),
                 };
-                let _ = quorum_core::tasks::update(&mut conn, &a, task_id, &fields, now);
+                match tasks::apply_event(&mut conn, &a, task_id, &event, now) {
+                    Ok(tr) => {
+                        log(&format!(
+                            "recovery: lifecycle task #{task_id} -> {} via AgentFailed",
+                            tr.task.status,
+                        ));
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "recovery: apply_event(AgentFailed) failed for task #{task_id}: {e}"
+                        ));
+                    }
+                }
             }
-            let _ = journal::delete(&mut conn, &a);
+            if let Err(e) = journal::delete(&mut conn, &a) {
+                log(&format!("recovery: journal::delete failed for {a}: {e}"));
+            }
         }
     })
     .await
