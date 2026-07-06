@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 19). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 20). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -72,7 +72,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Review-task only: the original executor whose `done` spawned this review (issue #10).
     -- The claim path filters review tasks where orig == caller so an agent cannot review its
     -- own work — "no self-review" as mechanism, not policy. NULL on non-review tasks.
-    orig         TEXT
+    orig         TEXT,
+    -- v20 lifecycle columns: durable identity + rework tracking for single-task model.
+    author       TEXT,
+    reviewer     TEXT,
+    rework_round INTEGER NOT NULL DEFAULT 0,
+    review_only  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 
