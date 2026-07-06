@@ -1,8 +1,7 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23
-**Status:** Implemented (v1) · CLI-first / daemon-less · design reviewed (2 rounds) + every
-phase sub-agent-reviewed · 72 tests green
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06)
+**Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 **Repo:** `~/dev/quorum`
 
 ## Principle (north star)
@@ -160,9 +159,11 @@ DEFAULT 0` is required — a NULL falls *out* of the partial index and silently 
 
 ### `tasks` — the work queue (replaces `cto:agent-ready` issues)
 `id` INTEGER PK · `title` TEXT NOT NULL · `body` TEXT · `status`
-(`open`/`claimed`/`in_progress`/`blocked`/`done`/`cancelled`) · `priority` INTEGER NOT NULL
-DEFAULT 0 · `labels` TEXT (json) · `assignee` TEXT · `created_by` TEXT NOT NULL ·
-`created_at` · `updated_at` · `refs` TEXT (json).
+(`open`/`working`/`in-review`/`rework`/`merging`/`done`/`failed`/`cancelled`) · `priority`
+INTEGER NOT NULL DEFAULT 0 · `labels` TEXT (json) · `assignee` TEXT · `created_by` TEXT NOT
+NULL · `created_at` · `updated_at` · `refs` TEXT (json) · `author` TEXT · `reviewer` TEXT ·
+`rework_round` INTEGER NOT NULL DEFAULT 0 · `review_only` INTEGER NOT NULL DEFAULT 0 ·
+`depends_on` TEXT (json array of task IDs).
 
 ### `errors` — observable *abnormal* failures
 `id` INTEGER PK · `ts` · `source` TEXT · `detail` TEXT · `expires_at` INTEGER NOT NULL.
@@ -249,15 +250,19 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum claims [--target <t>]` → active claims (read-filtered `expires_at > now`)
 
 ### Tasks
-- `quorum task-create --created-by <id> --title <s> [--priority N] [--labels <json>] (--body-stdin | --body-file <p> | --json-stdin)` → `{id}`
+- `quorum task-create --created-by <id> --title <s> [--priority N] [--labels <json>] [--depends-on <json>] (--body-stdin | --body-file <p> | --json-stdin)` → `{id}` (status: `open`)
+- `quorum task-create ... --review-pr <N>` → review-only task (status: `in-review`,
+  `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
 - `quorum task-claim --agent <id> [--task-id <n>]` → specific task, or highest-priority
-  `open`; atomic via `UPDATE … WHERE status='open' RETURNING`. Response also includes
-  `suggested_branch`, `suggested_worktree`, and `branch_exists` for the claimed task —
-  centralized per-(task, project) branch allocation lives in `task_branches` and is
-  idempotent on `(task_id, repo)`, so a reopened/rework re-claim returns the SAME
-  branch (issue #98). Per-project worktree convention:
-  `.claude/worktrees/<basename>` for ag2trust, `~/dev/quorum-wt/<basename>` for quorum.
-- `quorum task-update --agent <id> --task-id <n> [--status <s>] [--assignee <id>] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee
+  ready `open` task; atomic via `UPDATE … WHERE status='open' RETURNING`. Fires
+  `Claimed { agent }` → `working`. Response includes `suggested_branch`,
+  `suggested_worktree`, and `branch_exists` — centralized per-(task, project) branch
+  allocation in `task_branches`, idempotent on `(task_id, repo)`, so rework re-claims
+  return the SAME branch (issue #98). **Dependency gating:** `depends_on` tasks must all
+  be `done` before a task is claimable.
+- `quorum task-claim --agent <id> --task-id <n>` (on an `in-review` task) → fires
+  `ReviewerAttached { agent }`, sets reviewer. **Guard:** agent must differ from author.
+- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events.
 - `quorum task-list [--status <s>] [--label <l>] [--assignee <id>]` (read-filtered)
 - `quorum task-get --task-id <n>`
 
@@ -330,9 +335,7 @@ repo slug: `~/.quorum/repos/<owner>__<name>/quorum.db` (e.g. `ag2trust__quorum`)
 
 **`quorum serve` requires `--repo`** (mandatory, no default). The daemon injects
 `QUORUM_REPO=<repo>` into every worker/reviewer it spawns, so their CLI calls resolve
-to the same per-repo DB without relying on cwd. The former `--only-repo` and
-`--repo-dir-map` flags are deleted; `refs.repo` in task/message metadata is ignored
-for DB routing.
+to the same per-repo DB without relying on cwd.
 
 ### Single-daemon-per-DB guard
 
@@ -347,14 +350,148 @@ A second daemon on the same DB:
 On clean shutdown the lease is released (row deleted). A crash leaves a stale row that
 the next daemon takes over.
 
-### Cutover runbook (moving from global DB to per-repo)
+### Cutover recipe (lifecycle refactor)
 
-1. Merge the per-repo DB chain (parts 1–3).
-2. Stop any running daemon (`kill <pid>` or Ctrl-C).
-3. Either copy the existing `~/.quorum/quorum.db` into
-   `~/.quorum/repos/<owner>__<name>/quorum.db`, or start fresh (DB is disposable pre-GA).
-4. Relaunch with `quorum serve --repo <owner>/<name> ...`.
-5. Verify: `quorum status` from a git checkout of the repo resolves to the new DB.
+The lifecycle refactor (parts 1–3) changed the task status vocabulary and eliminated
+review tasks (`kind:review`) in favor of a single-task state machine. There is no data
+migration — the per-repo DB is disposable.
+
+1. Stop the running daemon: `kill <pid>` or Ctrl-C.
+2. Delete the per-repo DB: `rm ~/.quorum/repos/<owner>__<name>/quorum.db*`
+3. Rebuild and install: `./dev-install.sh`
+4. Relaunch (recommended — supervised, with self-update):
+   ```sh
+   scripts/serve-supervisor.sh \
+     --repo <owner>/<name> \
+     --cap 4 \
+     --self-update-drain \
+     --names-file <path-to-names> \
+     --repo-dir <path-to-checkout> \
+     --worktree-base <path-to-worktrees>
+   ```
+5. Verify: `quorum status` from a git checkout shows the new schema version and
+   no stale tasks.
+
+## Task lifecycle state machine
+
+**Source of truth:** `quorum-core/src/lifecycle.rs` — a pure function
+`transition(TaskView, Event) → (Status, Vec<Effect>)` with no I/O.
+
+### Status graph
+
+```
+open → working → in-review → merging → done
+                     ↕                   ↑
+                   rework ───────────────┘
+                     ↓
+                   failed (rework cap exceeded)
+
+Terminals: done, failed, cancelled (reachable from any non-terminal)
+```
+
+| Status | Wire format | Terminal | Meaning |
+|---|---|---|---|
+| Open | `open` | no | Unclaimed, available for work |
+| Working | `working` | no | Claimed by a worker agent |
+| InReview | `in-review` | no | Worker signaled done (PR posted), awaiting reviewer |
+| Rework | `rework` | no | Reviewer requested changes; worker must fix and re-push |
+| Merging | `merging` | no | Approved; merge in progress |
+| Done | `done` | yes | Successfully merged |
+| Failed | `failed` | yes | Rework cap exceeded, or review-only task got changes verdict |
+| Cancelled | `cancelled` | yes | Explicitly cancelled |
+
+### Events
+
+| Event | Payload | Trigger |
+|---|---|---|
+| `Claimed { agent }` | agent name | `task-claim` / daemon auto-pick |
+| `SignaledDone { pr }` | PR number | `done --pr N` (first delivery) |
+| `ReviewerAttached { agent }` | reviewer name | `task-claim` on an in-review task |
+| `VerdictApprove` | — | `done --verdict approved --blocking 0` |
+| `VerdictChanges` | — | `done --verdict changes --feedback "..."` |
+| `ReworkPushed` | — | `done --pr N` when `rework_round > 0` |
+| `MergeSucceeded` | — | Daemon after successful `gh pr merge` |
+| `MergeFailed { reason }` | description | Daemon after merge failure |
+| `LeaseExpired` | — | Lease reaper |
+| `AgentFailed { reason }` | description | Worker/reviewer process died |
+| `Cancelled { by }` | who | `task-update --status cancelled` or daemon policy |
+
+### Effects
+
+| Effect | Meaning |
+|---|---|
+| `SetAuthor { agent }` | Record who wrote the code |
+| `SetReviewer { agent }` | Record who is reviewing |
+| `SpawnWorker` / `SpawnReviewer` | Daemon provisions a new agent process |
+| `ResumeWorker` / `ResumeReviewer` | Daemon feeds a new turn to the sticky agent |
+| `MergePr { pr }` | Daemon initiates merge flow |
+| `IncrementReworkRound` | Bump `rework_round += 1` |
+| `NotifyOwner { reason }` | Alert the task creator |
+| `ReleaseLease` | Deactivate the claims row |
+| `PostFindingsNote` | Post findings as a task note (review-only terminal) |
+
+### Transition table
+
+**From Open:**
+- `Claimed { agent }` → Working · effects: SetAuthor
+- `Cancelled { by }` → Cancelled · effects: ReleaseLease
+
+**From Working:**
+- `SignaledDone { pr }` → InReview · effects: SpawnReviewer
+- `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
+- `Cancelled { by }` → Cancelled · effects: ReleaseLease
+
+**From InReview:**
+- `ReviewerAttached { agent }` → InReview (stays) · effects: SetReviewer · **guard: agent ≠ author**
+- `VerdictApprove` → Merging · effects: MergePr
+- `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
+- `VerdictChanges` (review_only=true) → Failed · effects: PostFindingsNote, ReleaseLease
+- `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
+- `AgentFailed` / `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
+- `Cancelled { by }` → Cancelled · effects: ReleaseLease
+
+**From Rework:**
+- `ReworkPushed` → InReview · effects: ResumeReviewer
+- `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
+- `Cancelled { by }` → Cancelled · effects: ReleaseLease
+
+**From Merging:**
+- `MergeSucceeded` → Done · effects: ReleaseLease
+- `MergeFailed { reason }` → InReview · effects: NotifyOwner, ResumeReviewer
+- `Cancelled { by }` → Cancelled · effects: ReleaseLease
+
+**Terminals (Done, Failed, Cancelled):** reject all events.
+
+### Guards and policies
+
+- **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
+  The daemon enforces #206: the deliverer (who signaled `done`) cannot review.
+- **Rework cap:** `REWORK_CAP = 3`. When `rework_round >= 3` and VerdictChanges fires,
+  the task goes to Failed (not Rework).
+- **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
+  with `review_only=true`. VerdictChanges on a review-only task goes to Failed (no worker
+  to rework).
+- **Sticky InReview:** reviewer crash/expiry does NOT leave InReview — the task stays and a
+  new reviewer is spawned. Prevents review tasks from reverting to Open.
+- **Resume semantics:** rework feeds a new turn to the existing worker (ResumeWorker);
+  reviewer re-review feeds a new turn to the existing reviewer (ResumeReviewer).
+- **Verdict attestation (#206):** `--verdict approved` requires `--blocking 0`; any blocking
+  finding requires `--verdict changes --feedback`. Unattested approvals are demoted to
+  changes by the daemon.
+- **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
+- **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
+  one worker + one reviewer per task).
+
+### Daemon merge flow
+
+After VerdictApprove (InReview → Merging):
+1. Check mergeability — if conflicting, MergeFailed → rework cycle.
+2. Wait for CI checks — failed → rework; timed out → cancelled.
+3. Persist approval record (instance-independent, survives restart).
+4. Execute `gh pr merge` — success → Done; policy-blocked → Cancelled;
+   retryable failure → rework.
+5. Self-update drain: if enabled, a successful merge triggers drain mode →
+   exit 75 for the supervisor to rebuild and relaunch.
 
 ## Decisions & non-goals
 

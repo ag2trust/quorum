@@ -29,14 +29,15 @@ humans is a read-only `quorum status [--watch]`.
 
 ## Architecture in one breath
 
-A short-lived process per command: open DB → apply PRAGMAs → migrate-if-needed → one atomic
-op (`BEGIN IMMEDIATE`) → print JSON → exit with a meaningful code. **No daemon, no server,
-no network, no MCP.** The per-repo SQLite file is the only state. SQLite's cross-process
-file locking is the concurrency authority. DB path resolution: `QUORUM_REPO` env var
-(set by daemon for workers) > cwd git detection > loud error (exit 2). `quorum serve`
-requires `--repo` and enforces one daemon per DB via a `daemon_lock` table (pid +
-heartbeat). Crate layout: `quorum-core` (lib: store, logic, PRAGMAs, migrations — fully
-unit-testable) + `quorum` (bin: clap, stdin/file I/O, JSON, exit codes).
+**CLI commands** are short-lived processes: open DB → apply PRAGMAs → migrate-if-needed →
+one atomic op (`BEGIN IMMEDIATE`) → print JSON → exit with a meaningful code. The per-repo
+SQLite file is the only state. SQLite's cross-process file locking is the concurrency
+authority. DB path resolution: `QUORUM_REPO` env var (set by daemon for workers) > cwd git
+detection > loud error (exit 2). **`quorum serve`** is the long-lived daemon that drives the
+task lifecycle state machine: spawn workers/reviewers, process verdicts, merge PRs. One
+daemon per DB, enforced via `daemon_lock` table (pid + heartbeat). Crate layout:
+`quorum-core` (lib: store, lifecycle, PRAGMAs, migrations — fully unit-testable) + `quorum`
+(bin: clap, stdin/file I/O, JSON, exit codes, serve daemon).
 
 ## Load-bearing invariants (do NOT regress — each cost a review round to get right)
 

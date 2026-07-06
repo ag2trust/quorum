@@ -23,7 +23,7 @@ mailbox table that the daemon polls.
 ### Process model
 
 ```
-quorum serve --cap N --repo-dir <path> --worktree-base <path> --names-file <path>
+quorum serve --repo <owner/name> --cap N --repo-dir <path> --worktree-base <path> --names-file <path>
   │
   ├── tick loop (500ms)
   │     ├── Phase 1: poll mailbox (unconsumed rows)
@@ -95,7 +95,7 @@ No sockets, no pipes beyond the stream-json stdin/stdout of each agent process.
 
 ```
 [ready task in DB]
-  → claim (atomic, open → claimed)
+  → claim (atomic, open → working)
   → provision worktree (serialized via mutex)
   → journal: phase="working"
   → spawn AgentProc, feed task prompt as turn 1
