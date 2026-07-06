@@ -121,10 +121,11 @@ fn tool_snippet(name: &str, input: &serde_json::Value) -> Option<String> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}…")
     }
 }
 
@@ -249,6 +250,16 @@ mod tests {
         };
         let rendered = render_event(&event).unwrap();
         assert!(rendered.contains("> Skill: code-review:code-review"));
+    }
+
+    #[test]
+    fn truncate_multibyte_utf8_does_not_panic() {
+        let event = Event::ToolUse {
+            name: "Bash".into(),
+            input: json!({"command": "echo héllo wörld über alles café"}),
+        };
+        let rendered = render_event(&event).unwrap();
+        assert!(rendered.contains("> Bash:"));
     }
 
     #[test]
