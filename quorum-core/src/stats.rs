@@ -64,7 +64,7 @@ pub struct AgentCurrentTask {
 
 /// Claimable-task count grouped by required tier label. `tier` is either a `tier:*` value
 /// (e.g. `tier:opus-47`), `untiered` (open tasks with no `tier:` label), or `review`
-/// (open `kind:review` tasks — they're tier-exempt and routed separately, see #73 fix).
+/// (tasks with `review_only=1`).
 ///
 /// Only counts `ready=true` tasks (deps satisfied) — blocked tasks appear in
 /// [`Stats::blocked`] instead (#86).
@@ -539,28 +539,31 @@ pub fn extract_tier_from_labels(labels_json: Option<&str>) -> String {
     "unknown".to_string()
 }
 
-/// Claimable (ready) open-task count grouped by required tier (#86). Uses
-/// [`extract_tier_from_labels`] over each open task row in app-space. Only counts tasks
+/// Claimable (ready) task count grouped by required tier (#86). Uses
+/// [`extract_tier_from_labels`] over each task row in app-space. Only counts tasks
 /// whose dependencies are all satisfied (`ready=true`); blocked tasks are surfaced
-/// separately via [`blocked_tasks`]. `kind:review` open tasks land in a distinct `review`
-/// bucket (tier-exempt at the matcher, #73 fix).
+/// separately via [`blocked_tasks`]. Tasks with `review_only=1` land in a distinct
+/// `review` bucket.
 fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
-    let mut stmt = conn.prepare("SELECT id, labels, depends_on FROM tasks WHERE status='open'")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, labels, depends_on, review_only FROM tasks WHERE status IN ('open', 'in-review')",
+    )?;
     let rows = stmt
         .query_map([], |r| {
             let id: i64 = r.get(0)?;
             let labels: Option<String> = r.get(1)?;
             let depends_on: Option<String> = r.get(2)?;
-            Ok((id, labels, depends_on))
+            let review_only: bool = r.get::<_, i64>(3)? != 0;
+            Ok((id, labels, depends_on, review_only))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for (_id, labels, depends_on) in &rows {
+    for (_id, labels, depends_on, review_only) in &rows {
         let ready = crate::tasks::compute_ready(conn, depends_on)?;
         if !ready {
             continue;
         }
-        let bucket = if has_label(labels.as_deref(), "kind:review") {
+        let bucket = if *review_only {
             "review".to_string()
         } else {
             let t = extract_tier_from_labels(labels.as_deref());
@@ -754,21 +757,19 @@ fn agent_load_scores(conn: &Connection) -> Result<Vec<AgentLoadScore>> {
 fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
     let hour_ago = now - 3600;
     let closed_last_hour: i64 = conn.query_row(
-        "SELECT count(*) FROM tasks WHERE status='closed' AND updated_at > ?1",
+        "SELECT count(*) FROM tasks WHERE status='done' AND updated_at > ?1",
         params![hour_ago],
         |r| r.get(0),
     )?;
-    // Exclude kind:review tasks — their terminal state is `done` (they never transition
-    // to `closed`), so they inflate "awaiting review" counters. See issue #81.
-    let done_filter = "status='done' AND (labels IS NULL OR labels NOT LIKE '%\"kind:review\"%')";
     let done_awaiting_review: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM tasks WHERE {done_filter}"),
+        "SELECT count(*) FROM tasks WHERE status='in-review'",
         [],
         |r| r.get(0),
     )?;
+    let in_review_filter = "status='in-review'";
     let oldest_done_ts: Option<i64> = conn
         .query_row(
-            &format!("SELECT MIN(updated_at) FROM tasks WHERE {done_filter}"),
+            &format!("SELECT MIN(updated_at) FROM tasks WHERE {in_review_filter}"),
             [],
             |r| r.get(0),
         )
@@ -776,7 +777,7 @@ fn throughput(conn: &Connection, now: i64) -> Result<Throughput> {
     let oldest_done_awaiting_review_secs = oldest_done_ts.map(|ts| (now - ts).max(0));
     let stuck_threshold = now - DONE_STUCK_THRESHOLD_SECS;
     let done_stuck_count: i64 = conn.query_row(
-        &format!("SELECT count(*) FROM tasks WHERE {done_filter} AND updated_at < ?1"),
+        &format!("SELECT count(*) FROM tasks WHERE {in_review_filter} AND updated_at < ?1"),
         params![stuck_threshold],
         |r| r.get(0),
     )?;
@@ -1037,7 +1038,7 @@ mod tests {
         crate::feed::post(&mut c, "A", "info", None, "dead", None, None, 5, 100).unwrap();
         // Claim auto-renewed by touch to expires_at = MAX(1100, 100+3600) = 3700.
         crate::claims::claim(&mut c, "A", "pr#1", 1000, 100).unwrap();
-        crate::tasks::create(&mut c, "A", "t", None, 0, None, None, None, 100).unwrap();
+        crate::tasks::create(&mut c, "A", "t", None, 0, None, None, None, None, 100).unwrap();
 
         // now=4000: agent last_seen=100 (3900s stale > 900 window), claim expired (3700 < 4000).
         let s = stats(&c, 4000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
@@ -1078,6 +1079,7 @@ mod tests {
             None,
             0,
             Some("[\"tier:opus-46\"]"),
+            None,
             None,
             None,
             100,
@@ -1122,11 +1124,11 @@ mod tests {
     #[test]
     fn has_label_matches_exactly() {
         assert!(has_label(
-            Some(r#"["kind:review","tier:opus-47"]"#),
-            "kind:review"
+            Some(r#"["kind:bug","tier:opus-47"]"#),
+            "kind:bug"
         ));
-        assert!(!has_label(Some(r#"["kind:bug"]"#), "kind:review"));
-        assert!(!has_label(None, "kind:review"));
+        assert!(!has_label(Some(r#"["kind:bug"]"#), "tier:opus-47"));
+        assert!(!has_label(None, "tier:opus-47"));
     }
 
     #[test]
@@ -1142,6 +1144,7 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             None,
+            None,
             100,
         )
         .unwrap();
@@ -1152,6 +1155,7 @@ mod tests {
             None,
             0,
             Some("[\"tier:opus-47\"]"),
+            None,
             None,
             None,
             100,
@@ -1207,6 +1211,7 @@ mod tests {
             Some("[\"tier:opus-47\"]"),
             None,
             None,
+            None,
             100,
         )
         .unwrap();
@@ -1217,6 +1222,7 @@ mod tests {
             None,
             0,
             Some("[\"tier:opus-47\"]"),
+            None,
             None,
             None,
             100,
@@ -1231,19 +1237,21 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             None,
+            None,
             100,
         )
         .unwrap();
-        crate::tasks::create(&mut c, "boss", "d", None, 0, None, None, None, 100).unwrap();
+        crate::tasks::create(&mut c, "boss", "d", None, 0, None, None, None, None, 100).unwrap();
         crate::tasks::create(
             &mut c,
             "boss",
             "r",
             None,
             1000,
-            Some("[\"kind:review\"]"),
             None,
             None,
+            None,
+            Some(42),
             100,
         )
         .unwrap();
@@ -1394,7 +1402,7 @@ mod tests {
     // ── Agent load score (#95 Phase 1) ─────────────────────────────────
 
     fn make_task(c: &mut Connection, title: &str, now: i64) -> i64 {
-        crate::tasks::create(c, "boss", title, None, 0, None, None, None, now).unwrap()
+        crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, now).unwrap()
     }
 
     /// Drive one task all the way through claim → done as `agent`, returning the
@@ -1469,28 +1477,38 @@ mod tests {
     }
 
     #[test]
-    fn throughput_counts_oldest_done_awaiting_review() {
+    fn throughput_counts_oldest_in_review() {
         let (_d, mut c) = open_tmp();
-        // Two tasks, both driven to `done` at different times. No closed transitions:
-        // closing requires the review-verdict path (approve/changes), which is exercised
-        // in tasks::tests. Stats only reads the resulting state — pin that here.
-        let t1 =
-            crate::tasks::create(&mut c, "boss", "t1", None, 0, None, None, None, 100).unwrap();
-        let t2 =
-            crate::tasks::create(&mut c, "boss", "t2", None, 0, None, None, None, 200).unwrap();
+        let t1 = crate::tasks::create(&mut c, "boss", "t1", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let t2 = crate::tasks::create(&mut c, "boss", "t2", None, 0, None, None, None, None, 200)
+            .unwrap();
         let t3_open =
-            crate::tasks::create(&mut c, "boss", "t3", None, 0, None, None, None, 300).unwrap();
+            crate::tasks::create(&mut c, "boss", "t3", None, 0, None, None, None, None, 300)
+                .unwrap();
         crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 1000, 400).unwrap();
-        crate::tasks::update(&mut c, "Alice", t1, &done("done"), 400).unwrap();
+        crate::tasks::apply_event(
+            &mut c,
+            "Alice",
+            t1,
+            &crate::lifecycle::Event::SignaledDone { pr: "1".into() },
+            400,
+        )
+        .unwrap();
         crate::tasks::claim(&mut c, "Bob", Some(t2), &[], 1000, 500).unwrap();
-        crate::tasks::update(&mut c, "Bob", t2, &done("done"), 500).unwrap();
+        crate::tasks::apply_event(
+            &mut c,
+            "Bob",
+            t2,
+            &crate::lifecycle::Event::SignaledDone { pr: "2".into() },
+            500,
+        )
+        .unwrap();
 
         let now = 600;
         let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert_eq!(s.throughput.done_awaiting_review, 2);
-        // t1 went done at 400; now=600 → age 200s. t1 is older than t2.
         assert_eq!(s.throughput.oldest_done_awaiting_review_secs, Some(200));
-        // 200s < DONE_STUCK_THRESHOLD_SECS (30 min) → not stuck.
         assert_eq!(s.throughput.done_stuck_count, 0);
         assert!(crate::tasks::get(&c, t3_open).unwrap().is_some());
     }
@@ -1513,35 +1531,22 @@ mod tests {
     }
 
     #[test]
-    fn throughput_excludes_review_tasks_from_done_counters() {
+    fn throughput_counts_in_review_tasks() {
         let (_d, c) = open_tmp();
-        // A work task in done (should count).
-        insert_task_raw(&c, "work-task", "done", None, 300);
-        // A review task in done (should NOT count).
-        insert_task_raw(
-            &c,
-            "review-1",
-            "done",
-            Some(r#"["kind:review","tier:opus-46"]"#),
-            250,
-        );
-        // A second review task in done (should NOT count).
-        insert_task_raw(&c, "review-2", "done", Some(r#"["kind:review"]"#), 220);
+        insert_task_raw(&c, "work-in-review", "in-review", None, 300);
+        insert_task_raw(&c, "done-task", "done", None, 250);
 
         let now = 400;
         let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
-        // Only the work task counts.
         assert_eq!(s.throughput.done_awaiting_review, 1);
-        // Oldest done is the work task (updated_at=300), age = 100s.
         assert_eq!(s.throughput.oldest_done_awaiting_review_secs, Some(100));
-        // 100s < 30min threshold → not stuck.
         assert_eq!(s.throughput.done_stuck_count, 0);
     }
 
     #[test]
-    fn throughput_zero_when_only_review_tasks_done() {
+    fn throughput_zero_when_no_tasks_in_review() {
         let (_d, c) = open_tmp();
-        insert_task_raw(&c, "review-only", "done", Some(r#"["kind:review"]"#), 300);
+        insert_task_raw(&c, "done-task", "done", None, 300);
 
         let now = 400;
         let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
@@ -1551,13 +1556,21 @@ mod tests {
     }
 
     #[test]
-    fn throughput_done_stuck_flagged_after_threshold() {
+    fn throughput_in_review_stuck_flagged_after_threshold() {
         let (_d, mut c) = open_tmp();
-        let t =
-            crate::tasks::create(&mut c, "boss", "stuck", None, 0, None, None, None, 100).unwrap();
+        let t = crate::tasks::create(
+            &mut c, "boss", "stuck", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
         crate::tasks::claim(&mut c, "Alice", Some(t), &[], 10000, 100).unwrap();
-        crate::tasks::update(&mut c, "Alice", t, &done("done"), 100).unwrap();
-        // Now far enough in the future for it to be stuck.
+        crate::tasks::apply_event(
+            &mut c,
+            "Alice",
+            t,
+            &crate::lifecycle::Event::SignaledDone { pr: "1".into() },
+            100,
+        )
+        .unwrap();
         let now = 100 + DONE_STUCK_THRESHOLD_SECS + 60;
         let s = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert_eq!(s.throughput.done_stuck_count, 1);
@@ -1579,6 +1592,7 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             None,
+            None,
             100,
         )
         .unwrap();
@@ -1593,6 +1607,7 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             Some(&format!("[{t1}]")),
+            None,
             100,
         )
         .unwrap();
@@ -1619,6 +1634,7 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             None,
+            None,
             100,
         )
         .unwrap();
@@ -1631,6 +1647,7 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             Some(&format!("[{t1}]")),
+            None,
             100,
         )
         .unwrap();
@@ -1643,6 +1660,7 @@ mod tests {
             Some("[\"tier:opus-46\"]"),
             None,
             Some(&format!("[{t2}]")),
+            None,
             100,
         )
         .unwrap();
@@ -1670,6 +1688,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             100,
         )
         .unwrap();
@@ -1682,10 +1701,10 @@ mod tests {
             None,
             None,
             Some(&format!("[{t1}]")),
+            None,
             100,
         )
         .unwrap();
-        // Close t1 via the full lifecycle: claim → done → approve.
         crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
         crate::tasks::update(
             &mut c,
@@ -1698,9 +1717,6 @@ mod tests {
             100,
         )
         .unwrap();
-        // Directly mark closed via raw SQL (the full review flow is overkill for this test).
-        c.execute("UPDATE tasks SET status='closed' WHERE id=?1", params![t1])
-            .unwrap();
 
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert!(s.blocked.is_empty());

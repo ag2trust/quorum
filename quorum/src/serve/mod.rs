@@ -1385,7 +1385,6 @@ async fn tick(
                             let sha = format!("post-merge-pr-{pr_num}");
                             drain_state.start_drain(&sha);
                         }
-                        let reviewer_agent = reviewers[ri].agent_name.clone();
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r).await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -1402,39 +1401,8 @@ async fn tick(
                             )
                             .await;
                         }
-                        // #162: auto-resolve the vestigial review task spawned by
-                        // teardown_worker("done"). The in-cycle reviewer already
-                        // approved; a second review would be redundant.
-                        {
-                            let p = db_path.clone();
-                            let agent = reviewer_agent.clone();
-                            let task_id = reviewer_task_id;
-                            let note = format!(
-                                "daemon: auto-resolved — PR #{pr_num} already reviewed \
-                                 by {agent} and merged in-cycle"
-                            );
-                            let resolved = tokio::task::spawn_blocking(move || {
-                                let mut conn = quorum_core::db::open(&p)?;
-                                let now = now_unix();
-                                tasks::auto_resolve_review(&mut conn, task_id, &agent, &note, now)
-                            })
-                            .await
-                            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-                            match resolved {
-                                Ok(Some(review_id)) => {
-                                    log(&format!(
-                                        "auto-resolved vestigial review task #{review_id} \
-                                         for task #{task_id}"
-                                    ));
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    log(&format!(
-                                        "auto-resolve review for task #{task_id} failed: {e}"
-                                    ));
-                                }
-                            }
-                        }
+                        // Review auto-resolve removed (lifecycle refactor PR 2/4).
+                        // The daemon will drive review via the transition table in PR 3.
                         reviewer_provision_tracker.clear(reviewer_task_id, pr_num);
                     } else {
                         let failure_kind = merge_result
@@ -2873,7 +2841,7 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if quorum_core::stats::has_label(t.labels.as_deref(), "kind:review") {
+            if t.review_only {
                 return false;
             }
             true

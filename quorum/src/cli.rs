@@ -48,6 +48,9 @@ pub enum Command {
         /// + finalized). Validated as a JSON array of ints at create — malformed exits 2.
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
+        /// Create as a review-only task (starts in in-review). The PR number is stored in refs.pr.
+        #[arg(long = "review-pr")]
+        review_pr: Option<i64>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]
@@ -84,11 +87,8 @@ pub enum Command {
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
     /// other field updates in the same call.
     ///
-    /// `--verdict approve|changes` (issue #10) is the reviewer's decision when marking a
-    /// `kind:review` task `done`. **Required** on review tasks; **forbidden** on non-review
-    /// tasks. `approve` chains the original task to `closed`; `changes` reopens the original
-    /// with the `rework` label and a sticky window (only the original assignee may claim
-    /// during the window, then anyone).
+    /// `--verdict approve|changes` is the reviewer's verdict on an in-review task.
+    /// `approve` transitions to merging; `changes` transitions to rework.
     TaskUpdate {
         #[arg(long)]
         agent: String,
@@ -108,8 +108,7 @@ pub enum Command {
         /// Read a free-text note from a file and append it to the task's history.
         #[arg(long = "note-file")]
         note_file: Option<PathBuf>,
-        /// Reviewer's verdict on a `kind:review` task being marked done. One of: approve,
-        /// changes. Required on review tasks, rejected on non-review.
+        /// Reviewer's verdict on an in-review task. One of: approve, changes.
         #[arg(long)]
         verdict: Option<String>,
         /// Count of BLOCKING findings in your review (#206). `--verdict approve`

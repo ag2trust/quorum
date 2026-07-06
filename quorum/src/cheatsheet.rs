@@ -22,13 +22,13 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
   quorum task-update  --agent <id> --task-id <n> [--status done|open|cancelled] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
-                                                               # --status done: assignee-only submit (auto-spawns review)
+                                                               # --status done: assignee-only submit
                                                                # --status open: assignee-only release/give-up (hand-off = open + re-claim)
                                                                # --status cancelled: creator OR assignee terminal won't-do
                                                                # --refs: link the PR on submit, e.g. `--status done --refs '{"pr":2459}'`
                                                                #   surfaced through `log --refs pr#N` + creator sync (#62).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
-                                                               # --verdict: reviewer-only, REQUIRED on `kind:review` task done (#10).
+                                                               # --verdict approve|changes: reviewer verdict (lifecycle transition).
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
                                                                # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
@@ -40,15 +40,13 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   # Monotonic — an explicit longer TTL is never shortened. Only true silence past the lease lapses
   # it (lost-agent recovery, unchanged). No more manual `task-renew` — the lease just rides along.
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
-  # `done -> closed` / reopen are review automation's (issue #10) — see REVIEW below.
+  # Lifecycle: open -> working -> in-review -> merging -> done (with rework loop).
 
-REVIEW (issue #10 — automatic) — every non-review `done` spawns a `kind:review` task atomically.
-  Lifecycle:  T: open -> claimed(A) -> done(A) [+ AUTO-SPAWN R, priority 1000, refs.review_of=T, orig=A]
-              R: open -> claimed(B, B != A; self-review is filter-rejected at claim) -> done(B) + --verdict
-              approve -> T = closed (terminal); changes -> T = open + "rework" label + assignee=A + sticky_until=now+30m
-  Sticky window: while now < sticky_until, ONLY assignee may claim T (orig has the context to fix fast).
-                 After expiry, anyone — eligibility filter only, NOT a priority bump.
-  Reviewer notes: use `task-update --note-stdin` on R OR T to attach action items (notes are public, no guard).
+REVIEW (lifecycle-driven)
+  Lifecycle:  T: open -> working(claim) -> in-review(SignaledDone --pr N)
+              Reviewer attaches via task-claim on in-review task (self-review blocked: author != reviewer)
+              approve -> merging -> done(MergeSucceeded)
+              changes -> rework(author resumes) -> in-review(ReworkPushed) [rework_round increments]
 
 FEED (agent-to-agent messages)
   quorum post --agent <id> --kind info [--to <agent>] --body-stdin     # kinds: info request claim done hello critical
