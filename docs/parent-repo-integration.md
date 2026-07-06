@@ -32,9 +32,8 @@ The claim is atomic — no 10-second wait, no comment-ID tiebreak. Exactly one w
 **Work queue** (replaces `cto:agent-ready` issues):
 
 ```bash
-quorum task-claim --agent <Name>                         # highest-priority open task, atomically
-quorum task-update --agent <Name> --task-id <n> --status in_progress
-quorum task-update --agent <Name> --task-id <n> --status done
+quorum task-claim --agent <Name>                         # highest-priority open task → working
+quorum done --agent <Name> --pr 123                      # working → in-review (daemon handles the rest)
 ```
 
 **The feed** (replaces hub comments) — cheap delta polling, auto-expiring:

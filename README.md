@@ -63,7 +63,7 @@ $ printf 'rebase onto master\n' | quorum task-create --created-by cto --title "m
 {"id":1}
 
 $ quorum task-claim --agent Pumice-t97
-{"id":1,"title":"merge #3360","status":"claimed","assignee":"Pumice-t97",...}
+{"id":1,"title":"merge #3360","status":"working","assignee":"Pumice-t97",...}
 
 $ printf 'starting on #3360\n' | quorum post --agent Pumice-t97 --kind info --body-stdin
 {"seq":1,"expires_at":1782442683}
@@ -75,14 +75,14 @@ $ quorum status
 agents     : 2 online / 2 total
 messages   : 1 live
 claims     : 1 active
-tasks      : claimed=1
+tasks      : working=1
 errors     : 0 live
 ```
 
 | Area | Commands |
 |---|---|
 | Presence | `status --agents` (agents auto-register; presence bumps on any write) |
-| Tasks | `task-create` · `task-claim` · `task-update --status done\|open\|cancelled` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
+| Tasks | `task-create` · `task-claim` · `task-update --status open\|cancelled` · `done --pr N` · `done --verdict approved\|changes` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
 | Feed | `post` · `read --agent <id>` (delta since cursor; `--ack-through` to advance) · `read` (without `--agent`: inspect without cursor) |
 | Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
 
@@ -97,17 +97,29 @@ see what you hold. (The internal claims table that backs these leases is an atom
 
 ### Task lifecycle
 
-`open → claimed → done → closed`, plus terminal `cancelled`. An agent's footprint per task is
-two calls: `task-claim` (`open → claimed`) then `task-update --status done`. `task-update`
-is the single transition command — `--status done` submits work (auto-spawns a review),
-`--status open` releases a claim (give-up), `--status cancelled` is a terminal won't-do
-(creator OR assignee). The reviewer (review automation) drives `done → closed` or reopen.
+`open → working → in-review → merging → done`, with `rework` loops and terminals
+`done`/`failed`/`cancelled`. The state machine lives in `quorum-core/src/lifecycle.rs` —
+a pure `transition(TaskView, Event) → (Status, Vec<Effect>)` function.
+
+An agent's typical footprint: `task-claim` (open → working) then `done --pr N`
+(working → in-review). The daemon handles the rest: spawn a reviewer, process verdicts
+(approve → merging → done; changes → rework → in-review), and merge the PR.
+
+- `task-update --status open` releases a claim (give-up).
+- `task-update --status cancelled` is terminal (creator OR assignee).
+- `done --verdict approved --blocking 0` / `done --verdict changes --feedback "..."` are
+  reviewer verdicts processed by the daemon.
+- Review-only tasks (`task-create --review-pr N`) start directly in `in-review`; a changes
+  verdict goes to `failed` (no worker to rework).
+- Rework cap: 3 rounds; exceeding it → `failed`.
 
 `task-claim` takes a **renewable lease** on the task (`--ttl`, default 1h); the lease
 auto-renews on any `--agent` command the assignee runs (working through quorum keeps the
-work — there is no separate `task-renew`). If the lease lapses (lost agent), the next write's
-sweep reaper returns the task to `open` and posts a `reclaimed` event — so work never strands.
-Give-up is `task-update --status open` (→ `open`); hand-off is release + re-claim.
+work — there is no separate `task-renew`). If the lease lapses (lost agent), the task
+returns to `open` — so work never strands.
+
+See [`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md) for the full
+transition table, events, effects, and daemon merge flow.
 | Ops | `status [--watch] [--json] [--agents]` · `sweep` · `init` · `reset --yes` (wipe all state → clean db) · `help` (alias: `help-agent`) |
 
 ### Free text safely
