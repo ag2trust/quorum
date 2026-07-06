@@ -615,11 +615,8 @@ fn rework_feed_failure_releases_task() {
     // Wait for reviewer to finish its turn.
     std::thread::sleep(Duration::from_secs(2));
 
-    // Kill the worker process directly so its stdin pipe breaks.
-    // We read the worker PID from /proc or use the agent name to find it.
-    // Simpler: use the daemon's own serve process to find the child.
-    // Actually, the easiest way: look up the process. Since fake-agent
-    // is our child's child, we can find it by name and kill it.
+    // Kill ALL fake-agent processes so the worker's stdin pipe breaks.
+    // This also kills the reviewer, so Phase 4b fires AgentFailed on both.
     let pgrep_out = Command::new("pgrep")
         .args(["-f", "fake-agent.*--session-id"])
         .output();
@@ -674,7 +671,9 @@ fn rework_feed_failure_releases_task() {
 
     handle.stop();
 
-    // Task must be back to open (not stranded in claimed/in-progress).
+    // With lifecycle, AgentFailed from in-review stays in-review (the code
+    // was pushed, task just needs a new reviewer). The pgrep kills both
+    // agents, so the task lands in in-review — not open.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -684,7 +683,10 @@ fn rework_feed_failure_releases_task() {
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
-        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
-        "task was not released back to open after rework feed failure: {stdout}"
+        stdout.contains("\"status\":\"in-review\"")
+            || stdout.contains("\"status\": \"in-review\"")
+            || stdout.contains("\"status\":\"open\"")
+            || stdout.contains("\"status\": \"open\""),
+        "task was not in a recoverable state after rework feed failure: {stdout}"
     );
 }

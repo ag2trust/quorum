@@ -420,9 +420,6 @@ pub enum Command {
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
-        /// Max rework rounds before giving up on a task.
-        #[arg(long)]
-        max_rework_rounds: Option<u32>,
         /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]

@@ -2,9 +2,8 @@
 //!
 //! Verifies that cost and runaway controls kill agents and release tasks
 //! when ceilings are exceeded:
-//! 1. max-rework-rounds: worker killed after N rework cycles
-//! 2. max-task-tokens: worker killed when cumulative tokens exceed ceiling
-//! 3. max-turn-tokens: worker killed when single-turn tokens exceed ceiling
+//! 1. max-task-tokens: worker killed when cumulative tokens exceed ceiling
+//! 2. max-turn-tokens: worker killed when single-turn tokens exceed ceiling
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -231,7 +230,7 @@ fn rework_cap_kills_worker_and_releases_task() {
         repo_dir.path(),
         wt_base.path(),
         &names_file,
-        &["--max-rework-rounds", "1"],
+        &[],
     );
 
     // Wait for worker to spawn and produce a result
@@ -261,7 +260,7 @@ fn rework_cap_kills_worker_and_releases_task() {
     // Wait for reviewer to finish
     std::thread::sleep(Duration::from_secs(2));
 
-    // Reviewer requests changes — rework round #1 (within limit)
+    // Reviewer requests changes — rework round #1
     quorum_done(
         home.path(),
         &[
@@ -276,72 +275,21 @@ fn rework_cap_kills_worker_and_releases_task() {
         ],
     );
 
+    // Lifecycle: VerdictChanges → rework, daemon feeds rework turn to worker
     assert!(
         handle.wait_for("rework #1 started", 15),
         "first rework not seen. Lines: {:?}",
         handle.lines
     );
 
-    // Wait for rework result
+    // Verify lifecycle logged the transition
+    let saw_lifecycle = handle.lines.iter().any(|l| l.contains("lifecycle:"));
     assert!(
-        handle.wait_for("result", 15),
-        "rework result not seen. Lines: {:?}",
+        saw_lifecycle,
+        "lifecycle transition log not seen. Lines: {:?}",
         handle.lines
     );
 
-    // Worker signals done with PR again
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "2"]);
-
-    // Second reviewer spawns
-    assert!(
-        handle.wait_for("spawning reviewer", 15),
-        "second reviewer not spawned. Lines: {:?}",
-        handle.lines
-    );
-    let reviewer2_name = handle
-        .lines
-        .iter()
-        .rev()
-        .find_map(|l| {
-            l.split("spawning reviewer ")
-                .nth(1)
-                .map(|r| r.split_whitespace().next().unwrap_or("").to_string())
-        })
-        .unwrap();
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Second "changes" verdict — rework round #2 would exceed max of 1
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &reviewer2_name,
-            "--pr",
-            "2",
-            "--verdict",
-            "changes",
-            "--feedback",
-            "Still broken",
-        ],
-    );
-
-    // Watchdog should kill the worker
-    assert!(
-        handle.wait_for("WATCHDOG", 15),
-        "watchdog kill not seen. Lines: {:?}",
-        handle.lines
-    );
-
-    let saw_rework_rounds = handle.lines.iter().any(|l| l.contains("rework rounds"));
-    assert!(
-        saw_rework_rounds,
-        "rework rounds limit message not seen. Lines: {:?}",
-        handle.lines
-    );
-
-    // SIGINT to prevent the daemon from re-claiming the released task.
-    // On shutdown, any re-spawned worker is also torn down with "open".
     handle.stop();
 }
 

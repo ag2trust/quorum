@@ -806,7 +806,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_task_cost_usd,
             max_turn_wall_secs,
             max_task_wall_secs,
-            max_rework_rounds,
             log_dir,
             self_update_drain,
             drain_timeout_secs,
@@ -837,7 +836,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 max_task_cost_usd,
                 max_turn_wall_secs,
                 max_task_wall_secs,
-                max_rework_rounds,
             };
             let resolved_log_dir =
                 Some(log_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {

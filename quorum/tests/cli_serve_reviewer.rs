@@ -418,19 +418,19 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
         handle.lines
     );
 
-    // Reviewer must be torn down
+    // Sticky-agent policy: reviewer stays alive during rework.
     let reviewer_teardowns = handle
         .lines
         .iter()
         .filter(|l| l.contains("tearing down reviewer"))
         .count();
     assert_eq!(
-        reviewer_teardowns, 1,
-        "reviewer should be torn down after changes verdict. Lines: {:?}",
+        reviewer_teardowns, 0,
+        "reviewer should stay alive (sticky-agent policy). Lines: {:?}",
         handle.lines
     );
 
-    // Task status: must still be claimed by the same worker (not done, not open)
+    // Task status: lifecycle transitions to "rework" during rework.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -442,8 +442,8 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("working"),
-        "task must remain working during rework, got: {stdout}"
+        Some("rework"),
+        "task must be in rework during rework cycle, got: {stdout}"
     );
     assert_eq!(
         task["assignee"].as_str(),
@@ -539,18 +539,8 @@ fn merge_failure_feeds_rework_to_worker() {
         handle.lines
     );
 
-    // The reviewer should be torn down
-    let saw_reviewer_teardown = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("tearing down reviewer"));
-    assert!(
-        saw_reviewer_teardown,
-        "reviewer teardown not seen. Lines: {:?}",
-        handle.lines
-    );
-
-    // Task should NOT be done (merge failed, worker is reworking)
+    // Sticky-agent policy: reviewer stays alive during merge-failure rework.
+    // Task should be in rework (lifecycle: merging → in-review → rework).
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -617,19 +607,15 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
     // Reviewer signals done WITHOUT a verdict — the `_ =>` branch
     quorum_done(home.path(), &["--agent", &reviewer_name, "--pr", "1"]);
 
-    // Daemon should tear down the reviewer and clear w.pr
+    // Daemon should fire AgentFailed and tear down the reviewer
     assert!(
-        handle.wait_for("clearing PR", 15),
-        "clearing PR log not seen. Lines: {:?}",
+        handle.wait_for("without verdict", 15),
+        "no-verdict handling not seen. Lines: {:?}",
         handle.lines
     );
 
-    let saw_reviewer_teardown = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("tearing down reviewer"));
     assert!(
-        saw_reviewer_teardown,
+        handle.wait_for("tearing down reviewer", 15),
         "reviewer teardown not seen. Lines: {:?}",
         handle.lines
     );
@@ -766,8 +752,8 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("working"),
-        "demoted verdict must leave the task working (rework), not done: {stdout}"
+        Some("rework"),
+        "demoted verdict must leave the task in rework, not done: {stdout}"
     );
     assert_eq!(
         task["assignee"].as_str(),

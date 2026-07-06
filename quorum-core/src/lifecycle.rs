@@ -288,12 +288,12 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         // ---- Merging ----
         (Status::Merging, Event::MergeSucceeded) => Ok((Status::Done, vec![Effect::ReleaseLease])),
         (Status::Merging, Event::MergeFailed { reason }) => Ok((
-            Status::Failed,
+            Status::InReview,
             vec![
-                Effect::ReleaseLease,
                 Effect::NotifyOwner {
                     reason: reason.clone(),
                 },
+                Effect::ResumeReviewer,
             ],
         )),
         (Status::Merging, Event::Cancelled { .. }) => {
@@ -747,12 +747,12 @@ mod tests {
             &Event::MergeFailed {
                 reason: "conflict".into(),
             },
-            Status::Failed,
+            Status::InReview,
             &[
-                Effect::ReleaseLease,
                 Effect::NotifyOwner {
                     reason: "conflict".into(),
                 },
+                Effect::ResumeReviewer,
             ],
         );
     }
