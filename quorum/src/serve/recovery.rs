@@ -318,6 +318,7 @@ pub(crate) async fn recover(
                             turn_started_at: now_instant,
                             agent_state: entry.agent_state.clone(),
                             session_log,
+                            live_stats: super::LiveStats::new(),
                         });
 
                         log(&format!(

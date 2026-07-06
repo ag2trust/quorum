@@ -3,8 +3,8 @@ use quorum_core::stats::{
 };
 use std::io::Write;
 
-const DEAD_THRESHOLD: i64 = 120;
-const STALL_THRESHOLD: i64 = 30;
+const DEAD_THRESHOLD: i64 = 180;
+const STALL_THRESHOLD: i64 = 60;
 
 pub(crate) struct Style {
     color: bool,
@@ -110,14 +110,6 @@ fn fmt_tokens(tok: i64) -> String {
     }
 }
 
-fn fmt_cost(cost: f64) -> String {
-    if cost < 0.005 {
-        "—".to_string()
-    } else {
-        format!("${cost:.2}")
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -215,8 +207,8 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
     let _ = writeln!(
         w,
-        "    {:>10}   {:>5}  {:<24} {:<10} {:>4}  {:>5}  {:>6}  {:>2}  PR",
-        "TIER·EFF", "TASK", "WHAT", "PHASE", "ACT", "TOK", "COST", "↻"
+        "    {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
+        "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
     );
 
     let reviewers: Vec<&DaemonAgentView> = s
@@ -227,7 +219,8 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
     for d in &workers {
         let dot = sty.freshness_dot(d.last_activity_age_secs);
-        let tier_eff = d.tier_eff.as_deref().unwrap_or("—");
+        let eff = d.tier_eff.as_deref().unwrap_or("—");
+        let eff_short = eff.rsplit('·').next().unwrap_or(eff);
         let task_str = d
             .task_id
             .map(|id| format!("#{id}"))
@@ -235,55 +228,63 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         let title = d
             .task_title
             .as_deref()
-            .map(|t| truncate(t, 24))
+            .map(|t| truncate(t, 18))
             .unwrap_or_else(|| "—".to_string());
-        let act = d
-            .last_activity_age_secs
+        let up = d
+            .uptime_secs
             .map(fmt_age)
             .unwrap_or_else(|| "—".to_string());
         let tok = fmt_tokens(d.cost_tokens);
-        let cost = fmt_cost(d.cost_usd);
-        let pr_str =
-            d.pr.map(|p| format!("#{p}"))
-                .unwrap_or_else(|| "—".to_string());
+        let tools = d.tool_count.to_string();
+        let evm = d
+            .events_per_min
+            .map(|v| format!("{:.0}", v))
+            .unwrap_or_else(|| "—".to_string());
+        let now = d.now_label.as_deref().unwrap_or("—");
+        let now_display = truncate(now, 24);
+        let rework_suffix = if d.rework_count > 0 {
+            format!(" ↻{}", d.rework_count)
+        } else {
+            String::new()
+        };
 
         let _ = writeln!(
             w,
-            "{} {:<14} {:>10}   {:>5}  {:<24} {:<10} {:>4}  {:>5}  {:>6}  {:>2}  {}",
+            "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
             dot,
             d.agent,
-            tier_eff,
+            eff_short,
             task_str,
             title,
-            d.phase,
-            act,
+            up,
             tok,
-            cost,
-            d.rework_count,
-            pr_str,
+            tools,
+            evm,
+            now_display,
+            rework_suffix,
         );
 
-        // Show reviewer sub-row if one exists for this task
         if let Some(tid) = d.task_id {
             for rev in &reviewers {
                 if rev.task_id == Some(tid) {
-                    let rev_act = rev
-                        .last_activity_age_secs
-                        .map(fmt_age)
-                        .unwrap_or_else(|| "—".to_string());
+                    let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
+                        rev.last_activity_age_secs
+                            .map(fmt_age)
+                            .unwrap_or_else(|| "—".to_string())
+                    });
                     let rev_tok = fmt_tokens(rev.cost_tokens);
                     let sub = if sty.color {
                         format!(
-                            "    {} reviewer  {} · reviewing {} · {} tok",
+                            "    {} reviewer  {} · {} · {} tok",
                             sty.dim("└"),
                             rev.agent,
-                            rev_act,
+                            rev_up,
                             rev_tok,
                         )
                     } else {
                         format!(
-                            "    +- reviewer  {} · reviewing {} · {} tok",
-                            rev.agent, rev_act, rev_tok,
+                            "    +- reviewer  {} · {} · {} tok",
+                            rev.agent, rev_up, rev_tok,
                         )
                     };
                     let _ = writeln!(w, "{sub}");
@@ -525,6 +526,10 @@ mod tests {
             tier_eff: Some("opus46·hi".into()),
             pr: None,
             rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
         });
         s.health = HealthVerdict::Stalled;
         s.stalled_count = 1;
@@ -622,6 +627,10 @@ mod tests {
             tier_eff: Some("opus46·md".into()),
             pr: Some(193),
             rework_count: 0,
+            tool_count: 27,
+            now_label: Some("Bash: cargo test".into()),
+            events_per_min: Some(14.0),
+            uptime_secs: Some(240),
         });
         s.daemon_agents.push(DaemonAgentView {
             agent: "R1".into(),
@@ -637,6 +646,10 @@ mod tests {
             tier_eff: None,
             pr: None,
             rework_count: 0,
+            tool_count: 5,
+            now_label: None,
+            events_per_min: Some(2.0),
+            uptime_secs: Some(120),
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
