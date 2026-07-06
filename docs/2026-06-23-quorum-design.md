@@ -25,9 +25,12 @@ long-lived with `--watch`) for at-a-glance health. It mutates nothing.
 
 ## What Quorum *is*
 
-**A single `quorum` binary on PATH + one SQLite file at `~/.quorum/quorum.db`.**
-No daemon. No server. No network. No MCP. Agents invoke `quorum <subcommand>` as ordinary
-shell commands (via the Bash tool), exactly as they already drive `gh`, `git`, and `rtk`.
+**A single `quorum` binary on PATH + one SQLite file per managed repo.**
+DB path: `~/.quorum/repos/<owner>__<name>/quorum.db`. Repo identity is resolved from
+`QUORUM_REPO` env var (set by the daemon for workers) > cwd git detection (parse the
+`origin` remote URL) > loud error (exit 2). No daemon required for CLI commands. No
+server. No network. No MCP. Agents invoke `quorum <subcommand>` as ordinary shell
+commands (via the Bash tool), exactly as they already drive `gh`, `git`, and `rtk`.
 
 Each invocation is a **complete, self-contained, short-lived process**: open the DB,
 perform one atomic op, print JSON to stdout, exit with a meaningful code. There is **no
@@ -129,7 +132,7 @@ failure class):
 - `quorum init` is just "open + migrate" on a fresh path (idempotent). Concurrent `init` is
   safe via the same write-lock path (tested).
 
-## Data model (6 tables)
+## Data model
 
 ### `agents` — identity + presence
 `id` TEXT PK · `first_seen` INTEGER NOT NULL · `last_seen` INTEGER NOT NULL. **No
@@ -314,6 +317,44 @@ Tests:
    binary < db_version refuses (exit 3).
 10. **WAL health** — 500 short-lived writes leave `-wal` ≈ 0; `--watch` per-tick-fresh-read
     does not pin the WAL.
+
+## Per-repo DB model
+
+Each managed repository gets its own SQLite database. The DB path is computed from the
+repo slug: `~/.quorum/repos/<owner>__<name>/quorum.db` (e.g. `ag2trust__quorum`).
+
+**Resolution order** for the repo identity:
+1. `QUORUM_REPO` env var — set by the daemon for spawned workers/reviewers.
+2. cwd git detection — parse `origin` remote URL from the enclosing git checkout.
+3. Neither → exit 2 with a clear error ("set QUORUM_REPO or run inside a git checkout").
+
+**`quorum serve` requires `--repo`** (mandatory, no default). The daemon injects
+`QUORUM_REPO=<repo>` into every worker/reviewer it spawns, so their CLI calls resolve
+to the same per-repo DB without relying on cwd. The former `--only-repo` and
+`--repo-dir-map` flags are deleted; `refs.repo` in task/message metadata is ignored
+for DB routing.
+
+### Single-daemon-per-DB guard
+
+On startup, `quorum serve` acquires an exclusive lease in the `daemon_lock` table
+(one-row, stores pid + heartbeat timestamp). The heartbeat is refreshed on every tick.
+A second daemon on the same DB:
+
+- **Live holder** (heartbeat fresh within 30s AND pid alive via `kill(pid, 0)`) → exit 2
+  with error naming the holder pid. Never a silent second daemon.
+- **Stale holder** (heartbeat old OR pid dead) → take over the lease, log it.
+
+On clean shutdown the lease is released (row deleted). A crash leaves a stale row that
+the next daemon takes over.
+
+### Cutover runbook (moving from global DB to per-repo)
+
+1. Merge the per-repo DB chain (parts 1–3).
+2. Stop any running daemon (`kill <pid>` or Ctrl-C).
+3. Either copy the existing `~/.quorum/quorum.db` into
+   `~/.quorum/repos/<owner>__<name>/quorum.db`, or start fresh (DB is disposable pre-GA).
+4. Relaunch with `quorum serve --repo <owner>/<name> ...`.
+5. Verify: `quorum status` from a git checkout of the repo resolves to the new DB.
 
 ## Decisions & non-goals
 

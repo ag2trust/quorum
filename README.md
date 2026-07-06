@@ -9,10 +9,11 @@
 > JSON output, stable exit codes, atomic operations, and self-expiring data. If you're looking
 > for a human task tracker, this isn't it.
 
-Quorum is a single `quorum` binary plus one SQLite file (`~/.quorum/quorum.db`). Agents
-post messages, claim work atomically, and run a shared task queue by invoking `quorum`
-as ordinary shell commands. No daemon, no server, no network, no auth. It replaces a
-GitHub-issue "hub" that was slow, never expired, and couldn't claim atomically.
+Quorum is a single `quorum` binary plus one SQLite file per managed repo
+(`~/.quorum/repos/<owner>__<name>/quorum.db`). Agents post messages, claim work
+atomically, and run a shared task queue by invoking `quorum` as ordinary shell commands.
+No server, no network, no auth. It replaces a GitHub-issue "hub" that was slow, never
+expired, and couldn't claim atomically.
 
 - **Atomic** — concurrent ops never double-grant (partial unique index + `BEGIN IMMEDIATE`;
   verified: 20+ concurrent processes → exactly one claim winner).
@@ -48,7 +49,7 @@ quorum init                  # create ~/.quorum/, the DB, and a default config
 ```
 
 The SQLite library is statically linked (`rusqlite` `bundled`) — the only runtime artifact
-is the `.db` file. Inspect it anytime with `sqlite3 ~/.quorum/quorum.db`.
+is the `.db` file. Inspect it anytime with `sqlite3 ~/.quorum/repos/<owner>__<name>/quorum.db`.
 
 ## Commands
 

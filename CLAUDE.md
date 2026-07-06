@@ -1,10 +1,10 @@
 # Quorum — Project Brief
 
 **Quorum is a local coordination substrate for AI agents** — a single `quorum` binary + one
-SQLite file (`~/.quorum/quorum.db`). Agents post messages, claim work atomically, and run a
-shared task queue by invoking `quorum <subcommand>` as ordinary shell commands. It replaces
-an earlier GitHub-Issue-based "hub" that was slow, never expired, and couldn't claim
-atomically.
+SQLite file per managed repo (`~/.quorum/repos/<owner>__<name>/quorum.db`). Agents post
+messages, claim work atomically, and run a shared task queue by invoking
+`quorum <subcommand>` as ordinary shell commands. It replaces an earlier
+GitHub-Issue-based "hub" that was slow, never expired, and couldn't claim atomically.
 
 - **Design spec (source of truth):** `docs/2026-06-23-quorum-design.md` — read it before any
   non-trivial work. This file is the *operating brief*; the spec is the *design of record*.
@@ -31,9 +31,12 @@ humans is a read-only `quorum status [--watch]`.
 
 A short-lived process per command: open DB → apply PRAGMAs → migrate-if-needed → one atomic
 op (`BEGIN IMMEDIATE`) → print JSON → exit with a meaningful code. **No daemon, no server,
-no network, no MCP.** The SQLite file is the only state. SQLite's cross-process file locking
-is the concurrency authority. Crate layout: `quorum-core` (lib: store, logic, PRAGMAs,
-migrations — fully unit-testable) + `quorum` (bin: clap, stdin/file I/O, JSON, exit codes).
+no network, no MCP.** The per-repo SQLite file is the only state. SQLite's cross-process
+file locking is the concurrency authority. DB path resolution: `QUORUM_REPO` env var
+(set by daemon for workers) > cwd git detection > loud error (exit 2). `quorum serve`
+requires `--repo` and enforces one daemon per DB via a `daemon_lock` table (pid +
+heartbeat). Crate layout: `quorum-core` (lib: store, logic, PRAGMAs, migrations — fully
+unit-testable) + `quorum` (bin: clap, stdin/file I/O, JSON, exit codes).
 
 ## Load-bearing invariants (do NOT regress — each cost a review round to get right)
 
@@ -84,6 +87,11 @@ established it.
     SQLite parameter (never concatenated into SQL), and is emitted as JSON. **Reject invalid
     UTF-8 and embedded NUL on input (exit 2)** — TEXT+JSON cannot carry arbitrary bytes; fail
     loud rather than mangle.
+11. **Single daemon per DB.** `quorum serve` acquires an exclusive lease in the `daemon_lock`
+    table on startup (pid + heartbeat refreshed every tick). A second daemon on the same DB
+    exits 2 if the holder is live (heartbeat < 30s AND pid alive); takes over if stale/dead.
+    Lease released on clean shutdown. This replaces the safety that `instance_id` alone
+    provided — instance_id scopes journal rows, daemon_lock prevents concurrent instances.
 
 ## Quick start
 
