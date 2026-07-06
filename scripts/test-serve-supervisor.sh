@@ -41,6 +41,7 @@ make_fake_repo() {
   git -C "$1" commit --allow-empty -m "init" -q 2>/dev/null
   git -C "$1" remote add origin "$1" 2>/dev/null || true
   git -C "$1" branch -M main 2>/dev/null || true
+  git -C "$1" fetch origin main -q 2>/dev/null || true
 }
 
 # Run the supervisor with a stub quorum that exits with given codes in sequence.
@@ -213,6 +214,171 @@ if printf '%s' "$CAPTURED_OUTPUT" | grep -q "rebuild OK"; then
 else fail "logged rebuild OK on second attempt"; fi
 
 rm -rf "$repo_dir" "$seq_file" "$out_file" "$counter_file"
+
+# --- Test 8: SIGTERM forwarded to child; both exit ---
+printf '\ntest 8: SIGTERM forwarded to child\n'
+
+seq_file="$TMPDIR_TEST/seq_t8"
+: > "$seq_file"
+
+repo_dir="$TMPDIR_TEST/repo_t8"
+mkdir -p "$repo_dir"
+make_fake_repo "$repo_dir"
+cat > "$repo_dir/dev-install.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$repo_dir/dev-install.sh"
+
+long_stub="$TMPDIR_TEST/stub-quorum-long"
+child_pid_file="$TMPDIR_TEST/child_pid_t8"
+cat > "$long_stub" <<LONGSTUB
+#!/bin/sh
+printf '%s' "\$\$" > "$child_pid_file"
+trap 'exit 0' TERM
+while true; do sleep 1; done
+LONGSTUB
+chmod +x "$long_stub"
+
+out_file="$TMPDIR_TEST/out_t8"
+QUORUM_REPO_DIR="$repo_dir" \
+QUORUM_SERVE_BIN="$long_stub" \
+QUORUM_TEST_SEQ="$seq_file" \
+"$SUPERVISOR" > "$out_file" 2>&1 &
+supervisor_pid=$!
+
+attempts=0
+while [ ! -f "$child_pid_file" ] && [ "$attempts" -lt 20 ]; do
+  sleep 0.1
+  attempts=$((attempts + 1))
+done
+
+if [ -f "$child_pid_file" ]; then
+  child_pid=$(cat "$child_pid_file")
+
+  kill -TERM "$supervisor_pid" 2>/dev/null
+  sup_exit=0
+  wait "$supervisor_pid" 2>/dev/null || sup_exit=$?
+
+  if [ "$sup_exit" -eq 143 ]; then pass "supervisor exited 143 on SIGTERM"
+  else fail "supervisor exited 143 on SIGTERM (got $sup_exit)"; fi
+
+  if ! kill -0 "$child_pid" 2>/dev/null; then pass "child process exited after SIGTERM"
+  else
+    fail "child process exited after SIGTERM (still running)"
+    kill -9 "$child_pid" 2>/dev/null || true
+  fi
+else
+  fail "supervisor exited 143 on SIGTERM (child never started)"
+  fail "child process exited after SIGTERM (child never started)"
+  kill "$supervisor_pid" 2>/dev/null || true
+  wait "$supervisor_pid" 2>/dev/null || true
+fi
+
+rm -rf "$repo_dir" "$seq_file" "$out_file" "$child_pid_file" "$long_stub"
+
+# --- Test 9: fast-forward merge is applied after exit 75 ---
+printf '\ntest 9: fast-forward merge applied on self-update\n'
+
+repo_dir="$TMPDIR_TEST/repo_t10"
+mkdir -p "$repo_dir"
+git -C "$repo_dir" init -q
+git -C "$repo_dir" commit --allow-empty -m "init" -q
+git -C "$repo_dir" branch -M main
+
+bare_dir="$TMPDIR_TEST/bare_t10"
+git clone --bare -q "$repo_dir" "$bare_dir" 2>/dev/null
+git -C "$repo_dir" remote add origin "$bare_dir" 2>/dev/null || true
+git -C "$repo_dir" fetch origin main -q 2>/dev/null
+
+git -C "$repo_dir" checkout -b tmp-ff -q 2>/dev/null
+git -C "$repo_dir" commit --allow-empty -m "advance" -q
+git -C "$repo_dir" push origin tmp-ff:main -q 2>/dev/null
+git -C "$repo_dir" checkout main -q 2>/dev/null
+pre_sha=$(git -C "$repo_dir" rev-parse HEAD)
+
+seq_file="$TMPDIR_TEST/seq_t10"
+printf '75\n0\n' > "$seq_file"
+
+cat > "$repo_dir/dev-install.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$repo_dir/dev-install.sh"
+
+stub_bin="$TMPDIR_TEST/stub-quorum"
+make_stub_quorum "$stub_bin"
+
+out_file="$TMPDIR_TEST/out_t10"
+CAPTURED_EXIT=0
+QUORUM_REPO_DIR="$repo_dir" \
+QUORUM_SERVE_BIN="$stub_bin" \
+QUORUM_TEST_SEQ="$seq_file" \
+"$SUPERVISOR" > "$out_file" 2>&1 || CAPTURED_EXIT=$?
+
+CAPTURED_OUTPUT=$(cat "$out_file")
+post_sha=$(git -C "$repo_dir" rev-parse HEAD)
+
+if [ "$pre_sha" != "$post_sha" ]; then pass "HEAD advanced after fast-forward merge"
+else fail "HEAD advanced after fast-forward merge (SHA unchanged)"; fi
+
+if printf '%s' "$CAPTURED_OUTPUT" | grep -q "rebuild OK"; then
+  pass "rebuild succeeded after fast-forward"
+else fail "rebuild succeeded after fast-forward"; fi
+
+rm -rf "$repo_dir" "$bare_dir" "$seq_file" "$out_file"
+
+# --- Test 10: fast-forward merge failure alerts and relaunches old binary ---
+printf '\ntest 10: fast-forward merge failure alerts and continues\n'
+
+repo_dir="$TMPDIR_TEST/repo_t10b"
+mkdir -p "$repo_dir"
+git -C "$repo_dir" init -q
+git -C "$repo_dir" commit --allow-empty -m "init" -q
+git -C "$repo_dir" branch -M main
+
+bare_dir="$TMPDIR_TEST/bare_t10b"
+git clone --bare -q "$repo_dir" "$bare_dir" 2>/dev/null
+git -C "$repo_dir" remote add origin "$bare_dir" 2>/dev/null || true
+git -C "$repo_dir" fetch origin main -q 2>/dev/null
+
+# Create a divergent history that can't fast-forward
+git -C "$repo_dir" commit --allow-empty -m "local diverge" -q
+git -C "$repo_dir" checkout -b tmp-div -q 2>/dev/null
+git -C "$repo_dir" reset --hard HEAD~1 -q
+git -C "$repo_dir" commit --allow-empty -m "remote diverge" -q
+git -C "$repo_dir" push origin tmp-div:main -f -q 2>/dev/null
+git -C "$repo_dir" checkout main -q 2>/dev/null
+
+seq_file="$TMPDIR_TEST/seq_t10b"
+printf '75\n0\n' > "$seq_file"
+
+cat > "$repo_dir/dev-install.sh" <<'STUB'
+#!/bin/sh
+exit 0
+STUB
+chmod +x "$repo_dir/dev-install.sh"
+
+stub_bin="$TMPDIR_TEST/stub-quorum"
+make_stub_quorum "$stub_bin"
+
+out_file="$TMPDIR_TEST/out_t10b"
+CAPTURED_EXIT=0
+QUORUM_REPO_DIR="$repo_dir" \
+QUORUM_SERVE_BIN="$stub_bin" \
+QUORUM_TEST_SEQ="$seq_file" \
+"$SUPERVISOR" > "$out_file" 2>&1 || CAPTURED_EXIT=$?
+
+CAPTURED_OUTPUT=$(cat "$out_file")
+
+if [ "$CAPTURED_EXIT" -eq 0 ]; then pass "continued after merge failure"
+else fail "continued after merge failure (got exit $CAPTURED_EXIT)"; fi
+
+if printf '%s' "$CAPTURED_OUTPUT" | grep -q "SUPERVISOR ALERT.*fast-forward merge failed"; then
+  pass "alerted on merge failure"
+else fail "alerted on merge failure"; fi
+
+rm -rf "$repo_dir" "$bare_dir" "$seq_file" "$out_file"
 
 # === Summary ===
 printf '\n--- Results: %s tests, %s passed, %s failed ---\n' "$TESTS" "$PASS" "$FAIL"
