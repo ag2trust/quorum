@@ -549,6 +549,9 @@ pub fn apply_event(
                 deactivate_lease(&tx, id, now)?;
                 if new_status.is_terminal() || new_status == Status::Open {
                     assignee = None;
+                } else if new_status == Status::InReview {
+                    reviewer = None;
+                    assignee = None;
                 }
             }
             Effect::NotifyOwner { reason } => {
@@ -1968,6 +1971,87 @@ mod tests {
             r.effects.iter().any(|e| matches!(e, Effect::SpawnReviewer)),
             "in-review AgentFailed must emit SpawnReviewer"
         );
+    }
+
+    #[test]
+    fn reviewer_replacement_after_expiry() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // Worker claims and signals done → in-review
+        claim(&mut c, "W", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        // R1 claims as reviewer
+        claim(&mut c, "R1", Some(id), &[], TTL, 1002).unwrap();
+        // R1's lease expires → sticky in-review, reviewer/assignee must be cleared
+        let r = apply_event(&mut c, "system", id, &Event::LeaseExpired, 1003).unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert!(
+            r.task.reviewer.is_none(),
+            "reviewer must be cleared on sticky in-review release"
+        );
+        assert!(
+            r.task.assignee.is_none(),
+            "assignee must be cleared on sticky in-review release"
+        );
+        assert!(r.effects.contains(&Effect::SpawnReviewer));
+        // R2 can now claim as the new reviewer
+        let t = claim(&mut c, "R2", Some(id), &[], TTL, 1004)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.reviewer, Some("R2".to_string()));
+        assert_eq!(t.assignee, Some("R2".to_string()));
+    }
+
+    #[test]
+    fn reviewer_replacement_after_agent_failed() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R1", Some(id), &[], TTL, 1002).unwrap();
+        // R1 crashes → sticky in-review
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::AgentFailed {
+                reason: "crashed".to_string(),
+            },
+            1003,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert!(
+            r.task.reviewer.is_none(),
+            "reviewer must be cleared on agent failure"
+        );
+        assert!(
+            r.task.assignee.is_none(),
+            "assignee must be cleared on agent failure"
+        );
+        // R2 can claim
+        let t = claim(&mut c, "R2", Some(id), &[], TTL, 1004)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.reviewer, Some("R2".to_string()));
     }
 
     #[test]
