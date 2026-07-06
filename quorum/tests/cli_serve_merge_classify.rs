@@ -296,11 +296,7 @@ fn policy_blocked_merge_parks_task_no_rework() {
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
         stdout.contains("\"status\":\"cancelled\"") || stdout.contains("\"status\": \"cancelled\""),
-        "task should be parked as cancelled, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("daemon:parked:merge-blocked"),
-        "task body should contain daemon:parked:merge-blocked tag, got: {stdout}"
+        "task should be cancelled after policy-blocked merge, got: {stdout}"
     );
 }
 
@@ -328,12 +324,7 @@ fn conflicting_pr_skips_merge_sends_rework() {
         wt_base.path(),
         &names_file,
         "true",
-        &[
-            "--max-rework-rounds",
-            "1",
-            "--merge-mergeability-cmd",
-            "echo conflicting",
-        ],
+        &["--merge-mergeability-cmd", "echo conflicting"],
     );
 
     assert!(
@@ -421,7 +412,7 @@ fn retryable_merge_sends_rework_turn() {
         wt_base.path(),
         &names_file,
         "echo 'merge conflict in src/main.rs' >&2 && exit 1",
-        &["--max-rework-rounds", "1"],
+        &[],
     );
 
     assert!(

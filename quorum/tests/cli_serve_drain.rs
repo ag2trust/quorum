@@ -283,9 +283,9 @@ fn self_repo_merge_drains_and_exits_75() {
     // Agent done with a PR → triggers reviewer spawn → reviewer approves → merge → drain
     quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
 
-    // Wait for reviewer to produce a result
+    // Wait for reviewer to be spawned
     assert!(
-        handle.wait_for("reviewer", 15),
+        handle.wait_for("spawning reviewer", 15),
         "reviewer was not spawned: {:?}",
         handle.lines
     );
@@ -394,7 +394,7 @@ fn other_repo_merge_does_not_drain() {
     quorum_done(home.path(), &["--agent", &agent_name, "--pr", "99"]);
 
     assert!(
-        handle.wait_for("reviewer", 15),
+        handle.wait_for("spawning reviewer", 15),
         "reviewer was not spawned: {:?}",
         handle.lines
     );

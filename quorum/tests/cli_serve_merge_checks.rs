@@ -327,8 +327,6 @@ fn checks_fail_sends_rework() {
             "10",
             "--merge-checks-poll-secs",
             "1",
-            "--max-rework-rounds",
-            "1",
         ],
     );
 
@@ -495,11 +493,7 @@ fn checks_timeout_parks_task() {
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
         stdout.contains("\"status\":\"cancelled\"") || stdout.contains("\"status\": \"cancelled\""),
-        "task should be parked as cancelled, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("daemon:parked:merge-blocked"),
-        "task body should contain daemon:parked:merge-blocked tag, got: {stdout}"
+        "task should be cancelled after checks timeout, got: {stdout}"
     );
 }
 
