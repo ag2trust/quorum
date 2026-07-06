@@ -466,3 +466,79 @@ fn retryable_merge_sends_rework_turn() {
 
     handle.stop();
 }
+
+/// T5: worker signals done with a PR that is already merged on GitHub.
+/// The daemon should detect this in Phase 5, fire MergeSucceeded, and
+/// close the task without spawning a reviewer.
+#[test]
+fn already_merged_pr_closes_task_no_reviewer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for already-merged PR test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--merge-mergeability-cmd", "echo merged"],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("already merged", 15),
+        "already-merged log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_reviewer = handle.lines.iter().any(|l| l.contains("spawning reviewer"));
+    assert!(
+        !saw_reviewer,
+        "reviewer should NOT be spawned for already-merged PR. Lines: {:?}",
+        handle.lines
+    );
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    handle.stop();
+
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"done\"") || stdout.contains("\"status\": \"done\""),
+        "task should be done after already-merged PR detected, got: {stdout}"
+    );
+}

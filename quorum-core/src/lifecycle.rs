@@ -257,7 +257,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::InReview, Event::Claimed { .. }) => reject("in review, not claimable"),
         (Status::InReview, Event::SignaledDone { .. }) => reject("already in review"),
         (Status::InReview, Event::ReworkPushed) => reject("not in rework"),
-        (Status::InReview, Event::MergeSucceeded) => reject("not merging"),
+        (Status::InReview, Event::MergeSucceeded) => Ok((Status::Done, vec![Effect::ReleaseLease])),
         (Status::InReview, Event::MergeFailed { .. }) => reject("not merging"),
 
         // ---- Rework ----
@@ -638,13 +638,23 @@ mod tests {
     }
 
     #[test]
+    fn in_review_merge_succeeded() {
+        let t = view_with_author(Status::InReview, "W1");
+        assert_ok(
+            &t,
+            &Event::MergeSucceeded,
+            Status::Done,
+            &[Effect::ReleaseLease],
+        );
+    }
+
+    #[test]
     fn in_review_rejects_all_others() {
         let t = view_with_author(Status::InReview, "W1");
         let invalid_events = [
             Event::Claimed { agent: "W2".into() },
             Event::SignaledDone { pr: "1".into() },
             Event::ReworkPushed,
-            Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
         ];
         for e in &invalid_events {

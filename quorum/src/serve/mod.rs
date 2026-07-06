@@ -2400,6 +2400,8 @@ async fn tick(
             })
             .collect();
         let mut parked_workers: Vec<usize> = Vec::new();
+        let mut merged_workers: Vec<usize> = Vec::new();
+        let mut closed_workers: Vec<usize> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
@@ -2408,6 +2410,42 @@ async fn tick(
                 ));
                 parked_workers.push(*wi);
                 continue;
+            }
+            // H3: check PR state before spawning reviewer
+            let pr_state = {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let pr_num = *pr;
+                tokio::task::spawn_blocking(move || executor.check_mergeability(pr_num, &repo))
+                    .await
+                    .unwrap_or(merge::MergeabilityState::Mergeable)
+            };
+            match pr_state {
+                merge::MergeabilityState::AlreadyMerged => {
+                    log(&format!(
+                        "PR #{pr} already merged — firing MergeSucceeded for task #{task_id}"
+                    ));
+                    fire_event(&db_path, "system", *task_id, &Event::MergeSucceeded).await;
+                    merged_workers.push(*wi);
+                    continue;
+                }
+                merge::MergeabilityState::Closed => {
+                    log(&format!(
+                        "PR #{pr} closed (not merged) — firing AgentFailed for task #{task_id}"
+                    ));
+                    fire_event(
+                        &db_path,
+                        "system",
+                        *task_id,
+                        &Event::AgentFailed {
+                            reason: format!("PR #{pr} closed without merging"),
+                        },
+                    )
+                    .await;
+                    closed_workers.push(*wi);
+                    continue;
+                }
+                _ => {}
             }
             let counterpart: ReviewCounterpart = (&workers[*wi]).into();
             spawn_reviewer_for_worker(
@@ -2422,24 +2460,47 @@ async fn tick(
             )
             .await?;
         }
-        for &wi in parked_workers.iter().rev() {
-            let w = workers.remove(wi);
-            let pr_label =
-                w.pr.map(|n| format!("#{n}"))
-                    .unwrap_or_else(|| "unknown".to_string());
-            teardown_worker_with_body(
-                config,
-                wt_mgr,
-                name_pool,
-                w,
-                "cancelled",
-                Some(&format!(
-                    "{}provision-exhausted | PR {pr_label} | \
-                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
-                    tasks::PARKED_BODY_PREFIX
-                )),
-            )
-            .await;
+        {
+            // Combine all removal indices and process in reverse to keep
+            // indices stable. Sets are mutually exclusive (loop continues).
+            let mut removals: Vec<(usize, u8)> = Vec::new(); // (index, kind)
+            for &wi in &parked_workers {
+                removals.push((wi, 0)); // 0 = parked
+            }
+            for &wi in &merged_workers {
+                removals.push((wi, 1)); // 1 = merged
+            }
+            for &wi in &closed_workers {
+                removals.push((wi, 2)); // 2 = closed
+            }
+            removals.sort_unstable_by_key(|r| std::cmp::Reverse(r.0)); // reverse order
+            for (wi, kind) in removals {
+                let w = workers.remove(wi);
+                match kind {
+                    1 | 2 => {
+                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                    }
+                    _ => {
+                        let pr_label =
+                            w.pr.map(|n| format!("#{n}"))
+                                .unwrap_or_else(|| "unknown".to_string());
+                        teardown_worker_with_body(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            w,
+                            "cancelled",
+                            Some(&format!(
+                                "{}provision-exhausted | PR {pr_label} | \
+                                 reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
+                                 time(s)",
+                                tasks::PARKED_BODY_PREFIX
+                            )),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
 
         // Provision reviewers for restart-recovered pending reviews (#178).
@@ -2455,6 +2516,8 @@ async fn tick(
             })
             .collect();
         let mut parked_pending: Vec<usize> = Vec::new();
+        let mut merged_pending: Vec<usize> = Vec::new();
+        let mut closed_pending: Vec<usize> = Vec::new();
         for (pr, task_id, pi) in &needs_reviewer_from_pending {
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
@@ -2463,6 +2526,42 @@ async fn tick(
                 ));
                 parked_pending.push(*pi);
                 continue;
+            }
+            // H3: check PR state before spawning reviewer (recovery path)
+            let pr_state = {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let pr_num = *pr;
+                tokio::task::spawn_blocking(move || executor.check_mergeability(pr_num, &repo))
+                    .await
+                    .unwrap_or(merge::MergeabilityState::Mergeable)
+            };
+            match pr_state {
+                merge::MergeabilityState::AlreadyMerged => {
+                    log(&format!(
+                        "PR #{pr} already merged — firing MergeSucceeded for task #{task_id}"
+                    ));
+                    fire_event(&db_path, "system", *task_id, &Event::MergeSucceeded).await;
+                    merged_pending.push(*pi);
+                    continue;
+                }
+                merge::MergeabilityState::Closed => {
+                    log(&format!(
+                        "PR #{pr} closed (not merged) — firing AgentFailed for task #{task_id}"
+                    ));
+                    fire_event(
+                        &db_path,
+                        "system",
+                        *task_id,
+                        &Event::AgentFailed {
+                            reason: format!("PR #{pr} closed without merging"),
+                        },
+                    )
+                    .await;
+                    closed_pending.push(*pi);
+                    continue;
+                }
+                _ => {}
             }
             let counterpart: ReviewCounterpart = (&pending_reviews[*pi]).into();
             spawn_reviewer_for_worker(
@@ -2477,21 +2576,42 @@ async fn tick(
             )
             .await?;
         }
-        for &pi in parked_pending.iter().rev() {
-            let p = pending_reviews.remove(pi);
-            let pr = p.pr;
-            teardown_pending_review(
-                config,
-                wt_mgr,
-                name_pool,
-                p,
-                "cancelled",
-                Some(&format!(
-                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
-                     time(s) for PR #{pr} — parking task"
-                )),
-            )
-            .await;
+        {
+            let mut removals: Vec<(usize, u8)> = Vec::new();
+            for &pi in &parked_pending {
+                removals.push((pi, 0));
+            }
+            for &pi in &merged_pending {
+                removals.push((pi, 1));
+            }
+            for &pi in &closed_pending {
+                removals.push((pi, 2));
+            }
+            removals.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+            for (pi, kind) in removals {
+                let p = pending_reviews.remove(pi);
+                match kind {
+                    1 | 2 => {
+                        cleanup_pending(config, wt_mgr, name_pool, p).await;
+                    }
+                    _ => {
+                        let pr = p.pr;
+                        teardown_pending_review(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            p,
+                            "cancelled",
+                            Some(&format!(
+                                "daemon: reviewer provision failed \
+                                 {MAX_REVIEWER_PROVISION_STRIKES} time(s) for PR #{pr} \
+                                 — parking task"
+                            )),
+                        )
+                        .await;
+                    }
+                }
+            }
         }
     }
 
