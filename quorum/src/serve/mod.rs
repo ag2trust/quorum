@@ -3646,26 +3646,47 @@ async fn teardown_worker_with_body(
 
     state.proc.kill_and_reap().await;
 
-    let p = config.db_path.clone();
-    let agent = state.agent_name.clone();
-    let task_id = state.task_id;
-    let status = task_status.to_string();
-    let body_owned = body.map(|s| s.to_string());
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&p)?;
-        let now = now_unix();
-        let fields = tasks::TaskUpdate {
-            status: Some(&status),
-            body: body_owned.as_deref(),
-            refs: None,
-            verdict: None,
-        };
-        tasks::update(&mut conn, &agent, task_id, &fields, now)?;
-        journal::delete(&mut conn, &agent)?;
-        Ok(())
-    })
-    .await
-    .ok();
+    if task_status == "open" {
+        fire_event(
+            &config.db_path,
+            &state.agent_name,
+            state.task_id,
+            &Event::AgentFailed {
+                reason: "worker teardown (shutdown/cleanup)".into(),
+            },
+        )
+        .await;
+        let p = config.db_path.clone();
+        let agent = state.agent_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            journal::delete(&mut conn, &agent)?;
+            Ok(())
+        })
+        .await
+        .ok();
+    } else {
+        let p = config.db_path.clone();
+        let agent = state.agent_name.clone();
+        let task_id = state.task_id;
+        let status = task_status.to_string();
+        let body_owned = body.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let now = now_unix();
+            let fields = tasks::TaskUpdate {
+                status: Some(&status),
+                body: body_owned.as_deref(),
+                refs: None,
+                verdict: None,
+            };
+            tasks::update(&mut conn, &agent, task_id, &fields, now)?;
+            journal::delete(&mut conn, &agent)?;
+            Ok(())
+        })
+        .await
+        .ok();
+    }
 
     let repo_dir = &config.repo_dir;
     wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
@@ -3724,26 +3745,47 @@ async fn teardown_pending_review(
         state.agent_name, state.task_id
     ));
 
-    let p = config.db_path.clone();
-    let agent = state.agent_name.clone();
-    let task_id = state.task_id;
-    let status = task_status.to_string();
-    let body_owned = body.map(|s| s.to_string());
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&p)?;
-        let now = now_unix();
-        let fields = tasks::TaskUpdate {
-            status: Some(&status),
-            body: body_owned.as_deref(),
-            refs: None,
-            verdict: None,
-        };
-        tasks::update(&mut conn, &agent, task_id, &fields, now)?;
-        journal::delete(&mut conn, &agent)?;
-        Ok(())
-    })
-    .await
-    .ok();
+    if task_status == "open" {
+        fire_event(
+            &config.db_path,
+            &state.agent_name,
+            state.task_id,
+            &Event::AgentFailed {
+                reason: "pending review teardown (shutdown/cleanup)".into(),
+            },
+        )
+        .await;
+        let p = config.db_path.clone();
+        let agent = state.agent_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            journal::delete(&mut conn, &agent)?;
+            Ok(())
+        })
+        .await
+        .ok();
+    } else {
+        let p = config.db_path.clone();
+        let agent = state.agent_name.clone();
+        let task_id = state.task_id;
+        let status = task_status.to_string();
+        let body_owned = body.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let now = now_unix();
+            let fields = tasks::TaskUpdate {
+                status: Some(&status),
+                body: body_owned.as_deref(),
+                refs: None,
+                verdict: None,
+            };
+            tasks::update(&mut conn, &agent, task_id, &fields, now)?;
+            journal::delete(&mut conn, &agent)?;
+            Ok(())
+        })
+        .await
+        .ok();
+    }
 
     wt_mgr
         .remove(&config.repo_dir, &state.worktree_path)

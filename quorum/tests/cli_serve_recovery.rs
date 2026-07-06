@@ -308,3 +308,229 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
 
     handle2.sigkill();
 }
+
+/// C7 regression: a task stuck in `in-review` with no journal row — the orphan
+/// rescue scan must detect it and register a PendingReview for reviewer provisioning.
+#[test]
+fn orphan_in_review_task_rescued_on_startup() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    // Set up the orphan state directly: create task, claim it, signal done to reach in-review.
+    // No daemon means no journal row — exactly the orphan scenario.
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let now = 1000;
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "test",
+            "Orphan task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(id, 1);
+        quorum_core::tasks::claim(&mut conn, "W1", Some(id), &[], 3600, now).unwrap();
+        quorum_core::tasks::apply_event(
+            &mut conn,
+            "W1",
+            id,
+            &quorum_core::lifecycle::Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            now + 1,
+        )
+        .unwrap();
+        // Verify task is in-review
+        let task = quorum_core::tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        // No journal row exists — this is the orphan state
+    }
+
+    // Start daemon — it should detect the orphan and rescue it.
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(
+        handle.wait_for("rescuing orphaned in-review task #1", 15),
+        "orphan rescue not triggered. Lines: {:?}",
+        handle.lines
+    );
+
+    // The orphan should be registered as a PendingReview, leading to reviewer provisioning.
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not provisioned for rescued orphan. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.sigkill();
+}
+
+/// Double-restart idempotent: orphan rescue on second restart should not
+/// create duplicates or crash if the task was already rescued.
+#[test]
+fn orphan_rescue_double_restart_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let now = 1000;
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "test",
+            "Orphan task 2",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        quorum_core::tasks::claim(&mut conn, "W1", Some(id), &[], 3600, now).unwrap();
+        quorum_core::tasks::apply_event(
+            &mut conn,
+            "W1",
+            id,
+            &quorum_core::lifecycle::Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            now + 1,
+        )
+        .unwrap();
+    }
+
+    // First daemon start — rescues orphan.
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+    assert!(
+        handle.wait_for("rescuing orphaned in-review task #1", 15),
+        "first-start orphan rescue not triggered. Lines: {:?}",
+        handle.lines
+    );
+    handle.sigkill();
+
+    // Second daemon start — the orphan-rescue journal entry has no worktree on disk,
+    // so recovery cleans it up via AgentFailed (in-review stays in-review), then the
+    // orphan scan re-rescues. This is idempotent: the task stays in-review throughout.
+    let mut handle2 = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+    assert!(
+        handle2.wait_for("recovery: complete", 15),
+        "second start did not complete recovery. Lines: {:?}",
+        handle2.lines
+    );
+
+    // Verify task is still in-review (not corrupted by double recovery).
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(
+        task.status, "in-review",
+        "task must remain in-review across double restart. Lines: {:?}",
+        handle2.lines
+    );
+    drop(conn);
+
+    handle2.sigkill();
+}
+
+/// Awaiting-review journal row must survive shutdown teardown — the task
+/// stays in-review (not silently reset to open) across a graceful stop.
+#[test]
+fn in_review_journal_row_survives_shutdown() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for shutdown survival");
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("PR #1 ready for review", 15),
+        "PR not acknowledged. Lines: {:?}",
+        handle.lines
+    );
+
+    // Kill daemon — simulate unclean shutdown.
+    handle.sigkill();
+
+    // Verify task is still in-review (not silently reset to open).
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(
+        task.status, "in-review",
+        "task should remain in-review after shutdown, not silently reset to open"
+    );
+}

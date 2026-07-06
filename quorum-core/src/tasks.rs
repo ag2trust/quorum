@@ -282,6 +282,15 @@ fn extract_pr_from_refs(refs: &Option<String>) -> Option<String> {
     })
 }
 
+pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
+    let s = refs.as_deref()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("pr").and_then(|p| {
+        p.as_i64()
+            .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
 // ── create ────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1908,5 +1917,64 @@ mod tests {
         assert_eq!(t.body.as_deref(), Some("new body"));
         assert_eq!(t.refs.as_deref(), Some(r#"{"pr":42}"#));
         assert_eq!(t.status, "working");
+    }
+
+    #[test]
+    fn agent_failed_from_working_transitions_to_open() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W", Some(id), &[], TTL, 1000).unwrap();
+        let r = apply_event(
+            &mut c,
+            "W",
+            id,
+            &Event::AgentFailed {
+                reason: "worktree missing on recovery".into(),
+            },
+            1001,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "open");
+        assert!(r.task.assignee.is_none());
+    }
+
+    #[test]
+    fn agent_failed_from_in_review_stays_in_review() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        let r = apply_event(
+            &mut c,
+            "W",
+            id,
+            &Event::AgentFailed {
+                reason: "worktree missing on recovery".into(),
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert!(
+            r.effects.iter().any(|e| matches!(e, Effect::SpawnReviewer)),
+            "in-review AgentFailed must emit SpawnReviewer"
+        );
+    }
+
+    #[test]
+    fn extract_pr_number_from_refs() {
+        assert_eq!(extract_pr_number(&Some(r#"{"pr":42}"#.into())), Some(42),);
+        assert_eq!(extract_pr_number(&Some(r#"{"pr":"99"}"#.into())), Some(99),);
+        assert_eq!(extract_pr_number(&None), None);
+        assert_eq!(extract_pr_number(&Some(r#"{"branch":"foo"}"#.into())), None,);
     }
 }
