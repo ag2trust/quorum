@@ -16,6 +16,7 @@ pub mod error;
 pub mod events;
 pub mod feed;
 pub mod journal;
+pub mod lifecycle;
 pub mod mailbox;
 pub mod pinned;
 pub mod stats;

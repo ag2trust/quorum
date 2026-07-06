@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 20;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -308,6 +308,29 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v19 = single-daemon-per-DB guard. Net-new `daemon_lock` table — the
         // `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL handles fresh DBs and
         // upgrades alike; no ALTER needed.
+
+        // v20 = lifecycle columns on tasks: author, reviewer, rework_round,
+        // review_only. Additive — pre-existing rows default to NULL/0.
+        if current < 20 {
+            if !column_exists(conn, "tasks", "author")? {
+                conn.execute("ALTER TABLE tasks ADD COLUMN author TEXT", [])?;
+            }
+            if !column_exists(conn, "tasks", "reviewer")? {
+                conn.execute("ALTER TABLE tasks ADD COLUMN reviewer TEXT", [])?;
+            }
+            if !column_exists(conn, "tasks", "rework_round")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN rework_round INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "tasks", "review_only")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN review_only INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
