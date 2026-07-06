@@ -47,7 +47,7 @@ pub fn try_acquire(
         let heartbeat_age = now - heartbeat_at;
         let alive = is_pid_alive(holder_pid);
         // Same pid re-acquiring is always allowed (daemon restart in-place).
-        if holder_pid != pid && alive && heartbeat_age < stale_secs {
+        if holder_pid != pid && alive && heartbeat_age <= stale_secs {
             tx.commit()?;
             return Ok(AcquireResult::Held {
                 holder_pid,
@@ -65,13 +65,14 @@ pub fn try_acquire(
     Ok(AcquireResult::Acquired)
 }
 
-/// Refresh the heartbeat timestamp. Called on every daemon tick.
-pub fn refresh(conn: &Connection, pid: i64, now: i64) -> Result<()> {
-    conn.execute(
+/// Refresh the heartbeat timestamp. Returns the number of rows updated —
+/// 0 means the lock was stolen by another daemon (pid no longer matches).
+pub fn refresh(conn: &Connection, pid: i64, now: i64) -> Result<usize> {
+    let n = conn.execute(
         "UPDATE daemon_lock SET heartbeat_at = ?1 WHERE id = 1 AND pid = ?2",
         params![now, pid],
     )?;
-    Ok(())
+    Ok(n)
 }
 
 /// Release the lock on clean shutdown.
@@ -142,6 +143,21 @@ mod tests {
     }
 
     #[test]
+    fn exact_stale_boundary_is_still_live() {
+        let (_d, mut c) = open_tmp();
+        try_acquire(&mut c, 100, 1000, STALE, |_| true).unwrap();
+        // heartbeat_age == STALE exactly — must still be considered live.
+        let r = try_acquire(&mut c, 200, 1000 + STALE, STALE, |_| true).unwrap();
+        assert_eq!(
+            r,
+            AcquireResult::Held {
+                holder_pid: 100,
+                heartbeat_age: STALE,
+            }
+        );
+    }
+
+    #[test]
     fn dead_pid_allows_takeover() {
         let (_d, mut c) = open_tmp();
         try_acquire(&mut c, 100, 1000, STALE, |_| true).unwrap();
@@ -175,7 +191,8 @@ mod tests {
     fn refresh_updates_heartbeat() {
         let (_d, mut c) = open_tmp();
         try_acquire(&mut c, 100, 1000, STALE, |_| true).unwrap();
-        refresh(&c, 100, 5000).unwrap();
+        let n = refresh(&c, 100, 5000).unwrap();
+        assert_eq!(n, 1);
         let hb: i64 = c
             .query_row(
                 "SELECT heartbeat_at FROM daemon_lock WHERE id = 1",
@@ -187,10 +204,11 @@ mod tests {
     }
 
     #[test]
-    fn refresh_wrong_pid_is_noop() {
+    fn refresh_wrong_pid_returns_zero() {
         let (_d, mut c) = open_tmp();
         try_acquire(&mut c, 100, 1000, STALE, |_| true).unwrap();
-        refresh(&c, 999, 5000).unwrap();
+        let n = refresh(&c, 999, 5000).unwrap();
+        assert_eq!(n, 0);
         let hb: i64 = c
             .query_row(
                 "SELECT heartbeat_at FROM daemon_lock WHERE id = 1",
