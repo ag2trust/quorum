@@ -966,4 +966,528 @@ mod tests {
             Event::Cancelled { by: "boss".into() },
         ]
     }
+
+    // ===================================================================
+    // Walk tests — multi-step scenario traces
+    // ===================================================================
+
+    // MergeFailed → re-review → approve → done
+    #[test]
+    fn walk_merge_failed_re_review_done() {
+        let mut t = view(Status::Open);
+
+        // open → working
+        let (next, _) = transition(&t, &Event::Claimed { agent: "W1".into() }).unwrap();
+        t.status = next;
+        t.author = Some("W1".into());
+
+        // working → in-review
+        let (next, _) = transition(&t, &Event::SignaledDone { pr: "99".into() }).unwrap();
+        t.status = next;
+        t.pr = Some("99".into());
+
+        // reviewer attaches
+        let (next, _) = transition(&t, &Event::ReviewerAttached { agent: "R1".into() }).unwrap();
+        t.status = next;
+        t.reviewer = Some("R1".into());
+
+        // approve → merging
+        let (next, effects) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        assert!(effects.contains(&Effect::MergePr { pr: "99".into() }));
+        t.status = next;
+
+        // merge fails → back to in-review
+        let (next, effects) = transition(
+            &t,
+            &Event::MergeFailed {
+                reason: "conflict".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(effects.contains(&Effect::ResumeReviewer));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+        t.status = next;
+
+        // re-approve → merging again
+        let (next, _) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        t.status = next;
+
+        // merge succeeds → done
+        let (next, _) = transition(&t, &Event::MergeSucceeded).unwrap();
+        assert_eq!(next, Status::Done);
+        assert!(next.is_terminal());
+    }
+
+    // Rework → Open (lease expired) → re-claim preserves PR/branch
+    #[test]
+    fn walk_rework_open_reclaim_preserves_pr() {
+        let mut t = view(Status::Open);
+
+        // open → working → in-review
+        let (next, _) = transition(&t, &Event::Claimed { agent: "W1".into() }).unwrap();
+        t.status = next;
+        t.author = Some("W1".into());
+
+        let (next, _) = transition(&t, &Event::SignaledDone { pr: "55".into() }).unwrap();
+        t.status = next;
+        t.pr = Some("55".into());
+
+        // reviewer + changes → rework
+        let (next, _) = transition(&t, &Event::ReviewerAttached { agent: "R1".into() }).unwrap();
+        t.status = next;
+        t.reviewer = Some("R1".into());
+
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.status = next;
+        t.rework_round += 1;
+
+        // rework agent's lease expires → back to Open
+        let (next, effects) = transition(&t, &Event::LeaseExpired).unwrap();
+        assert_eq!(next, Status::Open);
+        assert!(effects.contains(&Effect::ReleaseLease));
+        t.status = next;
+
+        // PR and rework_round survive the Open transition (TaskView state persists)
+        assert_eq!(t.pr.as_deref(), Some("55"));
+        assert_eq!(t.rework_round, 1);
+
+        // re-claim from Open
+        let (next, effects) = transition(&t, &Event::Claimed { agent: "W2".into() }).unwrap();
+        assert_eq!(next, Status::Working);
+        assert_eq!(effects, vec![Effect::SetAuthor { agent: "W2".into() }]);
+        t.status = next;
+        t.author = Some("W2".into());
+
+        // the PR is still there
+        assert_eq!(t.pr.as_deref(), Some("55"));
+        assert_eq!(t.rework_round, 1);
+    }
+
+    // close_after_merge from InReview (AgentFailed during merge → InReview,
+    // then approve again → merge succeeds)
+    #[test]
+    fn walk_close_after_merge_from_in_review() {
+        let mut t = view(Status::Open);
+        t.status = Status::InReview;
+        t.author = Some("W1".into());
+        t.reviewer = Some("R1".into());
+        t.pr = Some("77".into());
+
+        // approve → merging
+        let (next, _) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        t.status = next;
+
+        // agent fails during merge → back to in-review
+        let (next, effects) = transition(
+            &t,
+            &Event::AgentFailed {
+                reason: "timeout".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(effects.contains(&Effect::ResumeReviewer));
+        t.status = next;
+
+        // re-approve → merging
+        let (next, _) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        t.status = next;
+
+        // merge succeeds
+        let (next, _) = transition(&t, &Event::MergeSucceeded).unwrap();
+        assert_eq!(next, Status::Done);
+    }
+
+    // close_after_merge from Merging (direct path)
+    #[test]
+    fn walk_close_after_merge_from_merging() {
+        let mut t = view(Status::Merging);
+        t.pr = Some("88".into());
+
+        let (next, effects) = transition(&t, &Event::MergeSucceeded).unwrap();
+        assert_eq!(next, Status::Done);
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(next.is_terminal());
+    }
+
+    // Reviewer replacement after expiry in InReview (regression coverage for H1)
+    #[test]
+    fn walk_reviewer_replacement_after_expiry() {
+        let mut t = view(Status::Open);
+        t.status = Status::InReview;
+        t.author = Some("W1".into());
+        t.pr = Some("42".into());
+
+        // first reviewer attaches
+        let (next, effects) =
+            transition(&t, &Event::ReviewerAttached { agent: "R1".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::SetReviewer { agent: "R1".into() }]);
+        t.status = next;
+        t.reviewer = Some("R1".into());
+
+        // reviewer's lease expires → stays InReview, spawns new reviewer
+        let (next, effects) = transition(&t, &Event::LeaseExpired).unwrap();
+        assert_eq!(next, Status::InReview, "InReview must be sticky on expiry");
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(effects.contains(&Effect::SpawnReviewer));
+        t.status = next;
+
+        // new reviewer attaches (replacing the old one)
+        let (next, effects) =
+            transition(&t, &Event::ReviewerAttached { agent: "R2".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::SetReviewer { agent: "R2".into() }]);
+        t.reviewer = Some("R2".into());
+
+        // new reviewer approves
+        let (next, _) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+    }
+
+    // Reviewer AgentFailed triggers replacement (second H1 regression path)
+    #[test]
+    fn walk_reviewer_replacement_after_agent_failed() {
+        let mut t = view(Status::InReview);
+        t.author = Some("W1".into());
+        t.reviewer = Some("R1".into());
+        t.pr = Some("42".into());
+
+        // reviewer agent fails → stays InReview, spawns new reviewer
+        let (next, effects) = transition(
+            &t,
+            &Event::AgentFailed {
+                reason: "crash".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next,
+            Status::InReview,
+            "InReview must be sticky on agent failure"
+        );
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(effects.contains(&Effect::SpawnReviewer));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+        t.status = next;
+
+        // replacement reviewer attaches
+        let (next, effects) =
+            transition(&t, &Event::ReviewerAttached { agent: "R2".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::SetReviewer { agent: "R2".into() }]);
+        t.reviewer = Some("R2".into());
+
+        // finishes the review
+        let (next, _) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+    }
+
+    // Multiple rework rounds, then cap hit
+    #[test]
+    fn walk_rework_loop_hits_cap() {
+        let mut t = view(Status::Open);
+        t.status = Status::InReview;
+        t.author = Some("W1".into());
+        t.reviewer = Some("R1".into());
+        t.pr = Some("10".into());
+
+        for round in 0..REWORK_CAP {
+            // VerdictChanges → Rework
+            let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+            assert_eq!(next, Status::Rework, "round {round} should go to Rework");
+            assert!(effects.contains(&Effect::IncrementReworkRound));
+            t.status = next;
+            t.rework_round += 1;
+
+            // ReworkPushed → InReview
+            let (next, _) = transition(&t, &Event::ReworkPushed).unwrap();
+            assert_eq!(next, Status::InReview);
+            t.status = next;
+        }
+
+        assert_eq!(t.rework_round, REWORK_CAP);
+
+        // one more VerdictChanges at cap → Failed
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Failed);
+        assert!(next.is_terminal());
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+    }
+}
+
+// ===========================================================================
+// Property / fuzz tests (proptest)
+// ===========================================================================
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_event() -> impl Strategy<Value = Event> {
+        prop_oneof![
+            Just(Event::Claimed { agent: "W1".into() }),
+            Just(Event::SignaledDone { pr: "42".into() }),
+            Just(Event::ReviewerAttached { agent: "R1".into() }),
+            Just(Event::VerdictApprove),
+            Just(Event::VerdictChanges),
+            Just(Event::ReworkPushed),
+            Just(Event::MergeSucceeded),
+            Just(Event::MergeFailed {
+                reason: "conflict".into()
+            }),
+            Just(Event::LeaseExpired),
+            Just(Event::AgentFailed {
+                reason: "crash".into()
+            }),
+            Just(Event::Cancelled { by: "boss".into() }),
+        ]
+    }
+
+    fn arb_event_seq(max_len: usize) -> impl Strategy<Value = Vec<Event>> {
+        prop::collection::vec(arb_event(), 1..=max_len)
+    }
+
+    /// Apply a sequence of events to a fresh Open task, tracking state as the
+    /// daemon would. Returns the final TaskView and the history of
+    /// (pre_status, event, post_status) for accepted transitions.
+    fn simulate(events: &[Event]) -> (TaskView, Vec<(Status, Event, Status)>) {
+        let mut t = TaskView {
+            status: Status::Open,
+            author: None,
+            reviewer: None,
+            rework_round: 0,
+            pr: None,
+            review_only: false,
+        };
+        let mut history = Vec::new();
+
+        for event in events {
+            let pre = t.status;
+            if let Ok((next, effects)) = transition(&t, event) {
+                history.push((pre, event.clone(), next));
+
+                for eff in &effects {
+                    match eff {
+                        Effect::SetAuthor { agent } => t.author = Some(agent.clone()),
+                        Effect::SetReviewer { agent } => t.reviewer = Some(agent.clone()),
+                        Effect::IncrementReworkRound => t.rework_round += 1,
+                        Effect::ReleaseLease => {}
+                        _ => {}
+                    }
+                }
+                // Track PR from SignaledDone
+                if let Event::SignaledDone { pr } = event {
+                    t.pr = Some(pr.clone());
+                }
+                t.status = next;
+            }
+        }
+
+        (t, history)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// Once a task reaches a terminal state, every subsequent event is rejected.
+        #[test]
+        fn terminals_absorb(events in arb_event_seq(30)) {
+            let (final_view, history) = simulate(&events);
+
+            // Find the first transition into a terminal state
+            let terminal_idx = history.iter().position(|(_, _, next)| next.is_terminal());
+
+            if let Some(idx) = terminal_idx {
+                let terminal_status = history[idx].2;
+                // Every transition after the terminal one must not exist in history
+                // (i.e., the simulate loop skipped them because transition() returned Err)
+                prop_assert!(
+                    history[idx + 1..].is_empty(),
+                    "terminal {} absorbed a transition: {:?}",
+                    terminal_status,
+                    &history[idx + 1..],
+                );
+                // Also verify the final status is that terminal
+                prop_assert_eq!(final_view.status, terminal_status);
+            }
+        }
+
+        /// rework_round is monotonically non-decreasing across the lifecycle.
+        #[test]
+        fn rework_round_monotonic(events in arb_event_seq(40)) {
+            let mut t = TaskView {
+                status: Status::Open,
+                author: None,
+                reviewer: None,
+                rework_round: 0,
+                pr: None,
+                review_only: false,
+            };
+            let mut prev_round = 0u32;
+
+            for event in &events {
+                if let Ok((next, effects)) = transition(&t, event) {
+                    for eff in &effects {
+                        match eff {
+                            Effect::SetAuthor { agent } => t.author = Some(agent.clone()),
+                            Effect::SetReviewer { agent } => t.reviewer = Some(agent.clone()),
+                            Effect::IncrementReworkRound => t.rework_round += 1,
+                            _ => {}
+                        }
+                    }
+                    if let Event::SignaledDone { pr } = event {
+                        t.pr = Some(pr.clone());
+                    }
+                    t.status = next;
+
+                    prop_assert!(
+                        t.rework_round >= prev_round,
+                        "rework_round went from {} to {}",
+                        prev_round,
+                        t.rework_round
+                    );
+                    prev_round = t.rework_round;
+                }
+            }
+        }
+
+        /// A state bearing a PR (pr.is_some()) can only transition to Open from
+        /// Rework (AgentFailed/LeaseExpired). InReview and Merging must never
+        /// drop to Open.
+        #[test]
+        fn pr_bearing_to_open_only_from_rework(events in arb_event_seq(40)) {
+            let (_, history) = simulate(&events);
+
+            let mut pr_set = false;
+            for (pre, event, next) in &history {
+                if let Event::SignaledDone { .. } = event {
+                    pr_set = true;
+                }
+                if pr_set && *next == Status::Open {
+                    prop_assert!(
+                        *pre == Status::Rework || *pre == Status::Working,
+                        "PR-bearing task went Open from {:?} (event {:?}), expected only Rework or Working",
+                        pre, event
+                    );
+                }
+            }
+        }
+
+        /// Cancelled is reachable from every non-terminal state.
+        #[test]
+        fn cancelled_reachable_from_all_non_terminals(status_idx in 0..5usize) {
+            let statuses = [
+                Status::Open,
+                Status::Working,
+                Status::InReview,
+                Status::Rework,
+                Status::Merging,
+            ];
+            let status = statuses[status_idx];
+            let t = TaskView {
+                status,
+                author: Some("W1".into()),
+                reviewer: Some("R1".into()),
+                rework_round: 0,
+                pr: Some("1".into()),
+                review_only: false,
+            };
+            let result = transition(&t, &Event::Cancelled { by: "x".into() });
+            prop_assert!(result.is_ok(), "Cancelled rejected from {:?}", status);
+            let (next, _) = result.unwrap();
+            prop_assert_eq!(next, Status::Cancelled);
+        }
+
+        /// IncrementReworkRound effect only appears on VerdictChanges → Rework.
+        #[test]
+        fn increment_rework_only_on_verdict_changes(events in arb_event_seq(40)) {
+            let mut t = TaskView {
+                status: Status::Open,
+                author: None,
+                reviewer: None,
+                rework_round: 0,
+                pr: None,
+                review_only: false,
+            };
+
+            for event in &events {
+                if let Ok((next, effects)) = transition(&t, event) {
+                    if effects.contains(&Effect::IncrementReworkRound) {
+                        prop_assert!(
+                            matches!(event, Event::VerdictChanges),
+                            "IncrementReworkRound from event {:?}", event
+                        );
+                        prop_assert_eq!(
+                            next, Status::Rework,
+                            "IncrementReworkRound but next state is {:?}", next
+                        );
+                    }
+                    for eff in &effects {
+                        match eff {
+                            Effect::SetAuthor { agent } => t.author = Some(agent.clone()),
+                            Effect::SetReviewer { agent } => t.reviewer = Some(agent.clone()),
+                            Effect::IncrementReworkRound => t.rework_round += 1,
+                            _ => {}
+                        }
+                    }
+                    if let Event::SignaledDone { pr } = event {
+                        t.pr = Some(pr.clone());
+                    }
+                    t.status = next;
+                }
+            }
+        }
+
+        /// Valid transitions never produce an empty effects list — every accepted
+        /// event has at least one side-effect.
+        #[test]
+        fn no_empty_effects_on_accepted_transition(events in arb_event_seq(30)) {
+            let mut t = TaskView {
+                status: Status::Open,
+                author: None,
+                reviewer: None,
+                rework_round: 0,
+                pr: None,
+                review_only: false,
+            };
+
+            for event in &events {
+                if let Ok((next, effects)) = transition(&t, event) {
+                    prop_assert!(
+                        !effects.is_empty(),
+                        "empty effects for {:?} → {:?} on event {:?}",
+                        t.status, next, event
+                    );
+                    for eff in &effects {
+                        match eff {
+                            Effect::SetAuthor { agent } => t.author = Some(agent.clone()),
+                            Effect::SetReviewer { agent } => t.reviewer = Some(agent.clone()),
+                            Effect::IncrementReworkRound => t.rework_round += 1,
+                            _ => {}
+                        }
+                    }
+                    if let Event::SignaledDone { pr } = event {
+                        t.pr = Some(pr.clone());
+                    }
+                    t.status = next;
+                }
+            }
+        }
+    }
 }
