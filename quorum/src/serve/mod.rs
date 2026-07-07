@@ -1069,6 +1069,25 @@ async fn tick(
                         })?
                     };
 
+                    if mergeability == merge::MergeabilityState::AlreadyMerged {
+                        log(&format!(
+                            "PR #{pr_num} already merged — firing MergeSucceeded"
+                        ));
+                        fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
+                            .await;
+                        if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
+                        {
+                            let w = workers.remove(wi);
+                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                        }
+                        let r = reviewers.remove(ri);
+                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                        break;
+                    }
+
                     if mergeability == merge::MergeabilityState::Conflicting {
                         log(&format!("PR #{pr_num} is CONFLICTING — firing MergeFailed"));
                         // merging → in-review
@@ -2400,7 +2419,35 @@ async fn tick(
             })
             .collect();
         let mut parked_workers: Vec<usize> = Vec::new();
+        let mut pr_closed_workers: Vec<usize> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
+            let pr_state = {
+                let exec = config.merge_executor.clone();
+                let pr_num = *pr;
+                let repo = config.repo_dir.clone();
+                tokio::task::spawn_blocking(move || exec.check_mergeability(pr_num, &repo))
+                    .await
+                    .unwrap_or(merge::MergeabilityState::Mergeable)
+            };
+            match pr_state {
+                merge::MergeabilityState::AlreadyMerged => {
+                    log(&format!(
+                        "PR #{pr} already merged — firing PrFoundMerged for task #{task_id}"
+                    ));
+                    fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                    pr_closed_workers.push(*wi);
+                    continue;
+                }
+                merge::MergeabilityState::Closed => {
+                    log(&format!(
+                        "PR #{pr} closed without merge — firing PrFoundClosed for task #{task_id}"
+                    ));
+                    fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
+                    pr_closed_workers.push(*wi);
+                    continue;
+                }
+                _ => {}
+            }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "reviewer provision exhausted for task #{task_id} PR #{pr} \
@@ -2421,6 +2468,10 @@ async fn tick(
                 counterpart,
             )
             .await?;
+        }
+        for &wi in pr_closed_workers.iter().rev() {
+            let w = workers.remove(wi);
+            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
         }
         for &wi in parked_workers.iter().rev() {
             let w = workers.remove(wi);
@@ -2455,7 +2506,37 @@ async fn tick(
             })
             .collect();
         let mut parked_pending: Vec<usize> = Vec::new();
+        let mut pr_closed_pending: Vec<usize> = Vec::new();
         for (pr, task_id, pi) in &needs_reviewer_from_pending {
+            let pr_state = {
+                let exec = config.merge_executor.clone();
+                let pr_num = *pr;
+                let repo = config.repo_dir.clone();
+                tokio::task::spawn_blocking(move || exec.check_mergeability(pr_num, &repo))
+                    .await
+                    .unwrap_or(merge::MergeabilityState::Mergeable)
+            };
+            match pr_state {
+                merge::MergeabilityState::AlreadyMerged => {
+                    log(&format!(
+                        "PR #{pr} already merged (pending review) — \
+                         firing PrFoundMerged for task #{task_id}"
+                    ));
+                    fire_event(&db_path, "system", *task_id, &Event::PrFoundMerged).await;
+                    pr_closed_pending.push(*pi);
+                    continue;
+                }
+                merge::MergeabilityState::Closed => {
+                    log(&format!(
+                        "PR #{pr} closed without merge (pending review) — \
+                         firing PrFoundClosed for task #{task_id}"
+                    ));
+                    fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
+                    pr_closed_pending.push(*pi);
+                    continue;
+                }
+                _ => {}
+            }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "reviewer provision exhausted for task #{task_id} PR #{pr} \
@@ -2476,6 +2557,10 @@ async fn tick(
                 counterpart,
             )
             .await?;
+        }
+        for &pi in pr_closed_pending.iter().rev() {
+            let p = pending_reviews.remove(pi);
+            cleanup_pending(config, wt_mgr, name_pool, p).await;
         }
         for &pi in parked_pending.iter().rev() {
             let p = pending_reviews.remove(pi);

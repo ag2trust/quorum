@@ -74,6 +74,8 @@ pub enum Event {
     ReworkPushed,
     MergeSucceeded,
     MergeFailed { reason: String },
+    PrFoundMerged,
+    PrFoundClosed,
     LeaseExpired,
     AgentFailed { reason: String },
     Cancelled { by: String },
@@ -169,6 +171,8 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Open, Event::ReworkPushed) => reject("no rework from open"),
         (Status::Open, Event::MergeSucceeded) => reject("no merge from open"),
         (Status::Open, Event::MergeFailed { .. }) => reject("no merge from open"),
+        (Status::Open, Event::PrFoundMerged) => reject("no PR from open"),
+        (Status::Open, Event::PrFoundClosed) => reject("no PR from open"),
         (Status::Open, Event::AgentFailed { .. }) => reject("no agent in open"),
 
         // ---- Working ----
@@ -195,6 +199,8 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Working, Event::ReworkPushed) => reject("not in rework"),
         (Status::Working, Event::MergeSucceeded) => reject("not merging"),
         (Status::Working, Event::MergeFailed { .. }) => reject("not merging"),
+        (Status::Working, Event::PrFoundMerged) => reject("not in review"),
+        (Status::Working, Event::PrFoundClosed) => reject("not in review"),
 
         // ---- InReview ----
         (Status::InReview, Event::ReviewerAttached { agent }) => {
@@ -259,6 +265,16 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::InReview, Event::ReworkPushed) => reject("not in rework"),
         (Status::InReview, Event::MergeSucceeded) => reject("not merging"),
         (Status::InReview, Event::MergeFailed { .. }) => reject("not merging"),
+        (Status::InReview, Event::PrFoundMerged) => Ok((Status::Done, vec![Effect::ReleaseLease])),
+        (Status::InReview, Event::PrFoundClosed) => Ok((
+            Status::Failed,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "PR closed externally without merging".into(),
+                },
+            ],
+        )),
 
         // ---- Rework ----
         (Status::Rework, Event::ReworkPushed) => {
@@ -284,6 +300,8 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Rework, Event::VerdictChanges) => reject("not in review"),
         (Status::Rework, Event::MergeSucceeded) => reject("not merging"),
         (Status::Rework, Event::MergeFailed { .. }) => reject("not merging"),
+        (Status::Rework, Event::PrFoundMerged) => reject("not in review"),
+        (Status::Rework, Event::PrFoundClosed) => reject("not in review"),
 
         // ---- Merging ----
         (Status::Merging, Event::MergeSucceeded) => Ok((Status::Done, vec![Effect::ReleaseLease])),
@@ -305,6 +323,8 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Merging, Event::VerdictApprove) => reject("merging in progress"),
         (Status::Merging, Event::VerdictChanges) => reject("merging in progress"),
         (Status::Merging, Event::ReworkPushed) => reject("merging in progress"),
+        (Status::Merging, Event::PrFoundMerged) => reject("merging in progress"),
+        (Status::Merging, Event::PrFoundClosed) => reject("merging in progress"),
         (Status::Merging, Event::LeaseExpired) => reject("merging in progress"),
         (Status::Merging, Event::AgentFailed { .. }) => reject("merging in progress"),
 
@@ -443,6 +463,8 @@ mod tests {
             Event::ReworkPushed,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
+            Event::PrFoundMerged,
+            Event::PrFoundClosed,
             Event::AgentFailed { reason: "x".into() },
         ];
         for e in &invalid_events {
@@ -517,6 +539,8 @@ mod tests {
             Event::ReworkPushed,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
+            Event::PrFoundMerged,
+            Event::PrFoundClosed,
         ];
         for e in &invalid_events {
             assert_invalid(&t, e);
@@ -638,6 +662,33 @@ mod tests {
     }
 
     #[test]
+    fn in_review_pr_found_merged() {
+        let t = view_with_author(Status::InReview, "W1");
+        assert_ok(
+            &t,
+            &Event::PrFoundMerged,
+            Status::Done,
+            &[Effect::ReleaseLease],
+        );
+    }
+
+    #[test]
+    fn in_review_pr_found_closed() {
+        let t = view_with_author(Status::InReview, "W1");
+        assert_ok(
+            &t,
+            &Event::PrFoundClosed,
+            Status::Failed,
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "PR closed externally without merging".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn in_review_rejects_all_others() {
         let t = view_with_author(Status::InReview, "W1");
         let invalid_events = [
@@ -718,6 +769,8 @@ mod tests {
             Event::VerdictChanges,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
+            Event::PrFoundMerged,
+            Event::PrFoundClosed,
         ];
         for e in &invalid_events {
             assert_invalid(&t, e);
@@ -778,6 +831,8 @@ mod tests {
             Event::VerdictApprove,
             Event::VerdictChanges,
             Event::ReworkPushed,
+            Event::PrFoundMerged,
+            Event::PrFoundClosed,
             Event::LeaseExpired,
             Event::AgentFailed { reason: "x".into() },
         ];
@@ -936,6 +991,8 @@ mod tests {
             Event::ReworkPushed,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
+            Event::PrFoundMerged,
+            Event::PrFoundClosed,
             Event::LeaseExpired,
             Event::AgentFailed { reason: "x".into() },
             Event::Cancelled { by: "boss".into() },
