@@ -629,6 +629,16 @@ pub fn apply_event(
     })
 }
 
+// ── set_body (daemon post-event body annotation) ─────────────────────────────
+
+pub fn set_body(conn: &mut Connection, id: i64, body: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET body=?1, updated_at=?2 WHERE id=?3",
+        params![body, now, id],
+    )?;
+    Ok(())
+}
+
 // ── update (backward compat for serve/) ───────────────────────────────────────
 
 pub fn update(
@@ -2084,6 +2094,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(t.reviewer, Some("R2".to_string()));
+    }
+
+    #[test]
+    fn cancelled_event_emits_task_cancelled_row() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1001).unwrap();
+        let r = apply_event(
+            &mut c,
+            "daemon",
+            id,
+            &Event::Cancelled {
+                by: "daemon:provision-exhausted".to_string(),
+            },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "cancelled");
+
+        let event_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='task_cancelled' AND subject=?1",
+                params![format!("task#{id}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1, "expected exactly one task_cancelled event");
+    }
+
+    #[test]
+    fn set_body_updates_task_body() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        set_body(&mut c, id, "daemon:parked:provision-exhausted", 1001).unwrap();
+        let task: String = c
+            .query_row("SELECT body FROM tasks WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(task, "daemon:parked:provision-exhausted");
     }
 
     #[test]

@@ -2427,19 +2427,26 @@ async fn tick(
             let pr_label =
                 w.pr.map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "unknown".to_string());
-            teardown_worker_with_body(
-                config,
-                wt_mgr,
-                name_pool,
-                w,
-                "cancelled",
-                Some(&format!(
+            fire_event(
+                &db_path,
+                &w.agent_name,
+                w.task_id,
+                &Event::Cancelled {
+                    by: "daemon:provision-exhausted".into(),
+                },
+            )
+            .await;
+            set_task_body(
+                &db_path,
+                w.task_id,
+                &format!(
                     "{}provision-exhausted | PR {pr_label} | \
                      reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
                     tasks::PARKED_BODY_PREFIX
-                )),
+                ),
             )
             .await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
         }
 
         // Provision reviewers for restart-recovered pending reviews (#178).
@@ -2480,18 +2487,26 @@ async fn tick(
         for &pi in parked_pending.iter().rev() {
             let p = pending_reviews.remove(pi);
             let pr = p.pr;
-            teardown_pending_review(
-                config,
-                wt_mgr,
-                name_pool,
-                p,
-                "cancelled",
-                Some(&format!(
-                    "daemon: reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} \
-                     time(s) for PR #{pr} — parking task"
-                )),
+            fire_event(
+                &db_path,
+                &p.agent_name,
+                p.task_id,
+                &Event::Cancelled {
+                    by: "daemon:provision-exhausted".into(),
+                },
             )
             .await;
+            set_task_body(
+                &db_path,
+                p.task_id,
+                &format!(
+                    "{}provision-exhausted | PR #{pr} | \
+                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
+                    tasks::PARKED_BODY_PREFIX
+                ),
+            )
+            .await;
+            cleanup_pending(config, wt_mgr, name_pool, p).await;
         }
     }
 
@@ -3540,6 +3555,24 @@ async fn fire_event(
             ));
             None
         }
+    }
+}
+
+async fn set_task_body(db_path: &std::path::Path, task_id: i64, body: &str) {
+    let p = db_path.to_path_buf();
+    let b = body.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        tasks::set_body(&mut conn, task_id, &b, now)
+    })
+    .await;
+    match result {
+        Ok(Err(e)) => log(&format!("set_task_body failed for task #{task_id}: {e}")),
+        Err(e) => log(&format!(
+            "set_task_body join error for task #{task_id}: {e}"
+        )),
+        Ok(Ok(())) => {}
     }
 }
 
