@@ -968,13 +968,14 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
     v.get("pr")?.as_i64()
 }
 
-/// Task pipeline view: tasks in active lifecycle stages + recently closed (#204).
+/// Task pipeline view: tasks in active lifecycle stages + recently done/closed (#204).
+/// Done/closed tasks are time-windowed to the last hour to avoid unbounded growth.
 /// Excludes `open` (already in QUEUE/BLOCKED), `cancelled`, and `parked`.
 fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let hour_ago = now - 3600;
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs, depends_on FROM tasks
-         WHERE status = 'done'
+         WHERE status = 'done' AND updated_at > ?1
          UNION ALL
          SELECT id, title, status, refs, depends_on FROM tasks
          WHERE status = 'closed' AND updated_at > ?1
@@ -2124,5 +2125,34 @@ mod tests {
             })
             .count() as i64;
         assert_eq!(count, 1, "only the stalled working worker counts");
+    }
+
+    #[test]
+    fn pipeline_tasks_time_windows_done() {
+        let (_d, mut c) = open_tmp();
+        let now = 10_000_i64;
+
+        // Create two tasks, mark both done at different times.
+        let t_recent =
+            crate::tasks::create(&mut c, "A", "recent", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let t_old =
+            crate::tasks::create(&mut c, "A", "old", None, 0, None, None, None, None, 100).unwrap();
+
+        // Mark both done: recent within the hour, old outside it.
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1 WHERE id=?2",
+            rusqlite::params![now - 1800, t_recent], // 30 min ago — inside window
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1 WHERE id=?2",
+            rusqlite::params![now - 7200, t_old], // 2 hours ago — outside window
+        )
+        .unwrap();
+
+        let tasks = pipeline_tasks(&c, now).unwrap();
+        assert_eq!(tasks.len(), 1, "only recently-done task should appear");
+        assert_eq!(tasks[0].id, t_recent);
     }
 }
