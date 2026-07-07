@@ -1270,6 +1270,38 @@ mod tests {
     }
 
     #[test]
+    fn apply_event_merging_agent_failed_to_in_review() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictApprove, 1003).unwrap();
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::AgentFailed {
+                reason: "force-kill during merge".into(),
+            },
+            1004,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert!(r.effects.contains(&Effect::ResumeReviewer));
+        assert!(r.effects.iter().any(|e| matches!(e, Effect::NotifyOwner { reason } if reason.contains("force-kill during merge"))));
+    }
+
+    #[test]
     fn apply_event_illegal_transition_is_err() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
