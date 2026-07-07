@@ -299,6 +299,15 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Merging, Event::Cancelled { .. }) => {
             Ok((Status::Cancelled, vec![Effect::ReleaseLease]))
         }
+        (Status::Merging, Event::AgentFailed { reason }) => Ok((
+            Status::InReview,
+            vec![
+                Effect::NotifyOwner {
+                    reason: format!("agent failed during merge: {reason}"),
+                },
+                Effect::ResumeReviewer,
+            ],
+        )),
         (Status::Merging, Event::Claimed { .. }) => reject("merging in progress"),
         (Status::Merging, Event::SignaledDone { .. }) => reject("merging in progress"),
         (Status::Merging, Event::ReviewerAttached { .. }) => reject("merging in progress"),
@@ -306,7 +315,6 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Merging, Event::VerdictChanges) => reject("merging in progress"),
         (Status::Merging, Event::ReworkPushed) => reject("merging in progress"),
         (Status::Merging, Event::LeaseExpired) => reject("merging in progress"),
-        (Status::Merging, Event::AgentFailed { .. }) => reject("merging in progress"),
 
         // ---- Done (terminal) ----
         (Status::Done, _) => reject("task is done"),
@@ -769,6 +777,24 @@ mod tests {
     }
 
     #[test]
+    fn merging_agent_failed() {
+        let t = view(Status::Merging);
+        assert_ok(
+            &t,
+            &Event::AgentFailed {
+                reason: "worker teardown".into(),
+            },
+            Status::InReview,
+            &[
+                Effect::NotifyOwner {
+                    reason: "agent failed during merge: worker teardown".into(),
+                },
+                Effect::ResumeReviewer,
+            ],
+        );
+    }
+
+    #[test]
     fn merging_rejects_all_others() {
         let t = view(Status::Merging);
         let invalid_events = [
@@ -779,7 +805,6 @@ mod tests {
             Event::VerdictChanges,
             Event::ReworkPushed,
             Event::LeaseExpired,
-            Event::AgentFailed { reason: "x".into() },
         ];
         for e in &invalid_events {
             assert_invalid(&t, e);

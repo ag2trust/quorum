@@ -539,6 +539,126 @@ pub(crate) async fn recover(
         }
     }
 
+    // Phase 5: Rescue orphaned merging tasks (M10)
+    // A task stuck in `merging` with no journal entry means the daemon died
+    // mid-merge (SIGKILL, crash, or force-kill where teardown's AgentFailed was
+    // rejected by the old lifecycle). Fire AgentFailed to move it back to
+    // `in-review`, then register a PendingReview so Phase 6 provisions a
+    // reviewer to re-evaluate the PR state.
+    {
+        let p = db_path.clone();
+        let merging_orphans =
+            tokio::task::spawn_blocking(move || -> Result<Vec<quorum_core::tasks::Task>> {
+                let conn = quorum_core::db::open(&p)?;
+                quorum_core::tasks::list(&conn, Some("merging"), None, None)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .unwrap_or_default();
+
+        for task in merging_orphans {
+            if journal_task_ids.contains(&task.id) {
+                continue;
+            }
+
+            let pr_str = quorum_core::tasks::extract_pr_number(&task.refs);
+            let tid = task.id;
+
+            // Fire AgentFailed to transition merging -> in-review
+            let p2 = db_path.clone();
+            let transitioned = tokio::task::spawn_blocking(move || -> bool {
+                let Ok(mut conn) = quorum_core::db::open(&p2) else {
+                    return false;
+                };
+                let now = crate::serve::now_unix();
+                let event = Event::AgentFailed {
+                    reason: "orphaned merging task on recovery (M10)".into(),
+                };
+                match tasks::apply_event(&mut conn, "daemon", tid, &event, now) {
+                    Ok(tr) => {
+                        log(&format!(
+                            "recovery: orphan merging task #{tid} -> {} via AgentFailed",
+                            tr.task.status,
+                        ));
+                        true
+                    }
+                    Err(e) => {
+                        log(&format!(
+                            "recovery: orphan AgentFailed failed for merging task #{tid}: {e}",
+                        ));
+                        false
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+
+            if !transitioned {
+                continue;
+            }
+
+            let Some(pr_num) = pr_str else {
+                log(&format!(
+                    "recovery: orphaned merging task #{tid} has no PR ref — \
+                     moved to in-review but cannot register PendingReview",
+                ));
+                continue;
+            };
+
+            log(&format!(
+                "recovery: rescuing orphaned merging task #{tid} (PR #{pr_num}) — \
+                 registering PendingReview",
+            ));
+
+            let agent_name = format!("orphan-merge-rescue-{tid}");
+            name_pool.reclaim(&agent_name);
+            lifetime_roster.register(&agent_name);
+
+            let worktree_path = config.worktree_base.join(&agent_name);
+            let branch = format!("orphan-merge-rescue-task-{tid}");
+
+            let p2 = db_path.clone();
+            let entry = JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(tid),
+                session_id: String::new(),
+                worktree: Some(worktree_path.to_string_lossy().into()),
+                branch: Some(branch.clone()),
+                phase: "awaiting-review".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(pr_num),
+                rework_count: task.rework_round as i32,
+            };
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&p2)?;
+                journal::upsert(&mut conn, &entry)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .ok();
+
+            pending_reviews.push(PendingReview {
+                agent_name,
+                task_id: tid,
+                pr: pr_num,
+                session_id: String::new(),
+                worktree_path,
+                branch,
+                rework_count: task.rework_round as u32,
+                cost_tokens: 0,
+                cost_usd: 0.0,
+                agent_state: None,
+                log_dir: None,
+                task_started_at: std::time::Instant::now(),
+            });
+        }
+    }
+
     log(&format!(
         "recovery: complete — {} worker(s) resumed, {} pending review(s)",
         workers.len(),
