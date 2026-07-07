@@ -78,7 +78,8 @@ pub enum Command {
     /// task-transition command — replaces the former `task-release` and `task-cancel`.
     ///
     /// Valid `--status` values and their guards:
-    ///   `done`      — assignee-only, from `claimed`. Auto-spawns a review task.
+    ///   `done`      — assignee-only, from `claimed`. Sets terminal status only;
+    ///                  review spawning happens via `quorum done`, not task-update.
     ///   `open`      — assignee-only, from `claimed` (release/give-up semantics).
     ///   `cancelled` — creator OR assignee, from non-terminal (won't-do).
     ///   Omitted     — metadata-only update (body/refs/note), assignee guard.

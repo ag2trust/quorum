@@ -670,7 +670,6 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         &wt_mgr,
         &mut name_pool,
         &mut workers,
-        &mut reviewers,
         &mut pending_reviews,
         &mut lifetime_roster,
     )

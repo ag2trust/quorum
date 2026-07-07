@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at  INTEGER NOT NULL,
     refs        TEXT,
     -- JSON array of task ids this task depends on; NULL = no deps. Claim auto-pick + explicit
-    -- --task-id both gate on every listed dep being status='closed' (reviewed + finalized).
+    -- --task-id both gate on every listed dep being status='done'.
     -- Validated at create-time, so reads never fault on bad JSON.
     depends_on  TEXT,
     -- Sticky-reopen window (issue #10): set on a `changes`-driven reopen; while sticky_until

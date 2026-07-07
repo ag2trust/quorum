@@ -422,7 +422,7 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 |---|---|
 | `SetAuthor { agent }` | Record who wrote the code |
 | `SetReviewer { agent }` | Record who is reviewing |
-| `SpawnWorker` / `SpawnReviewer` | Daemon provisions a new agent process |
+| `SpawnReviewer` | Daemon provisions a new reviewer process |
 | `ResumeWorker` / `ResumeReviewer` | Daemon feeds a new turn to the sticky agent |
 | `MergePr { pr }` | Daemon initiates merge flow |
 | `IncrementReworkRound` | Bump `rework_round += 1` |
@@ -447,7 +447,8 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `VerdictChanges` (review_only=true) → Failed · effects: PostFindingsNote, ReleaseLease
 - `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
-- `AgentFailed` / `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
+- `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
+- `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From Rework:**

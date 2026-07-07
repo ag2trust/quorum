@@ -8,8 +8,8 @@ GitHub-Issue-based "hub" that was slow, never expired, and couldn't claim atomic
 
 - **Design spec (source of truth):** `docs/2026-06-23-quorum-design.md` — read it before any
   non-trivial work. This file is the *operating brief*; the spec is the *design of record*.
-- **Status:** implemented and shipping. 11 core modules, 6 bin modules, schema v5, 142 tests
-  (incl. 20-process claim-race canary). `cargo test` passes; release binary verified end-to-end.
+- **Status:** implemented and shipping. Run `cargo test` for current module/test counts.
+  `cargo test` passes; release binary verified end-to-end.
 
 ## Purpose & principle (north star)
 

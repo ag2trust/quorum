@@ -87,7 +87,6 @@ pub enum Event {
 pub enum Effect {
     SetAuthor { agent: String },
     SetReviewer { agent: String },
-    SpawnWorker,
     SpawnReviewer,
     ResumeReviewer,
     ResumeWorker,
