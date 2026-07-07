@@ -169,7 +169,6 @@ pub fn effect_name(e: &Effect) -> String {
     match e {
         Effect::SetAuthor { .. } => "set_author".into(),
         Effect::SetReviewer { .. } => "set_reviewer".into(),
-        Effect::SpawnWorker => "spawn_worker".into(),
         Effect::SpawnReviewer => "spawn_reviewer".into(),
         Effect::ResumeReviewer => "resume_reviewer".into(),
         Effect::ResumeWorker => "resume_worker".into(),

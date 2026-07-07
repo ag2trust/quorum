@@ -387,7 +387,7 @@ fn render_pipeline(
 }
 
 fn pipeline_state(p: &PipelineTask, in_review: bool, sty: &Style) -> (String, String) {
-    if p.status == "closed" {
+    if p.status == "done" {
         let icon = if sty.color {
             sty.green("✅")
         } else {
@@ -395,7 +395,7 @@ fn pipeline_state(p: &PipelineTask, in_review: bool, sty: &Style) -> (String, St
         };
         return (icon, "merged".to_string());
     }
-    if in_review || p.status == "done" {
+    if in_review {
         let icon = if sty.color {
             "🔍".to_string()
         } else {
@@ -577,37 +577,26 @@ mod tests {
     #[test]
     fn pipeline_state_icons_plain() {
         let sty = Style::plain();
-        let closed = PipelineTask {
+        let done = PipelineTask {
             id: 1,
             title: "t".into(),
-            status: "closed".into(),
+            status: "done".into(),
             pr: Some(42),
             blocked: false,
         };
-        let (icon, label) = pipeline_state(&closed, false, &sty);
+        let (icon, label) = pipeline_state(&done, false, &sty);
         assert_eq!(icon, "[merged]");
         assert_eq!(label, "merged");
 
         let in_review = PipelineTask {
             id: 4,
             title: "t".into(),
-            status: "done".into(),
+            status: "working".into(),
             pr: Some(99),
             blocked: false,
         };
         let (icon, _) = pipeline_state(&in_review, true, &sty);
         assert_eq!(icon, "[review]");
-
-        let done_no_reviewer = PipelineTask {
-            id: 5,
-            title: "t".into(),
-            status: "done".into(),
-            pr: Some(99),
-            blocked: false,
-        };
-        let (icon, label) = pipeline_state(&done_no_reviewer, false, &sty);
-        assert_eq!(icon, "[review]");
-        assert_eq!(label, "in review");
     }
 
     #[test]

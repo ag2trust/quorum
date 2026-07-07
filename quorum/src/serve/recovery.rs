@@ -75,13 +75,11 @@ pub(crate) fn build_resume_turn(entry: &JournalEntry) -> String {
     super::agent::user_turn(&content)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
-    _reviewers: &mut [SlotState],
     pending_reviews: &mut Vec<PendingReview>,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<()> {
