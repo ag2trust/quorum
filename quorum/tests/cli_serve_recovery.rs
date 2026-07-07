@@ -534,3 +534,133 @@ fn in_review_journal_row_survives_shutdown() {
         "task should remain in-review after shutdown, not silently reset to open"
     );
 }
+
+/// M3: Simulate the exit-75 (self-update) recovery path where a pending review's
+/// journal row survives the restart and the task's claim lease has expired during
+/// the rebuild window. Recovery must re-adopt the pending review from journal and
+/// provision a reviewer — the expired claim must not cause duplicate execution.
+#[test]
+fn exit75_pending_review_recovered_with_expired_lease() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+
+    // Seed the post-exit-75 state directly in the DB:
+    // 1. Task in in-review (worker signaled done --pr)
+    // 2. Claim with expired expires_at (lease expired during slow rebuild)
+    // 3. Journal row for the worker in awaiting-review phase (left by exit-75)
+    // 4. Worktree directory exists on disk (exit-75 preserves worktrees)
+    let fake_wt = wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&fake_wt).unwrap();
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let now = 1000;
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "test",
+            "M3 exit-75 lease expiry test",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        assert_eq!(id, 1);
+
+        // Claim task with a short TTL so the lease is already expired by "now"
+        quorum_core::tasks::claim(&mut conn, "Agent0", Some(id), &[], 100, now).unwrap();
+
+        // Transition to in-review via SignaledDone
+        quorum_core::tasks::apply_event(
+            &mut conn,
+            "Agent0",
+            id,
+            &quorum_core::lifecycle::Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            now + 1,
+        )
+        .unwrap();
+
+        // Verify task is in-review
+        let task = quorum_core::tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+
+        // Insert journal row as if exit-75 left it: worker in awaiting-review
+        // with a PR and a worktree path that exists on disk.
+        let entry = quorum_core::journal::JournalEntry {
+            agent: "Agent0".into(),
+            role: "worker".into(),
+            task_id: Some(id),
+            session_id: "sess-exit75".into(),
+            worktree: Some(fake_wt.to_string_lossy().into()),
+            branch: Some("feat/test-exit75".into()),
+            phase: "awaiting-review".into(),
+            cost_tokens: 500,
+            agent_state: None,
+            cost_usd: 0.01,
+            log_dir: None,
+            pid: None,
+            pr: Some(99),
+            rework_count: 0,
+        };
+        quorum_core::journal::upsert(&mut conn, &entry).unwrap();
+    }
+
+    // Start daemon — recovery must re-adopt the journal entry as a PendingReview.
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Recovery Phase 2 routes awaiting-review-with-PR to pending review.
+    assert!(
+        handle.wait_for("resuming task #1 at REVIEW stage", 15),
+        "recovery did not resume pending review from exit-75 journal row. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait a moment for any late log output.
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    // Verify task remains in-review (expired claim didn't corrupt status).
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(
+        task.status, "in-review",
+        "task must stay in-review despite expired claim lease. Lines: {:?}",
+        handle.lines
+    );
+    drop(conn);
+
+    // No fresh worker should be spawned for task #1 — it's covered by the pending review.
+    let fresh_spawns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawning agent") && l.contains("task #1"))
+        .count();
+    assert_eq!(
+        fresh_spawns, 0,
+        "exit-75 recovery must not re-execute the task. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.sigkill();
+}
