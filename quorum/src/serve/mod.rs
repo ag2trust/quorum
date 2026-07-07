@@ -891,6 +891,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                         w.proc.kill_and_reap().await;
                         name_pool.release(&w.agent_name);
                     }
+                    // M3: pending_reviews have no process but hold agent names.
+                    // Journal rows are deliberately preserved — recovery
+                    // re-adopts them on restart (#178 Phase 2). DB writes are
+                    // impossible (schema-too-new), which is correct: the journal
+                    // is exactly what the rebuilt binary's recovery needs.
+                    for p in pending_reviews.drain(..) {
+                        name_pool.release(&p.agent_name);
+                    }
                     return Ok(EXIT_SELF_UPDATE);
                 }
                 TickErrorAction::Continue => log(&format!("tick error: {e}")),
