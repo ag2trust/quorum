@@ -30,6 +30,24 @@ fn kill_stale_process_group(pid: Option<i32>) {
     }
 }
 
+/// After killpg, poll `kill(pid, 0)` until the process is gone or timeout expires.
+/// Returns `true` if the process is confirmed dead, `false` if still alive at timeout.
+async fn await_process_exit(pid: i32, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(50);
+
+    loop {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 pub(crate) fn build_resume_turn(entry: &JournalEntry) -> String {
     let content = match (entry.role.as_str(), entry.phase.as_str()) {
         ("worker", "working") => format!(
@@ -85,13 +103,25 @@ pub(crate) async fn recover(
         ));
     }
 
-    // Phase 1: Kill stale process groups
+    // Phase 1: Kill stale process groups, then confirm death via kill(pid, 0)
+    let mut skip_pids: std::collections::HashSet<i32> = std::collections::HashSet::new();
     if !entries.is_empty() {
+        let reap_timeout = std::time::Duration::from_secs(5);
         for entry in &entries {
             kill_stale_process_group(entry.pid);
+            if let Some(pid) = entry.pid {
+                if !await_process_exit(pid, reap_timeout).await {
+                    log(&format!(
+                        "recovery: WARNING — pid {} for agent {} still alive after {}s \
+                         post-SIGKILL, skipping resume to avoid dual-write",
+                        pid,
+                        entry.agent,
+                        reap_timeout.as_secs(),
+                    ));
+                    skip_pids.insert(pid);
+                }
+            }
         }
-        // Brief pause to let processes exit
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // Phase 2: Reclaim names + process entries
@@ -137,6 +167,25 @@ pub(crate) async fn recover(
                 name_pool.release(&entry.agent);
             }
             "worker" => {
+                // C5: if the old process refused to die, fall through to release
+                if entry.pid.is_some_and(|p| skip_pids.contains(&p)) {
+                    log(&format!(
+                        "recovery: pid {} for {} unkillable — releasing task instead of resume",
+                        entry.pid.unwrap_or(0),
+                        entry.agent,
+                    ));
+                    release_and_cleanup(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        &entry.agent,
+                        entry.task_id,
+                        entry.branch.as_deref(),
+                    )
+                    .await;
+                    continue;
+                }
+
                 // Verify the worktree still exists
                 let wt_path = match &entry.worktree {
                     Some(wt) => {
@@ -602,5 +651,66 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
         let content = parsed["message"]["content"].as_str().unwrap();
         assert!(content.contains("custom-phase"));
+    }
+
+    #[tokio::test]
+    async fn await_process_exit_returns_true_when_process_dies() {
+        // Spawn a short-lived process; reap in background so kill(pid,0) sees ESRCH
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.05")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child.id() as i32;
+        // Background reaper — without this the zombie lingers and kill(pid,0)==0 forever
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let dead = await_process_exit(pid, std::time::Duration::from_secs(5)).await;
+        assert!(dead, "process should have exited within timeout");
+    }
+
+    #[tokio::test]
+    async fn await_process_exit_returns_false_on_timeout() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child.id() as i32;
+
+        let dead = await_process_exit(pid, std::time::Duration::from_millis(100)).await;
+        assert!(!dead, "process should still be alive at timeout");
+
+        // Cleanup
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn await_process_exit_killed_process_confirms_death() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child.id() as i32;
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        // Reap so kill(pid,0) returns ESRCH instead of seeing a zombie
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let dead = await_process_exit(pid, std::time::Duration::from_secs(5)).await;
+        assert!(dead, "SIGKILL'd process should be confirmed dead");
     }
 }
