@@ -699,6 +699,10 @@ async fn release_and_cleanup(
                         ));
                     }
                 }
+            } else {
+                log(&format!(
+                    "recovery: WARN agent {a} has no task_id — skipping AgentFailed lifecycle event"
+                ));
             }
             if let Err(e) = journal::delete(&mut conn, &a) {
                 log(&format!("recovery: journal::delete failed for {a}: {e}"));
