@@ -1051,6 +1051,21 @@ fn recovery_stale_mailbox_drained() {
         handle.lines
     );
 
+    // Verify the mailbox rows are actually consumed (no unconsumed rows remain).
+    {
+        let conn = quorum_core::db::open(&env.db_path).unwrap();
+        let unconsumed = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+        let agent0_unconsumed: Vec<_> = unconsumed
+            .iter()
+            .filter(|(_, r)| r.agent == "Agent0")
+            .collect();
+        assert!(
+            agent0_unconsumed.is_empty(),
+            "stale mailbox rows should be consumed in DB, found {} unconsumed",
+            agent0_unconsumed.len()
+        );
+    }
+
     handle.sigkill();
 }
 
@@ -1135,6 +1150,35 @@ fn recovery_agent_dies_after_resume_releases_task() {
     assert!(
         handle.wait_for("died mid-task", 15),
         "tick loop did not detect dead worker after resume. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait for the lifecycle event to fire (DB update happens inside fire_event,
+    // before the "tearing down" log).
+    assert!(
+        handle.wait_for("tearing down worker Agent0", 15),
+        "worker teardown not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Check what the lifecycle event did — either success or failure.
+    handle.drain_pending_lines();
+    let lifecycle_fired = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("lifecycle: task #") && l.contains("-> open"));
+    let lifecycle_failed = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("lifecycle: fire_event failed"));
+
+    // If the lifecycle event succeeded, task should be open.
+    // If it failed (e.g., sweep already reaped), the task is still open from the reap.
+    let status = env.task_status(id);
+    assert!(
+        status == "open" || status == "cancelled",
+        "task should be open or cancelled after agent dies post-resume, got: {status}. \
+         lifecycle_fired={lifecycle_fired}, lifecycle_failed={lifecycle_failed}. Lines: {:?}",
         handle.lines
     );
 
@@ -1247,6 +1291,19 @@ fn recovery_awaiting_review_without_pr_spawns_resume() {
         !review_stage_log,
         "awaiting-review without PR should NOT route to pending review. Lines: {:?}",
         handle.lines
+    );
+
+    // Task should remain in working status (resumed, not released).
+    assert_eq!(
+        env.task_status(id),
+        "working",
+        "task should stay working after awaiting-review-without-PR resume"
+    );
+
+    // Journal entry should still exist (worker was resumed, not torn down).
+    assert!(
+        env.journal_exists("Agent0"),
+        "journal entry should persist after resume (worker is running)"
     );
 
     handle.sigkill();
