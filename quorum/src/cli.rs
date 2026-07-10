@@ -470,6 +470,16 @@ pub enum Command {
         #[arg(long)]
         raw: bool,
     },
+    /// Performance report: model × effort aggregates over terminal tasks.
+    /// Read-only, no mutations.
+    Perf {
+        /// Cut dimension: `complexity` or `reviewer`.
+        #[arg(long)]
+        by: Option<String>,
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]

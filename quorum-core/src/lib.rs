@@ -18,6 +18,7 @@ pub mod feed;
 pub mod journal;
 pub mod lifecycle;
 pub mod mailbox;
+pub mod perf;
 pub mod pinned;
 pub mod stats;
 pub mod sweep;

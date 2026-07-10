@@ -59,6 +59,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
         cli::Command::Tail { .. } => "tail",
+        cli::Command::Perf { .. } => "perf",
         cli::Command::Help => "help",
     }
 }
@@ -970,6 +971,26 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
             }
 
+            Ok(0)
+        }
+        cli::Command::Perf { by, json } => {
+            let cut = match by.as_deref() {
+                None => quorum_core::perf::PerfCut::Default,
+                Some("complexity") => quorum_core::perf::PerfCut::Complexity,
+                Some("reviewer") => quorum_core::perf::PerfCut::Reviewer,
+                Some(other) => {
+                    return Err(QuorumError::Usage(format!(
+                        "unknown --by value '{other}'; valid: complexity, reviewer"
+                    )));
+                }
+            };
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let report = quorum_core::perf::perf(&conn, cut)?;
+            if json {
+                output::emit(&report);
+            } else {
+                quorum_core::perf::render_table(&report);
+            }
             Ok(0)
         }
         cli::Command::Help => {
