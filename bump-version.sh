@@ -75,7 +75,9 @@ fi
 
 cargo check --quiet 2>/dev/null
 
-git add "$CARGO_TOML"
+# cargo check just rewrote the workspace versions into Cargo.lock — commit it
+# too, or every clean-main build self-dirties and binaries stamp "-dirty".
+git add "$CARGO_TOML" Cargo.lock
 git commit -m "chore: bump version to $next"
 git push -u origin "$branch"
 

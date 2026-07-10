@@ -508,6 +508,11 @@ pub enum Command {
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
+        /// Disable --bare for the classifier agent so it inherits operator
+        /// credentials — required on subscription-auth (logged-in) machines,
+        /// same as `serve --no-bare-agent`.
+        #[arg(long)]
+        no_bare_agent: bool,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.

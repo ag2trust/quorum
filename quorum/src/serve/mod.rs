@@ -2666,6 +2666,7 @@ async fn tick(
                     &dup_context,
                     &config.repo_dir,
                     config.agent_bin.as_deref(),
+                    config.bare_agent,
                 ) {
                     Ok(mut slot) => {
                         if let Err(e) = slot.proc.feed_turn(&turn).await {

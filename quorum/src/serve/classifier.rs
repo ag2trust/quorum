@@ -16,26 +16,34 @@ pub struct ClassifierSlot {
     pub response_text: String,
 }
 
+/// Build the spec for a classifier agent. `bare` must follow the daemon's
+/// `no_bare_agent` setting (same as worker/reviewer spawns): on machines
+/// using subscription auth a `--bare` agent has no credentials, so every
+/// classifier turn fails "Not logged in · Please run /login" and the daemon
+/// respawn-loops (observed live 2026-07-10, right after the session-id fix).
+pub fn classifier_spec(repo_dir: &Path, bare: bool) -> AgentSpec {
+    AgentSpec {
+        model: CLASSIFIER_MODEL.to_string(),
+        effort: CLASSIFIER_EFFORT.to_string(),
+        session_id: super::agent::new_session_id(),
+        worktree: repo_dir.to_path_buf(),
+        bare,
+        allowed_tools: String::new(),
+        env_vars: vec![],
+    }
+}
+
 /// Spawn a headless classifier agent for a batch of tasks.
 pub fn spawn_classifier(
     tasks: &[TaskForClassification],
     _dup_context: &[TaskForClassification],
     repo_dir: &Path,
     agent_bin: Option<&str>,
+    bare: bool,
 ) -> std::io::Result<ClassifierSlot> {
     let pending_task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
 
-    let session_id = super::agent::new_session_id();
-
-    let spec = AgentSpec {
-        model: CLASSIFIER_MODEL.to_string(),
-        effort: CLASSIFIER_EFFORT.to_string(),
-        session_id,
-        worktree: repo_dir.to_path_buf(),
-        bare: true,
-        allowed_tools: String::new(),
-        env_vars: vec![],
-    };
+    let spec = classifier_spec(repo_dir, bare);
 
     let proc = AgentProc::spawn(&spec, agent_bin)?;
 
@@ -134,6 +142,12 @@ fn extract_json(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifier_spec_threads_bare_flag() {
+        assert!(!classifier_spec(Path::new("."), false).bare);
+        assert!(classifier_spec(Path::new("."), true).bare);
+    }
 
     #[test]
     fn extract_json_direct() {

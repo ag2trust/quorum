@@ -247,3 +247,100 @@ fn serve_omits_bare_with_no_bare_agent_flag() {
 
     handle.stop();
 }
+
+fn task_get_json(home: &std::path::Path, task_id: u32) -> String {
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", &task_id.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// 2026-07-10 live incident: spawn_classifier hardcoded bare:true, so on
+/// subscription-auth machines every classifier turn failed "Not logged in"
+/// and the daemon respawn-looped. These two tests pin the classifier spawn
+/// to the daemon's bare_agent config end-to-end: fake-agent answers the
+/// classifier prompt with an `area:fake-bare` / `area:fake-nobare` cx tag
+/// depending on whether it was spawned with --bare, and we assert the tag
+/// that lands in the task's refs.
+#[test]
+fn classifier_spawn_is_bare_by_default() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Classify me (bare default)");
+
+    let mut handle = BareServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &[],
+    );
+
+    assert!(
+        handle.wait_for("classifier: stored 1 classification(s)", 30),
+        "classifier never stored a classification. Lines: {:?}",
+        handle.lines
+    );
+    handle.stop();
+
+    let refs = task_get_json(home.path(), 1);
+    assert!(
+        refs.contains("area:fake-bare"),
+        "classifier agent should be spawned with --bare by default; task refs: {refs}"
+    );
+}
+
+#[test]
+fn classifier_spawn_respects_no_bare_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Classify me (no-bare)");
+
+    let mut handle = BareServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--no-bare-agent"],
+    );
+
+    assert!(
+        handle.wait_for("classifier: stored 1 classification(s)", 30),
+        "classifier never stored a classification. Lines: {:?}",
+        handle.lines
+    );
+    handle.stop();
+
+    let refs = task_get_json(home.path(), 1);
+    assert!(
+        refs.contains("area:fake-nobare"),
+        "classifier agent must NOT get --bare under --no-bare-agent; task refs: {refs}"
+    );
+}
