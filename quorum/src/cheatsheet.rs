@@ -13,6 +13,8 @@ SYNC (the agent's compass — one call per tick)
 
 TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
+                                                               # --labels complexity:N (1-5): 1=mechanical one-liner, 2=single-file,
+                                                               #   3=multi-file design, 4=cross-module, 5=cross-cutting refactor
                                                                # --depends-on gates the claim: dependent stays unclaimable
                                                                # until every listed task is `closed` (#2 alignment).
                                                                # --refs: structured external-ref JSON (e.g. {"pr":N}) — load-bearing

@@ -230,6 +230,20 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+async fn close_agent_run(db_path: &std::path::Path, run_id: Option<i64>, end_reason: &str) {
+    if let Some(rid) = run_id {
+        let p = db_path.to_path_buf();
+        let reason = end_reason.to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = quorum_core::db::open(&p) {
+                let _ = quorum_core::agent_runs::close(&conn, rid, now_unix(), &reason);
+            }
+        })
+        .await
+        .ok();
+    }
+}
+
 fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
     JournalEntry {
         agent: slot.agent_name.clone(),
@@ -434,6 +448,7 @@ pub(crate) struct SlotState {
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
     error_turn_count: u32,
+    agent_run_id: Option<i64>,
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -3042,6 +3057,29 @@ async fn spawn_reviewer_for_worker(
             )
             .await;
 
+            let reviewer_run_id = {
+                let p = config.db_path.clone();
+                let name = reviewer_name.clone();
+                let m = config.model.clone();
+                let e = config.effort.clone();
+                let tid = worker.task_id;
+                tokio::task::spawn_blocking(move || -> Result<i64> {
+                    let conn = quorum_core::db::open(&p)?;
+                    quorum_core::agent_runs::insert(
+                        &conn,
+                        tid,
+                        &name,
+                        "reviewer",
+                        &m,
+                        &e,
+                        now_unix(),
+                    )
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok()
+            };
+
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
                 agent_name: reviewer_name,
@@ -3061,6 +3099,7 @@ async fn spawn_reviewer_for_worker(
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                agent_run_id: reviewer_run_id,
             });
         }
         Err(e) => {
@@ -3271,9 +3310,11 @@ async fn spawn_worker(
     .ok();
 
     let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
+    let resolved_model = label_model.unwrap_or_else(|| config.model.clone());
+    let resolved_effort = label_effort.unwrap_or_else(|| config.effort.clone());
     let spec = AgentSpec {
-        model: label_model.unwrap_or_else(|| config.model.clone()),
-        effort: label_effort.unwrap_or_else(|| config.effort.clone()),
+        model: resolved_model.clone(),
+        effort: resolved_effort.clone(),
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
         bare: config.bare_agent,
@@ -3339,6 +3380,21 @@ async fn spawn_worker(
                 .ok();
             }
 
+            let worker_run_id = {
+                let p = db_path.clone();
+                let name = agent_name.clone();
+                let m = resolved_model.clone();
+                let e = resolved_effort.clone();
+                let tid = task.id;
+                tokio::task::spawn_blocking(move || -> Result<i64> {
+                    let conn = quorum_core::db::open(&p)?;
+                    quorum_core::agent_runs::insert(&conn, tid, &name, "worker", &m, &e, now_unix())
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok()
+            };
+
             let now_instant = std::time::Instant::now();
             workers.push(SlotState {
                 agent_name,
@@ -3358,6 +3414,7 @@ async fn spawn_worker(
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                agent_run_id: worker_run_id,
             });
         }
         Err(e) => {
@@ -3501,6 +3558,7 @@ async fn cleanup_slot(
     }
 
     state.proc.kill_and_reap().await;
+    close_agent_run(&config.db_path, state.agent_run_id, "done").await;
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
@@ -3553,6 +3611,12 @@ async fn teardown_worker_with_body(
     }
 
     state.proc.kill_and_reap().await;
+    let end_reason = if task_status == "open" {
+        "failed"
+    } else {
+        task_status
+    };
+    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
     if task_status == "open" {
         fire_event(
@@ -3618,6 +3682,7 @@ async fn teardown_reviewer(
     }
 
     state.proc.kill_and_reap().await;
+    close_agent_run(&config.db_path, state.agent_run_id, "verdict").await;
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
@@ -3785,6 +3850,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            agent_run_id: None,
         }
     }
 
