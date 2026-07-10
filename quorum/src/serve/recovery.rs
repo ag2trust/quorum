@@ -299,7 +299,10 @@ pub(crate) async fn recover(
                     bare: config.bare_agent,
                     resume: true,
                     allowed_tools: ALLOWED_TOOLS.to_string(),
-                    env_vars: vec![("QUORUM_REPO".into(), config.repo.clone())],
+                    env_vars: vec![
+                        ("QUORUM_REPO".into(), config.repo.clone()),
+                        ("QUORUM_AGENT".into(), entry.agent.clone()),
+                    ],
                 };
 
                 match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
