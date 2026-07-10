@@ -8,11 +8,11 @@
 
 | Severity | Count |
 |----------|-------|
-| Critical | 5 |
+| Critical | 7 |
 | High | 8 |
-| Medium | 21 |
+| Medium | 22 |
 | Low | 3 |
-| **Total** | **37** |
+| **Total** | **40** |
 
 | Source audit | Findings contributed |
 |---|---|
@@ -23,6 +23,10 @@
 | 04-liveness | 5 (1 deduped into tick-effects) |
 | 05-storage-cli | 6 (1 merged into lifecycle) |
 | 06-ops-scripts-test-harness | 10 |
+| watchdog live incidents (Gantry-m3) | 2 (C6, C7) |
+| 03-recovery (promoted out-of-scope handoff) | 1 (M10) |
+
+**Discernment pass (2026-07-06, Gantry-m3 + owner):** 39 of 40 marked `FILE: yes`, M9 marked `FILE: no` (bikeshed-tier), C4 scenario corrected, C6/C7/M10 added. Footer item 5 (sticky_until docs) deferred.
 
 ---
 
@@ -34,7 +38,7 @@
 `severity:` critical
 `labels:` `["kind:bug","severity:critical","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -64,7 +68,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 1
 `severity:` critical
 `labels:` `["kind:bug","severity:critical","audit:lifecycle"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -98,7 +102,7 @@ Sourced from: audits/2026-07-06-01-lifecycle-claim-integrity.md — Finding 1
 `severity:` critical
 `labels:` `["kind:bug","severity:critical","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -128,7 +132,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 2
 `severity:` critical
 `labels:` `["kind:bug","severity:critical","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -136,8 +140,17 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 2
 raw `tasks::update` instead of firing `Event::AgentFailed` through `tasks::apply_event`.
 This bypasses the lifecycle state machine. If the task's actual status differs from what
 the stale journal entry assumed (e.g., task progressed to `in-review`), the raw update
-forces it to `open` regardless. A fresh worker re-executes while the prior PR still
-exists — duplicate work. No `NotifyOwner` effect is emitted, so the failure is silent.
+silently FAILS — `tasks::update`'s open-release matches only `WHERE status='working'`
+(tasks.rs:594–601) and returns `NotHolder`; the error is swallowed (`let _ =`,
+recovery.rs:409) and `journal::delete` still runs (recovery.rs:411). The task is left
+permanently in-review with no journal row, no reviewer, and no lease — an invisible
+orphan (live-confirmed on task #18, 2026-07-06; see C7). No `NotifyOwner` effect is
+emitted, so the failure is silent.
+
+*(Corrected 2026-07-06 during review of PR #251: the original audit scenario claimed
+the task is forced to `open`; that path is guarded — the real outcome is the orphan.
+The original duplicate-work scenario is blocked by the `WHERE status='working'` guard
+at all current call sites; the related force-kill gap is tracked as M10.)*
 
 **Evidence:** `quorum/src/serve/recovery.rs:143–158` (raw tasks::update),
 `quorum/src/serve/recovery.rs:388–420` (release_and_cleanup implementation).
@@ -156,7 +169,7 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 1
 `severity:` critical
 `labels:` `["kind:bug","severity:critical","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -177,6 +190,84 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 3
 
 ---
 
+### C6. Rework re-signal never resumes reviewer — ResumeReviewer has no executor
+
+`title:` bug: rework re-signal deadlocks — ResumeReviewer effect never executed
+`severity:` critical
+`labels:` `["kind:bug","severity:critical","audit:tick-effects","source:watchdog"]`
+`needs_owner_call:` no
+`FILE:` yes
+
+`body:`
+
+**Problem.** After a rework round, the worker re-signals done and the daemon fires
+`Event::ReworkPushed` (mod.rs:1881–1892) → the lifecycle returns
+`(InReview, [ResumeReviewer])` — but `fire_event`'s return value is discarded at the
+call site, and no code anywhere executes `Effect::ResumeReviewer` (repo-wide grep hits
+only lifecycle.rs definitions and tasks.rs effect_name). The paired reviewer is never
+fed a re-review turn, and because it is still paired, Phase 5's spawn scan
+(mod.rs:2287–2299) refuses to provision a replacement. Worker and reviewer both idle
+forever — a permanent deadlock with no timeout.
+
+**Evidence:** `quorum/src/serve/mod.rs:1881–1892` (fire_event result discarded),
+`quorum-core/src/lifecycle.rs:264–266` ((Rework, ReworkPushed) → ResumeReviewer),
+`quorum/src/serve/mod.rs:2287–2299` (Phase 5 pairing guard).
+
+**Live incident:** task #17 / PR #253, 2026-07-06 — deadlocked ~25 min after the rework
+push; cleared only by manually killing the idle reviewer (Tiller-d16) so Phase 5 would
+respawn (Ember-d21 then approved and the daemon merged).
+
+**Fix:** Execute the effects returned by fire_event at the ReworkPushed site: on
+`ResumeReviewer`, feed the paired reviewer a re-review turn (or tear it down and let
+Phase 5 respawn). Longer-term: dispatch ALL lifecycle effects returned by fire_event
+instead of logging them (same root cause family as C3 and H4).
+
+Sourced from: live watchdog incident 2026-07-06 (Gantry-m3), PR #253 timeline — not
+present in any audit report.
+
+---
+
+### C7. Drain/restart orphans in-review tasks — invisible forever, no self-heal
+
+`title:` bug: in-review task orphaned across daemon restart; LeaseExpired never emitted
+`severity:` critical
+`labels:` `["kind:bug","severity:critical","audit:recovery","source:watchdog"]`
+`needs_owner_call:` no
+`FILE:` yes
+
+`body:`
+
+**Problem.** Three defects chain to orphan any task that is in-review when the daemon
+shuts down uncleanly: (1) shutdown teardown calls `tasks::update(status:"open")`, which
+fails on in-review tasks (guarded `WHERE status='working'`); the `?` short-circuit skips
+`journal::delete`, but worktree/branch removal proceeds outside the closure
+(mod.rs:3542–3560); (2) on restart, the now-missing worktree routes the journal entry to
+`release_and_cleanup`, which swallows the same failed update and deletes the journal row
+(recovery.rs:406–411); (3) recovery consults only journal rows — never task status — so
+an in-review task without a journal row is invisible, and `Event::LeaseExpired` is
+emitted nowhere in the codebase, making the designed
+`(InReview, LeaseExpired) → SpawnReviewer` self-heal (lifecycle.rs:250–253) unreachable
+dead code.
+
+**Evidence:** file:lines above; repo-wide grep confirms no LeaseExpired construction
+outside lifecycle.rs and tests.
+
+**Live incident:** task #18 / PR #251, 2026-07-06 — orphaned across the 16:02 relaunch
+(in-review, reviewer NULL, claim inactive, no journal row, zero events 40+ min). Needed
+a manual review + merge + direct DB reconcile; blocked the entire audit chain at the
+#22 dependency gate.
+
+**Fix:** (a) At recovery start, scan `in-review` tasks with no journal row and no live
+reviewer → recreate a PendingReview from `refs.pr` (verifying the PR is still open, per
+H3). (b) Make failed status writes in teardown/release loud instead of `let _`/`.ok()`.
+(c) Either wire a LeaseExpired emitter into the sweep/reaper or remove the dead
+transitions so the table stays honest.
+
+Sourced from: live watchdog incident 2026-07-06 (Gantry-m3), PR #251 review record —
+extends audit 03 Findings 1/2 (scenarios corrected in C4).
+
+---
+
 ## High — correctness bug in main path
 
 ### H1. Reviewer not cleared after InReview failure → permanent stall
@@ -185,7 +276,7 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 3
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:lifecycle"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -212,7 +303,7 @@ Sourced from: audits/2026-07-06-01-lifecycle-claim-integrity.md — Finding 2
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -240,7 +331,7 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 5
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:tick-effects","audit:recovery"]`
 `needs_owner_call:` yes
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -263,6 +354,9 @@ a `PendingReview` against a closed/merged PR, leading to the same wasted cycle.
 `MergeSucceeded` directly. If closed (not merged), fire `AgentFailed`.
 Owner call needed: should `PrFoundMerged`/`PrFoundClosed` be added as lifecycle Events?
 
+**Owner decision (2026-07-06 discernment):** file approved. Implementer proposes
+in the fix PR whether `PrFoundMerged`/`PrFoundClosed` become lifecycle Events.
+
 Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 3,
 audits/2026-07-06-03-recovery-self-healing.md — Finding 2
 
@@ -274,7 +368,7 @@ audits/2026-07-06-03-recovery-self-healing.md — Finding 2
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:tick-effects","audit:liveness"]`
 `needs_owner_call:` yes
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -297,6 +391,9 @@ rework cap and fails has no notification path — discoverable only by polling.
 needed: is a feed message sufficient, or should this be a mailbox delivery / external
 notification?
 
+**Owner decision (2026-07-06 discernment):** file approved. Channel: post a
+`kind:alert` message to the feed.
+
 Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 4,
 audits/2026-07-06-04-liveness.md — Finding 2
 
@@ -308,7 +405,7 @@ audits/2026-07-06-04-liveness.md — Finding 2
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:liveness"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -337,7 +434,7 @@ Sourced from: audits/2026-07-06-04-liveness.md — Finding 1
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:storage-cli"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -362,7 +459,7 @@ Sourced from: audits/2026-07-06-05-storage-cli.md — Finding 1
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:ops"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -388,7 +485,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Finding 1
 `severity:` high
 `labels:` `["kind:bug","severity:high","audit:ops"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -420,7 +517,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Finding 2
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:lifecycle","audit:storage-cli"]`
 `needs_owner_call:` yes
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -439,6 +536,10 @@ happens through the daemon's mailbox/lifecycle path (`quorum done`), not `task-u
 path), or (b) update CLI docstring to clarify review only happens through `quorum done`.
 Owner call: which option?
 
+**Owner decision (2026-07-06 discernment):** file approved. Do option (b) —
+docstring fix — now; option (a) restriction only after the daemon's internal
+done-path (teardown_worker_with_body → tasks::update status=done) is migrated.
+
 Sourced from: audits/2026-07-06-01-lifecycle-claim-integrity.md — Finding 3,
 audits/2026-07-06-05-storage-cli.md — Finding 5
 
@@ -450,7 +551,7 @@ audits/2026-07-06-05-storage-cli.md — Finding 5
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -476,7 +577,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 5
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -503,7 +604,7 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 9
 `severity:` medium
 `labels:` `["kind:docs","severity:medium","audit:lifecycle"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -529,7 +630,7 @@ Sourced from: audits/2026-07-06-01-lifecycle-claim-integrity.md — Finding 4
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -554,7 +655,7 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 4
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:baseline","audit:storage-cli"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -585,7 +686,7 @@ audits/2026-07-06-05-storage-cli.md — Finding 2
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:ops"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -609,7 +710,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Finding 3
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:ops"]`
 `needs_owner_call:` yes
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -623,6 +724,9 @@ trips, and stale binary relaunches are invisible.
 well-known log file, or call an external notifier. Owner call: which notification
 channel?
 
+**Owner decision (2026-07-06 discernment):** file approved. Channel:
+`quorum post --kind alert`.
+
 Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Finding 4
 
 ---
@@ -633,7 +737,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Finding 4
 `severity:` medium
 `labels:` `["kind:bug","severity:medium","audit:storage-cli"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` no
 
 `body:`
 
@@ -651,6 +755,33 @@ Sourced from: audits/2026-07-06-05-storage-cli.md — Finding 6
 
 ---
 
+### M10. Force-kill fires AgentFailed on Merging tasks — rejected, stuck in merging
+
+`title:` bug: force-kill during merge leaves task stuck in merging state
+`severity:` medium
+`labels:` `["kind:bug","severity:medium","audit:lifecycle","audit:recovery","source:audit-03"]`
+`needs_owner_call:` no
+`FILE:` yes
+
+`body:`
+
+**Problem.** `(Merging, AgentFailed)` is rejected by the lifecycle ("merging in
+progress", lifecycle.rs:308), but the daemon's force-kill path fires `AgentFailed` after
+killing agents. A task force-killed mid-merge stays in `merging` with no agent, no
+lease, and no expected actor — a permanent stall requiring manual intervention.
+
+**Evidence:** `quorum-core/src/lifecycle.rs:308` (reject), audit 03 out-of-scope
+handoffs (raised, never promoted to a finding), consolidation footer item 4.
+
+**Fix:** Decide the intended cell: fire `Cancelled` (or a new `MergeInterrupted`) from
+the force-kill path, or have recovery re-arm the merge wait for `merging` tasks
+(see the #228 approval-recovery precedent).
+
+Sourced from: audits/2026-07-06-03-recovery-self-healing.md — out-of-scope handoffs;
+consolidation footer item 4 (promoted 2026-07-06 discernment pass).
+
+---
+
 ## Medium — test gaps
 
 ### T1. No crash-recovery integration tests for recovery::recover
@@ -659,7 +790,7 @@ Sourced from: audits/2026-07-06-05-storage-cli.md — Finding 6
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:recovery","audit:baseline"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -688,7 +819,7 @@ audits/2026-07-06-00-baseline.md — §3 Coverage map
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:lifecycle"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -715,7 +846,7 @@ Sourced from: audits/2026-07-06-01-lifecycle-claim-integrity.md — Finding 5
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -739,7 +870,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 6
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -763,7 +894,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 7
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -787,7 +918,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 8
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:tick-effects"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -811,7 +942,7 @@ Sourced from: audits/2026-07-06-02-tick-effects.md — Finding 9
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -834,7 +965,7 @@ Sourced from: audits/2026-07-06-03-recovery-self-healing.md — Finding 7
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:liveness"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -865,7 +996,7 @@ Sourced from: audits/2026-07-06-04-liveness.md — Findings 3, 4, 5
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:storage-cli"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -889,7 +1020,7 @@ Sourced from: audits/2026-07-06-05-storage-cli.md — Finding 3
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:storage-cli"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -914,7 +1045,7 @@ Sourced from: audits/2026-07-06-05-storage-cli.md — Finding 4
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:ops"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -940,7 +1071,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Findings 5, 6
 `severity:` medium
 `labels:` `["kind:test","severity:medium","audit:ops"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -976,7 +1107,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Findings 7, 9
 `severity:` low
 `labels:` `["kind:docs","severity:low","audit:ops"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -1000,7 +1131,7 @@ Sourced from: audits/2026-07-06-06-ops-scripts-test-harness.md — Finding 8
 `severity:` low
 `labels:` `["kind:chore","severity:low","audit:lifecycle"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
@@ -1025,7 +1156,7 @@ Sourced from: audits/2026-07-06-01-lifecycle-claim-integrity.md — Finding 6
 `severity:` low
 `labels:` `["kind:chore","severity:low","audit:recovery"]`
 `needs_owner_call:` no
-`FILE:` pending
+`FILE:` yes
 
 `body:`
 
