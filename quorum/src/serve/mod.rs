@@ -858,6 +858,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log(&format!(
                     "DRAIN: all agents finished (sha={sha}), exiting {exit}"
                 ));
+                if let Some(slot) = classifier_slot.take() {
+                    slot.proc.kill_and_reap().await;
+                }
                 return Ok(exit);
             }
 
