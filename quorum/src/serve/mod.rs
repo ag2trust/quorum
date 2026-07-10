@@ -173,6 +173,17 @@ fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
 }
 
+/// Build the daemon-authored branch name for an orphan in-review task.
+/// Returns `None` for review-only tasks or tasks with no author — those
+/// have externally-authored branches that must be resolved from GitHub.
+fn orphan_worker_branch(author: &str, task_id: i64, review_only: bool) -> Option<String> {
+    if review_only || author.is_empty() {
+        None
+    } else {
+        Some(format!("daemon/{}-t{}", author.to_lowercase(), task_id))
+    }
+}
+
 /// Map a tier label suffix to a full Claude model ID.
 /// Returns `None` (fall back to global default) for unknown tiers.
 fn tier_to_model_id(tier: &str) -> Option<String> {
@@ -2460,16 +2471,16 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        let orphan_in_review: Vec<(i64, i64, String)> = {
+        let orphan_in_review: Vec<(i64, i64, String, bool)> = {
             let p = db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<Vec<(i64, i64, String)>> {
+            tokio::task::spawn_blocking(move || -> Result<Vec<(i64, i64, String, bool)>> {
                 let conn = quorum_core::db::open(&p)?;
                 let ir_tasks = tasks::list(&conn, Some("in-review"), None, None)?;
                 let mut result = Vec::new();
                 for t in ir_tasks {
                     if let Some(pr) = tasks::extract_pr_number(&t.refs) {
                         let author = t.author.unwrap_or_default();
-                        result.push((t.id, pr, author));
+                        result.push((t.id, pr, author, t.review_only));
                     }
                 }
                 Ok(result)
@@ -2478,7 +2489,7 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author) in &orphan_in_review {
+        for (task_id, pr, author, review_only) in &orphan_in_review {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -2537,9 +2548,38 @@ async fn tick(
                 .await;
                 continue;
             }
-            let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+            let branch = if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
+                b
+            } else {
+                // Review-only tasks (or tasks with no author) have no daemon-authored
+                // branch — resolve the PR's head ref from GitHub instead of guessing
+                // a malformed daemon/-t<id> branch name.
+                let pr_num = *pr;
+                let repo_dir = config.repo_dir.clone();
+                let gh_repo = config.repo.clone();
+                let resolved = tokio::task::spawn_blocking(move || {
+                    query_pr_head_ref(pr_num, &repo_dir, Some(&gh_repo))
+                })
+                .await
+                .ok()
+                .flatten();
+                match resolved {
+                    Some(head_ref) => head_ref,
+                    None => {
+                        log(&format!(
+                            "orphan in-review task #{task_id} PR #{pr}: \
+                             review-only but could not resolve PR head ref — skipping"
+                        ));
+                        continue;
+                    }
+                }
+            };
             let counterpart = ReviewCounterpart {
-                agent_name: author,
+                agent_name: if author.is_empty() {
+                    "external"
+                } else {
+                    author
+                },
                 task_id: *task_id,
                 branch: &branch,
             };
@@ -4492,5 +4532,28 @@ mod tests {
     fn live_stats_uptime_is_nonnegative() {
         let ls = LiveStats::new();
         assert!(ls.uptime_secs() < 2);
+    }
+
+    #[test]
+    fn orphan_worker_branch_daemon_authored() {
+        assert_eq!(
+            orphan_worker_branch("Anvil", 42, false),
+            Some("daemon/anvil-t42".into())
+        );
+    }
+
+    #[test]
+    fn orphan_worker_branch_review_only_returns_none() {
+        assert_eq!(orphan_worker_branch("", 15, true), None);
+    }
+
+    #[test]
+    fn orphan_worker_branch_empty_author_returns_none() {
+        assert_eq!(orphan_worker_branch("", 15, false), None);
+    }
+
+    #[test]
+    fn orphan_worker_branch_review_only_with_author_returns_none() {
+        assert_eq!(orphan_worker_branch("Anvil", 15, true), None);
     }
 }
