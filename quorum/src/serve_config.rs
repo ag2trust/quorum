@@ -39,8 +39,10 @@ pub struct ServeFileConfig {
     pub merge_checks_poll_secs: Option<u64>,
 }
 
-/// Load serve config from `path`. Missing file → defaults; malformed / unknown keys → exit 2.
-pub fn load(path: &Path) -> Result<ServeFileConfig> {
+/// Load serve config from `path`. Malformed / unknown keys → exit 2.
+/// When `explicit` is true (user passed --config), missing file → exit 2.
+/// When false (auto-discovered default path), missing file → built-in defaults.
+pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
             let cfg: ServeFileConfig = toml::from_str(&s).map_err(|e| {
@@ -48,7 +50,16 @@ pub fn load(path: &Path) -> Result<ServeFileConfig> {
             })?;
             Ok(cfg)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ServeFileConfig::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if explicit {
+                Err(QuorumError::Usage(format!(
+                    "serve config not found: {}",
+                    path.display()
+                )))
+            } else {
+                Ok(ServeFileConfig::default())
+            }
+        }
         Err(e) => Err(QuorumError::Io(format!(
             "cannot read serve config {}: {e}",
             path.display()
@@ -305,10 +316,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn load_missing_file_returns_defaults() {
-        let cfg = load(Path::new("/nonexistent/path/serve.toml")).unwrap();
+    fn load_missing_implicit_returns_defaults() {
+        let cfg = load(Path::new("/nonexistent/path/serve.toml"), false).unwrap();
         assert!(cfg.cap.is_none());
         assert!(cfg.model.is_none());
+    }
+
+    #[test]
+    fn load_missing_explicit_fails_loud() {
+        let err = load(Path::new("/nonexistent/path/serve.toml"), true).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "error should say not found: {msg}"
+        );
     }
 
     #[test]
@@ -316,7 +338,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.toml");
         std::fs::write(&path, "bogus_key = 42\n").unwrap();
-        let err = load(&path).unwrap_err();
+        let err = load(&path, false).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         let msg = err.to_string();
         assert!(
@@ -344,7 +366,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
 "#,
         )
         .unwrap();
-        let cfg = load(&path).unwrap();
+        let cfg = load(&path, true).unwrap();
         assert_eq!(cfg.cap, Some(8));
         assert_eq!(cfg.model.as_deref(), Some("opus-48"));
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));

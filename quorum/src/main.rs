@@ -864,12 +864,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             // repo_dir detection.
             let (file_cfg, config_path_used) = if let Some(ref p) = config_flag {
                 let path = std::path::Path::new(p);
-                let cfg = load(path)?;
+                let cfg = load(path, true)?;
                 (cfg, Some(p.clone()))
             } else if let Some(ref r) = repo {
                 let path = default_config_path(r)?;
                 if path.exists() {
-                    let cfg = load(&path)?;
+                    let cfg = load(&path, false)?;
                     (cfg, Some(path.to_string_lossy().into_owned()))
                 } else {
                     (ServeFileConfig::default(), None)
@@ -891,7 +891,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 if config_path_used.is_none() && config_flag.is_none() {
                     let path = default_config_path(&r_repo.value)?;
                     if path.exists() {
-                        let cfg = load(&path)?;
+                        let cfg = load(&path, false)?;
                         let p = path.to_string_lossy().into_owned();
                         (cfg, Some(p))
                     } else {

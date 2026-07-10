@@ -241,6 +241,46 @@ fn serve_config_rejects_unknown_keys() {
 }
 
 #[test]
+fn serve_config_explicit_missing_file_fails() {
+    let home = tempfile::tempdir().unwrap();
+
+    let init_status = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    assert!(init_status.success(), "init failed");
+
+    let output = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "serve",
+            "--config",
+            "/nonexistent/path/typo.toml",
+            "--repo",
+            "test/repo",
+            "--repo-dir",
+            "/tmp/x",
+            "--worktree-base",
+            "/tmp/y",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "serve should fail when --config points to a missing file"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "error should say 'not found': {stderr}"
+    );
+}
+
+#[test]
 fn serve_config_default_path_loaded() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
