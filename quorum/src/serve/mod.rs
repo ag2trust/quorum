@@ -2337,6 +2337,29 @@ async fn tick(
                 _ => {}
             }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
+                log(&format!(
+                    "orphan in-review task #{task_id} PR #{pr}: \
+                     provision exhausted — parking"
+                ));
+                fire_event(
+                    &db_path,
+                    "daemon",
+                    *task_id,
+                    &Event::Cancelled {
+                        by: "daemon:parked:provision-exhausted".into(),
+                    },
+                )
+                .await;
+                set_task_body(
+                    &db_path,
+                    *task_id,
+                    &format!(
+                        "{}provision-exhausted | PR #{pr} | \
+                         reviewer provision failed (orphan in-review)",
+                        tasks::PARKED_BODY_PREFIX
+                    ),
+                )
+                .await;
                 continue;
             }
             let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
