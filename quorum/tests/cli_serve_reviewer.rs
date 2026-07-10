@@ -769,7 +769,7 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
 /// reviewer (which stayed alive per sticky-agent policy) so Phase 5 respawns a
 /// fresh one — otherwise the idle reviewer blocks respawn and the task deadlocks.
 #[test]
-fn rework_resignal_spawns_fresh_reviewer() {
+fn rework_resignal_feeds_rereview_turn() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -850,17 +850,11 @@ fn rework_resignal_spawns_fresh_reviewer() {
     // Worker re-signals done with PR (rework pushed)
     quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
 
-    // The fix: ResumeReviewer effect tears down the old reviewer
+    // ResumeReviewer feeds a re-review turn to the existing reviewer
+    // (no teardown + respawn — the reviewer keeps its session context).
     assert!(
-        handle.wait_for("tearing down reviewer", 15),
-        "old reviewer not torn down after rework re-signal. Lines: {:?}",
-        handle.lines
-    );
-
-    // Phase 5 spawns a fresh reviewer
-    assert!(
-        handle.wait_for("spawning reviewer", 15),
-        "fresh reviewer not spawned after rework re-signal. Lines: {:?}",
+        handle.wait_for("fed re-review turn", 15),
+        "reviewer not fed re-review turn after rework re-signal. Lines: {:?}",
         handle.lines
     );
 
@@ -870,15 +864,16 @@ fn rework_resignal_spawns_fresh_reviewer() {
         handle.lines.push(line);
     }
 
-    // Exactly 2 reviewer spawns: first review + post-rework re-review
+    // Exactly 1 reviewer spawn: the original. Re-review is a feed_turn,
+    // not a fresh spawn.
     let reviewer_spawns = handle
         .lines
         .iter()
         .filter(|l| l.contains("spawning reviewer"))
         .count();
     assert_eq!(
-        reviewer_spawns, 2,
-        "expected 2 reviewer spawns (original + post-rework), got {reviewer_spawns}. Lines: {:?}",
+        reviewer_spawns, 1,
+        "expected 1 reviewer spawn (original only, re-review is feed_turn), got {reviewer_spawns}. Lines: {:?}",
         handle.lines
     );
 
