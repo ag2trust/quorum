@@ -723,19 +723,47 @@ pub fn update(
                    AND status NOT IN ('done', 'failed', 'cancelled')",
             params![id, "cancelled", fields.body, fields.refs, now, agent],
         )?,
-        _ => tx.execute(
-            "UPDATE tasks SET
-                status   = COALESCE(?2, status),
-                body     = COALESCE(?3, body),
-                refs     = COALESCE(?4, refs),
-                updated_at = ?5
-             WHERE id=?1 AND assignee=?6 AND status='working'",
-            params![id, fields.status, fields.body, fields.refs, now, agent],
-        )?,
+        _ => {
+            let rows = tx.execute(
+                "UPDATE tasks SET
+                    status   = COALESCE(?2, status),
+                    body     = COALESCE(?3, body),
+                    refs     = COALESCE(?4, refs),
+                    updated_at = ?5
+                 WHERE id=?1 AND assignee=?6 AND status='working'",
+                params![id, fields.status, fields.body, fields.refs, now, agent],
+            )?;
+            if rows == 0 && fields.status.is_none() {
+                tx.execute(
+                    "UPDATE tasks SET
+                        body     = COALESCE(?2, body),
+                        refs     = COALESCE(?3, refs),
+                        updated_at = ?4
+                     WHERE id=?1 AND created_by=?5 AND assignee IS NULL AND status='open'",
+                    params![id, fields.body, fields.refs, now, agent],
+                )?
+            } else {
+                rows
+            }
+        }
     };
     if n == 0 {
         tx.commit()?;
         return Err(QuorumError::NotHolder);
+    }
+
+    if fields.status.is_none() && fields.body.is_some() {
+        let is_unclaimed: bool = tx.query_row(
+            "SELECT assignee IS NULL AND status='open' FROM tasks WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if is_unclaimed {
+            tx.execute(
+                "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
+                params![id, now, agent, format!("body replaced by creator {agent}")],
+            )?;
+        }
     }
 
     if fields.status == Some("open") {
@@ -1983,6 +2011,99 @@ mod tests {
         assert_eq!(t.body.as_deref(), Some("new body"));
         assert_eq!(t.refs.as_deref(), Some(r#"{"pr":42}"#));
         assert_eq!(t.status, "working");
+    }
+
+    #[test]
+    fn creator_edits_unclaimed_task_body() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            Some("old"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let t = update(
+            &mut c,
+            "boss",
+            id,
+            &TaskUpdate {
+                body: Some("revised spec"),
+                ..Default::default()
+            },
+            1001,
+        )
+        .unwrap();
+        assert_eq!(t.body.as_deref(), Some("revised spec"));
+        assert_eq!(t.status, "open");
+        let notes = notes_for(&c, id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].body.contains("body replaced by creator"));
+    }
+
+    #[test]
+    fn non_creator_cannot_edit_unclaimed_task() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            Some("old"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let err = update(
+            &mut c,
+            "rando",
+            id,
+            &TaskUpdate {
+                body: Some("hijack"),
+                ..Default::default()
+            },
+            1001,
+        );
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
+    }
+
+    #[test]
+    fn claimed_task_rejects_creator_body_edit() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            Some("old"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        let err = update(
+            &mut c,
+            "boss",
+            id,
+            &TaskUpdate {
+                body: Some("nope"),
+                ..Default::default()
+            },
+            1001,
+        );
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
     }
 
     #[test]

@@ -82,7 +82,8 @@ pub enum Command {
     ///                  review spawning happens via `quorum done`, not task-update.
     ///   `open`      — assignee-only, from `claimed` (release/give-up semantics).
     ///   `cancelled` — creator OR assignee, from non-terminal (won't-do).
-    ///   Omitted     — metadata-only update (body/refs/note), assignee guard.
+    ///   Omitted     — metadata-only update (body/refs/note). Assignee guard if
+    ///                  claimed; creator guard if unclaimed (open + no assignee).
     ///
     /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
