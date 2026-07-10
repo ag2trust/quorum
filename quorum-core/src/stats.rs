@@ -272,6 +272,10 @@ pub struct Stats {
     pub stalled_count: i64,
     /// #204: total session cost (sum of journal cost_usd).
     pub session_cost: f64,
+    /// T59: open PRs with no task backing.
+    pub unbacked_prs: Vec<crate::drift::UnbackedPr>,
+    /// T59: tasks with multiple open PRs.
+    pub twin_prs: Vec<crate::drift::TwinPr>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -352,6 +356,8 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         })
         .count() as i64;
     let session_cost: f64 = daemon_agents.iter().map(|d| d.cost_usd).sum();
+    let unbacked_prs = crate::drift::unbacked_pr_events(conn, now).unwrap_or_default();
+    let twin_prs = crate::drift::twin_pr_events(conn, now).unwrap_or_default();
 
     Ok(Stats {
         agents_total,
@@ -378,6 +384,8 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         health,
         stalled_count,
         session_cost,
+        unbacked_prs,
+        twin_prs,
     })
 }
 

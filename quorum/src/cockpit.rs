@@ -1,3 +1,4 @@
+use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
     BlockedTask, DaemonAgentView, DedupedError, HealthVerdict, PipelineTask, QueueTask, Stats,
 };
@@ -132,6 +133,7 @@ pub fn render_with_style(s: &Stats, sty: &Style, w: &mut dyn Write) {
     render_queue(&s.queue_tasks, sty, w, width);
     render_blocked(&s.blocked, sty, w, width);
     render_pipeline(&s.pipeline, &s.daemon_agents, sty, w, width);
+    render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
 }
 
@@ -411,6 +413,50 @@ fn pipeline_state(p: &PipelineTask, in_review: bool, sty: &Style) -> (String, St
     (icon, p.status.clone())
 }
 
+fn render_unbacked_prs(
+    unbacked: &[UnbackedPr],
+    twins: &[TwinPr],
+    sty: &Style,
+    w: &mut dyn Write,
+    width: usize,
+) {
+    if unbacked.is_empty() && twins.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("UNBACKED PRS", width));
+    for u in unbacked {
+        let warn = if sty.color {
+            sty.yellow("⚠")
+        } else {
+            "[!]".to_string()
+        };
+        let _ = writeln!(
+            w,
+            "  {} #{:<5} {:<30} {}",
+            warn,
+            u.number,
+            truncate(&u.title, 30),
+            sty.dim(&u.branch),
+        );
+    }
+    for t in twins {
+        let warn = if sty.color {
+            sty.yellow("⚠")
+        } else {
+            "[!]".to_string()
+        };
+        let prs: Vec<String> = t.pr_numbers.iter().map(|n| format!("#{n}")).collect();
+        let _ = writeln!(
+            w,
+            "  {} task #{:<4} twin PRs: {}",
+            warn,
+            t.task_id,
+            prs.join(", "),
+        );
+    }
+}
+
 fn render_errors(
     errors: &[DedupedError],
     older_silenced: i64,
@@ -652,6 +698,61 @@ mod tests {
         assert!(
             output.contains("R1"),
             "reviewer name should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn render_unbacked_prs_section() {
+        let mut s = default_stats();
+        s.unbacked_prs.push(UnbackedPr {
+            number: 267,
+            title: "stale superseded PR".into(),
+            branch: "daemon/feat-old".into(),
+        });
+        s.twin_prs.push(TwinPr {
+            task_id: 42,
+            pr_numbers: vec![259, 269],
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("UNBACKED PRS"),
+            "section header should appear: {output}"
+        );
+        assert!(
+            output.contains("#267"),
+            "unbacked PR number should appear: {output}"
+        );
+        assert!(
+            output.contains("stale superseded PR"),
+            "unbacked PR title should appear: {output}"
+        );
+        assert!(
+            output.contains("daemon/feat-old"),
+            "unbacked PR branch should appear: {output}"
+        );
+        assert!(
+            output.contains("task #42"),
+            "twin task id should appear: {output}"
+        );
+        assert!(
+            output.contains("#259, #269"),
+            "twin PR numbers should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn unbacked_prs_section_hidden_when_empty() {
+        let s = default_stats();
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("UNBACKED"),
+            "section should be hidden when no unbacked PRs: {output}"
         );
     }
 }
