@@ -3181,7 +3181,10 @@ async fn spawn_reviewer_for_worker(
         &wt_path,
         config.agent_bin.as_deref(),
         config.bare_agent,
-        vec![("QUORUM_REPO".into(), config.repo.clone())],
+        vec![
+            ("QUORUM_REPO".into(), config.repo.clone()),
+            ("QUORUM_AGENT".into(), reviewer_name.clone()),
+        ],
     )
     .await
     {
@@ -3485,7 +3488,10 @@ async fn spawn_worker(
         bare: config.bare_agent,
         resume: false,
         allowed_tools: agent::ALLOWED_TOOLS.to_string(),
-        env_vars: vec![("QUORUM_REPO".into(), config.repo.clone())],
+        env_vars: vec![
+            ("QUORUM_REPO".into(), config.repo.clone()),
+            ("QUORUM_AGENT".into(), agent_name.clone()),
+        ],
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
         Ok(mut proc) => {
@@ -3977,7 +3983,10 @@ async fn spawn_resume_worker_for_pending(
         bare: config.bare_agent,
         resume: true,
         allowed_tools: agent::ALLOWED_TOOLS.to_string(),
-        env_vars: vec![("QUORUM_REPO".into(), config.repo.clone())],
+        env_vars: vec![
+            ("QUORUM_REPO".into(), config.repo.clone()),
+            ("QUORUM_AGENT".into(), pending.agent_name.clone()),
+        ],
     };
 
     let mut proc = match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
