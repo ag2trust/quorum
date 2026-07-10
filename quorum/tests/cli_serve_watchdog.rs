@@ -135,6 +135,73 @@ impl ServeHandle {
         }
     }
 
+    fn start_with_limits_and_env(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        extra_args: &[&str],
+        extra_envs: &[(&str, &str)],
+    ) -> Self {
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let fake_agent = cargo_bin("fake-agent");
+        let mut args = vec![
+            "serve",
+            "--repo",
+            "test/repo",
+            "--cap",
+            "1",
+            "--repo-dir",
+            &repo.to_string_lossy(),
+            "--worktree-base",
+            &wt_base.to_string_lossy(),
+            "--names-file",
+            &names.to_string_lossy(),
+            "--agent-bin",
+            &fake_agent.to_string_lossy(),
+            "--merge-cmd",
+            "true",
+            "--exit-when-gone",
+            &sentinel_path,
+        ]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+        for a in extra_args {
+            args.push(a.to_string());
+        }
+
+        let mut cmd = Command::new(cargo_bin("quorum"));
+        cmd.env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
+            .args(&args)
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null());
+        for (k, v) in extra_envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        ServeHandle {
+            child,
+            rx,
+            lines: Vec::new(),
+            _sentinel: Some(sentinel),
+        }
+    }
+
     fn wait_for(&mut self, needle: &str, timeout_secs: u64) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
         while std::time::Instant::now() < deadline {
@@ -600,6 +667,276 @@ fn cumulative_cost_usd_is_high_water_mark_not_summed() {
             "logged cost should be 0.0210 (last cumulative), got: {line}"
         );
     }
+
+    handle.stop();
+}
+
+#[test]
+fn turn_wall_clock_limit_kills_worker_and_releases_task() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for turn wall-clock limit test");
+
+    // fake-agent delays 3s before emitting result; turn ceiling is 1s.
+    let mut handle = ServeHandle::start_with_limits_and_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-turn-wall-secs", "1"],
+        &[("FAKE_AGENT_DELAY_SECS", "3")],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("WATCHDOG", 15),
+        "watchdog kill not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_turn_wall = handle.lines.iter().any(|l| l.contains("turn wall-clock"));
+    assert!(
+        saw_turn_wall,
+        "turn wall-clock limit message not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
+        "task should be released to open after turn wall-clock limit, got: {stdout}"
+    );
+}
+
+#[test]
+fn task_wall_clock_limit_kills_worker_and_releases_task() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for task wall-clock limit test");
+
+    // fake-agent delays 3s; task ceiling is 1s.
+    let mut handle = ServeHandle::start_with_limits_and_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--max-task-wall-secs", "1"],
+        &[("FAKE_AGENT_DELAY_SECS", "3")],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("WATCHDOG", 15),
+        "watchdog kill not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_task_wall = handle.lines.iter().any(|l| l.contains("task wall-clock"));
+    assert!(
+        saw_task_wall,
+        "task wall-clock limit message not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
+        "task should be released to open after task wall-clock limit, got: {stdout}"
+    );
+}
+
+#[test]
+fn reviewer_ceiling_kills_reviewer_and_respawns() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for reviewer ceiling test");
+
+    // Wrapper script: first invocation (worker) runs fake-agent normally;
+    // subsequent invocations (reviewers) set FAKE_AGENT_DELAY_SECS=4 so the
+    // reviewer hangs long enough to hit the 1s wall-clock ceiling.
+    let fake_agent = cargo_bin("fake-agent");
+    let wrapper = marker_dir.path().join("agent-wrapper.sh");
+    let marker = marker_dir.path().join("invoked");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/bash\n\
+             if [ -f \"{marker}\" ]; then\n\
+               export FAKE_AGENT_DELAY_SECS=4\n\
+             fi\n\
+             touch \"{marker}\"\n\
+             exec \"{fake_agent}\" \"$@\"\n",
+            marker = marker.display(),
+            fake_agent = fake_agent.display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let sentinel = tempfile::tempdir().unwrap();
+    let sentinel_path = sentinel.path().to_string_lossy().to_string();
+    let mut child = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "serve",
+            "--repo",
+            "test/repo",
+            "--cap",
+            "1",
+            "--repo-dir",
+            &repo_dir.path().to_string_lossy(),
+            "--worktree-base",
+            &wt_base.path().to_string_lossy(),
+            "--names-file",
+            &names_file.to_string_lossy(),
+            "--agent-bin",
+            &wrapper.to_string_lossy(),
+            "--merge-cmd",
+            "true",
+            "--exit-when-gone",
+            &sentinel_path,
+            "--max-turn-wall-secs",
+            "1",
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut handle = ServeHandle {
+        child,
+        rx,
+        lines: Vec::new(),
+        _sentinel: Some(sentinel),
+    };
+
+    // Worker spawns (no delay on first invocation), emits result immediately.
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    // Worker signals done with PR → reviewer spawns.
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "first reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+
+    // Reviewer delays 4s, hits 1s wall-clock ceiling → watchdog kills it.
+    assert!(
+        handle.wait_for("WATCHDOG", 20),
+        "watchdog kill not seen for reviewer. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_reviewer_watchdog = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("WATCHDOG: reviewer"));
+    assert!(
+        saw_reviewer_watchdog,
+        "WATCHDOG message should mention 'reviewer'. Lines: {:?}",
+        handle.lines
+    );
+
+    // Key assertion: task does NOT stall — Phase 5 respawns a new reviewer.
+    assert!(
+        handle.wait_for("spawning reviewer", 20),
+        "second reviewer not spawned — task stalled in-review after ceiling kill. Lines: {:?}",
+        handle.lines
+    );
 
     handle.stop();
 }
