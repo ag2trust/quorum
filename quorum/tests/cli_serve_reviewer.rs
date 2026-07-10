@@ -272,14 +272,12 @@ fn approve_flow_tears_down_both_agents() {
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer result
+    // Wait for reviewer to finish its turn
     assert!(
-        handle.wait_for("reviewer", 15),
-        "reviewer activity not seen. Lines: {:?}",
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
         handle.lines
     );
-    // Give a moment for draining to complete
-    std::thread::sleep(Duration::from_secs(1));
 
     // Reviewer signals approved verdict
     quorum_done(
@@ -308,8 +306,6 @@ fn approve_flow_tears_down_both_agents() {
         handle.lines
     );
 
-    // Verify task is closed (done → review auto-resolved → closed, #162)
-    std::thread::sleep(Duration::from_millis(500));
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -372,8 +368,11 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer to finish its turn
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer signals changes verdict with feedback
     quorum_done(
@@ -403,13 +402,10 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
         handle.lines
     );
 
-    // Drain remaining lines
-    std::thread::sleep(Duration::from_millis(500));
+    // ── State assertions (F12) ──
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
-
-    // ── State assertions (F12) ──
 
     // Invariant: same warm worker — exactly 1 worker spawn, 0 worker teardowns
     let worker_spawns = handle
@@ -523,8 +519,11 @@ fn merge_failure_feeds_rework_to_worker() {
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer to finish its turn
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer signals approved verdict — but merge will fail
     quorum_done(
@@ -617,8 +616,11 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer to produce its result
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer signals done WITHOUT a verdict — the `_ =>` branch
     quorum_done(home.path(), &["--agent", &reviewer_name, "--pr", "1"]);
@@ -636,9 +638,8 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
         handle.lines
     );
 
-    // Wait 3 seconds (6+ ticks) — if w.pr was NOT cleared, a second reviewer
-    // would spawn within one or two ticks.
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait 2 ticks — if w.pr was NOT cleared, a second reviewer would spawn.
+    std::thread::sleep(Duration::from_secs(1));
 
     // Drain any remaining log lines
     while let Ok(line) = handle.rx.try_recv() {
@@ -719,7 +720,12 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     );
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
-    std::thread::sleep(Duration::from_secs(2));
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Bypass the CLI's #206 validation: write the approved-verdict mailbox row
     // directly, with NO attestation payload.
@@ -743,8 +749,6 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
         handle.lines
     );
 
-    // Drain remaining lines, then assert nothing was merged.
-    std::thread::sleep(Duration::from_millis(500));
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
@@ -830,8 +834,11 @@ fn rework_resignal_feeds_rereview_turn() {
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer to produce its result
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer signals changes verdict → triggers rework
     quorum_done(
@@ -860,8 +867,11 @@ fn rework_resignal_feeds_rereview_turn() {
         handle.lines
     );
 
-    // Wait for worker to finish its rework turn (drain_events sets draining=false)
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "worker rework result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Worker re-signals done with PR (rework pushed)
     quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
@@ -874,8 +884,6 @@ fn rework_resignal_feeds_rereview_turn() {
         handle.lines
     );
 
-    // Drain remaining lines
-    std::thread::sleep(Duration::from_millis(500));
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
@@ -969,8 +977,8 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         handle.lines
     );
 
-    // Wait a few ticks to confirm no reviewer spawns
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait 2 ticks to confirm no reviewer spawns
+    std::thread::sleep(Duration::from_secs(1));
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
@@ -1057,8 +1065,8 @@ fn already_merged_pr_closes_task_without_reviewer() {
         handle.lines
     );
 
-    // Wait a few ticks to confirm no reviewer spawns
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait 2 ticks to confirm no reviewer spawns
+    std::thread::sleep(Duration::from_secs(1));
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }

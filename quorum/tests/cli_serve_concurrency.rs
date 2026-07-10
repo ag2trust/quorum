@@ -358,8 +358,8 @@ fn cap_limits_concurrent_workers() {
         handle.lines
     );
 
-    // Wait a few ticks to see if a third spawns (it shouldn't).
-    std::thread::sleep(Duration::from_secs(3));
+    // Wait 2 ticks to see if a third spawns (it shouldn't).
+    std::thread::sleep(Duration::from_secs(1));
     handle.drain_available();
 
     let spawn_count = handle

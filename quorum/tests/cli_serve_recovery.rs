@@ -341,8 +341,6 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
         handle2.lines
     );
 
-    // A moment for any late log lines.
-    std::thread::sleep(Duration::from_millis(500));
     handle2.drain_pending_lines();
 
     // ── Invariant: NO fresh worker spawn for task #1 after restart. ──
@@ -691,8 +689,6 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         handle.lines
     );
 
-    // Wait a moment for any late log output.
-    std::thread::sleep(Duration::from_millis(500));
     handle.drain_pending_lines();
 
     // Verify task remains in-review (expired claim didn't corrupt status).

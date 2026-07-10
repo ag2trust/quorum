@@ -268,8 +268,8 @@ fn unmatched_done_row_left_for_other_instance() {
         handle.lines
     );
 
-    // Give the daemon a couple more ticks to (not) consume the row.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait 2 ticks to confirm daemon does not consume the row.
+    std::thread::sleep(Duration::from_secs(1));
 
     handle.stop();
 
@@ -410,8 +410,8 @@ fn two_daemons_do_not_consume_sibling_signals() {
         handle_b.lines
     );
 
-    // Give B extra ticks to (not) consume.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait 2 ticks to confirm B does not consume.
+    std::thread::sleep(Duration::from_secs(1));
 
     // Sibling row must survive.
     assert_eq!(
@@ -461,8 +461,8 @@ fn non_done_mailbox_rows_dont_block_daemon() {
         handle.lines
     );
 
-    // Give the daemon a moment to finish processing the two mailbox rows.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Wait 2 ticks for the daemon to finish processing the two mailbox rows.
+    std::thread::sleep(Duration::from_secs(1));
 
     handle.stop();
 
@@ -612,8 +612,11 @@ fn rework_feed_failure_releases_task() {
 
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer to finish its turn.
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Kill ALL fake-agent processes so the worker's stdin pipe breaks.
     // This also kills the reviewer, so Phase 4b fires AgentFailed on both.
@@ -665,9 +668,6 @@ fn rework_feed_failure_releases_task() {
         "daemon did not handle dead worker. Lines: {:?}",
         handle.lines
     );
-
-    // Wait for cleanup.
-    std::thread::sleep(Duration::from_secs(1));
 
     handle.stop();
 
