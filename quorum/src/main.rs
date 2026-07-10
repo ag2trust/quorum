@@ -12,6 +12,7 @@ mod input;
 mod output;
 mod paths;
 mod serve;
+mod serve_config;
 mod verdict;
 
 use clap::Parser;
@@ -823,6 +824,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             Ok(0)
         }
         cli::Command::Serve {
+            config: config_flag,
             cap,
             repo_dir,
             worktree_base,
@@ -852,7 +854,133 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             base_branch,
             exit_when_gone,
         } => {
-            let db = paths::ensure_repo_dir(&repo)?;
+            use serve_config::*;
+
+            // Step 1: determine repo identity (needed for default config path).
+            // Flag > file-at-explicit-path > error. We need repo before we can
+            // resolve the default config path, but repo might BE in the config file.
+            // Break the cycle: if --config is explicit, load that; if --repo is
+            // given, derive the default path from it; otherwise try loading from
+            // repo_dir detection.
+            let (file_cfg, config_path_used) = if let Some(ref p) = config_flag {
+                let path = std::path::Path::new(p);
+                let cfg = load(path)?;
+                (cfg, Some(p.clone()))
+            } else if let Some(ref r) = repo {
+                let path = default_config_path(r)?;
+                if path.exists() {
+                    let cfg = load(&path)?;
+                    (cfg, Some(path.to_string_lossy().into_owned()))
+                } else {
+                    (ServeFileConfig::default(), None)
+                }
+            } else {
+                (ServeFileConfig::default(), None)
+            };
+
+            let r_repo = resolve_str(repo.as_deref(), file_cfg.repo.as_deref(), "");
+            if r_repo.value.is_empty() {
+                return Err(QuorumError::Usage(
+                    "serve requires --repo (or repo in config file)".into(),
+                ));
+            }
+
+            // If we didn't load a config (no --config, no --repo for default path),
+            // try the default path using the now-resolved repo.
+            let (file_cfg, config_path_used) =
+                if config_path_used.is_none() && config_flag.is_none() {
+                    let path = default_config_path(&r_repo.value)?;
+                    if path.exists() {
+                        let cfg = load(&path)?;
+                        let p = path.to_string_lossy().into_owned();
+                        (cfg, Some(p))
+                    } else {
+                        (file_cfg, None)
+                    }
+                } else {
+                    (file_cfg, config_path_used)
+                };
+
+            let r_repo_dir = resolve_str(repo_dir.as_deref(), file_cfg.repo_dir.as_deref(), "");
+            if r_repo_dir.value.is_empty() {
+                return Err(QuorumError::Usage(
+                    "serve requires --repo-dir (or repo_dir in config file)".into(),
+                ));
+            }
+            let r_wt = resolve_str(
+                worktree_base.as_deref(),
+                file_cfg.worktree_base.as_deref(),
+                "",
+            );
+            if r_wt.value.is_empty() {
+                return Err(QuorumError::Usage(
+                    "serve requires --worktree-base (or worktree_base in config file)".into(),
+                ));
+            }
+            let r_cap = resolve_val(cap, file_cfg.cap, 4);
+            let r_model = resolve_str(model.as_deref(), file_cfg.model.as_deref(), "sonnet");
+            let r_effort = resolve_str(effort.as_deref(), file_cfg.effort.as_deref(), "high");
+            let r_names = resolve_opt_str(names_file.as_deref(), file_cfg.names_file.as_deref());
+            let r_agent_bin = resolve_opt_str(agent_bin.as_deref(), file_cfg.agent_bin.as_deref());
+            let r_merge_token = resolve_opt_str(
+                merge_token_file.as_deref(),
+                file_cfg.merge_token_file.as_deref(),
+            );
+            let r_no_bare = resolve_bool(no_bare_agent, file_cfg.no_bare_agent, false);
+            let r_max_turn_tokens = resolve_opt(max_turn_tokens, file_cfg.max_turn_tokens);
+            let r_max_task_tokens = resolve_opt(max_task_tokens, file_cfg.max_task_tokens);
+            let r_max_turn_cost = resolve_opt(max_turn_cost_usd, file_cfg.max_turn_cost_usd);
+            let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
+            let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
+            let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
+            let r_log_dir = resolve_opt_str(log_dir.as_deref(), file_cfg.log_dir.as_deref());
+            let r_self_update = resolve_bool(self_update_drain, file_cfg.self_update_drain, false);
+            let r_drain_timeout = resolve_val(drain_timeout_secs, file_cfg.drain_timeout_secs, 900);
+            let r_self_repo = resolve_opt_str(self_repo.as_deref(), file_cfg.self_repo.as_deref());
+            let r_sha_poll =
+                resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 60);
+            let r_base_branch = resolve_str(
+                base_branch.as_deref(),
+                file_cfg.base_branch.as_deref(),
+                "main",
+            );
+            let r_merge_checks_timeout = resolve_val(
+                merge_checks_timeout_secs,
+                file_cfg.merge_checks_timeout_secs,
+                900,
+            );
+            let r_merge_checks_poll =
+                resolve_val(merge_checks_poll_secs, file_cfg.merge_checks_poll_secs, 30);
+
+            // Print the resolved config banner.
+            let banner_text = banner(&BannerData {
+                config_path: config_path_used.as_deref(),
+                repo: &r_repo,
+                repo_dir: &r_repo_dir,
+                worktree_base: &r_wt,
+                base_branch: &r_base_branch,
+                cap: &r_cap,
+                model: &r_model,
+                effort: &r_effort,
+                log_dir: &r_log_dir,
+                no_bare_agent: &r_no_bare,
+                self_update_drain: &r_self_update,
+                drain_timeout_secs: &r_drain_timeout,
+                max_turn_wall_secs: &r_max_turn_wall,
+                max_task_wall_secs: &r_max_task_wall,
+                max_turn_tokens: &r_max_turn_tokens,
+                max_task_tokens: &r_max_task_tokens,
+                max_turn_cost_usd: &r_max_turn_cost,
+                max_task_cost_usd: &r_max_task_cost,
+                merge_checks_timeout_secs: &r_merge_checks_timeout,
+            });
+            eprintln!(
+                "quorum serve: {}",
+                banner_text.replace('\n', "\nquorum serve: ")
+            );
+
+            let db = paths::ensure_repo_dir(&r_repo.value)?;
+
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
                 if let Some(cmd) = merge_cmd {
                     std::sync::Arc::new(serve::merge::CommandMergeExecutor {
@@ -862,51 +990,57 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     })
                 } else {
                     std::sync::Arc::new(serve::merge::GhMergeExecutor {
-                        token_file: merge_token_file.map(std::path::PathBuf::from),
-                        gh_repo: resolve_gh_repo(&repo_dir),
+                        token_file: r_merge_token.value.map(std::path::PathBuf::from),
+                        gh_repo: resolve_gh_repo(&r_repo_dir.value),
                     })
                 };
-            let limits = serve::CostLimits {
-                max_turn_tokens,
-                max_task_tokens,
-                max_turn_cost_usd,
-                max_task_cost_usd,
-                max_turn_wall_secs,
-                max_task_wall_secs,
-            };
-            let resolved_log_dir =
-                Some(log_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
-                    paths::home_dir()
-                        .unwrap_or_else(|_| std::path::PathBuf::from(".quorum"))
-                        .join("logs")
-                }));
-            let resolved_self_repo = if self_update_drain {
-                self_repo.or_else(|| resolve_gh_repo(&repo_dir))
+
+            let resolved_log_dir = Some(
+                r_log_dir
+                    .value
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        paths::home_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from(".quorum"))
+                            .join("logs")
+                    }),
+            );
+            let resolved_self_repo = if r_self_update.value {
+                r_self_repo
+                    .value
+                    .or_else(|| resolve_gh_repo(&r_repo_dir.value))
             } else {
                 None
             };
-            let worktree_base_path = std::path::PathBuf::from(worktree_base);
+
             let config = serve::ServeConfig {
                 db_path: db,
-                cap,
-                repo_dir: std::path::PathBuf::from(repo_dir),
-                worktree_base: worktree_base_path,
-                names_file: names_file.map(std::path::PathBuf::from),
-                agent_bin,
-                model,
-                effort,
+                cap: r_cap.value,
+                repo_dir: std::path::PathBuf::from(r_repo_dir.value),
+                worktree_base: std::path::PathBuf::from(r_wt.value),
+                names_file: r_names.value.map(std::path::PathBuf::from),
+                agent_bin: r_agent_bin.value,
+                model: r_model.value,
+                effort: r_effort.value,
                 merge_executor,
-                bare_agent: !no_bare_agent,
-                limits,
+                bare_agent: !r_no_bare.value,
+                limits: serve::CostLimits {
+                    max_turn_tokens: r_max_turn_tokens.value,
+                    max_task_tokens: r_max_task_tokens.value,
+                    max_turn_cost_usd: r_max_turn_cost.value,
+                    max_task_cost_usd: r_max_task_cost.value,
+                    max_turn_wall_secs: r_max_turn_wall.value,
+                    max_task_wall_secs: r_max_task_wall.value,
+                },
                 log_dir: resolved_log_dir,
-                self_update_drain,
-                drain_timeout_secs,
+                self_update_drain: r_self_update.value,
+                drain_timeout_secs: r_drain_timeout.value,
                 self_repo: resolved_self_repo,
-                sha_poll_interval_secs,
-                merge_checks_timeout_secs,
-                merge_checks_poll_secs,
-                repo,
-                base_branch,
+                sha_poll_interval_secs: r_sha_poll.value,
+                merge_checks_timeout_secs: r_merge_checks_timeout.value,
+                merge_checks_poll_secs: r_merge_checks_poll.value,
+                repo: r_repo.value,
+                base_branch: r_base_branch.value,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
             };
             Ok(serve::run_serve(config)?)
