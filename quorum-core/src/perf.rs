@@ -1,0 +1,529 @@
+//! Performance report queries for `quorum perf`. Read-only — no writes, no mutations.
+//!
+//! Computes aggregate metrics from the `tasks` table (terminal tasks only: done, failed,
+//! cancelled). Model/effort derived from task labels (`tier:*`, `effort:*`). Complexity
+//! derived from `complexity:*` labels.
+
+use crate::error::Result;
+use crate::stats::extract_tier_from_labels;
+use rusqlite::Connection;
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PerfCut {
+    Default,
+    Complexity,
+    Reviewer,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct PerfReport {
+    pub rows: Vec<PerfRow>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct PerfRow {
+    pub model: String,
+    pub effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complexity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    pub n_tasks: i64,
+    pub first_pass_pct: f64,
+    pub avg_rework: f64,
+    pub fail_pct: f64,
+    pub median_wall_mins: f64,
+}
+
+fn extract_label_value(labels_json: Option<&str>, prefix: &str) -> Option<String> {
+    let s = labels_json?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let arr = v.as_array()?;
+    for item in arr {
+        if let Some(t) = item.as_str() {
+            if let Some(rest) = t.strip_prefix(prefix) {
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_effort(labels_json: Option<&str>) -> String {
+    extract_label_value(labels_json, "effort:").unwrap_or_else(|| "unknown".to_string())
+}
+
+fn extract_complexity(labels_json: Option<&str>) -> String {
+    extract_label_value(labels_json, "complexity:").unwrap_or_else(|| "untagged".to_string())
+}
+
+fn tier_to_model(tier: &str) -> String {
+    tier.strip_prefix("tier:").unwrap_or(tier).to_string()
+}
+
+struct TaskRow {
+    status: String,
+    labels: Option<String>,
+    rework_round: i64,
+    created_at: i64,
+    updated_at: i64,
+    reviewer: Option<String>,
+}
+
+fn load_terminal_tasks(conn: &Connection) -> Result<Vec<TaskRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT status, labels, rework_round, created_at, updated_at, reviewer \
+         FROM tasks WHERE status IN ('done', 'failed', 'cancelled')",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TaskRow {
+                status: r.get(0)?,
+                labels: r.get(1)?,
+                rework_round: r.get(2)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+                reviewer: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn median(sorted: &[f64]) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let n = sorted.len();
+    if n.is_multiple_of(2) {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    }
+}
+
+type GroupKey = (String, String, Option<String>, Option<String>);
+
+struct GroupAccum {
+    total: i64,
+    first_pass: i64,
+    rework_sum: i64,
+    failed: i64,
+    wall_mins: Vec<f64>,
+}
+
+impl GroupAccum {
+    fn new() -> Self {
+        Self {
+            total: 0,
+            first_pass: 0,
+            rework_sum: 0,
+            failed: 0,
+            wall_mins: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, task: &TaskRow) {
+        self.total += 1;
+        if task.status == "done" && task.rework_round == 0 {
+            self.first_pass += 1;
+        }
+        self.rework_sum += task.rework_round;
+        if task.status == "failed" || task.status == "cancelled" {
+            self.failed += 1;
+        }
+        let wall_secs = (task.updated_at - task.created_at).max(0) as f64;
+        self.wall_mins.push(wall_secs / 60.0);
+    }
+
+    fn into_row(
+        mut self,
+        model: String,
+        effort: String,
+        complexity: Option<String>,
+        reviewer: Option<String>,
+    ) -> PerfRow {
+        self.wall_mins
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = self.total as f64;
+        PerfRow {
+            model,
+            effort,
+            complexity,
+            reviewer,
+            n_tasks: self.total,
+            first_pass_pct: if n > 0.0 {
+                (self.first_pass as f64 / n) * 100.0
+            } else {
+                0.0
+            },
+            avg_rework: if n > 0.0 {
+                self.rework_sum as f64 / n
+            } else {
+                0.0
+            },
+            fail_pct: if n > 0.0 {
+                (self.failed as f64 / n) * 100.0
+            } else {
+                0.0
+            },
+            median_wall_mins: median(&self.wall_mins),
+        }
+    }
+}
+
+pub fn perf(conn: &Connection, cut: PerfCut) -> Result<PerfReport> {
+    let tasks = load_terminal_tasks(conn)?;
+    if tasks.is_empty() {
+        return Ok(PerfReport { rows: vec![] });
+    }
+
+    let mut groups: BTreeMap<GroupKey, GroupAccum> = BTreeMap::new();
+
+    for task in &tasks {
+        let (model, effort, complexity, reviewer_col) = match cut {
+            PerfCut::Default => {
+                let tier = extract_tier_from_labels(task.labels.as_deref());
+                let model = tier_to_model(&tier);
+                let effort = extract_effort(task.labels.as_deref());
+                (model, effort, None, None)
+            }
+            PerfCut::Complexity => {
+                let tier = extract_tier_from_labels(task.labels.as_deref());
+                let model = tier_to_model(&tier);
+                let effort = extract_effort(task.labels.as_deref());
+                let cx = extract_complexity(task.labels.as_deref());
+                (model, effort, Some(cx), None)
+            }
+            PerfCut::Reviewer => {
+                let tier = extract_tier_from_labels(task.labels.as_deref());
+                let model = tier_to_model(&tier);
+                let effort = extract_effort(task.labels.as_deref());
+                let rev = task.reviewer.clone().unwrap_or_else(|| "none".to_string());
+                (model, effort, None, Some(rev))
+            }
+        };
+
+        let key = (model, effort, complexity, reviewer_col);
+        groups.entry(key).or_insert_with(GroupAccum::new).add(task);
+    }
+
+    let rows = groups
+        .into_iter()
+        .map(|((model, effort, cx, rev), acc)| acc.into_row(model, effort, cx, rev))
+        .collect();
+
+    Ok(PerfReport { rows })
+}
+
+pub fn render_table(report: &PerfReport) {
+    if report.rows.is_empty() {
+        println!("No terminal tasks found.");
+        return;
+    }
+
+    let has_complexity = report.rows.iter().any(|r| r.complexity.is_some());
+    let has_reviewer = report.rows.iter().any(|r| r.reviewer.is_some());
+
+    let mut header = format!("{:<14} {:<8}", "MODEL", "EFFORT");
+    if has_complexity {
+        header.push_str(&format!(" {:<12}", "COMPLEXITY"));
+    }
+    if has_reviewer {
+        header.push_str(&format!(" {:<18}", "REVIEWER"));
+    }
+    header.push_str(&format!(
+        " {:>7} {:>10} {:>9} {:>7} {:>11}",
+        "N", "1st_PASS", "AVG_RWK", "FAIL", "MED_MINS"
+    ));
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+
+    for r in &report.rows {
+        let mut line = format!("{:<14} {:<8}", r.model, r.effort);
+        if has_complexity {
+            line.push_str(&format!(" {:<12}", r.complexity.as_deref().unwrap_or("")));
+        }
+        if has_reviewer {
+            line.push_str(&format!(" {:<18}", r.reviewer.as_deref().unwrap_or("")));
+        }
+        line.push_str(&format!(
+            " {:>7} {:>9.1}% {:>9.2} {:>6.1}% {:>11.1}",
+            r.n_tasks, r.first_pass_pct, r.avg_rework, r.fail_pct, r.median_wall_mins
+        ));
+        println!("{line}");
+    }
+}
+
+// ── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_tmp() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = crate::db::open(&dir.path().join("q.db")).unwrap();
+        (dir, c)
+    }
+
+    fn seed_task(
+        conn: &mut rusqlite::Connection,
+        status: &str,
+        labels: Option<&str>,
+        rework_round: i64,
+        reviewer: Option<&str>,
+        created_at: i64,
+        updated_at: i64,
+    ) {
+        let tx = crate::db::begin_immediate(conn).unwrap();
+        tx.execute(
+            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
+             created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
+             VALUES ('test', NULL, ?1, 0, ?2, NULL, 'boss', ?3, ?4, NULL, NULL, 'worker', ?5, ?6, 0)",
+            rusqlite::params![status, labels, created_at, updated_at, reviewer, rework_round],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn empty_db_returns_empty_report() {
+        let (_d, c) = open_tmp();
+        let r = perf(&c, PerfCut::Default).unwrap();
+        assert!(r.rows.is_empty());
+    }
+
+    #[test]
+    fn single_done_task_default_cut() {
+        let (_d, mut c) = open_tmp();
+        seed_task(
+            &mut c,
+            "done",
+            Some(r#"["tier:opus-46","effort:high"]"#),
+            0,
+            Some("rev-1"),
+            1000,
+            1600, // 600s = 10 mins
+        );
+        let r = perf(&c, PerfCut::Default).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        let row = &r.rows[0];
+        assert_eq!(row.model, "opus-46");
+        assert_eq!(row.effort, "high");
+        assert_eq!(row.n_tasks, 1);
+        assert!((row.first_pass_pct - 100.0).abs() < 0.01);
+        assert!((row.avg_rework - 0.0).abs() < 0.01);
+        assert!((row.fail_pct - 0.0).abs() < 0.01);
+        assert!((row.median_wall_mins - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mixed_outcomes_correct_aggregates() {
+        let (_d, mut c) = open_tmp();
+        let labels = Some(r#"["tier:opus-47","effort:medium"]"#);
+
+        // Task 1: done, 0 rework, 600s wall
+        seed_task(&mut c, "done", labels, 0, Some("R"), 1000, 1600);
+        // Task 2: done, 2 rework rounds, 1200s wall
+        seed_task(&mut c, "done", labels, 2, Some("R"), 1000, 2200);
+        // Task 3: failed, 1 rework, 300s wall
+        seed_task(&mut c, "failed", labels, 1, Some("R"), 1000, 1300);
+        // Task 4: cancelled, 0 rework, 60s wall
+        seed_task(&mut c, "cancelled", labels, 0, None, 1000, 1060);
+
+        let r = perf(&c, PerfCut::Default).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        let row = &r.rows[0];
+        assert_eq!(row.model, "opus-47");
+        assert_eq!(row.effort, "medium");
+        assert_eq!(row.n_tasks, 4);
+        // first_pass: only task 1 is done with rework_round==0 → 1/4 = 25%
+        assert!((row.first_pass_pct - 25.0).abs() < 0.01);
+        // avg_rework: (0+2+1+0)/4 = 0.75
+        assert!((row.avg_rework - 0.75).abs() < 0.01);
+        // fail: 2 of 4 = 50%
+        assert!((row.fail_pct - 50.0).abs() < 0.01);
+        // median wall mins: sorted=[1.0, 5.0, 10.0, 20.0] → median=(5+10)/2=7.5
+        assert!((row.median_wall_mins - 7.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn complexity_cut_splits_by_label() {
+        let (_d, mut c) = open_tmp();
+        seed_task(
+            &mut c,
+            "done",
+            Some(r#"["tier:opus-46","effort:high","complexity:simple"]"#),
+            0,
+            None,
+            1000,
+            1600,
+        );
+        seed_task(
+            &mut c,
+            "done",
+            Some(r#"["tier:opus-46","effort:high","complexity:complex"]"#),
+            1,
+            None,
+            1000,
+            2200,
+        );
+        seed_task(
+            &mut c,
+            "done",
+            Some(r#"["tier:opus-46","effort:high"]"#),
+            0,
+            None,
+            1000,
+            1300,
+        );
+
+        let r = perf(&c, PerfCut::Complexity).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        let simple = r
+            .rows
+            .iter()
+            .find(|r| r.complexity.as_deref() == Some("simple"))
+            .unwrap();
+        assert_eq!(simple.n_tasks, 1);
+        assert!((simple.first_pass_pct - 100.0).abs() < 0.01);
+
+        let complex = r
+            .rows
+            .iter()
+            .find(|r| r.complexity.as_deref() == Some("complex"))
+            .unwrap();
+        assert_eq!(complex.n_tasks, 1);
+        assert!((complex.first_pass_pct - 0.0).abs() < 0.01);
+
+        let untagged = r
+            .rows
+            .iter()
+            .find(|r| r.complexity.as_deref() == Some("untagged"))
+            .unwrap();
+        assert_eq!(untagged.n_tasks, 1);
+    }
+
+    #[test]
+    fn reviewer_cut_splits_by_reviewer() {
+        let (_d, mut c) = open_tmp();
+        let labels = Some(r#"["tier:opus-46","effort:high"]"#);
+        seed_task(&mut c, "done", labels, 0, Some("alice"), 1000, 1600);
+        seed_task(&mut c, "done", labels, 1, Some("alice"), 1000, 2200);
+        seed_task(&mut c, "done", labels, 0, Some("bob"), 1000, 1300);
+        seed_task(&mut c, "failed", labels, 0, None, 1000, 1060);
+
+        let r = perf(&c, PerfCut::Reviewer).unwrap();
+        assert_eq!(r.rows.len(), 3);
+
+        let alice = r
+            .rows
+            .iter()
+            .find(|r| r.reviewer.as_deref() == Some("alice"))
+            .unwrap();
+        assert_eq!(alice.n_tasks, 2);
+        assert!((alice.first_pass_pct - 50.0).abs() < 0.01);
+
+        let bob = r
+            .rows
+            .iter()
+            .find(|r| r.reviewer.as_deref() == Some("bob"))
+            .unwrap();
+        assert_eq!(bob.n_tasks, 1);
+
+        let none = r
+            .rows
+            .iter()
+            .find(|r| r.reviewer.as_deref() == Some("none"))
+            .unwrap();
+        assert_eq!(none.n_tasks, 1);
+    }
+
+    #[test]
+    fn multiple_model_effort_combos() {
+        let (_d, mut c) = open_tmp();
+        seed_task(
+            &mut c,
+            "done",
+            Some(r#"["tier:opus-46","effort:high"]"#),
+            0,
+            None,
+            1000,
+            1600,
+        );
+        seed_task(
+            &mut c,
+            "done",
+            Some(r#"["tier:sonnet-5","effort:medium"]"#),
+            0,
+            None,
+            1000,
+            1300,
+        );
+        seed_task(&mut c, "done", None, 0, None, 1000, 1120);
+
+        let r = perf(&c, PerfCut::Default).unwrap();
+        assert_eq!(r.rows.len(), 3);
+
+        let opus = r.rows.iter().find(|r| r.model == "opus-46").unwrap();
+        assert_eq!(opus.effort, "high");
+
+        let sonnet = r.rows.iter().find(|r| r.model == "sonnet-5").unwrap();
+        assert_eq!(sonnet.effort, "medium");
+
+        let unknown = r.rows.iter().find(|r| r.model == "unknown").unwrap();
+        assert_eq!(unknown.effort, "unknown");
+    }
+
+    #[test]
+    fn non_terminal_tasks_excluded() {
+        let (_d, mut c) = open_tmp();
+        let labels = Some(r#"["tier:opus-46","effort:high"]"#);
+        // Terminal
+        seed_task(&mut c, "done", labels, 0, None, 1000, 1600);
+        // Non-terminal — must be excluded
+        let tx = crate::db::begin_immediate(&mut c).unwrap();
+        tx.execute(
+            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
+             created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
+             VALUES ('wip', NULL, 'working', 0, ?1, 'A', 'boss', 1000, 1600, NULL, NULL, 'A', NULL, 0, 0)",
+            rusqlite::params![labels],
+        ).unwrap();
+        tx.execute(
+            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
+             created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
+             VALUES ('open', NULL, 'open', 0, ?1, NULL, 'boss', 1000, 1600, NULL, NULL, NULL, NULL, 0, 0)",
+            rusqlite::params![labels],
+        ).unwrap();
+        tx.commit().unwrap();
+
+        let r = perf(&c, PerfCut::Default).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].n_tasks, 1);
+    }
+
+    #[test]
+    fn median_odd_count() {
+        assert!((median(&[1.0, 3.0, 5.0]) - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn median_even_count() {
+        assert!((median(&[1.0, 2.0, 3.0, 4.0]) - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn median_single() {
+        assert!((median(&[7.0]) - 7.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn median_empty() {
+        assert!((median(&[]) - 0.0).abs() < 0.001);
+    }
+}
