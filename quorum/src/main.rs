@@ -61,6 +61,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Activity { .. } => "activity",
         cli::Command::Tail { .. } => "tail",
         cli::Command::Perf { .. } => "perf",
+        cli::Command::Classify { .. } => "classify",
         cli::Command::Help => "help",
     }
 }
@@ -1125,6 +1126,129 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             } else {
                 quorum_core::perf::render_table(&report);
             }
+            Ok(0)
+        }
+        cli::Command::Classify {
+            backfill,
+            agent_bin,
+        } => {
+            if !backfill {
+                return Err(QuorumError::Usage(
+                    "classify requires --backfill (daemon handles live classification)".into(),
+                ));
+            }
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let tasks = quorum_core::classify::tasks_missing_cx_all(&conn)?;
+            if tasks.is_empty() {
+                output::emit(
+                    &serde_json::json!({"classified": 0, "message": "all tasks already have cx_est"}),
+                );
+                return Ok(0);
+            }
+
+            let batch_size = 20;
+            let mut total_stored = 0;
+
+            for chunk in tasks.chunks(batch_size) {
+                let turn = serve::classifier::classifier_turn(chunk, &[]);
+                let spec = serve::agent::AgentSpec {
+                    model: serve::classifier::CLASSIFIER_MODEL.to_string(),
+                    effort: serve::classifier::CLASSIFIER_EFFORT.to_string(),
+                    session_id: format!("classify-backfill-{}", chunk[0].id),
+                    worktree: std::env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    bare: true,
+                    allowed_tools: String::new(),
+                    env_vars: vec![],
+                };
+
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;
+
+                let stored = rt.block_on(async {
+                    let mut proc = serve::agent::AgentProc::spawn(&spec, agent_bin.as_deref())
+                        .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
+
+                    proc.feed_turn(&turn)
+                        .await
+                        .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
+
+                    let mut response_text = String::new();
+                    let timeout_dur = std::time::Duration::from_secs(120);
+                    let deadline = tokio::time::Instant::now() + timeout_dur;
+
+                    loop {
+                        let remaining = deadline - tokio::time::Instant::now();
+                        match tokio::time::timeout(remaining, proc.next_event()).await {
+                            Ok(Some(serve::stream::Event::Result {
+                                result, is_error, ..
+                            })) => {
+                                if is_error.unwrap_or(false) {
+                                    eprintln!(
+                                        "classifier error for batch starting at #{}",
+                                        chunk[0].id
+                                    );
+                                    break;
+                                }
+                                let text = result
+                                    .as_str()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| result.to_string());
+                                if !text.is_empty() {
+                                    response_text = text;
+                                }
+                                break;
+                            }
+                            Ok(Some(serve::stream::Event::Assistant { message })) => {
+                                if let Some(content) =
+                                    message.get("content").and_then(|c| c.as_str())
+                                {
+                                    response_text.push_str(content);
+                                }
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => {
+                                eprintln!(
+                                    "classifier timeout for batch starting at #{}",
+                                    chunk[0].id
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    proc.kill_and_reap().await;
+
+                    if response_text.is_empty() {
+                        return Ok(0usize);
+                    }
+
+                    if let Some(results) = serve::classifier::parse_response(&response_text) {
+                        let now = quorum_core::clock::now();
+                        quorum_core::classify::store_classifications(
+                            &mut conn,
+                            &results,
+                            quorum_core::classify::CLASSIFIER_VERSION,
+                            now,
+                        )
+                    } else {
+                        eprintln!(
+                            "failed to parse classifier response for batch starting at #{}",
+                            chunk[0].id
+                        );
+                        Ok(0usize)
+                    }
+                })?;
+
+                total_stored += stored;
+            }
+
+            output::emit(&serde_json::json!({
+                "classified": total_stored,
+                "total_tasks": tasks.len(),
+            }));
             Ok(0)
         }
         cli::Command::Help => {
