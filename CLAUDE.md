@@ -273,6 +273,19 @@ A short or "all-green" test summary may be RTK hiding the failures.
 
 - The N-process claim-race test is the project's smoke alarm — keep it fast and in the
   default `cargo test` run.
+- **The `claude` CLI boundary is invisible to fake_agent — test it for zero tokens.** Two
+  live respawn-loops in one day (2026-07-10) both failed *before* any API call: (1) a
+  non-UUID `--session-id` is rejected at arg parsing ("Invalid session ID. Must be a valid
+  UUID." — the daemon only sees "process exited without response"), (2) `--bare` strips
+  operator credentials, so on subscription-auth machines a bare agent's every turn returns
+  "Not logged in". Fix pattern: session ids come only from `agent::new_session_id()`; every
+  spawn path (worker, reviewer, classifier, backfill) must thread the `bare_agent` config —
+  never hardcode `bare`. Prevention pattern: the real-CLI contract tests in `agent.rs`
+  (spawn the installed binary with `CLAUDE_CONFIG_DIR` → empty tempdir + blanked cred env
+  vars: it reaches arg-parse and auth but can never reach the API — any stream event back
+  means args parsed; event-less exit is the crash-loop signature). Debug pattern: the
+  classifier's real error text isn't in daemon logs — read the newest session jsonl under
+  `~/.claude/projects/<repo-slug>/`.
 - `read --ack-through` is a **write** (it advances the cursor), so it takes the write lock
   like everything else — it is not a "pure read." Plain `read`/`peek` without ack are reads.
 - **Presence is implicit and display-only.** There is no `heartbeat` or `register` command in
