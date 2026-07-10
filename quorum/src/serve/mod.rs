@@ -1973,19 +1973,36 @@ async fn tick(
                         for effect in &tr.effects {
                             match effect {
                                 Effect::ResumeReviewer => {
-                                    // C6: tear down existing reviewer so Phase 5
-                                    // respawns a fresh one with current PR context.
+                                    // C6: feed the existing reviewer a re-review
+                                    // turn so it keeps its session context.
                                     if let Some(ri) = reviewers
                                         .iter()
                                         .position(|r| r.task_id == workers[wi].task_id)
                                     {
-                                        log(&format!(
-                                            "ResumeReviewer: tearing down reviewer \
-                                             for task #{}",
-                                            workers[wi].task_id
-                                        ));
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                        let rereview_turn = reviewer::build_rereview_turn(
+                                            &reviewers[ri].agent_name,
+                                            pr,
+                                            &workers[wi].agent_name,
+                                        );
+                                        if let Err(e) =
+                                            reviewers[ri].proc.feed_turn(&rereview_turn).await
+                                        {
+                                            log(&format!(
+                                                "ResumeReviewer: feed_turn failed \
+                                                 for task #{}: {e} — tearing down",
+                                                workers[wi].task_id
+                                            ));
+                                            let r = reviewers.remove(ri);
+                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                        } else {
+                                            log(&format!(
+                                                "ResumeReviewer: fed re-review turn \
+                                                 to {} for task #{}",
+                                                reviewers[ri].agent_name, workers[wi].task_id
+                                            ));
+                                            reviewers[ri].turn_started_at =
+                                                std::time::Instant::now();
+                                        }
                                     }
                                 }
                                 other => {

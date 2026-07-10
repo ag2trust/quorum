@@ -126,6 +126,26 @@ pub fn build_worker_turn(
     ))
 }
 
+pub fn build_rereview_turn(reviewer_name: &str, pr: i64, worker_agent: &str) -> String {
+    super::agent::user_turn(&format!(
+        "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
+         Invoke the `pr-review` skill (via the Skill tool) and follow it. If the skill \
+         is unavailable, read the full PR diff and surrounding code, check the repo \
+         CLAUDE.md invariants, and check the PR's verification evidence.\n\n\
+         Review contract (#206 — the verdict MUST match your own findings):\n\
+         - Classify every finding as BLOCKING or advisory.\n\
+         - Zero blocking findings: run: quorum done --agent {name} --pr {pr} \
+         --verdict approved --blocking 0\n\
+         - One or more blocking findings: run: quorum done --agent {name} --pr {pr} \
+         --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\n\
+         Do NOT merge the PR yourself — the daemon handles merging.\n\
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+        worker = worker_agent,
+        name = reviewer_name,
+        pr = pr,
+    ))
+}
+
 pub fn build_rework_turn(
     agent_name: &str,
     task_id: i64,
@@ -267,6 +287,40 @@ mod tests {
     }
 
     #[test]
+    fn rereview_turn_contains_pr_and_agents() {
+        let turn = build_rereview_turn("Rev-1", 42, "Worker-1");
+        assert!(turn.contains("PR #42"));
+        assert!(turn.contains("Worker-1"));
+        assert!(turn.contains("Rev-1"));
+        assert!(
+            turn.contains("quorum done --agent Rev-1 --pr 42"),
+            "rereview template must instruct reviewer to signal done with PR number"
+        );
+        assert!(
+            turn.contains("--verdict approved"),
+            "rereview template must include approval instruction"
+        );
+        assert!(
+            turn.contains("--verdict changes"),
+            "rereview template must include changes instruction"
+        );
+        assert!(
+            turn.contains("Do NOT merge the PR yourself"),
+            "rereview template must forbid reviewer merging"
+        );
+        assert!(
+            turn.contains("pr-review"),
+            "rereview template must reference the pr-review skill"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&turn).unwrap();
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(
+            parsed["message"]["role"], "user",
+            "claude CLI exits 1 on turns without message.role"
+        );
+    }
+
+    #[test]
     fn worker_turn_contains_agent_and_task() {
         let turn = build_worker_turn("Agent-1", 99, "Fix the bug", "Detailed body text", None);
         assert!(turn.contains("Agent-1"));
@@ -331,6 +385,7 @@ mod tests {
             ("worker", build_worker_turn("A", 1, "t", "b", None)),
             ("reviewer", build_review_prompt(&spec)),
             ("rework", build_rework_turn("A", 1, 1, "fix it", 0.0, None)),
+            ("rereview", build_rereview_turn("R", 1, "W")),
         ];
 
         let clap_cmd = crate::cli::Cli::command();
