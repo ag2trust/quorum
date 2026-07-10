@@ -1131,6 +1131,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::Classify {
             backfill,
             agent_bin,
+            no_bare_agent,
         } => {
             if !backfill {
                 return Err(QuorumError::Usage(
@@ -1152,16 +1153,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
             for chunk in tasks.chunks(batch_size) {
                 let turn = serve::classifier::classifier_turn(chunk, &[]);
-                let spec = serve::agent::AgentSpec {
-                    model: serve::classifier::CLASSIFIER_MODEL.to_string(),
-                    effort: serve::classifier::CLASSIFIER_EFFORT.to_string(),
-                    session_id: serve::agent::new_session_id(),
-                    worktree: std::env::current_dir()
-                        .unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                    bare: true,
-                    allowed_tools: String::new(),
-                    env_vars: vec![],
-                };
+                let spec = serve::classifier::classifier_spec(
+                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    !no_bare_agent,
+                );
 
                 let rt = tokio::runtime::Runtime::new()
                     .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;

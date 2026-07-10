@@ -182,6 +182,89 @@ mod tests {
         );
     }
 
+    /// Zero-token contract tests against the REAL installed claude CLI.
+    ///
+    /// Both 2026-07-10 live incidents (non-UUID --session-id crash-loop, then
+    /// bare-agent "Not logged in" crash-loop) failed at the CLI boundary
+    /// *before* any API call — fake_agent accepts anything, so only the real
+    /// binary can catch them. These tests guarantee zero token spend by
+    /// pointing CLAUDE_CONFIG_DIR at an empty dir and blanking every
+    /// credential env var: the run can reach auth, never the API.
+    ///
+    /// Skipped (pass with a note) when no `claude` is on PATH (e.g. CI).
+    fn claude_available() -> bool {
+        std::process::Command::new("claude")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn no_auth_env(tmp: &std::path::Path) -> Vec<(String, String)> {
+        vec![
+            ("CLAUDE_CONFIG_DIR".into(), tmp.display().to_string()),
+            ("ANTHROPIC_API_KEY".into(), String::new()),
+            ("ANTHROPIC_AUTH_TOKEN".into(), String::new()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), String::new()),
+        ]
+    }
+
+    /// Positive contract: a production-built spec must clear the CLI's
+    /// argument validation. Any stream event back (init, assistant,
+    /// result — even an auth-failure result) proves the args parsed;
+    /// instant exit with no events is exactly the crash-loop signature.
+    #[tokio::test]
+    async fn real_cli_accepts_production_agent_spec_args() {
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = crate::serve::classifier::classifier_spec(tmp.path(), true);
+        spec.env_vars = no_auth_env(tmp.path());
+
+        let mut proc = AgentProc::spawn(&spec, None).expect("spawn claude");
+        proc.feed_turn(&user_turn("ping")).await.expect("feed turn");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("claude produced no event within 60s — args may hang the CLI");
+        proc.kill_and_reap().await;
+        assert!(
+            event.is_some(),
+            "claude exited without emitting any stream event — the AgentSpec \
+             argument surface was rejected at CLI validation (crash-loop class)"
+        );
+    }
+
+    /// Negative control pinning the #297 failure mode: a non-UUID session id
+    /// must make the CLI exit with NO stream events. If this ever starts
+    /// emitting events, the CLI relaxed its validation and the positive
+    /// test's discriminator needs a rethink.
+    #[tokio::test]
+    async fn real_cli_rejects_non_uuid_session_id() {
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = crate::serve::classifier::classifier_spec(tmp.path(), true);
+        spec.session_id = "classifier-1".into();
+        spec.env_vars = no_auth_env(tmp.path());
+
+        let mut proc = AgentProc::spawn(&spec, None).expect("spawn claude");
+        let _ = proc.feed_turn(&user_turn("ping")).await; // may fail: process already dead
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("claude neither exited nor emitted within 60s");
+        proc.kill_and_reap().await;
+        assert!(
+            event.is_none(),
+            "claude accepted a non-UUID --session-id — CLI validation changed"
+        );
+    }
+
     /// #206: reviewers are instructed to invoke the pinned `pr-review` skill;
     /// without `Skill` in the allowlist the invocation is auto-denied under
     /// dontAsk and the review silently degrades to an unstructured read.
