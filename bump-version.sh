@@ -18,8 +18,14 @@ case "$BUMP" in
   minor) minor=$((minor + 1)); patch=0 ;;
   patch) patch=$((patch + 1)) ;;
   tag)
-    # Post-merge: tag the current HEAD and push the tag.
     tag="v${current}"
+    if [[ -n "$(git status --porcelain)" ]]; then
+      echo "error: working tree is dirty — commit or stash first" >&2
+      exit 1
+    fi
+    git checkout "$BASE_BRANCH"
+    git pull --ff-only
+    git fetch --tags
     if git tag -l "$tag" | grep -q .; then
       echo "error: tag $tag already exists" >&2
       exit 1
@@ -60,7 +66,12 @@ git checkout "$BASE_BRANCH"
 git pull --ff-only
 git checkout -b "$branch"
 
-sed -i '' "s/version = \"$current\"/version = \"$next\"/" "$CARGO_TOML"
+# Portable in-place sed (BSD vs GNU)
+if sed --version 2>/dev/null | grep -q GNU; then
+  sed -i "s/version = \"$current\"/version = \"$next\"/" "$CARGO_TOML"
+else
+  sed -i '' "s/version = \"$current\"/version = \"$next\"/" "$CARGO_TOML"
+fi
 
 cargo check --quiet 2>/dev/null
 
