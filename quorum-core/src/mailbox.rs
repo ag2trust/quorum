@@ -368,4 +368,65 @@ mod tests {
         assert_eq!(unconsumed.len(), 1);
         assert_eq!(unconsumed[0].1.agent, "Beta");
     }
+
+    /// T6: if mark_consumed is skipped (simulating failure), poll_unconsumed
+    /// returns the same row on the next poll — the replay path used by the
+    /// daemon when consume_mailbox_row returns false.
+    #[test]
+    fn unconsumed_row_replays_on_next_poll() {
+        let (mut conn, _dir) = test_conn();
+        let row = MailboxRow {
+            agent: "Worker".into(),
+            kind: MailboxKind::Done,
+            task_id: Some(1),
+            pr: Some(10),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let id = append(&mut conn, &row).unwrap();
+
+        let first = poll_unconsumed(&conn).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, id);
+
+        // Simulate consume failure: skip mark_consumed.
+        // Second poll must return the same row (at-least-once delivery).
+        let second = poll_unconsumed(&conn).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].0, id, "same row must be returned on replay");
+
+        // After successful consume, row disappears.
+        mark_consumed(&mut conn, id).unwrap();
+        let third = poll_unconsumed(&conn).unwrap();
+        assert!(third.is_empty());
+    }
+
+    /// T6: mark_consumed is idempotent — calling it twice on the same row
+    /// does not error (the row is already consumed, UPDATE is a no-op).
+    #[test]
+    fn mark_consumed_idempotent() {
+        let (mut conn, _dir) = test_conn();
+        let row = MailboxRow {
+            agent: "X".into(),
+            kind: MailboxKind::Done,
+            task_id: Some(1),
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let id = append(&mut conn, &row).unwrap();
+
+        mark_consumed(&mut conn, id).unwrap();
+        // Second call must not fail.
+        mark_consumed(&mut conn, id).unwrap();
+
+        let unconsumed = poll_unconsumed(&conn).unwrap();
+        assert!(unconsumed.is_empty());
+    }
 }

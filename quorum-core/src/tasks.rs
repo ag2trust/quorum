@@ -2195,4 +2195,114 @@ mod tests {
             "task-create must reject effort:low, got {err:?}"
         );
     }
+
+    // ── T6: lifecycle replay idempotency ──────────────────────────────────
+
+    /// T6: replaying SignaledDone on a task already in in-review fails with
+    /// InvalidTransition (Usage error), not corruption. This is the safety
+    /// net for the mailbox consume-failure replay path.
+    #[test]
+    fn replay_signaled_done_is_harmless() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+
+        // First apply: working → in-review.
+        let r = apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+
+        // Replay: same event again (simulates consume failure + re-poll).
+        let err = apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1002,
+        );
+        assert!(
+            err.is_err(),
+            "replay must be rejected, not silently applied"
+        );
+
+        // Task state is unchanged — no corruption.
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+    }
+
+    /// T6: replaying VerdictApprove on a task already in merging fails
+    /// harmlessly.
+    #[test]
+    fn replay_verdict_approve_is_harmless() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+
+        // First: in-review → merging.
+        let r = apply_event(&mut c, "R", id, &Event::VerdictApprove, 1003).unwrap();
+        assert_eq!(r.task.status, "merging");
+
+        // Replay: merging + VerdictApprove is invalid.
+        let err = apply_event(&mut c, "R", id, &Event::VerdictApprove, 1004);
+        assert!(err.is_err());
+
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "merging");
+    }
+
+    /// T6: replaying a Done mailbox row after the task is cancelled fails
+    /// harmlessly — the daemon's C3 path.
+    #[test]
+    fn replay_signaled_done_on_cancelled_task_is_harmless() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+
+        apply_event(
+            &mut c,
+            "boss",
+            id,
+            &Event::Cancelled {
+                by: "boss".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Worker tries SignaledDone on cancelled task (C3 replay scenario).
+        let err = apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "42".to_string(),
+            },
+            1002,
+        );
+        assert!(err.is_err());
+
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+    }
 }

@@ -1,8 +1,8 @@
 //! Integration tests for self-update drain mode (issue #159).
 //!
 //! Verifies: Trigger A (self-repo merge → drain → exit 75), negative path
-//! (other-repo merge does NOT trigger drain), drain timeout path, and
-//! queued tasks survive restart.
+//! (other-repo merge does NOT trigger drain), drain timeout path,
+//! queued tasks survive restart, and T3: drain timeout with merge-in-progress.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -549,5 +549,143 @@ fn drain_timeout_force_kills_and_exits_75() {
     assert!(
         stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
         "queued task was not left open for next generation: {stdout}"
+    );
+}
+
+/// T3 regression: drain timeout must be honored even when tick() is blocked
+/// inside wait_for_checks. With drain_timeout_secs=2 and
+/// merge_checks_timeout_secs=30, the daemon must exit within the drain window,
+/// not after the merge-checks timeout.
+///
+/// Expected: FAILS against current code (wait_for_checks blocks the tick loop,
+/// preventing the drain-timeout check from firing). Ignored until the fix
+/// lands — un-ignore to verify the fix.
+#[test]
+#[ignore]
+fn drain_timeout_honored_during_merge_checks() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task_with_refs(
+        home.path(),
+        "Task with long merge checks",
+        r#"{"repo":"test-owner/test-repo"}"#,
+    );
+
+    // checks-cmd always returns "pending" → wait_for_checks blocks for up to
+    // merge_checks_timeout_secs (30s) inside a spawn_blocking.
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--self-update-drain",
+            "--self-repo",
+            "test-owner/test-repo",
+            "--drain-timeout-secs",
+            "2",
+            "--merge-checks-cmd",
+            "echo pending",
+            "--merge-checks-timeout-secs",
+            "30",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned: {:?}",
+        handle.lines
+    );
+
+    let agent_name = handle
+        .extract_agent_name("spawning agent ")
+        .expect("could not extract agent name");
+
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen: {:?}",
+        handle.lines
+    );
+
+    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned: {:?}",
+        handle.lines
+    );
+
+    let reviewer_name = handle
+        .extract_agent_name("spawning reviewer ")
+        .expect("could not extract reviewer name");
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen: {:?}",
+        handle.lines
+    );
+
+    // Reviewer approves → daemon enters wait_for_checks (blocks up to 30s).
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "42",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("waiting for checks", 15),
+        "daemon did not enter merge-checks wait: {:?}",
+        handle.lines
+    );
+
+    // Now trigger drain via SIGINT while wait_for_checks is blocking tick().
+    let drain_start = std::time::Instant::now();
+    unsafe {
+        libc::kill(handle.child.id() as libc::pid_t, libc::SIGINT);
+    }
+
+    // The daemon must exit within drain_timeout (2s) + margin (6s for tick
+    // latency and teardown). If wait_for_checks blocks the drain check, it
+    // won't exit for ~30s → test fails.
+    let status = handle
+        .wait_exit(8)
+        .expect("daemon did not exit within 8s (drain timeout is 2s)");
+
+    let elapsed = drain_start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "daemon took {elapsed:?} to exit — drain_timeout_secs=2 was violated \
+         (wait_for_checks blocked the tick loop)"
+    );
+
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected exit 0 (signal drain), got {:?}. Lines: {:?}",
+        status.code(),
+        handle.lines
     );
 }
