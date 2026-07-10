@@ -1906,6 +1906,13 @@ async fn tick(
                                         }
                                     }
                                 }
+                                Effect::SpawnReviewer => {
+                                    // Intentionally deferred: reviewer spawning for a
+                                    // newly-InReview task is picked up by the Phase 5
+                                    // tick reconciler ("Spawn reviewers for workers with
+                                    // PRs"), not dispatched inline here. Costs at most
+                                    // one tick — not worth a log line on every task.
+                                }
                                 other => {
                                     log(&format!(
                                         "WARN: unhandled effect {} at done-signal site",
