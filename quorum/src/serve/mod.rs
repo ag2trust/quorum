@@ -3080,7 +3080,7 @@ async fn spawn_reviewer_for_worker(
         reviewer_name, pr, worker.agent_name
     ));
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = agent::new_session_id();
     let branch = reviewer::reviewer_branch(pr, &reviewer_name);
     let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &reviewer_name);
 
@@ -3465,7 +3465,7 @@ async fn spawn_worker(
 
     let worker_repo_dir = &config.repo_dir;
 
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = agent::new_session_id();
     let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task.id);
     let wt_path = config
         .worktree_base

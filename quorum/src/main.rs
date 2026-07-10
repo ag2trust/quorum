@@ -1155,7 +1155,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 let spec = serve::agent::AgentSpec {
                     model: serve::classifier::CLASSIFIER_MODEL.to_string(),
                     effort: serve::classifier::CLASSIFIER_EFFORT.to_string(),
-                    session_id: format!("classify-backfill-{}", chunk[0].id),
+                    session_id: serve::agent::new_session_id(),
                     worktree: std::env::current_dir()
                         .unwrap_or_else(|_| std::path::PathBuf::from(".")),
                     bare: true,

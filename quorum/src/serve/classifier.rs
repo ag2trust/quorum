@@ -25,7 +25,7 @@ pub fn spawn_classifier(
 ) -> std::io::Result<ClassifierSlot> {
     let pending_task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
 
-    let session_id = format!("classifier-{}", pending_task_ids.first().unwrap_or(&0));
+    let session_id = super::agent::new_session_id();
 
     let spec = AgentSpec {
         model: CLASSIFIER_MODEL.to_string(),
