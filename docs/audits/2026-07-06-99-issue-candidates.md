@@ -24,6 +24,7 @@
 | 05-storage-cli | 6 (1 merged into lifecycle) |
 | 06-ops-scripts-test-harness | 10 |
 | watchdog live incidents (Gantry-m3) | 2 (C6, C7) |
+| 03-recovery (promoted out-of-scope handoff) | 1 (M10) |
 
 **Discernment pass (2026-07-06, Gantry-m3 + owner):** 39 of 40 marked `FILE: yes`, M9 marked `FILE: no` (bikeshed-tier), C4 scenario corrected, C6/C7/M10 added. Footer item 5 (sticky_until docs) deferred.
 
@@ -147,7 +148,9 @@ orphan (live-confirmed on task #18, 2026-07-06; see C7). No `NotifyOwner` effect
 emitted, so the failure is silent.
 
 *(Corrected 2026-07-06 during review of PR #251: the original audit scenario claimed
-the task is forced to `open`; that path is guarded — the real outcome is the orphan.)*
+the task is forced to `open`; that path is guarded — the real outcome is the orphan.
+The original duplicate-work scenario is blocked by the `WHERE status='working'` guard
+at all current call sites; the related force-kill gap is tracked as M10.)*
 
 **Evidence:** `quorum/src/serve/recovery.rs:143–158` (raw tasks::update),
 `quorum/src/serve/recovery.rs:388–420` (release_and_cleanup implementation).
@@ -756,7 +759,7 @@ Sourced from: audits/2026-07-06-05-storage-cli.md — Finding 6
 
 `title:` bug: force-kill during merge leaves task stuck in merging state
 `severity:` medium
-`labels:` `["kind:bug","severity:medium","audit:lifecycle","audit:recovery"]`
+`labels:` `["kind:bug","severity:medium","audit:lifecycle","audit:recovery","source:audit-03"]`
 `needs_owner_call:` no
 `FILE:` yes
 
