@@ -2175,4 +2175,54 @@ mod tests {
         assert_eq!(tasks.len(), 1, "only recently-done task should appear");
         assert_eq!(tasks[0].id, t_recent);
     }
+
+    #[test]
+    fn working_phase_worker_with_no_activity_counts_as_stalled() {
+        let view = DaemonAgentView {
+            agent: "W1".into(),
+            role: "worker".into(),
+            task_id: Some(1),
+            phase: "working".into(),
+            cost_tokens: 500,
+            agent_state: None,
+            cost_usd: 0.05,
+            log_dir: None,
+            last_activity_age_secs: None,
+            task_title: None,
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
+        };
+        assert!(is_stall_eligible(&view));
+        let health = compute_health(&[view], false);
+        assert_eq!(health, HealthVerdict::Stalled);
+    }
+
+    #[test]
+    fn awaiting_review_worker_is_not_stall_eligible() {
+        let view = DaemonAgentView {
+            agent: "W1".into(),
+            role: "worker".into(),
+            task_id: Some(1),
+            phase: "awaiting-review".into(),
+            cost_tokens: 500,
+            agent_state: None,
+            cost_usd: 0.05,
+            log_dir: None,
+            last_activity_age_secs: None,
+            task_title: None,
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
+        };
+        assert!(!is_stall_eligible(&view));
+    }
 }
