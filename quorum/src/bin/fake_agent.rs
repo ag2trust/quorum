@@ -19,6 +19,8 @@
 //!   before the result, so the daemon's tool_count/now_label code paths get exercised.
 //! - `FAKE_AGENT_SIDE_EFFECTS=1`: after the result event on turn 1, calls
 //!   `quorum done --agent $QUORUM_AGENT` as a real subprocess, creating a mailbox row.
+//! - `FAKE_AGENT_ERROR_RESULT=N`: emits `is_error: true` on the first N turns,
+//!   then succeeds on subsequent turns. Used to test the daemon's error-refeed logic.
 
 use std::io::{self, BufRead, Write};
 use std::process::Command;
@@ -43,12 +45,17 @@ fn emit_tool_use(name: &str, input: serde_json::Value) {
     io::stdout().flush().ok();
 }
 
-fn emit_result(turn: u32, cumulative_cost: f64) {
+fn emit_result(turn: u32, cumulative_cost: f64, is_error: bool) {
     let input_tokens = 500 * turn as u64;
     let output_tokens = 200 * turn as u64;
+    let result_text = if is_error {
+        format!("API Error: Connection closed mid-response (turn {turn})")
+    } else {
+        format!("turn-{turn}-complete")
+    };
     let msg = serde_json::json!({
         "type": "result",
-        "result": format!("turn-{turn}-complete"),
+        "result": result_text,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -56,7 +63,7 @@ fn emit_result(turn: u32, cumulative_cost: f64) {
         "total_cost_usd": cumulative_cost,
         "num_turns": turn,
         "duration_ms": 1000 * turn as u64,
-        "is_error": false,
+        "is_error": is_error,
     });
     println!("{}", msg);
     io::stdout().flush().ok();
@@ -105,6 +112,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs);
+    let error_result_count: u32 = std::env::var("FAKE_AGENT_ERROR_RESULT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let stdin = io::stdin();
     let mut turn: u32 = 0;
@@ -164,7 +175,8 @@ fn main() {
         let output_tokens = 200 * turn as u64;
         cumulative_cost += (input_tokens + output_tokens) as f64 * cost_per_token;
 
-        emit_result(turn, cumulative_cost);
+        let is_error = error_result_count > 0 && turn <= error_result_count;
+        emit_result(turn, cumulative_cost, is_error);
 
         if side_effects && turn == 1 {
             run_quorum_done();

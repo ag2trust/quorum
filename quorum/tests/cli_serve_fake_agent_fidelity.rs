@@ -320,3 +320,87 @@ fn emit_tool_use_mode_exercises_tool_count_and_now_label() {
 
     handle.stop();
 }
+
+/// FAKE_AGENT_ERROR_RESULT=1: turn 1 emits is_error=true, the daemon auto-refeeds,
+/// turn 2 succeeds normally.
+#[test]
+fn error_result_triggers_auto_refeed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    let log_dir = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Error refeed test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        log_dir.path(),
+        &[("FAKE_AGENT_ERROR_RESULT", "1")],
+    );
+
+    assert!(
+        handle.wait_for("auto-refeed worker", 20),
+        "daemon should auto-refeed after error-terminated turn. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("result", 15),
+        "agent should produce a second (successful) result after refeed. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+/// FAKE_AGENT_ERROR_RESULT=99: every turn errors. After MAX_ERROR_RETRIES (3) the
+/// daemon fires AgentFailed and the task returns to open.
+#[test]
+fn repeated_error_results_fire_agent_failed() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    let log_dir = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Error cap test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        log_dir.path(),
+        &[("FAKE_AGENT_ERROR_RESULT", "99")],
+    );
+
+    assert!(
+        handle.wait_for("exhausted error retries", 30),
+        "daemon should fire AgentFailed after max error retries. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}

@@ -30,6 +30,7 @@ use worktree::WorktreeManager;
 
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
+const MAX_ERROR_RETRIES: u32 = 3;
 
 struct PoisonTracker {
     strikes: HashMap<i64, u32>,
@@ -432,6 +433,7 @@ pub(crate) struct SlotState {
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
+    error_turn_count: u32,
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -1964,6 +1966,63 @@ async fn tick(
         cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
     }
 
+    // ── Phase 4-refeed: Auto-refeed workers whose last turn ended with an error ──
+    // An error-terminated result (is_error=true) leaves the worker idle with
+    // error_turn_count > 0. Re-feed a continuation turn so the agent retries.
+    // After MAX_ERROR_RETRIES consecutive errors, fire AgentFailed.
+    let mut error_failed: Vec<usize> = Vec::new();
+    for (i, w) in workers.iter_mut().enumerate() {
+        if w.error_turn_count == 0 || w.draining {
+            continue;
+        }
+        if w.error_turn_count >= MAX_ERROR_RETRIES {
+            log(&format!(
+                "worker {} exhausted error retries ({}/{}) on task #{} — firing AgentFailed",
+                w.agent_name, w.error_turn_count, MAX_ERROR_RETRIES, w.task_id
+            ));
+            error_failed.push(i);
+            continue;
+        }
+        let turn = agent::user_turn(&format!(
+            "Your previous turn was interrupted by a transport/API error (attempt {}/{}). \
+             Verify any partial state from your last turn, then continue your task.",
+            w.error_turn_count, MAX_ERROR_RETRIES
+        ));
+        match w.proc.feed_turn(&turn).await {
+            Ok(()) => {
+                w.draining = true;
+                w.turn_started_at = std::time::Instant::now();
+                log(&format!(
+                    "auto-refeed worker {} after error (attempt {}/{})",
+                    w.agent_name, w.error_turn_count, MAX_ERROR_RETRIES
+                ));
+            }
+            Err(e) => {
+                log(&format!(
+                    "auto-refeed worker {} failed: {e} — marking for AgentFailed",
+                    w.agent_name
+                ));
+                error_failed.push(i);
+            }
+        }
+    }
+    for &i in error_failed.iter().rev() {
+        let dead = workers.remove(i);
+        fire_event(
+            &db_path,
+            &dead.agent_name,
+            dead.task_id,
+            &Event::AgentFailed {
+                reason: format!(
+                    "worker exhausted error retries ({} consecutive error-terminated turns)",
+                    dead.error_turn_count
+                ),
+            },
+        )
+        .await;
+        cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+    }
+
     // ── Phase 4a-drain: Tear down idle agents during drain ──────────────
     // During drain, agents that have finished their current turn (draining=false)
     // should be torn down immediately — no new reviewers/work will be spawned.
@@ -2543,8 +2602,10 @@ async fn drain_events(
             stream::Event::Result {
                 usage,
                 total_cost_usd,
+                is_error,
                 ..
             } => {
+                let error_terminated = is_error.unwrap_or(false);
                 let turn_tokens = usage
                     .as_ref()
                     .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
@@ -2557,25 +2618,28 @@ async fn drain_events(
                 }
                 let turn_cost_usd = total_cost_usd.map(|c| (c - prev_cost).max(0.0));
                 log(&format!(
-                    "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
-                    slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd
+                    "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}{})",
+                    slot.agent_name,
+                    turn_tokens,
+                    slot.cost_tokens,
+                    slot.cost_usd,
+                    if error_terminated { ", ERROR" } else { "" }
                 ));
 
-                if let Some(ref mut sl) = slot.session_log {
-                    sl.update_cost(slot.cost_tokens, slot.cost_usd);
-                    sl.set_phase(if role == "worker" {
-                        "awaiting-review"
-                    } else {
-                        "reviewing"
-                    });
-                }
-
-                let p = db_path.to_path_buf();
-                let phase = if role == "worker" {
+                let phase = if error_terminated {
+                    "working"
+                } else if role == "worker" {
                     "awaiting-review"
                 } else {
                     "reviewing"
                 };
+
+                if let Some(ref mut sl) = slot.session_log {
+                    sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                    sl.set_phase(phase);
+                }
+
+                let p = db_path.to_path_buf();
                 let entry = slot_journal_entry(slot, role, phase);
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -2589,6 +2653,12 @@ async fn drain_events(
                 slot.live_stats.mid_turn_tokens = 0;
                 slot.live_stats.record_event();
                 write_live_sidecar(slot);
+
+                if error_terminated {
+                    slot.error_turn_count += 1;
+                } else {
+                    slot.error_turn_count = 0;
+                }
 
                 if let Some(ref mut sl) = slot.session_log {
                     sl.log_event(&event);
@@ -2990,6 +3060,7 @@ async fn spawn_reviewer_for_worker(
                 agent_state: None,
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
+                error_turn_count: 0,
             });
         }
         Err(e) => {
@@ -3286,6 +3357,7 @@ async fn spawn_worker(
                 agent_state: None,
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
+                error_turn_count: 0,
             });
         }
         Err(e) => {
@@ -3712,6 +3784,7 @@ mod tests {
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
+            error_turn_count: 0,
         }
     }
 
