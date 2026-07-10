@@ -41,7 +41,7 @@ case "$BUMP" in
     echo "  patch  0.2.0 -> 0.2.1  (default)"
     echo "  minor  0.2.0 -> 0.3.0"
     echo "  major  0.2.0 -> 1.0.0"
-    echo "  tag    tag current version + push (run after PR merges)"
+    echo "  tag    manual fallback: tag current version + push (CI does this automatically)"
     exit 2
     ;;
 esac
@@ -88,4 +88,5 @@ pr_url=$(gh pr create \
 
 echo ""
 echo "PR created: $pr_url"
-echo "after merge, run:  ./bump-version.sh tag"
+echo "after merge, CI auto-tags ${tag} and triggers the release build"
+echo "(manual fallback if CI fails: ./bump-version.sh tag)"

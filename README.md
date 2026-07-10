@@ -37,8 +37,9 @@ quorum init                  # create ~/.quorum/, the DB, and a default config
 `install.sh` detects your platform, downloads the matching release asset to `~/.local/bin/`,
 and verifies its SHA-256 before installing (refuses on mismatch). Re-run it to upgrade. Pin a
 version with `./install.sh v0.2.0`; change the destination with `QUORUM_INSTALL_DIR=...`.
-Prebuilt targets: `x86_64` Linux and Apple Silicon / Intel macOS. (Releases are published by
-`.github/workflows/release.yml` on every `v*` tag.)
+Prebuilt targets: `x86_64` Linux and Apple Silicon / Intel macOS. (Releases are published
+automatically: merging a version-bump PR triggers `.github/workflows/auto-tag.yml`, which
+creates the `v*` tag and chains to `.github/workflows/release.yml` for the build.)
 
 ### From source
 

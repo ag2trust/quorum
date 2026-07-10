@@ -7,6 +7,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Tag name (e.g. v0.2.3) — passed by auto-tag workflow'
+        required: true
+        type: string
 
 permissions:
   contents: write # required to create the Release and upload assets
@@ -18,6 +24,8 @@ jobs:
   build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     strategy:
       fail-fast: false
       matrix:
@@ -44,8 +52,7 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          # Tag-triggered: action-gh-release creates/updates the Release for this tag and
-          # uploads each matrix job's assets to it.
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             quorum-${{ matrix.target }}.tar.gz
             quorum-${{ matrix.target }}.tar.gz.sha256
