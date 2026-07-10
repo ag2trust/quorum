@@ -81,7 +81,11 @@ fn emit_classifier_result(line: &str, bare: bool) {
             ids.push(id);
         }
     }
-    let tag = if bare { "area:fake-bare" } else { "area:fake-nobare" };
+    let tag = if bare {
+        "area:fake-bare"
+    } else {
+        "area:fake-nobare"
+    };
     let tasks: Vec<serde_json::Value> = ids
         .iter()
         .map(|id| {
