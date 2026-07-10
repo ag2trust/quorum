@@ -307,6 +307,7 @@ pub struct ServeConfig {
 pub const EXIT_SELF_UPDATE: i32 = 75;
 
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
+const DRIFT_CHECK_INTERVAL_SECS: u64 = 15 * 60;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     log(&format!(
@@ -449,6 +450,58 @@ fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Option
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout.split_whitespace().next().map(|s| s.to_string())
+}
+
+/// Run unbacked/twin PR drift detection. Shells out to `gh pr list`,
+/// compares against task refs.pr, and emits one-time events. Fail-open on
+/// any error (API unavailable, parse failure, etc.).
+fn run_drift_check(db_path: &std::path::Path, repo: &str) -> Result<()> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--json",
+            "number,title,headRefName",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+        ])
+        .output()
+        .map_err(|e| QuorumError::Io(format!("gh pr list: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(QuorumError::Io(format!("gh pr list failed: {stderr}")));
+    }
+    let open_prs: Vec<quorum_core::drift::GhPr> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| QuorumError::Io(format!("gh pr list parse: {e}")))?;
+
+    let mut conn = quorum_core::db::open(db_path)?;
+    let task_prs = quorum_core::drift::task_pr_refs(&conn)?;
+    let task_branches = quorum_core::drift::task_branch_allocations(&conn)?;
+    let drift = quorum_core::drift::detect(&open_prs, &task_prs, &task_branches);
+
+    let now = now_unix();
+
+    for u in &drift.unbacked {
+        log(&format!(
+            "DRIFT: unbacked PR #{} \"{}\" (branch: {})",
+            u.number, u.title, u.branch
+        ));
+    }
+    for t in &drift.twins {
+        let prs: Vec<String> = t.pr_numbers.iter().map(|n| format!("#{n}")).collect();
+        log(&format!(
+            "DRIFT: twin PRs for task #{}: {}",
+            t.task_id,
+            prs.join(", ")
+        ));
+    }
+
+    quorum_core::drift::emit_drift_events(&mut conn, &drift, now)?;
+    Ok(())
 }
 
 /// Why the daemon entered drain mode.
@@ -613,6 +666,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
+    let mut last_drift_check: Option<std::time::Instant> = None;
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -799,6 +853,24 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log(&format!("DRAIN: exiting {exit} (sha={sha})"));
                 return Ok(exit);
             }
+        }
+
+        // ── Drift check: unbacked/twin PR detection (~15 min cadence) ──
+        let should_drift_check = match last_drift_check {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= DRIFT_CHECK_INTERVAL_SECS,
+        };
+        if should_drift_check {
+            last_drift_check = Some(std::time::Instant::now());
+            let db = config.db_path.clone();
+            let repo = config.repo.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = run_drift_check(&db, &repo) {
+                    log(&format!("drift check failed (fail-open): {e}"));
+                }
+            })
+            .await
+            .ok();
         }
 
         if let Err(e) = tick(

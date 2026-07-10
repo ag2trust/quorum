@@ -11,6 +11,7 @@ pub mod clock;
 pub mod control;
 pub mod daemon_lock;
 pub mod db;
+pub mod drift;
 pub mod errlog;
 pub mod error;
 pub mod events;
