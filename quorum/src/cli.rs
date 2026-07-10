@@ -485,6 +485,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Classify tasks: assign complexity scores, shape-lint flags, type tags,
+    /// and duplicate-of hints. Primarily driven by the daemon; this command is
+    /// for manual backfill of historical tasks.
+    Classify {
+        /// Backfill all tasks (any status) that lack a complexity score.
+        #[arg(long)]
+        backfill: bool,
+        /// Override the agent binary (default: "claude").
+        #[arg(long)]
+        agent_bin: Option<String>,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]

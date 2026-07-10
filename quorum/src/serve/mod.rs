@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod approvals;
+pub mod classifier;
 pub mod merge;
 pub mod names;
 pub mod recovery;
@@ -682,6 +683,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
+    let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -758,6 +760,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         // Check if heartbeat task detected lock theft.
         if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
             log("daemon lock stolen — tearing down and exiting");
+            if let Some(slot) = classifier_slot.take() {
+                slot.proc.kill_and_reap().await;
+            }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
             }
@@ -774,6 +779,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("force shutdown (second signal)");
             } else {
                 log("shutting down (signal, no in-flight agents)");
+            }
+            if let Some(slot) = classifier_slot.take() {
+                slot.proc.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
@@ -795,6 +803,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         if let Some(ref sentinel) = config.exit_when_gone {
             if !sentinel.exists() {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
+                if let Some(slot) = classifier_slot.take() {
+                    slot.proc.kill_and_reap().await;
+                }
                 for r in reviewers.drain(..) {
                     r.proc.kill_and_reap().await;
                     name_pool.release(&r.agent_name);
@@ -858,6 +869,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     workers.len(),
                     reviewers.len(),
                 ));
+                if let Some(slot) = classifier_slot.take() {
+                    slot.proc.kill_and_reap().await;
+                }
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
                 }
@@ -898,6 +912,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut reviewer_provision_tracker,
             &mut drain_state,
             &mut lifetime_roster,
+            &mut classifier_slot,
         )
         .await
         {
@@ -915,6 +930,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     // can't gracefully teardown (that writes to the DB, which also fails
                     // against a too-new schema); just reap the processes and release their
                     // names. Journal recovery reclaims the tasks on restart.
+                    if let Some(slot) = classifier_slot.take() {
+                        slot.proc.kill_and_reap().await;
+                    }
                     for r in reviewers.drain(..) {
                         r.proc.kill_and_reap().await;
                         name_pool.release(&r.agent_name);
@@ -944,6 +962,7 @@ async fn tick(
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
+    classifier_slot: &mut Option<classifier::ClassifierSlot>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -2545,6 +2564,118 @@ async fn tick(
             .await?
             {
                 break;
+            }
+        }
+    }
+
+    // ── Phase 7: Task classifier ─────────────────────────────────────
+    // 7a: Drain events from in-flight classifier.
+    if let Some(slot) = classifier_slot.as_mut() {
+        // Check if the classifier process exited.
+        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+
+        if let Some(result) = classifier::drain_classifier_events(slot).await {
+            match result {
+                classifier::ClassifierResult::Done(text) => {
+                    if let Some(results) = classifier::parse_response(&text) {
+                        let p = db_path.clone();
+                        let version = quorum_core::classify::CLASSIFIER_VERSION.to_string();
+                        let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            let now = now_unix();
+                            quorum_core::classify::store_classifications(
+                                &mut conn, &results, &version, now,
+                            )
+                        })
+                        .await
+                        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                        .unwrap_or(0);
+
+                        if stored > 0 {
+                            log(&format!("classifier: stored {stored} classification(s)"));
+                        }
+                    } else {
+                        log("classifier: failed to parse response");
+                    }
+                    *classifier_slot = None;
+                }
+                classifier::ClassifierResult::Error(e) => {
+                    log(&format!("classifier: {e}"));
+                    *classifier_slot = None;
+                }
+            }
+        } else if exited {
+            // Process exited without a Result event.
+            if !slot.response_text.is_empty() {
+                let text = std::mem::take(&mut slot.response_text);
+                if let Some(results) = classifier::parse_response(&text) {
+                    let p = db_path.clone();
+                    let version = quorum_core::classify::CLASSIFIER_VERSION.to_string();
+                    let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        let now = now_unix();
+                        quorum_core::classify::store_classifications(
+                            &mut conn, &results, &version, now,
+                        )
+                    })
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                    .unwrap_or(0);
+
+                    if stored > 0 {
+                        log(&format!("classifier: stored {stored} classification(s)"));
+                    }
+                } else {
+                    log("classifier: process exited without parseable response");
+                }
+            } else {
+                log("classifier: process exited without response");
+            }
+            *classifier_slot = None;
+        }
+    }
+
+    // 7b: Spawn classifier if idle and there are unclassified tasks.
+    if classifier_slot.is_none() && !drain_state.draining {
+        let p = db_path.clone();
+        let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
+            let conn = quorum_core::db::open(&p)?;
+            let tasks = quorum_core::classify::unclassified_tasks(&conn)?;
+            if tasks.is_empty() {
+                return Ok((vec![], vec![]));
+            }
+            let all_open = quorum_core::classify::dup_context_tasks(&conn)?;
+            let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+            let dup_context: Vec<_> = all_open
+                .into_iter()
+                .filter(|t| !task_ids.contains(&t.id))
+                .collect();
+            Ok((tasks, dup_context))
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+
+        if let Ok((tasks, dup_context)) = unclassified {
+            if !tasks.is_empty() {
+                let turn = classifier::classifier_turn(&tasks, &dup_context);
+                match classifier::spawn_classifier(
+                    &tasks,
+                    &dup_context,
+                    &config.repo_dir,
+                    config.agent_bin.as_deref(),
+                ) {
+                    Ok(mut slot) => {
+                        if let Err(e) = slot.proc.feed_turn(&turn).await {
+                            log(&format!("classifier: feed_turn failed: {e}"));
+                        } else {
+                            log(&format!("classifier: spawned for {} task(s)", tasks.len()));
+                            *classifier_slot = Some(slot);
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!("classifier: spawn failed: {e}"));
+                    }
+                }
             }
         }
     }

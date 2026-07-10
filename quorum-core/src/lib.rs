@@ -8,6 +8,7 @@ pub mod agents;
 pub mod approvals;
 pub mod branches;
 pub mod claims;
+pub mod classify;
 pub mod clock;
 pub mod control;
 pub mod daemon_lock;
