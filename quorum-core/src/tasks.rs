@@ -34,6 +34,7 @@ pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
 
 const KNOWN_TIERS: &[&str] = &["opus-46", "opus-47", "opus-48", "sonnet-5"];
 const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
+const KNOWN_COMPLEXITIES: &[&str] = &["1", "2", "3", "4", "5"];
 
 pub fn lease_target(id: i64) -> String {
     format!("task#{id}")
@@ -238,6 +239,15 @@ fn validate_labels(s: &str) -> Result<()> {
                     "invalid effort '{effort}' in --labels; only {} are accepted \
                      (serve rejects anything else at dispatch)",
                     KNOWN_EFFORTS.join(", ")
+                )));
+            }
+        }
+        if let Some(complexity) = label.strip_prefix("complexity:") {
+            if !complexity.is_empty() && !KNOWN_COMPLEXITIES.contains(&complexity) {
+                return Err(QuorumError::Usage(format!(
+                    "invalid complexity '{complexity}' in --labels; only {} are accepted \
+                     (1=mechanical one-liner, 2=single-file, 3=multi-file, 4=cross-module, 5=cross-cutting)",
+                    KNOWN_COMPLEXITIES.join(", ")
                 )));
             }
         }
@@ -2196,6 +2206,25 @@ mod tests {
             matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort")),
             "task-create must reject effort:low, got {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_labels_accepts_known_complexities() {
+        assert!(validate_labels(r#"["complexity:1"]"#).is_ok());
+        assert!(validate_labels(r#"["complexity:3"]"#).is_ok());
+        assert!(validate_labels(r#"["complexity:5"]"#).is_ok());
+        assert!(validate_labels(r#"["tier:opus-46","effort:medium","complexity:2"]"#).is_ok());
+    }
+
+    #[test]
+    fn validate_labels_rejects_invalid_complexity() {
+        let err = validate_labels(r#"["complexity:0"]"#).unwrap_err();
+        assert!(
+            matches!(&err, QuorumError::Usage(m) if m.contains("invalid complexity '0'")),
+            "got {err:?}"
+        );
+        assert!(validate_labels(r#"["complexity:6"]"#).is_err());
+        assert!(validate_labels(r#"["complexity:easy"]"#).is_err());
     }
 
     // ── T6: lifecycle replay idempotency ──────────────────────────────────

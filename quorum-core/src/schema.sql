@@ -257,6 +257,24 @@ CREATE TABLE IF NOT EXISTS daemon_lock (
     heartbeat_at  INTEGER NOT NULL
 );
 
+-- Agent-performance capture: one row per daemon-spawned agent process (worker
+-- or reviewer). Records the RESOLVED model+effort (after label→model mapping +
+-- daemon defaults) so query surfaces can cut by what actually ran, not what was
+-- requested. Rows are opened at spawn and closed at teardown/terminal.
+-- Not TTL'd — durable historical data for performance analysis.
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    agent_name  TEXT NOT NULL,
+    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    model       TEXT NOT NULL,
+    effort      TEXT NOT NULL,
+    spawned_at  INTEGER NOT NULL,
+    ended_at    INTEGER,
+    end_reason  TEXT
+);
+CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+
 -- `activity_events`: one row per Claude PostToolUse hook firing. `agent_name`
 -- is resolved at insert time (NULL if the session isn't registered).
 -- Stats-only; never read by claim/routing/sign-off code paths. TTL'd.

@@ -3,6 +3,7 @@
 //! See `docs/2026-06-23-quorum-design.md` for the design of record.
 
 pub mod activity;
+pub mod agent_runs;
 pub mod agents;
 pub mod approvals;
 pub mod branches;
