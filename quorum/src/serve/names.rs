@@ -147,19 +147,6 @@ impl Pool {
         }
     }
 
-    pub fn reclaim(&mut self, name: &str) -> bool {
-        if self.in_use.contains(name) {
-            return true;
-        }
-        if let Some(idx) = self.available.iter().position(|n| n == name) {
-            let name = self.available.remove(idx);
-            self.in_use.insert(name);
-        } else {
-            self.in_use.insert(name.to_string());
-        }
-        true
-    }
-
     pub fn has_file(&self) -> bool {
         self.has_file
     }
@@ -278,53 +265,6 @@ mod tests {
 
         pool.release(n1.name());
         assert_eq!(pool.in_use_count(), 1);
-    }
-
-    #[test]
-    fn reclaim_generated_name() {
-        let mut pool = Pool::new_generated();
-        assert!(pool.reclaim("Anvil-x3k9"));
-        assert_eq!(pool.in_use_count(), 1);
-    }
-
-    #[test]
-    fn reclaim_moves_name_to_in_use() {
-        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
-        let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
-
-        assert!(pool.reclaim("C"));
-        assert_eq!(pool.in_use_count(), 1);
-
-        let mut acquired = Vec::new();
-        for _ in 0..8 {
-            let n = pool.acquire();
-            acquired.push(n.into_name());
-        }
-        assert!(!acquired.contains(&"C".to_string()));
-
-        pool.release("C");
-        assert_eq!(pool.in_use_count(), 8);
-    }
-
-    #[test]
-    fn reclaim_unknown_name_tracks_it() {
-        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
-        let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
-        assert!(pool.reclaim("Unknown"));
-        assert_eq!(pool.in_use_count(), 1);
-    }
-
-    #[test]
-    fn reclaim_already_in_use_returns_true() {
-        let names: Vec<&str> = vec!["A", "B", "C", "D", "E", "F", "G", "H", "I"];
-        let (_f, path) = write_names_file(&names);
-        let mut pool = Pool::load(&path, 4).unwrap();
-        pool.acquire();
-        let first = pool.acquire().into_name();
-        assert!(pool.reclaim(&first));
-        assert_eq!(pool.in_use_count(), 2);
     }
 
     #[test]

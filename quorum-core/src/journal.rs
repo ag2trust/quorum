@@ -1,8 +1,8 @@
 //! Daemon journal: crash-recovery state for in-flight agents (workers and reviewers).
 //!
-//! The daemon upserts on every lifecycle transition so a restart can resurrect agents
-//! via `claude --resume <session-id>`. Keyed by agent name (one process per name at any
-//! time). Deleted on terminal transitions (merge/cancel/fail). See spec §19.
+//! The daemon upserts on every lifecycle transition so a restart can identify stale
+//! processes to kill. Keyed by agent name (one process per name at any time). Deleted
+//! on terminal transitions (merge/cancel/fail). See spec §19.
 
 use crate::clock;
 use crate::db::begin_immediate;
@@ -109,6 +109,13 @@ pub fn delete(conn: &mut Connection, agent: &str) -> Result<bool> {
     let changed = tx.execute("DELETE FROM journal WHERE agent = ?1", params![agent])?;
     tx.commit()?;
     Ok(changed > 0)
+}
+
+pub fn delete_all(conn: &mut Connection) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute("DELETE FROM journal", [])?;
+    tx.commit()?;
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -228,6 +235,28 @@ mod tests {
         let (mut conn, _dir) = test_conn();
         let deleted = delete(&mut conn, "Ghost").unwrap();
         assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_all_clears_journal() {
+        let (mut conn, _dir) = test_conn();
+
+        upsert(&mut conn, &sample_entry("Alpha")).unwrap();
+        upsert(&mut conn, &sample_entry("Beta")).unwrap();
+        upsert(&mut conn, &sample_entry("Gamma")).unwrap();
+
+        let count = delete_all(&mut conn).unwrap();
+        assert_eq!(count, 3);
+
+        let remaining = list_in_flight(&conn).unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn delete_all_empty_returns_zero() {
+        let (mut conn, _dir) = test_conn();
+        let count = delete_all(&mut conn).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -68,7 +68,6 @@ pub async fn spawn_reviewer(
         session_id: session_id.to_string(),
         worktree: worktree_path.to_path_buf(),
         bare,
-        resume: false,
         allowed_tools: ALLOWED_TOOLS.to_string(),
         env_vars,
     };

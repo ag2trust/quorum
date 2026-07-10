@@ -12,7 +12,6 @@ pub struct AgentSpec {
     pub session_id: String,
     pub worktree: PathBuf,
     pub bare: bool,
-    pub resume: bool,
     pub allowed_tools: String,
     pub env_vars: Vec<(String, String)>,
 }
@@ -55,11 +54,7 @@ impl AgentProc {
             .arg("--effort")
             .arg(&spec.effort);
 
-        if spec.resume {
-            cmd.arg("--resume").arg(&spec.session_id);
-        } else {
-            cmd.arg("--session-id").arg(&spec.session_id);
-        }
+        cmd.arg("--session-id").arg(&spec.session_id);
 
         // In dontAsk mode every tool call OUTSIDE the allowlist is auto-denied
         // (there is no human to ask). Without --allowedTools the agent cannot
@@ -185,7 +180,6 @@ mod tests {
             session_id: "sid".into(),
             worktree: PathBuf::from("/tmp"),
             bare: false,
-            resume: false,
             allowed_tools: "Bash,Read".to_string(),
             env_vars: vec![],
         };
