@@ -22,6 +22,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::process::Command;
+use std::time::Duration;
 
 fn emit_assistant(text: &str) {
     let msg = serde_json::json!({
@@ -100,6 +101,10 @@ fn main() {
     let side_effects = std::env::var("FAKE_AGENT_SIDE_EFFECTS")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let delay: Option<Duration> = std::env::var("FAKE_AGENT_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs);
 
     let stdin = io::stdin();
     let mut turn: u32 = 0;
@@ -149,6 +154,10 @@ fn main() {
 
         if die_mid_turn {
             std::process::exit(1);
+        }
+
+        if let Some(d) = delay {
+            std::thread::sleep(d);
         }
 
         let input_tokens = 500 * turn as u64;
