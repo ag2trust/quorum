@@ -44,6 +44,10 @@ pub enum MergeabilityState {
     Mergeable,
     /// PR has conflicts with the base branch.
     Conflicting,
+    /// PR was already merged.
+    AlreadyMerged,
+    /// PR was closed without merging.
+    Closed,
 }
 
 #[derive(Debug)]
@@ -314,6 +318,11 @@ fn parse_mergeability(json_str: &str) -> MergeabilityState {
         Ok(v) => v,
         Err(_) => return MergeabilityState::Mergeable,
     };
+    match val.get("state").and_then(|v| v.as_str()) {
+        Some("MERGED") => return MergeabilityState::AlreadyMerged,
+        Some("CLOSED") => return MergeabilityState::Closed,
+        _ => {}
+    }
     match val.get("mergeStateStatus").and_then(|v| v.as_str()) {
         Some("DIRTY") => MergeabilityState::Conflicting,
         _ => MergeabilityState::Mergeable,
@@ -395,7 +404,7 @@ impl MergeExecutor for GhMergeExecutor {
     fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> MergeabilityState {
         let pr_str = pr.to_string();
         let mut cmd = self.build_gh_cmd(
-            &["pr", "view", &pr_str, "--json", "mergeStateStatus"],
+            &["pr", "view", &pr_str, "--json", "mergeStateStatus,state"],
             repo_dir,
         );
         let output = match cmd.output() {
@@ -562,6 +571,8 @@ impl MergeExecutor for CommandMergeExecutor {
                 let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 match stdout.as_str() {
                     "conflicting" => MergeabilityState::Conflicting,
+                    "merged" => MergeabilityState::AlreadyMerged,
+                    "closed" => MergeabilityState::Closed,
                     _ => MergeabilityState::Mergeable,
                 }
             }
@@ -1064,6 +1075,56 @@ mod tests {
         assert_eq!(
             exec.check_mergeability(1, Path::new("/tmp")),
             MergeabilityState::Mergeable,
+        );
+    }
+
+    #[test]
+    fn command_mergeability_merged() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: Some("echo merged".into()),
+        };
+        assert_eq!(
+            exec.check_mergeability(1, Path::new("/tmp")),
+            MergeabilityState::AlreadyMerged,
+        );
+    }
+
+    #[test]
+    fn command_mergeability_closed() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: Some("echo closed".into()),
+        };
+        assert_eq!(
+            exec.check_mergeability(1, Path::new("/tmp")),
+            MergeabilityState::Closed,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_state_merged() {
+        assert_eq!(
+            parse_mergeability(r#"{"state":"MERGED","mergeStateStatus":"CLEAN"}"#),
+            MergeabilityState::AlreadyMerged,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_state_closed() {
+        assert_eq!(
+            parse_mergeability(r#"{"state":"CLOSED","mergeStateStatus":"DIRTY"}"#),
+            MergeabilityState::Closed,
+        );
+    }
+
+    #[test]
+    fn parse_mergeability_state_open_dirty() {
+        assert_eq!(
+            parse_mergeability(r#"{"state":"OPEN","mergeStateStatus":"DIRTY"}"#),
+            MergeabilityState::Conflicting,
         );
     }
 }

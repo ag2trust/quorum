@@ -89,31 +89,47 @@ impl ServeHandle {
         names: &std::path::Path,
         merge_cmd: &str,
     ) -> Self {
+        Self::start_with_options(home, repo, wt_base, names, merge_cmd, None)
+    }
+
+    fn start_with_options(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        merge_cmd: &str,
+        mergeability_cmd: Option<&str>,
+    ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let fake_agent = cargo_bin("fake-agent");
+        let mut args = vec![
+            "serve".to_string(),
+            "--repo".to_string(),
+            "test/repo".to_string(),
+            "--cap".to_string(),
+            "1".to_string(),
+            "--repo-dir".to_string(),
+            repo.to_string_lossy().to_string(),
+            "--worktree-base".to_string(),
+            wt_base.to_string_lossy().to_string(),
+            "--names-file".to_string(),
+            names.to_string_lossy().to_string(),
+            "--agent-bin".to_string(),
+            fake_agent.to_string_lossy().to_string(),
+            "--merge-cmd".to_string(),
+            merge_cmd.to_string(),
+            "--exit-when-gone".to_string(),
+            sentinel_path,
+        ];
+        if let Some(m_cmd) = mergeability_cmd {
+            args.push("--merge-mergeability-cmd".to_string());
+            args.push(m_cmd.to_string());
+        }
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
-            .args([
-                "serve",
-                "--repo",
-                "test/repo",
-                "--cap",
-                "1",
-                "--repo-dir",
-                &repo.to_string_lossy(),
-                "--worktree-base",
-                &wt_base.to_string_lossy(),
-                "--names-file",
-                &names.to_string_lossy(),
-                "--agent-bin",
-                &fake_agent.to_string_lossy(),
-                "--merge-cmd",
-                merge_cmd,
-                "--exit-when-gone",
-                &sentinel_path,
-            ])
+            .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -990,6 +1006,92 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         task["status"].as_str(),
         Some("cancelled"),
         "task must remain cancelled, got: {stdout}"
+    );
+
+    handle.stop();
+}
+
+/// T5: Worker signals done with a PR that is already merged externally.
+/// The daemon should detect the merged state via check_mergeability, fire
+/// PrFoundMerged, transition the task to done, and never spawn a reviewer.
+#[test]
+fn already_merged_pr_closes_task_without_reviewer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for already-merged PR");
+
+    let mut handle = ServeHandle::start_with_options(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        Some("echo merged"),
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("already merged", 15),
+        "PR-already-merged detection not logged. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait a few ticks to confirm no reviewer spawns
+    std::thread::sleep(Duration::from_secs(3));
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
+    let reviewer_spawns = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("spawning reviewer"))
+        .count();
+    assert_eq!(
+        reviewer_spawns, 0,
+        "no reviewer should spawn for an already-merged PR, got {reviewer_spawns}. Lines: {:?}",
+        handle.lines
+    );
+
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        task["status"].as_str(),
+        Some("done"),
+        "task must be done after PrFoundMerged, got: {stdout}"
     );
 
     handle.stop();

@@ -519,7 +519,9 @@ pub fn apply_event(
         | Event::AgentFailed { .. }
         | Event::Cancelled { .. }
         | Event::MergeSucceeded
-        | Event::MergeFailed { .. } => {}
+        | Event::MergeFailed { .. }
+        | Event::PrFoundMerged
+        | Event::PrFoundClosed => {}
     }
 
     let view = TaskView {
