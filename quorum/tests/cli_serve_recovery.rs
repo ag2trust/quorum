@@ -168,6 +168,61 @@ impl ServeHandle {
         None
     }
 
+    fn start_with_agent_bin(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        agent_bin: &str,
+    ) -> Self {
+        let sentinel = tempfile::tempdir().unwrap();
+        let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let mut child = Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", home)
+            .env("QUORUM_REPO", "test/repo")
+            .args([
+                "serve",
+                "--repo",
+                "test/repo",
+                "--cap",
+                "1",
+                "--repo-dir",
+                &repo.to_string_lossy(),
+                "--worktree-base",
+                &wt_base.to_string_lossy(),
+                "--names-file",
+                &names.to_string_lossy(),
+                "--agent-bin",
+                agent_bin,
+                "--merge-cmd",
+                "true",
+                "--exit-when-gone",
+                &sentinel_path,
+            ])
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        ServeHandle {
+            child,
+            rx,
+            lines: Vec::new(),
+            _sentinel: Some(sentinel),
+        }
+    }
+
     fn sigkill(mut self) {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
@@ -660,6 +715,595 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         fresh_spawns, 0,
         "exit-75 recovery must not re-execute the task. Lines: {:?}",
         handle.lines
+    );
+
+    handle.sigkill();
+}
+
+// ── Crash-matrix integration tests ──────────────────────────────────────────
+
+struct TestEnv {
+    home: tempfile::TempDir,
+    repo_dir: tempfile::TempDir,
+    wt_base: tempfile::TempDir,
+    names_file: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let wt_base = tempfile::tempdir().unwrap();
+
+        init_git_repo(repo_dir.path());
+        let names_file = write_names_file(home.path());
+
+        Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .arg("init")
+            .status()
+            .unwrap();
+
+        let db_path = home
+            .path()
+            .join("repos")
+            .join("test__repo")
+            .join("quorum.db");
+
+        TestEnv {
+            home,
+            repo_dir,
+            wt_base,
+            names_file,
+            db_path,
+        }
+    }
+
+    fn start_serve(&self) -> ServeHandle {
+        ServeHandle::start(
+            self.home.path(),
+            self.repo_dir.path(),
+            self.wt_base.path(),
+            &self.names_file,
+        )
+    }
+
+    fn start_serve_with_agent_bin(&self, bin: &str) -> ServeHandle {
+        ServeHandle::start_with_agent_bin(
+            self.home.path(),
+            self.repo_dir.path(),
+            self.wt_base.path(),
+            &self.names_file,
+            bin,
+        )
+    }
+
+    fn seed_claimed_task(&self, title: &str, agent: &str) -> i64 {
+        let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+        let now = quorum_core::clock::now();
+        let id = quorum_core::tasks::create(
+            &mut conn, "test", title, None, 0, None, None, None, None, now,
+        )
+        .unwrap();
+        quorum_core::tasks::claim(&mut conn, agent, Some(id), &[], 86400, now).unwrap();
+        id
+    }
+
+    fn seed_journal(&self, entry: &quorum_core::journal::JournalEntry) {
+        let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+        quorum_core::journal::upsert(&mut conn, entry).unwrap();
+    }
+
+    fn task_status(&self, id: i64) -> String {
+        let conn = quorum_core::db::open(&self.db_path).unwrap();
+        quorum_core::tasks::get(&conn, id).unwrap().unwrap().status
+    }
+
+    fn journal_exists(&self, agent: &str) -> bool {
+        let conn = quorum_core::db::open(&self.db_path).unwrap();
+        let entries = quorum_core::journal::list_in_flight(&conn).unwrap();
+        entries.iter().any(|e| e.agent == agent)
+    }
+}
+
+fn make_journal_entry(
+    agent: &str,
+    role: &str,
+    phase: &str,
+    task_id: Option<i64>,
+    worktree: Option<&str>,
+    pr: Option<i64>,
+) -> quorum_core::journal::JournalEntry {
+    quorum_core::journal::JournalEntry {
+        agent: agent.into(),
+        role: role.into(),
+        task_id,
+        session_id: "sess-test".into(),
+        worktree: worktree.map(Into::into),
+        branch: Some("feat/test-branch".into()),
+        phase: phase.into(),
+        cost_tokens: 100,
+        agent_state: None,
+        cost_usd: 0.01,
+        log_dir: None,
+        pid: None,
+        pr,
+        rework_count: 0,
+    }
+}
+
+/// Cell: worker/working with existing worktree → resumed with --resume + feed_turn
+#[test]
+fn recovery_worker_working_with_worktree_resumes() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Working task with worktree", "Agent0");
+
+    let wt = env.wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None,
+    ));
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("resumed worker Agent0", 15),
+        "recovery did not resume worker/working with existing worktree. Lines: {:?}",
+        handle.lines
+    );
+
+    // The worker should remain in working status (not released).
+    assert_eq!(
+        env.task_status(id),
+        "working",
+        "task should stay working after resume"
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: worker/working with missing worktree → release task via AgentFailed
+#[test]
+fn recovery_worker_working_missing_worktree_releases() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Working task missing worktree", "Agent0");
+
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some("/nonexistent/worktree/path"),
+        None,
+    ));
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("worktree missing for worker Agent0", 15),
+        "recovery did not detect missing worktree. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+
+    // Task should be back to open via AgentFailed (Working → Open).
+    assert_eq!(
+        env.task_status(id),
+        "open",
+        "task should revert to open when worktree is missing"
+    );
+
+    // Journal entry should be deleted.
+    assert!(
+        !env.journal_exists("Agent0"),
+        "journal entry should be deleted after worktree-missing cleanup"
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: reviewer teardown — journal deleted, worktree removed, name released
+#[test]
+fn recovery_reviewer_teardown() {
+    let env = TestEnv::new();
+
+    env.seed_journal(&make_journal_entry(
+        "Rev0",
+        "reviewer",
+        "reviewing",
+        Some(42),
+        None,
+        None,
+    ));
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("tearing down stale reviewer Rev0", 15),
+        "recovery did not tear down reviewer. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        !env.journal_exists("Rev0"),
+        "journal entry should be deleted after reviewer teardown"
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: unknown role → journal entry deleted, name released
+#[test]
+fn recovery_unknown_role_deleted() {
+    let env = TestEnv::new();
+
+    env.seed_journal(&make_journal_entry(
+        "X0", "observer", "watching", None, None, None,
+    ));
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("unknown role 'observer' for X0", 15),
+        "recovery did not handle unknown role. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        !env.journal_exists("X0"),
+        "journal entry should be deleted for unknown role"
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: orphaned worktree GC — directories in wt_base not referenced by journal are removed
+#[test]
+fn recovery_orphaned_worktree_gc() {
+    let env = TestEnv::new();
+
+    let orphan_dir = env.wt_base.path().join("orphan-stale-wt");
+    std::fs::create_dir_all(&orphan_dir).unwrap();
+    assert!(orphan_dir.exists());
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("GC'd 1 orphaned worktree", 15),
+        "recovery did not GC orphaned worktree. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        !orphan_dir.exists(),
+        "orphaned worktree directory should have been removed"
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: stale mailbox drain (F9) — unconsumed mailbox rows consumed before worker resume
+#[test]
+fn recovery_stale_mailbox_drained() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Mailbox drain task", "Agent0");
+
+    let wt = env.wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None,
+    ));
+
+    // Seed stale mailbox rows for Agent0 (as if the agent signaled before crash).
+    {
+        let mut conn = quorum_core::db::open(&env.db_path).unwrap();
+        let row = quorum_core::mailbox::MailboxRow {
+            agent: "Agent0".into(),
+            kind: quorum_core::mailbox::MailboxKind::Message,
+            task_id: Some(id),
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: Some("stale msg".into()),
+            to_agent: None,
+            payload: None,
+        };
+        quorum_core::mailbox::append(&mut conn, &row).unwrap();
+        quorum_core::mailbox::append(&mut conn, &row).unwrap();
+    }
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("consumed 2 stale mailbox row(s) for Agent0", 15),
+        "recovery did not drain stale mailbox rows. Lines: {:?}",
+        handle.lines
+    );
+
+    // Verify the mailbox rows are actually consumed (no unconsumed rows remain).
+    {
+        let conn = quorum_core::db::open(&env.db_path).unwrap();
+        let unconsumed = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+        let agent0_unconsumed: Vec<_> = unconsumed
+            .iter()
+            .filter(|(_, r)| r.agent == "Agent0")
+            .collect();
+        assert!(
+            agent0_unconsumed.is_empty(),
+            "stale mailbox rows should be consumed in DB, found {} unconsumed",
+            agent0_unconsumed.len()
+        );
+    }
+
+    handle.sigkill();
+}
+
+/// Cell: spawn failure → release_and_cleanup (task goes to open, journal deleted)
+#[test]
+fn recovery_spawn_failure_releases_task() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Spawn failure task", "Agent0");
+
+    let wt = env.wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None,
+    ));
+
+    // Use a non-existent binary so AgentProc::spawn returns Err.
+    let mut handle = env.start_serve_with_agent_bin("/nonexistent/agent/binary");
+
+    assert!(
+        handle.wait_for("spawn failed for Agent0", 15),
+        "recovery did not report spawn failure. Lines: {:?}",
+        handle.lines
+    );
+
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete after spawn failure. Lines: {:?}",
+        handle.lines
+    );
+
+    assert_eq!(
+        env.task_status(id),
+        "open",
+        "task should revert to open after spawn failure"
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: feed_turn failure path — when the resumed agent exits immediately,
+/// the tick loop detects the death and releases the task. The feed_turn
+/// failure path in recovery.rs shares `release_and_cleanup` with spawn
+/// failure (tested above); the pipe write succeeds because the kernel
+/// buffers the small resume turn, so the failure surfaces as worker death
+/// in the tick loop rather than as a feed_turn error.
+#[test]
+fn recovery_agent_dies_after_resume_releases_task() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Die-after-resume task", "Agent0");
+
+    let wt = env.wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None,
+    ));
+
+    // Script exits immediately after shell startup — too fast to respond.
+    let bad_agent = env.home.path().join("exit-agent.sh");
+    std::fs::write(&bad_agent, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bad_agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut handle = env.start_serve_with_agent_bin(&bad_agent.to_string_lossy());
+
+    // Recovery resumes the worker (feed_turn succeeds due to pipe buffering),
+    // then the tick loop detects the worker died.
+    assert!(
+        handle.wait_for("died mid-task", 15),
+        "tick loop did not detect dead worker after resume. Lines: {:?}",
+        handle.lines
+    );
+
+    // Wait for the lifecycle event to fire (DB update happens inside fire_event,
+    // before the "tearing down" log).
+    assert!(
+        handle.wait_for("tearing down worker Agent0", 15),
+        "worker teardown not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Check what the lifecycle event did — either success or failure.
+    handle.drain_pending_lines();
+    let lifecycle_fired = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("lifecycle: task #") && l.contains("-> open"));
+    let lifecycle_failed = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("lifecycle: fire_event failed"));
+
+    // If the lifecycle event succeeded, task should be open.
+    // If it failed (e.g., sweep already reaped), the task is still open from the reap.
+    let status = env.task_status(id);
+    assert!(
+        status == "open" || status == "cancelled",
+        "task should be open or cancelled after agent dies post-resume, got: {status}. \
+         lifecycle_fired={lifecycle_fired}, lifecycle_failed={lifecycle_failed}. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.sigkill();
+}
+
+/// Cell: mixed entries — multiple entry types processed in single recovery run
+#[test]
+fn recovery_mixed_worker_and_reviewer_entries() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Mixed recovery task", "Agent0");
+
+    let wt = env.wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    // Worker in working phase with existing worktree.
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None,
+    ));
+
+    // Reviewer entry — should be torn down.
+    env.seed_journal(&make_journal_entry(
+        "Rev0",
+        "reviewer",
+        "reviewing",
+        Some(99),
+        None,
+        None,
+    ));
+
+    let mut handle = env.start_serve();
+
+    // Wait for recovery to finish — entries are processed in alphabetical order.
+    assert!(
+        handle.wait_for("recovery: complete", 30),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.drain_pending_lines();
+
+    let has_resumed = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("resumed worker Agent0"));
+    let has_teardown = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("tearing down stale reviewer Rev0"));
+
+    assert!(
+        has_resumed,
+        "recovery did not resume worker in mixed scenario. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        has_teardown,
+        "recovery did not tear down reviewer in mixed scenario. Lines: {:?}",
+        handle.lines
+    );
+
+    // Worker task stays working, reviewer journal cleaned up.
+    assert_eq!(env.task_status(id), "working");
+    assert!(!env.journal_exists("Rev0"));
+
+    handle.sigkill();
+}
+
+/// Cell: worker/awaiting-review WITHOUT PR → falls through to --resume spawn
+/// (no PendingReview created; the worker is resumed as a regular slot)
+#[test]
+fn recovery_awaiting_review_without_pr_spawns_resume() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Awaiting review no PR", "Agent0");
+
+    let wt = env.wt_base.path().join("Agent0");
+    std::fs::create_dir_all(&wt).unwrap();
+
+    // awaiting-review but pr=None → recovery falls through to spawn with --resume
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "awaiting-review",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None, // no PR
+    ));
+
+    let mut handle = env.start_serve();
+
+    // Should resume (not route to pending review).
+    assert!(
+        handle.wait_for("resumed worker Agent0", 15),
+        "recovery did not resume awaiting-review worker without PR. Lines: {:?}",
+        handle.lines
+    );
+
+    // Should NOT see "at REVIEW stage" (that's the with-PR path).
+    handle.drain_pending_lines();
+    let review_stage_log = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("resuming task") && l.contains("at REVIEW stage"));
+    assert!(
+        !review_stage_log,
+        "awaiting-review without PR should NOT route to pending review. Lines: {:?}",
+        handle.lines
+    );
+
+    // Task should remain in working status (resumed, not released).
+    assert_eq!(
+        env.task_status(id),
+        "working",
+        "task should stay working after awaiting-review-without-PR resume"
+    );
+
+    // Journal entry should still exist (worker was resumed, not torn down).
+    assert!(
+        env.journal_exists("Agent0"),
+        "journal entry should persist after resume (worker is running)"
     );
 
     handle.sigkill();
