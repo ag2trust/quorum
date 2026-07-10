@@ -108,7 +108,7 @@ pub fn detect(
 /// Query non-terminal tasks with refs.pr set. Returns (task_id, pr_number) pairs.
 pub fn task_pr_refs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, refs FROM tasks WHERE status NOT IN ('closed', 'cancelled') AND refs IS NOT NULL",
+        "SELECT id, refs FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled', 'closed') AND refs IS NOT NULL",
     )?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -132,7 +132,7 @@ pub fn task_branch_allocations(conn: &Connection) -> Result<Vec<(i64, String)>> 
     let mut stmt = conn.prepare(
         "SELECT tb.task_id, tb.branch FROM task_branches tb
          INNER JOIN tasks t ON t.id = tb.task_id
-         WHERE t.status NOT IN ('closed', 'cancelled')",
+         WHERE t.status NOT IN ('done', 'failed', 'cancelled', 'closed')",
     )?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -375,7 +375,7 @@ mod tests {
         .unwrap();
         c.execute(
             "INSERT INTO tasks (title, status, priority, created_by, created_at, updated_at, refs)
-             VALUES ('t2', 'closed', 0, 'test', 1, 1, '{\"pr\":99}')",
+             VALUES ('t2', 'done', 0, 'test', 1, 1, '{\"pr\":99}')",
             [],
         )
         .unwrap();
@@ -386,8 +386,33 @@ mod tests {
         )
         .unwrap();
         let refs = task_pr_refs(&c).unwrap();
-        assert_eq!(refs.len(), 1, "closed task should be excluded");
+        assert_eq!(refs.len(), 1, "terminal task should be excluded");
         assert_eq!(refs[0], (1, 42));
+    }
+
+    #[test]
+    fn task_pr_refs_excludes_all_terminal_statuses() {
+        let (_d, c) = open_tmp();
+        for (i, status) in ["done", "failed", "cancelled", "closed"].iter().enumerate() {
+            c.execute(
+                &format!(
+                    "INSERT INTO tasks (id, title, status, priority, created_by, created_at, updated_at, refs)
+                     VALUES ({}, 'term-{}', '{}', 0, 'test', 1, 1, '{{\"pr\":{}}}')",
+                    100 + i, status, status, 500 + i
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_by, created_at, updated_at, refs)
+             VALUES (200, 'active', 'working', 0, 'test', 1, 1, '{\"pr\":999}')",
+            [],
+        )
+        .unwrap();
+        let refs = task_pr_refs(&c).unwrap();
+        assert_eq!(refs.len(), 1, "only non-terminal task should appear");
+        assert_eq!(refs[0], (200, 999));
     }
 
     #[test]
