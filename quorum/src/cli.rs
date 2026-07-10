@@ -4,10 +4,23 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+const fn long_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("QUORUM_GIT_SHA_SHORT"),
+        ")",
+    )
+}
+
+pub fn short_version() -> &'static str {
+    env!("QUORUM_GIT_DESCRIBE")
+}
+
 #[derive(Parser)]
 #[command(
     name = "quorum",
-    version,
+    version = long_version(),
     about = "Local agent coordination (by agents, for agents)",
     // We define our own `help` subcommand below (the agent cheat-sheet, recovery-safe).
     // Without this, clap auto-generates a generic `help` that would collide with ours.

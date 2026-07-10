@@ -162,8 +162,10 @@ fn render_header(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         }
     };
     let _ = writeln!(w);
-    let title = format!(" quorum · {verdict_str}");
-    let _ = writeln!(w, "{}", sty.bold(&title));
+    let ver = crate::cli::short_version();
+    let _ = write!(w, " {}", sty.bold("quorum"));
+    let _ = write!(w, " {}", sty.dim(ver));
+    let _ = writeln!(w, " {} {}", sty.bold("·"), verdict_str);
     let rule = if sty.color {
         sty.dim(&"─".repeat(width))
     } else {
