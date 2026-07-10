@@ -352,15 +352,19 @@ pub enum Command {
     /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
     /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.
     Serve {
-        /// Maximum concurrent worker agents.
-        #[arg(long, default_value = "4")]
-        cap: usize,
+        /// Path to a TOML config file. Default: ~/.quorum/serve/<owner>__<repo>.toml
+        /// if present. CLI flags override config-file values.
+        #[arg(long)]
+        config: Option<String>,
+        /// Maximum concurrent worker agents (default: 4).
+        #[arg(long)]
+        cap: Option<usize>,
         /// Path to the git repo the daemon manages.
         #[arg(long)]
-        repo_dir: String,
+        repo_dir: Option<String>,
         /// Base directory for agent worktrees.
         #[arg(long)]
-        worktree_base: String,
+        worktree_base: Option<String>,
         /// Path to the agent names file (one name per line).
         /// When absent, names are auto-generated.
         #[arg(long)]
@@ -368,12 +372,12 @@ pub enum Command {
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
-        /// Model to pass to spawned agents.
-        #[arg(long, default_value = "sonnet")]
-        model: String,
-        /// Effort level to pass to spawned agents.
-        #[arg(long, default_value = "high")]
-        effort: String,
+        /// Model to pass to spawned agents (default: sonnet).
+        #[arg(long)]
+        model: Option<String>,
+        /// Effort level to pass to spawned agents (default: high).
+        #[arg(long)]
+        effort: Option<String>,
         /// Path to a file containing a GitHub token for merging PRs.
         /// Read at merge time; never passed to agent processes.
         #[arg(long)]
@@ -391,12 +395,12 @@ pub enum Command {
         /// PR number. stdout: "conflicting" => PR has conflicts; anything else => mergeable.
         #[arg(long, hide = true)]
         merge_mergeability_cmd: Option<String>,
-        /// Seconds to wait for required status checks before merging. Default: 900.
-        #[arg(long, default_value = "900")]
-        merge_checks_timeout_secs: u64,
-        /// Poll interval for status checks (seconds). Default: 30.
-        #[arg(long, default_value = "30", hide = true)]
-        merge_checks_poll_secs: u64,
+        /// Seconds to wait for required status checks before merging (default: 900).
+        #[arg(long)]
+        merge_checks_timeout_secs: Option<u64>,
+        /// Poll interval for status checks in seconds (default: 30).
+        #[arg(long, hide = true)]
+        merge_checks_poll_secs: Option<u64>,
         /// Disable --bare mode for spawned agents. By default, agents are
         /// spawned with --bare so they do not inherit operator-local hooks,
         /// plugins, memory, or MCP config. Pass this flag to let agents use
@@ -431,25 +435,25 @@ pub enum Command {
         #[arg(long)]
         self_update_drain: bool,
         /// Seconds to wait for in-flight agents to finish before force-killing
-        /// them during a drain. Default: 900 (15 minutes).
-        #[arg(long, default_value = "900")]
-        drain_timeout_secs: u64,
+        /// them during a drain (default: 900).
+        #[arg(long)]
+        drain_timeout_secs: Option<u64>,
         /// Owner/name of the daemon's own repo (e.g. "ag2trust/quorum").
         /// Default: derived from --repo-dir's origin remote via `gh repo view`.
         #[arg(long)]
         self_repo: Option<String>,
-        /// Interval between git ls-remote sha polls (seconds). Default: 60.
-        #[arg(long, default_value = "60", hide = true)]
-        sha_poll_interval_secs: u64,
-        /// Repo this daemon manages (e.g. "ag2trust/quorum"). Required.
-        /// The daemon opens this repo's per-repo DB and sets QUORUM_REPO for
-        /// all spawned workers/reviewers.
+        /// Interval between git ls-remote sha polls in seconds (default: 60).
+        #[arg(long, hide = true)]
+        sha_poll_interval_secs: Option<u64>,
+        /// Repo this daemon manages (e.g. "ag2trust/quorum"). Required
+        /// (via flag or config file). The daemon opens this repo's per-repo DB
+        /// and sets QUORUM_REPO for all spawned workers/reviewers.
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         /// Base branch name for sha-polling, worktree provisioning, and merge
-        /// targeting. Use "master" for repos whose trunk is master. Default: main.
-        #[arg(long, default_value = "main")]
-        base_branch: String,
+        /// targeting. Use "master" for repos whose trunk is master (default: main).
+        #[arg(long)]
+        base_branch: Option<String>,
         /// Path to a sentinel file. When set, serve polls for this file's
         /// existence every tick and initiates shutdown when it disappears.
         /// Used by test fixtures to self-terminate when the parent test

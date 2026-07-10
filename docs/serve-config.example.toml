@@ -1,0 +1,46 @@
+# Quorum serve config — production-sane defaults.
+#
+# Place at ~/.quorum/serve/<owner>__<repo>.toml (e.g. ag2trust__quorum.toml)
+# to load automatically, or pass --config <path> explicitly.
+#
+# CLI flags override every value here (explicit wins).
+# Unknown keys are rejected (exit 2) — typos fail loud.
+
+# ── identity ──────────────────────────────────────────────────────────
+repo     = "ag2trust/quorum"
+repo_dir = "/home/user/dev/quorum"
+
+# ── paths (under ~/.quorum/serve/<repo>/ — survives reboots, unlike /tmp) ──
+worktree_base = "/home/user/.quorum/serve/quorum/worktrees"
+log_dir       = "/home/user/.quorum/serve/quorum/logs"
+
+# ── agent spawn ───────────────────────────────────────────────────────
+cap    = 4
+model  = "sonnet"
+effort = "high"
+# names_file = "/home/user/.quorum/serve/names.txt"
+# agent_bin  = "claude"
+
+# ── cost ceilings ────────────────────────────────────────────────────
+# A turn longer than 45 min is almost certainly stuck; #56's auto-refeed
+# handles legitimate interruptions.
+max_turn_wall_secs = 2700       # 45 min
+max_task_wall_secs = 14400      # 4h
+# max_turn_tokens  = 500000
+# max_task_tokens  = 2000000
+max_turn_cost_usd  = 50.0
+max_task_cost_usd  = 100.0
+
+# ── merge ─────────────────────────────────────────────────────────────
+# merge_token_file         = "/home/user/.quorum/serve/merge-token"
+merge_checks_timeout_secs  = 900
+# merge_checks_poll_secs   = 30
+
+# ── self-update ───────────────────────────────────────────────────────
+self_update_drain = true
+drain_timeout_secs = 900
+# self_repo = "ag2trust/quorum"  # auto-detected from repo_dir
+
+# ── misc ──────────────────────────────────────────────────────────────
+base_branch = "main"
+# no_bare_agent = false
