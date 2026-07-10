@@ -900,7 +900,6 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
                 eff_part = match rest {
                     "high" => "hi".to_string(),
                     "medium" | "med" => "md".to_string(),
-                    "low" => "lo".to_string(),
                     other => other.to_string(),
                 };
             }
@@ -2107,6 +2106,27 @@ mod tests {
             HealthVerdict::OnTrack,
             "only the active worker matters; awaiting-review and reviewer are excluded"
         );
+    }
+
+    #[test]
+    fn tier_eff_label_maps_known_efforts() {
+        assert_eq!(
+            tier_eff_label(Some(r#"["tier:opus-46","effort:high"]"#)),
+            "opus46·hi"
+        );
+        assert_eq!(
+            tier_eff_label(Some(r#"["tier:opus-46","effort:medium"]"#)),
+            "opus46·md"
+        );
+    }
+
+    #[test]
+    fn tier_eff_label_does_not_pretty_print_low() {
+        // effort:low should never reach the DB (validate_labels rejects it), but if a stray one
+        // slips through, we must NOT hide it behind a "lo" pretty label — surface the raw value
+        // so the operator sees the corruption.
+        let out = tier_eff_label(Some(r#"["effort:low"]"#));
+        assert_eq!(out, "low", "want raw passthrough, got {out:?}");
     }
 
     #[test]
