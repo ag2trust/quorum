@@ -152,7 +152,8 @@ pub fn already_alerted(conn: &Connection, kind: &str, subject: &str, now: i64) -
 }
 
 /// Emit drift events for newly detected unbacked/twin PRs (deduped against
-/// existing events). Opens its own write transaction per event.
+/// existing events), then revoke any stale events whose subjects are no longer
+/// in the current drift result.
 pub fn emit_drift_events(conn: &mut Connection, drift: &DriftResult, now: i64) -> Result<()> {
     for u in &drift.unbacked {
         let subject = format!("pr#{}", u.number);
@@ -176,6 +177,65 @@ pub fn emit_drift_events(conn: &mut Connection, drift: &DriftResult, now: i64) -
             tx.commit()?;
         }
     }
+    revoke_resolved_drift_events(conn, drift, now)?;
+    Ok(())
+}
+
+/// Expire unexpired drift events whose subjects are no longer in the current
+/// drift result. Sets `expires_at = now` so they disappear from status immediately.
+pub fn revoke_resolved_drift_events(
+    conn: &mut Connection,
+    drift: &DriftResult,
+    now: i64,
+) -> Result<()> {
+    let current_unbacked: HashSet<String> = drift
+        .unbacked
+        .iter()
+        .map(|u| format!("pr#{}", u.number))
+        .collect();
+    let current_twins: HashSet<String> = drift
+        .twins
+        .iter()
+        .map(|t| format!("task#{}", t.task_id))
+        .collect();
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+    {
+        let mut stmt = tx
+            .prepare("SELECT subject FROM events WHERE kind = 'unbacked_pr' AND expires_at > ?1")?;
+        let stale_subjects: Vec<String> = stmt
+            .query_map(params![now], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|s| !current_unbacked.contains(s))
+            .collect();
+        for subject in &stale_subjects {
+            tx.execute(
+                "UPDATE events SET expires_at = ?1 WHERE kind = 'unbacked_pr' AND subject = ?2 AND expires_at > ?1",
+                params![now, subject],
+            )?;
+        }
+    }
+
+    {
+        let mut stmt =
+            tx.prepare("SELECT subject FROM events WHERE kind = 'twin_pr' AND expires_at > ?1")?;
+        let stale_subjects: Vec<String> = stmt
+            .query_map(params![now], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|s| !current_twins.contains(s))
+            .collect();
+        for subject in &stale_subjects {
+            tx.execute(
+                "UPDATE events SET expires_at = ?1 WHERE kind = 'twin_pr' AND subject = ?2 AND expires_at > ?1",
+                params![now, subject],
+            )?;
+        }
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -488,6 +548,114 @@ mod tests {
         assert_eq!(prs2.len(), 1, "dedup should prevent duplicate events");
         let twins2 = twin_pr_events(&c, now).unwrap();
         assert_eq!(twins2.len(), 1, "dedup should prevent duplicate events");
+    }
+
+    #[test]
+    fn revoke_unbacked_pr_on_merge() {
+        let (_d, mut c) = open_tmp();
+        let now = 1000;
+        let drift = DriftResult {
+            unbacked: vec![
+                UnbackedPr {
+                    number: 42,
+                    title: "orphan".into(),
+                    branch: "feat/x".into(),
+                },
+                UnbackedPr {
+                    number: 99,
+                    title: "another".into(),
+                    branch: "feat/y".into(),
+                },
+            ],
+            twins: vec![],
+        };
+        emit_drift_events(&mut c, &drift, now).unwrap();
+        assert_eq!(unbacked_pr_events(&c, now).unwrap().len(), 2);
+
+        // PR #42 merges — next drift pass no longer lists it
+        let drift2 = DriftResult {
+            unbacked: vec![UnbackedPr {
+                number: 99,
+                title: "another".into(),
+                branch: "feat/y".into(),
+            }],
+            twins: vec![],
+        };
+        emit_drift_events(&mut c, &drift2, now).unwrap();
+        let remaining = unbacked_pr_events(&c, now).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].number, 99);
+    }
+
+    #[test]
+    fn revoke_unbacked_pr_on_task_backing() {
+        let (_d, mut c) = open_tmp();
+        let now = 1000;
+        let drift = DriftResult {
+            unbacked: vec![UnbackedPr {
+                number: 50,
+                title: "orphan".into(),
+                branch: "feat/z".into(),
+            }],
+            twins: vec![],
+        };
+        emit_drift_events(&mut c, &drift, now).unwrap();
+        assert_eq!(unbacked_pr_events(&c, now).unwrap().len(), 1);
+
+        // PR #50 gains a backing task — next drift pass returns empty
+        let drift2 = DriftResult::default();
+        emit_drift_events(&mut c, &drift2, now).unwrap();
+        assert!(unbacked_pr_events(&c, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoke_twin_pr_on_resolution() {
+        let (_d, mut c) = open_tmp();
+        let now = 1000;
+        let drift = DriftResult {
+            unbacked: vec![],
+            twins: vec![TwinPr {
+                task_id: 5,
+                pr_numbers: vec![10, 11],
+            }],
+        };
+        emit_drift_events(&mut c, &drift, now).unwrap();
+        assert_eq!(twin_pr_events(&c, now).unwrap().len(), 1);
+
+        // One twin PR closes — no longer twin
+        let drift2 = DriftResult::default();
+        emit_drift_events(&mut c, &drift2, now).unwrap();
+        assert!(twin_pr_events(&c, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn revoke_does_not_affect_still_active_events() {
+        let (_d, mut c) = open_tmp();
+        let now = 1000;
+        let drift = DriftResult {
+            unbacked: vec![
+                UnbackedPr {
+                    number: 1,
+                    title: "a".into(),
+                    branch: "b1".into(),
+                },
+                UnbackedPr {
+                    number: 2,
+                    title: "b".into(),
+                    branch: "b2".into(),
+                },
+            ],
+            twins: vec![TwinPr {
+                task_id: 10,
+                pr_numbers: vec![20, 21],
+            }],
+        };
+        emit_drift_events(&mut c, &drift, now).unwrap();
+
+        // Same drift result — nothing revoked
+        emit_drift_events(&mut c, &drift, now).unwrap();
+        assert_eq!(unbacked_pr_events(&c, now).unwrap().len(), 2);
+        assert_eq!(twin_pr_events(&c, now).unwrap().len(), 1);
     }
 
     #[test]
