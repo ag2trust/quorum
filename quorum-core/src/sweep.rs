@@ -65,12 +65,61 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
     Ok(())
 }
 
+/// Cancel open tasks whose dependencies can never be satisfied: every dep is terminal
+/// (done/failed/cancelled) but at least one is failed or cancelled. Without this, a
+/// cancelled dependency permanently blocks its dependents (#57 G1).
+pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
+    let doomed: Vec<(i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.id, je.value AS dep_id
+             FROM tasks t, json_each(t.depends_on) je
+             WHERE t.status = 'open'
+               AND t.depends_on IS NOT NULL
+               -- every dep is terminal …
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(t.depends_on) j2
+                   LEFT JOIN tasks d ON d.id = j2.value
+                   WHERE d.status NOT IN ('done','failed','cancelled')
+                      OR d.id IS NULL
+               )
+               -- … and at least one dep is NOT done
+               AND EXISTS (
+                   SELECT 1 FROM json_each(t.depends_on) j3
+                   JOIN tasks d ON d.id = j3.value
+                   WHERE d.status IN ('failed','cancelled')
+               )
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut count = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for (task_id, failed_dep) in &doomed {
+        if !seen.insert(*task_id) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE tasks SET status='cancelled', assignee=NULL, updated_at=?1 WHERE id=?2",
+            params![now, task_id],
+        )?;
+        let target = format!("task#{task_id}");
+        let body = format!("dep-cascade: dependency #{failed_dep} is terminal-not-done");
+        crate::events::emit(conn, "dep_cascade", &target, &body, now)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 /// Bounded sweep run opportunistically inside every mutation's transaction. The `LIMIT`
 /// keeps a large backlog from making one command's transaction pathologically long.
 pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // Correctness first: reclaim lost-agent tasks before the housekeeping deletes (a lapsed
     // `claimed` task must become re-claimable on the next write).
     reap_lapsed_tasks(conn, now, limit)?;
+    cascade_dead_deps(conn, now, limit)?;
     delete_bounded(conn, "messages", now, limit)?;
     delete_bounded(conn, "events", now, limit)?;
     delete_bounded(conn, "errors", now, limit)?;
@@ -92,6 +141,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
 /// Unbounded sweep + `wal_checkpoint(TRUNCATE)`. Backs `quorum sweep`.
 pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     reap_lapsed_tasks(conn, now, usize::MAX)?;
+    cascade_dead_deps(conn, now, usize::MAX)?;
     conn.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
     conn.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
     conn.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
@@ -291,6 +341,235 @@ mod tests {
             })
             .unwrap();
         assert_eq!(open3, 5, "all 5 reaped after three batches");
+    }
+
+    #[test]
+    fn cascade_cancels_task_blocked_by_cancelled_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        // Cancel the dependency.
+        c.execute(
+            "UPDATE tasks SET status='cancelled', updated_at=200 WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        // Before cascade: child is still open.
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open"
+        );
+        let n = cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(n, 1);
+        let t = crate::tasks::get(&c, child).unwrap().unwrap();
+        assert_eq!(t.status, "cancelled", "child must be cancelled by cascade");
+        // Event emitted.
+        let target = format!("task#{child}");
+        let evs = crate::events::list(&c, 0, Some(&target), 10, 300).unwrap();
+        assert!(
+            evs.iter().any(|e| e.kind == "dep_cascade"),
+            "dep_cascade event must be emitted"
+        );
+    }
+
+    #[test]
+    fn cascade_ignores_task_with_done_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=200 WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        let n = cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(n, 0, "done dep should not trigger cascade");
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open"
+        );
+    }
+
+    #[test]
+    fn cascade_ignores_task_with_non_terminal_dep() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        // dep is still open (non-terminal).
+        let n = cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(n, 0, "non-terminal dep should not trigger cascade");
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open"
+        );
+    }
+
+    #[test]
+    fn cascade_handles_mixed_deps_one_cancelled_one_still_working() {
+        let (_d, mut c) = open_tmp();
+        let dep1 =
+            crate::tasks::create(&mut c, "boss", "dep1", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let dep2 =
+            crate::tasks::create(&mut c, "boss", "dep2", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let _child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep1},{dep2}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        // dep1 cancelled, dep2 still working.
+        c.execute(
+            "UPDATE tasks SET status='cancelled', updated_at=200 WHERE id=?1",
+            params![dep1],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='working', updated_at=200 WHERE id=?1",
+            params![dep2],
+        )
+        .unwrap();
+        let n = cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(n, 0, "should not cascade when a dep is still non-terminal");
+    }
+
+    #[test]
+    fn cascade_fires_when_all_deps_terminal_but_one_failed() {
+        let (_d, mut c) = open_tmp();
+        let dep1 =
+            crate::tasks::create(&mut c, "boss", "dep1", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let dep2 =
+            crate::tasks::create(&mut c, "boss", "dep2", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep1},{dep2}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=200 WHERE id=?1",
+            params![dep1],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', updated_at=200 WHERE id=?1",
+            params![dep2],
+        )
+        .unwrap();
+        let n = cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn cascade_is_transitive() {
+        let (_d, mut c) = open_tmp();
+        let a = crate::tasks::create(&mut c, "boss", "a", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let b = crate::tasks::create(
+            &mut c,
+            "boss",
+            "b",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{a}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let ch = crate::tasks::create(
+            &mut c,
+            "boss",
+            "c",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{b}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        // Cancel a.
+        c.execute(
+            "UPDATE tasks SET status='cancelled', updated_at=200 WHERE id=?1",
+            params![a],
+        )
+        .unwrap();
+        // First cascade: b cancelled.
+        cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, b).unwrap().unwrap().status,
+            "cancelled"
+        );
+        // c still open (b just became cancelled, need another sweep).
+        // Second cascade: c cancelled.
+        cascade_dead_deps(&c, 400, 100).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, ch).unwrap().unwrap().status,
+            "cancelled"
+        );
     }
 
     #[test]
