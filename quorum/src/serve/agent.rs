@@ -16,6 +16,15 @@ pub struct AgentSpec {
     pub env_vars: Vec<(String, String)>,
 }
 
+/// Fresh session id for a spawned agent. The claude CLI validates
+/// `--session-id` as a UUID and exits before the first turn on anything else
+/// ("Invalid session ID. Must be a valid UUID."), which the daemon only sees
+/// as "process exited without response" — observed live 2026-07-10 as a
+/// classifier respawn-loop. Every `AgentSpec.session_id` must come from here.
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 pub struct AgentProc {
     child: Child,
     stdin: tokio::process::ChildStdin,
@@ -161,6 +170,17 @@ impl AgentProc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The claude CLI rejects any non-UUID --session-id before the first turn;
+    /// a formatted string here respawn-loops the daemon (observed 2026-07-10).
+    #[test]
+    fn session_id_is_valid_uuid() {
+        let sid = new_session_id();
+        assert!(
+            uuid::Uuid::parse_str(&sid).is_ok(),
+            "claude CLI rejects any non-UUID --session-id, got: {sid}"
+        );
+    }
 
     /// #206: reviewers are instructed to invoke the pinned `pr-review` skill;
     /// without `Skill` in the allowlist the invocation is auto-denied under

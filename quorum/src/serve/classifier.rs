@@ -16,14 +16,6 @@ pub struct ClassifierSlot {
     pub response_text: String,
 }
 
-/// Session id for the classifier agent process. The claude CLI validates
-/// `--session-id` as a UUID and exits before the first turn on anything else
-/// ("Invalid session ID. Must be a valid UUID."), which the daemon sees as
-/// "process exited without response" and respawn-loops (observed 2026-07-10).
-fn classifier_session_id() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
 /// Spawn a headless classifier agent for a batch of tasks.
 pub fn spawn_classifier(
     tasks: &[TaskForClassification],
@@ -33,7 +25,7 @@ pub fn spawn_classifier(
 ) -> std::io::Result<ClassifierSlot> {
     let pending_task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
 
-    let session_id = classifier_session_id();
+    let session_id = super::agent::new_session_id();
 
     let spec = AgentSpec {
         model: CLASSIFIER_MODEL.to_string(),
@@ -142,15 +134,6 @@ fn extract_json(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn session_id_is_valid_uuid() {
-        let sid = classifier_session_id();
-        assert!(
-            uuid::Uuid::parse_str(&sid).is_ok(),
-            "claude CLI rejects any non-UUID --session-id, got: {sid}"
-        );
-    }
 
     #[test]
     fn extract_json_direct() {
