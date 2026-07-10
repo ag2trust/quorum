@@ -46,3 +46,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Includes the N-process claim-race canary (quorum/tests/race.rs).
       - run: cargo test --workspace
+
+  shell-tests:
+    name: shell-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure git for test repos
+        run: |
+          git config --global user.email "ci@test.com"
+          git config --global user.name "CI"
+      - run: scripts/test-serve-supervisor.sh

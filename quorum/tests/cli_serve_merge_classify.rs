@@ -255,7 +255,11 @@ fn policy_blocked_merge_parks_task_no_rework() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),
@@ -349,7 +353,11 @@ fn conflicting_pr_skips_merge_sends_rework() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),
@@ -437,7 +445,11 @@ fn retryable_merge_sends_rework_turn() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),

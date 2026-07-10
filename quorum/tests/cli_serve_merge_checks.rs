@@ -265,7 +265,11 @@ fn checks_pass_then_merge_succeeds() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),
@@ -351,7 +355,11 @@ fn checks_fail_sends_rework() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),
@@ -444,7 +452,11 @@ fn checks_timeout_parks_task() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),
@@ -559,7 +571,11 @@ fn checks_pending_then_ready_merges_after_wait() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     quorum_done(
         home.path(),
@@ -664,7 +680,11 @@ fn approved_without_pr_skips_merge() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer signals approved WITHOUT --pr (the bug trigger).
     quorum_done(

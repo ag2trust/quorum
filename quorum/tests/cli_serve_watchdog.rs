@@ -257,8 +257,11 @@ fn rework_cap_kills_worker_and_releases_task() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    // Wait for reviewer to finish
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer requests changes — rework round #1
     quorum_done(
@@ -536,7 +539,11 @@ fn cumulative_cost_usd_is_high_water_mark_not_summed() {
     );
     let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
 
-    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
 
     // Reviewer requests changes → triggers rework (turn 2)
     quorum_done(
@@ -566,8 +573,7 @@ fn cumulative_cost_usd_is_high_water_mark_not_summed() {
         handle.lines
     );
 
-    // Drain any remaining log lines
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(Duration::from_secs(1));
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
@@ -636,8 +642,8 @@ fn no_limits_does_not_kill() {
         handle.lines
     );
 
-    // Wait a couple ticks — no watchdog should fire
-    std::thread::sleep(Duration::from_secs(2));
+    // Wait 2 ticks — no watchdog should fire
+    std::thread::sleep(Duration::from_secs(1));
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }

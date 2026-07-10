@@ -430,8 +430,8 @@ fn other_repo_merge_does_not_drain() {
         handle.lines
     );
 
-    // Give it a moment to confirm no drain was triggered
-    std::thread::sleep(Duration::from_secs(1));
+    // Wait 2 ticks to confirm no drain was triggered
+    std::thread::sleep(Duration::from_millis(600));
 
     let drain_found = handle.lines.iter().any(|l| l.contains("DRAIN:"));
     assert!(

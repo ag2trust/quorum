@@ -196,8 +196,21 @@ fn serve_spawns_agent_and_tears_down_on_done() {
             String::from_utf8_lossy(&done_out.stderr)
         );
 
-        // Wait briefly for teardown
-        std::thread::sleep(Duration::from_secs(2));
+        // Wait for daemon to process the done signal
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline - std::time::Instant::now();
+            match rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    let done = line.contains("spawning reviewer") || line.contains("tearing down");
+                    lines.push(line);
+                    if done {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     }
 
     // Kill the serve process
