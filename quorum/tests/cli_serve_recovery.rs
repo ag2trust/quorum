@@ -1,17 +1,10 @@
-//! #178 acceptance test: restart resumes done-awaiting-review at the REVIEW
-//! stage, not by re-executing the task from scratch.
+//! Recovery acceptance tests: after a daemon restart, in-review tasks must
+//! get reviewers provisioned (via Phase 5b) without re-executing the worker.
 //!
-//! Bug repro (2026-07-04, hit twice live): a worker completes and signals
-//! `done --pr N` (PR open on GitHub), sits in awaiting-review, then the
-//! daemon is restarted. Pre-fix: the pipeline position was lost — the
-//! awaiting-review journal entry had no PR, recovery spawned a stub worker
-//! that was reaped as dead (releasing the task to `open`), and a fresh
-//! worker re-executed the task producing a duplicate PR.
-//!
-//! Post-fix: the done --pr N handler upserts the journal with the PR, and
-//! recovery routes awaiting-review-with-PR entries to a `PendingReview`
-//! collection so a reviewer is provisioned for the recorded PR without a
-//! worker re-spawn.
+//! Stateless recovery (2026-07-09 refactor) kills stale processes, wipes the
+//! journal, GCs worktrees, and resets non-terminal tasks. In-review tasks are
+//! left as-is — the normal tick loop's Phase 5b queries the DB for in-review
+//! tasks with a PR but no live worker/reviewer and provisions a reviewer.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -228,7 +221,6 @@ impl ServeHandle {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
         }
         let _ = self.child.wait();
-        // Drain any final buffered log lines
         while let Ok(line) = self.rx.try_recv() {
             self.lines.push(line);
         }
@@ -275,6 +267,11 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
 /// then relaunched — the restart MUST resume at the review stage
 /// (provision reviewer against recorded PR) rather than re-execute the
 /// task from scratch and produce a duplicate PR.
+///
+/// Post-refactor: stateless recovery wipes the journal and leaves the
+/// in-review task as-is. Phase 5b of the tick loop detects the orphan
+/// in-review task (has PR, no live worker/reviewer) and provisions a
+/// reviewer.
 #[test]
 fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
     let home = tempfile::tempdir().unwrap();
@@ -295,7 +292,6 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Worker spawns and produces its first result.
     assert!(
         handle.wait_for("spawning agent", 15),
         "worker not spawned. Lines: {:?}",
@@ -308,16 +304,13 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
     );
     let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
 
-    // Worker signals done --pr — the daemon persists the PR to the journal.
     quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
 
-    // Wait for the daemon to acknowledge the PR (proof journal upsert ran).
     assert!(
         handle.wait_for("PR #1 ready for review", 15),
         "daemon did not acknowledge PR #1 before SIGKILL. Lines: {:?}",
         handle.lines
     );
-    // Small drain so we've observed all log lines up to this point.
     handle.drain_pending_lines();
 
     // ── Kill the daemon hard (mimics operator hitting the process). ──
@@ -326,27 +319,24 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
     // ── Relaunch the daemon. ──
     let mut handle2 = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Recovery MUST route the awaiting-review-with-PR entry to a pending
-    // review (no --resume worker spawn for this task).
+    // Recovery must complete (stateless: kill stale, wipe journal, GC worktrees).
     assert!(
-        handle2.wait_for("resuming task #1 at REVIEW stage", 30),
-        "recovery did not route awaiting-review-with-PR to pending review. Lines: {:?}",
+        handle2.wait_for("recovery: complete", 30),
+        "recovery did not complete. Lines: {:?}",
         handle2.lines
     );
 
-    // A reviewer MUST be provisioned against the recorded PR.
+    // Phase 5b must detect the orphan in-review task and provision a reviewer.
     assert!(
         handle2.wait_for("spawning reviewer", 30),
-        "reviewer not provisioned for pending review. Lines: {:?}",
+        "reviewer not provisioned for in-review task after restart. Lines: {:?}",
         handle2.lines
     );
 
+    std::thread::sleep(Duration::from_millis(500));
     handle2.drain_pending_lines();
 
     // ── Invariant: NO fresh worker spawn for task #1 after restart. ──
-    // This is the core anti-duplication guarantee. The pre-fix bug was
-    // exactly that a fresh `spawning agent` fired for the same task on
-    // restart, producing a duplicate PR.
     let fresh_worker_spawns = handle2
         .lines
         .iter()
@@ -362,10 +352,10 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
     handle2.sigkill();
 }
 
-/// C7 regression: a task stuck in `in-review` with no journal row — the orphan
-/// rescue scan must detect it and register a PendingReview for reviewer provisioning.
+/// In-review task with no journal row — Phase 5b must detect it and
+/// provision a reviewer on the first tick after startup.
 #[test]
-fn orphan_in_review_task_rescued_on_startup() {
+fn orphan_in_review_task_gets_reviewer_on_startup() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -380,8 +370,6 @@ fn orphan_in_review_task_rescued_on_startup() {
         .status()
         .unwrap();
 
-    // Set up the orphan state directly: create task, claim it, signal done to reach in-review.
-    // No daemon means no journal row — exactly the orphan scenario.
     let db_path = home
         .path()
         .join("repos")
@@ -415,35 +403,31 @@ fn orphan_in_review_task_rescued_on_startup() {
             now + 1,
         )
         .unwrap();
-        // Verify task is in-review
         let task = quorum_core::tasks::get(&conn, id).unwrap().unwrap();
         assert_eq!(task.status, "in-review");
-        // No journal row exists — this is the orphan state
     }
 
-    // Start daemon — it should detect the orphan and rescue it.
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
     assert!(
-        handle.wait_for("rescuing orphaned in-review task #1", 15),
-        "orphan rescue not triggered. Lines: {:?}",
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
         handle.lines
     );
 
-    // The orphan should be registered as a PendingReview, leading to reviewer provisioning.
+    // Phase 5b provisions a reviewer for the orphan in-review task.
     assert!(
         handle.wait_for("spawning reviewer", 15),
-        "reviewer not provisioned for rescued orphan. Lines: {:?}",
+        "reviewer not provisioned for orphan in-review task. Lines: {:?}",
         handle.lines
     );
 
     handle.sigkill();
 }
 
-/// Double-restart idempotent: orphan rescue on second restart should not
-/// create duplicates or crash if the task was already rescued.
+/// Double-restart idempotent: task stays in-review across two restarts.
 #[test]
-fn orphan_rescue_double_restart_idempotent() {
+fn double_restart_in_review_stays_in_review() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -492,18 +476,16 @@ fn orphan_rescue_double_restart_idempotent() {
         .unwrap();
     }
 
-    // First daemon start — rescues orphan.
+    // First daemon start — recovery completes, Phase 5b handles reviewer.
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
     assert!(
-        handle.wait_for("rescuing orphaned in-review task #1", 15),
-        "first-start orphan rescue not triggered. Lines: {:?}",
+        handle.wait_for("recovery: complete", 15),
+        "first-start recovery did not complete. Lines: {:?}",
         handle.lines
     );
     handle.sigkill();
 
-    // Second daemon start — the orphan-rescue journal entry has no worktree on disk,
-    // so recovery cleans it up via AgentFailed (in-review stays in-review), then the
-    // orphan scan re-rescues. This is idempotent: the task stays in-review throughout.
+    // Second daemon start — recovery again, task still in-review.
     let mut handle2 = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
     assert!(
         handle2.wait_for("recovery: complete", 15),
@@ -511,12 +493,6 @@ fn orphan_rescue_double_restart_idempotent() {
         handle2.lines
     );
 
-    // Verify task is still in-review (not corrupted by double recovery).
-    let db_path = home
-        .path()
-        .join("repos")
-        .join("test__repo")
-        .join("quorum.db");
     let conn = quorum_core::db::open(&db_path).unwrap();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(
@@ -571,10 +547,8 @@ fn in_review_journal_row_survives_shutdown() {
         handle.lines
     );
 
-    // Kill daemon — simulate unclean shutdown.
     handle.sigkill();
 
-    // Verify task is still in-review (not silently reset to open).
     let db_path = home
         .path()
         .join("repos")
@@ -588,12 +562,10 @@ fn in_review_journal_row_survives_shutdown() {
     );
 }
 
-/// M3: Simulate the exit-75 (self-update) recovery path where a pending review's
-/// journal row survives the restart and the task's claim lease has expired during
-/// the rebuild window. Recovery must re-adopt the pending review from journal and
-/// provision a reviewer — the expired claim must not cause duplicate execution.
+/// Exit-75 (self-update) recovery: journal row survives, task stays in-review,
+/// Phase 5b provisions a reviewer — no duplicate worker execution.
 #[test]
-fn exit75_pending_review_recovered_with_expired_lease() {
+fn exit75_in_review_recovered_without_worker_respawn() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -614,11 +586,6 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         .join("test__repo")
         .join("quorum.db");
 
-    // Seed the post-exit-75 state directly in the DB:
-    // 1. Task in in-review (worker signaled done --pr)
-    // 2. Claim with expired expires_at (lease expired during slow rebuild)
-    // 3. Journal row for the worker in awaiting-review phase (left by exit-75)
-    // 4. Worktree directory exists on disk (exit-75 preserves worktrees)
     let fake_wt = wt_base.path().join("Agent0");
     std::fs::create_dir_all(&fake_wt).unwrap();
     {
@@ -627,7 +594,7 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         let id = quorum_core::tasks::create(
             &mut conn,
             "test",
-            "M3 exit-75 lease expiry test",
+            "Exit-75 lease expiry test",
             None,
             0,
             None,
@@ -639,10 +606,8 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         .unwrap();
         assert_eq!(id, 1);
 
-        // Claim task with a short TTL so the lease is already expired by "now"
         quorum_core::tasks::claim(&mut conn, "Agent0", Some(id), &[], 100, now).unwrap();
 
-        // Transition to in-review via SignaledDone
         quorum_core::tasks::apply_event(
             &mut conn,
             "Agent0",
@@ -654,12 +619,9 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         )
         .unwrap();
 
-        // Verify task is in-review
         let task = quorum_core::tasks::get(&conn, id).unwrap().unwrap();
         assert_eq!(task.status, "in-review");
 
-        // Insert journal row as if exit-75 left it: worker in awaiting-review
-        // with a PR and a worktree path that exists on disk.
         let entry = quorum_core::journal::JournalEntry {
             agent: "Agent0".into(),
             role: "worker".into(),
@@ -679,19 +641,19 @@ fn exit75_pending_review_recovered_with_expired_lease() {
         quorum_core::journal::upsert(&mut conn, &entry).unwrap();
     }
 
-    // Start daemon — recovery must re-adopt the journal entry as a PendingReview.
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Recovery Phase 2 routes awaiting-review-with-PR to pending review.
+    // Stateless recovery: wipes journal, GCs worktrees, leaves in-review as-is.
     assert!(
-        handle.wait_for("resuming task #1 at REVIEW stage", 15),
-        "recovery did not resume pending review from exit-75 journal row. Lines: {:?}",
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
         handle.lines
     );
 
+    std::thread::sleep(Duration::from_millis(500));
     handle.drain_pending_lines();
 
-    // Verify task remains in-review (expired claim didn't corrupt status).
+    // Task stays in-review.
     let conn = quorum_core::db::open(&db_path).unwrap();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(
@@ -701,7 +663,7 @@ fn exit75_pending_review_recovered_with_expired_lease() {
     );
     drop(conn);
 
-    // No fresh worker should be spawned for task #1 — it's covered by the pending review.
+    // No fresh worker for task #1 — Phase 5b handles it via reviewer provisioning.
     let fresh_spawns = handle
         .lines
         .iter()
@@ -830,9 +792,10 @@ fn make_journal_entry(
     }
 }
 
-/// Cell: worker/working with existing worktree → resumed with --resume + feed_turn
+/// Stateless recovery: working task with journal entry → AgentFailed → open,
+/// journal wiped, worktree GC'd, Phase 6 re-spawns a fresh worker.
 #[test]
-fn recovery_worker_working_with_worktree_resumes() {
+fn recovery_working_task_reset_to_open_and_respawned() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Working task with worktree", "Agent0");
 
@@ -851,24 +814,37 @@ fn recovery_worker_working_with_worktree_resumes() {
     let mut handle = env.start_serve();
 
     assert!(
-        handle.wait_for("resumed worker Agent0", 15),
-        "recovery did not resume worker/working with existing worktree. Lines: {:?}",
+        handle.wait_for("working task #1 -> open via AgentFailed", 15),
+        "recovery did not reset working task to open. Lines: {:?}",
         handle.lines
     );
 
-    // The worker should remain in working status (not released).
-    assert_eq!(
-        env.task_status(id),
-        "working",
-        "task should stay working after resume"
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+
+    // Journal must be wiped.
+    assert!(
+        !env.journal_exists("Agent0"),
+        "journal entry should be deleted by stateless recovery"
+    );
+
+    // Phase 6 should re-spawn a fresh worker for the open task.
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "Phase 6 did not re-spawn a worker for the open task. Lines: {:?}",
+        handle.lines
     );
 
     handle.sigkill();
 }
 
-/// Cell: worker/working with missing worktree → release task via AgentFailed
+/// Stateless recovery: working task with missing worktree → same behavior
+/// as with existing worktree (journal wiped, task → open).
 #[test]
-fn recovery_worker_working_missing_worktree_releases() {
+fn recovery_working_task_missing_worktree_reset_to_open() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Working task missing worktree", "Agent0");
 
@@ -884,36 +860,28 @@ fn recovery_worker_working_missing_worktree_releases() {
     let mut handle = env.start_serve();
 
     assert!(
-        handle.wait_for("worktree missing for worker Agent0", 15),
-        "recovery did not detect missing worktree. Lines: {:?}",
-        handle.lines
-    );
-
-    assert!(
         handle.wait_for("recovery: complete", 15),
         "recovery did not complete. Lines: {:?}",
         handle.lines
     );
 
-    // Task should be back to open via AgentFailed (Working → Open).
     assert_eq!(
         env.task_status(id),
         "open",
-        "task should revert to open when worktree is missing"
+        "task should revert to open via AgentFailed"
     );
 
-    // Journal entry should be deleted.
     assert!(
         !env.journal_exists("Agent0"),
-        "journal entry should be deleted after worktree-missing cleanup"
+        "journal entry should be deleted by stateless recovery"
     );
 
     handle.sigkill();
 }
 
-/// Cell: reviewer teardown — journal deleted, worktree removed, name released
+/// Stateless recovery: all journal entries are wiped regardless of role.
 #[test]
-fn recovery_reviewer_teardown() {
+fn recovery_all_journal_entries_wiped() {
     let env = TestEnv::new();
 
     env.seed_journal(&make_journal_entry(
@@ -924,14 +892,11 @@ fn recovery_reviewer_teardown() {
         None,
         None,
     ));
+    env.seed_journal(&make_journal_entry(
+        "X0", "observer", "watching", None, None, None,
+    ));
 
     let mut handle = env.start_serve();
-
-    assert!(
-        handle.wait_for("tearing down stale reviewer Rev0", 15),
-        "recovery did not tear down reviewer. Lines: {:?}",
-        handle.lines
-    );
 
     assert!(
         handle.wait_for("recovery: complete", 15),
@@ -941,44 +906,18 @@ fn recovery_reviewer_teardown() {
 
     assert!(
         !env.journal_exists("Rev0"),
-        "journal entry should be deleted after reviewer teardown"
+        "reviewer journal entry should be deleted"
     );
-
-    handle.sigkill();
-}
-
-/// Cell: unknown role → journal entry deleted, name released
-#[test]
-fn recovery_unknown_role_deleted() {
-    let env = TestEnv::new();
-
-    env.seed_journal(&make_journal_entry(
-        "X0", "observer", "watching", None, None, None,
-    ));
-
-    let mut handle = env.start_serve();
-
-    assert!(
-        handle.wait_for("unknown role 'observer' for X0", 15),
-        "recovery did not handle unknown role. Lines: {:?}",
-        handle.lines
-    );
-
-    assert!(
-        handle.wait_for("recovery: complete", 15),
-        "recovery did not complete. Lines: {:?}",
-        handle.lines
-    );
-
     assert!(
         !env.journal_exists("X0"),
-        "journal entry should be deleted for unknown role"
+        "unknown-role journal entry should be deleted"
     );
 
     handle.sigkill();
 }
 
-/// Cell: orphaned worktree GC — directories in wt_base not referenced by journal are removed
+/// Phase 3: orphaned worktree directories are GC'd (all worktrees are orphans
+/// after journal wipe).
 #[test]
 fn recovery_orphaned_worktree_gc() {
     let env = TestEnv::new();
@@ -990,7 +929,7 @@ fn recovery_orphaned_worktree_gc() {
     let mut handle = env.start_serve();
 
     assert!(
-        handle.wait_for("GC'd 1 orphaned worktree", 15),
+        handle.wait_for("recovery: GC'd 1 worktree(s)", 15),
         "recovery did not GC orphaned worktree. Lines: {:?}",
         handle.lines
     );
@@ -1003,9 +942,11 @@ fn recovery_orphaned_worktree_gc() {
     handle.sigkill();
 }
 
-/// Cell: stale mailbox drain (F9) — unconsumed mailbox rows consumed before worker resume
+/// F9: stale mailbox rows for a re-spawned agent name are drained during
+/// Phase 6 spawn_worker (not during recovery, but before the worker's
+/// first turn).
 #[test]
-fn recovery_stale_mailbox_drained() {
+fn recovery_stale_mailbox_drained_on_respawn() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Mailbox drain task", "Agent0");
 
@@ -1041,13 +982,19 @@ fn recovery_stale_mailbox_drained() {
 
     let mut handle = env.start_serve();
 
+    // Recovery resets task to open, then Phase 6 spawns Agent0. The tick loop
+    // consumes stale mailbox rows (either via F9 drain or message processing).
     assert!(
-        handle.wait_for("consumed 2 stale mailbox row(s) for Agent0", 15),
-        "recovery did not drain stale mailbox rows. Lines: {:?}",
+        handle.wait_for("spawning agent Agent0", 15),
+        "Phase 6 did not re-spawn Agent0. Lines: {:?}",
         handle.lines
     );
 
-    // Verify the mailbox rows are actually consumed (no unconsumed rows remain).
+    // Give the spawn + mailbox processing a moment to settle.
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    // Verify the stale mailbox rows are consumed (no unconsumed rows remain).
     {
         let conn = quorum_core::db::open(&env.db_path).unwrap();
         let unconsumed = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
@@ -1057,7 +1004,7 @@ fn recovery_stale_mailbox_drained() {
             .collect();
         assert!(
             agent0_unconsumed.is_empty(),
-            "stale mailbox rows should be consumed in DB, found {} unconsumed",
+            "stale mailbox rows should be consumed, found {} unconsumed",
             agent0_unconsumed.len()
         );
     }
@@ -1065,9 +1012,10 @@ fn recovery_stale_mailbox_drained() {
     handle.sigkill();
 }
 
-/// Cell: spawn failure → release_and_cleanup (task goes to open, journal deleted)
+/// Stateless recovery resets working task to open; with a bad agent binary
+/// Phase 6's spawn attempt fails but the task stays open (not stuck).
 #[test]
-fn recovery_spawn_failure_releases_task() {
+fn recovery_bad_agent_binary_task_stays_open() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Spawn failure task", "Agent0");
 
@@ -1083,40 +1031,30 @@ fn recovery_spawn_failure_releases_task() {
         None,
     ));
 
-    // Use a non-existent binary so AgentProc::spawn returns Err.
     let mut handle = env.start_serve_with_agent_bin("/nonexistent/agent/binary");
 
     assert!(
-        handle.wait_for("spawn failed for Agent0", 15),
-        "recovery did not report spawn failure. Lines: {:?}",
-        handle.lines
-    );
-
-    assert!(
         handle.wait_for("recovery: complete", 15),
-        "recovery did not complete after spawn failure. Lines: {:?}",
+        "recovery did not complete. Lines: {:?}",
         handle.lines
     );
 
+    // Task should be open (reset by recovery's AgentFailed).
     assert_eq!(
         env.task_status(id),
         "open",
-        "task should revert to open after spawn failure"
+        "task should be open after recovery"
     );
 
     handle.sigkill();
 }
 
-/// Cell: feed_turn failure path — when the resumed agent exits immediately,
-/// the tick loop detects the death and releases the task. The feed_turn
-/// failure path in recovery.rs shares `release_and_cleanup` with spawn
-/// failure (tested above); the pipe write succeeds because the kernel
-/// buffers the small resume turn, so the failure surfaces as worker death
-/// in the tick loop rather than as a feed_turn error.
+/// After stateless recovery, a worker spawned by Phase 6 that exits
+/// immediately is detected by the tick loop and torn down.
 #[test]
-fn recovery_agent_dies_after_resume_releases_task() {
+fn recovery_respawned_agent_dies_detected_by_tick_loop() {
     let env = TestEnv::new();
-    let id = env.seed_claimed_task("Die-after-resume task", "Agent0");
+    let id = env.seed_claimed_task("Die-after-respawn task", "Agent0");
 
     let wt = env.wt_base.path().join("Agent0");
     std::fs::create_dir_all(&wt).unwrap();
@@ -1130,7 +1068,6 @@ fn recovery_agent_dies_after_resume_releases_task() {
         None,
     ));
 
-    // Script exits immediately after shell startup — too fast to respond.
     let bad_agent = env.home.path().join("exit-agent.sh");
     std::fs::write(&bad_agent, "#!/bin/sh\nexit 0\n").unwrap();
     #[cfg(unix)]
@@ -1141,56 +1078,40 @@ fn recovery_agent_dies_after_resume_releases_task() {
 
     let mut handle = env.start_serve_with_agent_bin(&bad_agent.to_string_lossy());
 
-    // Recovery resumes the worker (feed_turn succeeds due to pipe buffering),
-    // then the tick loop detects the worker died.
+    // Recovery resets task to open, Phase 6 spawns worker, worker dies immediately.
     assert!(
         handle.wait_for("died mid-task", 15),
-        "tick loop did not detect dead worker after resume. Lines: {:?}",
+        "tick loop did not detect dead worker. Lines: {:?}",
         handle.lines
     );
 
-    // Wait for the lifecycle event to fire (DB update happens inside fire_event,
-    // before the "tearing down" log).
     assert!(
-        handle.wait_for("tearing down worker Agent0", 15),
+        handle.wait_for("tearing down worker", 15),
         "worker teardown not seen. Lines: {:?}",
         handle.lines
     );
 
-    // Check what the lifecycle event did — either success or failure.
     handle.drain_pending_lines();
-    let lifecycle_fired = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("lifecycle: task #") && l.contains("-> open"));
-    let lifecycle_failed = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("lifecycle: fire_event failed"));
-
-    // If the lifecycle event succeeded, task should be open.
-    // If it failed (e.g., sweep already reaped), the task is still open from the reap.
     let status = env.task_status(id);
     assert!(
         status == "open" || status == "cancelled",
-        "task should be open or cancelled after agent dies post-resume, got: {status}. \
-         lifecycle_fired={lifecycle_fired}, lifecycle_failed={lifecycle_failed}. Lines: {:?}",
+        "task should be open or cancelled after agent dies, got: {status}. Lines: {:?}",
         handle.lines
     );
 
     handle.sigkill();
 }
 
-/// Cell: mixed entries — multiple entry types processed in single recovery run
+/// Stateless recovery: multiple journal entries of different roles are all
+/// wiped, and working tasks are reset to open.
 #[test]
-fn recovery_mixed_worker_and_reviewer_entries() {
+fn recovery_mixed_entries_all_wiped() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Mixed recovery task", "Agent0");
 
     let wt = env.wt_base.path().join("Agent0");
     std::fs::create_dir_all(&wt).unwrap();
 
-    // Worker in working phase with existing worktree.
     env.seed_journal(&make_journal_entry(
         "Agent0",
         "worker",
@@ -1199,8 +1120,6 @@ fn recovery_mixed_worker_and_reviewer_entries() {
         Some(&wt.to_string_lossy()),
         None,
     ));
-
-    // Reviewer entry — should be torn down.
     env.seed_journal(&make_journal_entry(
         "Rev0",
         "reviewer",
@@ -1212,94 +1131,61 @@ fn recovery_mixed_worker_and_reviewer_entries() {
 
     let mut handle = env.start_serve();
 
-    // Wait for recovery to finish — entries are processed in alphabetical order.
     assert!(
         handle.wait_for("recovery: complete", 30),
         "recovery did not complete. Lines: {:?}",
         handle.lines
     );
 
-    handle.drain_pending_lines();
-
-    let has_resumed = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("resumed worker Agent0"));
-    let has_teardown = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("tearing down stale reviewer Rev0"));
-
-    assert!(
-        has_resumed,
-        "recovery did not resume worker in mixed scenario. Lines: {:?}",
-        handle.lines
-    );
-    assert!(
-        has_teardown,
-        "recovery did not tear down reviewer in mixed scenario. Lines: {:?}",
-        handle.lines
-    );
-
-    // Worker task stays working, reviewer journal cleaned up.
-    assert_eq!(env.task_status(id), "working");
+    // Both journal entries wiped.
+    assert!(!env.journal_exists("Agent0"));
     assert!(!env.journal_exists("Rev0"));
+
+    // Working task reset to open.
+    assert_eq!(env.task_status(id), "open");
 
     handle.sigkill();
 }
 
-/// Cell: worker/awaiting-review WITHOUT PR → falls through to --resume spawn
-/// (no PendingReview created; the worker is resumed as a regular slot)
+/// Stateless recovery: journal phase (awaiting-review) is irrelevant — what
+/// matters is the DB task status. A working task with an awaiting-review
+/// journal entry is still reset to open via AgentFailed.
 #[test]
-fn recovery_awaiting_review_without_pr_spawns_resume() {
+fn recovery_journal_phase_irrelevant_db_status_drives_reset() {
     let env = TestEnv::new();
     let id = env.seed_claimed_task("Awaiting review no PR", "Agent0");
 
     let wt = env.wt_base.path().join("Agent0");
     std::fs::create_dir_all(&wt).unwrap();
 
-    // awaiting-review but pr=None → recovery falls through to spawn with --resume
     env.seed_journal(&make_journal_entry(
         "Agent0",
         "worker",
         "awaiting-review",
         Some(id),
         Some(&wt.to_string_lossy()),
-        None, // no PR
+        None,
     ));
 
     let mut handle = env.start_serve();
 
-    // Should resume (not route to pending review).
     assert!(
-        handle.wait_for("resumed worker Agent0", 15),
-        "recovery did not resume awaiting-review worker without PR. Lines: {:?}",
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
         handle.lines
     );
 
-    // Should NOT see "at REVIEW stage" (that's the with-PR path).
-    handle.drain_pending_lines();
-    let review_stage_log = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("resuming task") && l.contains("at REVIEW stage"));
+    // Journal wiped regardless of phase.
     assert!(
-        !review_stage_log,
-        "awaiting-review without PR should NOT route to pending review. Lines: {:?}",
+        !env.journal_exists("Agent0"),
+        "journal entry should be wiped by stateless recovery"
+    );
+
+    // Task was "working" in DB → open via AgentFailed → Phase 6 re-spawns.
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "Phase 6 did not re-spawn a worker. Lines: {:?}",
         handle.lines
-    );
-
-    // Task should remain in working status (resumed, not released).
-    assert_eq!(
-        env.task_status(id),
-        "working",
-        "task should stay working after awaiting-review-without-PR resume"
-    );
-
-    // Journal entry should still exist (worker was resumed, not torn down).
-    assert!(
-        env.journal_exists("Agent0"),
-        "journal entry should persist after resume (worker is running)"
     );
 
     handle.sigkill();

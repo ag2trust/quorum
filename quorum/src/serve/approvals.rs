@@ -16,9 +16,8 @@
 //!    - `Demote` → head moved; drop the approval and let normal recovery re-review.
 //!    - `Reject` → self-review / not attested; drop the approval (crash safety).
 //!
-//! Runs BEFORE journal-driven [`super::recovery::recover`] so an approved task
-//! is merged+closed (and its journal rows removed) before the worker-resume
-//! path could re-spawn a worker for it.
+//! Runs BEFORE [`super::recovery::recover`] so an approved task is
+//! merged+closed (and its journal rows removed) before recovery resets it.
 
 use super::log;
 use super::merge::{self, MergeabilityState};
@@ -274,8 +273,7 @@ async fn merge_approved(
         let note =
             format!("daemon: PR #{pr} merged on restart recovery (approved by {reviewer}, #228)");
         tasks::close_after_merge(&mut conn, task_id, &note, now)?;
-        // Remove any journal rows for this task so worker-resume recovery won't
-        // re-spawn an agent for now-merged work.
+        // Remove journal rows for this task so recovery won't reset now-merged work.
         let agents: Vec<String> = journal::list_in_flight(&conn)?
             .into_iter()
             .filter(|e| e.task_id == Some(task_id))
