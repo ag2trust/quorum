@@ -204,6 +204,48 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_try_acquire_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("q.db");
+            {
+                let c = crate::db::open(&db_path).unwrap();
+                drop(c);
+            }
+            let n = 8;
+            let barrier = Arc::new(Barrier::new(n));
+            let path = Arc::new(db_path);
+            let handles: Vec<_> = (0..n)
+                .map(|i| {
+                    let barrier = Arc::clone(&barrier);
+                    let path = Arc::clone(&path);
+                    std::thread::spawn(move || {
+                        let mut conn = crate::db::open(&path).unwrap();
+                        barrier.wait();
+                        let pid = 1000 + i as i64;
+                        try_acquire(&mut conn, pid, 5000, STALE, |_| true)
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| h.join().unwrap().unwrap())
+                .collect();
+            let acquired = results
+                .iter()
+                .filter(|r| matches!(r, AcquireResult::Acquired))
+                .count();
+            assert_eq!(acquired, 1, "exactly one thread must acquire the lock");
+            let held = results
+                .iter()
+                .filter(|r| matches!(r, AcquireResult::Held { .. }))
+                .count();
+            assert_eq!(held, n - 1);
+        }
+    }
+
+    #[test]
     fn refresh_wrong_pid_returns_zero() {
         let (_d, mut c) = open_tmp();
         try_acquire(&mut c, 100, 1000, STALE, |_| true).unwrap();
