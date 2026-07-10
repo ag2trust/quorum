@@ -455,6 +455,96 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_allocate_same_slug_distinct_tasks_distinct_branches() {
+        use std::sync::{Arc, Barrier};
+        let n = 4usize;
+        for _ in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("q.db");
+            {
+                let c = db::open(&db_path).unwrap();
+                drop(c);
+            }
+            let barrier = Arc::new(Barrier::new(n));
+            let path = Arc::new(db_path);
+            let handles: Vec<_> = (0..n)
+                .map(|i| {
+                    let barrier = Arc::clone(&barrier);
+                    let path = Arc::clone(&path);
+                    std::thread::spawn(move || {
+                        let mut conn = db::open(&path).unwrap();
+                        barrier.wait();
+                        allocate_for_task(
+                            &mut conn,
+                            (i + 1) as i64,
+                            "/tmp/wt",
+                            "same-agent",
+                            "identical slug",
+                            None,
+                            None,
+                            100,
+                        )
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let mut branches: Vec<String> = Vec::new();
+            for (i, r) in results.iter().enumerate() {
+                let alloc = r
+                    .as_ref()
+                    .unwrap_or_else(|e| panic!("thread {i} failed: {e}"));
+                assert!(!alloc.existed, "thread {i} should get a fresh allocation");
+                branches.push(alloc.branch.clone());
+            }
+            branches.sort();
+            branches.dedup();
+            assert_eq!(
+                branches.len(),
+                n,
+                "all branches must be distinct, got: {branches:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_retry_budget_exhaustion_returns_error() {
+        let (_dir, mut conn) = fresh_db();
+        for task_id in 1..=4 {
+            allocate_for_task(
+                &mut conn,
+                task_id,
+                "/tmp/wt",
+                "same-agent",
+                "same title",
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+        }
+        let result = allocate_for_task(
+            &mut conn,
+            5,
+            "/tmp/wt",
+            "same-agent",
+            "same title",
+            None,
+            None,
+            100,
+        );
+        assert!(
+            result.is_err(),
+            "5th identical slug must exhaust retry budget"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.exit_code(),
+            3,
+            "exhausted retries should be a DB error (exit 3)"
+        );
+    }
+
+    #[test]
     fn lookup_returns_existing() {
         let (_dir, mut conn) = fresh_db();
         let _ = allocate_for_task(

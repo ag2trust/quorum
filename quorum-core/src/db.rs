@@ -1281,4 +1281,72 @@ mod tests {
             .unwrap();
         assert_eq!(phase, "working");
     }
+
+    #[test]
+    fn migrates_v19_to_v20_adds_lifecycle_columns() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title       TEXT NOT NULL,
+                 body        TEXT,
+                 status      TEXT NOT NULL,
+                 priority    INTEGER NOT NULL DEFAULT 0,
+                 labels      TEXT,
+                 assignee    TEXT,
+                 created_by  TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 updated_at  INTEGER NOT NULL,
+                 refs        TEXT,
+                 depends_on  TEXT,
+                 sticky_until INTEGER,
+                 orig        TEXT
+             );
+             INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('seed task', 'open', 'test-agent', 100, 100);
+             PRAGMA user_version = 19;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        assert!(column_exists(&c, "tasks", "author").unwrap());
+        assert!(column_exists(&c, "tasks", "reviewer").unwrap());
+        assert!(column_exists(&c, "tasks", "rework_round").unwrap());
+        assert!(column_exists(&c, "tasks", "review_only").unwrap());
+
+        let (author, reviewer, rework_round, review_only): (
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+        ) = c
+            .query_row(
+                "SELECT author, reviewer, rework_round, review_only FROM tasks WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert!(author.is_none(), "author default must be NULL");
+        assert!(reviewer.is_none(), "reviewer default must be NULL");
+        assert_eq!(rework_round, 0, "rework_round default must be 0");
+        assert_eq!(review_only, 0, "review_only default must be 0");
+
+        let title: String = c
+            .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "seed task");
+    }
 }
