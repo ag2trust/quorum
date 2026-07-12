@@ -52,6 +52,8 @@ fn parse_daemon_branch_task_id(branch: &str) -> Option<i64> {
 ///
 /// `open_prs`: all open PRs from `gh pr list`.
 /// `task_prs`: `(task_id, pr_number)` pairs from non-terminal tasks with refs.pr set.
+/// `all_backed_prs`: PR numbers referenced by ANY task (including terminal) — a PR
+///   with a done review_only task is still "backed" and must not flag.
 /// `task_branches`: `(task_id, branch)` pairs from the task_branches table for
 ///   non-terminal tasks — used for branch-based twin matching.
 /// `active_task_ids`: IDs of all non-terminal tasks — used to suppress false positives
@@ -59,10 +61,15 @@ fn parse_daemon_branch_task_id(branch: &str) -> Option<i64> {
 pub fn detect(
     open_prs: &[GhPr],
     task_prs: &[(i64, i64)],
+    all_backed_prs: &HashSet<i64>,
     task_branches: &[(i64, String)],
     active_task_ids: &HashSet<i64>,
 ) -> DriftResult {
-    let backed_pr_numbers: HashSet<i64> = task_prs.iter().map(|(_, pr)| *pr).collect();
+    let backed_pr_numbers: HashSet<i64> = task_prs
+        .iter()
+        .map(|(_, pr)| *pr)
+        .chain(all_backed_prs.iter().copied())
+        .collect();
 
     let branch_task_set: HashSet<i64> = task_branches.iter().map(|(tid, _)| *tid).collect();
 
@@ -134,6 +141,27 @@ pub fn detect(
     twins.sort_by_key(|t| t.task_id);
 
     DriftResult { unbacked, twins }
+}
+
+/// Query ALL tasks with refs.pr set (including terminal). Used to suppress
+/// unbacked-PR flags for PRs that any task has ever referenced.
+pub fn all_task_pr_refs(conn: &Connection) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT refs FROM tasks WHERE refs IS NOT NULL")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut result = HashSet::new();
+    for refs_json in rows {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&refs_json) {
+            if let Some(pr) = v.get("pr").and_then(|p| {
+                p.as_i64()
+                    .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
+            }) {
+                result.insert(pr);
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Query non-terminal tasks with refs.pr set. Returns (task_id, pr_number) pairs.
@@ -282,7 +310,10 @@ pub fn revoke_resolved_drift_events(
 }
 
 /// Query unexpired unbacked_pr events for the status display.
+/// Filters out PRs that are now backed by any task (including terminal ones),
+/// so stale events don't linger between drift detection passes.
 pub fn unbacked_pr_events(conn: &Connection, now: i64) -> Result<Vec<UnbackedPr>> {
+    let backed = all_task_pr_refs(conn)?;
     let mut stmt = conn.prepare(
         "SELECT subject, body FROM events WHERE kind = 'unbacked_pr' AND expires_at > ?1
          ORDER BY seq ASC",
@@ -298,6 +329,9 @@ pub fn unbacked_pr_events(conn: &Connection, now: i64) -> Result<Vec<UnbackedPr>
             .strip_prefix("pr#")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
+        if backed.contains(&number) {
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             result.push(UnbackedPr {
                 number,
@@ -380,7 +414,7 @@ mod tests {
             },
         ];
         let task_prs = vec![(1, 100), (2, 300)];
-        let result = detect(&open_prs, &task_prs, &[], &HashSet::new());
+        let result = detect(&open_prs, &task_prs, &HashSet::new(), &[], &HashSet::new());
         assert_eq!(result.unbacked.len(), 1);
         assert_eq!(result.unbacked[0].number, 200);
         assert_eq!(result.unbacked[0].title, "orphan");
@@ -394,7 +428,7 @@ mod tests {
             head_ref_name: "x".into(),
         }];
         let task_prs = vec![(1, 10)];
-        let result = detect(&open_prs, &task_prs, &[], &HashSet::new());
+        let result = detect(&open_prs, &task_prs, &HashSet::new(), &[], &HashSet::new());
         assert!(result.unbacked.is_empty());
         assert!(result.twins.is_empty());
     }
@@ -415,7 +449,7 @@ mod tests {
         ];
         // Both PRs backed by the same task
         let task_prs = vec![(5, 10), (5, 11)];
-        let result = detect(&open_prs, &task_prs, &[], &HashSet::new());
+        let result = detect(&open_prs, &task_prs, &HashSet::new(), &[], &HashSet::new());
         assert!(result.unbacked.is_empty());
         assert_eq!(result.twins.len(), 1);
         assert_eq!(result.twins[0].task_id, 5);
@@ -439,7 +473,13 @@ mod tests {
         // Only PR 10 referenced by task, but PR 20 shares the branch
         let task_prs = vec![(5, 10)];
         let task_branches = vec![(5, "daemon/feat-w1".to_string())];
-        let result = detect(&open_prs, &task_prs, &task_branches, &HashSet::new());
+        let result = detect(
+            &open_prs,
+            &task_prs,
+            &HashSet::new(),
+            &task_branches,
+            &HashSet::new(),
+        );
         assert_eq!(result.twins.len(), 1);
         assert_eq!(result.twins[0].task_id, 5);
         assert_eq!(result.twins[0].pr_numbers, vec![10, 20]);
@@ -454,14 +494,20 @@ mod tests {
         }];
         let task_prs = vec![(5, 10)];
         let task_branches = vec![(5, "daemon/feat-w1".to_string())];
-        let result = detect(&open_prs, &task_prs, &task_branches, &HashSet::new());
+        let result = detect(
+            &open_prs,
+            &task_prs,
+            &HashSet::new(),
+            &task_branches,
+            &HashSet::new(),
+        );
         // One PR matched by both ref and branch — should NOT be twin
         assert!(result.twins.is_empty());
     }
 
     #[test]
     fn detect_empty_inputs() {
-        let result = detect(&[], &[], &[], &HashSet::new());
+        let result = detect(&[], &[], &HashSet::new(), &[], &HashSet::new());
         assert!(result.unbacked.is_empty());
         assert!(result.twins.is_empty());
     }
@@ -716,6 +762,56 @@ mod tests {
     }
 
     #[test]
+    fn unbacked_pr_hidden_when_task_refs_it() {
+        // A review_only task with refs {"pr":314} backs the PR — even after the
+        // task is done, the PR must not appear in unbacked_pr_events (issue #71).
+        let (_d, mut c) = open_tmp();
+        let now = 1000;
+        let body = serde_json::json!({"title": "external PR", "branch": "feat/ext"}).to_string();
+        let tx = c
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        crate::events::emit(&tx, "unbacked_pr", "pr#314", &body, now).unwrap();
+        tx.commit().unwrap();
+        // Before the task exists, event shows up
+        let prs = unbacked_pr_events(&c, now).unwrap();
+        assert_eq!(prs.len(), 1);
+
+        // Create a done review_only task with refs.pr = 314
+        c.execute(
+            "INSERT INTO tasks (title, status, priority, created_by, created_at, updated_at, refs, review_only)
+             VALUES ('review #314', 'done', 0, 'daemon', 1, 1, '{\"pr\":314}', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Now the event should be filtered out at display time
+        let prs = unbacked_pr_events(&c, now).unwrap();
+        assert!(
+            prs.is_empty(),
+            "PR backed by terminal task must not appear: {prs:?}"
+        );
+    }
+
+    #[test]
+    fn detect_suppresses_unbacked_when_terminal_task_refs_pr() {
+        // PR still open but a done task refs it — should not flag as unbacked.
+        let open_prs = vec![GhPr {
+            number: 314,
+            title: "external PR".into(),
+            head_ref_name: "feat/ext".into(),
+        }];
+        let task_prs = vec![]; // no active tasks ref it
+        let all_backed = HashSet::from([314i64]); // but a terminal task does
+        let result = detect(&open_prs, &task_prs, &all_backed, &[], &HashSet::new());
+        assert!(
+            result.unbacked.is_empty(),
+            "terminal-task-backed PR must not flag: {:?}",
+            result.unbacked
+        );
+    }
+
+    #[test]
     fn parse_daemon_branch_task_id_valid() {
         assert_eq!(
             parse_daemon_branch_task_id("daemon/bolt-rw4r-t38"),
@@ -746,7 +842,7 @@ mod tests {
         }];
         let task_prs = vec![]; // no refs.pr set yet (create→done window)
         let active = HashSet::from([38]);
-        let result = detect(&open_prs, &task_prs, &[], &active);
+        let result = detect(&open_prs, &task_prs, &HashSet::new(), &[], &active);
         assert!(
             result.unbacked.is_empty(),
             "should suppress during create→done window"
@@ -763,7 +859,7 @@ mod tests {
         }];
         let task_prs = vec![];
         let active = HashSet::new(); // task 38 is terminal/gone
-        let result = detect(&open_prs, &task_prs, &[], &active);
+        let result = detect(&open_prs, &task_prs, &HashSet::new(), &[], &active);
         assert_eq!(
             result.unbacked.len(),
             1,
@@ -782,7 +878,13 @@ mod tests {
         }];
         let task_prs = vec![]; // no refs.pr yet
         let task_branches = vec![(42, "feat/cool-thing-bolt-q8x".to_string())];
-        let result = detect(&open_prs, &task_prs, &task_branches, &HashSet::new());
+        let result = detect(
+            &open_prs,
+            &task_prs,
+            &HashSet::new(),
+            &task_branches,
+            &HashSet::new(),
+        );
         assert!(
             result.unbacked.is_empty(),
             "should suppress when branch is allocated to active task"
