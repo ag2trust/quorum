@@ -159,9 +159,15 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
                 agent: agent.clone(),
             }],
         )),
-        (Status::Open, Event::Cancelled { .. }) => {
-            Ok((Status::Cancelled, vec![Effect::ReleaseLease]))
-        }
+        (Status::Open, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
         (Status::Open, Event::LeaseExpired) => reject("no lease to expire in open"),
         (Status::Open, Event::SignaledDone { .. }) => reject("cannot signal done from open"),
         (Status::Open, Event::ReviewerAttached { .. }) => reject("no reviewer in open"),
@@ -188,9 +194,15 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             ],
         )),
         (Status::Working, Event::LeaseExpired) => Ok((Status::Open, vec![Effect::ReleaseLease])),
-        (Status::Working, Event::Cancelled { .. }) => {
-            Ok((Status::Cancelled, vec![Effect::ReleaseLease]))
-        }
+        (Status::Working, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
         (Status::Working, Event::Claimed { .. }) => reject("already claimed"),
         (Status::Working, Event::ReviewerAttached { .. }) => reject("not in review"),
         (Status::Working, Event::VerdictApprove) => reject("not in review"),
@@ -223,7 +235,13 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             if t.review_only {
                 return Ok((
                     Status::Failed,
-                    vec![Effect::PostFindingsNote, Effect::ReleaseLease],
+                    vec![
+                        Effect::PostFindingsNote,
+                        Effect::ReleaseLease,
+                        Effect::NotifyOwner {
+                            reason: "review-only task: reviewer requested changes".into(),
+                        },
+                    ],
                 ));
             }
             if t.rework_round >= REWORK_CAP {
@@ -256,9 +274,15 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             Status::InReview,
             vec![Effect::ReleaseLease, Effect::SpawnReviewer],
         )),
-        (Status::InReview, Event::Cancelled { .. }) => {
-            Ok((Status::Cancelled, vec![Effect::ReleaseLease]))
-        }
+        (Status::InReview, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
         (Status::InReview, Event::Claimed { .. }) => reject("in review, not claimable"),
         (Status::InReview, Event::SignaledDone { .. }) => reject("already in review"),
         (Status::InReview, Event::ReworkPushed) => reject("not in rework"),
@@ -289,9 +313,15 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             ],
         )),
         (Status::Rework, Event::LeaseExpired) => Ok((Status::Open, vec![Effect::ReleaseLease])),
-        (Status::Rework, Event::Cancelled { .. }) => {
-            Ok((Status::Cancelled, vec![Effect::ReleaseLease]))
-        }
+        (Status::Rework, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
         (Status::Rework, Event::Claimed { .. }) => reject("in rework, not claimable"),
         (Status::Rework, Event::SignaledDone { .. }) => reject("must push rework, not signal done"),
         (Status::Rework, Event::ReviewerAttached { .. }) => reject("not in review"),
@@ -313,9 +343,15 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
                 Effect::ResumeReviewer,
             ],
         )),
-        (Status::Merging, Event::Cancelled { .. }) => {
-            Ok((Status::Cancelled, vec![Effect::ReleaseLease]))
-        }
+        (Status::Merging, Event::Cancelled { by }) => Ok((
+            Status::Cancelled,
+            vec![
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: format!("cancelled: {by}"),
+                },
+            ],
+        )),
         (Status::Merging, Event::AgentFailed { reason }) => Ok((
             Status::InReview,
             vec![
@@ -454,7 +490,12 @@ mod tests {
             &t,
             &Event::Cancelled { by: "boss".into() },
             Status::Cancelled,
-            &[Effect::ReleaseLease],
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "cancelled: boss".into(),
+                },
+            ],
         );
     }
 
@@ -531,7 +572,12 @@ mod tests {
             &t,
             &Event::Cancelled { by: "boss".into() },
             Status::Cancelled,
-            &[Effect::ReleaseLease],
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "cancelled: boss".into(),
+                },
+            ],
         );
     }
 
@@ -606,7 +652,13 @@ mod tests {
             &t,
             &Event::VerdictChanges,
             Status::Failed,
-            &[Effect::PostFindingsNote, Effect::ReleaseLease],
+            &[
+                Effect::PostFindingsNote,
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "review-only task: reviewer requested changes".into(),
+                },
+            ],
         );
     }
 
@@ -664,7 +716,12 @@ mod tests {
             &t,
             &Event::Cancelled { by: "boss".into() },
             Status::Cancelled,
-            &[Effect::ReleaseLease],
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "cancelled: boss".into(),
+                },
+            ],
         );
     }
 
@@ -761,7 +818,12 @@ mod tests {
             &t,
             &Event::Cancelled { by: "boss".into() },
             Status::Cancelled,
-            &[Effect::ReleaseLease],
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "cancelled: boss".into(),
+                },
+            ],
         );
     }
 
@@ -824,7 +886,12 @@ mod tests {
             &t,
             &Event::Cancelled { by: "boss".into() },
             Status::Cancelled,
-            &[Effect::ReleaseLease],
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "cancelled: boss".into(),
+                },
+            ],
         );
     }
 
@@ -999,6 +1066,12 @@ mod tests {
         assert_eq!(next, Status::Failed);
         assert!(effects.contains(&Effect::PostFindingsNote));
         assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyOwner { .. })),
+            "review-only Failed must carry NotifyOwner"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1334,6 +1407,8 @@ mod proptests {
             Just(Event::AgentFailed {
                 reason: "crash".into()
             }),
+            Just(Event::PrFoundMerged),
+            Just(Event::PrFoundClosed),
             Just(Event::Cancelled { by: "boss".into() }),
         ]
     }
@@ -1515,6 +1590,43 @@ mod proptests {
                         prop_assert_eq!(
                             next, Status::Rework,
                             "IncrementReworkRound but next state is {:?}", next
+                        );
+                    }
+                    for eff in &effects {
+                        match eff {
+                            Effect::SetAuthor { agent } => t.author = Some(agent.clone()),
+                            Effect::SetReviewer { agent } => t.reviewer = Some(agent.clone()),
+                            Effect::IncrementReworkRound => t.rework_round += 1,
+                            _ => {}
+                        }
+                    }
+                    if let Event::SignaledDone { pr } = event {
+                        t.pr = Some(pr.clone());
+                    }
+                    t.status = next;
+                }
+            }
+        }
+
+        /// Every transition into Failed or Cancelled carries a NotifyOwner effect.
+        #[test]
+        fn terminal_failed_or_cancelled_always_notifies(events in arb_event_seq(30)) {
+            let mut t = TaskView {
+                status: Status::Open,
+                author: None,
+                reviewer: None,
+                rework_round: 0,
+                pr: None,
+                review_only: false,
+            };
+
+            for event in &events {
+                if let Ok((next, effects)) = transition(&t, event) {
+                    if next == Status::Failed || next == Status::Cancelled {
+                        prop_assert!(
+                            effects.iter().any(|e| matches!(e, Effect::NotifyOwner { .. })),
+                            "transition {:?} -> {:?} on {:?} lacks NotifyOwner; effects: {:?}",
+                            t.status, next, event, effects
                         );
                     }
                     for eff in &effects {
