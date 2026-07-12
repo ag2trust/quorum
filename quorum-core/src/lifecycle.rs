@@ -1002,6 +1002,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Guard: review-only merge failure stays in-review (not failed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn review_only_merge_failed_stays_in_review() {
+        let mut t = view_with_author(Status::Merging, "W1");
+        t.review_only = true;
+        let (next, effects) = transition(
+            &t,
+            &Event::MergeFailed {
+                reason: "conflict".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+        assert!(effects.contains(&Effect::ResumeReviewer));
+        assert!(!effects.contains(&Effect::ReleaseLease));
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 

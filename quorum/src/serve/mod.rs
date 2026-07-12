@@ -1171,8 +1171,8 @@ async fn tick(
 
                     if mergeability == merge::MergeabilityState::Conflicting {
                         log(&format!("PR #{pr_num} is CONFLICTING — firing MergeFailed"));
-                        // merging → in-review
-                        fire_event(
+                        // merging → in-review (NotifyOwner alert is posted by lifecycle)
+                        let mf = fire_event(
                             &db_path,
                             "system",
                             reviewer_task_id,
@@ -1184,102 +1184,121 @@ async fn tick(
                             },
                         )
                         .await;
-                        // in-review → rework (lifecycle checks rework cap)
-                        let reviewer_name = reviewers[ri].agent_name.clone();
-                        let vc = fire_event(
-                            &db_path,
-                            &reviewer_name,
-                            reviewer_task_id,
-                            &Event::VerdictChanges,
-                        )
-                        .await;
-                        match vc {
-                            Some(ref tr) if tr.task.status == "rework" => {
-                                let rework_msg = format!(
-                                    "PR #{pr_num} has conflicts with {} \
+
+                        let is_review_only = mf.as_ref().is_some_and(|tr| tr.task.review_only);
+
+                        if is_review_only {
+                            // Review-only: no worker to rebase. Park as
+                            // merge-blocked; orphan handler retries merge
+                            // when the PR becomes MERGEABLE again.
+                            log(&format!(
+                                "review-only task #{reviewer_task_id}: \
+                                 merge blocked (conflict) — parking, not failing"
+                            ));
+                            set_task_body(&db_path, reviewer_task_id, tasks::MERGE_BLOCKED_BODY)
+                                .await;
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        } else {
+                            // in-review → rework (lifecycle checks rework cap)
+                            let reviewer_name = reviewers[ri].agent_name.clone();
+                            let vc = fire_event(
+                                &db_path,
+                                &reviewer_name,
+                                reviewer_task_id,
+                                &Event::VerdictChanges,
+                            )
+                            .await;
+                            match vc {
+                                Some(ref tr) if tr.task.status == "rework" => {
+                                    let rework_msg = format!(
+                                        "PR #{pr_num} has conflicts with {} \
                                      (a sibling PR likely merged first).\n\n\
                                      Rebase on {}, resolve conflicts, \
                                      and push again.",
-                                    config.base_branch, config.base_branch
-                                );
-                                // Reviewer stays alive (sticky-agent).
-                                if let Some(wi) =
-                                    workers.iter().position(|w| w.task_id == reviewer_task_id)
-                                {
-                                    let rework_turn = reviewer::build_rework_turn(
-                                        &workers[wi].agent_name,
-                                        workers[wi].task_id,
-                                        pr_num,
-                                        &rework_msg,
-                                        workers[wi].cost_usd,
-                                        config.limits.max_task_cost_usd,
+                                        config.base_branch, config.base_branch
                                     );
-                                    if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
-                                        log(&format!(
-                                            "conflict rework feed failed: {e} — cleaning up"
-                                        ));
-                                        let w = workers.remove(wi);
+                                    // Reviewer stays alive (sticky-agent).
+                                    if let Some(wi) =
+                                        workers.iter().position(|w| w.task_id == reviewer_task_id)
+                                    {
+                                        let rework_turn = reviewer::build_rework_turn(
+                                            &workers[wi].agent_name,
+                                            workers[wi].task_id,
+                                            pr_num,
+                                            &rework_msg,
+                                            workers[wi].cost_usd,
+                                            config.limits.max_task_cost_usd,
+                                        );
+                                        if let Err(e) =
+                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        {
+                                            log(&format!(
+                                                "conflict rework feed failed: {e} — cleaning up"
+                                            ));
+                                            let w = workers.remove(wi);
+                                            fire_event(
+                                                &db_path,
+                                                &w.agent_name,
+                                                w.task_id,
+                                                &Event::AgentFailed {
+                                                    reason: format!("rework feed failed: {e}"),
+                                                },
+                                            )
+                                            .await;
+                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                        } else {
+                                            let w = &mut workers[wi];
+                                            w.draining = true;
+                                            w.pr = None;
+                                            w.rework_count += 1;
+                                            w.turn_started_at = std::time::Instant::now();
+                                            if let Some(ref mut sl) = w.session_log {
+                                                sl.log_rework(w.rework_count);
+                                            }
+                                            let p = db_path.clone();
+                                            let entry = slot_journal_entry(w, "worker", "working");
+                                            tokio::task::spawn_blocking(move || -> Result<()> {
+                                                let mut conn = quorum_core::db::open(&p)?;
+                                                journal::upsert(&mut conn, &entry)
+                                            })
+                                            .await
+                                            .ok();
+                                            log(&format!(
+                                                "worker {} rework #{} (pre-merge conflict)",
+                                                w.agent_name, w.rework_count
+                                            ));
+                                        }
+                                    } else {
                                         fire_event(
                                             &db_path,
-                                            &w.agent_name,
-                                            w.task_id,
+                                            "daemon",
+                                            reviewer_task_id,
                                             &Event::AgentFailed {
-                                                reason: format!("rework feed failed: {e}"),
+                                                reason: "no worker for rework".into(),
                                             },
                                         )
                                         .await;
-                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
-                                    } else {
-                                        let w = &mut workers[wi];
-                                        w.draining = true;
-                                        w.pr = None;
-                                        w.rework_count += 1;
-                                        w.turn_started_at = std::time::Instant::now();
-                                        if let Some(ref mut sl) = w.session_log {
-                                            sl.log_rework(w.rework_count);
-                                        }
-                                        let p = db_path.clone();
-                                        let entry = slot_journal_entry(w, "worker", "working");
-                                        tokio::task::spawn_blocking(move || -> Result<()> {
-                                            let mut conn = quorum_core::db::open(&p)?;
-                                            journal::upsert(&mut conn, &entry)
-                                        })
-                                        .await
-                                        .ok();
-                                        log(&format!(
-                                            "worker {} rework #{} (pre-merge conflict)",
-                                            w.agent_name, w.rework_count
-                                        ));
                                     }
-                                } else {
-                                    fire_event(
-                                        &db_path,
-                                        "daemon",
-                                        reviewer_task_id,
-                                        &Event::AgentFailed {
-                                            reason: "no worker for rework".into(),
-                                        },
-                                    )
-                                    .await;
+                                }
+                                Some(_) => {
+                                    // Rework cap exceeded → failed. Clean up.
+                                    let r = reviewers.remove(ri);
+                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    if let Some(wi) =
+                                        workers.iter().position(|w| w.task_id == reviewer_task_id)
+                                    {
+                                        let w = workers.remove(wi);
+                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                    }
+                                }
+                                None => {
+                                    // VerdictChanges failed — clean up.
+                                    let r = reviewers.remove(ri);
+                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
                                 }
                             }
-                            Some(_) => {
-                                // Rework cap exceeded → failed. Clean up.
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                                if let Some(wi) =
-                                    workers.iter().position(|w| w.task_id == reviewer_task_id)
-                                {
-                                    let w = workers.remove(wi);
-                                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
-                                }
-                            }
-                            None => {
-                                // VerdictChanges failed — clean up.
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                            }
-                        }
+                        } // end !review_only
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -1743,8 +1762,8 @@ async fn tick(
                                      — firing MergeFailed",
                                     merge_result.message
                                 ));
-                                // merging → in-review
-                                fire_event(
+                                // merging → in-review (NotifyOwner alert posted by lifecycle)
+                                let mf = fire_event(
                                     &db_path,
                                     "system",
                                     reviewer_task_id,
@@ -1756,108 +1775,133 @@ async fn tick(
                                     },
                                 )
                                 .await;
-                                // in-review → rework
-                                let reviewer_name = reviewers[ri].agent_name.clone();
-                                let vc = fire_event(
-                                    &db_path,
-                                    &reviewer_name,
-                                    reviewer_task_id,
-                                    &Event::VerdictChanges,
-                                )
-                                .await;
-                                match vc {
-                                    Some(ref tr) if tr.task.status == "rework" => {
-                                        let rework_msg = format!(
-                                            "Merge of PR #{pr_num} failed: {}\n\n\
+
+                                let is_review_only =
+                                    mf.as_ref().is_some_and(|tr| tr.task.review_only);
+
+                                if is_review_only {
+                                    log(&format!(
+                                        "review-only task #{reviewer_task_id}: \
+                                         merge blocked (retryable) — parking, not failing"
+                                    ));
+                                    set_task_body(
+                                        &db_path,
+                                        reviewer_task_id,
+                                        tasks::MERGE_BLOCKED_BODY,
+                                    )
+                                    .await;
+                                    let r = reviewers.remove(ri);
+                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                } else {
+                                    // in-review → rework
+                                    let reviewer_name = reviewers[ri].agent_name.clone();
+                                    let vc = fire_event(
+                                        &db_path,
+                                        &reviewer_name,
+                                        reviewer_task_id,
+                                        &Event::VerdictChanges,
+                                    )
+                                    .await;
+                                    match vc {
+                                        Some(ref tr) if tr.task.status == "rework" => {
+                                            let rework_msg = format!(
+                                                "Merge of PR #{pr_num} failed: {}\n\n\
                                              Rebase on {}, resolve any conflicts, \
                                              and push again.",
-                                            merge_result.message, config.base_branch
-                                        );
-                                        // Reviewer stays alive (sticky-agent).
-                                        if let Some(wi) = workers
-                                            .iter()
-                                            .position(|w| w.task_id == reviewer_task_id)
-                                        {
-                                            let rework_turn = reviewer::build_rework_turn(
-                                                &workers[wi].agent_name,
-                                                workers[wi].task_id,
-                                                pr_num,
-                                                &rework_msg,
-                                                workers[wi].cost_usd,
-                                                config.limits.max_task_cost_usd,
+                                                merge_result.message, config.base_branch
                                             );
-                                            if let Err(e) =
-                                                workers[wi].proc.feed_turn(&rework_turn).await
+                                            // Reviewer stays alive (sticky-agent).
+                                            if let Some(wi) = workers
+                                                .iter()
+                                                .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                log(&format!(
+                                                let rework_turn = reviewer::build_rework_turn(
+                                                    &workers[wi].agent_name,
+                                                    workers[wi].task_id,
+                                                    pr_num,
+                                                    &rework_msg,
+                                                    workers[wi].cost_usd,
+                                                    config.limits.max_task_cost_usd,
+                                                );
+                                                if let Err(e) =
+                                                    workers[wi].proc.feed_turn(&rework_turn).await
+                                                {
+                                                    log(&format!(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
                                                 ));
-                                                let w = workers.remove(wi);
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config, wt_mgr, name_pool, w, None,
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    let w = &mut workers[wi];
+                                                    w.draining = true;
+                                                    w.pr = None;
+                                                    w.rework_count += 1;
+                                                    w.turn_started_at = std::time::Instant::now();
+                                                    if let Some(ref mut sl) = w.session_log {
+                                                        sl.log_rework(w.rework_count);
+                                                    }
+                                                    let p = db_path.clone();
+                                                    let entry =
+                                                        slot_journal_entry(w, "worker", "working");
+                                                    tokio::task::spawn_blocking(
+                                                        move || -> Result<()> {
+                                                            let mut conn =
+                                                                quorum_core::db::open(&p)?;
+                                                            journal::upsert(&mut conn, &entry)
+                                                        },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                    log(&format!(
+                                                        "worker {} rework #{} (merge failure)",
+                                                        w.agent_name, w.rework_count
+                                                    ));
+                                                }
+                                            } else {
                                                 fire_event(
                                                     &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
+                                                    "daemon",
+                                                    reviewer_task_id,
                                                     &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
+                                                        reason: "no worker for rework".into(),
                                                     },
                                                 )
                                                 .await;
+                                            }
+                                        }
+                                        Some(_) => {
+                                            // Rework cap exceeded → failed. Clean up.
+                                            let r = reviewers.remove(ri);
+                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                            if let Some(wi) = workers
+                                                .iter()
+                                                .position(|w| w.task_id == reviewer_task_id)
+                                            {
+                                                let w = workers.remove(wi);
                                                 cleanup_slot(config, wt_mgr, name_pool, w, None)
                                                     .await;
-                                            } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
-                                                )
-                                                .await
-                                                .ok();
-                                                log(&format!(
-                                                    "worker {} rework #{} (merge failure)",
-                                                    w.agent_name, w.rework_count
-                                                ));
                                             }
-                                        } else {
-                                            fire_event(
-                                                &db_path,
-                                                "daemon",
-                                                reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker for rework".into(),
-                                                },
-                                            )
-                                            .await;
+                                        }
+                                        None => {
+                                            let r = reviewers.remove(ri);
+                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
                                         }
                                     }
-                                    Some(_) => {
-                                        // Rework cap exceeded → failed. Clean up.
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                                        if let Some(wi) = workers
-                                            .iter()
-                                            .position(|w| w.task_id == reviewer_task_id)
-                                        {
-                                            let w = workers.remove(wi);
-                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
-                                        }
-                                    }
-                                    None => {
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                                    }
-                                }
+                                } // end !review_only
                             }
                         }
                     }
@@ -2654,16 +2698,18 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        let orphan_in_review: Vec<(i64, i64, String, bool)> = {
+        // (task_id, pr, author, review_only, body, reviewer)
+        type OrphanRow = (i64, i64, String, bool, Option<String>, Option<String>);
+        let orphan_in_review: Vec<OrphanRow> = {
             let p = db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<Vec<(i64, i64, String, bool)>> {
+            tokio::task::spawn_blocking(move || -> Result<Vec<OrphanRow>> {
                 let conn = quorum_core::db::open(&p)?;
                 let ir_tasks = tasks::list(&conn, Some("in-review"), None, None)?;
                 let mut result = Vec::new();
                 for t in ir_tasks {
                     if let Some(pr) = tasks::extract_pr_number(&t.refs) {
                         let author = t.author.unwrap_or_default();
-                        result.push((t.id, pr, author, t.review_only));
+                        result.push((t.id, pr, author, t.review_only, t.body, t.reviewer));
                     }
                 }
                 Ok(result)
@@ -2672,7 +2718,7 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author, review_only) in &orphan_in_review {
+        for (task_id, pr, author, review_only, body, reviewer) in &orphan_in_review {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -2703,8 +2749,42 @@ async fn tick(
                     fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
                     continue;
                 }
+                merge::MergeabilityState::Conflicting
+                    if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) =>
+                {
+                    continue;
+                }
                 _ => {}
             }
+
+            // Merge-blocked retry: approved review-only task waiting for
+            // PR to become mergeable again.
+            if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
+                if let Some(reviewer_name) = reviewer.as_deref() {
+                    log(&format!(
+                        "merge-blocked task #{task_id} PR #{pr}: \
+                         PR is now mergeable — retrying merge"
+                    ));
+                    set_task_body(&db_path, *task_id, "").await;
+                    fire_event(&db_path, reviewer_name, *task_id, &Event::VerdictApprove).await;
+                } else {
+                    log(&format!(
+                        "merge-blocked task #{task_id} PR #{pr}: \
+                         no reviewer on record — cannot retry merge"
+                    ));
+                    fire_event(
+                        &db_path,
+                        "system",
+                        *task_id,
+                        &Event::AgentFailed {
+                            reason: "merge-blocked but no reviewer to re-approve".into(),
+                        },
+                    )
+                    .await;
+                }
+                continue;
+            }
+
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "orphan in-review task #{task_id} PR #{pr}: \
