@@ -334,14 +334,34 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
             .first()
             .map(|d| format!("#{d}"))
             .unwrap_or_else(|| "?".to_string());
-        let block_icon = if sty.color { "⛔" } else { "[blocked]" };
+        let is_deadlocked = !b.deadlocked_on.is_empty();
+        let block_icon = if is_deadlocked {
+            if sty.color {
+                "💀"
+            } else {
+                "[DEADLOCK]"
+            }
+        } else {
+            if sty.color {
+                "⛔"
+            } else {
+                "[blocked]"
+            }
+        };
+        let suffix = if is_deadlocked {
+            let dead_ids: Vec<String> = b.deadlocked_on.iter().map(|d| format!("#{d}")).collect();
+            format!(" (CANCELLED — will never unblock: {})", dead_ids.join(", "))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<24} {} waits on {}",
+            "  #{:<5} {:<24} {} waits on {}{}",
             b.id,
             truncate(&b.title, 24),
             block_icon,
             dep,
+            suffix,
         );
     }
 }

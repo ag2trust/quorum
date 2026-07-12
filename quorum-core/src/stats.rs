@@ -93,6 +93,8 @@ pub struct BlockedTask {
     pub id: i64,
     pub title: String,
     pub waiting_on: Vec<i64>,
+    /// Dep ids that are cancelled — will never unblock without intervention.
+    pub deadlocked_on: Vec<i64>,
 }
 
 /// A recent feed message — last N rows, oldest-first within the window.
@@ -626,10 +628,12 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             continue;
         }
         let waiting_on = unmet_deps(conn, &depends_on)?;
+        let deadlocked_on = cancelled_deps(conn, &depends_on)?;
         blocked.push(BlockedTask {
             id,
             title,
             waiting_on,
+            deadlocked_on,
         });
     }
     Ok(blocked)
@@ -644,6 +648,22 @@ fn unmet_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<i64>
         "SELECT je.value FROM json_each(?1) je
          WHERE NOT EXISTS (
              SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
+         )",
+    )?;
+    let ids = stmt
+        .query_map(params![json], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+fn cancelled_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<i64>> {
+    let Some(json) = depends_on.as_deref() else {
+        return Ok(vec![]);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT je.value FROM json_each(?1) je
+         WHERE EXISTS (
+             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'cancelled'
          )",
     )?;
     let ids = stmt
@@ -1467,9 +1487,7 @@ mod tests {
     fn done(status: &str) -> crate::tasks::TaskUpdate<'_> {
         crate::tasks::TaskUpdate {
             status: Some(status),
-            body: None,
-            refs: None,
-            verdict: None,
+            ..Default::default()
         }
     }
 
@@ -1796,6 +1814,56 @@ mod tests {
         assert!(s.blocked.is_empty());
         // The dependent should now appear in the queue.
         assert!(!s.queue_by_tier.is_empty());
+    }
+
+    #[test]
+    fn blocked_section_surfaces_deadlocked_cancelled_deps() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(
+            &mut c,
+            "boss",
+            "will-cancel",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "stuck-child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        // Cancel the dep
+        crate::tasks::claim(&mut c, "W", Some(dep), &[], 10000, 100).unwrap();
+        crate::tasks::update(
+            &mut c,
+            "W",
+            dep,
+            &crate::tasks::TaskUpdate {
+                status: Some("cancelled"),
+                ..Default::default()
+            },
+            101,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.blocked.len(), 1);
+        let b = &s.blocked[0];
+        assert_eq!(b.id, child);
+        assert_eq!(b.deadlocked_on, vec![dep]);
     }
 
     // -- Issue #97 scoreboard + retired list -----------------------------------

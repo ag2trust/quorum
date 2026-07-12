@@ -160,6 +160,7 @@ pub struct TaskUpdate<'a> {
     pub body: Option<&'a str>,
     pub refs: Option<&'a str>,
     pub verdict: Option<&'a str>,
+    pub depends_on: Option<&'a str>,
 }
 
 pub struct TransitionResult {
@@ -680,6 +681,9 @@ pub fn update(
             )));
         }
     }
+    if let Some(dep_json) = fields.depends_on {
+        validate_depends_on(dep_json)?;
+    }
 
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
@@ -697,7 +701,6 @@ pub fn update(
                 params![id, "open", fields.body, fields.refs, now, agent],
             )?;
             if rows == 0 {
-                let like_pat = format!("{}%", PARKED_BODY_PREFIX);
                 tx.execute(
                     "UPDATE tasks SET
                         status='open', assignee=NULL,
@@ -705,9 +708,8 @@ pub fn update(
                         refs  = COALESCE(?4, refs),
                         updated_at = ?5
                      WHERE id=?1 AND (created_by=?6 OR assignee=?6)
-                           AND status='cancelled'
-                           AND body LIKE ?7",
-                    params![id, "open", fields.body, fields.refs, now, agent, like_pat],
+                           AND status='cancelled'",
+                    params![id, "open", fields.body, fields.refs, now, agent],
                 )?
             } else {
                 rows
@@ -747,9 +749,22 @@ pub fn update(
             }
         }
     };
-    if n == 0 {
+    if n == 0 && fields.depends_on.is_none() {
         tx.commit()?;
         return Err(QuorumError::NotHolder);
+    }
+
+    if let Some(dep_json) = fields.depends_on {
+        let dep_rows = tx.execute(
+            "UPDATE tasks SET depends_on=?2, updated_at=?3
+             WHERE id=?1 AND (created_by=?4 OR assignee=?4)
+                   AND status NOT IN ('done', 'failed')",
+            params![id, dep_json, now, agent],
+        )?;
+        if dep_rows == 0 && n == 0 {
+            tx.commit()?;
+            return Err(QuorumError::NotHolder);
+        }
     }
 
     if fields.status.is_none() && fields.body.is_some() {
@@ -1707,6 +1722,179 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "working");
+    }
+
+    #[test]
+    fn resurrect_cancelled_dep_unblocks_child() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "W", Some(dep), &[], TTL, 1000).unwrap();
+        cancel(&mut c, "W", dep, 1001).unwrap();
+        // Child is blocked (dep is cancelled, not done)
+        assert!(!get(&c, child).unwrap().unwrap().ready);
+        // Resurrect the dep (creator reopens — no parked prefix needed)
+        let reopened_dep = release(&mut c, "boss", dep, 1003).unwrap();
+        assert_eq!(reopened_dep.status, "open");
+        // Also resurrect child (cascade_dead_deps may have cancelled it on the
+        // previous write; in the live system it fires on the next daemon tick)
+        let child_task = get(&c, child).unwrap().unwrap();
+        if child_task.status == "cancelled" {
+            release(&mut c, "boss", child, 1003).unwrap();
+        }
+        // Complete the dep
+        claim(&mut c, "W", Some(dep), &[], TTL, 1004)
+            .unwrap()
+            .unwrap();
+        close_after_merge(&mut c, dep, "merged", 1005).unwrap();
+        // Now child is unblocked
+        let t = claim(&mut c, "A", Some(child), &[], TTL, 1006)
+            .unwrap()
+            .expect("child should be claimable now that dep is done");
+        assert_eq!(t.status, "working");
+    }
+
+    #[test]
+    fn edit_depends_on_unblocks_stuck_child() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "W", Some(dep), &[], TTL, 1000).unwrap();
+        cancel(&mut c, "W", dep, 1001).unwrap();
+        // child is blocked (dep is cancelled, not done)
+        assert!(!get(&c, child).unwrap().unwrap().ready);
+        // Clear child's deps (works even on cancelled tasks)
+        let updated = update(
+            &mut c,
+            "boss",
+            child,
+            &TaskUpdate {
+                depends_on: Some("[]"),
+                ..Default::default()
+            },
+            1002,
+        )
+        .unwrap();
+        assert!(updated.ready);
+        assert_eq!(updated.depends_on.as_deref(), Some("[]"));
+        // If cascade cancelled the child, resurrect it (now safe — no dead deps)
+        if updated.status == "cancelled" {
+            let reopened = release(&mut c, "boss", child, 1003).unwrap();
+            assert_eq!(reopened.status, "open");
+        }
+        // Now claimable
+        let t = claim(&mut c, "A", Some(child), &[], TTL, 1004)
+            .unwrap()
+            .expect("child with cleared deps should be claimable");
+        assert_eq!(t.status, "working");
+    }
+
+    #[test]
+    fn reopen_cancelled_task_without_parked_prefix() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        cancel(&mut c, "A", id, 1001).unwrap();
+        // Reopen by creator — no parked prefix required
+        let t = release(&mut c, "boss", id, 1002).unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none());
+    }
+
+    #[test]
+    fn update_depends_on_edits_deps() {
+        let (_d, mut c) = open_tmp();
+        let dep1 = create(
+            &mut c, "boss", "dep1", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        let _dep2 = create(
+            &mut c, "boss", "dep2", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep1}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        // Child depends on dep1 — not ready
+        let t = get(&c, child).unwrap().unwrap();
+        assert!(!t.ready);
+        // Creator edits deps to point at dep2 (already done? no, but let's clear deps)
+        let t = update(
+            &mut c,
+            "boss",
+            child,
+            &TaskUpdate {
+                depends_on: Some("[]"),
+                ..Default::default()
+            },
+            1001,
+        )
+        .unwrap();
+        assert!(t.ready);
+        assert_eq!(t.depends_on.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn update_depends_on_rejects_non_creator_non_assignee() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            None,
+            Some("[999]"),
+            None,
+            1000,
+        )
+        .unwrap();
+        let err = update(
+            &mut c,
+            "rando",
+            id,
+            &TaskUpdate {
+                depends_on: Some("[]"),
+                ..Default::default()
+            },
+            1001,
+        );
+        assert!(matches!(err, Err(QuorumError::NotHolder)));
     }
 
     // ── close_after_merge ───────────────────────────────────────────────────
