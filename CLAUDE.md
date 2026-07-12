@@ -185,8 +185,9 @@ is disqualified from reviewing it, even if the git author is someone else (#206)
 
 **Verdict contract (#206):** reviews classify findings BLOCKING/advisory and the verdict is
 derived, not chosen — `--verdict approved` requires `--blocking 0`; any blocking finding
-requires `--verdict changes --feedback`. See `.claude/skills/pr-review/SKILL.md` (invoke the
-`pr-review` skill when reviewing). The daemon demotes unattested approvals to `changes`.
+requires `--verdict changes --feedback`. The daemon reviewer prompt carries the full
+contract inline and invokes the builtin `review` skill. The daemon demotes unattested
+approvals to `changes`.
 
 ### 3. Work in your own git worktree
 
