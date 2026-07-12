@@ -416,6 +416,27 @@ impl GhMergeExecutor {
         }
     }
 
+    /// Fetch `reviews` + `headRefOid` in one `gh` call. Returns `None` on any
+    /// query failure so the caller can fail-open (post the approval).
+    fn fetch_reviews_and_head(&self, pr: i64, repo_dir: &Path) -> Option<(String, String)> {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr_str, "--json", "reviews,headRefOid"],
+            repo_dir,
+        );
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let head = serde_json::from_str::<serde_json::Value>(&stdout)
+            .ok()?
+            .get("headRefOid")?
+            .as_str()?
+            .to_string();
+        Some((stdout, head))
+    }
+
     fn verify_pr_merged(&self, pr: i64, repo_dir: &Path) -> bool {
         let pr_str = pr.to_string();
         let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "state"], repo_dir);
@@ -451,6 +472,26 @@ impl GhMergeExecutor {
     }
 }
 
+/// Return true iff the `reviews` array (from `gh pr view --json reviews`)
+/// contains an APPROVED review whose `commit.oid` matches `head_sha`. Any
+/// parse failure returns false (fail-open — caller posts the approval).
+fn head_has_approval(reviews_json: &str, head_sha: &str) -> bool {
+    let val: serde_json::Value = match serde_json::from_str(reviews_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let Some(reviews) = val.get("reviews").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    reviews.iter().any(|r| {
+        r.get("state").and_then(|v| v.as_str()) == Some("APPROVED")
+            && r.get("commit")
+                .and_then(|c| c.get("oid"))
+                .and_then(|o| o.as_str())
+                == Some(head_sha)
+    })
+}
+
 fn parse_mergeability(json_str: &str) -> MergeabilityState {
     let val: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
@@ -470,29 +511,43 @@ fn parse_mergeability(json_str: &str) -> MergeabilityState {
 impl MergeExecutor for GhMergeExecutor {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
         let pr_str = pr.to_string();
-        let approve_body = format!(
-            "Formal approval — per {} review verdict (task #{}). \
-             Merge performed programmatically on approved verdict (daemon model).",
-            ctx.reviewer_name, ctx.review_task_id,
-        );
 
-        let approve = self.run_gh(
-            &[
-                "pr",
-                "review",
-                &pr_str,
-                "--approve",
-                "--body",
-                &approve_body,
-            ],
-            repo_dir,
-        );
-        if !approve.success {
-            return MergeResult {
-                success: false,
-                message: format!("approve failed (merge not attempted): {}", approve.message),
-                failure_kind: Some(MergeFailureKind::PolicyBlocked),
-            };
+        // #49: on a PolicyPending retry the daemon calls merge() again — without
+        // dedupe every retry posts another `--approve` stub, cluttering the PR
+        // review history (4 identical approvals in 7s observed on task #45).
+        // Skip the approve step if an APPROVED review already exists on the
+        // current head SHA. Fail-open: query hiccup falls through to the
+        // approve call and behaves as before this guard.
+        let already_approved = self
+            .fetch_reviews_and_head(pr, repo_dir)
+            .map(|(reviews_json, head)| head_has_approval(&reviews_json, &head))
+            .unwrap_or(false);
+
+        if !already_approved {
+            let approve_body = format!(
+                "Formal approval — per {} review verdict (task #{}). \
+                 Merge performed programmatically on approved verdict (daemon model).",
+                ctx.reviewer_name, ctx.review_task_id,
+            );
+
+            let approve = self.run_gh(
+                &[
+                    "pr",
+                    "review",
+                    &pr_str,
+                    "--approve",
+                    "--body",
+                    &approve_body,
+                ],
+                repo_dir,
+            );
+            if !approve.success {
+                return MergeResult {
+                    success: false,
+                    message: format!("approve failed (merge not attempted): {}", approve.message),
+                    failure_kind: Some(MergeFailureKind::PolicyBlocked),
+                };
+            }
         }
 
         let result = self.run_gh(
@@ -778,6 +833,38 @@ mod tests {
             reviewer_name: "Rev-1".into(),
             review_task_id: 99,
         }
+    }
+
+    #[test]
+    fn head_has_approval_matches_current_head() {
+        let json = r#"{
+            "reviews": [
+                {"state":"COMMENTED","commit":{"oid":"aaa"}},
+                {"state":"APPROVED","commit":{"oid":"bbb"}}
+            ]
+        }"#;
+        assert!(head_has_approval(json, "bbb"));
+    }
+
+    #[test]
+    fn head_has_approval_stale_approval_ignored() {
+        // Approval was on an old commit; head has since moved.
+        let json = r#"{"reviews":[{"state":"APPROVED","commit":{"oid":"old"}}]}"#;
+        assert!(!head_has_approval(json, "new"));
+    }
+
+    #[test]
+    fn head_has_approval_non_approved_ignored() {
+        let json = r#"{"reviews":[{"state":"CHANGES_REQUESTED","commit":{"oid":"same"}}]}"#;
+        assert!(!head_has_approval(json, "same"));
+    }
+
+    #[test]
+    fn head_has_approval_empty_and_malformed_are_false() {
+        assert!(!head_has_approval("", "abc"));
+        assert!(!head_has_approval("not json", "abc"));
+        assert!(!head_has_approval(r#"{"reviews":[]}"#, "abc"));
+        assert!(!head_has_approval(r#"{}"#, "abc"));
     }
 
     #[test]
