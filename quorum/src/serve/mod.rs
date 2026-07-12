@@ -288,6 +288,10 @@ pub struct CostLimits {
     pub max_task_cost_usd: Option<f64>,
     pub max_turn_wall_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
+    /// Max seconds a worker/reviewer may sit idle between turns (draining=false)
+    /// before the watchdog kills it. Catches zombies that asked a question no one
+    /// can answer (e.g. permission denied in dontAsk mode). Default: 300.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Configuration for the daemon, resolved from CLI flags / config file.
@@ -337,6 +341,9 @@ pub struct ServeConfig {
     /// Seconds to wait for the default branch CI to turn green before
     /// proceeding anyway. Default: 300.
     pub master_ci_timeout_secs: u64,
+    /// Override the default tool allowlist for spawned agents. When None,
+    /// uses `agent::ALLOWED_TOOLS`.
+    pub allowed_tools: Option<String>,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -466,6 +473,9 @@ pub(crate) struct SlotState {
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
+    /// Set when `draining` flips to false (turn completed). Used by the idle
+    /// watchdog to detect zombies sitting between turns indefinitely.
+    turn_ended_at: Option<std::time::Instant>,
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
@@ -2284,6 +2294,43 @@ async fn tick(
         teardown_reviewer(config, wt_mgr, name_pool, dead).await;
     }
 
+    // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
+    let idle_timeout = config.limits.idle_timeout_secs.unwrap_or(300);
+    let mut idle_reviewers: Vec<usize> = Vec::new();
+    for (i, r) in reviewers.iter().enumerate() {
+        if r.draining {
+            continue;
+        }
+        if let Some(ended) = r.turn_ended_at {
+            if ended.elapsed().as_secs() > idle_timeout {
+                log(&format!(
+                    "WATCHDOG: reviewer {} idle {}s (limit {}s) — killing zombie",
+                    r.agent_name,
+                    ended.elapsed().as_secs(),
+                    idle_timeout
+                ));
+                idle_reviewers.push(i);
+            }
+        }
+    }
+    for &i in idle_reviewers.iter().rev() {
+        let dead = reviewers.remove(i);
+        fire_event(
+            &db_path,
+            &dead.agent_name,
+            dead.task_id,
+            &Event::AgentFailed {
+                reason: format!(
+                    "reviewer idle {}s between turns (limit {}s) — zombie reaped",
+                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
+                    idle_timeout
+                ),
+            },
+        )
+        .await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+    }
+
     // ── Phase 4: Drain events from active workers ──────────────────────
     let mut workers_to_kill: Vec<usize> = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
@@ -2314,6 +2361,45 @@ async fn tick(
             dead.task_id,
             &Event::AgentFailed {
                 reason: "worker killed by watchdog".into(),
+            },
+        )
+        .await;
+        cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+    }
+
+    // ── Phase 4-idle: Kill workers idle too long between turns ─────────
+    // A worker that completed a turn (draining=false) but never gets a new
+    // turn is a zombie — e.g. it asked a question in dontAsk mode (#74).
+    let mut idle_zombies: Vec<usize> = Vec::new();
+    for (i, w) in workers.iter().enumerate() {
+        if w.draining || w.error_turn_count > 0 {
+            continue;
+        }
+        if let Some(ended) = w.turn_ended_at {
+            if ended.elapsed().as_secs() > idle_timeout {
+                log(&format!(
+                    "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
+                    w.agent_name,
+                    ended.elapsed().as_secs(),
+                    w.task_id,
+                    idle_timeout
+                ));
+                idle_zombies.push(i);
+            }
+        }
+    }
+    for &i in idle_zombies.iter().rev() {
+        let dead = workers.remove(i);
+        fire_event(
+            &db_path,
+            &dead.agent_name,
+            dead.task_id,
+            &Event::AgentFailed {
+                reason: format!(
+                    "worker idle {}s between turns (limit {}s) — zombie reaped",
+                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
+                    idle_timeout
+                ),
             },
         )
         .await;
@@ -3205,6 +3291,7 @@ async fn drain_events(
                 .ok();
 
                 slot.draining = false;
+                slot.turn_ended_at = Some(std::time::Instant::now());
                 slot.live_stats.mid_turn_tokens = 0;
                 slot.live_stats.record_event();
                 write_live_sidecar(slot);
@@ -3532,6 +3619,7 @@ async fn spawn_reviewer_for_worker(
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), reviewer_name.clone()),
         ],
+        config.allowed_tools.as_deref(),
     )
     .await
     {
@@ -3635,6 +3723,7 @@ async fn spawn_reviewer_for_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                turn_ended_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
@@ -3858,7 +3947,10 @@ async fn spawn_worker(
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
         bare: config.bare_agent,
-        allowed_tools: agent::ALLOWED_TOOLS.to_string(),
+        allowed_tools: config
+            .allowed_tools
+            .clone()
+            .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
         env_vars: vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), agent_name.clone()),
@@ -3950,6 +4042,7 @@ async fn spawn_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
@@ -4387,6 +4480,7 @@ mod tests {
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
+            turn_ended_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -4536,6 +4630,54 @@ mod tests {
         assert!(limits.max_task_cost_usd.is_none());
         assert!(limits.max_turn_wall_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
+        assert!(limits.idle_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn idle_timeout_detects_zombie_slot() {
+        let mut slot = make_dummy_slot();
+        // Simulate: turn ended 400s ago, not draining, no errors
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        let timeout = 300u64;
+        let is_zombie = !slot.draining
+            && slot.error_turn_count == 0
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(is_zombie);
+    }
+
+    #[test]
+    fn idle_timeout_ignores_draining_slot() {
+        let mut slot = make_dummy_slot();
+        slot.draining = true;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        let timeout = 300u64;
+        let is_zombie = !slot.draining
+            && slot.error_turn_count == 0
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(!is_zombie);
+    }
+
+    #[test]
+    fn idle_timeout_ignores_fresh_idle_slot() {
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.turn_ended_at = Some(std::time::Instant::now());
+
+        let timeout = 300u64;
+        let is_zombie = !slot.draining
+            && slot.error_turn_count == 0
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(!is_zombie);
     }
 
     #[test]

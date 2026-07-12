@@ -444,6 +444,13 @@ pub enum Command {
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
+        /// Max seconds a worker/reviewer may sit idle between turns before
+        /// the watchdog kills it (default: 300). Catches zombies.
+        #[arg(long)]
+        idle_timeout_secs: Option<u64>,
+        /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
+        #[arg(long)]
+        allowed_tools: Option<String>,
         /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]
