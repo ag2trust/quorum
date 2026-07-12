@@ -328,6 +328,15 @@ pub struct ServeConfig {
     /// When set, serve polls for this file's existence every tick and initiates
     /// shutdown when it disappears (#201: test fixture self-termination).
     pub exit_when_gone: Option<PathBuf>,
+    /// Per-repo list of CI job names that must have conclusion SUCCESS (not
+    /// SKIPPED or absent) on the PR head before merging. Empty = gate off.
+    pub required_jobs: Vec<String>,
+    /// When true, check the default branch's latest CI run before merging;
+    /// hold if red/pending, proceed with a warning after `master_ci_timeout_secs`.
+    pub master_ci_gate: bool,
+    /// Seconds to wait for the default branch CI to turn green before
+    /// proceeding anyway. Default: 300.
+    pub master_ci_timeout_secs: u64,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -1288,6 +1297,56 @@ async fn tick(
                         .map_err(|e| QuorumError::Io(format!("checks spawn_blocking join: {e}")))?
                     };
 
+                    // Required jobs gate: if checks are Ready but configured
+                    // required jobs are not SUCCESS (e.g. SKIPPED), override to
+                    // Failed so the existing rework path handles it.
+                    let checks_outcome = if matches!(checks_outcome, merge::ChecksOutcome::Ready)
+                        && !config.required_jobs.is_empty()
+                    {
+                        let rj_outcome = {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            let jobs = config.required_jobs.clone();
+                            tokio::task::spawn_blocking(move || {
+                                executor.check_required_jobs(pr_num, &repo, &jobs)
+                            })
+                            .await
+                            .map_err(|e| {
+                                QuorumError::Io(format!("required_jobs spawn_blocking join: {e}"))
+                            })?
+                        };
+                        match rj_outcome {
+                            merge::RequiredJobsOutcome::AllSucceeded => {
+                                log("required jobs gate: all required jobs succeeded");
+                                checks_outcome
+                            }
+                            merge::RequiredJobsOutcome::NotReady { issues } => {
+                                let failing: Vec<String> = issues
+                                    .iter()
+                                    .map(|(name, status)| format!("{name} ({status})"))
+                                    .collect();
+                                log(&format!(
+                                    "REQUIRED JOBS GATE: PR #{pr_num} required jobs \
+                                     not SUCCESS: {}",
+                                    failing.join(", ")
+                                ));
+                                merge::ChecksOutcome::Failed {
+                                    failing_checks: failing,
+                                }
+                            }
+                            merge::RequiredJobsOutcome::Pending { pending_jobs } => {
+                                log(&format!(
+                                    "REQUIRED JOBS GATE: PR #{pr_num} required jobs \
+                                     still pending: {}",
+                                    pending_jobs.join(", ")
+                                ));
+                                merge::ChecksOutcome::TimedOut
+                            }
+                        }
+                    } else {
+                        checks_outcome
+                    };
+
                     match checks_outcome {
                         merge::ChecksOutcome::Failed { failing_checks } => {
                             let names = failing_checks.join(", ");
@@ -1478,6 +1537,74 @@ async fn tick(
                                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
                                 .ok();
                             }
+                        }
+                    }
+
+                    // Master-green gate: hold the merge while the default
+                    // branch's latest CI run is red/pending. Proceed with a
+                    // warning after the timeout — the PR being merged may
+                    // itself be the fix.
+                    if config.master_ci_gate {
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(config.master_ci_timeout_secs);
+                        loop {
+                            let branch_status = {
+                                let repo = config.repo_dir.clone();
+                                let executor = Arc::clone(&config.merge_executor);
+                                let branch = config.base_branch.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    executor.check_default_branch_ci(&repo, &branch)
+                                })
+                                .await
+                                .map_err(|e| {
+                                    QuorumError::Io(format!(
+                                        "default_branch_ci spawn_blocking join: {e}"
+                                    ))
+                                })?
+                            };
+                            match branch_status {
+                                merge::DefaultBranchStatus::Green => {
+                                    log(&format!(
+                                        "master-ci gate: {} CI is green",
+                                        config.base_branch
+                                    ));
+                                    break;
+                                }
+                                merge::DefaultBranchStatus::Unknown => {
+                                    log(&format!(
+                                        "master-ci gate: {} CI status unknown \
+                                         — proceeding",
+                                        config.base_branch
+                                    ));
+                                    break;
+                                }
+                                merge::DefaultBranchStatus::Red { ref details } => {
+                                    log(&format!(
+                                        "MASTER-CI GATE: {} CI is red ({details}) \
+                                         — holding merge for PR #{pr_num}",
+                                        config.base_branch
+                                    ));
+                                }
+                                merge::DefaultBranchStatus::Pending => {
+                                    log(&format!(
+                                        "MASTER-CI GATE: {} CI is pending \
+                                         — holding merge for PR #{pr_num}",
+                                        config.base_branch
+                                    ));
+                                }
+                            }
+                            let poll = config.merge_checks_poll_secs;
+                            if std::time::Instant::now() + std::time::Duration::from_secs(poll)
+                                > deadline
+                            {
+                                log(&format!(
+                                    "MASTER-CI GATE: {} CI still not green after \
+                                     {}s — proceeding (the PR may be the fix)",
+                                    config.base_branch, config.master_ci_timeout_secs
+                                ));
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
                         }
                     }
 

@@ -73,6 +73,24 @@ pub enum ChecksOutcome {
     TimedOut,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequiredJobsOutcome {
+    /// All required jobs completed with conclusion SUCCESS.
+    AllSucceeded,
+    /// Some required jobs are SKIPPED, absent, or have a non-SUCCESS conclusion.
+    NotReady { issues: Vec<(String, String)> },
+    /// Some required jobs haven't completed yet.
+    Pending { pending_jobs: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultBranchStatus {
+    Green,
+    Red { details: String },
+    Pending,
+    Unknown,
+}
+
 /// Trait for executing PR merges. The default implementation posts a formal
 /// GitHub approval review (`gh pr review --approve`) then calls `gh pr merge`.
 /// Tests inject a mock via [`CommandMergeExecutor::command`].
@@ -104,6 +122,23 @@ pub trait MergeExecutor: Send + Sync {
     /// blind. Default `None` so mock executors opt in explicitly.
     fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
         None
+    }
+
+    /// Verify that each required job in the PR's check suite has conclusion
+    /// SUCCESS (not SKIPPED, NEUTRAL, or absent). Default: gate off (all succeed).
+    fn check_required_jobs(
+        &self,
+        _pr: i64,
+        _repo_dir: &Path,
+        _required_jobs: &[String],
+    ) -> RequiredJobsOutcome {
+        RequiredJobsOutcome::AllSucceeded
+    }
+
+    /// Check the CI status of the default branch's latest workflow run.
+    /// Default: Green (gate off).
+    fn check_default_branch_ci(&self, _repo_dir: &Path, _branch: &str) -> DefaultBranchStatus {
+        DefaultBranchStatus::Green
     }
 
     /// Post a formal REQUEST_CHANGES review on the PR — the durable
@@ -215,6 +250,99 @@ fn checks_query_from_parsed(
     }
 
     ChecksQueryResult::AllPassed
+}
+
+/// Check whether each required job in the PR's `statusCheckRollup` has conclusion
+/// SUCCESS specifically — SKIPPED and NEUTRAL do NOT satisfy a required job.
+pub fn validate_required_jobs(checks_json: &str, required_jobs: &[String]) -> RequiredJobsOutcome {
+    if required_jobs.is_empty() {
+        return RequiredJobsOutcome::AllSucceeded;
+    }
+
+    let val: serde_json::Value = match serde_json::from_str(checks_json) {
+        Ok(v) => v,
+        Err(_) => {
+            let issues = required_jobs
+                .iter()
+                .map(|j| (j.clone(), "unknown (parse error)".into()))
+                .collect();
+            return RequiredJobsOutcome::NotReady { issues };
+        }
+    };
+
+    let checks: Vec<(&str, &str, &str)> = val
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name")?.as_str()?;
+                    let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let conclusion = entry
+                        .get("conclusion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    Some((name, status, conclusion))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut issues = Vec::new();
+    let mut pending = Vec::new();
+
+    for job in required_jobs {
+        match checks.iter().find(|(name, _, _)| *name == job.as_str()) {
+            None => issues.push((job.clone(), "absent".to_string())),
+            Some((_, status, _)) if *status != "COMPLETED" => pending.push(job.clone()),
+            Some((_, _, conclusion)) if *conclusion != "SUCCESS" => {
+                issues.push((job.clone(), conclusion.to_string()));
+            }
+            Some(_) => {}
+        }
+    }
+
+    if !pending.is_empty() {
+        return RequiredJobsOutcome::Pending {
+            pending_jobs: pending,
+        };
+    }
+    if !issues.is_empty() {
+        return RequiredJobsOutcome::NotReady { issues };
+    }
+    RequiredJobsOutcome::AllSucceeded
+}
+
+/// Parse the output of `gh run list --json conclusion,status` for the default
+/// branch's latest CI run.
+pub fn parse_default_branch_ci(json: &str) -> DefaultBranchStatus {
+    let val: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return DefaultBranchStatus::Unknown,
+    };
+
+    let arr = match val.as_array() {
+        Some(a) if !a.is_empty() => a,
+        _ => return DefaultBranchStatus::Unknown,
+    };
+
+    let entry = &arr[0];
+    let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let conclusion = entry
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if status != "completed" {
+        return DefaultBranchStatus::Pending;
+    }
+
+    match conclusion {
+        "success" => DefaultBranchStatus::Green,
+        other => DefaultBranchStatus::Red {
+            details: format!("latest run conclusion: {other}"),
+        },
+    }
 }
 
 /// Production executor: posts a formal GitHub approval review, then runs
@@ -449,6 +577,56 @@ impl MergeExecutor for GhMergeExecutor {
         } else {
             Some(s)
         }
+    }
+
+    fn check_required_jobs(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        required_jobs: &[String],
+    ) -> RequiredJobsOutcome {
+        if required_jobs.is_empty() {
+            return RequiredJobsOutcome::AllSucceeded;
+        }
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr_str, "--json", "statusCheckRollup"],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                let issues = required_jobs
+                    .iter()
+                    .map(|j| (j.clone(), "query failed".into()))
+                    .collect();
+                return RequiredJobsOutcome::NotReady { issues };
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        validate_required_jobs(&stdout, required_jobs)
+    }
+
+    fn check_default_branch_ci(&self, repo_dir: &Path, branch: &str) -> DefaultBranchStatus {
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "run",
+                "list",
+                "--branch",
+                branch,
+                "--limit",
+                "1",
+                "--json",
+                "conclusion,status",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => return DefaultBranchStatus::Unknown,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_default_branch_ci(&stdout)
     }
 
     fn request_changes(&self, pr: i64, repo_dir: &Path, feedback: &str) -> MergeResult {
@@ -1155,5 +1333,186 @@ mod tests {
             parse_mergeability(r#"{"state":"OPEN","mergeStateStatus":"DIRTY"}"#),
             MergeabilityState::Conflicting,
         );
+    }
+
+    // ── Required jobs gate tests ──────────────────────────────────────
+
+    #[test]
+    fn required_jobs_empty_list_always_succeeds() {
+        assert_eq!(
+            validate_required_jobs("{}", &[]),
+            RequiredJobsOutcome::AllSucceeded,
+        );
+    }
+
+    #[test]
+    fn required_jobs_all_success() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "python-tests", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "frontend-build", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "ci-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        assert_eq!(
+            validate_required_jobs(json, &["python-tests".into(), "frontend-build".into()],),
+            RequiredJobsOutcome::AllSucceeded,
+        );
+    }
+
+    #[test]
+    fn required_jobs_skipped_blocks() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "python-tests", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                {"name": "pii-service-tests", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                {"name": "ci-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let result =
+            validate_required_jobs(json, &["python-tests".into(), "pii-service-tests".into()]);
+        match result {
+            RequiredJobsOutcome::NotReady { issues } => {
+                assert_eq!(issues.len(), 2);
+                assert!(issues
+                    .iter()
+                    .any(|(n, s)| n == "python-tests" && s == "SKIPPED"));
+                assert!(issues
+                    .iter()
+                    .any(|(n, s)| n == "pii-service-tests" && s == "SKIPPED"));
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_jobs_absent_blocks() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "ci-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let result = validate_required_jobs(json, &["python-tests".into()]);
+        match result {
+            RequiredJobsOutcome::NotReady { issues } => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0], ("python-tests".into(), "absent".into()));
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_jobs_neutral_blocks() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "python-tests", "status": "COMPLETED", "conclusion": "NEUTRAL"}
+            ]
+        }"#;
+        let result = validate_required_jobs(json, &["python-tests".into()]);
+        match result {
+            RequiredJobsOutcome::NotReady { issues } => {
+                assert_eq!(issues[0].1, "NEUTRAL");
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_jobs_pending_returns_pending() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "python-tests", "status": "IN_PROGRESS", "conclusion": ""},
+                {"name": "ci-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let result = validate_required_jobs(json, &["python-tests".into()]);
+        match result {
+            RequiredJobsOutcome::Pending { pending_jobs } => {
+                assert_eq!(pending_jobs, vec!["python-tests".to_string()]);
+            }
+            other => panic!("expected Pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_jobs_mixed_skipped_and_success() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "python-tests", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"name": "pii-service-tests", "status": "COMPLETED", "conclusion": "SKIPPED"},
+                {"name": "frontend-build", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        let result = validate_required_jobs(
+            json,
+            &[
+                "python-tests".into(),
+                "pii-service-tests".into(),
+                "frontend-build".into(),
+            ],
+        );
+        match result {
+            RequiredJobsOutcome::NotReady { issues } => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0], ("pii-service-tests".into(), "SKIPPED".into()));
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_jobs_invalid_json() {
+        let result = validate_required_jobs("not json", &["test".into()]);
+        assert!(matches!(result, RequiredJobsOutcome::NotReady { .. }));
+    }
+
+    // ── Default branch CI gate tests ──────────────────────────────────
+
+    #[test]
+    fn default_branch_ci_green() {
+        let json = r#"[{"conclusion":"success","status":"completed"}]"#;
+        assert_eq!(parse_default_branch_ci(json), DefaultBranchStatus::Green);
+    }
+
+    #[test]
+    fn default_branch_ci_red() {
+        let json = r#"[{"conclusion":"failure","status":"completed"}]"#;
+        match parse_default_branch_ci(json) {
+            DefaultBranchStatus::Red { details } => {
+                assert!(details.contains("failure"), "details: {details}");
+            }
+            other => panic!("expected Red, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_branch_ci_pending() {
+        let json = r#"[{"conclusion":"","status":"in_progress"}]"#;
+        assert_eq!(parse_default_branch_ci(json), DefaultBranchStatus::Pending);
+    }
+
+    #[test]
+    fn default_branch_ci_empty_array() {
+        assert_eq!(parse_default_branch_ci("[]"), DefaultBranchStatus::Unknown);
+    }
+
+    #[test]
+    fn default_branch_ci_invalid_json() {
+        assert_eq!(
+            parse_default_branch_ci("not json"),
+            DefaultBranchStatus::Unknown,
+        );
+    }
+
+    #[test]
+    fn default_branch_ci_cancelled() {
+        let json = r#"[{"conclusion":"cancelled","status":"completed"}]"#;
+        match parse_default_branch_ci(json) {
+            DefaultBranchStatus::Red { details } => {
+                assert!(details.contains("cancelled"), "details: {details}");
+            }
+            other => panic!("expected Red, got {other:?}"),
+        }
     }
 }
