@@ -449,6 +449,20 @@ impl GhMergeExecutor {
         let (merge_state, checks) = parse_checks_json(&stdout);
         checks_query_from_parsed(&merge_state, &checks)
     }
+
+    fn is_draft(&self, pr: i64, repo_dir: &Path) -> bool {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "pr", "view", &pr_str, "--json", "isDraft", "--jq", ".isDraft",
+            ],
+            repo_dir,
+        );
+        match cmd.output() {
+            Ok(o) if o.status.success() => parse_is_draft(&String::from_utf8_lossy(&o.stdout)),
+            _ => false,
+        }
+    }
 }
 
 fn parse_mergeability(json_str: &str) -> MergeabilityState {
@@ -467,9 +481,48 @@ fn parse_mergeability(json_str: &str) -> MergeabilityState {
     }
 }
 
+/// Parse the `--jq .isDraft` output of `gh pr view` (bare `true`/`false`).
+/// Anything that isn't exactly `true` is treated as not-draft (fail-safe:
+/// a query hiccup skips the undraft and behaves as it did before this guard).
+fn parse_is_draft(jq_out: &str) -> bool {
+    jq_out.trim() == "true"
+}
+
 impl MergeExecutor for GhMergeExecutor {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
         let pr_str = pr.to_string();
+
+        // A worker that opened its PR as a draft hard-blocks the merge:
+        // `gh pr merge` (GraphQL mergePullRequest) refuses drafts, that failure
+        // classifies as PolicyBlocked, and the daemon cancels the task —
+        // leaving an approved, green, orphaned PR. Undraft first, then let
+        // mergeability re-settle (undrafting recomputes mergeStateStatus, which
+        // flips to UNKNOWN/BLOCKED for a few seconds before returning CLEAN).
+        if self.is_draft(pr, repo_dir) {
+            let ready = self.run_gh(&["pr", "ready", &pr_str], repo_dir);
+            if !ready.success {
+                return MergeResult {
+                    success: false,
+                    message: format!("undraft failed (merge not attempted): {}", ready.message),
+                    failure_kind: Some(MergeFailureKind::PolicyBlocked),
+                };
+            }
+            // Only a genuine check failure aborts; TimedOut falls through to the
+            // merge attempt, whose own failure the caller's merge-gate classifies.
+            if let ChecksOutcome::Failed { failing_checks } =
+                self.wait_for_checks(pr, repo_dir, 180, 5)
+            {
+                return MergeResult {
+                    success: false,
+                    message: format!(
+                        "checks not green after undraft: {}",
+                        failing_checks.join(", ")
+                    ),
+                    failure_kind: Some(MergeFailureKind::PolicyBlocked),
+                };
+            }
+        }
+
         let approve_body = format!(
             "Formal approval — per {} review verdict (task #{}). \
              Merge performed programmatically on approved verdict (daemon model).",
@@ -940,6 +993,17 @@ mod tests {
             classify_merge_failure("failed to run gh: No such file or directory"),
             MergeFailureKind::PolicyBlocked,
         );
+    }
+
+    #[test]
+    fn parse_is_draft_variants() {
+        assert!(parse_is_draft("true"));
+        assert!(parse_is_draft("true\n"));
+        assert!(parse_is_draft("  true  "));
+        assert!(!parse_is_draft("false"));
+        assert!(!parse_is_draft(""));
+        assert!(!parse_is_draft("null"));
+        assert!(!parse_is_draft("TRUE"));
     }
 
     #[test]
