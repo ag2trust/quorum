@@ -958,6 +958,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             );
             let r_merge_checks_poll =
                 resolve_val(merge_checks_poll_secs, file_cfg.merge_checks_poll_secs, 30);
+            let r_required_jobs: Vec<String> = file_cfg.required_jobs.clone().unwrap_or_default();
+            let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
+            let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -980,6 +983,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 max_turn_cost_usd: &r_max_turn_cost,
                 max_task_cost_usd: &r_max_task_cost,
                 merge_checks_timeout_secs: &r_merge_checks_timeout,
+                required_jobs: &r_required_jobs,
+                master_ci_gate: &r_master_ci_gate,
+                master_ci_timeout_secs: &r_master_ci_timeout,
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1049,6 +1055,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo: r_repo.value,
                 base_branch: r_base_branch.value,
                 exit_when_gone: exit_when_gone.map(std::path::PathBuf::from),
+                required_jobs: r_required_jobs,
+                master_ci_gate: r_master_ci_gate.value,
+                master_ci_timeout_secs: r_master_ci_timeout.value,
             };
             Ok(serve::run_serve(config)?)
         }

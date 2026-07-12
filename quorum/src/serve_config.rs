@@ -37,6 +37,9 @@ pub struct ServeFileConfig {
     pub base_branch: Option<String>,
     pub merge_checks_timeout_secs: Option<u64>,
     pub merge_checks_poll_secs: Option<u64>,
+    pub required_jobs: Option<Vec<String>>,
+    pub master_ci_gate: Option<bool>,
+    pub master_ci_timeout_secs: Option<u64>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
@@ -216,6 +219,9 @@ pub struct BannerData<'a> {
     pub max_turn_cost_usd: &'a Sourced<Option<f64>>,
     pub max_task_cost_usd: &'a Sourced<Option<f64>>,
     pub merge_checks_timeout_secs: &'a Sourced<u64>,
+    pub required_jobs: &'a [String],
+    pub master_ci_gate: &'a Sourced<bool>,
+    pub master_ci_timeout_secs: &'a Sourced<u64>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -298,6 +304,19 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  merge_checks_timeout_secs: {}",
         d.merge_checks_timeout_secs
+    ));
+    if d.required_jobs.is_empty() {
+        lines.push("  required_jobs:             (none)".to_string());
+    } else {
+        lines.push(format!(
+            "  required_jobs:             [{}]",
+            d.required_jobs.join(", ")
+        ));
+    }
+    lines.push(format!("  master_ci_gate:            {}", d.master_ci_gate));
+    lines.push(format!(
+        "  master_ci_timeout_secs:    {}",
+        d.master_ci_timeout_secs
     ));
     lines.push("─────────────────────────────".to_string());
     lines.join("\n")
@@ -467,6 +486,15 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             },
             merge_checks_timeout_secs: &Sourced {
                 value: 900,
+                source: Source::Default,
+            },
+            required_jobs: &[],
+            master_ci_gate: &Sourced {
+                value: false,
+                source: Source::Default,
+            },
+            master_ci_timeout_secs: &Sourced {
+                value: 300,
                 source: Source::Default,
             },
         });
