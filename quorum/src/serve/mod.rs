@@ -516,9 +516,16 @@ fn run_drift_check(db_path: &std::path::Path, repo: &str) -> Result<()> {
 
     let mut conn = quorum_core::db::open(db_path)?;
     let task_prs = quorum_core::drift::task_pr_refs(&conn)?;
+    let all_backed_prs = quorum_core::drift::all_task_pr_refs(&conn)?;
     let task_branches = quorum_core::drift::task_branch_allocations(&conn)?;
     let active_tasks = quorum_core::drift::active_task_ids(&conn)?;
-    let drift = quorum_core::drift::detect(&open_prs, &task_prs, &task_branches, &active_tasks);
+    let drift = quorum_core::drift::detect(
+        &open_prs,
+        &task_prs,
+        &all_backed_prs,
+        &task_branches,
+        &active_tasks,
+    );
 
     let now = now_unix();
 
