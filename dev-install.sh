@@ -46,6 +46,17 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
   chmod 0755 "$BINARY"
 fi
 
+# --- Agent skill (Claude Code) ----------------------------------------------
+# Copy the `quorum` skill from the working tree to the global skills dir so agent
+# sessions on this machine pick up the current version (lockstep with the binary).
+SKILL_SRC="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/.claude/skills/quorum/SKILL.md"
+SKILL_DIR="${QUORUM_SKILL_DIR:-$HOME/.claude/skills}/quorum"
+if [ -f "$SKILL_SRC" ]; then
+  mkdir -p "$SKILL_DIR"
+  cp "$SKILL_SRC" "$SKILL_DIR/SKILL.md"
+  printf '=== Agent skill -> %s/SKILL.md ===\n' "$SKILL_DIR"
+fi
+
 # --- Git hooks ---------------------------------------------------------------
 # Point hooks at .githooks (pre-push runs `preflight.sh --quick`: fmt + branch-base
 # check). Repo config is shared by all worktrees, so this covers every agent worktree.
