@@ -623,6 +623,272 @@ fn checks_pending_then_ready_merges_after_wait() {
     handle.stop();
 }
 
+/// Empty check rollup (no check runs yet for new head SHA) is treated as
+/// pending, not passing. Verifies the daemon waits instead of merging
+/// prematurely on a rework push with stale/absent checks.
+#[test]
+fn empty_checks_treated_as_pending() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    // Checks command returns "pending" (simulating empty check rollup that
+    // transitions to ready after 2 polls).
+    let state_file = home.path().join("checks_state");
+    std::fs::write(&state_file, "pending").unwrap();
+    let checks_cmd = format!("cat {}", state_file.to_string_lossy());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for empty-checks test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "15",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    // Wait long enough that the old (buggy) code would have merged immediately.
+    assert!(
+        handle.wait_for("waiting for checks", 10),
+        "waiting-for-checks log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Verify no merge happened while pending.
+    let merged_before = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("proceeding to merge") || l.contains("merged"));
+    assert!(
+        !merged_before,
+        "merge should NOT happen while checks are pending/empty. Lines: {:?}",
+        handle.lines
+    );
+
+    // Now transition checks to ready.
+    std::fs::write(&state_file, "ready").unwrap();
+
+    assert!(
+        handle.wait_for("checks passed", 15),
+        "checks-passed log not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("merged", 15),
+        "merge-success log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+/// Policy-pending merge retries until checks pass then merges successfully.
+/// Simulates rework-push race: first merge attempt hits "policy prohibits"
+/// (checks not propagated), retry wait sees checks become ready, second
+/// merge attempt succeeds.
+#[test]
+fn policy_pending_retries_then_merges() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    let merge_state_file = home.path().join("merge_state");
+    std::fs::write(&merge_state_file, "fail").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for policy-pending retry test");
+
+    // Merge command: fails with "policy prohibits" when state is "fail",
+    // succeeds when state is "pass".
+    let merge_cmd = format!(
+        "state=$(cat {}); if [ \"$state\" = \"pass\" ]; then echo merged; else \
+         echo 'not mergeable: the base branch policy prohibits the merge' >&2; exit 1; fi",
+        merge_state_file.to_string_lossy()
+    );
+
+    // Checks cmd starts pending, then transitions to ready (which also
+    // flips the merge state so the retry merge succeeds).
+    let checks_state_file = home.path().join("checks_state");
+    std::fs::write(&checks_state_file, "pending").unwrap();
+
+    let checks_cmd = format!("cat {}", checks_state_file.to_string_lossy());
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &merge_cmd,
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "15",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Initial checks pass (simulating stale check state from old HEAD).
+    std::fs::write(&checks_state_file, "ready").unwrap();
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    // First merge attempt hits policy-pending.
+    assert!(
+        handle.wait_for("policy-pending", 15),
+        "policy-pending log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Flip merge state so retry succeeds.
+    std::fs::write(&merge_state_file, "pass").unwrap();
+
+    // Should retry and succeed.
+    assert!(
+        handle.wait_for("merged", 20),
+        "merge-success log not seen after policy-pending retry. Lines: {:?}",
+        handle.lines
+    );
+
+    // No cancel, no rework.
+    let saw_cancelled = handle.lines.iter().any(|l| l.contains("cancelling task"));
+    assert!(
+        !saw_cancelled,
+        "task should NOT be cancelled on policy-pending retry success. Lines: {:?}",
+        handle.lines
+    );
+    let saw_rework = handle.lines.iter().any(|l| l.contains("rework"));
+    assert!(
+        !saw_rework,
+        "rework should NOT be sent for policy-pending merge. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"done\"") || stdout.contains("\"status\": \"done\""),
+        "task should be done after policy-pending retry merge, got: {stdout}"
+    );
+}
+
 /// #223: approved verdict with no PR number must warn and skip merge,
 /// not call merge with PR #0.
 #[test]
