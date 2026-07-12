@@ -28,6 +28,8 @@ pub struct ServeFileConfig {
     pub max_task_cost_usd: Option<f64>,
     pub max_turn_wall_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
+    pub allowed_tools: Option<String>,
     pub log_dir: Option<String>,
     pub self_update_drain: Option<bool>,
     pub drain_timeout_secs: Option<u64>,
@@ -214,6 +216,7 @@ pub struct BannerData<'a> {
     pub drain_timeout_secs: &'a Sourced<u64>,
     pub max_turn_wall_secs: &'a Sourced<Option<u64>>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
+    pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
     pub max_task_tokens: &'a Sourced<Option<i64>>,
     pub max_turn_cost_usd: &'a Sourced<Option<f64>>,
@@ -284,6 +287,13 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  max_task_wall_secs:        {}",
         opt_u64(d.max_task_wall_secs)
+    ));
+    lines.push(format!(
+        "  idle_timeout_secs:         {}",
+        match d.idle_timeout_secs.value {
+            Some(v) => format!("{v} ({src})", src = d.idle_timeout_secs.source),
+            None => format!("300 ({src}, default)", src = d.idle_timeout_secs.source),
+        }
     ));
     lines.push(format!(
         "  max_turn_tokens:           {}",
@@ -465,6 +475,10 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
                 source: Source::File,
             },
             max_task_wall_secs: &Sourced {
+                value: None,
+                source: Source::Default,
+            },
+            idle_timeout_secs: &Sourced {
                 value: None,
                 source: Source::Default,
             },

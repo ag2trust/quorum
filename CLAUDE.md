@@ -313,6 +313,14 @@ A short or "all-green" test summary may be RTK hiding the failures.
 - Match the **extended** SQLite code (`SQLITE_CONSTRAINT_UNIQUE`), not the primary
   `ConstraintViolation`, when detecting a lost claim — so a future CHECK/NOT NULL violation fails
   loud instead of being misread as a lost race.
+- **`dontAsk` mode denies edits to `.claude/**` paths** even when Edit is in `--allowedTools`
+  and the worktree contains `.claude/`. The claude CLI treats `.claude/` as a protected
+  namespace requiring explicit human approval. Tasks that edit `.claude/skills/**` or
+  `.claude/settings.*` will zombie in dontAsk mode — the worker asks "can you grant
+  permission?" to an empty room. Mitigations: (1) the idle watchdog (idle_timeout_secs,
+  default 300s) reaps such zombies automatically, (2) task descriptions involving `.claude/`
+  edits should be routed to a human-attended session or run with an operator that pre-grants
+  the paths.
 
 ## Design notes & known limitations (v1)
 

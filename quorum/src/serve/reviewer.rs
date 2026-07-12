@@ -58,6 +58,7 @@ pub fn reviewer_branch(pr: i64, reviewer_name: &str) -> String {
     format!("review/pr-{}-{}", pr, reviewer_name.to_lowercase())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_reviewer(
     model: &str,
     effort: &str,
@@ -66,6 +67,7 @@ pub async fn spawn_reviewer(
     agent_bin: Option<&str>,
     bare: bool,
     env_vars: Vec<(String, String)>,
+    allowed_tools_override: Option<&str>,
 ) -> std::io::Result<AgentProc> {
     let agent_spec = AgentSpec {
         model: model.to_string(),
@@ -73,7 +75,7 @@ pub async fn spawn_reviewer(
         session_id: session_id.to_string(),
         worktree: worktree_path.to_path_buf(),
         bare,
-        allowed_tools: ALLOWED_TOOLS.to_string(),
+        allowed_tools: allowed_tools_override.unwrap_or(ALLOWED_TOOLS).to_string(),
         env_vars,
     };
     AgentProc::spawn(&agent_spec, agent_bin)

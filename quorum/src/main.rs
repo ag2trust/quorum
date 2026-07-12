@@ -852,6 +852,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_task_cost_usd,
             max_turn_wall_secs,
             max_task_wall_secs,
+            idle_timeout_secs,
+            allowed_tools,
             log_dir,
             self_update_drain,
             drain_timeout_secs,
@@ -940,6 +942,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
+            let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);
+            let r_allowed_tools =
+                resolve_opt_str(allowed_tools.as_deref(), file_cfg.allowed_tools.as_deref());
             let r_log_dir = resolve_opt_str(log_dir.as_deref(), file_cfg.log_dir.as_deref());
             let r_self_update = resolve_bool(self_update_drain, file_cfg.self_update_drain, false);
             let r_drain_timeout = resolve_val(drain_timeout_secs, file_cfg.drain_timeout_secs, 900);
@@ -978,6 +983,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 drain_timeout_secs: &r_drain_timeout,
                 max_turn_wall_secs: &r_max_turn_wall,
                 max_task_wall_secs: &r_max_task_wall,
+                idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
                 max_task_tokens: &r_max_task_tokens,
                 max_turn_cost_usd: &r_max_turn_cost,
@@ -1044,6 +1050,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     max_task_cost_usd: r_max_task_cost.value,
                     max_turn_wall_secs: r_max_turn_wall.value,
                     max_task_wall_secs: r_max_task_wall.value,
+                    idle_timeout_secs: r_idle_timeout.value,
                 },
                 log_dir: resolved_log_dir,
                 self_update_drain: r_self_update.value,
@@ -1058,6 +1065,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 required_jobs: r_required_jobs,
                 master_ci_gate: r_master_ci_gate.value,
                 master_ci_timeout_secs: r_master_ci_timeout.value,
+                allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
             };
             Ok(serve::run_serve(config)?)
         }
