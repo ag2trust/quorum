@@ -316,6 +316,14 @@ pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
     })
 }
 
+pub fn extract_repo(refs: &Option<String>) -> Option<String> {
+    let s = refs.as_deref()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("repo")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+}
+
 // ── create ────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -2530,6 +2538,17 @@ mod tests {
         assert_eq!(extract_pr_number(&Some(r#"{"pr":"99"}"#.into())), Some(99),);
         assert_eq!(extract_pr_number(&None), None);
         assert_eq!(extract_pr_number(&Some(r#"{"branch":"foo"}"#.into())), None,);
+    }
+
+    #[test]
+    fn extract_repo_from_refs() {
+        assert_eq!(
+            extract_repo(&Some(r#"{"pr":42,"repo":"ag2trust/quorum"}"#.into())),
+            Some("ag2trust/quorum".to_string()),
+        );
+        assert_eq!(extract_repo(&Some(r#"{"pr":42}"#.into())), None);
+        assert_eq!(extract_repo(&None), None);
+        assert_eq!(extract_repo(&Some(r#"{"repo":123}"#.into())), None);
     }
 
     #[test]

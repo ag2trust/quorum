@@ -393,40 +393,11 @@ fn other_repo_merge_does_not_drain() {
 
     quorum_done(home.path(), &["--agent", &agent_name, "--pr", "99"]);
 
+    // #75: cross-repo tasks are detected and parked immediately — no reviewer
+    // spawn, no drain.
     assert!(
-        handle.wait_for("spawning reviewer", 15),
-        "reviewer was not spawned: {:?}",
-        handle.lines
-    );
-
-    let reviewer_name = handle
-        .extract_agent_name("spawning reviewer ")
-        .expect("could not extract reviewer name");
-
-    assert!(
-        handle.wait_for("result", 15),
-        "reviewer did not produce result: {:?}",
-        handle.lines
-    );
-
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &reviewer_name,
-            "--pr",
-            "99",
-            "--verdict",
-            "approved",
-            "--blocking",
-            "0",
-        ],
-    );
-
-    // After merge, should see "merged" but NOT "DRAIN"
-    assert!(
-        handle.wait_for("merged", 15),
-        "did not see merge: {:?}",
+        handle.wait_for("REPO MISMATCH", 15),
+        "did not see repo mismatch detection: {:?}",
         handle.lines
     );
 

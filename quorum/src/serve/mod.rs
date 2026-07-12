@@ -2613,6 +2613,7 @@ async fn tick(
             })
             .collect();
         let mut parked_workers: Vec<usize> = Vec::new();
+        let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
             let pr_state = {
@@ -2642,6 +2643,19 @@ async fn tick(
                 }
                 _ => {}
             }
+            // #75: detect cross-repo PR before burning provision strikes
+            let task_refs = lookup_task_refs(&db_path, *task_id).await;
+            if let Some(task_repo) =
+                check_repo_mismatch(&task_refs, &config.repo, config.self_repo.as_deref())
+            {
+                log(&format!(
+                    "REPO MISMATCH: task #{task_id} PR #{pr} belongs to {task_repo}, \
+                     not {} — parking immediately",
+                    config.repo
+                ));
+                repo_mismatch_workers.push((*wi, task_repo));
+                continue;
+            }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "reviewer provision exhausted for task #{task_id} PR #{pr} \
@@ -2665,6 +2679,39 @@ async fn tick(
         }
         for &wi in pr_closed_workers.iter().rev() {
             let w = workers.remove(wi);
+            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+        }
+        // #75: park repo-mismatch workers without burning strikes
+        // Process in reverse index order to avoid index invalidation.
+        repo_mismatch_workers.sort_by_key(|b| std::cmp::Reverse(b.0));
+        for (wi, task_repo) in repo_mismatch_workers {
+            let w = workers.remove(wi);
+            let pr_label =
+                w.pr.map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| "unknown".to_string());
+            fire_event(
+                &db_path,
+                &w.agent_name,
+                w.task_id,
+                &Event::Cancelled {
+                    by: "daemon:parked:repo-mismatch".into(),
+                },
+            )
+            .await;
+            let body = format!(
+                "{}repo-mismatch | PR {pr_label} belongs to {task_repo}, \
+                 not {} — cannot provision reviewer from this daemon",
+                tasks::PARKED_BODY_PREFIX,
+                config.repo
+            );
+            set_task_body(&db_path, w.task_id, &body).await;
+            notify_provision_failure(
+                &db_path,
+                w.task_id,
+                &format!("repo mismatch ({task_repo} vs {})", config.repo),
+                &pr_label,
+            )
+            .await;
             cleanup_slot(config, wt_mgr, name_pool, w, None).await;
         }
         for &wi in parked_workers.iter().rev() {
@@ -2691,6 +2738,13 @@ async fn tick(
                 ),
             )
             .await;
+            notify_provision_failure(
+                &db_path,
+                w.task_id,
+                "reviewer provision exhausted",
+                &pr_label,
+            )
+            .await;
             cleanup_slot(config, wt_mgr, name_pool, w, None).await;
         }
 
@@ -2698,8 +2752,16 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        // (task_id, pr, author, review_only, body, reviewer)
-        type OrphanRow = (i64, i64, String, bool, Option<String>, Option<String>);
+        // (task_id, pr, author, review_only, body, reviewer, refs)
+        type OrphanRow = (
+            i64,
+            i64,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
         let orphan_in_review: Vec<OrphanRow> = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<OrphanRow>> {
@@ -2709,7 +2771,7 @@ async fn tick(
                 for t in ir_tasks {
                     if let Some(pr) = tasks::extract_pr_number(&t.refs) {
                         let author = t.author.unwrap_or_default();
-                        result.push((t.id, pr, author, t.review_only, t.body, t.reviewer));
+                        result.push((t.id, pr, author, t.review_only, t.body, t.reviewer, t.refs));
                     }
                 }
                 Ok(result)
@@ -2718,7 +2780,7 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author, review_only, body, reviewer) in &orphan_in_review {
+        for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -2785,6 +2847,40 @@ async fn tick(
                 continue;
             }
 
+            // #75: detect cross-repo PR before burning provision strikes
+            if let Some(other_repo) =
+                check_repo_mismatch(task_refs, &config.repo, config.self_repo.as_deref())
+            {
+                log(&format!(
+                    "REPO MISMATCH: orphan in-review task #{task_id} PR #{pr} \
+                     belongs to {other_repo}, not {} — parking",
+                    config.repo
+                ));
+                fire_event(
+                    &db_path,
+                    "daemon",
+                    *task_id,
+                    &Event::Cancelled {
+                        by: "daemon:parked:repo-mismatch".into(),
+                    },
+                )
+                .await;
+                let body = format!(
+                    "{}repo-mismatch | PR #{pr} belongs to {other_repo}, \
+                     not {} — cannot provision reviewer from this daemon",
+                    tasks::PARKED_BODY_PREFIX,
+                    config.repo
+                );
+                set_task_body(&db_path, *task_id, &body).await;
+                notify_provision_failure(
+                    &db_path,
+                    *task_id,
+                    &format!("repo mismatch ({other_repo} vs {})", config.repo),
+                    &format!("#{pr}"),
+                )
+                .await;
+                continue;
+            }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "orphan in-review task #{task_id} PR #{pr}: \
@@ -2807,6 +2903,13 @@ async fn tick(
                          reviewer provision failed (orphan in-review)",
                         tasks::PARKED_BODY_PREFIX
                     ),
+                )
+                .await;
+                notify_provision_failure(
+                    &db_path,
+                    *task_id,
+                    "reviewer provision exhausted (orphan in-review)",
+                    &format!("#{pr}"),
                 )
                 .await;
                 continue;
@@ -4081,6 +4184,89 @@ async fn set_task_body(db_path: &std::path::Path, task_id: i64, body: &str) {
     }
 }
 
+/// Post a direct message to a task's creator when the daemon parks a task
+/// due to provision failure (exhausted strikes or repo mismatch).
+async fn notify_provision_failure(
+    db_path: &std::path::Path,
+    task_id: i64,
+    reason: &str,
+    pr_label: &str,
+) {
+    let p = db_path.to_path_buf();
+    let tid = task_id;
+    let reason_owned = reason.to_string();
+    let pr_label_owned = pr_label.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let task = tasks::get(&conn, tid)?;
+        let created_by = task.map(|t| t.created_by).unwrap_or_default();
+        if created_by.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix();
+        let body = format!(
+            "task #{tid} parked: {reason_owned} | PR {pr_label_owned} — \
+             review linkage lost, manual re-queue may be needed"
+        );
+        quorum_core::feed::post(
+            &mut conn,
+            "daemon",
+            "critical",
+            None,
+            &body,
+            None,
+            Some(&created_by),
+            86400,
+            now,
+        )?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Err(e)) => log(&format!(
+            "notify_provision_failure failed for task #{task_id}: {e}"
+        )),
+        Err(e) => log(&format!(
+            "notify_provision_failure join error for task #{task_id}: {e}"
+        )),
+        Ok(Ok(())) => log(&format!(
+            "notified creator of task #{task_id} about provision failure"
+        )),
+    }
+}
+
+/// Check if a task's refs.repo mismatches all repos this daemon can provision from.
+/// Returns `Some(task_repo)` on mismatch, `None` if matching or unknown.
+fn check_repo_mismatch(
+    task_refs: &Option<String>,
+    daemon_repo: &str,
+    self_repo: Option<&str>,
+) -> Option<String> {
+    let task_repo = tasks::extract_repo(task_refs)?;
+    if task_repo == daemon_repo {
+        return None;
+    }
+    if let Some(sr) = self_repo {
+        if task_repo == sr {
+            return None;
+        }
+    }
+    Some(task_repo)
+}
+
+/// Look up a task's refs from the DB. Returns None on any failure.
+async fn lookup_task_refs(db_path: &std::path::Path, task_id: i64) -> Option<String> {
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Option<String> {
+        let conn = quorum_core::db::open(&p).ok()?;
+        let task = tasks::get(&conn, task_id).ok()??;
+        task.refs
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Clean up a worker slot's resources without updating task status.
 /// Used when `apply_event` has already transitioned the task state.
 async fn cleanup_slot(
@@ -4755,6 +4941,39 @@ mod tests {
             !tracker.is_exhausted(1, 43),
             "different PR on same task must not be exhausted"
         );
+    }
+
+    #[test]
+    fn check_repo_mismatch_detects_cross_repo() {
+        let refs = Some(r#"{"pr":318,"repo":"ag2trust/quorum"}"#.to_string());
+        let result = check_repo_mismatch(&refs, "ag2trust/ag2trust", None);
+        assert_eq!(result, Some("ag2trust/quorum".to_string()));
+    }
+
+    #[test]
+    fn check_repo_mismatch_same_repo_returns_none() {
+        let refs = Some(r#"{"pr":318,"repo":"ag2trust/quorum"}"#.to_string());
+        assert_eq!(check_repo_mismatch(&refs, "ag2trust/quorum", None), None);
+    }
+
+    #[test]
+    fn check_repo_mismatch_self_repo_returns_none() {
+        let refs = Some(r#"{"pr":318,"repo":"ag2trust/quorum"}"#.to_string());
+        assert_eq!(
+            check_repo_mismatch(&refs, "ag2trust/ag2trust", Some("ag2trust/quorum")),
+            None
+        );
+    }
+
+    #[test]
+    fn check_repo_mismatch_no_repo_returns_none() {
+        let refs = Some(r#"{"pr":318}"#.to_string());
+        assert_eq!(check_repo_mismatch(&refs, "ag2trust/ag2trust", None), None);
+    }
+
+    #[test]
+    fn check_repo_mismatch_none_refs_returns_none() {
+        assert_eq!(check_repo_mismatch(&None, "ag2trust/ag2trust", None), None);
     }
 
     #[test]
