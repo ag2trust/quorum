@@ -104,6 +104,20 @@ install -m 0755 "$tmp/quorum" "$INSTALL_DIR/quorum" 2>/dev/null \
   || { cp "$tmp/quorum" "$INSTALL_DIR/quorum" && chmod 0755 "$INSTALL_DIR/quorum"; }
 
 printf 'installed quorum %s -> %s\n' "$VERSION" "$INSTALL_DIR/quorum"
+
+# --- Agent skill (Claude Code) -----------------------------------------------------------
+# Installs the `quorum` skill globally so any agent session on this machine knows how to
+# use quorum. Fetched from the same tag as the binary (lockstep). Warn-only on failure —
+# older tags don't ship the skill, and a missing skill must not fail a binary install.
+SKILL_DIR="${QUORUM_SKILL_DIR:-$HOME/.claude/skills}/quorum"
+skill_url="https://raw.githubusercontent.com/$REPO/$VERSION/.claude/skills/quorum/SKILL.md"
+if dl "$skill_url" "$tmp/SKILL.md" 2>/dev/null; then
+  mkdir -p "$SKILL_DIR"
+  cp "$tmp/SKILL.md" "$SKILL_DIR/SKILL.md"
+  printf 'installed agent skill -> %s/SKILL.md\n' "$SKILL_DIR"
+else
+  printf 'note: agent skill not available for %s (pre-skill tag?) — skipped\n' "$VERSION"
+fi
 # shellcheck disable=SC2016 # the literal $PATH below is intentional — a copy-paste hint for the user
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
