@@ -16,7 +16,10 @@ pub struct MergeContext {
 pub enum MergeFailureKind {
     /// Worker can fix (merge conflict, branch behind base).
     Retryable,
-    /// Not worker-fixable (policy blocked, auth failure, infra).
+    /// Merge prerequisites not yet met (checks/approval still propagating).
+    /// Daemon should re-enter the wait+merge cycle, not cancel or rework.
+    PolicyPending,
+    /// Not worker-fixable (auth failure, infra, unknown).
     PolicyBlocked,
 }
 
@@ -34,6 +37,9 @@ pub fn classify_merge_failure(message: &str) -> MergeFailureKind {
         if lower.contains(pat) {
             return MergeFailureKind::Retryable;
         }
+    }
+    if lower.contains("policy prohibits") {
+        return MergeFailureKind::PolicyPending;
     }
     MergeFailureKind::PolicyBlocked
 }
@@ -183,6 +189,10 @@ fn checks_query_from_parsed(
 ) -> ChecksQueryResult {
     if merge_state.as_deref() == Some("CLEAN") {
         return ChecksQueryResult::AllPassed;
+    }
+
+    if checks.is_empty() {
+        return ChecksQueryResult::Pending;
     }
 
     let mut failing = Vec::new();
@@ -631,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn command_merge_executor_policy_blocked() {
+    fn command_merge_executor_policy_pending() {
         let exec = CommandMergeExecutor {
             command:
                 "echo 'not mergeable: the base branch policy prohibits the merge' >&2 && exit 1"
@@ -641,7 +651,7 @@ mod tests {
         };
         let result = exec.merge(7, Path::new("/tmp"), &test_ctx());
         assert!(!result.success);
-        assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyPending));
     }
 
     #[test]
@@ -731,10 +741,10 @@ mod tests {
     }
 
     #[test]
-    fn classify_policy_blocked() {
+    fn classify_policy_pending() {
         assert_eq!(
             classify_merge_failure("not mergeable: the base branch policy prohibits the merge"),
-            MergeFailureKind::PolicyBlocked,
+            MergeFailureKind::PolicyPending,
         );
     }
 
@@ -895,6 +905,25 @@ mod tests {
             result,
             ChecksQueryResult::SomeFailed(vec!["clippy".to_string(), "test".to_string()])
         );
+    }
+
+    #[test]
+    fn parse_checks_empty_rollup_is_pending() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": []
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::Pending);
+    }
+
+    #[test]
+    fn parse_checks_no_rollup_field_is_pending() {
+        let json = r#"{"mergeStateStatus": "BLOCKED"}"#;
+        let (state, checks) = parse_checks_json(json);
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::Pending);
     }
 
     #[test]

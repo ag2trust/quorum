@@ -1272,6 +1272,9 @@ async fn tick(
                     log(&format!(
                         "verdict: approved — waiting for checks on PR #{pr_num}"
                     ));
+
+                    const MAX_POLICY_RETRIES: u32 = 3;
+                    let mut policy_retry = 0u32;
                     let checks_outcome = {
                         let repo = config.repo_dir.clone();
                         let executor = Arc::clone(&config.merge_executor);
@@ -1477,18 +1480,62 @@ async fn tick(
                         }
                     }
 
-                    let merge_result = {
-                        let repo = config.repo_dir.clone();
-                        let executor = Arc::clone(&config.merge_executor);
-                        let merge_ctx = merge::MergeContext {
-                            reviewer_name: reviewers[ri].agent_name.clone(),
-                            review_task_id: reviewer_task_id,
+                    let merge_result = 'merge_gate: loop {
+                        let attempt = {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            let merge_ctx = merge::MergeContext {
+                                reviewer_name: reviewers[ri].agent_name.clone(),
+                                review_task_id: reviewer_task_id,
+                            };
+                            tokio::task::spawn_blocking(move || {
+                                executor.merge(pr_num, &repo, &merge_ctx)
+                            })
+                            .await
+                            .map_err(|e| {
+                                QuorumError::Io(format!("merge spawn_blocking join: {e}"))
+                            })?
                         };
-                        tokio::task::spawn_blocking(move || {
-                            executor.merge(pr_num, &repo, &merge_ctx)
-                        })
-                        .await
-                        .map_err(|e| QuorumError::Io(format!("merge spawn_blocking join: {e}")))?
+
+                        if !attempt.success
+                            && attempt.failure_kind == Some(merge::MergeFailureKind::PolicyPending)
+                            && policy_retry < MAX_POLICY_RETRIES
+                        {
+                            policy_retry += 1;
+                            log(&format!(
+                                "PR #{pr_num} merge policy-pending (attempt {policy_retry}/\
+                                 {MAX_POLICY_RETRIES}): {} — re-waiting for checks",
+                                attempt.message
+                            ));
+                            let retry_outcome = {
+                                let repo = config.repo_dir.clone();
+                                let executor = Arc::clone(&config.merge_executor);
+                                let timeout = config.merge_checks_timeout_secs;
+                                let poll = config.merge_checks_poll_secs;
+                                tokio::task::spawn_blocking(move || {
+                                    executor.wait_for_checks(pr_num, &repo, timeout, poll)
+                                })
+                                .await
+                                .map_err(|e| {
+                                    QuorumError::Io(format!("checks spawn_blocking join: {e}"))
+                                })?
+                            };
+                            match retry_outcome {
+                                merge::ChecksOutcome::Ready => {
+                                    log(&format!(
+                                        "checks passed for PR #{pr_num} (retry) \
+                                         — retrying merge"
+                                    ));
+                                    continue 'merge_gate;
+                                }
+                                merge::ChecksOutcome::Failed { .. }
+                                | merge::ChecksOutcome::TimedOut => {
+                                    break 'merge_gate attempt;
+                                }
+                            }
+                        }
+
+                        break 'merge_gate attempt;
                     };
 
                     // #228: the merge was attempted by this live instance —
@@ -1530,7 +1577,8 @@ async fn tick(
                             .unwrap_or(merge::MergeFailureKind::PolicyBlocked);
 
                         match failure_kind {
-                            merge::MergeFailureKind::PolicyBlocked => {
+                            merge::MergeFailureKind::PolicyBlocked
+                            | merge::MergeFailureKind::PolicyPending => {
                                 log(&format!(
                                     "MERGE BLOCKED: PR #{pr_num} merge failed \
                                      (not worker-fixable): {} — cancelling task",
