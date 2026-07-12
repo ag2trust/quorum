@@ -369,13 +369,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             note_file,
             verdict,
             blocking,
+            depends_on,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
             let note = read_optional_note(note_stdin, note_file)?;
             verdict::validate(verdict.as_deref(), blocking, None, false)
                 .map_err(QuorumError::Usage)?;
-            let has_field_update =
-                status.is_some() || refs.is_some() || body.is_some() || verdict.is_some();
+            let has_field_update = status.is_some()
+                || refs.is_some()
+                || body.is_some()
+                || verdict.is_some()
+                || depends_on.is_some();
             if !has_field_update && note.is_none() {
                 return Err(QuorumError::Usage(
                     "task-update needs at least one of --status/--refs/--verdict/\
@@ -402,6 +406,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     body: body.as_deref(),
                     refs: refs.as_deref(),
                     verdict: None,
+                    depends_on: depends_on.as_deref(),
                 };
                 let t = quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?;
                 (t, vec![])

@@ -3723,6 +3723,7 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
             body: None,
             refs: None,
             verdict: None,
+            depends_on: None,
         };
         tasks::update(&mut conn, &a, task_id, &fields, now)?;
         Ok(())
@@ -3746,6 +3747,7 @@ async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strik
             body: Some(&body),
             refs: None,
             verdict: None,
+            depends_on: None,
         };
         tasks::update(&mut conn, &a, task_id, &fields, now)?;
         Ok(())
@@ -3926,8 +3928,7 @@ async fn teardown_worker_with_body(
             let fields = tasks::TaskUpdate {
                 status: Some(&status),
                 body: body_owned.as_deref(),
-                refs: None,
-                verdict: None,
+                ..Default::default()
             };
             tasks::update(&mut conn, &agent, task_id, &fields, now)?;
             journal::delete(&mut conn, &agent)?;

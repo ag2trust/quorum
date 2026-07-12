@@ -1304,9 +1304,7 @@ mod tests {
             t_cancelled,
             &tasks::TaskUpdate {
                 status: Some("cancelled"),
-                body: None,
-                refs: None,
-                verdict: None,
+                ..Default::default()
             },
             150,
         )

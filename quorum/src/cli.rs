@@ -131,6 +131,11 @@ pub enum Command {
         /// `--verdict changes`.
         #[arg(long)]
         blocking: Option<u32>,
+        /// Replace this task's dependency list. JSON array of task ids, e.g. '[1,3]'.
+        /// Pass '[]' to clear all dependencies. Creator or assignee guard; blocked on
+        /// terminal tasks (done/failed).
+        #[arg(long = "depends-on")]
+        depends_on: Option<String>,
     },
     /// List tasks, optionally filtered by status/label/assignee. `--brief` returns summary rows
     /// (no body) for a token-cheap queue scan; the full body is one `task-get <id>` away.
