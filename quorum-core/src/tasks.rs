@@ -32,6 +32,11 @@ pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 /// prefix is reopenable by creator or (former) assignee (#182).
 pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
 
+/// Body marker for review-only tasks whose approved PR failed to merge (e.g. conflicts).
+/// The daemon's orphan-in-review handler detects this and retries merge when the PR
+/// becomes MERGEABLE again.
+pub const MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked";
+
 const KNOWN_TIERS: &[&str] = &["opus-46", "opus-47", "opus-48", "sonnet-5"];
 const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
 const KNOWN_COMPLEXITIES: &[&str] = &["1", "2", "3", "4", "5"];
@@ -2149,6 +2154,59 @@ mod tests {
             .find(|n| n.body.contains("review-only"))
             .expect("findings note missing");
         assert!(note.body.contains("requested changes"));
+    }
+
+    #[test]
+    fn review_only_merge_failed_posts_alert_and_stays_in_review() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "review PR #50",
+            None,
+            100,
+            None,
+            None,
+            None,
+            Some(50),
+            1000,
+        )
+        .unwrap();
+        // Claim as reviewer, approve, then fail merge
+        claim(&mut c, "R", Some(id), &[], TTL, 1001).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictApprove, 1002).unwrap();
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::MergeFailed {
+                reason: "PR #50 has conflicts with main".into(),
+            },
+            1003,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert!(r.task.review_only);
+        assert!(r
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+
+        // Creator got an alert DM
+        let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
+        let alert = msgs
+            .iter()
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .expect("alert DM to creator missing after merge failure");
+        assert!(
+            alert.body.contains("conflicts"),
+            "alert should mention conflicts: {}",
+            alert.body
+        );
+
+        // Reviewer column is still set (needed for merge retry)
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.reviewer.as_deref(), Some("R"));
     }
 
     #[test]
