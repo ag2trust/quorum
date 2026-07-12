@@ -41,22 +41,53 @@ pub struct DriftResult {
     pub twins: Vec<TwinPr>,
 }
 
+/// Parse a daemon branch name (`daemon/<agent>-t<N>`) and return the task ID.
+fn parse_daemon_branch_task_id(branch: &str) -> Option<i64> {
+    let suffix = branch.strip_prefix("daemon/")?;
+    let t_pos = suffix.rfind("-t")?;
+    suffix[t_pos + 2..].parse::<i64>().ok()
+}
+
 /// Detect unbacked and twin PRs.
 ///
 /// `open_prs`: all open PRs from `gh pr list`.
 /// `task_prs`: `(task_id, pr_number)` pairs from non-terminal tasks with refs.pr set.
 /// `task_branches`: `(task_id, branch)` pairs from the task_branches table for
 ///   non-terminal tasks — used for branch-based twin matching.
+/// `active_task_ids`: IDs of all non-terminal tasks — used to suppress false positives
+///   during the create→done window when a daemon branch encodes its task ID.
 pub fn detect(
     open_prs: &[GhPr],
     task_prs: &[(i64, i64)],
     task_branches: &[(i64, String)],
+    active_task_ids: &HashSet<i64>,
 ) -> DriftResult {
     let backed_pr_numbers: HashSet<i64> = task_prs.iter().map(|(_, pr)| *pr).collect();
+
+    let branch_task_set: HashSet<i64> = task_branches.iter().map(|(tid, _)| *tid).collect();
 
     let unbacked: Vec<UnbackedPr> = open_prs
         .iter()
         .filter(|pr| !backed_pr_numbers.contains(&pr.number))
+        .filter(|pr| {
+            // Suppress if the PR's branch is allocated to a non-terminal task
+            if let Some(&_tid) = task_branches.iter().find_map(|(tid, b)| {
+                if b == &pr.head_ref_name {
+                    Some(tid)
+                } else {
+                    None
+                }
+            }) {
+                return false;
+            }
+            // Suppress if branch matches daemon/<agent>-t<N> and task N is active
+            if let Some(task_id) = parse_daemon_branch_task_id(&pr.head_ref_name) {
+                if active_task_ids.contains(&task_id) || branch_task_set.contains(&task_id) {
+                    return false;
+                }
+            }
+            true
+        })
         .map(|pr| UnbackedPr {
             number: pr.number,
             title: pr.title.clone(),
@@ -125,6 +156,17 @@ pub fn task_pr_refs(conn: &Connection) -> Result<Vec<(i64, i64)>> {
         }
     }
     Ok(result)
+}
+
+/// Query IDs of all non-terminal tasks (used for daemon-branch correlation).
+pub fn active_task_ids(conn: &Connection) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled', 'closed')",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    Ok(ids)
 }
 
 /// Query branch allocations for non-terminal tasks.
@@ -338,7 +380,7 @@ mod tests {
             },
         ];
         let task_prs = vec![(1, 100), (2, 300)];
-        let result = detect(&open_prs, &task_prs, &[]);
+        let result = detect(&open_prs, &task_prs, &[], &HashSet::new());
         assert_eq!(result.unbacked.len(), 1);
         assert_eq!(result.unbacked[0].number, 200);
         assert_eq!(result.unbacked[0].title, "orphan");
@@ -352,7 +394,7 @@ mod tests {
             head_ref_name: "x".into(),
         }];
         let task_prs = vec![(1, 10)];
-        let result = detect(&open_prs, &task_prs, &[]);
+        let result = detect(&open_prs, &task_prs, &[], &HashSet::new());
         assert!(result.unbacked.is_empty());
         assert!(result.twins.is_empty());
     }
@@ -373,7 +415,7 @@ mod tests {
         ];
         // Both PRs backed by the same task
         let task_prs = vec![(5, 10), (5, 11)];
-        let result = detect(&open_prs, &task_prs, &[]);
+        let result = detect(&open_prs, &task_prs, &[], &HashSet::new());
         assert!(result.unbacked.is_empty());
         assert_eq!(result.twins.len(), 1);
         assert_eq!(result.twins[0].task_id, 5);
@@ -397,7 +439,7 @@ mod tests {
         // Only PR 10 referenced by task, but PR 20 shares the branch
         let task_prs = vec![(5, 10)];
         let task_branches = vec![(5, "daemon/feat-w1".to_string())];
-        let result = detect(&open_prs, &task_prs, &task_branches);
+        let result = detect(&open_prs, &task_prs, &task_branches, &HashSet::new());
         assert_eq!(result.twins.len(), 1);
         assert_eq!(result.twins[0].task_id, 5);
         assert_eq!(result.twins[0].pr_numbers, vec![10, 20]);
@@ -412,14 +454,14 @@ mod tests {
         }];
         let task_prs = vec![(5, 10)];
         let task_branches = vec![(5, "daemon/feat-w1".to_string())];
-        let result = detect(&open_prs, &task_prs, &task_branches);
+        let result = detect(&open_prs, &task_prs, &task_branches, &HashSet::new());
         // One PR matched by both ref and branch — should NOT be twin
         assert!(result.twins.is_empty());
     }
 
     #[test]
     fn detect_empty_inputs() {
-        let result = detect(&[], &[], &[]);
+        let result = detect(&[], &[], &[], &HashSet::new());
         assert!(result.unbacked.is_empty());
         assert!(result.twins.is_empty());
     }
@@ -671,5 +713,106 @@ mod tests {
         let far_future = now + crate::events::EVENT_TTL_SECS + 1;
         let prs = unbacked_pr_events(&c, far_future).unwrap();
         assert!(prs.is_empty(), "expired events should not appear");
+    }
+
+    #[test]
+    fn parse_daemon_branch_task_id_valid() {
+        assert_eq!(
+            parse_daemon_branch_task_id("daemon/bolt-rw4r-t38"),
+            Some(38)
+        );
+        assert_eq!(
+            parse_daemon_branch_task_id("daemon/pivot-8xbr-t67"),
+            Some(67)
+        );
+        assert_eq!(parse_daemon_branch_task_id("daemon/a-t1"), Some(1));
+    }
+
+    #[test]
+    fn parse_daemon_branch_task_id_invalid() {
+        assert_eq!(parse_daemon_branch_task_id("feat/something"), None);
+        assert_eq!(parse_daemon_branch_task_id("daemon/no-task-suffix"), None);
+        assert_eq!(parse_daemon_branch_task_id("daemon/"), None);
+        assert_eq!(parse_daemon_branch_task_id(""), None);
+    }
+
+    #[test]
+    fn detect_suppresses_unbacked_during_create_done_window() {
+        // PR on daemon branch for task 38 (active) — should be suppressed
+        let open_prs = vec![GhPr {
+            number: 3598,
+            title: "feat: something".into(),
+            head_ref_name: "daemon/bolt-rw4r-t38".into(),
+        }];
+        let task_prs = vec![]; // no refs.pr set yet (create→done window)
+        let active = HashSet::from([38]);
+        let result = detect(&open_prs, &task_prs, &[], &active);
+        assert!(
+            result.unbacked.is_empty(),
+            "should suppress during create→done window"
+        );
+    }
+
+    #[test]
+    fn detect_flags_unbacked_when_task_terminal() {
+        // PR on daemon branch for task 38, but task 38 is NOT in active set (terminal)
+        let open_prs = vec![GhPr {
+            number: 3598,
+            title: "feat: something".into(),
+            head_ref_name: "daemon/bolt-rw4r-t38".into(),
+        }];
+        let task_prs = vec![];
+        let active = HashSet::new(); // task 38 is terminal/gone
+        let result = detect(&open_prs, &task_prs, &[], &active);
+        assert_eq!(
+            result.unbacked.len(),
+            1,
+            "should flag when task is terminal"
+        );
+        assert_eq!(result.unbacked[0].number, 3598);
+    }
+
+    #[test]
+    fn detect_suppresses_unbacked_via_task_branches_match() {
+        // PR on a branch that's allocated to an active task via task_branches table
+        let open_prs = vec![GhPr {
+            number: 100,
+            title: "feat: allocated".into(),
+            head_ref_name: "feat/cool-thing-bolt-q8x".into(),
+        }];
+        let task_prs = vec![]; // no refs.pr yet
+        let task_branches = vec![(42, "feat/cool-thing-bolt-q8x".to_string())];
+        let result = detect(&open_prs, &task_prs, &task_branches, &HashSet::new());
+        assert!(
+            result.unbacked.is_empty(),
+            "should suppress when branch is allocated to active task"
+        );
+    }
+
+    #[test]
+    fn active_task_ids_from_db() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (10, 'working', 'working', 0, 'test', 1, 1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (20, 'done', 'done', 0, 'test', 1, 1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tasks (id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (30, 'open', 'open', 0, 'test', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let ids = active_task_ids(&c).unwrap();
+        assert!(ids.contains(&10));
+        assert!(!ids.contains(&20));
+        assert!(ids.contains(&30));
     }
 }
