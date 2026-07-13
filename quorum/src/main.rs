@@ -1191,8 +1191,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     )));
                 }
             };
+            let repo = paths::resolve_repo()?;
+            let cfg_path = serve_config::default_config_path(&repo)?;
+            let file_cfg = serve_config::load(&cfg_path, false)?;
+            let default_model = file_cfg.model.as_deref().unwrap_or("sonnet");
+            let default_effort = file_cfg.effort.as_deref().unwrap_or("high");
             let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let report = quorum_core::perf::perf(&conn, cut)?;
+            let report = quorum_core::perf::perf(&conn, cut, default_model, default_effort)?;
             if json {
                 output::emit(&report);
             } else {
