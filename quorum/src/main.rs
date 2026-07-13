@@ -62,6 +62,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Tail { .. } => "tail",
         cli::Command::Perf { .. } => "perf",
         cli::Command::Classify { .. } => "classify",
+        cli::Command::Kill { .. } => "kill",
         cli::Command::Help => "help",
     }
 }
@@ -825,6 +826,30 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 note: summary,
                 to_agent: None,
                 payload: verdict::attestation_payload(blocking),
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
+        cli::Command::Kill {
+            agent,
+            by,
+            reason_stdin,
+            reason_file,
+        } => {
+            let reason = read_optional_body(reason_stdin, reason_file)?;
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent: by,
+                kind: quorum_core::mailbox::MailboxKind::Kill,
+                task_id: None,
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: reason,
+                to_agent: Some(agent),
+                payload: None,
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
