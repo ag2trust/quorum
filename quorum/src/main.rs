@@ -295,7 +295,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             body_file,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let repo = paths::resolve_repo()?;
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&repo)?)?;
             let id = quorum_core::tasks::create(
                 &mut conn,
                 &created_by,
@@ -308,7 +309,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 review_pr,
                 now,
             )?;
-            output::emit(&serde_json::json!({ "id": id }));
+            output::emit(&serde_json::json!({ "id": id, "repo": repo }));
             Ok(0)
         }
         cli::Command::TaskClaim {
@@ -321,7 +322,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 Some(s) => parse_ttl(&s)?,
                 None => load_cfg()?.task_lease_ttl_secs,
             };
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let repo = paths::resolve_repo()?;
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&repo)?)?;
             let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
             match quorum_core::tasks::claim(&mut conn, &agent, task_id, &labels, ttl, now)? {
                 Some(t) => {
@@ -348,12 +350,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     compact.suggested_branch = Some(alloc.branch);
                     compact.suggested_worktree = Some(alloc.worktree);
                     compact.branch_exists = Some(alloc.existed);
+                    compact.repo = Some(repo);
                     output::emit(&compact);
                     Ok(0)
                 }
                 None => {
                     output::emit(
-                        &serde_json::json!({ "ok": false, "reason": "no claimable task" }),
+                        &serde_json::json!({ "ok": false, "reason": "no claimable task", "repo": repo }),
                     );
                     Ok(1)
                 }
