@@ -97,6 +97,7 @@ pub enum Effect {
     IncrementReworkRound,
     NotifyOwner { reason: String },
     ReleaseLease,
+    ClearAuthor,
     PostFindingsNote,
 }
 
@@ -190,12 +191,16 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             Status::Open,
             vec![
                 Effect::ReleaseLease,
+                Effect::ClearAuthor,
                 Effect::NotifyOwner {
                     reason: reason.clone(),
                 },
             ],
         )),
-        (Status::Working, Event::LeaseExpired) => Ok((Status::Open, vec![Effect::ReleaseLease])),
+        (Status::Working, Event::LeaseExpired) => Ok((
+            Status::Open,
+            vec![Effect::ReleaseLease, Effect::ClearAuthor],
+        )),
         (Status::Working, Event::Cancelled { by }) => Ok((
             Status::Cancelled,
             vec![
@@ -570,6 +575,7 @@ mod tests {
             Status::Open,
             &[
                 Effect::ReleaseLease,
+                Effect::ClearAuthor,
                 Effect::NotifyOwner {
                     reason: "oom".into(),
                 },
@@ -584,7 +590,7 @@ mod tests {
             &t,
             &Event::LeaseExpired,
             Status::Open,
-            &[Effect::ReleaseLease],
+            &[Effect::ReleaseLease, Effect::ClearAuthor],
         );
     }
 

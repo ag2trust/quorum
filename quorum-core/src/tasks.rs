@@ -187,6 +187,7 @@ pub fn effect_name(e: &Effect) -> String {
         Effect::IncrementReworkRound => "increment_rework_round".into(),
         Effect::NotifyOwner { .. } => "notify_owner".into(),
         Effect::ReleaseLease => "release_lease".into(),
+        Effect::ClearAuthor => "clear_author".into(),
         Effect::PostFindingsNote => "post_findings_note".into(),
     }
 }
@@ -422,7 +423,7 @@ pub fn claim(
                     "UPDATE tasks SET
                         status = CASE WHEN status='open' THEN 'working' ELSE status END,
                         assignee = ?1,
-                        author = CASE WHEN status='open' THEN ?1 ELSE author END,
+                        author = CASE WHEN status='open' AND author IS NULL THEN ?1 ELSE author END,
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3 AND (
@@ -461,7 +462,7 @@ pub fn claim(
                 "UPDATE tasks SET
                     status = CASE WHEN status='open' THEN 'working' ELSE status END,
                     assignee = ?1,
-                    author = CASE WHEN status='open' THEN ?1 ELSE author END,
+                    author = CASE WHEN status='open' AND author IS NULL THEN ?1 ELSE author END,
                     reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                     updated_at = ?2
                  WHERE id = ({selector}) RETURNING {COLS}"
@@ -580,6 +581,9 @@ pub fn apply_event(
             Effect::SetReviewer { agent } => {
                 reviewer = Some(agent.clone());
                 assignee = Some(agent.clone());
+            }
+            Effect::ClearAuthor => {
+                author = None;
             }
             Effect::IncrementReworkRound => {
                 rework_round += 1;
@@ -2725,5 +2729,95 @@ mod tests {
 
         let task = get(&c, id).unwrap().unwrap();
         assert_eq!(task.status, "cancelled");
+    }
+
+    /// Rework re-claim by a different agent must preserve the original author
+    /// and never overwrite it (#340). The branch (derived from author) stays
+    /// stable across re-claims, preventing duplicate PRs.
+    #[test]
+    fn rework_reclaim_preserves_original_author() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+
+        // Original author claims
+        let t = claim(&mut c, "Optic-lo4x", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.author, Some("Optic-lo4x".to_string()));
+
+        // Author signals done
+        apply_event(
+            &mut c,
+            "Optic-lo4x",
+            id,
+            &Event::SignaledDone {
+                pr: "3620".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Reviewer claims and sends back for rework
+        claim(&mut c, "Optic-c6at", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "Optic-c6at", id, &Event::VerdictChanges, 1003).unwrap();
+
+        // Author's lease lapsed — rework → open
+        apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
+
+        // Different agent claims the reopened task
+        let t = claim(&mut c, "Lever-lx89", Some(id), &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            t.author,
+            Some("Optic-lo4x".to_string()),
+            "author must be the original claimant, not the re-claimer"
+        );
+        assert_eq!(
+            t.assignee,
+            Some("Lever-lx89".to_string()),
+            "assignee should be the new worker"
+        );
+    }
+
+    /// Auto-select claim (task_id=None) also preserves author on rework re-claim (#340).
+    #[test]
+    fn rework_reclaim_auto_select_preserves_author() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+
+        // Original author claims
+        claim(&mut c, "Optic-lo4x", Some(id), &[], TTL, 1000).unwrap();
+
+        // Author signals done → in-review
+        apply_event(
+            &mut c,
+            "Optic-lo4x",
+            id,
+            &Event::SignaledDone {
+                pr: "1".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Reviewer sends back for rework
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
+
+        // Lease lapse → open
+        apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
+
+        // New agent auto-selects (no task_id)
+        let t = claim(&mut c, "Lever-lx89", None, &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, id);
+        assert_eq!(
+            t.author,
+            Some("Optic-lo4x".to_string()),
+            "auto-select claim must also preserve original author"
+        );
     }
 }
