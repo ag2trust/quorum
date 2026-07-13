@@ -68,6 +68,10 @@ pub enum Command {
         body_stdin: bool,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that repo's DB
+        /// instead of resolving from cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Atomically claim a task (a specific --task-id, or the highest-priority open task), taking
     /// a renewable lease. A lapsed lease returns the task to `open` (reaper).
@@ -86,6 +90,10 @@ pub enum Command {
         /// Lease duration, e.g. 45m, 1h, 30s, or bare seconds. Defaults to the config lease TTL.
         #[arg(long)]
         ttl: Option<String>,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that repo's DB
+        /// instead of resolving from cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Update a task: transition status, set refs/body, or append a note. The single
     /// task-transition command — replaces the former `task-release` and `task-cancel`.

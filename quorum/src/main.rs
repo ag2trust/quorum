@@ -122,6 +122,22 @@ fn load_cfg() -> Result<config::Config> {
     config::load(&paths::config_path()?)
 }
 
+/// Resolve repo identity: explicit `--repo owner/name` override, or cwd/env fallback.
+fn resolve_repo_override(repo: Option<&str>) -> Result<String> {
+    match repo {
+        Some(r) => {
+            let slash_count = r.chars().filter(|&c| c == '/').count();
+            if slash_count != 1 || r.starts_with('/') || r.ends_with('/') {
+                return Err(QuorumError::Usage(format!(
+                    "--repo must be owner/name (got {r:?})"
+                )));
+            }
+            Ok(r.to_string())
+        }
+        None => paths::resolve_repo(),
+    }
+}
+
 fn best_effort_errlog(source: &str, detail: &str) {
     if let Ok(db) = paths::db_path() {
         if let Ok(conn) = quorum_core::db::open(&db) {
@@ -293,10 +309,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             depends_on,
             review_pr,
             body_file,
+            repo,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
-            let repo = paths::resolve_repo()?;
-            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&repo)?)?;
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
             let id = quorum_core::tasks::create(
                 &mut conn,
                 &created_by,
@@ -309,7 +326,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 review_pr,
                 now,
             )?;
-            output::emit(&serde_json::json!({ "id": id, "repo": repo }));
+            output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
         }
         cli::Command::TaskClaim {
@@ -317,13 +334,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             task_id,
             match_label,
             ttl,
+            repo,
         } => {
             let ttl = match ttl {
                 Some(s) => parse_ttl(&s)?,
                 None => load_cfg()?.task_lease_ttl_secs,
             };
-            let repo = paths::resolve_repo()?;
-            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&repo)?)?;
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
             let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
             match quorum_core::tasks::claim(&mut conn, &agent, task_id, &labels, ttl, now)? {
                 Some(t) => {
@@ -350,13 +368,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     compact.suggested_branch = Some(alloc.branch);
                     compact.suggested_worktree = Some(alloc.worktree);
                     compact.branch_exists = Some(alloc.existed);
-                    compact.repo = Some(repo);
+                    compact.repo = Some(resolved_repo.clone());
                     output::emit(&compact);
                     Ok(0)
                 }
                 None => {
                     output::emit(
-                        &serde_json::json!({ "ok": false, "reason": "no claimable task", "repo": repo }),
+                        &serde_json::json!({ "ok": false, "reason": "no claimable task", "repo": resolved_repo }),
                     );
                     Ok(1)
                 }
@@ -1319,7 +1337,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ttl, wait_child_stdout};
+    use super::{parse_ttl, resolve_repo_override, wait_child_stdout};
 
     #[test]
     fn parse_ttl_units() {
@@ -1395,5 +1413,23 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "must not wait for the full sleep; elapsed: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn resolve_repo_override_accepts_valid_slug() {
+        assert_eq!(
+            resolve_repo_override(Some("ag2trust/quorum")).unwrap(),
+            "ag2trust/quorum"
+        );
+    }
+
+    #[test]
+    fn resolve_repo_override_rejects_malformed() {
+        for bad in &["noslash", "too/many/slashes", "/leading", "trailing/", ""] {
+            assert!(
+                resolve_repo_override(Some(bad)).is_err(),
+                "should reject {bad:?}"
+            );
+        }
     }
 }
