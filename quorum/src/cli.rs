@@ -538,6 +538,30 @@ pub enum Command {
         #[arg(long)]
         no_bare_agent: bool,
     },
+    /// Interpret PR review comments: fetch both comment endpoints, run a cheap
+    /// Haiku pass to extract structured findings (blocking, suggestion, rebuttal),
+    /// and store them in review_findings. One-shot per PR.
+    #[command(name = "review-interpret")]
+    ReviewInterpret {
+        /// PR number to interpret.
+        #[arg(long)]
+        pr: i64,
+        /// GitHub repo slug (owner/name). Uses `gh` default if omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Task ID to associate findings with.
+        #[arg(long)]
+        task_id: Option<i64>,
+        /// Override the agent binary (default: "claude").
+        #[arg(long)]
+        agent_bin: Option<String>,
+        /// Disable --bare for the agent (subscription-auth machines).
+        #[arg(long)]
+        no_bare_agent: bool,
+        /// Emit JSON output instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// Hard-terminate a daemon-managed agent. Writes a kill request to the
     /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,
     /// releases the slot, and runs the post-mortem ladder on any held task.

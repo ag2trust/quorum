@@ -63,6 +63,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Perf { .. } => "perf",
         cli::Command::Classify { .. } => "classify",
         cli::Command::Kill { .. } => "kill",
+        cli::Command::ReviewInterpret { .. } => "review-interpret",
         cli::Command::Help => "help",
     }
 }
@@ -1321,6 +1322,160 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 "classified": total_stored,
                 "total_tasks": tasks.len(),
             }));
+            Ok(0)
+        }
+        cli::Command::ReviewInterpret {
+            pr,
+            repo,
+            task_id,
+            agent_bin,
+            no_bare_agent,
+            json,
+        } => {
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+
+            // Fetch both comment endpoints via `gh api`.
+            let repo_flag: Vec<String> = repo
+                .as_deref()
+                .map(|r| vec!["-R".into(), r.into()])
+                .unwrap_or_default();
+
+            let fetch_comments = |endpoint: &str| -> Result<String> {
+                let mut cmd = std::process::Command::new("gh");
+                cmd.arg("api").args(&repo_flag);
+                cmd.arg(format!("repos/{{owner}}/{{repo}}/{endpoint}/{pr}/comments"));
+                let out = cmd
+                    .output()
+                    .map_err(|e| QuorumError::Io(format!("gh api: {e}")))?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    return Err(QuorumError::Io(format!(
+                        "gh api {endpoint} failed: {stderr}"
+                    )));
+                }
+                String::from_utf8(out.stdout)
+                    .map_err(|e| QuorumError::Io(format!("invalid utf8: {e}")))
+            };
+
+            let pulls_comments = fetch_comments("pulls")?;
+            let issues_comments = fetch_comments("issues")?;
+
+            // Build prompt and send to Haiku via claude CLI.
+            let prompt =
+                quorum_core::review_findings::build_prompt(&pulls_comments, &issues_comments, pr);
+            let turn = serve::agent::user_turn(&prompt);
+
+            let spec = serve::agent::AgentSpec {
+                model: serve::classifier::CLASSIFIER_MODEL.to_string(),
+                effort: serve::classifier::CLASSIFIER_EFFORT.to_string(),
+                session_id: serve::agent::new_session_id(),
+                worktree: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                bare: !no_bare_agent,
+                allowed_tools: String::new(),
+                env_vars: vec![],
+            };
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;
+
+            let findings = rt.block_on(async {
+                let mut proc = serve::agent::AgentProc::spawn(&spec, agent_bin.as_deref())
+                    .map_err(|e| QuorumError::Io(format!("spawn interpreter: {e}")))?;
+
+                proc.feed_turn(&turn)
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
+
+                let mut response_text = String::new();
+                let timeout_dur = std::time::Duration::from_secs(120);
+                let deadline = tokio::time::Instant::now() + timeout_dur;
+
+                loop {
+                    let remaining = deadline - tokio::time::Instant::now();
+                    match tokio::time::timeout(remaining, proc.next_event()).await {
+                        Ok(Some(serve::stream::Event::Result {
+                            result, is_error, ..
+                        })) => {
+                            if is_error.unwrap_or(false) {
+                                return Err(QuorumError::Io(
+                                    "interpreter agent returned an error".into(),
+                                ));
+                            }
+                            let text = result
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| result.to_string());
+                            if !text.is_empty() {
+                                response_text = text;
+                            }
+                            break;
+                        }
+                        Ok(Some(serve::stream::Event::Assistant { message })) => {
+                            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+                                response_text.push_str(content);
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            return Err(QuorumError::Io(format!(
+                                "interpreter timeout for PR #{pr}"
+                            )));
+                        }
+                    }
+                }
+
+                proc.kill_and_reap().await;
+
+                if response_text.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                quorum_core::review_findings::parse_response(&response_text, pr, task_id)
+                    .ok_or_else(|| {
+                        QuorumError::Io(format!(
+                            "failed to parse interpreter response for PR #{pr}"
+                        ))
+                    })
+            })?;
+
+            quorum_core::review_findings::replace_for_pr(&mut conn, pr, &findings)?;
+
+            if json {
+                output::emit(&serde_json::json!({
+                    "pr": pr,
+                    "findings_count": findings.len(),
+                    "findings": findings,
+                }));
+            } else {
+                eprintln!(
+                    "PR #{}: {} findings stored in review_findings",
+                    pr,
+                    findings.len()
+                );
+                for f in &findings {
+                    let pushback = if f.author_pushback {
+                        let accepted = match f.pushback_accepted {
+                            Some(true) => " (accepted)",
+                            Some(false) => " (overridden)",
+                            None => "",
+                        };
+                        format!(" [pushback{accepted}]")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "  [{}/{}] {}{} (from {})",
+                        f.kind,
+                        f.severity.as_deref().unwrap_or("?"),
+                        f.text,
+                        pushback,
+                        f.source_endpoint,
+                    );
+                }
+            }
+
             Ok(0)
         }
         cli::Command::Help => {
