@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 20). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 22). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -288,3 +288,23 @@ CREATE TABLE IF NOT EXISTS activity_events (
 );
 CREATE INDEX IF NOT EXISTS activity_events_agent_ts ON activity_events(agent_name, ts DESC);
 CREATE INDEX IF NOT EXISTS activity_events_expires  ON activity_events(expires_at);
+
+-- Review-comment interpreter output (#93): structured findings parsed from PR
+-- comment threads by a cheap Haiku pass. Captures blocking findings, non-blocking
+-- suggestions, and author rebuttals that would otherwise be lost as free text.
+-- Not TTL'd — durable historical data for review quality analysis.
+CREATE TABLE IF NOT EXISTS review_findings (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_number           INTEGER NOT NULL,
+    task_id             INTEGER,
+    reviewer            TEXT NOT NULL,
+    kind                TEXT NOT NULL CHECK(kind IN ('blocking', 'suggestion')),
+    author_pushback     INTEGER NOT NULL DEFAULT 0,
+    pushback_accepted   INTEGER,
+    severity            TEXT,
+    text                TEXT NOT NULL,
+    source_endpoint     TEXT NOT NULL CHECK(source_endpoint IN ('pulls', 'issues')),
+    created_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS review_findings_pr ON review_findings(pr_number);
+CREATE INDEX IF NOT EXISTS review_findings_task ON review_findings(task_id);
