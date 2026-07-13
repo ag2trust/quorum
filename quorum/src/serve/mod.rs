@@ -818,6 +818,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 slot.proc.kill_and_reap().await;
             }
+            for a in auditors.drain(..) {
+                R2_META.lock().unwrap().remove(&a.agent_name);
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, a, "shutdown").await;
+            }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -829,7 +833,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
 
         // Second signal (or first signal with no in-flight agents): immediate teardown.
-        if sig >= 2 || (sig >= 1 && workers.is_empty() && reviewers.is_empty()) {
+        if sig >= 2
+            || (sig >= 1 && workers.is_empty() && reviewers.is_empty() && auditors.is_empty())
+        {
             if sig >= 2 {
                 log("force shutdown (second signal)");
             } else {
@@ -837,6 +843,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             }
             if let Some(slot) = classifier_slot.take() {
                 slot.proc.kill_and_reap().await;
+            }
+            for a in auditors.drain(..) {
+                R2_META.lock().unwrap().remove(&a.agent_name);
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, a, "shutdown").await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -860,6 +870,11 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
                     slot.proc.kill_and_reap().await;
+                }
+                for a in auditors.drain(..) {
+                    R2_META.lock().unwrap().remove(&a.agent_name);
+                    a.proc.kill_and_reap().await;
+                    name_pool.release(&a.agent_name);
                 }
                 for r in reviewers.drain(..) {
                     r.proc.kill_and_reap().await;
@@ -932,6 +947,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     slot.proc.kill_and_reap().await;
                 }
                 for a in auditors.drain(..) {
+                    R2_META.lock().unwrap().remove(&a.agent_name);
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, a, "drain").await;
                 }
                 for r in reviewers.drain(..) {
@@ -2569,6 +2585,7 @@ async fn tick(
         }
         for &i in idle_auditors.iter().rev() {
             let dead = auditors.remove(i);
+            R2_META.lock().unwrap().remove(&dead.agent_name);
             teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
         }
     }
@@ -2767,6 +2784,7 @@ async fn tick(
         for &i in drain_auditors.iter().rev() {
             let a = auditors.remove(i);
             log(&format!("DRAIN: tearing down R2 auditor {}", a.agent_name));
+            R2_META.lock().unwrap().remove(&a.agent_name);
             teardown_reviewer(config, wt_mgr, name_pool, a, "drain").await;
         }
     }
@@ -2886,6 +2904,7 @@ async fn tick(
     }
     for &i in dead_auditors.iter().rev() {
         let dead = auditors.remove(i);
+        R2_META.lock().unwrap().remove(&dead.agent_name);
         teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
     }
 
