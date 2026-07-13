@@ -125,6 +125,8 @@ pub struct TaskCompact {
     pub branch_exists: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 impl From<&Task> for TaskCompact {
@@ -140,6 +142,7 @@ impl From<&Task> for TaskCompact {
             suggested_worktree: None,
             branch_exists: None,
             effects: Vec::new(),
+            repo: None,
         }
     }
 }
