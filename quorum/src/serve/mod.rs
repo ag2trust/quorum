@@ -3647,16 +3647,31 @@ async fn drain_events(
                 return Ok(breach);
             }
             stream::Event::Assistant { message } => {
-                if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                    let preview = if content.len() > 80 {
-                        let end = content
-                            .char_indices()
-                            .nth(80)
-                            .map_or(content.len(), |(i, _)| i);
-                        format!("{}…", &content[..end])
-                    } else {
-                        content.to_string()
-                    };
+                let content = message.get("content");
+                if let Some(blocks) = content.and_then(|c| c.as_array()) {
+                    for block in blocks {
+                        match block.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let preview = truncate_preview(text);
+                                    log(&format!("{role} {}: {preview}", slot.agent_name));
+                                }
+                            }
+                            Some("tool_use") => {
+                                if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                    let input = block
+                                        .get("input")
+                                        .cloned()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    slot.live_stats.tool_count += 1;
+                                    slot.live_stats.now_label = now_label(name, &input);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Some(text) = content.and_then(|c| c.as_str()) {
+                    let preview = truncate_preview(text);
                     log(&format!("{role} {}: {preview}", slot.agent_name));
                 }
                 if let Some(usage) = message.get("usage") {
@@ -3705,6 +3720,15 @@ fn write_live_sidecar(slot: &SlotState) {
         if let Ok(json) = serde_json::to_string(&stats) {
             let _ = std::fs::write(&path, json);
         }
+    }
+}
+
+fn truncate_preview(text: &str) -> String {
+    if text.len() > 80 {
+        let end = text.char_indices().nth(80).map_or(text.len(), |(i, _)| i);
+        format!("{}…", &text[..end])
+    } else {
+        text.to_string()
     }
 }
 
@@ -5385,6 +5409,35 @@ mod tests {
     fn now_label_unknown_tool() {
         let input = serde_json::json!({});
         assert_eq!(now_label("UnknownTool", &input), "UnknownTool");
+    }
+
+    #[test]
+    fn assistant_content_array_extracts_tool_use() {
+        let message = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Let me check that."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/foo/bar.rs"}}
+            ]
+        });
+        let mut tool_count: u32 = 0;
+        let mut last_now = String::new();
+        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                        let input = block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        tool_count += 1;
+                        last_now = now_label(name, &input);
+                    }
+                }
+            }
+        }
+        assert_eq!(tool_count, 2);
+        assert_eq!(last_now, "Read: bar.rs");
     }
 
     #[test]

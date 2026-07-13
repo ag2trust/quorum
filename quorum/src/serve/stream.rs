@@ -85,6 +85,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_assistant_with_content_array() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let event = parse_line(line).unwrap();
+        match event {
+            Event::Assistant { message } => {
+                let blocks = message.get("content").unwrap().as_array().unwrap();
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[1].get("name").unwrap().as_str().unwrap(), "Bash");
+            }
+            _ => panic!("expected Assistant event"),
+        }
+    }
+
+    #[test]
     fn parse_unknown_type_returns_other() {
         let line = r#"{"type":"system","message":"init"}"#;
         let event = parse_line(line).unwrap();
