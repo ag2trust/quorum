@@ -572,7 +572,7 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quorum"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "quorum-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "proptest",
  "rusqlite",
