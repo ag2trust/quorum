@@ -526,6 +526,22 @@ pub enum Command {
         #[arg(long)]
         no_bare_agent: bool,
     },
+    /// Hard-terminate a daemon-managed agent. Writes a kill request to the
+    /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,
+    /// releases the slot, and runs the post-mortem ladder on any held task.
+    /// Exit 0 = kill delivered to mailbox. The daemon acts on it at next tick.
+    Kill {
+        /// Target agent name to kill.
+        #[arg(long)]
+        agent: String,
+        /// Who is requesting the kill.
+        #[arg(long)]
+        by: String,
+        #[arg(long = "reason-stdin")]
+        reason_stdin: bool,
+        #[arg(long = "reason-file")]
+        reason_file: Option<PathBuf>,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]

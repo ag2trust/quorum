@@ -14,6 +14,7 @@ pub enum MailboxKind {
     Done,
     Message,
     TaskUpdate,
+    Kill,
 }
 
 impl MailboxKind {
@@ -22,6 +23,7 @@ impl MailboxKind {
             Self::Done => "done",
             Self::Message => "message",
             Self::TaskUpdate => "task_update",
+            Self::Kill => "kill",
         }
     }
 
@@ -30,6 +32,7 @@ impl MailboxKind {
             "done" => Some(Self::Done),
             "message" => Some(Self::Message),
             "task_update" => Some(Self::TaskUpdate),
+            "kill" => Some(Self::Kill),
             _ => None,
         }
     }
@@ -258,6 +261,31 @@ mod tests {
             unconsumed[0].1.payload.as_deref(),
             Some("hello from sender")
         );
+    }
+
+    #[test]
+    fn kill_kind_round_trips() {
+        let (mut conn, _dir) = test_conn();
+        let row = MailboxRow {
+            agent: "Admin".into(),
+            kind: MailboxKind::Kill,
+            task_id: None,
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: Some("zombie worker".into()),
+            to_agent: Some("Zombie".into()),
+            payload: None,
+        };
+        let id = append(&mut conn, &row).unwrap();
+
+        let unconsumed = poll_unconsumed(&conn).unwrap();
+        assert_eq!(unconsumed.len(), 1);
+        assert_eq!(unconsumed[0].0, id);
+        assert_eq!(unconsumed[0].1.kind, MailboxKind::Kill);
+        assert_eq!(unconsumed[0].1.agent, "Admin");
+        assert_eq!(unconsumed[0].1.to_agent.as_deref(), Some("Zombie"));
+        assert_eq!(unconsumed[0].1.note.as_deref(), Some("zombie worker"));
     }
 
     #[test]

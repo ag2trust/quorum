@@ -1069,6 +1069,68 @@ async fn tick(
             continue;
         }
 
+        // Kill rows — hard-terminate the targeted agent immediately.
+        if row.kind == mailbox::MailboxKind::Kill {
+            if let Some(target) = &row.to_agent {
+                let reason = row.note.as_deref().unwrap_or("no reason given");
+                let by = &row.agent;
+
+                // Check workers first, then reviewers.
+                if let Some(wi) = workers.iter().position(|w| w.agent_name == *target) {
+                    log(&format!(
+                        "kill: terminating worker {} (task #{}) by {by}: {reason}",
+                        workers[wi].agent_name, workers[wi].task_id,
+                    ));
+                    let w = workers.remove(wi);
+                    let task_id = w.task_id;
+                    fire_event(
+                        &db_path,
+                        &w.agent_name,
+                        task_id,
+                        &Event::AgentFailed {
+                            reason: format!("killed by {by}: {reason}"),
+                        },
+                    )
+                    .await;
+                    // Emit agent_killed event for the log.
+                    emit_kill_event(&db_path, target, by, reason).await;
+                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                } else if let Some(ri) = reviewers.iter().position(|r| r.agent_name == *target) {
+                    log(&format!(
+                        "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
+                        reviewers[ri].agent_name, reviewers[ri].task_id,
+                    ));
+                    let r = reviewers.remove(ri);
+                    let task_id = r.task_id;
+                    fire_event(
+                        &db_path,
+                        &r.agent_name,
+                        task_id,
+                        &Event::AgentFailed {
+                            reason: format!("killed by {by}: {reason}"),
+                        },
+                    )
+                    .await;
+                    emit_kill_event(&db_path, target, by, reason).await;
+                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                } else if lifetime_roster.owns(target) {
+                    log(&format!(
+                        "kill: agent {target} not active (already dead/finished)"
+                    ));
+                } else {
+                    log(&format!(
+                        "kill: agent {target} not in this instance's roster"
+                    ));
+                    // Leave unconsumed for another daemon instance.
+                    continue;
+                }
+            }
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+            continue;
+        }
+
         // M5: message rows — collect for delivery at idle (Phase 4c).
         if row.kind == mailbox::MailboxKind::Message {
             pending_messages.push((*id, row));
@@ -4257,6 +4319,22 @@ async fn fire_event(
             None
         }
     }
+}
+
+async fn emit_kill_event(db_path: &std::path::Path, target: &str, by: &str, reason: &str) {
+    let p = db_path.to_path_buf();
+    let subj = format!("agent:{target}");
+    let body = format!("killed by {by}: {reason}");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        quorum_core::events::emit(&tx, "agent_killed", &subj, &body, now)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .ok();
 }
 
 async fn set_task_body(db_path: &std::path::Path, task_id: i64, body: &str) {
