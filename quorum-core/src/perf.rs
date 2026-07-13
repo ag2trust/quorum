@@ -112,7 +112,7 @@ fn load_reviewer_durations(conn: &Connection) -> Result<HashMap<i64, Vec<i64>>> 
     let mut stmt = conn.prepare(
         "SELECT task_id, ended_at - spawned_at \
          FROM agent_runs \
-         WHERE role = 'reviewer' AND ended_at IS NOT NULL",
+         WHERE role = 'reviewer' AND ended_at IS NOT NULL AND sub_role IS NULL",
     )?;
     let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;

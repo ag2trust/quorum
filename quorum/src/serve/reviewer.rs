@@ -81,6 +81,39 @@ pub async fn spawn_reviewer(
     AgentProc::spawn(&agent_spec, agent_bin)
 }
 
+pub struct R2AuditSpec {
+    pub pr: i64,
+    pub r1_reviewer: String,
+    pub r2_name: String,
+}
+
+pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
+    format!(
+        "You are R2 auditor {name}. Adversarially audit the review by R1 reviewer \
+         {r1} on PR #{pr}.\n\n\
+         Read the full PR diff AND all review comments from {r1}. Your job is two-sided:\n\
+         1. `missed` — real problems R1 failed to flag (false negatives). Each with severity \
+         (critical/major/minor) and confidence (0-100).\n\
+         2. `overcaught` — fixes R1 demanded that were not actually needed (false positives).\n\n\
+         Output your findings as a JSON object on stdout (no markdown fences):\n\
+         ```\n\
+         {{\n\
+           \"missed\": [{{\"description\": \"...\", \"severity\": \"major\", \"confidence\": 80}}],\n\
+           \"overcaught\": [{{\"description\": \"...\"}}],\n\
+           \"verdict\": \"approved\" | \"changes\"\n\
+         }}\n\
+         ```\n\n\
+         Then signal completion:\n\
+         quorum done --agent {name} --pr {pr} --verdict <your_verdict> \
+         --blocking <count_of_missed_with_confidence_ge_70>\n\n\
+         Do NOT merge the PR. Do NOT mark the task done. Shadow mode — your verdict \
+         is recorded but does not affect the merge outcome.",
+        name = spec.r2_name,
+        r1 = spec.r1_reviewer,
+        pr = spec.pr,
+    )
+}
+
 /// Budget status line for worker turns. Workers self-regulate against the task
 /// ceiling instead of discovering it by being killed mid-task (task burned $8
 /// on a 32-subagent fan-out without ever knowing a ceiling existed). Empty when
