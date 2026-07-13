@@ -8,7 +8,7 @@
 use crate::error::Result;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerfCut {
@@ -35,6 +35,11 @@ pub struct PerfRow {
     pub avg_rework: f64,
     pub fail_pct: f64,
     pub median_wall_mins: f64,
+    pub avg_reviewer_secs: f64,
+    pub rubber_stamp_count: i64,
+    pub approve_rate_pct: f64,
+    pub avg_blocking: f64,
+    pub total_cost_usd: f64,
 }
 
 fn extract_label_value(labels_json: Option<&str>, prefix: &str) -> Option<String> {
@@ -58,6 +63,7 @@ fn extract_complexity(labels_json: Option<&str>) -> String {
 }
 
 struct TaskRow {
+    id: i64,
     status: String,
     labels: Option<String>,
     model: String,
@@ -74,7 +80,7 @@ fn load_terminal_tasks(
     default_effort: &str,
 ) -> Result<Vec<TaskRow>> {
     let mut stmt = conn.prepare(
-        "SELECT t.status, t.labels, t.rework_round, t.created_at, t.updated_at, t.reviewer, \
+        "SELECT t.id, t.status, t.labels, t.rework_round, t.created_at, t.updated_at, t.reviewer, \
                 COALESCE(ar.model, ?1), COALESCE(ar.effort, ?2) \
          FROM tasks t \
          LEFT JOIN ( \
@@ -87,18 +93,78 @@ fn load_terminal_tasks(
     let rows = stmt
         .query_map(rusqlite::params![default_model, default_effort], |r| {
             Ok(TaskRow {
-                status: r.get(0)?,
-                labels: r.get(1)?,
-                rework_round: r.get(2)?,
-                created_at: r.get(3)?,
-                updated_at: r.get(4)?,
-                reviewer: r.get(5)?,
-                model: r.get(6)?,
-                effort: r.get(7)?,
+                id: r.get(0)?,
+                status: r.get(1)?,
+                labels: r.get(2)?,
+                rework_round: r.get(3)?,
+                created_at: r.get(4)?,
+                updated_at: r.get(5)?,
+                reviewer: r.get(6)?,
+                model: r.get(7)?,
+                effort: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+fn load_reviewer_durations(conn: &Connection) -> Result<HashMap<i64, Vec<i64>>> {
+    let mut stmt = conn.prepare(
+        "SELECT task_id, ended_at - spawned_at \
+         FROM agent_runs \
+         WHERE role = 'reviewer' AND ended_at IS NOT NULL",
+    )?;
+    let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (task_id, duration) = row?;
+        map.entry(task_id).or_default().push(duration);
+    }
+    Ok(map)
+}
+
+fn load_approval_stats(conn: &Connection) -> Result<HashMap<i64, (String, i64)>> {
+    let mut stmt = conn.prepare("SELECT task_id, verdict, blocking_count FROM approvals")?;
+    let mut map = HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (task_id, verdict, blocking) = row?;
+        map.insert(task_id, (verdict, blocking));
+    }
+    Ok(map)
+}
+
+fn load_cost_by_task(conn: &Connection) -> Result<HashMap<i64, f64>> {
+    let mut stmt = conn.prepare(
+        "SELECT task_id, SUM(cost_usd) FROM journal WHERE task_id IS NOT NULL GROUP BY task_id",
+    )?;
+    let mut map = HashMap::new();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
+    for row in rows {
+        let (task_id, cost) = row?;
+        map.insert(task_id, cost);
+    }
+    Ok(map)
+}
+
+struct AuxData {
+    reviewer_durations: HashMap<i64, Vec<i64>>,
+    approvals: HashMap<i64, (String, i64)>,
+    costs: HashMap<i64, f64>,
+}
+
+fn load_aux_data(conn: &Connection) -> Result<AuxData> {
+    Ok(AuxData {
+        reviewer_durations: load_reviewer_durations(conn)?,
+        approvals: load_approval_stats(conn)?,
+        costs: load_cost_by_task(conn)?,
+    })
 }
 
 fn median(sorted: &[f64]) -> f64 {
@@ -121,6 +187,11 @@ struct GroupAccum {
     rework_sum: i64,
     failed: i64,
     wall_mins: Vec<f64>,
+    reviewer_durations: Vec<i64>,
+    n_approved: i64,
+    n_with_approval: i64,
+    blocking_sum: i64,
+    cost_usd_sum: f64,
 }
 
 impl GroupAccum {
@@ -131,10 +202,15 @@ impl GroupAccum {
             rework_sum: 0,
             failed: 0,
             wall_mins: Vec::new(),
+            reviewer_durations: Vec::new(),
+            n_approved: 0,
+            n_with_approval: 0,
+            blocking_sum: 0,
+            cost_usd_sum: 0.0,
         }
     }
 
-    fn add(&mut self, task: &TaskRow) {
+    fn add(&mut self, task: &TaskRow, aux: &AuxData) {
         self.total += 1;
         if task.status == "done" && task.rework_round == 0 {
             self.first_pass += 1;
@@ -145,6 +221,20 @@ impl GroupAccum {
         }
         let wall_secs = (task.updated_at - task.created_at).max(0) as f64;
         self.wall_mins.push(wall_secs / 60.0);
+
+        if let Some(durs) = aux.reviewer_durations.get(&task.id) {
+            self.reviewer_durations.extend(durs);
+        }
+        if let Some((verdict, blocking)) = aux.approvals.get(&task.id) {
+            self.n_with_approval += 1;
+            if verdict == "approved" {
+                self.n_approved += 1;
+            }
+            self.blocking_sum += blocking;
+        }
+        if let Some(&cost) = aux.costs.get(&task.id) {
+            self.cost_usd_sum += cost;
+        }
     }
 
     fn into_row(
@@ -157,6 +247,8 @@ impl GroupAccum {
         self.wall_mins
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = self.total as f64;
+        let n_reviews = self.reviewer_durations.len() as f64;
+        let n_appr = self.n_with_approval as f64;
         PerfRow {
             model,
             effort,
@@ -179,6 +271,23 @@ impl GroupAccum {
                 0.0
             },
             median_wall_mins: median(&self.wall_mins),
+            avg_reviewer_secs: if n_reviews > 0.0 {
+                self.reviewer_durations.iter().sum::<i64>() as f64 / n_reviews
+            } else {
+                0.0
+            },
+            rubber_stamp_count: self.reviewer_durations.iter().filter(|&&d| d < 120).count() as i64,
+            approve_rate_pct: if n_appr > 0.0 {
+                (self.n_approved as f64 / n_appr) * 100.0
+            } else {
+                0.0
+            },
+            avg_blocking: if n_appr > 0.0 {
+                self.blocking_sum as f64 / n_appr
+            } else {
+                0.0
+            },
+            total_cost_usd: self.cost_usd_sum,
         }
     }
 }
@@ -194,6 +303,7 @@ pub fn perf(
         return Ok(PerfReport { rows: vec![] });
     }
 
+    let aux = load_aux_data(conn)?;
     let mut groups: BTreeMap<GroupKey, GroupAccum> = BTreeMap::new();
 
     for task in &tasks {
@@ -210,7 +320,10 @@ pub fn perf(
         };
 
         let key = (model, effort, complexity, reviewer_col);
-        groups.entry(key).or_insert_with(GroupAccum::new).add(task);
+        groups
+            .entry(key)
+            .or_insert_with(GroupAccum::new)
+            .add(task, &aux);
     }
 
     let rows = groups
@@ -238,8 +351,17 @@ pub fn render_table(report: &PerfReport) {
         header.push_str(&format!(" {:<18}", "REVIEWER"));
     }
     header.push_str(&format!(
-        " {:>7} {:>10} {:>9} {:>7} {:>11}",
-        "N", "1st_PASS", "AVG_RWK", "FAIL", "MED_MINS"
+        " {:>7} {:>10} {:>9} {:>7} {:>11} {:>10} {:>7} {:>8} {:>9} {:>10}",
+        "N",
+        "1st_PASS",
+        "AVG_RWK",
+        "FAIL",
+        "MED_MINS",
+        "AVG_REV_S",
+        "RUBBER",
+        "APR_RT",
+        "AVG_BLK",
+        "COST_USD"
     ));
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
@@ -253,8 +375,17 @@ pub fn render_table(report: &PerfReport) {
             line.push_str(&format!(" {:<18}", r.reviewer.as_deref().unwrap_or("")));
         }
         line.push_str(&format!(
-            " {:>7} {:>9.1}% {:>9.2} {:>6.1}% {:>11.1}",
-            r.n_tasks, r.first_pass_pct, r.avg_rework, r.fail_pct, r.median_wall_mins
+            " {:>7} {:>9.1}% {:>9.2} {:>6.1}% {:>11.1} {:>10.0} {:>7} {:>7.1}% {:>9.2} {:>10.2}",
+            r.n_tasks,
+            r.first_pass_pct,
+            r.avg_rework,
+            r.fail_pct,
+            r.median_wall_mins,
+            r.avg_reviewer_secs,
+            r.rubber_stamp_count,
+            r.approve_rate_pct,
+            r.avg_blocking,
+            r.total_cost_usd
         ));
         println!("{line}");
     }
@@ -300,6 +431,42 @@ mod tests {
     fn seed_run(conn: &Connection, task_id: i64, model: &str, effort: &str, spawned_at: i64) {
         crate::agent_runs::insert(conn, task_id, "agent", "worker", model, effort, spawned_at)
             .unwrap();
+    }
+
+    fn seed_reviewer_run(
+        conn: &Connection,
+        task_id: i64,
+        agent: &str,
+        spawned_at: i64,
+        ended_at: i64,
+    ) {
+        let run_id = crate::agent_runs::insert(
+            conn, task_id, agent, "reviewer", "opus-46", "high", spawned_at,
+        )
+        .unwrap();
+        crate::agent_runs::close(conn, run_id, ended_at, "done").unwrap();
+    }
+
+    fn seed_approval(conn: &Connection, task_id: i64, verdict: &str, blocking_count: i64) {
+        conn.execute(
+            "INSERT OR REPLACE INTO approvals \
+             (pr_number, task_id, author, reviewer, verdict, blocking_count, approved_head_sha, created_at) \
+             VALUES (?1, ?2, 'worker', 'reviewer', ?3, ?4, 'abc123', 1000)",
+            rusqlite::params![task_id * 100, task_id, verdict, blocking_count],
+        )
+        .unwrap();
+    }
+
+    fn seed_journal_cost(conn: &mut Connection, task_id: i64, agent: &str, cost_usd: f64) {
+        let tx = crate::db::begin_immediate(conn).unwrap();
+        tx.execute(
+            "INSERT INTO journal \
+             (agent, role, task_id, session_id, phase, cost_tokens, cost_usd, updated_at) \
+             VALUES (?1, 'worker', ?2, 'sess-1', 'working', 0, ?3, 1000)",
+            rusqlite::params![agent, task_id, cost_usd],
+        )
+        .unwrap();
+        tx.commit().unwrap();
     }
 
     #[test]
@@ -563,5 +730,118 @@ mod tests {
     #[test]
     fn median_empty() {
         assert!((median(&[]) - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn reviewer_duration_and_rubber_stamp() {
+        let (_d, mut c) = open_tmp();
+        let t1 = seed_task(&mut c, "done", None, 0, Some("rev-a"), 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+        seed_reviewer_run(&c, t1, "rev-a", 1500, 1500 + 300); // 300s
+
+        let t2 = seed_task(&mut c, "done", None, 0, Some("rev-a"), 2000, 2600);
+        seed_run(&c, t2, "opus-46", "high", 2001);
+        seed_reviewer_run(&c, t2, "rev-a", 2500, 2500 + 60); // 60s — rubber stamp
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        let row = &r.rows[0];
+        assert!(
+            (row.avg_reviewer_secs - 180.0).abs() < 0.01,
+            "avg of 300+60 = 180"
+        );
+        assert_eq!(row.rubber_stamp_count, 1, "one review under 120s");
+    }
+
+    #[test]
+    fn no_reviewer_runs_zero_defaults() {
+        let (_d, mut c) = open_tmp();
+        seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert!((r.rows[0].avg_reviewer_secs - 0.0).abs() < 0.01);
+        assert_eq!(r.rows[0].rubber_stamp_count, 0);
+    }
+
+    #[test]
+    fn approval_stats_approve_rate_and_blocking() {
+        let (_d, mut c) = open_tmp();
+        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+        seed_approval(&c, t1, "approved", 0);
+
+        let t2 = seed_task(&mut c, "done", None, 1, None, 2000, 2600);
+        seed_run(&c, t2, "opus-46", "high", 2001);
+        seed_approval(&c, t2, "changes", 3);
+
+        let t3 = seed_task(&mut c, "done", None, 0, None, 3000, 3600);
+        seed_run(&c, t3, "opus-46", "high", 3001);
+        seed_approval(&c, t3, "approved", 0);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        let row = &r.rows[0];
+        // 2 approved out of 3 with approvals
+        assert!((row.approve_rate_pct - 66.666).abs() < 0.01);
+        // avg blocking: (0+3+0)/3 = 1.0
+        assert!((row.avg_blocking - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn no_approvals_zero_defaults() {
+        let (_d, mut c) = open_tmp();
+        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert!((r.rows[0].approve_rate_pct - 0.0).abs() < 0.01);
+        assert!((r.rows[0].avg_blocking - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn cost_aggregates_from_journal() {
+        let (_d, mut c) = open_tmp();
+        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+        seed_journal_cost(&mut c, t1, "w1", 1.50);
+
+        let t2 = seed_task(&mut c, "done", None, 0, None, 2000, 2600);
+        seed_run(&c, t2, "opus-46", "high", 2001);
+        seed_journal_cost(&mut c, t2, "w2", 0.75);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert!((r.rows[0].total_cost_usd - 2.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn reviewer_cut_with_review_metrics() {
+        let (_d, mut c) = open_tmp();
+        let t1 = seed_task(&mut c, "done", None, 0, Some("alice"), 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+        seed_reviewer_run(&c, t1, "alice", 1500, 1500 + 400); // 400s
+        seed_approval(&c, t1, "approved", 0);
+
+        let t2 = seed_task(&mut c, "done", None, 0, Some("bob"), 2000, 2600);
+        seed_run(&c, t2, "opus-46", "high", 2001);
+        seed_reviewer_run(&c, t2, "bob", 2500, 2500 + 31); // 31s rubber stamp
+        seed_approval(&c, t2, "approved", 0);
+
+        let r = perf(&c, PerfCut::Reviewer, DM, DE).unwrap();
+
+        let alice = r
+            .rows
+            .iter()
+            .find(|r| r.reviewer.as_deref() == Some("alice"))
+            .unwrap();
+        assert!((alice.avg_reviewer_secs - 400.0).abs() < 0.01);
+        assert_eq!(alice.rubber_stamp_count, 0);
+        assert!((alice.approve_rate_pct - 100.0).abs() < 0.01);
+
+        let bob = r
+            .rows
+            .iter()
+            .find(|r| r.reviewer.as_deref() == Some("bob"))
+            .unwrap();
+        assert!((bob.avg_reviewer_secs - 31.0).abs() < 0.01);
+        assert_eq!(bob.rubber_stamp_count, 1);
     }
 }
