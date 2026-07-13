@@ -1,6 +1,7 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    BlockedTask, DaemonAgentView, DedupedError, HealthVerdict, PipelineTask, QueueTask, Stats,
+    AlertMessage, BlockedTask, DaemonAgentView, DedupedError, HealthVerdict, PipelineTask,
+    QueueTask, Stats,
 };
 use std::io::Write;
 
@@ -134,6 +135,7 @@ pub fn render_with_style(s: &Stats, sty: &Style, w: &mut dyn Write) {
     render_blocked(&s.blocked, sty, w, width);
     render_pipeline(&s.pipeline, &s.daemon_agents, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
+    render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
 }
 
@@ -497,6 +499,43 @@ fn render_unbacked_prs(
     }
 }
 
+fn render_alerts(alerts: &[AlertMessage], sty: &Style, w: &mut dyn Write, width: usize) {
+    if alerts.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("ALERTS", width));
+    for a in alerts {
+        let age = fmt_age(a.age_secs);
+        let icon = if a.kind == "critical" {
+            if sty.color {
+                sty.red("!!")
+            } else {
+                "!!".to_string()
+            }
+        } else {
+            if sty.color {
+                sty.yellow("!")
+            } else {
+                "!".to_string()
+            }
+        };
+        let refs_str = a
+            .refs
+            .as_deref()
+            .map(|r| format!("  {}", sty.dim(r)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            w,
+            "  {} [{:>4} ago] {}{}",
+            icon,
+            age,
+            truncate(&a.body, 55),
+            refs_str,
+        );
+    }
+}
+
 fn render_errors(
     errors: &[DedupedError],
     older_silenced: i64,
@@ -850,6 +889,67 @@ mod tests {
         assert!(
             !output.contains("UNBACKED"),
             "section should be hidden when no unbacked PRs: {output}"
+        );
+    }
+
+    #[test]
+    fn alerts_section_renders_when_present() {
+        use quorum_core::stats::AlertMessage;
+        let mut s = default_stats();
+        s.alerts.push(AlertMessage {
+            body: "task #42: rework cap exceeded".into(),
+            refs: Some("task:42".into()),
+            age_secs: 120,
+            kind: "alert".into(),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("ALERTS"),
+            "ALERTS section should appear: {output}"
+        );
+        assert!(
+            output.contains("rework cap exceeded"),
+            "alert body should appear: {output}"
+        );
+        assert!(
+            output.contains("task:42"),
+            "alert refs should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn alerts_section_hidden_when_empty() {
+        let s = default_stats();
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("ALERTS"),
+            "ALERTS section should be hidden when no alerts: {output}"
+        );
+    }
+
+    #[test]
+    fn critical_alert_shows_double_bang() {
+        use quorum_core::stats::AlertMessage;
+        let mut s = default_stats();
+        s.alerts.push(AlertMessage {
+            body: "task #99: provision failure".into(),
+            refs: None,
+            age_secs: 30,
+            kind: "critical".into(),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("!!"),
+            "critical alert should show !!: {output}"
         );
     }
 }

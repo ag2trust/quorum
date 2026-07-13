@@ -607,7 +607,7 @@ pub fn apply_event(
                         alert_body,
                         format!("task:{id}"),
                         expires_at,
-                        task.created_by
+                        "owner"
                     ],
                 )?;
             }
@@ -2123,7 +2123,7 @@ mod tests {
         let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
         let alert = msgs
             .iter()
-            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("owner"))
             .expect("alert message to creator missing");
         assert!(
             alert.body.contains("rework cap"),
@@ -2208,7 +2208,7 @@ mod tests {
         let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
         let alert = msgs
             .iter()
-            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("owner"))
             .expect("alert DM to creator missing after merge failure");
         assert!(
             alert.body.contains("conflicts"),
@@ -2242,7 +2242,7 @@ mod tests {
         let msgs = crate::feed::peek(&c, None, None, 10, 1001).unwrap();
         let alert = msgs
             .iter()
-            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("owner"))
             .expect("alert message to creator missing");
         assert!(alert.body.contains("OOM killed"));
     }

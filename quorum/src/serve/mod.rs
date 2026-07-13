@@ -4548,11 +4548,6 @@ async fn notify_provision_failure(
     let pr_label_owned = pr_label.to_string();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
-        let task = tasks::get(&conn, tid)?;
-        let created_by = task.map(|t| t.created_by).unwrap_or_default();
-        if created_by.is_empty() {
-            return Ok(());
-        }
         let now = now_unix();
         let body = format!(
             "task #{tid} parked: {reason_owned} | PR {pr_label_owned} — \
@@ -4565,7 +4560,7 @@ async fn notify_provision_failure(
             None,
             &body,
             None,
-            Some(&created_by),
+            Some("owner"),
             86400,
             now,
         )?;
