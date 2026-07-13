@@ -727,6 +727,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut last_drift_check: Option<std::time::Instant> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
+    let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -960,6 +961,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut lifetime_roster,
             &mut classifier_slot,
             &mut doctor_slot,
+            &mut doctored_tasks,
         )
         .await
         {
@@ -1011,6 +1013,7 @@ async fn tick(
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
+    doctored_tasks: &mut std::collections::HashSet<i64>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -3196,24 +3199,24 @@ async fn tick(
         let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
 
         if let Some(result) = doctor::drain_doctor_events(slot).await {
+            let tid = slot.task_id;
             match result {
                 doctor::DoctorResult::Done(text) => {
                     log(&format!(
-                        "doctor: finished for task #{} ({}b)",
-                        slot.task_id,
+                        "doctor: finished for task #{tid} ({}b)",
                         text.len()
                     ));
                 }
                 doctor::DoctorResult::Error(e) => {
-                    log(&format!("doctor: error on task #{}: {e}", slot.task_id));
+                    log(&format!("doctor: error on task #{tid}: {e}"));
                 }
             }
+            doctored_tasks.insert(tid);
             *doctor_slot = None;
         } else if exited {
-            log(&format!(
-                "doctor: process exited for task #{}",
-                slot.task_id
-            ));
+            let tid = slot.task_id;
+            log(&format!("doctor: process exited for task #{tid}"));
+            doctored_tasks.insert(tid);
             *doctor_slot = None;
         }
     }
@@ -3223,6 +3226,7 @@ async fn tick(
         let p = db_path.clone();
         let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
         let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
+        let already_doctored = doctored_tasks.clone();
 
         let stalled =
             tokio::task::spawn_blocking(move || -> Result<Option<doctor::EvidenceBundle>> {
@@ -3233,6 +3237,7 @@ async fn tick(
                 for task in candidates {
                     if active_worker_task_ids.contains(&task.id)
                         || active_reviewer_task_ids.contains(&task.id)
+                        || already_doctored.contains(&task.id)
                     {
                         continue;
                     }

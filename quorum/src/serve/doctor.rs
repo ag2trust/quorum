@@ -44,7 +44,12 @@ pub fn doctor_turn(evidence: &EvidenceBundle) -> String {
     ));
     prompt.push_str(&format!("Title: {}\n", evidence.task_title));
     if let Some(body) = &evidence.task_body {
-        let truncated = if body.len() > 500 { &body[..500] } else { body };
+        let end = body
+            .char_indices()
+            .map(|(i, _)| i)
+            .nth(500)
+            .unwrap_or(body.len());
+        let truncated = &body[..end];
         prompt.push_str(&format!("Body (truncated): {truncated}\n"));
     }
     if let Some(author) = &evidence.author {
@@ -59,7 +64,10 @@ pub fn doctor_turn(evidence: &EvidenceBundle) -> String {
     prompt.push_str(&format!("Repo: {}\n", evidence.repo));
 
     prompt.push_str("\n## Your job\n\n");
-    prompt.push_str("1. Run `quorum task-get --task-id {} --json` to get current task state.\n");
+    prompt.push_str(&format!(
+        "1. Run `quorum task-get --task-id {} --json` to get current task state.\n",
+        evidence.task_id
+    ));
     prompt.push_str("2. Run `quorum status --json` to see daemon/agent state.\n");
     prompt.push_str("3. Check if there's a worktree or branch still present.\n");
     prompt.push_str("4. Look at recent quorum events for this task.\n");
