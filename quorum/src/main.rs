@@ -862,6 +862,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo,
             base_branch,
             exit_when_gone,
+            doctor_enabled,
         } => {
             use serve_config::*;
 
@@ -966,6 +967,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_required_jobs: Vec<String> = file_cfg.required_jobs.clone().unwrap_or_default();
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
+            let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -992,6 +994,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 required_jobs: &r_required_jobs,
                 master_ci_gate: &r_master_ci_gate,
                 master_ci_timeout_secs: &r_master_ci_timeout,
+                doctor_enabled: &r_doctor_enabled,
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1066,6 +1069,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_gate: r_master_ci_gate.value,
                 master_ci_timeout_secs: r_master_ci_timeout.value,
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
+                doctor_enabled: r_doctor_enabled.value,
             };
             Ok(serve::run_serve(config)?)
         }

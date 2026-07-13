@@ -42,6 +42,7 @@ pub struct ServeFileConfig {
     pub required_jobs: Option<Vec<String>>,
     pub master_ci_gate: Option<bool>,
     pub master_ci_timeout_secs: Option<u64>,
+    pub doctor_enabled: Option<bool>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
@@ -225,6 +226,7 @@ pub struct BannerData<'a> {
     pub required_jobs: &'a [String],
     pub master_ci_gate: &'a Sourced<bool>,
     pub master_ci_timeout_secs: &'a Sourced<u64>,
+    pub doctor_enabled: &'a Sourced<bool>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -328,6 +330,7 @@ pub fn banner(d: &BannerData<'_>) -> String {
         "  master_ci_timeout_secs:    {}",
         d.master_ci_timeout_secs
     ));
+    lines.push(format!("  doctor_enabled:            {}", d.doctor_enabled));
     lines.push("─────────────────────────────".to_string());
     lines.join("\n")
 }
@@ -399,6 +402,20 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         assert_eq!(cfg.cap, Some(8));
         assert_eq!(cfg.model.as_deref(), Some("opus-48"));
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
+        assert!(cfg.doctor_enabled.is_none());
+    }
+
+    #[test]
+    fn load_doctor_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(
+            &path,
+            "repo = \"test/repo\"\nrepo_dir = \"/tmp\"\nworktree_base = \"/tmp/wt\"\ndoctor_enabled = true\n",
+        )
+        .unwrap();
+        let cfg = load(&path, true).unwrap();
+        assert_eq!(cfg.doctor_enabled, Some(true));
     }
 
     #[test]
@@ -509,6 +526,10 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             },
             master_ci_timeout_secs: &Sourced {
                 value: 300,
+                source: Source::Default,
+            },
+            doctor_enabled: &Sourced {
+                value: false,
                 source: Source::Default,
             },
         });
