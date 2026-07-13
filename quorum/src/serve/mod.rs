@@ -4359,7 +4359,7 @@ async fn spawn_worker(
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
 
-    let task = match ready_task {
+    let mut task = match ready_task {
         Some(t) => t,
         None => return Ok(false),
     };
@@ -4429,16 +4429,22 @@ async fn spawn_worker(
             name_pool.release(&agent_name);
             return Ok(false);
         }
-        Ok(Some(_)) => {}
+        Ok(Some(claimed_task)) => {
+            task = claimed_task;
+        }
     }
 
     let worker_repo_dir = &config.repo_dir;
 
+    // Branch keyed to task + original author, not current assignee — a rework
+    // re-claim by a different agent continues the original branch instead of
+    // forking a duplicate PR (#340).
+    let branch_agent = task.author.as_deref().unwrap_or(&agent_name);
     let session_id = agent::new_session_id();
-    let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task.id);
+    let branch = format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id);
     let wt_path = config
         .worktree_base
-        .join(format!("{}-t{}", agent_name, task.id));
+        .join(format!("{}-t{}", branch_agent, task.id));
 
     match wt_mgr
         .provision(
