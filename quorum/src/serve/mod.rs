@@ -19,7 +19,7 @@ use agent::{AgentProc, AgentSpec};
 use names::Pool;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
-use quorum_core::lifecycle::{Effect, Event};
+use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
@@ -2619,6 +2619,59 @@ async fn tick(
         )
         .await;
         teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+    }
+
+    // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────
+    // A creator (or another daemon) may cancel/complete a task while our
+    // worker is still running on it. Poll the DB for current status of all
+    // held tasks; tear down any whose task reached a terminal state.
+    {
+        let held_task_ids: Vec<i64> = workers
+            .iter()
+            .map(|w| w.task_id)
+            .chain(reviewers.iter().map(|r| r.task_id))
+            .collect();
+        if !held_task_ids.is_empty() {
+            let p = db_path.clone();
+            let terminal_tasks: Vec<(i64, String)> = tokio::task::spawn_blocking(move || {
+                let conn = quorum_core::db::open(&p)?;
+                let mut result = Vec::new();
+                for tid in held_task_ids {
+                    if let Some(task) = tasks::get(&conn, tid)? {
+                        if task
+                            .status
+                            .parse::<lifecycle::Status>()
+                            .is_ok_and(|s| s.is_terminal())
+                        {
+                            result.push((tid, task.status));
+                        }
+                    }
+                }
+                Ok::<_, QuorumError>(result)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .unwrap_or_default();
+
+            for (tid, status) in terminal_tasks {
+                if let Some(wi) = workers.iter().position(|w| w.task_id == tid) {
+                    log(&format!(
+                        "task #{tid} externally moved to {status} — tearing down worker {}",
+                        workers[wi].agent_name,
+                    ));
+                    let w = workers.remove(wi);
+                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                }
+                if let Some(ri) = reviewers.iter().position(|r| r.task_id == tid) {
+                    log(&format!(
+                        "task #{tid} externally moved to {status} — tearing down reviewer {}",
+                        reviewers[ri].agent_name,
+                    ));
+                    let r = reviewers.remove(ri);
+                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                }
+            }
+        }
     }
 
     // ── Phase 4c: Deliver queued messages to idle workers (M5) ──────────
