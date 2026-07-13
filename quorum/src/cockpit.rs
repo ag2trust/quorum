@@ -173,11 +173,19 @@ fn render_header(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
     };
     let _ = writeln!(w, " {rule}");
 
-    let working_count = s
+    let worker_task_ids: std::collections::HashSet<i64> = s
         .daemon_agents
         .iter()
         .filter(|d| d.role == "worker")
+        .filter_map(|d| d.task_id)
+        .collect();
+    let orphan_reviewers = s
+        .daemon_agents
+        .iter()
+        .filter(|d| d.role == "reviewer")
+        .filter(|d| d.task_id.is_none_or(|tid| !worker_task_ids.contains(&tid)))
         .count();
+    let working_count = worker_task_ids.len() + orphan_reviewers;
     let queued = s.queue_tasks.len();
     let blocked = s.blocked.len();
     let merged_hr = s.throughput.closed_last_hour;
@@ -204,7 +212,21 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         .filter(|d| d.role == "worker")
         .collect();
 
-    if workers.is_empty() {
+    let reviewers: Vec<&DaemonAgentView> = s
+        .daemon_agents
+        .iter()
+        .filter(|d| d.role == "reviewer")
+        .collect();
+
+    let worker_task_ids: std::collections::HashSet<i64> =
+        workers.iter().filter_map(|d| d.task_id).collect();
+
+    let orphan_reviewers: Vec<&&DaemonAgentView> = reviewers
+        .iter()
+        .filter(|d| d.task_id.is_none_or(|tid| !worker_task_ids.contains(&tid)))
+        .collect();
+
+    if workers.is_empty() && orphan_reviewers.is_empty() {
         let _ = writeln!(w, "  {}", sty.dim("(idle — no agents working)"));
         return;
     }
@@ -215,87 +237,83 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
     );
 
-    let reviewers: Vec<&DaemonAgentView> = s
-        .daemon_agents
-        .iter()
-        .filter(|d| d.role == "reviewer")
-        .collect();
-
     for d in &workers {
-        let dot = sty.freshness_dot(d.last_activity_age_secs);
-        let eff = d.tier_eff.as_deref().unwrap_or("—");
-        let eff_short = eff.rsplit('·').next().unwrap_or(eff);
-        let task_str = d
-            .task_id
-            .map(|id| format!("#{id}"))
-            .unwrap_or_else(|| "—".to_string());
-        let title = d
-            .task_title
-            .as_deref()
-            .map(|t| truncate(t, 18))
-            .unwrap_or_else(|| "—".to_string());
-        let up = d
-            .uptime_secs
-            .map(fmt_age)
-            .unwrap_or_else(|| "—".to_string());
-        let tok = fmt_tokens(d.cost_tokens);
-        let tools = d.tool_count.to_string();
-        let evm = d
-            .events_per_min
-            .map(|v| format!("{:.0}", v))
-            .unwrap_or_else(|| "—".to_string());
-        let now = d.now_label.as_deref().unwrap_or("—");
-        let now_display = truncate(now, 24);
-        let rework_suffix = if d.rework_count > 0 {
-            format!(" ↻{}", d.rework_count)
-        } else {
-            String::new()
-        };
-
-        let _ = writeln!(
-            w,
-            "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
-            dot,
-            d.agent,
-            eff_short,
-            task_str,
-            title,
-            up,
-            tok,
-            tools,
-            evm,
-            now_display,
-            rework_suffix,
-        );
+        render_agent_row(d, sty, w);
 
         if let Some(tid) = d.task_id {
             for rev in &reviewers {
                 if rev.task_id == Some(tid) {
-                    let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
-                        rev.last_activity_age_secs
-                            .map(fmt_age)
-                            .unwrap_or_else(|| "—".to_string())
-                    });
-                    let rev_tok = fmt_tokens(rev.cost_tokens);
-                    let sub = if sty.color {
-                        format!(
-                            "    {} reviewer  {} · {} · {} tok",
-                            sty.dim("└"),
-                            rev.agent,
-                            rev_up,
-                            rev_tok,
-                        )
-                    } else {
-                        format!(
-                            "    +- reviewer  {} · {} · {} tok",
-                            rev.agent, rev_up, rev_tok,
-                        )
-                    };
-                    let _ = writeln!(w, "{sub}");
+                    render_reviewer_subrow(rev, sty, w);
                 }
             }
         }
     }
+
+    for rev in &orphan_reviewers {
+        render_agent_row(rev, sty, w);
+    }
+}
+
+fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
+    let dot = sty.freshness_dot(d.last_activity_age_secs);
+    let eff = d.tier_eff.as_deref().unwrap_or("—");
+    let eff_short = eff.rsplit('·').next().unwrap_or(eff);
+    let task_str = d
+        .task_id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "—".to_string());
+    let title = d
+        .task_title
+        .as_deref()
+        .map(|t| truncate(t, 18))
+        .unwrap_or_else(|| "—".to_string());
+    let up = d
+        .uptime_secs
+        .map(fmt_age)
+        .unwrap_or_else(|| "—".to_string());
+    let tok = fmt_tokens(d.cost_tokens);
+    let tools = d.tool_count.to_string();
+    let evm = d
+        .events_per_min
+        .map(|v| format!("{:.0}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let now = d.now_label.as_deref().unwrap_or("—");
+    let now_display = truncate(now, 24);
+    let rework_suffix = if d.rework_count > 0 {
+        format!(" ↻{}", d.rework_count)
+    } else {
+        String::new()
+    };
+
+    let _ = writeln!(
+        w,
+        "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
+        dot, d.agent, eff_short, task_str, title, up, tok, tools, evm, now_display, rework_suffix,
+    );
+}
+
+fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
+    let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
+        rev.last_activity_age_secs
+            .map(fmt_age)
+            .unwrap_or_else(|| "—".to_string())
+    });
+    let rev_tok = fmt_tokens(rev.cost_tokens);
+    let sub = if sty.color {
+        format!(
+            "    {} reviewer  {} · {} · {} tok",
+            sty.dim("└"),
+            rev.agent,
+            rev_up,
+            rev_tok,
+        )
+    } else {
+        format!(
+            "    +- reviewer  {} · {} · {} tok",
+            rev.agent, rev_up, rev_tok,
+        )
+    };
+    let _ = writeln!(w, "{sub}");
 }
 
 fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usize) {
@@ -762,6 +780,50 @@ mod tests {
         assert!(
             output.contains("#259, #269"),
             "twin PR numbers should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn orphan_reviewer_renders_as_working() {
+        let mut s = default_stats();
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "R-solo".into(),
+            role: "reviewer".into(),
+            task_id: Some(50),
+            phase: "reviewing".into(),
+            cost_tokens: 8000,
+            agent_state: None,
+            cost_usd: 0.10,
+            log_dir: None,
+            last_activity_age_secs: Some(5),
+            task_title: Some("review PR #3610".into()),
+            tier_eff: Some("opus46·hi".into()),
+            pr: None,
+            rework_count: 0,
+            tool_count: 12,
+            now_label: Some("Read: src/main.rs".into()),
+            events_per_min: Some(6.0),
+            uptime_secs: Some(180),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("no agents working"),
+            "orphan reviewer must not show idle: {output}"
+        );
+        assert!(
+            output.contains("R-solo"),
+            "orphan reviewer agent name must appear: {output}"
+        );
+        assert!(
+            output.contains("#50"),
+            "orphan reviewer task id must appear: {output}"
+        );
+        assert!(
+            output.contains("1 working"),
+            "header must count orphan reviewer: {output}"
         );
     }
 
