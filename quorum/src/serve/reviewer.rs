@@ -156,6 +156,40 @@ pub fn build_rereview_turn(reviewer_name: &str, pr: i64, worker_agent: &str) -> 
     ))
 }
 
+pub struct R2AuditSpec {
+    pub pr: i64,
+    pub r1_agent_name: String,
+    pub r2_name: String,
+    pub worker_agent: String,
+}
+
+pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
+    format!(
+        "You are R2 auditor agent {r2}. Adversarially audit the R1 review by {r1} of PR #{pr} \
+         (authored by {worker}).\n\n\
+         Your job is NOT to re-review the PR from scratch. Instead:\n\
+         1. Read the full PR diff and surrounding code.\n\
+         2. Read R1's review comments/verdict on the PR.\n\
+         3. Identify:\n\
+            - `missed[]`: real problems R1 failed to flag (false negatives). Each with \
+              severity (critical/major/minor) and confidence (0-100).\n\
+            - `overcaught[]`: fixes R1 demanded that were not actually needed (false \
+              positives). Each with explanation.\n\
+         4. Form your own verdict: would you have approved or requested changes?\n\n\
+         Signal completion with:\n\
+         quorum done --agent {r2} --pr {pr} --verdict <approved|changes> \
+         --feedback \"missed:<count> overcaught:<count> | <summary>\"\n\n\
+         IMPORTANT: You are a SHADOW reviewer. Your verdict does NOT affect the merge. \
+         Record your findings honestly — this data calibrates review quality.\n\n\
+         Do NOT merge the PR yourself — the daemon handles merging.\n\
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+        r2 = spec.r2_name,
+        r1 = spec.r1_agent_name,
+        pr = spec.pr,
+        worker = spec.worker_agent,
+    )
+}
+
 pub fn build_rework_turn(
     agent_name: &str,
     task_id: i64,
@@ -406,6 +440,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn r2_audit_prompt_contains_agents_and_pr() {
+        let spec = R2AuditSpec {
+            pr: 42,
+            r1_agent_name: "R1-reviewer".into(),
+            r2_name: "R2-auditor".into(),
+            worker_agent: "Worker-1".into(),
+        };
+        let prompt = build_r2_audit_prompt(&spec);
+        assert!(prompt.contains("PR #42"));
+        assert!(prompt.contains("R1-reviewer"));
+        assert!(prompt.contains("R2-auditor"));
+        assert!(prompt.contains("Worker-1"));
+        assert!(
+            prompt.contains("SHADOW"),
+            "R2 prompt must state shadow mode"
+        );
+        assert!(
+            prompt.contains("missed[]"),
+            "R2 prompt must define missed findings"
+        );
+        assert!(
+            prompt.contains("overcaught[]"),
+            "R2 prompt must define overcaught findings"
+        );
+        assert!(
+            prompt.contains("quorum done --agent R2-auditor --pr 42"),
+            "R2 prompt must instruct agent to signal done"
+        );
+        assert!(
+            prompt.contains("Do NOT merge the PR yourself"),
+            "R2 prompt must forbid merge"
+        );
+    }
+
     /// Extracts every `quorum <subcommand> --<flag>` from all turn-template
     /// strings and validates each subcommand and flag against the clap Command
     /// tree. Catches drift between what templates tell agents to run and what
@@ -419,11 +488,18 @@ mod tests {
             worker_agent: "W".into(),
             reviewer_name: "R".into(),
         };
+        let r2_spec = R2AuditSpec {
+            pr: 1,
+            r1_agent_name: "R1".into(),
+            r2_name: "R2".into(),
+            worker_agent: "W".into(),
+        };
         let templates: &[(&str, String)] = &[
             ("worker", build_worker_turn("A", 1, "t", "b", None)),
             ("reviewer", build_review_prompt(&spec)),
             ("rework", build_rework_turn("A", 1, 1, "fix it", 0.0, None)),
             ("rereview", build_rereview_turn("R", 1, "W")),
+            ("r2_audit", build_r2_audit_prompt(&r2_spec)),
         ];
 
         let clap_cmd = crate::cli::Cli::command();

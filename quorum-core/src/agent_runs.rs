@@ -84,6 +84,13 @@ mod tests {
     }
 
     #[test]
+    fn role_check_constraint_accepts_auditor() {
+        let (_d, c) = open_tmp();
+        let id = insert(&c, 1, "Auditor-1", "auditor", "model", "high", 100).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
     fn multiple_runs_per_task() {
         let (_d, c) = open_tmp();
         let r1 = insert(&c, 1, "Alice", "worker", "model-a", "high", 100).unwrap();

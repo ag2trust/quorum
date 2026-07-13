@@ -348,6 +348,13 @@ pub struct ServeConfig {
     /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
     /// with no active worker/reviewer. Default: false.
     pub doctor_enabled: bool,
+    /// R2 shadow reviewer: spawn a second adversarial reviewer on a stratified
+    /// sample of R1-approved PRs. Default: false.
+    pub r2_enabled: bool,
+    /// Per-stratum coverage target before switching to steady-state sampling.
+    pub r2_target_per_stratum: usize,
+    /// Steady-state sampling probability (0.0–1.0) after per-stratum target met.
+    pub r2_steady_state_p: f64,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -728,6 +735,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
     let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut auditors: Vec<SlotState> = Vec::new();
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -807,6 +815,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 slot.proc.kill_and_reap().await;
             }
+            for a in auditors.drain(..) {
+                a.proc.kill_and_reap().await;
+                name_pool.release(&a.agent_name);
+            }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -826,6 +838,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             }
             if let Some(slot) = classifier_slot.take() {
                 slot.proc.kill_and_reap().await;
+            }
+            for a in auditors.drain(..) {
+                a.proc.kill_and_reap().await;
+                name_pool.release(&a.agent_name);
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -849,6 +865,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
                     slot.proc.kill_and_reap().await;
+                }
+                for a in auditors.drain(..) {
+                    a.proc.kill_and_reap().await;
+                    name_pool.release(&a.agent_name);
                 }
                 for r in reviewers.drain(..) {
                     r.proc.kill_and_reap().await;
@@ -911,13 +931,18 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if drain_state.timed_out(config.drain_timeout_secs) {
                 let exit = drain_state.exit_code();
                 log(&format!(
-                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s)",
+                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s), {} auditor(s)",
                     config.drain_timeout_secs,
                     workers.len(),
                     reviewers.len(),
+                    auditors.len(),
                 ));
                 if let Some(slot) = classifier_slot.take() {
                     slot.proc.kill_and_reap().await;
+                }
+                for a in auditors.drain(..) {
+                    a.proc.kill_and_reap().await;
+                    name_pool.release(&a.agent_name);
                 }
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
@@ -955,6 +980,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut name_pool,
             &mut workers,
             &mut reviewers,
+            &mut auditors,
             &mut poison_tracker,
             &mut reviewer_provision_tracker,
             &mut drain_state,
@@ -982,6 +1008,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     if let Some(slot) = classifier_slot.take() {
                         slot.proc.kill_and_reap().await;
                     }
+                    for a in auditors.drain(..) {
+                        a.proc.kill_and_reap().await;
+                        name_pool.release(&a.agent_name);
+                    }
                     for r in reviewers.drain(..) {
                         r.proc.kill_and_reap().await;
                         name_pool.release(&r.agent_name);
@@ -1007,6 +1037,7 @@ async fn tick(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
+    auditors: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
@@ -1153,6 +1184,49 @@ async fn tick(
             .as_ref()
             .map(|n| format!(", summary={n:?}"))
             .unwrap_or_default();
+
+        // Check R2 auditor match first — auditors never affect lifecycle.
+        let auditor_idx = auditors.iter().position(|a| a.agent_name == row.agent);
+        if let Some(ai) = auditor_idx {
+            log(&format!(
+                "R2 auditor {} done (pr={:?}, verdict={:?}{note_suffix})",
+                auditors[ai].agent_name, row.pr, row.verdict
+            ));
+            let dead = auditors.remove(ai);
+            // Parse feedback for missed/overcaught counts.
+            let (missed, overcaught) = parse_r2_feedback(row.feedback.as_deref());
+            let r2_verdict = row.verdict.as_deref().unwrap_or("unknown");
+            // Record audit results.
+            {
+                let p = db_path.clone();
+                let agent_name = dead.agent_name.clone();
+                let verdict = r2_verdict.to_string();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    if let Some((audit_id, _)) =
+                        quorum_core::review_audits::find_by_r2_agent(&conn, &agent_name)?
+                    {
+                        quorum_core::review_audits::complete(
+                            &mut conn, audit_id, missed, overcaught, &verdict,
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                .ok();
+            }
+            close_agent_run(&db_path, dead.agent_run_id, "r2-done").await;
+            log(&format!(
+                "R2 audit recorded: missed={missed}, overcaught={overcaught}, verdict={r2_verdict}"
+            ));
+            let _ = wt_mgr.remove(&dead.worktree_path, &config.repo_dir).await;
+            name_pool.release(&dead.agent_name);
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+            continue;
+        }
 
         // Check reviewer match first (verdict handling).
         let reviewer_idx = reviewers.iter().position(|r| r.agent_name == row.agent);
@@ -1819,6 +1893,60 @@ async fn tick(
                             let sha = format!("post-merge-pr-{pr_num}");
                             drain_state.start_drain(&sha);
                         }
+                        // R2 shadow audit: spawn after merge, before teardown.
+                        if config.r2_enabled {
+                            let r1_name = reviewers[ri].agent_name.clone();
+                            let r1_run_id = reviewers[ri].agent_run_id;
+                            let worker_name = workers
+                                .iter()
+                                .find(|w| w.task_id == reviewer_task_id)
+                                .map(|w| w.agent_name.clone())
+                                .unwrap_or_default();
+                            // Look up resolved model/effort from R1's agent_run and task labels.
+                            let (resolved_model, resolved_effort, task_labels) = {
+                                let p = db_path.clone();
+                                let default_model = config.model.clone();
+                                let default_effort = config.effort.clone();
+                                let tid = reviewer_task_id;
+                                tokio::task::spawn_blocking(
+                                    move || -> (String, String, Option<String>) {
+                                        let conn = match quorum_core::db::open(&p) {
+                                            Ok(c) => c,
+                                            Err(_) => return (default_model, default_effort, None),
+                                        };
+                                        let task = tasks::get(&conn, tid).ok().flatten();
+                                        let labels = task.as_ref().and_then(|t| t.labels.clone());
+                                        let (model_override, effort_override) =
+                                            labels_to_model_effort(labels.as_deref());
+                                        let model = model_override.unwrap_or(default_model);
+                                        let effort = effort_override.unwrap_or(default_effort);
+                                        (model, effort, labels)
+                                    },
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    (config.model.clone(), config.effort.clone(), None)
+                                })
+                            };
+                            maybe_spawn_r2_auditor(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                auditors,
+                                lifetime_roster,
+                                pr_num,
+                                reviewer_task_id,
+                                &r1_name,
+                                r1_run_id,
+                                &worker_name,
+                                &resolved_model,
+                                &resolved_effort,
+                                task_labels.as_deref(),
+                            )
+                            .await
+                            .ok();
+                        }
+
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -2477,6 +2605,51 @@ async fn tick(
         )
         .await;
         teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
+    }
+
+    // ── Phase 3a: Drain events from active R2 auditors ─────────────────
+    // Auditors are fire-and-forget shadow reviewers; their exits are recorded
+    // but never affect task lifecycle. Killed on watchdog/idle like reviewers.
+    let mut auditors_to_kill: Vec<usize> = Vec::new();
+    for (i, a) in auditors.iter_mut().enumerate() {
+        if !a.draining {
+            if let Some(ended) = a.turn_ended_at {
+                if ended.elapsed().as_secs() > idle_timeout {
+                    log(&format!(
+                        "WATCHDOG: R2 auditor {} idle {}s — killing",
+                        a.agent_name,
+                        ended.elapsed().as_secs()
+                    ));
+                    auditors_to_kill.push(i);
+                }
+            }
+            continue;
+        }
+        if let Some(breach) = check_wall_clock_limits(&config.limits, a) {
+            log(&format!(
+                "WATCHDOG: R2 auditor {} killed — {}",
+                a.agent_name, breach
+            ));
+            auditors_to_kill.push(i);
+            continue;
+        }
+        if let Some(breach) = drain_events(a, &db_path, "auditor", &config.limits).await? {
+            log(&format!(
+                "WATCHDOG: R2 auditor {} killed — {}",
+                a.agent_name, breach
+            ));
+            auditors_to_kill.push(i);
+        }
+    }
+    for &i in auditors_to_kill.iter().rev() {
+        let dead = auditors.remove(i);
+        close_agent_run(&db_path, dead.agent_run_id, "watchdog").await;
+        log(&format!(
+            "R2 auditor {} torn down (watchdog)",
+            dead.agent_name
+        ));
+        let _ = wt_mgr.remove(&dead.worktree_path, &config.repo_dir).await;
+        name_pool.release(&dead.agent_name);
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
@@ -4861,6 +5034,293 @@ async fn teardown_reviewer(
     log(&format!("reviewer {} torn down", state.agent_name));
 }
 
+/// Parse R2 feedback string for missed/overcaught counts.
+/// Expected format: "missed:<N> overcaught:<N> | <summary>"
+fn parse_r2_feedback(feedback: Option<&str>) -> (i64, i64) {
+    let s = match feedback {
+        Some(s) => s,
+        None => return (0, 0),
+    };
+    let mut missed = 0i64;
+    let mut overcaught = 0i64;
+    for token in s.split_whitespace() {
+        if let Some(val) = token.strip_prefix("missed:") {
+            missed = val.parse().unwrap_or(0);
+        } else if let Some(val) = token.strip_prefix("overcaught:") {
+            overcaught = val.parse().unwrap_or(0);
+        }
+    }
+    (missed, overcaught)
+}
+
+/// Extract the complexity bucket from task labels. Returns "untagged" if absent.
+fn extract_complexity_from_labels(labels_json: Option<&str>) -> String {
+    let json = match labels_json {
+        Some(s) => s,
+        None => return "untagged".into(),
+    };
+    let arr: Vec<String> = match serde_json::from_str(json) {
+        Ok(a) => a,
+        Err(_) => return "untagged".into(),
+    };
+    for label in &arr {
+        if let Some(val) = label.strip_prefix("complexity:") {
+            if !val.is_empty() {
+                return val.to_string();
+            }
+        }
+    }
+    "untagged".into()
+}
+
+/// Decide whether to spawn R2 for this stratum based on coverage targets.
+fn should_spawn_r2(
+    stratum_count: i64,
+    target_per_stratum: usize,
+    steady_state_p: f64,
+    task_id: i64,
+) -> bool {
+    if (stratum_count as usize) < target_per_stratum {
+        return true;
+    }
+    // ponytail: deterministic hash instead of RNG for reproducibility.
+    // Uses task_id as entropy — same task always gets the same decision.
+    let hash = (task_id as u64).wrapping_mul(2654435761) % 10000;
+    (hash as f64 / 10000.0) < steady_state_p
+}
+
+/// Spawn an R2 auditor for a just-approved PR. Fire-and-forget — the auditor
+/// runs independently of the task lifecycle.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_spawn_r2_auditor(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    auditors: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    pr: i64,
+    task_id: i64,
+    r1_agent_name: &str,
+    r1_agent_run_id: Option<i64>,
+    worker_agent_name: &str,
+    resolved_model: &str,
+    resolved_effort: &str,
+    labels_json: Option<&str>,
+) -> Result<()> {
+    if !config.r2_enabled {
+        return Ok(());
+    }
+
+    let complexity = extract_complexity_from_labels(labels_json);
+
+    // Check stratum coverage.
+    let count = {
+        let p = config.db_path.clone();
+        let model = resolved_model.to_string();
+        let effort = resolved_effort.to_string();
+        let cplx = complexity.clone();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::review_audits::stratum_count(&conn, &model, &effort, &cplx)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+    }?;
+
+    if !should_spawn_r2(
+        count,
+        config.r2_target_per_stratum,
+        config.r2_steady_state_p,
+        task_id,
+    ) {
+        log(&format!(
+            "R2: skipping PR #{pr} — stratum ({resolved_model},{resolved_effort},{complexity}) \
+             has {count} audits, sampling declined"
+        ));
+        return Ok(());
+    }
+
+    log(&format!(
+        "R2: spawning auditor for PR #{pr} — stratum ({resolved_model},{resolved_effort},{complexity}), \
+         coverage={count}/{}", config.r2_target_per_stratum
+    ));
+
+    let r2_name = {
+        let result = name_pool.acquire();
+        if result.is_generated() && name_pool.has_file() {
+            log(&format!(
+                "names pool exhausted, generated fallback R2 name: {}",
+                result.name()
+            ));
+        }
+        result.into_name()
+    };
+    lifetime_roster.register(&r2_name);
+
+    // Drain stale mailbox rows for this name.
+    {
+        let p = config.db_path.clone();
+        let name = r2_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = quorum_core::db::open(&p)?;
+            mailbox::consume_all_for_agent(&mut conn, &name)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+        .ok();
+    }
+
+    let session_id = agent::new_session_id();
+    let branch = reviewer::reviewer_branch(pr, &r2_name);
+    let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &r2_name);
+
+    let task_repo_dir = &config.repo_dir;
+
+    // Try to look up the worker's branch from the PR.
+    let pr_head_ref = {
+        let pr_num = pr;
+        let repo_dir = task_repo_dir.to_path_buf();
+        let gh_repo = config.repo.clone();
+        tokio::task::spawn_blocking(move || query_pr_head_ref(pr_num, &repo_dir, Some(&gh_repo)))
+            .await
+            .ok()
+            .flatten()
+    };
+
+    let source_branch = pr_head_ref.as_deref().unwrap_or(&config.base_branch);
+
+    let provision_ok = wt_mgr
+        .fetch_and_provision(task_repo_dir, &branch, &wt_path, source_branch)
+        .await
+        .is_ok();
+
+    if !provision_ok {
+        log(&format!(
+            "R2: worktree provision failed for PR #{pr} — skipping audit"
+        ));
+        name_pool.release(&r2_name);
+        return Ok(());
+    }
+
+    // Record agent_run for R2.
+    let r2_run_id = {
+        let p = config.db_path.clone();
+        let name = r2_name.clone();
+        let model = resolved_model.to_string();
+        let effort = resolved_effort.to_string();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                &name,
+                "auditor",
+                &model,
+                &effort,
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+    }?;
+
+    // Create the review_audits row.
+    {
+        let p = config.db_path.clone();
+        let r1_name = r1_agent_name.to_string();
+        let r2_nm = r2_name.clone();
+        let model = resolved_model.to_string();
+        let effort = resolved_effort.to_string();
+        let cplx = complexity;
+        let r1_rid = r1_agent_run_id.unwrap_or(0);
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::review_audits::create(
+                &mut conn, task_id, pr, r1_rid, r2_run_id, &r1_name, &r2_nm, &model, &effort, &cplx,
+            )
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+        .ok();
+    }
+
+    let r2_session_log = config.log_dir.as_ref().and_then(|ld| {
+        session_log::SessionLog::create(
+            ld,
+            &r2_name,
+            "auditor",
+            Some(task_id),
+            &session_id,
+            &branch,
+            now_unix(),
+        )
+        .ok()
+    });
+
+    let spec = reviewer::R2AuditSpec {
+        pr,
+        r1_agent_name: r1_agent_name.to_string(),
+        r2_name: r2_name.clone(),
+        worker_agent: worker_agent_name.to_string(),
+    };
+    let prompt = reviewer::build_r2_audit_prompt(&spec);
+
+    let env_vars = vec![("QUORUM_REPO".into(), config.repo.clone())];
+
+    let proc = reviewer::spawn_reviewer(
+        resolved_model,
+        resolved_effort,
+        &session_id,
+        &wt_path,
+        config.agent_bin.as_deref(),
+        config.bare_agent,
+        env_vars,
+        config.allowed_tools.as_deref(),
+    )
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn R2 auditor: {e}")))?;
+
+    let turn = agent::user_turn(&prompt);
+    let mut slot = SlotState {
+        agent_name: r2_name,
+        proc,
+        task_id,
+        session_id,
+        worktree_path: wt_path,
+        branch,
+        draining: false,
+        pr: Some(pr),
+        rework_count: 0,
+        cost_tokens: 0,
+        cost_usd: 0.0,
+        task_started_at: std::time::Instant::now(),
+        turn_started_at: std::time::Instant::now(),
+        turn_ended_at: None,
+        agent_state: None,
+        session_log: r2_session_log,
+        live_stats: LiveStats::new(),
+        error_turn_count: 0,
+        agent_run_id: Some(r2_run_id),
+    };
+
+    match slot.proc.feed_turn(&turn).await {
+        Ok(()) => {
+            slot.draining = true;
+            auditors.push(slot);
+            log(&format!("R2 auditor spawned for PR #{pr}"));
+        }
+        Err(e) => {
+            log(&format!("R2 auditor feed_turn failed: {e} — aborting"));
+            slot.proc.kill_and_reap().await;
+            close_agent_run(&config.db_path, Some(r2_run_id), "spawn-failed").await;
+            let _ = wt_mgr.remove(&slot.worktree_path, &config.repo_dir).await;
+            name_pool.release(&slot.agent_name);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5548,5 +6008,74 @@ mod tests {
     #[test]
     fn orphan_worker_branch_review_only_with_author_returns_none() {
         assert_eq!(orphan_worker_branch("Anvil", 15, true), None);
+    }
+
+    #[test]
+    fn parse_r2_feedback_extracts_counts() {
+        let (m, o) = parse_r2_feedback(Some("missed:3 overcaught:1 | found real bugs"));
+        assert_eq!(m, 3);
+        assert_eq!(o, 1);
+    }
+
+    #[test]
+    fn parse_r2_feedback_handles_none() {
+        let (m, o) = parse_r2_feedback(None);
+        assert_eq!(m, 0);
+        assert_eq!(o, 0);
+    }
+
+    #[test]
+    fn parse_r2_feedback_handles_missing_counts() {
+        let (m, o) = parse_r2_feedback(Some("no counts here"));
+        assert_eq!(m, 0);
+        assert_eq!(o, 0);
+    }
+
+    #[test]
+    fn extract_complexity_returns_value() {
+        assert_eq!(
+            extract_complexity_from_labels(Some(r#"["complexity:3"]"#)),
+            "3"
+        );
+        assert_eq!(
+            extract_complexity_from_labels(Some(r#"["tier:opus-46","complexity:5"]"#)),
+            "5"
+        );
+    }
+
+    #[test]
+    fn extract_complexity_returns_untagged_when_absent() {
+        assert_eq!(extract_complexity_from_labels(None), "untagged");
+        assert_eq!(
+            extract_complexity_from_labels(Some(r#"["tier:opus-46"]"#)),
+            "untagged"
+        );
+    }
+
+    #[test]
+    fn should_spawn_r2_always_when_under_target() {
+        assert!(should_spawn_r2(0, 5, 0.0, 42));
+        assert!(should_spawn_r2(4, 5, 0.0, 42));
+    }
+
+    #[test]
+    fn should_spawn_r2_at_target_uses_probability() {
+        // With p=0.0, should never spawn once target met.
+        assert!(!should_spawn_r2(5, 5, 0.0, 1));
+        assert!(!should_spawn_r2(10, 5, 0.0, 99));
+
+        // With p=1.0, should always spawn.
+        assert!(should_spawn_r2(5, 5, 1.0, 1));
+        assert!(should_spawn_r2(10, 5, 1.0, 99));
+    }
+
+    #[test]
+    fn should_spawn_r2_deterministic_on_task_id() {
+        let result1 = should_spawn_r2(5, 5, 0.5, 42);
+        let result2 = should_spawn_r2(5, 5, 0.5, 42);
+        assert_eq!(
+            result1, result2,
+            "same task_id must give same sampling decision"
+        );
     }
 }

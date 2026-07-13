@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 22). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 23). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -266,7 +266,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id     INTEGER NOT NULL,
     agent_name  TEXT NOT NULL,
-    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','auditor')),
     model       TEXT NOT NULL,
     effort      TEXT NOT NULL,
     spawned_at  INTEGER NOT NULL,
@@ -308,3 +308,27 @@ CREATE TABLE IF NOT EXISTS review_findings (
 );
 CREATE INDEX IF NOT EXISTS review_findings_pr ON review_findings(pr_number);
 CREATE INDEX IF NOT EXISTS review_findings_task ON review_findings(task_id);
+
+-- R2 review-audit records (#92): one row per second-reviewer adversarial audit
+-- of an R1 verdict. Stratum key = (model, effort, complexity) from the worker's
+-- agent_run + task labels. Shadow-only (does not block merges) until the blocking
+-- toggle is flipped in serve config. Not TTL'd — durable historical data.
+CREATE TABLE IF NOT EXISTS review_audits (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             INTEGER NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    r1_agent_run_id     INTEGER NOT NULL,
+    r2_agent_run_id     INTEGER NOT NULL,
+    r1_agent_name       TEXT NOT NULL,
+    r2_agent_name       TEXT NOT NULL,
+    stratum_model       TEXT NOT NULL,
+    stratum_effort      TEXT NOT NULL,
+    stratum_complexity  TEXT NOT NULL,
+    missed_count        INTEGER,
+    overcaught_count    INTEGER,
+    r2_verdict          TEXT,
+    created_at          INTEGER NOT NULL,
+    completed_at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS review_audits_stratum ON review_audits(stratum_model, stratum_effort, stratum_complexity);
+CREATE INDEX IF NOT EXISTS review_audits_task ON review_audits(task_id);

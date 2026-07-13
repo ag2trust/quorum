@@ -43,6 +43,15 @@ pub struct ServeFileConfig {
     pub master_ci_gate: Option<bool>,
     pub master_ci_timeout_secs: Option<u64>,
     pub doctor_enabled: Option<bool>,
+    /// R2 shadow reviewer: spawn a second adversarial reviewer on a stratified
+    /// sample of R1-approved PRs. Default: false.
+    pub r2_enabled: Option<bool>,
+    // ponytail: r2_target_per_stratum — coverage ramp-up target; steady-state
+    // sampling kicks in after. Upgrade path: raise for wider coverage.
+    pub r2_target_per_stratum: Option<usize>,
+    // ponytail: r2_steady_state_p — sampling probability after target met.
+    // Upgrade path: raise toward 1.0 for full coverage.
+    pub r2_steady_state_p: Option<f64>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -331,6 +331,45 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 )?;
             }
         }
+        // v21 = agent_runs perf capture table. Net-new — SCHEMA_SQL handles it.
+
+        // v22 = review_findings table. Net-new — SCHEMA_SQL handles it.
+
+        // v23 = R2 review-audit table + agent_runs.role CHECK extended to
+        // include 'auditor'. The review_audits table is net-new (SCHEMA_SQL
+        // handles it). The agent_runs CHECK constraint must be widened:
+        // SQLite can't ALTER a CHECK, so recreate the table.
+        if current < 23 {
+            // Only recreate if agent_runs exists (it should from v21).
+            let has_agent_runs: bool = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_runs'",
+                    [],
+                    |r| Ok(r.get::<_, i64>(0)? > 0),
+                )
+                .unwrap_or(false);
+            if has_agent_runs {
+                conn.execute_batch(
+                    "CREATE TABLE agent_runs_new (
+                         id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                         task_id     INTEGER NOT NULL,
+                         agent_name  TEXT NOT NULL,
+                         role        TEXT NOT NULL CHECK(role IN ('worker','reviewer','auditor')),
+                         model       TEXT NOT NULL,
+                         effort      TEXT NOT NULL,
+                         spawned_at  INTEGER NOT NULL,
+                         ended_at    INTEGER,
+                         end_reason  TEXT
+                     );
+                     INSERT INTO agent_runs_new(id, task_id, agent_name, role, model, effort, spawned_at, ended_at, end_reason)
+                         SELECT id, task_id, agent_name, role, model, effort, spawned_at, ended_at, end_reason
+                         FROM agent_runs;
+                     DROP TABLE agent_runs;
+                     ALTER TABLE agent_runs_new RENAME TO agent_runs;
+                     CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);",
+                )?;
+            }
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -394,6 +433,8 @@ mod tests {
             "journal",
             "daemon_lock",
             "agent_runs",
+            "review_findings",
+            "review_audits",
         ] {
             let n: i64 = c
                 .query_row(
@@ -1349,5 +1390,76 @@ mod tests {
             .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "seed task");
+    }
+
+    #[test]
+    fn migrates_v22_to_v23_adds_review_audits_and_widens_role_check() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE agent_runs (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id     INTEGER NOT NULL,
+                 agent_name  TEXT NOT NULL,
+                 role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+                 model       TEXT NOT NULL,
+                 effort      TEXT NOT NULL,
+                 spawned_at  INTEGER NOT NULL,
+                 ended_at    INTEGER,
+                 end_reason  TEXT
+             );
+             INSERT INTO agent_runs(task_id, agent_name, role, model, effort, spawned_at)
+                 VALUES (1, 'Alice', 'worker', 'opus', 'high', 100);
+             INSERT INTO agent_runs(task_id, agent_name, role, model, effort, spawned_at)
+                 VALUES (1, 'Bob', 'reviewer', 'opus', 'high', 200);
+             PRAGMA user_version = 22;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // review_audits table exists.
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='review_audits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "review_audits table must exist after v22→v23 migration"
+        );
+
+        // Pre-existing agent_runs data preserved.
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM agent_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "pre-existing agent_runs rows must survive migration"
+        );
+
+        // The 'auditor' role is now accepted.
+        let result = c.execute(
+            "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, spawned_at)
+             VALUES (2, 'Carol', 'auditor', 'opus', 'high', 300)",
+            [],
+        );
+        assert!(
+            result.is_ok(),
+            "agent_runs role CHECK must accept 'auditor' after v23 migration"
+        );
     }
 }
