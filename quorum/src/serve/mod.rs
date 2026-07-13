@@ -808,7 +808,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 slot.proc.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
-                teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
             for w in workers.drain(..) {
                 teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
@@ -828,7 +828,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 slot.proc.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
-                teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
             for w in workers.drain(..) {
                 teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
@@ -920,7 +920,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     slot.proc.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
-                    teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+                    teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
                 }
                 for w in workers.drain(..) {
                     teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
@@ -1122,7 +1122,7 @@ async fn tick(
                     )
                     .await;
                     emit_kill_event(&db_path, target, by, reason).await;
-                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                    teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
                 } else if lifetime_roster.owns(target) {
                     log(&format!(
                         "kill: agent {target} not active (already dead/finished)"
@@ -1185,7 +1185,7 @@ async fn tick(
                             reviewers[ri].agent_name
                         ));
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -1204,7 +1204,7 @@ async fn tick(
                     {
                         log("VerdictApprove transition failed — skipping merge");
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         // C3 belt-and-suspenders: clear worker.pr so Phase 5
                         // doesn't spawn another reviewer for a rejected task.
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -1244,7 +1244,7 @@ async fn tick(
                             cleanup_slot(config, wt_mgr, name_pool, w, None).await;
                         }
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -1280,7 +1280,8 @@ async fn tick(
                             set_task_body(&db_path, reviewer_task_id, tasks::MERGE_BLOCKED_BODY)
                                 .await;
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                .await;
                         } else {
                             // Non-review-only: fire MergeConflict (merging → rework
                             // directly, skipping the reviewer hop).
@@ -1356,7 +1357,14 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -1367,7 +1375,14 @@ async fn tick(
                                 None => {
                                     // MergeConflict event failed — clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -1542,7 +1557,14 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -1552,7 +1574,14 @@ async fn tick(
                                 }
                                 None => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                 }
                             }
                             if !consume_mailbox_row(&db_path, *id).await {
@@ -1576,7 +1605,8 @@ async fn tick(
                             )
                             .await;
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                .await;
                             if let Some(wi) =
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
@@ -1624,7 +1654,7 @@ async fn tick(
                                     author,
                                     reviewer: reviewer_name,
                                     verdict: "approved".to_string(),
-                                    blocking_count: 0,
+                                    blocking_count: gated.blocking_count.unwrap_or(0) as i64,
                                     approved_head_sha: head,
                                 };
                                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1790,7 +1820,7 @@ async fn tick(
                             drain_state.start_drain(&sha);
                         }
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
@@ -1820,7 +1850,8 @@ async fn tick(
                                 )
                                 .await;
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                    .await;
                                 if let Some(wi) =
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
@@ -1863,7 +1894,14 @@ async fn tick(
                                     )
                                     .await;
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                 } else {
                                     // in-review → rework
                                     let reviewer_name = reviewers[ri].agent_name.clone();
@@ -1958,7 +1996,14 @@ async fn tick(
                                         Some(_) => {
                                             // Rework cap exceeded → failed. Clean up.
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                            teardown_reviewer(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                r,
+                                                "verdict:approved",
+                                            )
+                                            .await;
                                             if let Some(wi) = workers
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
@@ -1970,7 +2015,14 @@ async fn tick(
                                         }
                                         None => {
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                            teardown_reviewer(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                r,
+                                                "verdict:approved",
+                                            )
+                                            .await;
                                         }
                                     }
                                 } // end !review_only
@@ -2015,6 +2067,35 @@ async fn tick(
                             Err(e) => log(&format!(
                                 "REQUEST_CHANGES spawn_blocking join failed (non-blocking): {e}"
                             )),
+                        }
+                    }
+
+                    // #90: record the changes verdict in approvals (mirrors approved path).
+                    if let Some(pr_num) = row.pr {
+                        let reviewer_name = reviewers[ri].agent_name.clone();
+                        let author = workers
+                            .iter()
+                            .find(|w| w.task_id == reviewer_task_id)
+                            .map(|w| w.agent_name.clone());
+                        if let Some(author) = author {
+                            let blocking = gated.blocking_count.unwrap_or(0) as i64;
+                            let p = db_path.clone();
+                            let record = quorum_core::approvals::Approval {
+                                pr_number: pr_num,
+                                task_id: reviewer_task_id,
+                                author,
+                                reviewer: reviewer_name,
+                                verdict: "changes".to_string(),
+                                blocking_count: blocking,
+                                approved_head_sha: String::new(),
+                            };
+                            tokio::task::spawn_blocking(move || -> Result<()> {
+                                let mut conn = quorum_core::db::open(&p)?;
+                                quorum_core::approvals::record(&mut conn, &record)
+                            })
+                            .await
+                            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                            .ok();
                         }
                     }
 
@@ -2099,7 +2180,8 @@ async fn tick(
                         Some(_) => {
                             // Rework cap exceeded → failed. Clean up both.
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:changes")
+                                .await;
                             if let Some(wi) =
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
@@ -2109,7 +2191,8 @@ async fn tick(
                         }
                         None => {
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:changes")
+                                .await;
                         }
                     }
                 }
@@ -2128,7 +2211,7 @@ async fn tick(
                         },
                     )
                     .await;
-                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                    teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:none").await;
                     if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id) {
                         workers[wi].pr = None;
                     }
@@ -2204,7 +2287,10 @@ async fn tick(
                                                 workers[wi].task_id
                                             ));
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                            teardown_reviewer(
+                                                config, wt_mgr, name_pool, r, "failed",
+                                            )
+                                            .await;
                                         } else {
                                             log(&format!(
                                                 "ResumeReviewer: fed re-review turn \
@@ -2353,7 +2439,7 @@ async fn tick(
             },
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
@@ -2390,7 +2476,7 @@ async fn tick(
             },
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
@@ -2574,7 +2660,7 @@ async fn tick(
                 },
             )
             .await;
-            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+            teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await;
         }
     }
 
@@ -2680,7 +2766,7 @@ async fn tick(
             },
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
     }
 
     // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────
@@ -2730,7 +2816,7 @@ async fn tick(
                         reviewers[ri].agent_name,
                     ));
                     let r = reviewers.remove(ri);
-                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                    teardown_reviewer(config, wt_mgr, name_pool, r, "cancelled").await;
                 }
             }
         }
@@ -4746,6 +4832,7 @@ async fn teardown_reviewer(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     mut state: SlotState,
+    end_reason: &str,
 ) {
     log(&format!("tearing down reviewer {}", state.agent_name));
 
@@ -4754,7 +4841,7 @@ async fn teardown_reviewer(
     }
 
     state.proc.kill_and_reap().await;
-    close_agent_run(&config.db_path, state.agent_run_id, "verdict").await;
+    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
