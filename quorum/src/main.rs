@@ -1015,6 +1015,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
             let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
+            let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(false);
+            let r_r2_target_per_stratum = file_cfg.r2_target_per_stratum.unwrap_or(5);
+            let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(0.10);
+            let r_r2_blocking = file_cfg.r2_blocking.unwrap_or(false);
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -1117,6 +1121,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_timeout_secs: r_master_ci_timeout.value,
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
                 doctor_enabled: r_doctor_enabled.value,
+                r2_enabled: r_r2_enabled,
+                r2_target_per_stratum: r_r2_target_per_stratum,
+                r2_steady_state_p: r_r2_steady_state_p,
+                r2_blocking: r_r2_blocking,
             };
             Ok(serve::run_serve(config)?)
         }

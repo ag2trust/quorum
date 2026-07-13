@@ -21,6 +21,23 @@ pub fn insert(
     Ok(conn.last_insert_rowid())
 }
 
+/// Insert an R2 audit run (sub_role='r2'). Returns the row id.
+pub fn insert_r2(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    model: &str,
+    effort: &str,
+    spawned_at: i64,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, spawned_at, sub_role)
+         VALUES (?1, ?2, 'reviewer', ?3, ?4, ?5, 'r2')",
+        params![task_id, agent_name, model, effort, spawned_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Close an open run row at teardown/terminal.
 pub fn close(conn: &Connection, run_id: i64, ended_at: i64, end_reason: &str) -> Result<()> {
     conn.execute(

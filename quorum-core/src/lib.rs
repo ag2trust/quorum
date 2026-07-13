@@ -23,6 +23,7 @@ pub mod lifecycle;
 pub mod mailbox;
 pub mod perf;
 pub mod pinned;
+pub mod review_audits;
 pub mod review_findings;
 pub mod stats;
 pub mod sweep;
