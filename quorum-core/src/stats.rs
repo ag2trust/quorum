@@ -920,6 +920,7 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
     };
     let mut tier_part = String::new();
     let mut eff_part = String::new();
+    let mut complexity: Option<&str> = None;
     for item in arr {
         if let Some(t) = item.as_str() {
             if let Some(rest) = t.strip_prefix("tier:") {
@@ -930,11 +931,16 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
                     "medium" | "med" => "md".to_string(),
                     other => other.to_string(),
                 };
+            } else if let Some(rest) = t.strip_prefix("complexity:") {
+                complexity = Some(rest);
             }
         }
     }
     if tier_part.is_empty() && eff_part.is_empty() {
-        return "—".to_string();
+        return match complexity {
+            Some(n) => format!("c{n}"),
+            None => "—".to_string(),
+        };
     }
     if eff_part.is_empty() {
         return tier_part;
@@ -2203,6 +2209,20 @@ mod tests {
         // so the operator sees the corruption.
         let out = tier_eff_label(Some(r#"["effort:low"]"#));
         assert_eq!(out, "low", "want raw passthrough, got {out:?}");
+    }
+
+    #[test]
+    fn tier_eff_label_complexity_fallback() {
+        assert_eq!(tier_eff_label(Some(r#"["complexity:2"]"#)), "c2");
+        assert_eq!(tier_eff_label(Some(r#"["complexity:5"]"#)), "c5");
+        // tier/effort present → complexity ignored
+        assert_eq!(
+            tier_eff_label(Some(r#"["tier:opus-46","effort:high","complexity:3"]"#)),
+            "opus46·hi"
+        );
+        // no labels at all → dash
+        assert_eq!(tier_eff_label(None), "—");
+        assert_eq!(tier_eff_label(Some(r#"[]"#)), "—");
     }
 
     #[test]
