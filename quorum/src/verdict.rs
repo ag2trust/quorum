@@ -84,6 +84,8 @@ pub struct GatedVerdict {
     /// Set when an `approved` verdict was demoted to `changes`; explains why
     /// and doubles as the rework feedback.
     pub demotion_reason: Option<String>,
+    /// Attested blocking-finding count from the payload, if present and valid.
+    pub blocking_count: Option<u32>,
 }
 
 /// Daemon-boundary gate: `approved` is only actionable with a payload
@@ -92,6 +94,11 @@ pub struct GatedVerdict {
 /// `changes` so the daemon never merges on it. `changes` and non-verdicts
 /// pass through untouched.
 pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
+    let parsed_blocking = payload
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+        .and_then(|v| v.get("blocking").and_then(|b| b.as_u64()))
+        .map(|n| n as u32);
+
     // Both spellings are approval claims ("approve" is the passive-flow
     // spelling); canonicalize so a raw mailbox row can't slip past the gate
     // into the daemon's "done without verdict" catch-all.
@@ -100,17 +107,15 @@ pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
         return GatedVerdict {
             verdict: verdict.map(str::to_string),
             demotion_reason: None,
+            blocking_count: parsed_blocking,
         };
     }
 
-    let blocking = payload
-        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
-        .and_then(|v| v.get("blocking").and_then(|b| b.as_u64()));
-
-    match blocking {
+    match parsed_blocking {
         Some(0) => GatedVerdict {
             verdict: Some("approved".to_string()),
             demotion_reason: None,
+            blocking_count: Some(0),
         },
         Some(n) => GatedVerdict {
             verdict: Some("changes".to_string()),
@@ -119,6 +124,7 @@ pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
                  finding(s) — a blocking finding cannot be approved over (#206). \
                  Re-signal done to trigger a fresh review after addressing the findings."
             )),
+            blocking_count: Some(n),
         },
         None => {
             // Covers both a missing payload and a malformed one (bad JSON or
@@ -135,6 +141,7 @@ pub fn gate(verdict: Option<&str>, payload: Option<&str>) -> GatedVerdict {
                      attestation (--blocking 0). The verdict did not come through the \
                      validated CLI path (#206). Re-signal done to trigger a fresh review."
                 )),
+                blocking_count: None,
             }
         }
     }
@@ -308,6 +315,7 @@ mod tests {
         let g = gate(Some("approved"), Some("{\"blocking\":0}"));
         assert_eq!(g.verdict.as_deref(), Some("approved"));
         assert!(g.demotion_reason.is_none());
+        assert_eq!(g.blocking_count, Some(0));
     }
 
     /// Review #226 finding 1 (CONFIRMED): a raw mailbox row using the
@@ -377,6 +385,14 @@ mod tests {
         let g = gate(Some("changes"), None);
         assert_eq!(g.verdict.as_deref(), Some("changes"));
         assert!(g.demotion_reason.is_none());
+        assert_eq!(g.blocking_count, None);
+    }
+
+    #[test]
+    fn gate_changes_carries_blocking_count() {
+        let g = gate(Some("changes"), Some("{\"blocking\":3}"));
+        assert_eq!(g.verdict.as_deref(), Some("changes"));
+        assert_eq!(g.blocking_count, Some(3));
     }
 
     #[test]
@@ -384,6 +400,7 @@ mod tests {
         let g = gate(None, None);
         assert_eq!(g.verdict, None);
         assert!(g.demotion_reason.is_none());
+        assert_eq!(g.blocking_count, None);
     }
 
     // --- dispose_approval: the #228 restart-recovery trust gate ---
