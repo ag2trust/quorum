@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod approvals;
 pub mod classifier;
+pub mod doctor;
 pub mod merge;
 pub mod names;
 pub mod recovery;
@@ -344,6 +345,9 @@ pub struct ServeConfig {
     /// Override the default tool allowlist for spawned agents. When None,
     /// uses `agent::ALLOWED_TOOLS`.
     pub allowed_tools: Option<String>,
+    /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
+    /// with no active worker/reviewer. Default: false.
+    pub doctor_enabled: bool,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -722,6 +726,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
+    let mut doctor_slot: Option<doctor::DoctorSlot> = None;
+    let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -954,6 +960,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
+            &mut doctor_slot,
+            &mut doctored_tasks,
         )
         .await
         {
@@ -1004,6 +1012,8 @@ async fn tick(
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
+    doctor_slot: &mut Option<doctor::DoctorSlot>,
+    doctored_tasks: &mut std::collections::HashSet<i64>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -3231,6 +3241,108 @@ async fn tick(
                     Err(e) => {
                         log(&format!("classifier: spawn failed: {e}"));
                     }
+                }
+            }
+        }
+    }
+
+    // ── Phase 8: Doctor agent ────────────────────────────────────────
+    // 8a: Drain events from in-flight doctor.
+    if let Some(slot) = doctor_slot.as_mut() {
+        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+
+        if let Some(result) = doctor::drain_doctor_events(slot).await {
+            let tid = slot.task_id;
+            match result {
+                doctor::DoctorResult::Done(text) => {
+                    log(&format!(
+                        "doctor: finished for task #{tid} ({}b)",
+                        text.len()
+                    ));
+                }
+                doctor::DoctorResult::Error(e) => {
+                    log(&format!("doctor: error on task #{tid}: {e}"));
+                }
+            }
+            doctored_tasks.insert(tid);
+            *doctor_slot = None;
+        } else if exited {
+            let tid = slot.task_id;
+            log(&format!("doctor: process exited for task #{tid}"));
+            doctored_tasks.insert(tid);
+            *doctor_slot = None;
+        }
+    }
+
+    // 8b: Spawn doctor if enabled, idle, not draining, and a stalled task exists.
+    if config.doctor_enabled && doctor_slot.is_none() && !drain_state.draining {
+        let p = db_path.clone();
+        let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+        let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
+        let already_doctored = doctored_tasks.clone();
+
+        let stalled =
+            tokio::task::spawn_blocking(move || -> Result<Option<doctor::EvidenceBundle>> {
+                let conn = quorum_core::db::open(&p)?;
+                let working = tasks::list(&conn, Some("working"), None, None)?;
+                let in_review = tasks::list(&conn, Some("in-review"), None, None)?;
+                let candidates: Vec<_> = working.into_iter().chain(in_review).collect();
+                for task in candidates {
+                    if active_worker_task_ids.contains(&task.id)
+                        || active_reviewer_task_ids.contains(&task.id)
+                        || already_doctored.contains(&task.id)
+                    {
+                        continue;
+                    }
+                    let refs_json: Option<serde_json::Value> = task
+                        .refs
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok());
+                    let pr = refs_json.as_ref().and_then(|v| v["pr"].as_i64());
+                    let worktree_path = refs_json
+                        .as_ref()
+                        .and_then(|v| v["worktree"].as_str().map(|s| s.to_string()));
+                    return Ok(Some(doctor::EvidenceBundle {
+                        task_id: task.id,
+                        task_title: task.title,
+                        task_status: task.status,
+                        task_body: task.body,
+                        author: task.assignee,
+                        pr,
+                        worktree_path,
+                        repo: String::new(),
+                    }));
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+
+        if let Ok(Some(mut evidence)) = stalled {
+            evidence.repo = config.repo.clone();
+            let allowed = config
+                .allowed_tools
+                .as_deref()
+                .unwrap_or(agent::ALLOWED_TOOLS);
+            let turn = doctor::doctor_turn(&evidence);
+            match doctor::spawn_doctor(
+                evidence.task_id,
+                &config.repo_dir,
+                config.agent_bin.as_deref(),
+                config.bare_agent,
+                allowed,
+                &config.repo,
+            ) {
+                Ok(mut slot) => {
+                    if let Err(e) = slot.proc.feed_turn(&turn).await {
+                        log(&format!("doctor: feed_turn failed: {e}"));
+                    } else {
+                        log(&format!("doctor: spawned for task #{}", evidence.task_id));
+                        *doctor_slot = Some(slot);
+                    }
+                }
+                Err(e) => {
+                    log(&format!("doctor: spawn failed: {e}"));
                 }
             }
         }

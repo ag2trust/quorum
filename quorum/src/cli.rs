@@ -486,6 +486,10 @@ pub enum Command {
         /// process dies and its tempdir is cleaned up.
         #[arg(long, hide = true)]
         exit_when_gone: Option<String>,
+        /// Enable the doctor agent — a one-shot troubleshooter spawned for
+        /// tasks stalled with no active worker/reviewer. Default: off.
+        #[arg(long)]
+        doctor_enabled: bool,
     },
     /// Stream rendered events from an agent's session log. Resolves the agent's
     /// latest session log directory via the journal. Default: print events so far
