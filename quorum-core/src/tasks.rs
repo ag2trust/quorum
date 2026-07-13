@@ -547,6 +547,7 @@ pub fn apply_event(
         | Event::Cancelled { .. }
         | Event::MergeSucceeded
         | Event::MergeFailed { .. }
+        | Event::MergeConflict
         | Event::PrFoundMerged
         | Event::PrFoundClosed => {}
     }
