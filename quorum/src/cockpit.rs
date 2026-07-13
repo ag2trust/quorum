@@ -233,8 +233,8 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
     let _ = writeln!(
         w,
-        "    {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
-        "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
+        "  {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
+        "AGENT", "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
     );
 
     for d in &workers {
@@ -738,6 +738,19 @@ mod tests {
         assert!(
             output.contains("R1"),
             "reviewer name should appear: {output}"
+        );
+
+        // Header "EFF" column must align with data "EFF" column
+        let header_line = output
+            .lines()
+            .find(|l| l.contains("EFF") && l.contains("TASK"))
+            .unwrap();
+        let data_line = output.lines().find(|l| l.contains("W1")).unwrap();
+        let header_eff_col = header_line.find("EFF").unwrap();
+        let data_eff_col = data_line.find("md").unwrap(); // "md" = eff value from "opus46·md"
+        assert_eq!(
+            header_eff_col, data_eff_col,
+            "EFF header col ({header_eff_col}) must match data col ({data_eff_col})\nheader: {header_line}\n  data: {data_line}"
         );
     }
 
