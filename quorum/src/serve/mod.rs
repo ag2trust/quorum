@@ -221,6 +221,39 @@ fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> String {
     MODEL_TIERS[final_rank].to_string()
 }
 
+fn escalate_model(current: &str) -> String {
+    match model_rank(current) {
+        Some(i) if i + 1 < MODEL_TIERS.len() => MODEL_TIERS[i + 1].into(),
+        _ => current.into(),
+    }
+}
+
+fn extract_cx_est(refs: &Option<String>) -> Option<i64> {
+    let s = refs.as_deref()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("cx_est")?.as_i64()
+}
+
+fn resolve_worker_model_effort(
+    labels_json: Option<&str>,
+    refs: &Option<String>,
+    default_model: &str,
+    default_effort: &str,
+) -> (String, String) {
+    let (label_model, label_effort) = labels_to_model_effort(labels_json);
+    if label_model.is_none() && label_effort.is_none() {
+        match extract_cx_est(refs) {
+            Some(cx) if cx >= 4 => (escalate_model(default_model), "high".into()),
+            _ => (default_model.into(), default_effort.into()),
+        }
+    } else {
+        (
+            label_model.unwrap_or_else(|| default_model.into()),
+            label_effort.unwrap_or_else(|| default_effort.into()),
+        )
+    }
+}
+
 /// Extract model and effort overrides from a task's labels JSON.
 ///
 /// Labels like `tier:opus-46` map to model `claude-opus-4-6`; `effort:high` maps to effort `high`.
@@ -4582,9 +4615,21 @@ async fn spawn_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
-    let resolved_model = label_model.unwrap_or_else(|| config.model.clone());
-    let resolved_effort = label_effort.unwrap_or_else(|| config.effort.clone());
+    let cx_before = extract_cx_est(&task.refs);
+    let (resolved_model, resolved_effort) = resolve_worker_model_effort(
+        task.labels.as_deref(),
+        &task.refs,
+        &config.model,
+        &config.effort,
+    );
+    if let Some(cx) = cx_before {
+        if cx >= 4 && resolved_model != config.model {
+            log(&format!(
+                "cx_est auto-upgrade: task #{} cx_est={} -> model={}, effort=high",
+                task.id, cx, resolved_model
+            ));
+        }
+    }
     let spec = AgentSpec {
         model: resolved_model.clone(),
         effort: resolved_effort.clone(),
@@ -5485,7 +5530,6 @@ mod tests {
 
     #[test]
     fn escalated_reviewer_default_worker_steps_up() {
-        // opus-4-6 worker -> reviewer gets opus-4-7
         assert_eq!(
             escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6"),
             "claude-opus-4-7"
@@ -5494,7 +5538,6 @@ mod tests {
 
     #[test]
     fn escalated_reviewer_top_tier_caps() {
-        // opus-4-8 (top) worker -> reviewer stays at opus-4-8
         assert_eq!(
             escalated_reviewer_model("claude-opus-4-8", "claude-opus-4-6"),
             "claude-opus-4-8"
@@ -5503,7 +5546,6 @@ mod tests {
 
     #[test]
     fn escalated_reviewer_config_higher_wins() {
-        // sonnet-5 worker escalates to opus-4-6, but config is opus-4-7 -> config wins
         assert_eq!(
             escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7"),
             "claude-opus-4-7"
@@ -5512,11 +5554,119 @@ mod tests {
 
     #[test]
     fn escalated_reviewer_unknown_worker_uses_rank_zero() {
-        // unknown model -> rank 0 (sonnet-5), +1 = opus-4-6, vs config opus-4-6 -> opus-4-6
         assert_eq!(
             escalated_reviewer_model("unknown-model", "claude-opus-4-6"),
             "claude-opus-4-6"
         );
+    }
+
+    #[test]
+    fn extract_cx_est_from_refs() {
+        assert_eq!(extract_cx_est(&Some(r#"{"cx_est":4}"#.into())), Some(4));
+        assert_eq!(
+            extract_cx_est(&Some(r#"{"cx_est":5,"pr":99}"#.into())),
+            Some(5)
+        );
+        assert_eq!(extract_cx_est(&Some(r#"{"pr":42}"#.into())), None);
+        assert_eq!(extract_cx_est(&None), None);
+        assert_eq!(extract_cx_est(&Some("not json".into())), None);
+        assert_eq!(
+            extract_cx_est(&Some(r#"{"cx_est":"bad"}"#.into())),
+            None,
+            "non-integer cx_est must return None"
+        );
+    }
+
+    #[test]
+    fn escalate_model_one_tier_up() {
+        assert_eq!(escalate_model("claude-opus-4-6"), "claude-opus-4-7");
+        assert_eq!(escalate_model("claude-opus-4-7"), "claude-opus-4-8");
+    }
+
+    #[test]
+    fn escalate_model_at_top_stays() {
+        assert_eq!(escalate_model("claude-opus-4-8"), "claude-opus-4-8");
+    }
+
+    #[test]
+    fn escalate_model_unknown_stays() {
+        assert_eq!(escalate_model("claude-haiku-4-5"), "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn cx_est_4_no_labels_upgrades() {
+        let refs = Some(r#"{"cx_est":4}"#.into());
+        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
+        assert_eq!(model, "claude-opus-4-7");
+        assert_eq!(effort, "high");
+    }
+
+    #[test]
+    fn cx_est_5_no_labels_upgrades() {
+        let refs = Some(r#"{"cx_est":5}"#.into());
+        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
+        assert_eq!(model, "claude-opus-4-7");
+        assert_eq!(effort, "high");
+    }
+
+    #[test]
+    fn cx_est_4_explicit_effort_label_no_upgrade() {
+        let refs = Some(r#"{"cx_est":4}"#.into());
+        let labels = r#"["effort:medium"]"#;
+        let (model, effort) =
+            resolve_worker_model_effort(Some(labels), &refs, "claude-opus-4-6", "medium");
+        assert_eq!(
+            model, "claude-opus-4-6",
+            "explicit label must prevent model upgrade"
+        );
+        assert_eq!(
+            effort, "medium",
+            "explicit effort:medium must win over cx_est"
+        );
+    }
+
+    #[test]
+    fn cx_est_4_explicit_tier_label_no_upgrade() {
+        let refs = Some(r#"{"cx_est":4}"#.into());
+        let labels = r#"["tier:opus-46"]"#;
+        let (model, effort) =
+            resolve_worker_model_effort(Some(labels), &refs, "claude-opus-4-7", "medium");
+        assert_eq!(model, "claude-opus-4-6", "explicit tier label must win");
+        assert_eq!(
+            effort, "medium",
+            "no effort upgrade when tier label present"
+        );
+    }
+
+    #[test]
+    fn cx_est_2_no_labels_no_upgrade() {
+        let refs = Some(r#"{"cx_est":2}"#.into());
+        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
+        assert_eq!(model, "claude-opus-4-6");
+        assert_eq!(effort, "medium");
+    }
+
+    #[test]
+    fn missing_cx_est_no_upgrade() {
+        let refs = Some(r#"{"pr":42}"#.into());
+        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
+        assert_eq!(model, "claude-opus-4-6");
+        assert_eq!(effort, "medium");
+    }
+
+    #[test]
+    fn no_refs_no_upgrade() {
+        let (model, effort) = resolve_worker_model_effort(None, &None, "claude-opus-4-6", "medium");
+        assert_eq!(model, "claude-opus-4-6");
+        assert_eq!(effort, "medium");
+    }
+
+    #[test]
+    fn malformed_refs_no_upgrade() {
+        let refs = Some("not json".into());
+        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
+        assert_eq!(model, "claude-opus-4-6");
+        assert_eq!(effort, "medium");
     }
 
     fn make_dummy_slot() -> SlotState {
