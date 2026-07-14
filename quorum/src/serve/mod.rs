@@ -2481,6 +2481,7 @@ async fn tick(
                                             &reviewers[ri].agent_name,
                                             pr,
                                             &workers[wi].agent_name,
+                                            &config.effort,
                                         );
                                         if let Err(e) =
                                             reviewers[ri].proc.feed_turn(&rereview_turn).await
@@ -4337,7 +4338,7 @@ async fn spawn_reviewer_for_worker(
     .await
     {
         Ok(mut proc) => {
-            let prompt = reviewer::build_review_prompt(&spec);
+            let prompt = reviewer::build_review_prompt(&spec, &config.effort);
             let turn1 = agent::user_turn(&prompt);
             if let Err(e) = proc.feed_turn(&turn1).await {
                 log(&format!("reviewer feed_turn failed: {e}"));
