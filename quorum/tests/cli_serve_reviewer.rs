@@ -16,6 +16,29 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
+/// Poll every worker/reviewer session log under `{home}/logs/*/stream.jsonl`
+/// for `needle` until it matches or the timeout elapses. Agent *text* is
+/// written to the per-session log, NOT echoed to daemon stderr, so agent
+/// output (like the fake-agent's "Fixing…" rework response) is observed here.
+fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> bool {
+    let logs = home.join("logs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(&logs) {
+            for entry in entries.flatten() {
+                let stream = entry.path().join("stream.jsonl");
+                if let Ok(content) = std::fs::read_to_string(&stream) {
+                    if content.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -397,9 +420,8 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     );
 
     assert!(
-        handle.wait_for("Fixing", 15),
-        "worker rework response not seen. Lines: {:?}",
-        handle.lines
+        wait_session_log(home.path(), "Fixing", 15),
+        "worker rework response not seen in session log"
     );
 
     // ── State assertions (F12) ──
@@ -862,9 +884,8 @@ fn rework_resignal_feeds_rereview_turn() {
         handle.lines
     );
     assert!(
-        handle.wait_for("Fixing", 15),
-        "worker rework response not seen. Lines: {:?}",
-        handle.lines
+        wait_session_log(home.path(), "Fixing", 15),
+        "worker rework response not seen in session log"
     );
 
     assert!(

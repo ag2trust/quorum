@@ -3864,30 +3864,22 @@ async fn drain_events(
             stream::Event::Assistant { message } => {
                 let content = message.get("content");
                 if let Some(blocks) = content.and_then(|c| c.as_array()) {
+                    // Agent text blocks are captured in the per-session log
+                    // (stream.jsonl + transcript.md); do NOT echo them to daemon
+                    // stderr — they drown real serve decisions/errors. Only
+                    // tool_use blocks update live stats here.
                     for block in blocks {
-                        match block.get("type").and_then(|t| t.as_str()) {
-                            Some("text") => {
-                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                                    let preview = truncate_preview(text);
-                                    log(&format!("{role} {}: {preview}", slot.agent_name));
-                                }
+                        if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
+                            if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                let input = block
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                slot.live_stats.tool_count += 1;
+                                slot.live_stats.now_label = now_label(name, &input);
                             }
-                            Some("tool_use") => {
-                                if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                                    let input = block
-                                        .get("input")
-                                        .cloned()
-                                        .unwrap_or(serde_json::Value::Null);
-                                    slot.live_stats.tool_count += 1;
-                                    slot.live_stats.now_label = now_label(name, &input);
-                                }
-                            }
-                            _ => {}
                         }
                     }
-                } else if let Some(text) = content.and_then(|c| c.as_str()) {
-                    let preview = truncate_preview(text);
-                    log(&format!("{role} {}: {preview}", slot.agent_name));
                 }
                 if let Some(usage) = message.get("usage") {
                     let input = usage
@@ -3935,15 +3927,6 @@ fn write_live_sidecar(slot: &SlotState) {
         if let Ok(json) = serde_json::to_string(&stats) {
             let _ = std::fs::write(&path, json);
         }
-    }
-}
-
-fn truncate_preview(text: &str) -> String {
-    if text.len() > 80 {
-        let end = text.char_indices().nth(80).map_or(text.len(), |(i, _)| i);
-        format!("{}…", &text[..end])
-    } else {
-        text.to_string()
     }
 }
 

@@ -142,6 +142,9 @@ impl BareServeHandle {
         }
     }
 
+    /// Wait for a daemon-decision line (e.g. "classifier: stored …") on serve's
+    /// stderr. NOTE: agent *text* is NOT on stderr — observe that via
+    /// `wait_session_log` / `session_log_contains` instead.
     fn wait_for(&mut self, needle: &str, timeout_secs: u64) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
         while std::time::Instant::now() < deadline {
@@ -169,6 +172,38 @@ impl BareServeHandle {
     }
 }
 
+/// Scan every worker/reviewer session log under `{home}/logs/*/stream.jsonl`
+/// for `needle`. Agent text (like the fake-agent's `[bare]` marker) is written
+/// to the per-session log, NOT echoed to daemon stderr — so this is where e2e
+/// tests must observe it.
+fn session_log_contains(home: &std::path::Path, needle: &str) -> bool {
+    let logs = home.join("logs");
+    let Ok(entries) = std::fs::read_dir(&logs) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let stream = entry.path().join("stream.jsonl");
+        if let Ok(content) = std::fs::read_to_string(&stream) {
+            if content.contains(needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Poll `session_log_contains` until it matches or the timeout elapses.
+fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if session_log_contains(home, needle) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 #[test]
 fn serve_passes_bare_to_agent_by_default() {
     let home = tempfile::tempdir().unwrap();
@@ -187,7 +222,7 @@ fn serve_passes_bare_to_agent_by_default() {
 
     seed_task(home.path(), "Test bare flag");
 
-    let mut handle = BareServeHandle::start(
+    let handle = BareServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
@@ -196,9 +231,8 @@ fn serve_passes_bare_to_agent_by_default() {
     );
 
     assert!(
-        handle.wait_for("[bare]", 15),
-        "agent turn-1 should contain [bare] when bare_agent is enabled (default). Lines: {:?}",
-        handle.lines
+        wait_session_log(home.path(), "[bare]", 15),
+        "agent turn-1 session log should contain [bare] when bare_agent is enabled (default)"
     );
 
     handle.stop();
@@ -222,7 +256,7 @@ fn serve_omits_bare_with_no_bare_agent_flag() {
 
     seed_task(home.path(), "Test no-bare flag");
 
-    let mut handle = BareServeHandle::start(
+    let handle = BareServeHandle::start(
         home.path(),
         repo_dir.path(),
         wt_base.path(),
@@ -230,19 +264,17 @@ fn serve_omits_bare_with_no_bare_agent_flag() {
         &["--no-bare-agent"],
     );
 
-    // Wait for the agent result (turn-1 completed)
+    // Sync on turn-1 landing in the session log (both variants emit the
+    // "Working on task..." prefix; only the bare variant appends "[bare]").
     assert!(
-        handle.wait_for("result", 15),
-        "agent should have produced a result event. Lines: {:?}",
-        handle.lines
+        wait_session_log(home.path(), "Working on task", 15),
+        "agent turn-1 should have landed in the session log"
     );
 
-    // The agent's turn-1 message should NOT contain [bare]
-    let has_bare = handle.lines.iter().any(|l| l.contains("[bare]"));
+    // The agent's turn-1 message must NOT contain [bare] under --no-bare-agent.
     assert!(
-        !has_bare,
-        "agent turn-1 should NOT contain [bare] with --no-bare-agent. Lines: {:?}",
-        handle.lines
+        !session_log_contains(home.path(), "[bare]"),
+        "agent turn-1 session log should NOT contain [bare] with --no-bare-agent"
     );
 
     handle.stop();
