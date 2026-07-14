@@ -175,6 +175,7 @@ pub struct Throughput {
 pub struct DaemonAgentView {
     pub agent: String,
     pub role: String,
+    pub sub_role: Option<String>,
     pub task_id: Option<i64>,
     pub phase: String,
     pub cost_tokens: i64,
@@ -917,9 +918,15 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
                 (0, None, None, None, 0)
             };
         let display_tokens = e.cost_tokens + mid_turn_tok;
+        let sub_role = if e.phase == "auditing" {
+            Some("r2".to_string())
+        } else {
+            None
+        };
         views.push(DaemonAgentView {
             agent: e.agent,
             role: e.role,
+            sub_role,
             task_id: e.task_id,
             phase: e.phase,
             cost_tokens: display_tokens,
@@ -2143,6 +2150,7 @@ mod tests {
         let worker = |age: Option<i64>| DaemonAgentView {
             agent: "W".into(),
             role: "worker".into(),
+            sub_role: None,
             task_id: Some(1),
             phase: "working".into(),
             cost_tokens: 0,
@@ -2180,6 +2188,7 @@ mod tests {
         DaemonAgentView {
             agent: format!("{role}-1"),
             role: role.into(),
+            sub_role: None,
             task_id: Some(1),
             phase: phase.into(),
             cost_tokens: 0,
@@ -2327,6 +2336,7 @@ mod tests {
         let view = DaemonAgentView {
             agent: "W1".into(),
             role: "worker".into(),
+            sub_role: None,
             task_id: Some(1),
             phase: "working".into(),
             cost_tokens: 500,
@@ -2353,6 +2363,7 @@ mod tests {
         let view = DaemonAgentView {
             agent: "W1".into(),
             role: "worker".into(),
+            sub_role: None,
             task_id: Some(1),
             phase: "awaiting-review".into(),
             cost_tokens: 500,

@@ -330,11 +330,26 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
     } else {
         String::new()
     };
+    let agent_label = if d.sub_role.as_deref() == Some("r2") {
+        format!("{}(r2)", d.agent)
+    } else {
+        d.agent.clone()
+    };
 
     let _ = writeln!(
         w,
         "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
-        dot, d.agent, eff_short, task_str, title, up, tok, tools, evm, now_display, rework_suffix,
+        dot,
+        agent_label,
+        eff_short,
+        task_str,
+        title,
+        up,
+        tok,
+        tools,
+        evm,
+        now_display,
+        rework_suffix,
     );
 }
 
@@ -345,18 +360,24 @@ fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write)
             .unwrap_or_else(|| "—".to_string())
     });
     let rev_tok = fmt_tokens(rev.cost_tokens);
+    let role_label = if rev.sub_role.as_deref() == Some("r2") {
+        "r2 audit"
+    } else {
+        "reviewer"
+    };
     let sub = if sty.color {
         format!(
-            "    {} reviewer  {} · {} · {} tok",
+            "    {} {}  {} · {} · {} tok",
             sty.dim("└"),
+            role_label,
             rev.agent,
             rev_up,
             rev_tok,
         )
     } else {
         format!(
-            "    +- reviewer  {} · {} · {} tok",
-            rev.agent, rev_up, rev_tok,
+            "    +- {}  {} · {} · {} tok",
+            role_label, rev.agent, rev_up, rev_tok,
         )
     };
     let _ = writeln!(w, "{sub}");
@@ -684,6 +705,7 @@ mod tests {
         s.daemon_agents.push(DaemonAgentView {
             agent: "W1".into(),
             role: "worker".into(),
+            sub_role: None,
             task_id: Some(1),
             phase: "working".into(),
             cost_tokens: 100,
@@ -774,6 +796,7 @@ mod tests {
         s.daemon_agents.push(DaemonAgentView {
             agent: "W1".into(),
             role: "worker".into(),
+            sub_role: None,
             task_id: Some(10),
             phase: "review".into(),
             cost_tokens: 40000,
@@ -793,6 +816,7 @@ mod tests {
         s.daemon_agents.push(DaemonAgentView {
             agent: "R1".into(),
             role: "reviewer".into(),
+            sub_role: None,
             task_id: Some(10),
             phase: "reviewing".into(),
             cost_tokens: 12000,
@@ -885,6 +909,7 @@ mod tests {
         s.daemon_agents.push(DaemonAgentView {
             agent: "R-solo".into(),
             role: "reviewer".into(),
+            sub_role: None,
             task_id: Some(50),
             phase: "reviewing".into(),
             cost_tokens: 8000,
@@ -920,6 +945,97 @@ mod tests {
         assert!(
             output.contains("1 working"),
             "header must count orphan reviewer: {output}"
+        );
+    }
+
+    #[test]
+    fn r2_auditor_shows_marker() {
+        let mut s = default_stats();
+        // Worker whose task is done — R2 auditor is orphan.
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "Keel-8z3a".into(),
+            role: "reviewer".into(),
+            sub_role: Some("r2".into()),
+            task_id: Some(85),
+            phase: "auditing".into(),
+            cost_tokens: 5000,
+            agent_state: None,
+            cost_usd: 0.06,
+            log_dir: None,
+            last_activity_age_secs: Some(10),
+            task_title: Some("merged task".into()),
+            tier_eff: Some("opus46·hi".into()),
+            pr: Some(3667),
+            rework_count: 0,
+            tool_count: 3,
+            now_label: None,
+            events_per_min: Some(4.0),
+            uptime_secs: Some(60),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("(r2)"),
+            "R2 auditor must show (r2) marker: {output}"
+        );
+        assert!(
+            output.contains("Keel-8z3a"),
+            "R2 auditor name must appear: {output}"
+        );
+    }
+
+    #[test]
+    fn r2_auditor_subrow_shows_r2_audit_label() {
+        let mut s = default_stats();
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "W1".into(),
+            role: "worker".into(),
+            sub_role: None,
+            task_id: Some(10),
+            phase: "working".into(),
+            cost_tokens: 1000,
+            agent_state: None,
+            cost_usd: 0.01,
+            log_dir: None,
+            last_activity_age_secs: Some(5),
+            task_title: Some("task".into()),
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
+        });
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "R2-aud".into(),
+            role: "reviewer".into(),
+            sub_role: Some("r2".into()),
+            task_id: Some(10),
+            phase: "auditing".into(),
+            cost_tokens: 2000,
+            agent_state: None,
+            cost_usd: 0.02,
+            log_dir: None,
+            last_activity_age_secs: Some(3),
+            task_title: None,
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 1,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: Some(30),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("r2 audit"),
+            "R2 reviewer subrow must show 'r2 audit' label: {output}"
         );
     }
 
