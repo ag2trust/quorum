@@ -187,6 +187,10 @@ fn orphan_worker_branch(author: &str, task_id: i64, review_only: bool) -> Option
 
 /// Map a tier label suffix to a full Claude model ID.
 /// Returns `None` (fall back to global default) for unknown tiers.
+pub fn tier_to_model_id_pub(tier: &str) -> Option<String> {
+    tier_to_model_id(tier)
+}
+
 fn tier_to_model_id(tier: &str) -> Option<String> {
     match tier {
         "opus-46" => Some("claude-opus-4-6".into()),
@@ -221,37 +225,73 @@ fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> String {
     MODEL_TIERS[final_rank].to_string()
 }
 
-fn escalate_model(current: &str) -> String {
-    match model_rank(current) {
-        Some(i) if i + 1 < MODEL_TIERS.len() => MODEL_TIERS[i + 1].into(),
-        _ => current.into(),
-    }
-}
-
 fn extract_cx_est(refs: &Option<String>) -> Option<i64> {
     let s = refs.as_deref()?;
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     v.get("cx_est")?.as_i64()
 }
 
-fn resolve_worker_model_effort(
-    labels_json: Option<&str>,
-    refs: &Option<String>,
-    default_model: &str,
-    default_effort: &str,
-) -> (String, String) {
-    let (label_model, label_effort) = labels_to_model_effort(labels_json);
-    if label_model.is_none() && label_effort.is_none() {
-        match extract_cx_est(refs) {
-            Some(cx) if cx >= 4 => (escalate_model(default_model), "high".into()),
-            _ => (default_model.into(), default_effort.into()),
-        }
-    } else {
-        (
-            label_model.unwrap_or_else(|| default_model.into()),
-            label_effort.unwrap_or_else(|| default_effort.into()),
-        )
+fn extract_complexity_label(labels_json: Option<&str>) -> Option<u8> {
+    let arr: Vec<String> = serde_json::from_str(labels_json?).ok()?;
+    arr.iter().find_map(|l| {
+        l.strip_prefix("complexity:")
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|&v| (1..=5).contains(&v))
+    })
+}
+
+fn effort_rank(effort: &str) -> u8 {
+    match effort {
+        "medium" => 1,
+        "high" => 2,
+        _ => 0,
     }
+}
+
+/// Default suggested (tier, effort) per complexity level.
+const SUGGESTED_DEFAULTS: [(u8, &str, &str); 5] = [
+    (1, "claude-sonnet-5", "medium"),
+    (2, "claude-opus-4-6", "medium"),
+    (3, "claude-opus-4-6", "high"),
+    (4, "claude-opus-4-7", "high"),
+    (5, "claude-opus-4-8", "high"),
+];
+
+fn suggested_for(
+    cx: u8,
+    overrides: &std::collections::HashMap<String, String>,
+) -> (String, String) {
+    if let Some(val) = overrides.get(&cx.to_string()) {
+        if let Some((tier, effort)) = val.split_once('/') {
+            if let Some(model) = tier_to_model_id(tier) {
+                if effort == "medium" || effort == "high" {
+                    return (model, effort.to_string());
+                }
+            }
+        }
+    }
+    SUGGESTED_DEFAULTS
+        .iter()
+        .find(|(level, _, _)| *level == cx)
+        .map(|(_, model, effort)| (model.to_string(), effort.to_string()))
+        .unwrap_or_else(|| ("claude-opus-4-6".into(), "medium".into()))
+}
+
+fn is_model_effort_below(
+    resolved_model: &str,
+    resolved_effort: &str,
+    suggested_model: &str,
+    suggested_effort: &str,
+) -> bool {
+    let r_rank = model_rank(resolved_model).unwrap_or(0);
+    let s_rank = model_rank(suggested_model).unwrap_or(0);
+    if r_rank < s_rank {
+        return true;
+    }
+    if r_rank == s_rank && effort_rank(resolved_effort) < effort_rank(suggested_effort) {
+        return true;
+    }
+    false
 }
 
 /// Extract model and effort overrides from a task's labels JSON.
@@ -410,6 +450,8 @@ pub struct ServeConfig {
     /// R2: when true, R2 misses with confidence>=70 block merge. Default: false.
     #[allow(dead_code)]
     pub r2_blocking: bool,
+    /// Per-complexity suggested model/effort overrides (keys "1".."5", values "tier/effort").
+    pub suggested_models: std::collections::HashMap<String, String>,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -4615,21 +4657,61 @@ async fn spawn_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let cx_before = extract_cx_est(&task.refs);
-    let (resolved_model, resolved_effort) = resolve_worker_model_effort(
-        task.labels.as_deref(),
-        &task.refs,
-        &config.model,
-        &config.effort,
-    );
-    if let Some(cx) = cx_before {
-        if cx >= 4 && resolved_model != config.model {
-            log(&format!(
-                "cx_est auto-upgrade: task #{} cx_est={} -> model={}, effort=high",
-                task.id, cx, resolved_model
-            ));
+    let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
+    let resolved_model = label_model.unwrap_or_else(|| config.model.clone());
+    let resolved_effort = label_effort.unwrap_or_else(|| config.effort.clone());
+
+    // Mismatch alert: complexity label > cx_est from refs > skip
+    let cx_source = extract_complexity_label(task.labels.as_deref())
+        .map(|cx| (cx, "label"))
+        .or_else(|| {
+            extract_cx_est(&task.refs)
+                .and_then(|v| u8::try_from(v).ok())
+                .map(|cx| (cx, "cx_est"))
+        });
+    if let Some((cx, source)) = cx_source {
+        let (sug_model, sug_effort) = suggested_for(cx, &config.suggested_models);
+        if is_model_effort_below(&resolved_model, &resolved_effort, &sug_model, &sug_effort) {
+            let alert_body = format!(
+                "model/effort mismatch: task #{} \"{}\" (creator: {}) — \
+                 complexity {} (source: {}), using {}/{}, suggested {}/{}",
+                task.id,
+                task.title,
+                task.author.as_deref().unwrap_or("unknown"),
+                cx,
+                source,
+                resolved_model,
+                resolved_effort,
+                sug_model,
+                sug_effort,
+            );
+            log(&format!("mismatch alert: {alert_body}"));
+            let p = db_path.clone();
+            let tid = task.id;
+            let body = alert_body.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&p)?;
+                let now = now_unix();
+                quorum_core::feed::post(
+                    &mut conn,
+                    "daemon",
+                    "alert",
+                    None,
+                    &body,
+                    None,
+                    Some("owner"),
+                    86400,
+                    now,
+                )?;
+                quorum_core::tasks::add_note(&mut conn, "daemon", tid, &body, now)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .ok();
         }
     }
+
     let spec = AgentSpec {
         model: resolved_model.clone(),
         effort: resolved_effort.clone(),
@@ -5578,95 +5660,222 @@ mod tests {
     }
 
     #[test]
-    fn escalate_model_one_tier_up() {
-        assert_eq!(escalate_model("claude-opus-4-6"), "claude-opus-4-7");
-        assert_eq!(escalate_model("claude-opus-4-7"), "claude-opus-4-8");
-    }
-
-    #[test]
-    fn escalate_model_at_top_stays() {
-        assert_eq!(escalate_model("claude-opus-4-8"), "claude-opus-4-8");
-    }
-
-    #[test]
-    fn escalate_model_unknown_stays() {
-        assert_eq!(escalate_model("claude-haiku-4-5"), "claude-haiku-4-5");
-    }
-
-    #[test]
-    fn cx_est_4_no_labels_upgrades() {
-        let refs = Some(r#"{"cx_est":4}"#.into());
-        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
-        assert_eq!(model, "claude-opus-4-7");
-        assert_eq!(effort, "high");
-    }
-
-    #[test]
-    fn cx_est_5_no_labels_upgrades() {
-        let refs = Some(r#"{"cx_est":5}"#.into());
-        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
-        assert_eq!(model, "claude-opus-4-7");
-        assert_eq!(effort, "high");
-    }
-
-    #[test]
-    fn cx_est_4_explicit_effort_label_no_upgrade() {
-        let refs = Some(r#"{"cx_est":4}"#.into());
-        let labels = r#"["effort:medium"]"#;
-        let (model, effort) =
-            resolve_worker_model_effort(Some(labels), &refs, "claude-opus-4-6", "medium");
+    fn extract_complexity_label_valid() {
         assert_eq!(
-            model, "claude-opus-4-6",
-            "explicit label must prevent model upgrade"
+            extract_complexity_label(Some(r#"["complexity:3"]"#)),
+            Some(3)
         );
         assert_eq!(
-            effort, "medium",
-            "explicit effort:medium must win over cx_est"
+            extract_complexity_label(Some(r#"["complexity:5","tier:opus-46"]"#)),
+            Some(5)
         );
     }
 
     #[test]
-    fn cx_est_4_explicit_tier_label_no_upgrade() {
-        let refs = Some(r#"{"cx_est":4}"#.into());
-        let labels = r#"["tier:opus-46"]"#;
-        let (model, effort) =
-            resolve_worker_model_effort(Some(labels), &refs, "claude-opus-4-7", "medium");
-        assert_eq!(model, "claude-opus-4-6", "explicit tier label must win");
+    fn extract_complexity_label_out_of_range() {
+        assert_eq!(extract_complexity_label(Some(r#"["complexity:0"]"#)), None);
+        assert_eq!(extract_complexity_label(Some(r#"["complexity:6"]"#)), None);
         assert_eq!(
-            effort, "medium",
-            "no effort upgrade when tier label present"
+            extract_complexity_label(Some(r#"["complexity:bad"]"#)),
+            None
+        );
+        assert_eq!(extract_complexity_label(None), None);
+    }
+
+    #[test]
+    fn suggested_for_defaults() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            suggested_for(1, &empty),
+            ("claude-sonnet-5".into(), "medium".into())
+        );
+        assert_eq!(
+            suggested_for(4, &empty),
+            ("claude-opus-4-7".into(), "high".into())
+        );
+        assert_eq!(
+            suggested_for(5, &empty),
+            ("claude-opus-4-8".into(), "high".into())
         );
     }
 
     #[test]
-    fn cx_est_2_no_labels_no_upgrade() {
-        let refs = Some(r#"{"cx_est":2}"#.into());
-        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
-        assert_eq!(model, "claude-opus-4-6");
-        assert_eq!(effort, "medium");
+    fn suggested_for_override() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("3".into(), "opus-48/high".into());
+        assert_eq!(
+            suggested_for(3, &m),
+            ("claude-opus-4-8".into(), "high".into())
+        );
+        // non-overridden key still uses default
+        assert_eq!(
+            suggested_for(1, &m),
+            ("claude-sonnet-5".into(), "medium".into())
+        );
     }
 
     #[test]
-    fn missing_cx_est_no_upgrade() {
-        let refs = Some(r#"{"pr":42}"#.into());
-        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
-        assert_eq!(model, "claude-opus-4-6");
-        assert_eq!(effort, "medium");
+    fn is_model_effort_below_detects_mismatch() {
+        assert!(is_model_effort_below(
+            "claude-opus-4-6",
+            "medium",
+            "claude-opus-4-7",
+            "high"
+        ));
+        assert!(is_model_effort_below(
+            "claude-opus-4-7",
+            "medium",
+            "claude-opus-4-7",
+            "high"
+        ));
+        assert!(is_model_effort_below(
+            "claude-sonnet-5",
+            "high",
+            "claude-opus-4-6",
+            "medium"
+        ));
     }
 
     #[test]
-    fn no_refs_no_upgrade() {
-        let (model, effort) = resolve_worker_model_effort(None, &None, "claude-opus-4-6", "medium");
-        assert_eq!(model, "claude-opus-4-6");
-        assert_eq!(effort, "medium");
+    fn is_model_effort_below_no_mismatch_when_at_or_above() {
+        assert!(!is_model_effort_below(
+            "claude-opus-4-7",
+            "high",
+            "claude-opus-4-7",
+            "high"
+        ));
+        assert!(!is_model_effort_below(
+            "claude-opus-4-8",
+            "medium",
+            "claude-opus-4-7",
+            "high"
+        ));
+        assert!(!is_model_effort_below(
+            "claude-opus-4-7",
+            "high",
+            "claude-opus-4-6",
+            "medium"
+        ));
     }
 
     #[test]
-    fn malformed_refs_no_upgrade() {
-        let refs = Some("not json".into());
-        let (model, effort) = resolve_worker_model_effort(None, &refs, "claude-opus-4-6", "medium");
-        assert_eq!(model, "claude-opus-4-6");
-        assert_eq!(effort, "medium");
+    fn effort_rank_ordering() {
+        assert!(effort_rank("medium") < effort_rank("high"));
+        assert_eq!(effort_rank("unknown"), 0);
+    }
+
+    fn test_db() -> (rusqlite::Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        (conn, dir)
+    }
+
+    #[test]
+    fn mismatch_alert_posts_feed_and_note() {
+        let (mut conn, _dir) = test_db();
+        let now = 1000;
+        // Create a task to attach the note to
+        quorum_core::tasks::create(
+            &mut conn,
+            "tester",
+            "test task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        let tasks = quorum_core::tasks::list(&conn, None, None, None).unwrap();
+        let tid = tasks[0].id;
+
+        let body =
+            "model/effort mismatch: task #1 cx=4 using opus-4-6/medium, suggested opus-4-7/high";
+        quorum_core::feed::post(
+            &mut conn,
+            "daemon",
+            "alert",
+            None,
+            body,
+            None,
+            Some("owner"),
+            86400,
+            now,
+        )
+        .unwrap();
+        quorum_core::tasks::add_note(&mut conn, "daemon", tid, body, now).unwrap();
+
+        // Verify alert message in feed (read as "owner" — the recipient)
+        let msgs = quorum_core::feed::read(
+            &mut conn,
+            "owner",
+            None,
+            None,
+            quorum_core::feed::ReadFilter::All,
+            10,
+            now,
+        )
+        .unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind, "alert");
+        assert!(msgs[0].body.contains("mismatch"));
+
+        // Verify task note
+        let detail = quorum_core::tasks::get_with_notes(&conn, tid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.notes.len(), 1);
+        assert!(detail.notes[0].body.contains("mismatch"));
+    }
+
+    #[test]
+    fn cx_label_mismatch_detected_cx_est_no_upgrade() {
+        // cx_est=5, no labels -> resolved stays at config default, NOT upgraded
+        let labels: Option<&str> = None;
+        let (label_model, label_effort) = labels_to_model_effort(labels);
+        let config_model = "claude-opus-4-6";
+        let config_effort = "medium";
+        let resolved_model = label_model.unwrap_or_else(|| config_model.into());
+        let resolved_effort = label_effort.unwrap_or_else(|| config_effort.into());
+
+        // Verify: resolved is config default (revert proof)
+        assert_eq!(resolved_model, "claude-opus-4-6");
+        assert_eq!(resolved_effort, "medium");
+
+        // Mismatch should be detected
+        let empty = std::collections::HashMap::new();
+        let (sug_model, sug_effort) = suggested_for(5, &empty);
+        assert!(
+            is_model_effort_below(&resolved_model, &resolved_effort, &sug_model, &sug_effort),
+            "cx 5 on opus-4-6/medium should trigger mismatch alert"
+        );
+    }
+
+    #[test]
+    fn cx_label_4_explicit_tier_high_no_alert() {
+        let labels = Some(r#"["tier:opus-47","effort:high","complexity:4"]"#);
+        let (label_model, label_effort) = labels_to_model_effort(labels);
+        let resolved_model = label_model.unwrap_or_else(|| "claude-opus-4-6".into());
+        let resolved_effort = label_effort.unwrap_or_else(|| "medium".into());
+
+        let empty = std::collections::HashMap::new();
+        let (sug_model, sug_effort) = suggested_for(4, &empty);
+        assert!(
+            !is_model_effort_below(&resolved_model, &resolved_effort, &sug_model, &sug_effort),
+            "explicit tier:opus-47 effort:high should not trigger mismatch for cx 4"
+        );
+    }
+
+    #[test]
+    fn cx_2_default_no_alert() {
+        let empty = std::collections::HashMap::new();
+        let (sug_model, sug_effort) = suggested_for(2, &empty);
+        assert!(
+            !is_model_effort_below("claude-opus-4-6", "medium", &sug_model, &sug_effort),
+            "cx 2 on opus-4-6/medium matches suggestion, no alert"
+        );
     }
 
     fn make_dummy_slot() -> SlotState {

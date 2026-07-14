@@ -1119,6 +1119,20 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(0.10);
             let r_r2_blocking = file_cfg.r2_blocking.unwrap_or(false);
 
+            let r_suggested_models = file_cfg.suggested_models.unwrap_or_default();
+            for (k, v) in &r_suggested_models {
+                let valid_key = matches!(k.as_str(), "1" | "2" | "3" | "4" | "5");
+                let valid_val = v.split_once('/').is_some_and(|(tier, effort)| {
+                    serve::tier_to_model_id_pub(tier).is_some()
+                        && (effort == "medium" || effort == "high")
+                });
+                if !valid_key || !valid_val {
+                    return Err(QuorumError::Usage(format!(
+                        "bad suggested_models entry: {k} = \"{v}\" (expected key 1-5, value \"tier/effort\")"
+                    )));
+                }
+            }
+
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
                 config_path: config_path_used.as_deref(),
@@ -1224,6 +1238,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
                 r2_blocking: r_r2_blocking,
+                suggested_models: r_suggested_models,
             };
             Ok(serve::run_serve(config)?)
         }
