@@ -132,13 +132,24 @@ fn watch_status(online_window: i64) -> Result<()> {
     loop {
         let now = quorum_core::clock::now();
         let conn = quorum_core::db::open(&paths::db_path()?)?;
-        let s = quorum_core::stats::stats(&conn, now, online_window)?;
+        let mut s = quorum_core::stats::stats(&conn, now, online_window)?;
+        s.daemon = quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
         drop(conn); // close before sleeping; do not hold across ticks
         print!("\x1b[H\x1b[J");
         cockpit::render(&s);
         std::io::Write::flush(&mut std::io::stdout()).ok();
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
+}
+
+const DAEMON_STALE_SECS: i64 = 30;
+
+fn pid_is_alive(pid: i64) -> bool {
+    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if ret == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Reject a negative numeric flag value (fail loud per the input-validation principle).
@@ -716,7 +727,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 Ok(0)
             } else {
                 let conn = quorum_core::db::open(&paths::db_path()?)?;
-                let s = quorum_core::stats::stats(&conn, now, cfg.online_window_secs)?;
+                let mut s = quorum_core::stats::stats(&conn, now, cfg.online_window_secs)?;
+                s.daemon = quorum_core::daemon_lock::liveness(
+                    &conn,
+                    now,
+                    DAEMON_STALE_SECS,
+                    pid_is_alive,
+                )?;
                 if json {
                     output::emit(&s);
                 } else {

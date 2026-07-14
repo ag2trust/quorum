@@ -230,6 +230,23 @@ pub struct AlertMessage {
     pub kind: String,
 }
 
+/// Daemon liveness snapshot read from `daemon_lock`.
+/// Populated by the binary crate (which owns the pid-alive syscall).
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Default)]
+pub enum DaemonLiveness {
+    #[default]
+    /// No row in daemon_lock — daemon has never started.
+    None,
+    /// Daemon alive: heartbeat fresh AND pid exists.
+    Alive { pid: i64, heartbeat_age_secs: i64 },
+    /// Daemon stale: heartbeat old or pid dead.
+    Stale {
+        pid: i64,
+        heartbeat_age_secs: i64,
+        pid_dead: bool,
+    },
+}
+
 /// Health verdict for the status header.
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default)]
 pub enum HealthVerdict {
@@ -289,6 +306,8 @@ pub struct Stats {
     pub twin_prs: Vec<crate::drift::TwinPr>,
     /// #88: owner-alert feed messages (kind = alert/critical), visible in ALERTS cockpit section.
     pub alerts: Vec<AlertMessage>,
+    /// #115: daemon liveness from daemon_lock (populated by binary crate).
+    pub daemon: DaemonLiveness,
 }
 
 /// Gather a snapshot. Read-only.
@@ -405,6 +424,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         unbacked_prs,
         twin_prs,
         alerts,
+        daemon: DaemonLiveness::default(),
     })
 }
 

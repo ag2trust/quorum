@@ -1,7 +1,7 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    AlertMessage, BlockedTask, DaemonAgentView, DedupedError, HealthVerdict, PipelineTask,
-    QueueTask, Stats,
+    AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DedupedError, HealthVerdict,
+    PipelineTask, QueueTask, Stats,
 };
 use std::io::Write;
 
@@ -174,6 +174,50 @@ fn render_header(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         "-".repeat(width)
     };
     let _ = writeln!(w, " {rule}");
+
+    let daemon_str = match &s.daemon {
+        DaemonLiveness::None => "daemon: none".to_string(),
+        DaemonLiveness::Alive {
+            pid,
+            heartbeat_age_secs,
+        } => {
+            format!(
+                "daemon: pid {} alive, heartbeat {}s ago",
+                pid, heartbeat_age_secs
+            )
+        }
+        DaemonLiveness::Stale {
+            pid,
+            heartbeat_age_secs,
+            pid_dead,
+        } => {
+            let age = fmt_age(*heartbeat_age_secs);
+            let reason = if *pid_dead {
+                format!(", pid {} dead", pid)
+            } else {
+                String::new()
+            };
+            format!("daemon: STALE — heartbeat {} ago{}", age, reason)
+        }
+    };
+    let daemon_line = match &s.daemon {
+        DaemonLiveness::None => sty.dim(&daemon_str),
+        DaemonLiveness::Alive { .. } => {
+            if sty.color {
+                sty.green(&daemon_str)
+            } else {
+                daemon_str
+            }
+        }
+        DaemonLiveness::Stale { .. } => {
+            if sty.color {
+                sty.red(&daemon_str)
+            } else {
+                daemon_str
+            }
+        }
+    };
+    let _ = writeln!(w, " {daemon_line}");
 
     let worker_task_ids: std::collections::HashSet<i64> = s
         .daemon_agents
@@ -950,6 +994,56 @@ mod tests {
         assert!(
             output.contains("!!"),
             "critical alert should show !!: {output}"
+        );
+    }
+
+    #[test]
+    fn daemon_none_renders() {
+        let s = default_stats();
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("daemon: none"),
+            "expected 'daemon: none': {output}"
+        );
+    }
+
+    #[test]
+    fn daemon_alive_renders() {
+        let mut s = default_stats();
+        s.daemon = DaemonLiveness::Alive {
+            pid: 12345,
+            heartbeat_age_secs: 4,
+        };
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("daemon: pid 12345 alive, heartbeat 4s ago"),
+            "expected alive line: {output}"
+        );
+    }
+
+    #[test]
+    fn daemon_stale_renders() {
+        let mut s = default_stats();
+        s.daemon = DaemonLiveness::Stale {
+            pid: 99999,
+            heartbeat_age_secs: 720,
+            pid_dead: true,
+        };
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("daemon: STALE")
+                && output.contains("12m ago")
+                && output.contains("pid 99999 dead"),
+            "expected stale line: {output}"
         );
     }
 }

@@ -75,6 +75,50 @@ pub fn refresh(conn: &Connection, pid: i64, now: i64) -> Result<usize> {
     Ok(n)
 }
 
+/// Read the current lock row without taking the write lock.
+/// Returns `None` when the table is empty (no daemon has ever started).
+pub fn peek(conn: &Connection) -> Result<Option<(i64, i64)>> {
+    let row = conn
+        .query_row(
+            "SELECT pid, heartbeat_at FROM daemon_lock WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Read daemon_lock and compute liveness. Same check `try_acquire` uses for
+/// takeover: heartbeat < stale_secs AND pid alive via the caller's closure.
+/// Pure read — does not take the write lock or bump last_seen.
+pub fn liveness(
+    conn: &Connection,
+    now: i64,
+    stale_secs: i64,
+    is_pid_alive: impl Fn(i64) -> bool,
+) -> Result<crate::stats::DaemonLiveness> {
+    use crate::stats::DaemonLiveness;
+    match peek(conn)? {
+        None => Ok(DaemonLiveness::None),
+        Some((pid, heartbeat_at)) => {
+            let age = now - heartbeat_at;
+            let alive = is_pid_alive(pid);
+            if alive && age <= stale_secs {
+                Ok(DaemonLiveness::Alive {
+                    pid,
+                    heartbeat_age_secs: age,
+                })
+            } else {
+                Ok(DaemonLiveness::Stale {
+                    pid,
+                    heartbeat_age_secs: age,
+                    pid_dead: !alive,
+                })
+            }
+        }
+    }
+}
+
 /// Release the lock on clean shutdown.
 pub fn release(conn: &Connection, pid: i64) -> Result<()> {
     conn.execute(
@@ -259,5 +303,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hb, 1000); // unchanged
+    }
+
+    #[test]
+    fn peek_empty_returns_none() {
+        let (_d, c) = open_tmp();
+        assert_eq!(peek(&c).unwrap(), None);
+    }
+
+    #[test]
+    fn peek_returns_pid_and_heartbeat() {
+        let (_d, mut c) = open_tmp();
+        try_acquire(&mut c, 42, 9000, STALE, |_| true).unwrap();
+        assert_eq!(peek(&c).unwrap(), Some((42, 9000)));
+    }
+
+    #[test]
+    fn liveness_empty_is_none() {
+        use crate::stats::DaemonLiveness;
+        let (_d, c) = open_tmp();
+        let l = liveness(&c, 1000, STALE, |_| true).unwrap();
+        assert_eq!(l, DaemonLiveness::None);
+    }
+
+    #[test]
+    fn liveness_alive() {
+        use crate::stats::DaemonLiveness;
+        let (_d, mut c) = open_tmp();
+        try_acquire(&mut c, 42, 1000, STALE, |_| true).unwrap();
+        let l = liveness(&c, 1004, STALE, |_| true).unwrap();
+        assert_eq!(
+            l,
+            DaemonLiveness::Alive {
+                pid: 42,
+                heartbeat_age_secs: 4
+            }
+        );
+    }
+
+    #[test]
+    fn liveness_stale_heartbeat() {
+        use crate::stats::DaemonLiveness;
+        let (_d, mut c) = open_tmp();
+        try_acquire(&mut c, 42, 1000, STALE, |_| true).unwrap();
+        let l = liveness(&c, 1000 + STALE + 1, STALE, |_| true).unwrap();
+        assert_eq!(
+            l,
+            DaemonLiveness::Stale {
+                pid: 42,
+                heartbeat_age_secs: STALE + 1,
+                pid_dead: false
+            }
+        );
+    }
+
+    #[test]
+    fn liveness_dead_pid() {
+        use crate::stats::DaemonLiveness;
+        let (_d, mut c) = open_tmp();
+        try_acquire(&mut c, 42, 1000, STALE, |_| true).unwrap();
+        let l = liveness(&c, 1004, STALE, |_| false).unwrap();
+        assert_eq!(
+            l,
+            DaemonLiveness::Stale {
+                pid: 42,
+                heartbeat_age_secs: 4,
+                pid_dead: true
+            }
+        );
     }
 }
