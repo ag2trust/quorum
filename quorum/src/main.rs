@@ -118,6 +118,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Tail { .. } => "tail",
         cli::Command::Perf { .. } => "perf",
         cli::Command::Classify { .. } => "classify",
+        cli::Command::TaskClose { .. } => "task-close",
         cli::Command::Kill { .. } => "kill",
         cli::Command::ReviewInterpret { .. } => "review-interpret",
         cli::Command::Upgrade { .. } => "upgrade",
@@ -951,6 +952,33 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
+        }
+        cli::Command::TaskClose {
+            agent,
+            task_id,
+            reason_stdin,
+            reason_file,
+        } => {
+            let reason = read_optional_body(reason_stdin, reason_file)?.ok_or_else(|| {
+                QuorumError::Usage(
+                    "--reason-stdin or --reason-file is required for `task-close`".into(),
+                )
+            })?;
+            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            match quorum_core::tasks::close_manual(&mut conn, &agent, task_id, &reason, now)? {
+                Some(task) => {
+                    let compact = quorum_core::tasks::TaskCompact::from(&task);
+                    output::emit(&compact);
+                    Ok(0)
+                }
+                None => {
+                    output::emit(&serde_json::json!({
+                        "ok": false,
+                        "reason": "task not found or already terminal",
+                    }));
+                    Ok(1)
+                }
+            }
         }
         cli::Command::Kill {
             agent,

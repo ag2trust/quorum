@@ -564,6 +564,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Explicitly close a task from any non-terminal state, with a required reason.
+    /// For manual/external resolution (merged by hand, fixed elsewhere, obsolete).
+    /// Sets the task to `done` but emits a `task_closed_manual` event (never
+    /// `task_done`), so the audit log distinguishes manual closes from the
+    /// reviewed+merged lifecycle. Reason via --reason-stdin or --reason-file.
+    TaskClose {
+        #[arg(long)]
+        agent: String,
+        #[arg(long = "task-id")]
+        task_id: i64,
+        #[arg(long = "reason-stdin")]
+        reason_stdin: bool,
+        #[arg(long = "reason-file")]
+        reason_file: Option<PathBuf>,
+    },
     /// Hard-terminate a daemon-managed agent. Writes a kill request to the
     /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,
     /// releases the slot, and runs the post-mortem ladder on any held task.

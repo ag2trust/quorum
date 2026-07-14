@@ -867,6 +867,49 @@ pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -
     Ok(true)
 }
 
+// ── close_manual ─────────────────────────────────────────────────────────────
+
+pub fn close_manual(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<Option<Task>> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let n = tx.execute(
+        "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
+         WHERE id=?1 AND status NOT IN ('done', 'failed', 'cancelled')",
+        params![id, now],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    deactivate_lease(&tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
+        params![id, now, agent, format!("manually closed: {reason}")],
+    )?;
+    crate::events::emit(
+        &tx,
+        "task_closed_manual",
+        &lease_target(id),
+        &format!("by {agent}: {reason}"),
+        now,
+    )?;
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
+    tx.commit()?;
+    Ok(Some(task))
+}
+
 // ── list / get / notes ────────────────────────────────────────────────────────
 
 pub fn list(
@@ -1940,6 +1983,65 @@ mod tests {
         close_after_merge(&mut c, id, "merged", 1001).unwrap();
         let changed = close_after_merge(&mut c, id, "merged", 1002).unwrap();
         assert!(!changed, "already done — should be idempotent");
+    }
+
+    // ── close_manual ────────────────────────────────────────────────────────
+
+    #[test]
+    fn close_manual_from_working() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        let t = close_manual(&mut c, "owner", id, "fixed elsewhere", 1001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.status, "done");
+        assert!(t.assignee.is_none());
+        assert!(!has_live_lease(&c, id, 1001));
+        // Verify note was appended
+        let td = get_with_notes(&c, id).unwrap().unwrap();
+        assert!(td.notes.iter().any(|n| n.body.contains("fixed elsewhere")));
+    }
+
+    #[test]
+    fn close_manual_from_open() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        let t = close_manual(&mut c, "owner", id, "obsolete", 1001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.status, "done");
+    }
+
+    #[test]
+    fn close_manual_already_terminal_is_none() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        cancel(&mut c, "A", id, 1001).unwrap();
+        assert!(
+            close_manual(&mut c, "owner", id, "too late", 1002)
+                .unwrap()
+                .is_none(),
+            "already cancelled — should return None"
+        );
+    }
+
+    #[test]
+    fn close_manual_emits_distinct_event() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        close_manual(&mut c, "owner", id, "merged by hand", 1001).unwrap();
+        let events = crate::events::list(&c, 0, Some(&lease_target(id)), 100, 2000).unwrap();
+        assert!(
+            events.iter().any(|e| e.kind == "task_closed_manual"),
+            "must emit task_closed_manual event"
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "task_done" && e.ts == 1001),
+            "must NOT emit task_done"
+        );
     }
 
     // ── notes ───────────────────────────────────────────────────────────────
