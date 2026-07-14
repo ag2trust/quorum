@@ -149,7 +149,12 @@ for the captured session.
    test first for the atomicity/TTL/migration invariants (they're easy to get subtly wrong,
    hard to debug later). **Evidence before assertions:** never claim "passing"/"fixed"
    without pasting the actual command output. If tests fail, say so with the output; if a
-   step was skipped, say that.
+   step was skipped, say that. This extends to diagnoses: any mechanism claim ("X happens
+   because Y") must cite a `file:line` or a DB row, and any proposed fix must cite the code
+   path where the behavior is missing — if you can't point at where it should be and isn't,
+   you haven't read the path. Separate **Verified** (with citations) from **Hypothesis**
+   (unproven) in every diagnosis; the 2026-07-14 "zombie worker" misdiagnosis shipped correct
+   DB facts and an invented mechanism in one confidence tone (see Gotchas).
 6. **Grep before you code; copy working patterns.** Match the surrounding code's idiom,
    naming, and comment density rather than inventing a new style.
 7. **No over-claims** — in docs, `--help`, or commit messages. Say what it does, not what it
@@ -329,6 +334,11 @@ A short or "all-green" test summary may be RTK hiding the failures.
   the state machine), `quorum task-close --reason-stdin` (manual/external terminal close with
   distinct `task_closed_manual` audit event), and the `done` state itself (set only by the
   system after approve + merge). See `quorum help` for the canonical surface.
+- **An agent shown in WORKING after its task merged is usually the R2 auditor, not a
+  zombie.** `maybe_spawn_r2` deliberately spawns the shadow auditor *after* merge; the
+  worker itself is killed synchronously in the merge-success path (`cleanup_slot` →
+  `kill_and_reap`). Check `agent_runs.sub_role` (`r2`) and `end_reason` (`r2-done`) before
+  diagnosing a leak — quorum task #116 tracks labeling these in the cockpit.
 
 ## Design notes & known limitations (v1)
 
