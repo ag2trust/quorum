@@ -2309,7 +2309,34 @@ async fn tick(
                 ));
             }
 
-            if let Some(pr) = row.pr {
+            // #101: resolve PR — prefer explicit row.pr, fall back to
+            // task refs so a done-without-`--pr` doesn't silently close
+            // a task whose refs already carry a PR number.
+            let effective_pr = if row.pr.is_some() {
+                row.pr
+            } else {
+                let p = db_path.clone();
+                let tid = workers[wi].task_id;
+                let refs_pr = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    let task = tasks::get(&conn, tid)?;
+                    Ok(task.and_then(|t| tasks::extract_pr_number(&t.refs)))
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten();
+                if let Some(pr) = refs_pr {
+                    log(&format!(
+                        "BACKFILL: worker {} done without --pr but task #{} refs carry \
+                         pr#{} — routing to review flow",
+                        workers[wi].agent_name, workers[wi].task_id, pr
+                    ));
+                }
+                refs_pr
+            };
+
+            if let Some(pr) = effective_pr {
                 // Fire the appropriate lifecycle event based on whether
                 // this is the first done signal or a rework-pushed.
                 let event = if workers[wi].rework_count > 0 {

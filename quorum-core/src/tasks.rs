@@ -2820,4 +2820,66 @@ mod tests {
             "auto-select claim must also preserve original author"
         );
     }
+
+    // #101: a working task whose refs carry a PR must NOT be direct-closed
+    // when the done signal omits --pr. The daemon must extract the PR from
+    // refs and route through the review lifecycle instead.
+    #[test]
+    fn done_without_pr_flag_must_not_close_task_with_refs_pr() {
+        let (_dir, mut c) = open_tmp();
+
+        // Create and claim a task with refs containing pr:343.
+        let id = create(
+            &mut c,
+            "system",
+            "review task with PR",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":343}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+
+        claim(&mut c, "worker-1", Some(id), &[], TTL, 1001).unwrap();
+
+        // Verify extract_pr_number finds the PR in refs.
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(
+            extract_pr_number(&task.refs),
+            Some(343),
+            "refs.pr must be extractable for backfill"
+        );
+
+        // The lifecycle transition for SignaledDone must produce in-review,
+        // not a terminal state — proving direct-close is wrong here.
+        let view = crate::lifecycle::TaskView {
+            status: crate::lifecycle::Status::Working,
+            author: Some("worker-1".into()),
+            reviewer: None,
+            rework_round: 0,
+            pr: Some("343".into()),
+            review_only: false,
+        };
+        let (new_status, _effects) = crate::lifecycle::transition(
+            &view,
+            &crate::lifecycle::Event::SignaledDone { pr: "343".into() },
+        )
+        .unwrap();
+        assert_eq!(
+            new_status,
+            crate::lifecycle::Status::InReview,
+            "working task with PR must transition to in-review, not be direct-closed"
+        );
+
+        // Negative assertion: close_after_merge on a working task would
+        // incorrectly skip the review lifecycle.
+        assert_eq!(task.status, "working");
+        assert!(
+            extract_pr_number(&task.refs).is_some(),
+            "daemon must check refs before direct-closing"
+        );
+    }
 }
