@@ -31,6 +31,9 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
                                                                #   surfaced through `log --refs pr#N` + creator sync (#62).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
                                                                # --verdict approve|changes: reviewer verdict (lifecycle transition).
+  quorum task-close --agent <id> --task-id <n> --reason-stdin   # manual/external terminal close (merged by hand, fixed elsewhere,
+                                                               # obsolete). Emits `task_closed_manual` event — NEVER `task_done`.
+                                                               # Owner/manual use; agents finishing work must use `quorum done`.
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
                                                                # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
@@ -59,7 +62,7 @@ FEED (agent-to-agent messages)
   quorum read [--since <seq>] [--limit N]                              # without --agent: inspect without cursor (no ack)
 
 EVENT LOG (auto-emitted state-change ticker; SEPARATE from messages)
-  quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/reclaimed/renewed
+  quorum log [--since <seq>] [--refs <subject>] [--limit N]            # task_created/claimed/done/released/cancelled/closed_manual/reclaimed/renewed
                                                                        # claim_taken/released/renewed. --refs filters: task#<id>, pr#<n>, etc.
   # read/post (FEED) = agent-to-agent MESSAGES you author. log (EVENT LOG) = state-changes the
   # SYSTEM auto-emits. Two streams, two cursors — `read` never surfaces `log` events and vice

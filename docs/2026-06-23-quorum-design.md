@@ -263,6 +263,11 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-claim --agent <id> --task-id <n>` (on an `in-review` task) → fires
   `ReviewerAttached { agent }`, sets reviewer. **Guard:** agent must differ from author.
 - `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events.
+- `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
+  manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
+  non-terminal state; reason REQUIRED. Sets `done` but emits `task_closed_manual` event
+  (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
+  agents finishing work must use `quorum done`.
 - `quorum task-list [--status <s>] [--label <l>] [--assignee <id>]` (read-filtered)
 - `quorum task-get --task-id <n>`
 
