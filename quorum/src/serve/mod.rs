@@ -2313,27 +2313,44 @@ async fn tick(
             // task refs so a done-without-`--pr` doesn't silently close
             // a task whose refs already carry a PR number.
             let effective_pr = if row.pr.is_some() {
-                row.pr
+                Ok(row.pr)
             } else {
                 let p = db_path.clone();
                 let tid = workers[wi].task_id;
-                let refs_pr = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+                let result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
                     let conn = quorum_core::db::open(&p)?;
                     let task = tasks::get(&conn, tid)?;
                     Ok(task.and_then(|t| tasks::extract_pr_number(&t.refs)))
                 })
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten();
-                if let Some(pr) = refs_pr {
-                    log(&format!(
-                        "BACKFILL: worker {} done without --pr but task #{} refs carry \
-                         pr#{} — routing to review flow",
-                        workers[wi].agent_name, workers[wi].task_id, pr
-                    ));
+                .await;
+                match result {
+                    Ok(Ok(pr)) => {
+                        if let Some(n) = pr {
+                            log(&format!(
+                                "BACKFILL: worker {} done without --pr but task #{} refs \
+                                 carry pr#{} — routing to review flow",
+                                workers[wi].agent_name, workers[wi].task_id, n
+                            ));
+                        }
+                        Ok(pr)
+                    }
+                    Ok(Err(e)) => Err(format!("DB error loading refs for task #{tid}: {e}")),
+                    Err(e) => Err(format!("spawn_blocking join error for task #{tid}: {e}")),
                 }
-                refs_pr
+            };
+
+            // DB error during refs lookup — log loudly, leave mailbox row
+            // unconsumed so next tick retries. Never fall through to direct-close.
+            let effective_pr = match effective_pr {
+                Ok(pr) => pr,
+                Err(msg) => {
+                    log(&format!(
+                        "ERROR: refs backfill lookup failed for worker {} — \
+                         skipping done processing (will retry): {msg}",
+                        workers[wi].agent_name
+                    ));
+                    break;
+                }
             };
 
             if let Some(pr) = effective_pr {
