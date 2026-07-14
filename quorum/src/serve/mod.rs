@@ -202,6 +202,25 @@ fn tier_to_model_id(tier: &str) -> Option<String> {
     }
 }
 
+const MODEL_TIERS: &[&str] = &[
+    "claude-sonnet-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+];
+
+fn model_rank(model: &str) -> Option<usize> {
+    MODEL_TIERS.iter().position(|&m| m == model)
+}
+
+fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> String {
+    let worker_rank = model_rank(worker_model).unwrap_or(0);
+    let config_rank = model_rank(config_model).unwrap_or(0);
+    let escalated = (worker_rank + 1).min(MODEL_TIERS.len() - 1);
+    let final_rank = escalated.max(config_rank);
+    MODEL_TIERS[final_rank].to_string()
+}
+
 /// Extract model and effort overrides from a task's labels JSON.
 ///
 /// Labels like `tier:opus-46` map to model `claude-opus-4-6`; `effort:high` maps to effort `high`.
@@ -4198,6 +4217,29 @@ async fn spawn_reviewer_for_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
+    let reviewer_model = {
+        let p = config.db_path.clone();
+        let tid = worker.task_id;
+        let cfg_model = config.model.clone();
+        tokio::task::spawn_blocking(move || -> String {
+            let worker_model = quorum_core::db::open(&p)
+                .ok()
+                .and_then(|conn| {
+                    quorum_core::agent_runs::worker_model(&conn, tid)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_else(|| cfg_model.clone());
+            escalated_reviewer_model(&worker_model, &cfg_model)
+        })
+        .await
+        .unwrap_or_else(|_| config.model.clone())
+    };
+    log(&format!(
+        "reviewer model escalated to {reviewer_model} for task {}",
+        worker.task_id
+    ));
+
     let spec = reviewer::ReviewerSpec {
         pr,
         worker_agent: worker.agent_name.to_string(),
@@ -4205,7 +4247,7 @@ async fn spawn_reviewer_for_worker(
     };
 
     match reviewer::spawn_reviewer(
-        &config.model,
+        &reviewer_model,
         &config.effort,
         &session_id,
         &wt_path,
@@ -4284,7 +4326,7 @@ async fn spawn_reviewer_for_worker(
             let reviewer_run_id = {
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
-                let m = config.model.clone();
+                let m = reviewer_model.clone();
                 let e = config.effort.clone();
                 let tid = worker.task_id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
@@ -5430,6 +5472,51 @@ mod tests {
         let labels = r#"["effort:high"]"#;
         let (_, effort) = labels_to_model_effort(Some(labels));
         assert_eq!(effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn model_rank_known_models() {
+        assert_eq!(model_rank("claude-sonnet-5"), Some(0));
+        assert_eq!(model_rank("claude-opus-4-6"), Some(1));
+        assert_eq!(model_rank("claude-opus-4-7"), Some(2));
+        assert_eq!(model_rank("claude-opus-4-8"), Some(3));
+        assert_eq!(model_rank("unknown-model"), None);
+    }
+
+    #[test]
+    fn escalated_reviewer_default_worker_steps_up() {
+        // opus-4-6 worker -> reviewer gets opus-4-7
+        assert_eq!(
+            escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6"),
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn escalated_reviewer_top_tier_caps() {
+        // opus-4-8 (top) worker -> reviewer stays at opus-4-8
+        assert_eq!(
+            escalated_reviewer_model("claude-opus-4-8", "claude-opus-4-6"),
+            "claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn escalated_reviewer_config_higher_wins() {
+        // sonnet-5 worker escalates to opus-4-6, but config is opus-4-7 -> config wins
+        assert_eq!(
+            escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7"),
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn escalated_reviewer_unknown_worker_uses_rank_zero() {
+        // unknown model -> rank 0 (sonnet-5), +1 = opus-4-6, vs config opus-4-6 -> opus-4-6
+        assert_eq!(
+            escalated_reviewer_model("unknown-model", "claude-opus-4-6"),
+            "claude-opus-4-6"
+        );
     }
 
     fn make_dummy_slot() -> SlotState {

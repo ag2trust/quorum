@@ -1,7 +1,7 @@
 //! Agent-performance capture: one row per daemon-spawned agent process.
 
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Insert a new run row at spawn time. Returns the row id.
 pub fn insert(
@@ -36,6 +36,20 @@ pub fn insert_r2(
         params![task_id, agent_name, model, effort, spawned_at],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Return the model used by the first worker agent_run for a task, if any.
+pub fn worker_model(conn: &Connection, task_id: i64) -> Result<Option<String>> {
+    let model = conn
+        .query_row(
+            "SELECT model FROM agent_runs \
+             WHERE task_id = ?1 AND role = 'worker' \
+             ORDER BY spawned_at ASC LIMIT 1",
+            params![task_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(model)
 }
 
 /// Close an open run row at teardown/terminal.
@@ -115,5 +129,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn worker_model_returns_first_worker() {
+        let (_d, c) = open_tmp();
+        assert_eq!(worker_model(&c, 999).unwrap(), None);
+
+        insert(&c, 1, "Alice", "worker", "claude-opus-4-6", "high", 100).unwrap();
+        insert(&c, 1, "Bob", "reviewer", "claude-opus-4-8", "medium", 200).unwrap();
+        insert(&c, 1, "Carol", "worker", "claude-opus-4-7", "high", 300).unwrap();
+
+        assert_eq!(
+            worker_model(&c, 1).unwrap().as_deref(),
+            Some("claude-opus-4-6")
+        );
     }
 }
