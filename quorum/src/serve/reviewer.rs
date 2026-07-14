@@ -43,6 +43,8 @@ pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
          - Never review your own delivery — if you authored the PR, adopted it, or \
          signaled its done, you are disqualified.\n\n\
          Do NOT merge the PR yourself — the daemon handles merging.\n\
+         Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
+         approval as the merge account after your verdict.\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         name = spec.reviewer_name,
         pr = spec.pr,
@@ -106,8 +108,9 @@ pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
          Then signal completion:\n\
          quorum done --agent {name} --pr {pr} --verdict <your_verdict> \
          --blocking <count_of_missed_with_confidence_ge_70>\n\n\
-         Do NOT merge the PR. Do NOT mark the task done. Shadow mode — your verdict \
-         is recorded but does not affect the merge outcome.",
+         Do NOT merge the PR. Do NOT run `gh pr review --approve` — the daemon \
+         posts the formal GitHub approval. Do NOT mark the task done. Shadow mode — \
+         your verdict is recorded but does not affect the merge outcome.",
         name = spec.r2_name,
         r1 = spec.r1_reviewer,
         pr = spec.pr,
@@ -277,6 +280,10 @@ mod tests {
             "reviewer prompt must NOT instruct the reviewer to merge"
         );
         assert!(prompt.contains("Do NOT merge the PR yourself"));
+        assert!(
+            prompt.contains("Do NOT run `gh pr review --approve`"),
+            "reviewer prompt must forbid gh pr review --approve (daemon posts approval)"
+        );
     }
 
     #[test]
@@ -290,6 +297,20 @@ mod tests {
     fn reviewer_branch_format() {
         let branch = reviewer_branch(55, "Rev-1");
         assert_eq!(branch, "review/pr-55-rev-1");
+    }
+
+    #[test]
+    fn r2_audit_prompt_forbids_gh_approve() {
+        let spec = R2AuditSpec {
+            pr: 10,
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
+        let prompt = build_r2_audit_prompt(&spec);
+        assert!(
+            prompt.contains("Do NOT run `gh pr review --approve`"),
+            "R2 audit prompt must forbid gh pr review --approve"
+        );
     }
 
     #[test]
