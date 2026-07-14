@@ -48,6 +48,8 @@ pub struct ServeFileConfig {
     pub r2_target_per_stratum: Option<i64>,
     pub r2_steady_state_p: Option<f64>,
     pub r2_blocking: Option<bool>,
+    /// Per-complexity suggested model/effort (keys "1".."5", values "tier/effort").
+    pub suggested_models: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
@@ -421,6 +423,29 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         .unwrap();
         let cfg = load(&path, true).unwrap();
         assert_eq!(cfg.doctor_enabled, Some(true));
+    }
+
+    #[test]
+    fn load_suggested_models_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(
+            &path,
+            r#"
+repo = "test/repo"
+repo_dir = "/tmp"
+worktree_base = "/tmp/wt"
+
+[suggested_models]
+"3" = "opus-48/high"
+"5" = "opus-47/medium"
+"#,
+        )
+        .unwrap();
+        let cfg = load(&path, true).unwrap();
+        let sm = cfg.suggested_models.unwrap();
+        assert_eq!(sm.get("3").unwrap(), "opus-48/high");
+        assert_eq!(sm.get("5").unwrap(), "opus-47/medium");
     }
 
     #[test]
