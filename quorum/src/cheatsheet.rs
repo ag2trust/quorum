@@ -23,12 +23,12 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
-  quorum task-update  --agent <id> --task-id <n> [--status done|open|cancelled] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
-                                                               # --status done: assignee-only submit
+  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
                                                                # --status open: assignee-only release/give-up (hand-off = open + re-claim)
                                                                # --status cancelled: creator OR assignee terminal won't-do
-                                                               # --refs: link the PR on submit, e.g. `--status done --refs '{"pr":2459}'`
+                                                               # --refs: link PR ref, e.g. `--refs '{"pr":2459}'`
                                                                #   surfaced through `log --refs pr#N` + creator sync (#62).
+                                                               # NOTE: `done` is lifecycle-only — use `quorum submit` or `quorum task-close`.
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
                                                                # --verdict approve|changes: reviewer verdict (lifecycle transition).
   quorum task-close --agent <id> --task-id <n> --reason-stdin   # manual/external terminal close (merged by hand, fixed elsewhere,

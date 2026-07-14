@@ -31,7 +31,7 @@ fn create_claim_update_flow() {
         .success()
         .stdout(predicates::str::contains("\"assignee\":\"A\""));
 
-    // update by assignee: the executor submits `done`
+    // `done` is lifecycle-only — task-update rejects it with exit 2
     quorum(home.path())
         .args([
             "task-update",
@@ -43,22 +43,22 @@ fn create_claim_update_flow() {
             "done",
         ])
         .assert()
-        .success()
-        .stdout(predicates::str::contains("\"status\":\"done\""));
+        .code(2);
 
-    // update by non-assignee fails loud (exit 1)
+    // close manually via task-close
     quorum(home.path())
         .args([
-            "task-update",
+            "task-close",
             "--agent",
-            "B",
+            "A",
             "--task-id",
             "1",
-            "--status",
-            "done",
+            "--reason-stdin",
         ])
+        .write_stdin("done manually\n")
         .assert()
-        .code(1);
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"done\""));
 
     // body round-tripped byte-exact
     quorum(home.path())
@@ -78,7 +78,7 @@ fn normal_misses_do_not_log_errors() {
         .args(["task-claim", "--agent", "A"])
         .assert()
         .code(1);
-    // create + claim, then a non-assignee update → exit 1
+    // create + claim, then a non-assignee cancel → exit 1 (not holder/creator)
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
@@ -95,7 +95,7 @@ fn normal_misses_do_not_log_errors() {
             "--task-id",
             "1",
             "--status",
-            "done",
+            "cancelled",
         ])
         .assert()
         .code(1);
@@ -147,7 +147,7 @@ fn release_then_reclaim_hands_off_task() {
         ])
         .assert()
         .code(1);
-    // B claims the now-open task and submits done; A (not assignee) cannot.
+    // B claims the now-open task and cancels it; A (not assignee/creator) cannot.
     quorum(home.path())
         .args(["task-claim", "--agent", "B", "--task-id", "1"])
         .assert()
@@ -161,22 +161,10 @@ fn release_then_reclaim_hands_off_task() {
             "--task-id",
             "1",
             "--status",
-            "done",
+            "cancelled",
         ])
         .assert()
         .success();
-    quorum(home.path())
-        .args([
-            "task-update",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--status",
-            "done",
-        ])
-        .assert()
-        .code(1);
 }
 
 #[test]
@@ -358,10 +346,43 @@ fn notes_round_trip_byte_exact_and_any_agent_can_add() {
 }
 
 #[test]
-fn note_combinable_with_done_submit() {
-    // Post-#14 reconciliation: --note-* IS combinable with --status done (the only field
-    // update an executor performs), so the executor can submit + leave a final breadcrumb
-    // in one call. The field update runs first under the assignee guard; the note follows.
+fn note_combinable_with_cancel() {
+    // --note-* IS combinable with --status cancelled, so the agent can cancel + leave a
+    // breadcrumb in one call.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+            "--note-stdin",
+        ])
+        .write_stdin("won't do: see PR #123\n")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"cancelled\""));
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("won't do: see PR #123"));
+}
+
+#[test]
+fn note_with_status_done_rejected_before_note() {
+    // --status done is rejected at validation (exit 2) before the note is applied.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "x"])
@@ -382,45 +403,10 @@ fn note_combinable_with_done_submit() {
             "done",
             "--note-stdin",
         ])
-        .write_stdin("submitted: see PR #123\n")
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"status\":\"done\""));
-    quorum(home.path())
-        .args(["task-get", "--task-id", "1"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("submitted: see PR #123"));
-}
-
-#[test]
-fn note_with_status_done_from_nonassignee_aborts_before_adding_note() {
-    // Coherence: field update runs first; non-assignee --status done fails NotHolder (exit 1)
-    // and the note is NOT added. No half-applied state.
-    let home = tempfile::tempdir().unwrap();
-    quorum(home.path())
-        .args(["task-create", "--created-by", "boss", "--title", "x"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
-    quorum(home.path())
-        .args([
-            "task-update",
-            "--agent",
-            "B",
-            "--task-id",
-            "1",
-            "--status",
-            "done",
-            "--note-stdin",
-        ])
         .write_stdin("shouldnt land\n")
         .assert()
-        .code(1);
-    // Verify: the note was not added, the task is still claimed by A.
+        .code(2);
+    // Verify: the note was not added, the task is still working.
     quorum(home.path())
         .args(["task-get", "--task-id", "1"])
         .assert()
@@ -771,17 +757,17 @@ fn depends_on_gates_claim_end_to_end() {
         .assert()
         .code(1);
 
-    // Mark dep as done — `done` is the terminal state that ungates dependents.
+    // Mark dep as done via task-close — `done` ungates dependents.
     quorum(home.path())
         .args([
-            "task-update",
+            "task-close",
             "--agent",
             "A",
             "--task-id",
             "1",
-            "--status",
-            "done",
+            "--reason-stdin",
         ])
+        .write_stdin("completed\n")
         .assert()
         .success();
     // Now the dependent (task 2) is unblocked — B can claim it.

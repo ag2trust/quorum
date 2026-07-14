@@ -15,7 +15,7 @@ fn quorum(home: &std::path::Path) -> Command {
 fn state_changes_auto_emit_events_on_log() {
     let home = tempfile::tempdir().unwrap();
 
-    // create + claim + done → three events on the log
+    // create + claim + cancelled → three events on the log
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
@@ -32,7 +32,7 @@ fn state_changes_auto_emit_events_on_log() {
             "--task-id",
             "1",
             "--status",
-            "done",
+            "cancelled",
         ])
         .assert()
         .success();
@@ -43,7 +43,7 @@ fn state_changes_auto_emit_events_on_log() {
         .success()
         .stdout(predicates::str::contains("\"kind\":\"task_created\""))
         .stdout(predicates::str::contains("\"kind\":\"task_claimed\""))
-        .stdout(predicates::str::contains("\"kind\":\"task_done\""))
+        .stdout(predicates::str::contains("\"kind\":\"task_cancelled\""))
         .stdout(predicates::str::contains("\"subject\":\"task#1\""));
 }
 
@@ -154,4 +154,32 @@ fn negative_limit_is_usage_error() {
         .args(["log", "--limit", "-1"])
         .assert()
         .code(2);
+}
+
+#[test]
+fn task_update_status_done_rejected() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A", "--task-id", "1"])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "A",
+            "--task-id",
+            "1",
+            "--status",
+            "done",
+        ])
+        .assert()
+        .code(2)
+        .stderr(
+            predicates::str::contains("quorum submit").and(predicates::str::contains("task-close")),
+        );
 }
