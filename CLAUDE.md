@@ -219,18 +219,18 @@ few commits behind `main`. Don't rebase solely to catch up. "Dismiss stale appro
 commits" stays **ON** — a real push (fix commit, rebase) invalidates the existing approval and
 requires re-review.
 
-### 5. Preflight gate — green BEFORE `task-update --status done` (HARD RULE)
+### 5. Preflight gate — green BEFORE `quorum submit` (HARD RULE)
 
-`done` auto-spawns a review task, so marking done with a red branch burns a reviewer
-session on mechanical findings (#112/#114 cost ~5 reviewer sessions in one week). The
-gate is mechanical, not judgment:
+`submit` transitions the task to `in-review` and spawns a reviewer, so submitting with a
+red branch burns a reviewer session on mechanical findings (#112/#114 cost ~5 reviewer
+sessions in one week). The gate is mechanical, not judgment:
 
 ```bash
 rtk proxy ./preflight.sh    # branch-base check + fmt + clippy + test, fail-fast
 ```
 
 Paste the full output — it must end `PREFLIGHT: PASS` — in the PR body under
-`## Verification`. No green preflight → no `done`. The pre-push hook (installed by
+`## Verification`. No green preflight → no `submit`. The pre-push hook (installed by
 `./dev-install.sh`) re-runs the cheap subset (`--quick`: branch base + fmt) on every
 push; never bypass it with `--no-verify`.
 
@@ -321,6 +321,14 @@ A short or "all-green" test summary may be RTK hiding the failures.
   default 300s) reaps such zombies automatically, (2) task descriptions involving `.claude/`
   edits should be routed to a human-attended session or run with an operator that pre-grants
   the paths.
+- **Raw `task-update --status done` bypasses lifecycle — use `quorum submit` or `quorum
+  task-close`.** The ag2trust task#81 / PR#3659 incident: an agent ran
+  `task-update --status done` to terminal-close a working P0 task, bypassing review entirely.
+  The `done` status is now lifecycle-only (enforced by the CLI — `task-update --status done`
+  exits 2). Three verbs replace it: `quorum submit --pr N` (worker/reviewer hand-off into
+  the state machine), `quorum task-close --reason-stdin` (manual/external terminal close with
+  distinct `task_closed_manual` audit event), and the `done` state itself (set only by the
+  system after approve + merge). See `quorum help` for the canonical surface.
 
 ## Design notes & known limitations (v1)
 

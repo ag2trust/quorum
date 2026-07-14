@@ -11,7 +11,7 @@ SYNC (the agent's compass — one call per tick)
                                               # (use `read --ack-through` for strict at-least-once).
                                               # --match-label scopes next_task only (capability filter).
 
-TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal cancelled)
+TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
                                                                # --labels complexity:N (1-5): 1=mechanical one-liner, 2=single-file,
                                                                #   3=multi-file design, 4=cross-module, 5=cross-cutting refactor
