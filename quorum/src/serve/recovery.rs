@@ -58,6 +58,12 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     }?;
 
+    // Collect agent names from journal — these are daemon-managed agents
+    // whose working tasks should be reset. Tasks from passive/interactive
+    // agents (not in journal) are left alone.
+    let daemon_agents: std::collections::HashSet<String> =
+        entries.iter().map(|e| e.agent.clone()).collect();
+
     if !entries.is_empty() {
         log(&format!(
             "recovery: found {} stale journal entries — killing processes",
@@ -107,6 +113,9 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
     // working/rework → AgentFailed → open (Phase 6 re-claims and spawns a fresh worker)
     // merging → AgentFailed → in-review (Phase 5 spawns a reviewer)
     // in-review → left as-is (Phase 5 spawns a reviewer)
+    //
+    // Skip tasks assigned to passive/interactive agents (assignee not in
+    // journal) — those agents are still alive and working outside the daemon.
     for status in &["working", "rework"] {
         let p = db_path.clone();
         let s = status.to_string();
@@ -119,6 +128,17 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
         .unwrap_or_default();
 
         for task in tasks_in_state {
+            if let Some(ref assignee) = task.assignee {
+                if !daemon_agents.contains(assignee) {
+                    log(&format!(
+                        "recovery: skipping {st} task #{tid} — assignee {assignee} \
+                         is a passive agent (not in journal)",
+                        st = status,
+                        tid = task.id,
+                    ));
+                    continue;
+                }
+            }
             let p = db_path.clone();
             let tid = task.id;
             let st = *status;

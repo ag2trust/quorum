@@ -482,6 +482,13 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
+- **Passive agent support:** `daemon_lock` (invariant 11) guarantees one daemon per DB.
+  A `submit` mailbox row from an agent not in the daemon's spawn roster is treated as a
+  passive/interactive agent submission: the daemon looks up the agent's working task by
+  assignee, fires `SignaledDone { pr }` (or closes directly if no PR), and consumes the
+  row. Phase 5b then spawns a reviewer on the next tick. Recovery skips working tasks
+  assigned to passive agents (not found in the journal). This gives interactive Claude Code
+  sessions the same review lifecycle as daemon-managed workers.
 
 ### Daemon merge flow
 
