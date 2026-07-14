@@ -160,6 +160,7 @@ pub struct TaskDetail {
     #[serde(flatten)]
     pub task: Task,
     pub notes: Vec<Note>,
+    pub agent_runs: Vec<crate::agent_runs::AgentRun>,
 }
 
 #[derive(Default)]
@@ -969,7 +970,12 @@ pub fn get_with_notes(conn: &Connection, id: i64) -> Result<Option<TaskDetail>> 
         return Ok(None);
     };
     let notes = notes_for(conn, id)?;
-    Ok(Some(TaskDetail { task, notes }))
+    let agent_runs = crate::agent_runs::runs_for_task(conn, id)?;
+    Ok(Some(TaskDetail {
+        task,
+        notes,
+        agent_runs,
+    }))
 }
 
 pub fn add_note(
@@ -2969,5 +2975,46 @@ mod tests {
             extract_pr_number(&task.refs).is_some(),
             "daemon must check refs before direct-closing"
         );
+    }
+
+    #[test]
+    fn get_with_notes_includes_agent_runs() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c, "boss", "run-test", None, 0, None, None, None, None, TTL,
+        )
+        .unwrap();
+
+        // No runs yet — empty array, not error
+        let detail = get_with_notes(&c, tid).unwrap().unwrap();
+        assert!(detail.agent_runs.is_empty());
+
+        // Insert worker + reviewer + R2
+        crate::agent_runs::insert(&c, tid, "Alice", "worker", "opus-4", "high", 100).unwrap();
+        let rev_id =
+            crate::agent_runs::insert(&c, tid, "Bob", "reviewer", "sonnet-5", "medium", 200)
+                .unwrap();
+        crate::agent_runs::close(&c, rev_id, 300, "approved").unwrap();
+        crate::agent_runs::insert_r2(&c, tid, "Carol", "opus-4", "high", 250).unwrap();
+
+        let detail = get_with_notes(&c, tid).unwrap().unwrap();
+        assert_eq!(detail.agent_runs.len(), 3);
+
+        let w = &detail.agent_runs[0];
+        assert_eq!(w.agent, "Alice");
+        assert_eq!(w.role, "worker");
+        assert_eq!(w.sub_role, None);
+        assert_eq!(w.ended_at, None);
+
+        let r = &detail.agent_runs[1];
+        assert_eq!(r.agent, "Bob");
+        assert_eq!(r.role, "reviewer");
+        assert_eq!(r.end_reason.as_deref(), Some("approved"));
+        assert_eq!(r.ended_at, Some(300));
+
+        let r2 = &detail.agent_runs[2];
+        assert_eq!(r2.agent, "Carol");
+        assert_eq!(r2.role, "reviewer");
+        assert_eq!(r2.sub_role.as_deref(), Some("r2"));
     }
 }

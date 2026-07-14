@@ -2,6 +2,20 @@
 
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AgentRun {
+    pub id: i64,
+    pub agent: String,
+    pub role: String,
+    pub sub_role: Option<String>,
+    pub model: String,
+    pub effort: String,
+    pub spawned_at: i64,
+    pub ended_at: Option<i64>,
+    pub end_reason: Option<String>,
+}
 
 /// Insert a new run row at spawn time. Returns the row id.
 pub fn insert(
@@ -50,6 +64,30 @@ pub fn worker_model(conn: &Connection, task_id: i64) -> Result<Option<String>> {
         )
         .optional()?;
     Ok(model)
+}
+
+/// All runs for a task, ordered by id.
+pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, agent_name, role, sub_role, model, effort, spawned_at, ended_at, end_reason \
+         FROM agent_runs WHERE task_id = ?1 ORDER BY id ASC",
+    )?;
+    let runs = stmt
+        .query_map(params![task_id], |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                spawned_at: r.get(6)?,
+                ended_at: r.get(7)?,
+                end_reason: r.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(runs)
 }
 
 /// Close an open run row at teardown/terminal.
