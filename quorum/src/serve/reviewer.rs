@@ -91,7 +91,7 @@ pub struct R2AuditSpec {
 }
 
 pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
-    format!(
+    super::agent::user_turn(&format!(
         "You are R2 auditor {name}. Adversarially audit the review by R1 reviewer \
          {r1} on PR #{pr}.\n\n\
          Read the full PR diff AND all review comments from {r1}. Your job is two-sided:\n\
@@ -115,7 +115,7 @@ pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
         name = spec.r2_name,
         r1 = spec.r1_reviewer,
         pr = spec.pr,
-    )
+    ))
 }
 
 /// Budget status line for worker turns. Workers self-regulate against the task
@@ -312,16 +312,27 @@ mod tests {
     }
 
     #[test]
-    fn r2_audit_prompt_forbids_gh_approve() {
+    fn r2_audit_prompt_is_valid_user_turn() {
         let spec = R2AuditSpec {
             pr: 10,
             r1_reviewer: "R1".into(),
             r2_name: "R2".into(),
         };
         let prompt = build_r2_audit_prompt(&spec);
+        let parsed: serde_json::Value = serde_json::from_str(&prompt).unwrap();
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(
+            parsed["message"]["role"], "user",
+            "claude CLI rejects turns without message.role"
+        );
+        let content = parsed["message"]["content"].as_str().unwrap();
         assert!(
-            prompt.contains("Do NOT run `gh pr review --approve`"),
+            content.contains("Do NOT run `gh pr review --approve`"),
             "R2 audit prompt must forbid gh pr review --approve"
+        );
+        assert!(
+            content.contains("R2 auditor R2"),
+            "prompt must name the auditor"
         );
     }
 

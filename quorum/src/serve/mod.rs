@@ -5362,7 +5362,15 @@ async fn maybe_spawn_r2(
     .await
     {
         Ok(mut proc) => {
-            let _ = proc.feed_turn(&prompt).await;
+            if let Err(e) = proc.feed_turn(&prompt).await {
+                log(&format!("R2: auditor {r2_name} feed_turn failed: {e}"));
+                proc.kill_and_reap().await;
+                R2_META.lock().unwrap().remove(&r2_name);
+                close_agent_run(&config.db_path, agent_run_id, "feed-failed").await;
+                wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+                name_pool.release(&r2_name);
+                return;
+            }
             let now_inst = std::time::Instant::now();
             let slot = SlotState {
                 agent_name: r2_name.clone(),
