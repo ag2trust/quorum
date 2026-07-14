@@ -405,11 +405,11 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 | Event | Payload | Trigger |
 |---|---|---|
 | `Claimed { agent }` | agent name | `task-claim` / daemon auto-pick |
-| `SignaledDone { pr }` | PR number | `done --pr N` (first delivery) |
+| `SignaledDone { pr }` | PR number | `submit --pr N` (first delivery) |
 | `ReviewerAttached { agent }` | reviewer name | `task-claim` on an in-review task |
-| `VerdictApprove` | — | `done --verdict approved --blocking 0` |
-| `VerdictChanges` | — | `done --verdict changes --feedback "..."` |
-| `ReworkPushed` | — | `done --pr N` when `rework_round > 0` |
+| `VerdictApprove` | — | `submit --verdict approved --blocking 0` |
+| `VerdictChanges` | — | `submit --verdict changes --feedback "..."` |
+| `ReworkPushed` | — | `submit --pr N` when `rework_round > 0` |
 | `MergeSucceeded` | — | Daemon after successful `gh pr merge` |
 | `MergeFailed { reason }` | description | Daemon after merge failure |
 | `LeaseExpired` | — | Lease reaper |
@@ -466,7 +466,7 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 ### Guards and policies
 
 - **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
-  The daemon enforces #206: the deliverer (who signaled `done`) cannot review.
+  The daemon enforces #206: the deliverer (who signaled `submit`) cannot review.
 - **Rework cap:** `REWORK_CAP = 3`. When `rework_round >= 3` and VerdictChanges fires,
   the task goes to Failed (not Rework).
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`

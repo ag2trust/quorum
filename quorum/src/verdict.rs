@@ -15,7 +15,7 @@
 
 /// CLI-boundary validation of the verdict/blocking/feedback argument bundle.
 ///
-/// `changes_requires_feedback` is true for `quorum done` (daemon flow — the
+/// `changes_requires_feedback` is true for `quorum submit` (daemon flow — the
 /// feedback becomes the worker's rework turn) and false for
 /// `quorum task-update` (passive flow — feedback travels via review comments
 /// and task notes).

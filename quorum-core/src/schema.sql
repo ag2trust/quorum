@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 CREATE INDEX IF NOT EXISTS agent_sessions_expires ON agent_sessions(expires_at);
 
 -- Daemon mailbox (§12 IPC): agent-pushed control events consumed by the daemon's
--- tick loop. Each CLI invocation of `quorum done/task-update/message` writes one row;
+-- tick loop. Each CLI invocation of `quorum submit/task-update/message` writes one row;
 -- the daemon polls `consumed_at IS NULL` each tick and marks rows consumed after acting.
 -- Not TTL'd — consumed rows are GC'd by sweep (bounded by `consumed_at IS NOT NULL`).
 CREATE TABLE IF NOT EXISTS mailbox (

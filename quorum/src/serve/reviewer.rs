@@ -1,7 +1,7 @@
 //! Reviewer spawn + verdict handling.
 //!
 //! An ephemeral reviewer agent is spawned in a throwaway worktree at the PR's
-//! head. It runs review and signals back via `quorum done --verdict
+//! head. It runs review and signals back via `quorum submit --verdict
 //! approved|changes`. The reviewer does NOT merge — merge is the daemon's job
 //! (via MergeExecutor). The daemon consumes the verdict mailbox row and either
 //! merges + tears down both agents (approved) or feeds a rework turn to the
@@ -31,9 +31,9 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          or advisory (quality/follow-up).\n\
          - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
          BLOCKING.\n\
-         - Zero blocking findings: run: quorum done --agent {name} --pr {pr} \
+         - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum done --agent {name} --pr {pr} \
+         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\
          - Never signal approved for a review whose own text says changes are needed \
          before merge.\n\
@@ -107,7 +107,7 @@ pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
          }}\n\
          ```\n\n\
          Then signal completion:\n\
-         quorum done --agent {name} --pr {pr} --verdict <your_verdict> \
+         quorum submit --agent {name} --pr {pr} --verdict <your_verdict> \
          --blocking <count_of_missed_with_confidence_ge_70>\n\n\
          Do NOT merge the PR. Do NOT run `gh pr review --approve` — the daemon \
          posts the formal GitHub approval. Do NOT mark the task done. Shadow mode — \
@@ -157,7 +157,7 @@ pub fn build_worker_turn(
          {working_style}{budget}\n\n\
          When your work is complete:\n\
          1. Push your branch and open a PR with: gh pr create\n\
-         2. Signal completion with the PR number: quorum done --agent {agent} --pr <PR_NUMBER>\n\
+         2. Signal completion with the PR number: quorum submit --agent {agent} --pr <PR_NUMBER>\n\
          3. Post progress notes by writing text to a temp file, then: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         agent = agent_name,
@@ -186,9 +186,9 @@ pub fn build_rereview_turn(
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING or advisory.\n\
          - Missing or red `PREFLIGHT: PASS` under `## Verification` is BLOCKING.\n\
-         - Zero blocking findings: run: quorum done --agent {name} --pr {pr} \
+         - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum done --agent {name} --pr {pr} \
+         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\n\
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
@@ -212,7 +212,7 @@ pub fn build_rework_turn(
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and pushing:\n\
          1. Run preflight: ./preflight.sh\n\
-         2. Re-signal completion with your PR number: quorum done --agent {agent} --pr {pr}\n\
+         2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\
          3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         feedback = feedback,
@@ -372,7 +372,7 @@ mod tests {
             "no budget line when no ceiling is configured"
         );
         assert!(
-            turn.contains("quorum done --agent W-1 --pr 99"),
+            turn.contains("quorum submit --agent W-1 --pr 99"),
             "rework template must instruct agent to re-signal done with PR number"
         );
         assert!(
@@ -396,7 +396,7 @@ mod tests {
         assert!(turn.contains("Worker-1"));
         assert!(turn.contains("Rev-1"));
         assert!(
-            turn.contains("quorum done --agent Rev-1 --pr 42"),
+            turn.contains("quorum submit --agent Rev-1 --pr 42"),
             "rereview template must instruct reviewer to signal done with PR number"
         );
         assert!(
@@ -470,7 +470,7 @@ mod tests {
             "worker template must instruct agent to open a PR"
         );
         assert!(
-            turn.contains("quorum done --agent W-1 --pr"),
+            turn.contains("quorum submit --agent W-1 --pr"),
             "worker template must instruct agent to signal done with PR number"
         );
         assert!(

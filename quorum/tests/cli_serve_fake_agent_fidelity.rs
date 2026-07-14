@@ -1,5 +1,5 @@
 //! T11: fake_agent fidelity — test that `--with-side-effects` (FAKE_AGENT_SIDE_EFFECTS)
-//! produces a real `quorum done` mailbox row, and `--emit-tool-use` (FAKE_AGENT_EMIT_TOOL_USE)
+//! produces a real `quorum submit` mailbox row, and `--emit-tool-use` (FAKE_AGENT_EMIT_TOOL_USE)
 //! emits tool_use stream events that exercise the daemon's tool_count/now_label tracking.
 
 use std::io::{BufRead, BufReader, Write};
@@ -174,10 +174,10 @@ impl ServeHandle {
     }
 }
 
-/// FAKE_AGENT_SIDE_EFFECTS=1 causes the fake agent to call `quorum done --agent <name>`
+/// FAKE_AGENT_SIDE_EFFECTS=1 causes the fake agent to call `quorum submit --agent <name>`
 /// as a real subprocess, creating a mailbox row that the daemon then processes.
 #[test]
-fn side_effects_mode_creates_real_done_mailbox_row() {
+fn side_effects_mode_creates_real_submit_mailbox_row() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -204,9 +204,9 @@ fn side_effects_mode_creates_real_done_mailbox_row() {
         &[("FAKE_AGENT_SIDE_EFFECTS", "1")],
     );
 
-    // The daemon should process the done mailbox row from the fake agent's
-    // subprocess call to `quorum done`. The log will contain "done (pr=None"
-    // because the fake agent calls done without --pr.
+    // The daemon should process the submit mailbox row from the fake agent's
+    // subprocess call to `quorum submit`. The log will contain "done (pr=None"
+    // because the fake agent calls submit without --pr.
     assert!(
         handle.wait_for("done (pr=None", 20),
         "daemon should have processed a done mailbox row created by fake_agent \

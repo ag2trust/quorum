@@ -67,7 +67,7 @@ impl AgentProc {
 
         // In dontAsk mode every tool call OUTSIDE the allowlist is auto-denied
         // (there is no human to ask). Without --allowedTools the agent cannot
-        // edit files, run git/gh, or signal `quorum done` — it stalls forever
+        // edit files, run git/gh, or signal `quorum submit` — it stalls forever
         // in awaiting-review (observed second live run). Same list the
         // hand-run PoC loop used.
         cmd.arg("--add-dir")
