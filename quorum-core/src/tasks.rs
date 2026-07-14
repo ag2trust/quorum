@@ -695,6 +695,11 @@ pub fn update(
         if !STATUSES.contains(&s) {
             return Err(QuorumError::Usage(format!("invalid status: {s}")));
         }
+        if s == "done" {
+            return Err(QuorumError::Usage(
+                "task-update cannot set status 'done'; use `quorum submit` (finished your part) or `quorum task-close` (manual close)".into()
+            ));
+        }
         let restricted = ["working", "in-review", "rework", "merging", "failed"];
         if restricted.contains(&s) {
             return Err(QuorumError::Usage(format!(
@@ -818,15 +823,6 @@ pub fn update(
             "task_cancelled",
             &lease_target(id),
             &format!("cancelled by {agent}"),
-            now,
-        )?;
-    } else if fields.status == Some("done") {
-        deactivate_lease(&tx, id, now)?;
-        crate::events::emit(
-            &tx,
-            "task_done",
-            &lease_target(id),
-            &format!("done by {agent}"),
             now,
         )?;
     }
@@ -1669,11 +1665,11 @@ mod tests {
     }
 
     #[test]
-    fn update_done_from_working() {
+    fn update_done_rejected() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
-        let t = update(
+        let err = update(
             &mut c,
             "A",
             id,
@@ -1682,10 +1678,10 @@ mod tests {
                 ..Default::default()
             },
             1001,
-        )
-        .unwrap();
-        assert_eq!(t.status, "done");
-        assert!(!has_live_lease(&c, id, 1001));
+        );
+        assert!(matches!(err, Err(QuorumError::Usage(_))));
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "working");
     }
 
     #[test]
@@ -1698,7 +1694,7 @@ mod tests {
             "B",
             id,
             &TaskUpdate {
-                status: Some("done"),
+                status: Some("cancelled"),
                 ..Default::default()
             },
             1001,
@@ -1771,17 +1767,7 @@ mod tests {
             "child must not be claimable while dep is open"
         );
         claim(&mut c, "W", Some(dep), &[], TTL, 1000).unwrap();
-        update(
-            &mut c,
-            "W",
-            dep,
-            &TaskUpdate {
-                status: Some("done"),
-                ..Default::default()
-            },
-            1001,
-        )
-        .unwrap();
+        close_after_merge(&mut c, dep, "merged", 1001).unwrap();
         let t = claim(&mut c, "A", Some(child), &[], TTL, 1002)
             .unwrap()
             .unwrap();

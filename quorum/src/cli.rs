@@ -99,12 +99,14 @@ pub enum Command {
     /// task-transition command — replaces the former `task-release` and `task-cancel`.
     ///
     /// Valid `--status` values and their guards:
-    ///   `done`      — assignee-only, from `claimed`. Sets terminal status only;
-    ///                  review spawning happens via `quorum submit`, not task-update.
     ///   `open`      — assignee-only, from `claimed` (release/give-up semantics).
     ///   `cancelled` — creator OR assignee, from non-terminal (won't-do).
     ///   Omitted     — metadata-only update (body/refs/note). Assignee guard if
     ///                  claimed; creator guard if unclaimed (open + no assignee).
+    ///
+    /// `done` is NOT settable via task-update — use `quorum submit` (finished work)
+    /// or `quorum task-close` (manual close). This prevents marking tasks done while
+    /// PRs remain unreviewed/unmerged.
     ///
     /// `--note-stdin`/`--note-file` appends a breadcrumb to the task's note history. Notes
     /// have **no assignee guard** (any agent can leave one) and can be combined with the

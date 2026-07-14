@@ -1553,26 +1553,23 @@ mod tests {
         assert!(s.claim_ttls[0].expires_in_secs > 0);
     }
 
-    fn done(status: &str) -> crate::tasks::TaskUpdate<'_> {
-        crate::tasks::TaskUpdate {
-            status: Some(status),
-            ..Default::default()
-        }
-    }
-
     // ── Agent load score (#95 Phase 1) ─────────────────────────────────
 
     fn make_task(c: &mut Connection, title: &str, now: i64) -> i64 {
         crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, now).unwrap()
     }
 
-    /// Drive one task all the way through claim → done as `agent`, returning the
-    /// task id. Uses distinct claim/done timestamps so the per-task active duration is
-    /// non-zero.
+    /// Drive one task through claim → done as `agent`, preserving assignee for
+    /// load-score query testing. Uses direct SQL because the lifecycle paths
+    /// (close_after_merge, close_manual) clear assignee — a separate issue (#114 note).
     fn complete_task_as(c: &mut Connection, agent: &str, claim_ts: i64, done_ts: i64) -> i64 {
         let id = make_task(c, &format!("t-{claim_ts}"), claim_ts - 1);
         crate::tasks::claim(c, agent, Some(id), &[], 3600, claim_ts).unwrap();
-        crate::tasks::update(c, agent, id, &done("done"), done_ts).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            rusqlite::params![id, done_ts],
+        )
+        .unwrap();
         id
     }
 
@@ -1867,17 +1864,7 @@ mod tests {
         )
         .unwrap();
         crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
-        crate::tasks::update(
-            &mut c,
-            "Alice",
-            t1,
-            &crate::tasks::TaskUpdate {
-                status: Some("done"),
-                ..Default::default()
-            },
-            100,
-        )
-        .unwrap();
+        crate::tasks::close_after_merge(&mut c, t1, "merged", 100).unwrap();
 
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert!(s.blocked.is_empty());

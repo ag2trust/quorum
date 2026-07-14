@@ -1865,24 +1865,15 @@ mod tests {
 
     // -- Agent retirement (issue #97) -----------------------------------------------------
 
-    /// Drive a task to `done` as `agent`: create → claim → update(done). Returns the id.
-    /// Mirrors stats.rs's complete_task_as helper but uses a very long claim lease so
-    /// `sweep_on_write` (which fires inside every mutator's txn) does NOT delete the
-    /// claim row before `load_score_for` joins against it — load_score reads `claims.ts`
-    /// as the working-window start, so a swept claim silently zeros the score.
-    /// 10⁹ seconds is well past any test's `now`.
+    /// Drive a task to `done` as `agent`: create → claim → done (direct SQL, preserving
+    /// assignee for load-score joins). Uses a very long claim lease so `sweep_on_write`
+    /// does NOT delete the claim row before `load_score_for` joins against it.
     fn drive_done(c: &mut Connection, agent: &str, claim_ts: i64, done_ts: i64) -> i64 {
         let id = make_task(c, &format!("t-{claim_ts}"), 0, None, claim_ts - 1);
         tasks::claim(c, agent, Some(id), &[], 1_000_000_000, claim_ts).unwrap();
-        tasks::update(
-            c,
-            agent,
-            id,
-            &tasks::TaskUpdate {
-                status: Some("done"),
-                ..Default::default()
-            },
-            done_ts,
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            rusqlite::params![id, done_ts],
         )
         .unwrap();
         id
