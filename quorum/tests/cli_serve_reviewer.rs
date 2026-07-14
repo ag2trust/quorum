@@ -986,15 +986,26 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
     // Worker signals done with PR (doesn't know task was cancelled)
     quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
 
-    // Daemon should detect the rejected transition and clean up
-    assert!(
-        handle.wait_for("lifecycle rejected", 15),
-        "lifecycle rejection not logged. Lines: {:?}",
-        handle.lines
-    );
+    // Daemon should detect the cancelled task and clean up.  Two valid
+    // orderings: (a) done signal arrives first → "lifecycle rejected", or
+    // (b) tick detects cancellation first → "externally moved to cancelled"
+    // and the done row lands as "unmatched Done".  Both tear down the worker.
     assert!(
         handle.wait_for("tearing down worker", 15),
         "worker teardown not seen after cancelled task. Lines: {:?}",
+        handle.lines
+    );
+    let saw_rejection = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("lifecycle rejected"));
+    let saw_external = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("externally moved to cancelled"));
+    assert!(
+        saw_rejection || saw_external,
+        "expected either 'lifecycle rejected' or 'externally moved to cancelled'. Lines: {:?}",
         handle.lines
     );
 
