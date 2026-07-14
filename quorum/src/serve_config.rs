@@ -445,6 +445,16 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
     }
 
     #[test]
+    fn default_serve_scaffold_parses_cleanly() {
+        // The scaffold written by `quorum init` is all-comments — it must parse as
+        // empty defaults (no unknown keys, no syntax errors).
+        let cfg: ServeFileConfig = toml::from_str(crate::DEFAULT_SERVE_TOML).unwrap();
+        assert!(cfg.cap.is_none());
+        assert!(cfg.r2_enabled.is_none());
+        assert!(cfg.model.is_none());
+    }
+
+    #[test]
     fn banner_shows_config_path() {
         let b = banner(&BannerData {
             config_path: Some("/path/to/config.toml"),

@@ -578,6 +578,13 @@ pub enum Command {
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
     },
+    /// Update repo-level artifacts (SKILL.md) from the embedded copy in this binary.
+    /// Prints a unified diff and replaces the file. `--check` diffs without writing.
+    Upgrade {
+        /// Diff only — exit 0 if current, exit 1 if stale. No writes.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]
