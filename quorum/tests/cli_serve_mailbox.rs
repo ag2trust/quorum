@@ -1,14 +1,14 @@
-//! Mailbox consumption correctness tests (audit F8/F9/F13 + issue #181).
+//! Mailbox consumption correctness tests (audit F8/F9/F13).
 //!
 //! Scenarios:
-//! 1. Foreign Done row (agent not in this instance's lifetime roster) is LEFT
-//!    unconsumed — #181 preserves sibling daemon signals.
+//! 1. Non-roster Done row (passive agent, no working task) is consumed as
+//!    phantom — daemon_lock (invariant 11) guarantees single daemon per DB.
 //! 2. Phantom Done row for an agent this daemon HAS owned is still consumed —
 //!    F9 phantom-verdict guarantee preserved within a single instance.
-//! 3. Two-daemon regression: daemon B never eats daemon A's live signal (#181).
+//! 3. Non-roster Done rows are consumed (no sibling daemon to defer to).
 //! 4. Non-Done mailbox kinds don't block the daemon.
-//! 5. Stale Done row for a reused name is consumed at spawn time via the
-//!    at-spawn drain, preventing phantom verdict — F9.
+//! 5. Stale Done row for a name is consumed (passive agent phantom path or
+//!    at-spawn drain), preventing phantom verdict — F9.
 //! 6. Rework feed failure tears down the broken worker and releases the task
 //!    back to open — F8.
 
@@ -226,15 +226,13 @@ fn count_unconsumed(home: &std::path::Path, agent: &str) -> usize {
     .unwrap()
 }
 
-// ── #181: Foreign Done row (name never owned by this instance) is LEFT ────
+// ── Non-roster Done row is consumed (single daemon per DB) ───────────
 //
-// Under two-instance topology (shared SQLite queue), a Done row whose agent
-// name has never been in this daemon's lifetime roster is assumed to belong
-// to a sibling instance's worker — leave it for the owner. Consuming would
-// destroy the sibling's lifecycle signal (issue #181).
+// daemon_lock (invariant 11) guarantees one daemon per DB. A Done row from
+// a non-roster agent with no working task is consumed as a phantom.
 
 #[test]
-fn unmatched_done_row_left_for_other_instance() {
+fn unmatched_done_row_consumed_as_passive_phantom() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -251,33 +249,27 @@ fn unmatched_done_row_left_for_other_instance() {
 
     seed_task(home.path(), "Task for unmatched row test");
 
-    // Write a Done row for a name that this daemon will never acquire.
-    // (Its names_file only contains Agent0..Agent19; "GhostAgent" is
-    // outside the pool, so this daemon can never claim it.)
+    // Write a Done row for a name outside the daemon's pool.
     quorum_done(home.path(), &["--agent", "GhostAgent"]);
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Daemon should log that the row is being left (not consumed).
+    // Daemon should process the row as a passive agent phantom (no working task).
     assert!(
-        handle.wait_for(
-            "leaving Done row from GhostAgent unconsumed (not in this instance's roster)",
-            15
-        ),
-        "daemon did not log leaving GhostAgent row. Lines: {:?}",
+        handle.wait_for("passive agent GhostAgent submit: no working task found", 15),
+        "daemon did not process GhostAgent row. Lines: {:?}",
         handle.lines
     );
 
-    // Wait 2 ticks to confirm daemon does not consume the row.
     std::thread::sleep(Duration::from_secs(1));
 
     handle.stop();
 
-    // The GhostAgent row must still be unconsumed — leaving it for TTL/owner.
+    // Row must be consumed — single daemon per DB, no sibling to defer to.
     assert_eq!(
         count_unconsumed(home.path(), "GhostAgent"),
-        1,
-        "foreign Done row was consumed (would destroy sibling daemon's signal)"
+        0,
+        "non-roster Done row was not consumed"
     );
 }
 
@@ -354,34 +346,26 @@ fn phantom_done_row_for_owned_name_still_consumed() {
     );
 }
 
-// ── #181: Two daemons, one queue — neither eats the other's rows ───────
+// ── Single daemon consumes all non-roster Done rows ──────────────────
 //
-// Regression for the bug reported in #181: two per-repo daemons share a
-// SQLite queue; each has its own worktree base and names file. A Done row
-// for daemon A's live agent must NOT be consumed by daemon B — which polls
-// at 500ms ticks and would otherwise coin-flip who eats the signal.
+// daemon_lock (invariant 11) guarantees one daemon per DB. Non-roster
+// Done rows without working tasks are consumed as passive agent phantoms.
 
 #[test]
-fn two_daemons_do_not_consume_sibling_signals() {
+fn non_roster_done_rows_consumed_as_phantoms() {
     let home = tempfile::tempdir().unwrap();
-    let repo_a = tempfile::tempdir().unwrap();
-    let repo_b = tempfile::tempdir().unwrap();
-    let wt_b = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
 
-    init_git_repo(repo_a.path());
-    init_git_repo(repo_b.path());
+    init_git_repo(repo_dir.path());
 
-    // Two disjoint name pools so daemons cannot acquire each other's names.
-    let names_a = home.path().join("names_a.txt");
-    let names_b = home.path().join("names_b.txt");
-    let mut fa = std::fs::File::create(&names_a).unwrap();
-    let mut fb = std::fs::File::create(&names_b).unwrap();
-    for i in 0..10 {
-        writeln!(fa, "Aardvark{i}").unwrap();
-        writeln!(fb, "Beluga{i}").unwrap();
+    let names_file = home.path().join("names.txt");
+    {
+        let mut f = std::fs::File::create(&names_file).unwrap();
+        for i in 0..10 {
+            writeln!(f, "Beluga{i}").unwrap();
+        }
     }
-    drop(fa);
-    drop(fb);
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -390,37 +374,27 @@ fn two_daemons_do_not_consume_sibling_signals() {
         .status()
         .unwrap();
 
-    // Plant a Done row for one of daemon A's agent names BEFORE daemon B starts.
-    // Note: this is the same shape as A's Cleat-d12 done row in issue #181.
+    // Plant Done rows for names outside the daemon's pool.
     quorum_done(home.path(), &["--agent", "Aardvark0"]);
     quorum_done(home.path(), &["--agent", "Beluga0"]);
 
-    // Start daemon B ONLY (not A). B polls; sees rows for Aardvark0 (not in
-    // B's roster) and Beluga0 (also not in B's roster since B hasn't spawned
-    // yet). Both must be LEFT unconsumed.
-    let mut handle_b = ServeHandle::start(home.path(), repo_b.path(), wt_b.path(), &names_b);
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Wait for B to log "leaving Done row from Aardvark0" — the sibling signal.
+    // Both rows consumed as passive agent phantoms (no working task found).
     assert!(
-        handle_b.wait_for(
-            "leaving Done row from Aardvark0 unconsumed (not in this instance's roster)",
-            15
-        ),
-        "daemon B did not leave Aardvark0 (sibling) row unconsumed. Lines: {:?}",
-        handle_b.lines
+        handle.wait_for("passive agent Aardvark0 submit: no working task found", 15),
+        "Aardvark0 row not processed. Lines: {:?}",
+        handle.lines
     );
 
-    // Wait 2 ticks to confirm B does not consume.
     std::thread::sleep(Duration::from_secs(1));
+    handle.stop();
 
-    // Sibling row must survive.
     assert_eq!(
         count_unconsumed(home.path(), "Aardvark0"),
-        1,
-        "daemon B consumed daemon A's sibling done signal (#181 regression)"
+        0,
+        "non-roster Done row for Aardvark0 was not consumed"
     );
-
-    handle_b.stop();
 }
 
 // ── Non-Done mailbox kinds are consumed gracefully ────────────────────
@@ -466,14 +440,13 @@ fn non_done_mailbox_rows_dont_block_daemon() {
 
     handle.stop();
 
-    // Message with no to_agent is unroutable — consumed regardless (#181).
-    // task_update for a name outside this daemon's roster is left for the
-    // owning instance (or TTL sweep).
+    // Both rows consumed: single daemon per DB (invariant 11), no sibling
+    // to defer to. Message with no to_agent is unroutable; task_update for
+    // a passive agent has no worker slot but is still consumed.
     assert_eq!(
         count_unconsumed(home.path(), "SomeAgent"),
-        1,
-        "expected exactly 1 unconsumed row (the foreign task_update); \
-         message-with-no-to_agent must still be consumed"
+        0,
+        "non-Done mailbox rows for non-roster agent were not consumed"
     );
 }
 
@@ -522,14 +495,11 @@ fn stale_done_row_drained_on_name_reuse() {
 
     let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
 
-    // Under #181 semantics, the daemon may either LEAVE the stale row (name
-    // not yet in roster) or CONSUME it at spawn time when Agent0 is acquired.
-    // The at-spawn drain (`consumed N stale mailbox row(s) for Agent0`) is
-    // the mandatory defense — it MUST fire because Agent0 is the first name
-    // in the pool.
+    // The stale Done row is consumed via the passive agent phantom path
+    // (no working task found for Agent0) before the at-spawn drain fires.
     assert!(
-        handle.wait_for("consumed 1 stale mailbox row(s) for Agent0", 15),
-        "at-spawn drain did not consume stale Agent0 row. Lines: {:?}",
+        handle.wait_for("passive agent Agent0 submit: no working task found", 15),
+        "stale Agent0 row not consumed. Lines: {:?}",
         handle.lines
     );
 

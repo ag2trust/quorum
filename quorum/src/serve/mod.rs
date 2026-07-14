@@ -99,27 +99,19 @@ impl ReviewerProvisionTracker {
 
 /// Lifetime roster of agent names this daemon has ever owned.
 ///
-/// Under a multi-instance topology (one shared SQLite mailbox, per-repo daemons)
-/// a mailbox row whose `agent` matches no live worker/reviewer usually means
-/// "belongs to the OTHER daemon's agent", not "phantom row". Consuming such a
-/// row destroys the sibling daemon's lifecycle signal (#181).
-///
-/// The roster tracks every agent name this daemon has ever spawned or resumed —
-/// entries are inserted at spawn/recover and NEVER removed (so recently-torn-down
-/// names still register as "ours"). The phantom-row GC guarantee from #133 is
-/// preserved WITHIN an instance: our own past-agent rows still get consumed;
-/// rows for names we have never owned are left for the owning instance to
-/// process (or for TTL/sweep to reap if truly orphaned).
+/// Tracks every agent name this daemon has spawned or resumed — entries are
+/// inserted at spawn/recover and NEVER removed. Used to distinguish F9
+/// phantom rows (from our own past agents) from passive/interactive agent
+/// submissions. daemon_lock (invariant 11) guarantees single daemon per DB,
+/// so non-roster names are always passive agents, never a sibling daemon.
 pub(crate) struct LifetimeRoster {
     names: std::collections::HashSet<String>,
-    logged_foreign: std::collections::HashSet<String>,
 }
 
 impl LifetimeRoster {
     fn new() -> Self {
         Self {
             names: std::collections::HashSet::new(),
-            logged_foreign: std::collections::HashSet::new(),
         }
     }
 
@@ -131,12 +123,6 @@ impl LifetimeRoster {
     /// True if this daemon has ever owned this agent name.
     pub(crate) fn owns(&self, name: &str) -> bool {
         self.names.contains(name)
-    }
-
-    /// Record that we have logged a "foreign row" for this agent (debounce).
-    /// Returns true the first time an agent is seen, false on subsequent calls.
-    fn log_foreign_once(&mut self, name: &str) -> bool {
-        self.logged_foreign.insert(name.to_string())
     }
 }
 
@@ -1191,14 +1177,13 @@ async fn tick(
                     row.agent
                 ));
             } else {
-                // #181: row belongs to another daemon's agent — leave it.
-                if lifetime_roster.log_foreign_once(&row.agent) {
-                    log(&format!(
-                        "leaving task_update from {} unconsumed (not in this instance's roster)",
-                        row.agent
-                    ));
-                }
-                continue;
+                // Passive agent task_update — no worker slot, but consume
+                // so it doesn't accumulate. daemon_lock (invariant 11)
+                // guarantees single daemon per DB.
+                log(&format!(
+                    "consuming task_update from passive agent {} (no active worker)",
+                    row.agent
+                ));
             }
             if !consume_mailbox_row(&db_path, *id).await {
                 break;
@@ -1255,11 +1240,11 @@ async fn tick(
                         "kill: agent {target} not active (already dead/finished)"
                     ));
                 } else {
+                    // Passive agent — daemon can't terminate it, but
+                    // consume the row (single daemon per DB, invariant 11).
                     log(&format!(
-                        "kill: agent {target} not in this instance's roster"
+                        "kill: agent {target} not managed by daemon — consuming row"
                     ));
-                    // Leave unconsumed for another daemon instance.
-                    continue;
                 }
             }
             if !consume_mailbox_row(&db_path, *id).await {
@@ -2584,16 +2569,15 @@ async fn tick(
             break;
         }
 
-        // F9 + #181: Done row matches neither worker nor reviewer.
+        // F9: Done row matches neither worker nor reviewer.
         //
-        // If this daemon has ever owned the agent name, the row is a phantom
-        // from a prior turn we own — consume it (F9) so it doesn't re-poll and
-        // so a future name-reuse doesn't fire a phantom verdict.
+        // Roster-owned names with no active slot are phantoms from a prior
+        // turn — consume (F9) so they don't re-poll.
         //
-        // If this daemon has NEVER owned the name, the row belongs to another
-        // instance's agent (two-instance topology, shared SQLite queue) — leave
-        // it for the owning daemon to process (#181). Consuming would destroy
-        // the sibling's lifecycle signal.
+        // Non-roster names are passive/interactive agents. daemon_lock
+        // (invariant 11) guarantees a single daemon per DB, so there is no
+        // sibling instance to defer to. Look up the agent's working task
+        // and fire the lifecycle event so passive agents enter review.
         if lifetime_roster.owns(&row.agent) {
             log(&format!(
                 "consuming unmatched Done row from {} (matches no active agent)",
@@ -2602,11 +2586,84 @@ async fn tick(
             if !consume_mailbox_row(&db_path, *id).await {
                 break;
             }
-        } else if lifetime_roster.log_foreign_once(&row.agent) {
-            log(&format!(
-                "leaving Done row from {} unconsumed (not in this instance's roster)",
-                row.agent
-            ));
+        } else {
+            // Passive agent submit: find their working task and fire lifecycle.
+            let agent_name = row.agent.clone();
+            let row_pr = row.pr;
+            let passive_task = {
+                let p = db_path.clone();
+                let a = agent_name.clone();
+                tokio::task::spawn_blocking(move || -> Result<Option<(i64, Option<i64>)>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    let working = tasks::list(&conn, Some("working"), None, Some(&a))?;
+                    Ok(working
+                        .first()
+                        .map(|t| (t.id, tasks::extract_pr_number(&t.refs))))
+                })
+                .await
+            };
+            match passive_task {
+                Ok(Ok(Some((task_id, refs_pr)))) => {
+                    let effective_pr = row_pr.or(refs_pr);
+                    if let Some(pr) = effective_pr {
+                        log(&format!(
+                            "passive agent {} submit: task #{task_id} PR #{pr} — firing SignaledDone",
+                            agent_name
+                        ));
+                        let event = Event::SignaledDone { pr: pr.to_string() };
+                        let tr = fire_event(&db_path, &agent_name, task_id, &event).await;
+                        if tr.is_none() {
+                            log(&format!(
+                                "lifecycle rejected SignaledDone for passive agent {} task #{task_id}",
+                                agent_name
+                            ));
+                        }
+                    } else {
+                        // Done without PR — close directly.
+                        log(&format!(
+                            "passive agent {} submit: task #{task_id} no PR — closing directly",
+                            agent_name
+                        ));
+                        let p = db_path.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            let now = now_unix();
+                            tasks::close_after_merge(
+                                &mut conn,
+                                task_id,
+                                "done without PR (passive)",
+                                now,
+                            )?;
+                            Ok(())
+                        })
+                        .await
+                        .ok();
+                    }
+                }
+                Ok(Ok(None)) => {
+                    log(&format!(
+                        "passive agent {} submit: no working task found — consuming as phantom",
+                        agent_name
+                    ));
+                }
+                Ok(Err(e)) => {
+                    log(&format!(
+                        "ERROR: passive agent {} task lookup failed: {e} — leaving row for retry",
+                        agent_name
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    log(&format!(
+                        "ERROR: passive agent {} task lookup join error: {e} — leaving row for retry",
+                        agent_name
+                    ));
+                    continue;
+                }
+            }
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
         }
     }
 
@@ -3146,16 +3203,10 @@ async fn tick(
                 consume_mailbox_row(&db_path, *msg_id).await;
             }
             None => {
-                // #181: only reap messages addressed to agents we've ever owned.
-                // Otherwise the row belongs to another instance's worker — leave it.
-                if lifetime_roster.owns(target) {
-                    log(&format!("consuming message to {target} (no active worker)"));
-                    consume_mailbox_row(&db_path, *msg_id).await;
-                } else if lifetime_roster.log_foreign_once(target) {
-                    log(&format!(
-                        "leaving message to {target} unconsumed (not in this instance's roster)"
-                    ));
-                }
+                // No active worker for this target. Consume — single daemon
+                // per DB (invariant 11), no sibling to defer to.
+                log(&format!("consuming message to {target} (no active worker)"));
+                consume_mailbox_row(&db_path, *msg_id).await;
             }
         }
     }
