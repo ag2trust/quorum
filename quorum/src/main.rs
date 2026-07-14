@@ -120,6 +120,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Classify { .. } => "classify",
         cli::Command::Kill { .. } => "kill",
         cli::Command::ReviewInterpret { .. } => "review-interpret",
+        cli::Command::Upgrade { .. } => "upgrade",
         cli::Command::Help => "help",
     }
 }
@@ -325,24 +326,27 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 out["migrated_from"] = serde_json::json!(info.migrated_from);
             }
 
-            // Repo skill: write .claude/skills/quorum/SKILL.md if inside a git repo.
+            // Repo skill: create .claude/skills/quorum/SKILL.md if missing.
+            // Never overwrite — report stale if differs (use `quorum upgrade` to replace).
             if let Some(toplevel) = paths::git_toplevel() {
                 let skill_path = toplevel.join(".claude/skills/quorum/SKILL.md");
-                let needs_write = match std::fs::read_to_string(&skill_path) {
-                    Ok(existing) => existing != EMBEDDED_SKILL,
-                    Err(_) => true,
-                };
-                if needs_write {
-                    if let Some(parent) = skill_path.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| QuorumError::Io(e.to_string()))?;
+                match std::fs::read_to_string(&skill_path) {
+                    Ok(existing) if existing == EMBEDDED_SKILL => {}
+                    Ok(_) => {
+                        out["skill"] = serde_json::json!("stale");
                     }
-                    std::fs::write(&skill_path, EMBEDDED_SKILL)
-                        .map_err(|e| QuorumError::Io(e.to_string()))?;
-                    out["skill"] = serde_json::json!({
-                        "path": skill_path.to_string_lossy(),
-                        "action": "written",
-                    });
+                    Err(_) => {
+                        if let Some(parent) = skill_path.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|e| QuorumError::Io(e.to_string()))?;
+                        }
+                        std::fs::write(&skill_path, EMBEDDED_SKILL)
+                            .map_err(|e| QuorumError::Io(e.to_string()))?;
+                        out["skill"] = serde_json::json!({
+                            "path": skill_path.to_string_lossy(),
+                            "action": "created",
+                        });
+                    }
                 }
             }
 
@@ -1581,11 +1585,67 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
             Ok(0)
         }
+        cli::Command::Upgrade { check } => {
+            let toplevel = paths::git_toplevel()
+                .ok_or_else(|| QuorumError::Usage("not inside a git repository".into()))?;
+            let skill_path = toplevel.join(".claude/skills/quorum/SKILL.md");
+            let existing: String = std::fs::read_to_string(&skill_path).unwrap_or_default();
+            if existing == EMBEDDED_SKILL {
+                output::emit(&serde_json::json!({"ok": true, "status": "current"}));
+                return Ok(0);
+            }
+            // Print unified diff to stderr (human-readable).
+            for line in diff_lines(&existing, EMBEDDED_SKILL) {
+                eprintln!("{line}");
+            }
+            if check {
+                output::emit(&serde_json::json!({"ok": false, "status": "stale"}));
+                return Ok(1);
+            }
+            if let Some(parent) = skill_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| QuorumError::Io(e.to_string()))?;
+            }
+            std::fs::write(&skill_path, EMBEDDED_SKILL)
+                .map_err(|e| QuorumError::Io(e.to_string()))?;
+            output::emit(&serde_json::json!({
+                "ok": true,
+                "status": "upgraded",
+                "path": skill_path.to_string_lossy(),
+            }));
+            Ok(0)
+        }
         cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);
             Ok(0)
         }
     }
+}
+
+fn diff_lines(old: &str, new: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    out.push("--- installed".to_string());
+    out.push("+++ embedded".to_string());
+    // Simple line-by-line diff (good enough for a single small file).
+    let max = old_lines.len().max(new_lines.len());
+    let mut i = 0;
+    while i < max {
+        let ol = old_lines.get(i).copied().unwrap_or("");
+        let nl = new_lines.get(i).copied().unwrap_or("");
+        if ol == nl {
+            out.push(format!(" {ol}"));
+        } else {
+            if i < old_lines.len() {
+                out.push(format!("-{ol}"));
+            }
+            if i < new_lines.len() {
+                out.push(format!("+{nl}"));
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn main() {
