@@ -43,6 +43,8 @@ pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
          - Never review your own delivery — if you authored the PR, adopted it, or \
          signaled its done, you are disqualified.\n\n\
          Do NOT merge the PR yourself — the daemon handles merging.\n\
+         Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
+         approval as the merge account after your verdict.\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         name = spec.reviewer_name,
         pr = spec.pr,
@@ -58,6 +60,7 @@ pub fn reviewer_branch(pr: i64, reviewer_name: &str) -> String {
     format!("review/pr-{}-{}", pr, reviewer_name.to_lowercase())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_reviewer(
     model: &str,
     effort: &str,
@@ -66,6 +69,7 @@ pub async fn spawn_reviewer(
     agent_bin: Option<&str>,
     bare: bool,
     env_vars: Vec<(String, String)>,
+    allowed_tools_override: Option<&str>,
 ) -> std::io::Result<AgentProc> {
     let agent_spec = AgentSpec {
         model: model.to_string(),
@@ -73,10 +77,44 @@ pub async fn spawn_reviewer(
         session_id: session_id.to_string(),
         worktree: worktree_path.to_path_buf(),
         bare,
-        allowed_tools: ALLOWED_TOOLS.to_string(),
+        allowed_tools: allowed_tools_override.unwrap_or(ALLOWED_TOOLS).to_string(),
         env_vars,
     };
     AgentProc::spawn(&agent_spec, agent_bin)
+}
+
+pub struct R2AuditSpec {
+    pub pr: i64,
+    pub r1_reviewer: String,
+    pub r2_name: String,
+}
+
+pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
+    format!(
+        "You are R2 auditor {name}. Adversarially audit the review by R1 reviewer \
+         {r1} on PR #{pr}.\n\n\
+         Read the full PR diff AND all review comments from {r1}. Your job is two-sided:\n\
+         1. `missed` — real problems R1 failed to flag (false negatives). Each with severity \
+         (critical/major/minor) and confidence (0-100).\n\
+         2. `overcaught` — fixes R1 demanded that were not actually needed (false positives).\n\n\
+         Output your findings as a JSON object on stdout (no markdown fences):\n\
+         ```\n\
+         {{\n\
+           \"missed\": [{{\"description\": \"...\", \"severity\": \"major\", \"confidence\": 80}}],\n\
+           \"overcaught\": [{{\"description\": \"...\"}}],\n\
+           \"verdict\": \"approved\" | \"changes\"\n\
+         }}\n\
+         ```\n\n\
+         Then signal completion:\n\
+         quorum done --agent {name} --pr {pr} --verdict <your_verdict> \
+         --blocking <count_of_missed_with_confidence_ge_70>\n\n\
+         Do NOT merge the PR. Do NOT run `gh pr review --approve` — the daemon \
+         posts the formal GitHub approval. Do NOT mark the task done. Shadow mode — \
+         your verdict is recorded but does not affect the merge outcome.",
+        name = spec.r2_name,
+        r1 = spec.r1_reviewer,
+        pr = spec.pr,
+    )
 }
 
 /// Budget status line for worker turns. Workers self-regulate against the task
@@ -242,6 +280,10 @@ mod tests {
             "reviewer prompt must NOT instruct the reviewer to merge"
         );
         assert!(prompt.contains("Do NOT merge the PR yourself"));
+        assert!(
+            prompt.contains("Do NOT run `gh pr review --approve`"),
+            "reviewer prompt must forbid gh pr review --approve (daemon posts approval)"
+        );
     }
 
     #[test]
@@ -255,6 +297,20 @@ mod tests {
     fn reviewer_branch_format() {
         let branch = reviewer_branch(55, "Rev-1");
         assert_eq!(branch, "review/pr-55-rev-1");
+    }
+
+    #[test]
+    fn r2_audit_prompt_forbids_gh_approve() {
+        let spec = R2AuditSpec {
+            pr: 10,
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
+        let prompt = build_r2_audit_prompt(&spec);
+        assert!(
+            prompt.contains("Do NOT run `gh pr review --approve`"),
+            "R2 audit prompt must forbid gh pr review --approve"
+        );
     }
 
     #[test]

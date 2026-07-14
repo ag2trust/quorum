@@ -32,6 +32,11 @@ pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 /// prefix is reopenable by creator or (former) assignee (#182).
 pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
 
+/// Body marker for review-only tasks whose approved PR failed to merge (e.g. conflicts).
+/// The daemon's orphan-in-review handler detects this and retries merge when the PR
+/// becomes MERGEABLE again.
+pub const MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked";
+
 const KNOWN_TIERS: &[&str] = &["opus-46", "opus-47", "opus-48", "sonnet-5"];
 const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
 const KNOWN_COMPLEXITIES: &[&str] = &["1", "2", "3", "4", "5"];
@@ -120,6 +125,8 @@ pub struct TaskCompact {
     pub branch_exists: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 impl From<&Task> for TaskCompact {
@@ -135,6 +142,7 @@ impl From<&Task> for TaskCompact {
             suggested_worktree: None,
             branch_exists: None,
             effects: Vec::new(),
+            repo: None,
         }
     }
 }
@@ -179,6 +187,7 @@ pub fn effect_name(e: &Effect) -> String {
         Effect::IncrementReworkRound => "increment_rework_round".into(),
         Effect::NotifyOwner { .. } => "notify_owner".into(),
         Effect::ReleaseLease => "release_lease".into(),
+        Effect::ClearAuthor => "clear_author".into(),
         Effect::PostFindingsNote => "post_findings_note".into(),
     }
 }
@@ -311,6 +320,14 @@ pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
     })
 }
 
+pub fn extract_repo(refs: &Option<String>) -> Option<String> {
+    let s = refs.as_deref()?;
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    v.get("repo")
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+}
+
 // ── create ────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -406,7 +423,7 @@ pub fn claim(
                     "UPDATE tasks SET
                         status = CASE WHEN status='open' THEN 'working' ELSE status END,
                         assignee = ?1,
-                        author = CASE WHEN status='open' THEN ?1 ELSE author END,
+                        author = CASE WHEN status='open' AND author IS NULL THEN ?1 ELSE author END,
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3 AND (
@@ -445,7 +462,7 @@ pub fn claim(
                 "UPDATE tasks SET
                     status = CASE WHEN status='open' THEN 'working' ELSE status END,
                     assignee = ?1,
-                    author = CASE WHEN status='open' THEN ?1 ELSE author END,
+                    author = CASE WHEN status='open' AND author IS NULL THEN ?1 ELSE author END,
                     reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                     updated_at = ?2
                  WHERE id = ({selector}) RETURNING {COLS}"
@@ -531,6 +548,7 @@ pub fn apply_event(
         | Event::Cancelled { .. }
         | Event::MergeSucceeded
         | Event::MergeFailed { .. }
+        | Event::MergeConflict
         | Event::PrFoundMerged
         | Event::PrFoundClosed => {}
     }
@@ -564,6 +582,9 @@ pub fn apply_event(
                 reviewer = Some(agent.clone());
                 assignee = Some(agent.clone());
             }
+            Effect::ClearAuthor => {
+                author = None;
+            }
             Effect::IncrementReworkRound => {
                 rework_round += 1;
             }
@@ -590,7 +611,7 @@ pub fn apply_event(
                         alert_body,
                         format!("task:{id}"),
                         expires_at,
-                        task.created_by
+                        "owner"
                     ],
                 )?;
             }
@@ -2106,7 +2127,7 @@ mod tests {
         let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
         let alert = msgs
             .iter()
-            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("owner"))
             .expect("alert message to creator missing");
         assert!(
             alert.body.contains("rework cap"),
@@ -2152,6 +2173,59 @@ mod tests {
     }
 
     #[test]
+    fn review_only_merge_failed_posts_alert_and_stays_in_review() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "review PR #50",
+            None,
+            100,
+            None,
+            None,
+            None,
+            Some(50),
+            1000,
+        )
+        .unwrap();
+        // Claim as reviewer, approve, then fail merge
+        claim(&mut c, "R", Some(id), &[], TTL, 1001).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictApprove, 1002).unwrap();
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::MergeFailed {
+                reason: "PR #50 has conflicts with main".into(),
+            },
+            1003,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert!(r.task.review_only);
+        assert!(r
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+
+        // Creator got an alert DM
+        let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
+        let alert = msgs
+            .iter()
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("owner"))
+            .expect("alert DM to creator missing after merge failure");
+        assert!(
+            alert.body.contains("conflicts"),
+            "alert should mention conflicts: {}",
+            alert.body
+        );
+
+        // Reviewer column is still set (needed for merge retry)
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.reviewer.as_deref(), Some("R"));
+    }
+
+    #[test]
     fn agent_failed_from_working_posts_alert_to_creator() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
@@ -2172,7 +2246,7 @@ mod tests {
         let msgs = crate::feed::peek(&c, None, None, 10, 1001).unwrap();
         let alert = msgs
             .iter()
-            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("boss"))
+            .find(|m| m.kind == "alert" && m.recipient.as_deref() == Some("owner"))
             .expect("alert message to creator missing");
         assert!(alert.body.contains("OOM killed"));
     }
@@ -2475,6 +2549,17 @@ mod tests {
     }
 
     #[test]
+    fn extract_repo_from_refs() {
+        assert_eq!(
+            extract_repo(&Some(r#"{"pr":42,"repo":"ag2trust/quorum"}"#.into())),
+            Some("ag2trust/quorum".to_string()),
+        );
+        assert_eq!(extract_repo(&Some(r#"{"pr":42}"#.into())), None);
+        assert_eq!(extract_repo(&None), None);
+        assert_eq!(extract_repo(&Some(r#"{"repo":123}"#.into())), None);
+    }
+
+    #[test]
     fn validate_labels_accepts_known_efforts() {
         assert!(validate_labels(r#"["effort:medium"]"#).is_ok());
         assert!(validate_labels(r#"["effort:high"]"#).is_ok());
@@ -2644,5 +2729,157 @@ mod tests {
 
         let task = get(&c, id).unwrap().unwrap();
         assert_eq!(task.status, "cancelled");
+    }
+
+    /// Rework re-claim by a different agent must preserve the original author
+    /// and never overwrite it (#340). The branch (derived from author) stays
+    /// stable across re-claims, preventing duplicate PRs.
+    #[test]
+    fn rework_reclaim_preserves_original_author() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+
+        // Original author claims
+        let t = claim(&mut c, "Optic-lo4x", Some(id), &[], TTL, 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.author, Some("Optic-lo4x".to_string()));
+
+        // Author signals done
+        apply_event(
+            &mut c,
+            "Optic-lo4x",
+            id,
+            &Event::SignaledDone {
+                pr: "3620".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Reviewer claims and sends back for rework
+        claim(&mut c, "Optic-c6at", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "Optic-c6at", id, &Event::VerdictChanges, 1003).unwrap();
+
+        // Author's lease lapsed — rework → open
+        apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
+
+        // Different agent claims the reopened task
+        let t = claim(&mut c, "Lever-lx89", Some(id), &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            t.author,
+            Some("Optic-lo4x".to_string()),
+            "author must be the original claimant, not the re-claimer"
+        );
+        assert_eq!(
+            t.assignee,
+            Some("Lever-lx89".to_string()),
+            "assignee should be the new worker"
+        );
+    }
+
+    /// Auto-select claim (task_id=None) also preserves author on rework re-claim (#340).
+    #[test]
+    fn rework_reclaim_auto_select_preserves_author() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+
+        // Original author claims
+        claim(&mut c, "Optic-lo4x", Some(id), &[], TTL, 1000).unwrap();
+
+        // Author signals done → in-review
+        apply_event(
+            &mut c,
+            "Optic-lo4x",
+            id,
+            &Event::SignaledDone {
+                pr: "1".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Reviewer sends back for rework
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
+
+        // Lease lapse → open
+        apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
+
+        // New agent auto-selects (no task_id)
+        let t = claim(&mut c, "Lever-lx89", None, &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.id, id);
+        assert_eq!(
+            t.author,
+            Some("Optic-lo4x".to_string()),
+            "auto-select claim must also preserve original author"
+        );
+    }
+
+    // #101: a working task whose refs carry a PR must NOT be direct-closed
+    // when the done signal omits --pr. The daemon must extract the PR from
+    // refs and route through the review lifecycle instead.
+    #[test]
+    fn done_without_pr_flag_must_not_close_task_with_refs_pr() {
+        let (_dir, mut c) = open_tmp();
+
+        // Create and claim a task with refs containing pr:343.
+        let id = create(
+            &mut c,
+            "system",
+            "review task with PR",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":343}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+
+        claim(&mut c, "worker-1", Some(id), &[], TTL, 1001).unwrap();
+
+        // Verify extract_pr_number finds the PR in refs.
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(
+            extract_pr_number(&task.refs),
+            Some(343),
+            "refs.pr must be extractable for backfill"
+        );
+
+        // The lifecycle transition for SignaledDone must produce in-review,
+        // not a terminal state — proving direct-close is wrong here.
+        let view = crate::lifecycle::TaskView {
+            status: crate::lifecycle::Status::Working,
+            author: Some("worker-1".into()),
+            reviewer: None,
+            rework_round: 0,
+            pr: Some("343".into()),
+            review_only: false,
+        };
+        let (new_status, _effects) = crate::lifecycle::transition(
+            &view,
+            &crate::lifecycle::Event::SignaledDone { pr: "343".into() },
+        )
+        .unwrap();
+        assert_eq!(
+            new_status,
+            crate::lifecycle::Status::InReview,
+            "working task with PR must transition to in-review, not be direct-closed"
+        );
+
+        // Negative assertion: close_after_merge on a working task would
+        // incorrectly skip the review lifecycle.
+        assert_eq!(task.status, "working");
+        assert!(
+            extract_pr_number(&task.refs).is_some(),
+            "daemon must check refs before direct-closing"
+        );
     }
 }

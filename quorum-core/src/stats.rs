@@ -221,6 +221,15 @@ pub struct DedupedError {
     pub latest_age_secs: i64,
 }
 
+/// An owner-alert feed message (kind = "alert" or "critical") for the ALERTS cockpit section.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct AlertMessage {
+    pub body: String,
+    pub refs: Option<String>,
+    pub age_secs: i64,
+    pub kind: String,
+}
+
 /// Health verdict for the status header.
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy, Default)]
 pub enum HealthVerdict {
@@ -278,6 +287,8 @@ pub struct Stats {
     pub unbacked_prs: Vec<crate::drift::UnbackedPr>,
     /// T59: tasks with multiple open PRs.
     pub twin_prs: Vec<crate::drift::TwinPr>,
+    /// #88: owner-alert feed messages (kind = alert/critical), visible in ALERTS cockpit section.
+    pub alerts: Vec<AlertMessage>,
 }
 
 /// Gather a snapshot. Read-only.
@@ -348,7 +359,12 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let queue_tasks_list = queue_tasks(conn)?;
     let pipeline = pipeline_tasks(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
-    let health = compute_health(&daemon_agents, !recent_errors.is_empty());
+    let alerts = alert_messages(conn, now)?;
+    let health = compute_health(
+        &daemon_agents,
+        !recent_errors.is_empty(),
+        !alerts.is_empty(),
+    );
     let stalled_count = daemon_agents
         .iter()
         .filter(|d| is_stall_eligible(d))
@@ -388,6 +404,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         session_cost,
         unbacked_prs,
         twin_prs,
+        alerts,
     })
 }
 
@@ -920,6 +937,7 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
     };
     let mut tier_part = String::new();
     let mut eff_part = String::new();
+    let mut complexity: Option<&str> = None;
     for item in arr {
         if let Some(t) = item.as_str() {
             if let Some(rest) = t.strip_prefix("tier:") {
@@ -930,11 +948,16 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
                     "medium" | "med" => "md".to_string(),
                     other => other.to_string(),
                 };
+            } else if let Some(rest) = t.strip_prefix("complexity:") {
+                complexity = Some(rest);
             }
         }
     }
     if tier_part.is_empty() && eff_part.is_empty() {
-        return "—".to_string();
+        return match complexity {
+            Some(n) => format!("c{n}"),
+            None => "—".to_string(),
+        };
     }
     if eff_part.is_empty() {
         return tier_part;
@@ -1062,13 +1085,39 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
     Ok((recent, older))
 }
 
+/// Recent owner-alert messages (kind = alert/critical) for the ALERTS cockpit section (#88).
+fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
+    let mut stmt = conn.prepare(
+        "SELECT body, refs, ts, kind
+         FROM messages
+         WHERE expires_at > ?1 AND kind IN ('alert', 'critical')
+         ORDER BY ts DESC
+         LIMIT 10",
+    )?;
+    let rows = stmt
+        .query_map(params![now], |r| {
+            Ok(AlertMessage {
+                body: r.get(0)?,
+                refs: r.get(1)?,
+                age_secs: (now - r.get::<_, i64>(2)?).max(0),
+                kind: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Compute the health verdict (#204).
 /// Thresholds: 60s silent → attention, 180s silent → stalled.
 fn is_stall_eligible(d: &DaemonAgentView) -> bool {
     d.role == "worker" && d.phase != "awaiting-review"
 }
 
-fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> HealthVerdict {
+fn compute_health(
+    daemon_agents: &[DaemonAgentView],
+    errors_recent: bool,
+    alerts_present: bool,
+) -> HealthVerdict {
     let has_dead = daemon_agents
         .iter()
         .filter(|d| is_stall_eligible(d))
@@ -1086,7 +1135,7 @@ fn compute_health(daemon_agents: &[DaemonAgentView], errors_recent: bool) -> Hea
             Some(age) => age > 60,
             None => false,
         });
-    if has_stalling || errors_recent {
+    if has_stalling || errors_recent || alerts_present {
         return HealthVerdict::Attention;
     }
     HealthVerdict::OnTrack
@@ -2104,17 +2153,17 @@ mod tests {
             uptime_secs: None,
         };
         assert_eq!(
-            compute_health(&[worker(Some(50))], false),
+            compute_health(&[worker(Some(50))], false, false),
             HealthVerdict::OnTrack,
             "50s should be on-track (threshold is 60s)"
         );
         assert_eq!(
-            compute_health(&[worker(Some(90))], false),
+            compute_health(&[worker(Some(90))], false, false),
             HealthVerdict::Attention,
             "90s should be attention (was stalled at old 120s threshold)"
         );
         assert_eq!(
-            compute_health(&[worker(Some(200))], false),
+            compute_health(&[worker(Some(200))], false, false),
             HealthVerdict::Stalled,
             "200s should be stalled"
         );
@@ -2146,7 +2195,7 @@ mod tests {
     fn awaiting_review_worker_not_stalled() {
         let w = make_daemon_agent("worker", "awaiting-review", Some(300));
         assert_eq!(
-            compute_health(&[w], false),
+            compute_health(&[w], false, false),
             HealthVerdict::OnTrack,
             "awaiting-review worker with 300s silence must not trigger stalled"
         );
@@ -2156,7 +2205,7 @@ mod tests {
     fn working_worker_stalled_after_180s() {
         let w = make_daemon_agent("worker", "working", Some(200));
         assert_eq!(
-            compute_health(&[w], false),
+            compute_health(&[w], false, false),
             HealthVerdict::Stalled,
             "working worker with 200s silence must be stalled"
         );
@@ -2166,7 +2215,7 @@ mod tests {
     fn reviewer_not_counted_for_stall() {
         let r = make_daemon_agent("reviewer", "reviewing", Some(300));
         assert_eq!(
-            compute_health(&[r], false),
+            compute_health(&[r], false, false),
             HealthVerdict::OnTrack,
             "reviewer with 300s silence must not trigger stalled (not a worker)"
         );
@@ -2178,7 +2227,7 @@ mod tests {
         let active = make_daemon_agent("worker", "working", Some(30));
         let reviewer = make_daemon_agent("reviewer", "reviewing", Some(400));
         assert_eq!(
-            compute_health(&[awaiting, active, reviewer], false),
+            compute_health(&[awaiting, active, reviewer], false, false),
             HealthVerdict::OnTrack,
             "only the active worker matters; awaiting-review and reviewer are excluded"
         );
@@ -2203,6 +2252,20 @@ mod tests {
         // so the operator sees the corruption.
         let out = tier_eff_label(Some(r#"["effort:low"]"#));
         assert_eq!(out, "low", "want raw passthrough, got {out:?}");
+    }
+
+    #[test]
+    fn tier_eff_label_complexity_fallback() {
+        assert_eq!(tier_eff_label(Some(r#"["complexity:2"]"#)), "c2");
+        assert_eq!(tier_eff_label(Some(r#"["complexity:5"]"#)), "c5");
+        // tier/effort present → complexity ignored
+        assert_eq!(
+            tier_eff_label(Some(r#"["tier:opus-46","effort:high","complexity:3"]"#)),
+            "opus46·hi"
+        );
+        // no labels at all → dash
+        assert_eq!(tier_eff_label(None), "—");
+        assert_eq!(tier_eff_label(Some(r#"[]"#)), "—");
     }
 
     #[test]
@@ -2274,7 +2337,7 @@ mod tests {
             uptime_secs: None,
         };
         assert!(is_stall_eligible(&view));
-        let health = compute_health(&[view], false);
+        let health = compute_health(&[view], false, false);
         assert_eq!(health, HealthVerdict::Stalled);
     }
 

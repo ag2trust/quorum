@@ -68,6 +68,10 @@ pub enum Command {
         body_stdin: bool,
         #[arg(long = "body-file")]
         body_file: Option<PathBuf>,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that repo's DB
+        /// instead of resolving from cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Atomically claim a task (a specific --task-id, or the highest-priority open task), taking
     /// a renewable lease. A lapsed lease returns the task to `open` (reaper).
@@ -86,6 +90,10 @@ pub enum Command {
         /// Lease duration, e.g. 45m, 1h, 30s, or bare seconds. Defaults to the config lease TTL.
         #[arg(long)]
         ttl: Option<String>,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that repo's DB
+        /// instead of resolving from cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Update a task: transition status, set refs/body, or append a note. The single
     /// task-transition command — replaces the former `task-release` and `task-cancel`.
@@ -444,6 +452,13 @@ pub enum Command {
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
+        /// Max seconds a worker/reviewer may sit idle between turns before
+        /// the watchdog kills it (default: 300). Catches zombies.
+        #[arg(long)]
+        idle_timeout_secs: Option<u64>,
+        /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
+        #[arg(long)]
+        allowed_tools: Option<String>,
         /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]
@@ -479,6 +494,10 @@ pub enum Command {
         /// process dies and its tempdir is cleaned up.
         #[arg(long, hide = true)]
         exit_when_gone: Option<String>,
+        /// Enable the doctor agent — a one-shot troubleshooter spawned for
+        /// tasks stalled with no active worker/reviewer. Default: off.
+        #[arg(long)]
+        doctor_enabled: bool,
     },
     /// Stream rendered events from an agent's session log. Resolves the agent's
     /// latest session log directory via the journal. Default: print events so far
@@ -518,6 +537,46 @@ pub enum Command {
         /// same as `serve --no-bare-agent`.
         #[arg(long)]
         no_bare_agent: bool,
+    },
+    /// Interpret PR review comments: fetch both comment endpoints, run a cheap
+    /// Haiku pass to extract structured findings (blocking, suggestion, rebuttal),
+    /// and store them in review_findings. One-shot per PR.
+    #[command(name = "review-interpret")]
+    ReviewInterpret {
+        /// PR number to interpret.
+        #[arg(long)]
+        pr: i64,
+        /// GitHub repo slug (owner/name). Uses `gh` default if omitted.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Task ID to associate findings with.
+        #[arg(long)]
+        task_id: Option<i64>,
+        /// Override the agent binary (default: "claude").
+        #[arg(long)]
+        agent_bin: Option<String>,
+        /// Disable --bare for the agent (subscription-auth machines).
+        #[arg(long)]
+        no_bare_agent: bool,
+        /// Emit JSON output instead of a summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Hard-terminate a daemon-managed agent. Writes a kill request to the
+    /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,
+    /// releases the slot, and runs the post-mortem ladder on any held task.
+    /// Exit 0 = kill delivered to mailbox. The daemon acts on it at next tick.
+    Kill {
+        /// Target agent name to kill.
+        #[arg(long)]
+        agent: String,
+        /// Who is requesting the kill.
+        #[arg(long)]
+        by: String,
+        #[arg(long = "reason-stdin")]
+        reason_stdin: bool,
+        #[arg(long = "reason-file")]
+        reason_file: Option<PathBuf>,
     },
     /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
     /// `help-agent` is kept as a back-compat alias.

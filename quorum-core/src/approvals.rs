@@ -186,6 +186,24 @@ mod tests {
     }
 
     #[test]
+    fn changes_verdict_records_blocking_count() {
+        let (mut conn, _dir) = test_conn();
+        let a = Approval {
+            pr_number: 300,
+            task_id: 90,
+            author: "Worker-w1".into(),
+            reviewer: "Reviewer-r1".into(),
+            verdict: "changes".into(),
+            blocking_count: 3,
+            approved_head_sha: String::new(),
+        };
+        record(&mut conn, &a).unwrap();
+        let got = get(&conn, 300).unwrap().unwrap();
+        assert_eq!(got.verdict, "changes");
+        assert_eq!(got.blocking_count, 3);
+    }
+
+    #[test]
     fn approval_record_is_instance_independent() {
         // The whole point of #228: the record survives with no instance
         // identity, so a restarted instance (new/empty roster) reads it back

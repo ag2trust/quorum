@@ -44,3 +44,10 @@ drain_timeout_secs = 900
 # ── misc ──────────────────────────────────────────────────────────────
 base_branch = "main"
 # no_bare_agent = false
+
+# ── doctor agent ──────────────────────────────────────────────────────
+# One-shot troubleshooter for tasks stalled with no active worker/reviewer.
+# Default OFF — the deterministic ladder (stir → reap → terminal+notify)
+# is the complete behavior when disabled. Enable only after the
+# deterministic ladder is battle-tested.
+# doctor_enabled = false

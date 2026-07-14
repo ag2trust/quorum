@@ -76,6 +76,9 @@ DAEMON IPC (M5 — agent-to-agent messaging + state reactions)
   quorum react   --agent <id> --task-id <n> --state <s>
                                                       # signal non-terminal state: blocked, failed, needs-info, note
                                                       # daemon tracks per-slot and surfaces via `quorum status`
+  quorum kill    --agent <id> --by <id> [--reason-stdin]
+                                                      # hard-terminate a daemon-managed agent (SIGTERM->SIGKILL);
+                                                      # task returns to open. daemon-down = row waits until consumed.
 
 OPS
   quorum status [--watch] [--json] [--agents]    # health snapshot; --agents = agent presence (online/offline)

@@ -1,6 +1,7 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    BlockedTask, DaemonAgentView, DedupedError, HealthVerdict, PipelineTask, QueueTask, Stats,
+    AlertMessage, BlockedTask, DaemonAgentView, DedupedError, HealthVerdict, PipelineTask,
+    QueueTask, Stats,
 };
 use std::io::Write;
 
@@ -134,6 +135,7 @@ pub fn render_with_style(s: &Stats, sty: &Style, w: &mut dyn Write) {
     render_blocked(&s.blocked, sty, w, width);
     render_pipeline(&s.pipeline, &s.daemon_agents, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
+    render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
 }
 
@@ -173,11 +175,19 @@ fn render_header(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
     };
     let _ = writeln!(w, " {rule}");
 
-    let working_count = s
+    let worker_task_ids: std::collections::HashSet<i64> = s
         .daemon_agents
         .iter()
         .filter(|d| d.role == "worker")
+        .filter_map(|d| d.task_id)
+        .collect();
+    let orphan_reviewers = s
+        .daemon_agents
+        .iter()
+        .filter(|d| d.role == "reviewer")
+        .filter(|d| d.task_id.is_none_or(|tid| !worker_task_ids.contains(&tid)))
         .count();
+    let working_count = worker_task_ids.len() + orphan_reviewers;
     let queued = s.queue_tasks.len();
     let blocked = s.blocked.len();
     let merged_hr = s.throughput.closed_last_hour;
@@ -204,98 +214,108 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         .filter(|d| d.role == "worker")
         .collect();
 
-    if workers.is_empty() {
-        let _ = writeln!(w, "  {}", sty.dim("(idle — no agents working)"));
-        return;
-    }
-
-    let _ = writeln!(
-        w,
-        "    {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
-        "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
-    );
-
     let reviewers: Vec<&DaemonAgentView> = s
         .daemon_agents
         .iter()
         .filter(|d| d.role == "reviewer")
         .collect();
 
-    for d in &workers {
-        let dot = sty.freshness_dot(d.last_activity_age_secs);
-        let eff = d.tier_eff.as_deref().unwrap_or("—");
-        let eff_short = eff.rsplit('·').next().unwrap_or(eff);
-        let task_str = d
-            .task_id
-            .map(|id| format!("#{id}"))
-            .unwrap_or_else(|| "—".to_string());
-        let title = d
-            .task_title
-            .as_deref()
-            .map(|t| truncate(t, 18))
-            .unwrap_or_else(|| "—".to_string());
-        let up = d
-            .uptime_secs
-            .map(fmt_age)
-            .unwrap_or_else(|| "—".to_string());
-        let tok = fmt_tokens(d.cost_tokens);
-        let tools = d.tool_count.to_string();
-        let evm = d
-            .events_per_min
-            .map(|v| format!("{:.0}", v))
-            .unwrap_or_else(|| "—".to_string());
-        let now = d.now_label.as_deref().unwrap_or("—");
-        let now_display = truncate(now, 24);
-        let rework_suffix = if d.rework_count > 0 {
-            format!(" ↻{}", d.rework_count)
-        } else {
-            String::new()
-        };
+    let worker_task_ids: std::collections::HashSet<i64> =
+        workers.iter().filter_map(|d| d.task_id).collect();
 
-        let _ = writeln!(
-            w,
-            "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
-            dot,
-            d.agent,
-            eff_short,
-            task_str,
-            title,
-            up,
-            tok,
-            tools,
-            evm,
-            now_display,
-            rework_suffix,
-        );
+    let orphan_reviewers: Vec<&&DaemonAgentView> = reviewers
+        .iter()
+        .filter(|d| d.task_id.is_none_or(|tid| !worker_task_ids.contains(&tid)))
+        .collect();
+
+    if workers.is_empty() && orphan_reviewers.is_empty() {
+        let _ = writeln!(w, "  {}", sty.dim("(idle — no agents working)"));
+        return;
+    }
+
+    let _ = writeln!(
+        w,
+        "  {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
+        "AGENT", "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
+    );
+
+    for d in &workers {
+        render_agent_row(d, sty, w);
 
         if let Some(tid) = d.task_id {
             for rev in &reviewers {
                 if rev.task_id == Some(tid) {
-                    let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
-                        rev.last_activity_age_secs
-                            .map(fmt_age)
-                            .unwrap_or_else(|| "—".to_string())
-                    });
-                    let rev_tok = fmt_tokens(rev.cost_tokens);
-                    let sub = if sty.color {
-                        format!(
-                            "    {} reviewer  {} · {} · {} tok",
-                            sty.dim("└"),
-                            rev.agent,
-                            rev_up,
-                            rev_tok,
-                        )
-                    } else {
-                        format!(
-                            "    +- reviewer  {} · {} · {} tok",
-                            rev.agent, rev_up, rev_tok,
-                        )
-                    };
-                    let _ = writeln!(w, "{sub}");
+                    render_reviewer_subrow(rev, sty, w);
                 }
             }
         }
     }
+
+    for rev in &orphan_reviewers {
+        render_agent_row(rev, sty, w);
+    }
+}
+
+fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
+    let dot = sty.freshness_dot(d.last_activity_age_secs);
+    let eff = d.tier_eff.as_deref().unwrap_or("—");
+    let eff_short = eff.rsplit('·').next().unwrap_or(eff);
+    let task_str = d
+        .task_id
+        .map(|id| format!("#{id}"))
+        .unwrap_or_else(|| "—".to_string());
+    let title = d
+        .task_title
+        .as_deref()
+        .map(|t| truncate(t, 18))
+        .unwrap_or_else(|| "—".to_string());
+    let up = d
+        .uptime_secs
+        .map(fmt_age)
+        .unwrap_or_else(|| "—".to_string());
+    let tok = fmt_tokens(d.cost_tokens);
+    let tools = d.tool_count.to_string();
+    let evm = d
+        .events_per_min
+        .map(|v| format!("{:.0}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let now = d.now_label.as_deref().unwrap_or("—");
+    let now_display = truncate(now, 24);
+    let rework_suffix = if d.rework_count > 0 {
+        format!(" ↻{}", d.rework_count)
+    } else {
+        String::new()
+    };
+
+    let _ = writeln!(
+        w,
+        "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
+        dot, d.agent, eff_short, task_str, title, up, tok, tools, evm, now_display, rework_suffix,
+    );
+}
+
+fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
+    let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
+        rev.last_activity_age_secs
+            .map(fmt_age)
+            .unwrap_or_else(|| "—".to_string())
+    });
+    let rev_tok = fmt_tokens(rev.cost_tokens);
+    let sub = if sty.color {
+        format!(
+            "    {} reviewer  {} · {} · {} tok",
+            sty.dim("└"),
+            rev.agent,
+            rev_up,
+            rev_tok,
+        )
+    } else {
+        format!(
+            "    +- reviewer  {} · {} · {} tok",
+            rev.agent, rev_up, rev_tok,
+        )
+    };
+    let _ = writeln!(w, "{sub}");
 }
 
 fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usize) {
@@ -475,6 +495,43 @@ fn render_unbacked_prs(
             warn,
             t.task_id,
             prs.join(", "),
+        );
+    }
+}
+
+fn render_alerts(alerts: &[AlertMessage], sty: &Style, w: &mut dyn Write, width: usize) {
+    if alerts.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("ALERTS", width));
+    for a in alerts {
+        let age = fmt_age(a.age_secs);
+        let icon = if a.kind == "critical" {
+            if sty.color {
+                sty.red("!!")
+            } else {
+                "!!".to_string()
+            }
+        } else {
+            if sty.color {
+                sty.yellow("!")
+            } else {
+                "!".to_string()
+            }
+        };
+        let refs_str = a
+            .refs
+            .as_deref()
+            .map(|r| format!("  {}", sty.dim(r)))
+            .unwrap_or_default();
+        let _ = writeln!(
+            w,
+            "  {} [{:>4} ago] {}{}",
+            icon,
+            age,
+            truncate(&a.body, 55),
+            refs_str,
         );
     }
 }
@@ -721,6 +778,19 @@ mod tests {
             output.contains("R1"),
             "reviewer name should appear: {output}"
         );
+
+        // Header "EFF" column must align with data "EFF" column
+        let header_line = output
+            .lines()
+            .find(|l| l.contains("EFF") && l.contains("TASK"))
+            .unwrap();
+        let data_line = output.lines().find(|l| l.contains("W1")).unwrap();
+        let header_eff_col = header_line.find("EFF").unwrap();
+        let data_eff_col = data_line.find("md").unwrap(); // "md" = eff value from "opus46·md"
+        assert_eq!(
+            header_eff_col, data_eff_col,
+            "EFF header col ({header_eff_col}) must match data col ({data_eff_col})\nheader: {header_line}\n  data: {data_line}"
+        );
     }
 
     #[test]
@@ -766,6 +836,50 @@ mod tests {
     }
 
     #[test]
+    fn orphan_reviewer_renders_as_working() {
+        let mut s = default_stats();
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "R-solo".into(),
+            role: "reviewer".into(),
+            task_id: Some(50),
+            phase: "reviewing".into(),
+            cost_tokens: 8000,
+            agent_state: None,
+            cost_usd: 0.10,
+            log_dir: None,
+            last_activity_age_secs: Some(5),
+            task_title: Some("review PR #3610".into()),
+            tier_eff: Some("opus46·hi".into()),
+            pr: None,
+            rework_count: 0,
+            tool_count: 12,
+            now_label: Some("Read: src/main.rs".into()),
+            events_per_min: Some(6.0),
+            uptime_secs: Some(180),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("no agents working"),
+            "orphan reviewer must not show idle: {output}"
+        );
+        assert!(
+            output.contains("R-solo"),
+            "orphan reviewer agent name must appear: {output}"
+        );
+        assert!(
+            output.contains("#50"),
+            "orphan reviewer task id must appear: {output}"
+        );
+        assert!(
+            output.contains("1 working"),
+            "header must count orphan reviewer: {output}"
+        );
+    }
+
+    #[test]
     fn unbacked_prs_section_hidden_when_empty() {
         let s = default_stats();
         let sty = Style::plain();
@@ -775,6 +889,67 @@ mod tests {
         assert!(
             !output.contains("UNBACKED"),
             "section should be hidden when no unbacked PRs: {output}"
+        );
+    }
+
+    #[test]
+    fn alerts_section_renders_when_present() {
+        use quorum_core::stats::AlertMessage;
+        let mut s = default_stats();
+        s.alerts.push(AlertMessage {
+            body: "task #42: rework cap exceeded".into(),
+            refs: Some("task:42".into()),
+            age_secs: 120,
+            kind: "alert".into(),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("ALERTS"),
+            "ALERTS section should appear: {output}"
+        );
+        assert!(
+            output.contains("rework cap exceeded"),
+            "alert body should appear: {output}"
+        );
+        assert!(
+            output.contains("task:42"),
+            "alert refs should appear: {output}"
+        );
+    }
+
+    #[test]
+    fn alerts_section_hidden_when_empty() {
+        let s = default_stats();
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("ALERTS"),
+            "ALERTS section should be hidden when no alerts: {output}"
+        );
+    }
+
+    #[test]
+    fn critical_alert_shows_double_bang() {
+        use quorum_core::stats::AlertMessage;
+        let mut s = default_stats();
+        s.alerts.push(AlertMessage {
+            body: "task #99: provision failure".into(),
+            refs: None,
+            age_secs: 30,
+            kind: "critical".into(),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("!!"),
+            "critical alert should show !!: {output}"
         );
     }
 }

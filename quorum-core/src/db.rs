@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -330,6 +330,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                     [],
                 )?;
             }
+        }
+        // v23 = R2 review audits (#92): `review_audits` table (net-new, via
+        // SCHEMA_SQL) + `agent_runs.sub_role` to distinguish R2 from R1 runs.
+        if current < 23 && !column_exists(conn, "agent_runs", "sub_role")? {
+            conn.execute("ALTER TABLE agent_runs ADD COLUMN sub_role TEXT", [])?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -1349,5 +1354,65 @@ mod tests {
             .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "seed task");
+    }
+
+    #[test]
+    fn migrates_v22_to_v23_adds_sub_role_and_review_audits() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE agent_runs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id INTEGER NOT NULL,
+                 agent_name TEXT NOT NULL,
+                 role TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+                 model TEXT NOT NULL,
+                 effort TEXT NOT NULL,
+                 spawned_at INTEGER NOT NULL,
+                 ended_at INTEGER,
+                 end_reason TEXT
+             );
+             INSERT INTO agent_runs(task_id, agent_name, role, model, effort, spawned_at)
+                 VALUES (1, 'Alice', 'worker', 'opus-46', 'high', 100);
+             PRAGMA user_version = 22;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        assert!(
+            column_exists(&c, "agent_runs", "sub_role").unwrap(),
+            "sub_role column missing — v22→v23 migration silently skipped"
+        );
+
+        let sub_role: Option<String> = c
+            .query_row("SELECT sub_role FROM agent_runs WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(sub_role.is_none(), "pre-existing row must default to NULL");
+
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='review_audits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "review_audits table must exist after v22→v23 migration"
+        );
     }
 }

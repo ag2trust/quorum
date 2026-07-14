@@ -16,6 +16,29 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
 }
 
+/// Poll every worker/reviewer session log under `{home}/logs/*/stream.jsonl`
+/// for `needle` until it matches or the timeout elapses. Agent *text* is
+/// written to the per-session log, NOT echoed to daemon stderr, so agent
+/// output (like the fake-agent's "Fixing…" rework response) is observed here.
+fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> bool {
+    let logs = home.join("logs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(&logs) {
+            for entry in entries.flatten() {
+                let stream = entry.path().join("stream.jsonl");
+                if let Ok(content) = std::fs::read_to_string(&stream) {
+                    if content.contains(needle) {
+                        return true;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -397,9 +420,8 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
     );
 
     assert!(
-        handle.wait_for("Fixing", 15),
-        "worker rework response not seen. Lines: {:?}",
-        handle.lines
+        wait_session_log(home.path(), "Fixing", 15),
+        "worker rework response not seen in session log"
     );
 
     // ── State assertions (F12) ──
@@ -862,9 +884,8 @@ fn rework_resignal_feeds_rereview_turn() {
         handle.lines
     );
     assert!(
-        handle.wait_for("Fixing", 15),
-        "worker rework response not seen. Lines: {:?}",
-        handle.lines
+        wait_session_log(home.path(), "Fixing", 15),
+        "worker rework response not seen in session log"
     );
 
     assert!(
@@ -965,15 +986,26 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
     // Worker signals done with PR (doesn't know task was cancelled)
     quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
 
-    // Daemon should detect the rejected transition and clean up
-    assert!(
-        handle.wait_for("lifecycle rejected", 15),
-        "lifecycle rejection not logged. Lines: {:?}",
-        handle.lines
-    );
+    // Daemon should detect the cancelled task and clean up.  Two valid
+    // orderings: (a) done signal arrives first → "lifecycle rejected", or
+    // (b) tick detects cancellation first → "externally moved to cancelled"
+    // and the done row lands as "unmatched Done".  Both tear down the worker.
     assert!(
         handle.wait_for("tearing down worker", 15),
         "worker teardown not seen after cancelled task. Lines: {:?}",
+        handle.lines
+    );
+    let saw_rejection = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("lifecycle rejected"));
+    let saw_external = handle
+        .lines
+        .iter()
+        .any(|l| l.contains("externally moved to cancelled"));
+    assert!(
+        saw_rejection || saw_external,
+        "expected either 'lifecycle rejected' or 'externally moved to cancelled'. Lines: {:?}",
         handle.lines
     );
 

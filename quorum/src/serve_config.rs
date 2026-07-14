@@ -28,6 +28,8 @@ pub struct ServeFileConfig {
     pub max_task_cost_usd: Option<f64>,
     pub max_turn_wall_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
+    pub allowed_tools: Option<String>,
     pub log_dir: Option<String>,
     pub self_update_drain: Option<bool>,
     pub drain_timeout_secs: Option<u64>,
@@ -40,6 +42,12 @@ pub struct ServeFileConfig {
     pub required_jobs: Option<Vec<String>>,
     pub master_ci_gate: Option<bool>,
     pub master_ci_timeout_secs: Option<u64>,
+    pub doctor_enabled: Option<bool>,
+    // ponytail: R2 review-audit knobs — defaults in ServeConfig resolution
+    pub r2_enabled: Option<bool>,
+    pub r2_target_per_stratum: Option<i64>,
+    pub r2_steady_state_p: Option<f64>,
+    pub r2_blocking: Option<bool>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
@@ -214,6 +222,7 @@ pub struct BannerData<'a> {
     pub drain_timeout_secs: &'a Sourced<u64>,
     pub max_turn_wall_secs: &'a Sourced<Option<u64>>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
+    pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
     pub max_task_tokens: &'a Sourced<Option<i64>>,
     pub max_turn_cost_usd: &'a Sourced<Option<f64>>,
@@ -222,6 +231,7 @@ pub struct BannerData<'a> {
     pub required_jobs: &'a [String],
     pub master_ci_gate: &'a Sourced<bool>,
     pub master_ci_timeout_secs: &'a Sourced<u64>,
+    pub doctor_enabled: &'a Sourced<bool>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -286,6 +296,13 @@ pub fn banner(d: &BannerData<'_>) -> String {
         opt_u64(d.max_task_wall_secs)
     ));
     lines.push(format!(
+        "  idle_timeout_secs:         {}",
+        match d.idle_timeout_secs.value {
+            Some(v) => format!("{v} ({src})", src = d.idle_timeout_secs.source),
+            None => format!("300 ({src}, default)", src = d.idle_timeout_secs.source),
+        }
+    ));
+    lines.push(format!(
         "  max_turn_tokens:           {}",
         opt_i64(d.max_turn_tokens)
     ));
@@ -318,6 +335,7 @@ pub fn banner(d: &BannerData<'_>) -> String {
         "  master_ci_timeout_secs:    {}",
         d.master_ci_timeout_secs
     ));
+    lines.push(format!("  doctor_enabled:            {}", d.doctor_enabled));
     lines.push("─────────────────────────────".to_string());
     lines.join("\n")
 }
@@ -389,6 +407,20 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         assert_eq!(cfg.cap, Some(8));
         assert_eq!(cfg.model.as_deref(), Some("opus-48"));
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
+        assert!(cfg.doctor_enabled.is_none());
+    }
+
+    #[test]
+    fn load_doctor_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(
+            &path,
+            "repo = \"test/repo\"\nrepo_dir = \"/tmp\"\nworktree_base = \"/tmp/wt\"\ndoctor_enabled = true\n",
+        )
+        .unwrap();
+        let cfg = load(&path, true).unwrap();
+        assert_eq!(cfg.doctor_enabled, Some(true));
     }
 
     #[test]
@@ -468,6 +500,10 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
                 value: None,
                 source: Source::Default,
             },
+            idle_timeout_secs: &Sourced {
+                value: None,
+                source: Source::Default,
+            },
             max_turn_tokens: &Sourced {
                 value: None,
                 source: Source::Default,
@@ -495,6 +531,10 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             },
             master_ci_timeout_secs: &Sourced {
                 value: 300,
+                source: Source::Default,
+            },
+            doctor_enabled: &Sourced {
+                value: false,
                 source: Source::Default,
             },
         });

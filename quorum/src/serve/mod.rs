@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod approvals;
 pub mod classifier;
+pub mod doctor;
 pub mod merge;
 pub mod names;
 pub mod recovery;
@@ -19,7 +20,7 @@ use agent::{AgentProc, AgentSpec};
 use names::Pool;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
-use quorum_core::lifecycle::{Effect, Event};
+use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
@@ -288,6 +289,10 @@ pub struct CostLimits {
     pub max_task_cost_usd: Option<f64>,
     pub max_turn_wall_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
+    /// Max seconds a worker/reviewer may sit idle between turns (draining=false)
+    /// before the watchdog kills it. Catches zombies that asked a question no one
+    /// can answer (e.g. permission denied in dontAsk mode). Default: 300.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 /// Configuration for the daemon, resolved from CLI flags / config file.
@@ -337,6 +342,22 @@ pub struct ServeConfig {
     /// Seconds to wait for the default branch CI to turn green before
     /// proceeding anyway. Default: 300.
     pub master_ci_timeout_secs: u64,
+    /// Override the default tool allowlist for spawned agents. When None,
+    /// uses `agent::ALLOWED_TOOLS`.
+    pub allowed_tools: Option<String>,
+    /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
+    /// with no active worker/reviewer. Default: false.
+    pub doctor_enabled: bool,
+    /// R2 review-audit: spawn a second reviewer to adversarially audit R1.
+    pub r2_enabled: bool,
+    /// R2: minimum samples per (model, effort, cx_bucket) stratum before
+    /// switching to steady-state probability. Default: 5.
+    pub r2_target_per_stratum: i64,
+    /// R2: probability of spawning R2 once stratum target is met. Default: 0.10.
+    pub r2_steady_state_p: f64,
+    /// R2: when true, R2 misses with confidence>=70 block merge. Default: false.
+    #[allow(dead_code)]
+    pub r2_blocking: bool,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -466,6 +487,9 @@ pub(crate) struct SlotState {
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
+    /// Set when `draining` flips to false (turn completed). Used by the idle
+    /// watchdog to detect zombies sitting between turns indefinitely.
+    turn_ended_at: Option<std::time::Instant>,
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
@@ -516,9 +540,16 @@ fn run_drift_check(db_path: &std::path::Path, repo: &str) -> Result<()> {
 
     let mut conn = quorum_core::db::open(db_path)?;
     let task_prs = quorum_core::drift::task_pr_refs(&conn)?;
+    let all_backed_prs = quorum_core::drift::all_task_pr_refs(&conn)?;
     let task_branches = quorum_core::drift::task_branch_allocations(&conn)?;
     let active_tasks = quorum_core::drift::active_task_ids(&conn)?;
-    let drift = quorum_core::drift::detect(&open_prs, &task_prs, &task_branches, &active_tasks);
+    let drift = quorum_core::drift::detect(
+        &open_prs,
+        &task_prs,
+        &all_backed_prs,
+        &task_branches,
+        &active_tasks,
+    );
 
     let now = now_unix();
 
@@ -705,6 +736,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
+    let mut doctor_slot: Option<doctor::DoctorSlot> = None;
+    let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut auditors: Vec<SlotState> = Vec::new();
 
     // Snapshot initial main sha for Trigger B baseline
     if config.self_update_drain {
@@ -784,8 +818,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 slot.proc.kill_and_reap().await;
             }
+            for a in auditors.drain(..) {
+                R2_META.lock().unwrap().remove(&a.agent_name);
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, a, "shutdown").await;
+            }
             for r in reviewers.drain(..) {
-                teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
             for w in workers.drain(..) {
                 teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
@@ -795,7 +833,9 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
 
         // Second signal (or first signal with no in-flight agents): immediate teardown.
-        if sig >= 2 || (sig >= 1 && workers.is_empty() && reviewers.is_empty()) {
+        if sig >= 2
+            || (sig >= 1 && workers.is_empty() && reviewers.is_empty() && auditors.is_empty())
+        {
             if sig >= 2 {
                 log("force shutdown (second signal)");
             } else {
@@ -804,8 +844,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 slot.proc.kill_and_reap().await;
             }
+            for a in auditors.drain(..) {
+                R2_META.lock().unwrap().remove(&a.agent_name);
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, a, "shutdown").await;
+            }
             for r in reviewers.drain(..) {
-                teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+                teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
             for w in workers.drain(..) {
                 teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
@@ -826,6 +870,11 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
                     slot.proc.kill_and_reap().await;
+                }
+                for a in auditors.drain(..) {
+                    R2_META.lock().unwrap().remove(&a.agent_name);
+                    a.proc.kill_and_reap().await;
+                    name_pool.release(&a.agent_name);
                 }
                 for r in reviewers.drain(..) {
                     r.proc.kill_and_reap().await;
@@ -888,16 +937,21 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if drain_state.timed_out(config.drain_timeout_secs) {
                 let exit = drain_state.exit_code();
                 log(&format!(
-                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s)",
+                    "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s), {} auditor(s)",
                     config.drain_timeout_secs,
                     workers.len(),
                     reviewers.len(),
+                    auditors.len(),
                 ));
                 if let Some(slot) = classifier_slot.take() {
                     slot.proc.kill_and_reap().await;
                 }
+                for a in auditors.drain(..) {
+                    R2_META.lock().unwrap().remove(&a.agent_name);
+                    teardown_reviewer(config, &wt_mgr, &mut name_pool, a, "drain").await;
+                }
                 for r in reviewers.drain(..) {
-                    teardown_reviewer(config, &wt_mgr, &mut name_pool, r).await;
+                    teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
                 }
                 for w in workers.drain(..) {
                     teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
@@ -932,11 +986,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut name_pool,
             &mut workers,
             &mut reviewers,
+            &mut auditors,
             &mut poison_tracker,
             &mut reviewer_provision_tracker,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
+            &mut doctor_slot,
+            &mut doctored_tasks,
         )
         .await
         {
@@ -982,11 +1039,14 @@ async fn tick(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
+    auditors: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
     reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
+    doctor_slot: &mut Option<doctor::DoctorSlot>,
+    doctored_tasks: &mut std::collections::HashSet<i64>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -1052,6 +1112,68 @@ async fn tick(
             continue;
         }
 
+        // Kill rows — hard-terminate the targeted agent immediately.
+        if row.kind == mailbox::MailboxKind::Kill {
+            if let Some(target) = &row.to_agent {
+                let reason = row.note.as_deref().unwrap_or("no reason given");
+                let by = &row.agent;
+
+                // Check workers first, then reviewers.
+                if let Some(wi) = workers.iter().position(|w| w.agent_name == *target) {
+                    log(&format!(
+                        "kill: terminating worker {} (task #{}) by {by}: {reason}",
+                        workers[wi].agent_name, workers[wi].task_id,
+                    ));
+                    let w = workers.remove(wi);
+                    let task_id = w.task_id;
+                    fire_event(
+                        &db_path,
+                        &w.agent_name,
+                        task_id,
+                        &Event::AgentFailed {
+                            reason: format!("killed by {by}: {reason}"),
+                        },
+                    )
+                    .await;
+                    // Emit agent_killed event for the log.
+                    emit_kill_event(&db_path, target, by, reason).await;
+                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                } else if let Some(ri) = reviewers.iter().position(|r| r.agent_name == *target) {
+                    log(&format!(
+                        "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
+                        reviewers[ri].agent_name, reviewers[ri].task_id,
+                    ));
+                    let r = reviewers.remove(ri);
+                    let task_id = r.task_id;
+                    fire_event(
+                        &db_path,
+                        &r.agent_name,
+                        task_id,
+                        &Event::AgentFailed {
+                            reason: format!("killed by {by}: {reason}"),
+                        },
+                    )
+                    .await;
+                    emit_kill_event(&db_path, target, by, reason).await;
+                    teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
+                } else if lifetime_roster.owns(target) {
+                    log(&format!(
+                        "kill: agent {target} not active (already dead/finished)"
+                    ));
+                } else {
+                    log(&format!(
+                        "kill: agent {target} not in this instance's roster"
+                    ));
+                    // Leave unconsumed for another daemon instance.
+                    continue;
+                }
+            }
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+            continue;
+        }
+
         // M5: message rows — collect for delivery at idle (Phase 4c).
         if row.kind == mailbox::MailboxKind::Message {
             pending_messages.push((*id, row));
@@ -1064,6 +1186,20 @@ async fn tick(
             .as_ref()
             .map(|n| format!(", summary={n:?}"))
             .unwrap_or_default();
+
+        // R2 auditor done — record audit, tear down, consume. Never affects merge.
+        let auditor_idx = auditors.iter().position(|a| a.agent_name == row.agent);
+        if let Some(ai) = auditor_idx {
+            log(&format!(
+                "R2 auditor {} done (pr={:?}, verdict={:?})",
+                auditors[ai].agent_name, row.pr, row.verdict
+            ));
+            handle_r2_done(config, wt_mgr, name_pool, &mut *auditors, ai, row).await;
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+            continue;
+        }
 
         // Check reviewer match first (verdict handling).
         let reviewer_idx = reviewers.iter().position(|r| r.agent_name == row.agent);
@@ -1096,7 +1232,7 @@ async fn tick(
                             reviewers[ri].agent_name
                         ));
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -1115,7 +1251,7 @@ async fn tick(
                     {
                         log("VerdictApprove transition failed — skipping merge");
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         // C3 belt-and-suspenders: clear worker.pr so Phase 5
                         // doesn't spawn another reviewer for a rejected task.
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -1155,7 +1291,7 @@ async fn tick(
                             cleanup_slot(config, wt_mgr, name_pool, w, None).await;
                         }
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if !consume_mailbox_row(&db_path, *id).await {
                             break;
                         }
@@ -1163,42 +1299,62 @@ async fn tick(
                     }
 
                     if mergeability == merge::MergeabilityState::Conflicting {
-                        log(&format!("PR #{pr_num} is CONFLICTING — firing MergeFailed"));
-                        // merging → in-review
-                        fire_event(
-                            &db_path,
-                            "system",
-                            reviewer_task_id,
-                            &Event::MergeFailed {
-                                reason: format!(
-                                    "PR #{pr_num} has conflicts with {}",
-                                    config.base_branch
-                                ),
-                            },
-                        )
-                        .await;
-                        // in-review → rework (lifecycle checks rework cap)
-                        let reviewer_name = reviewers[ri].agent_name.clone();
-                        let vc = fire_event(
-                            &db_path,
-                            &reviewer_name,
-                            reviewer_task_id,
-                            &Event::VerdictChanges,
-                        )
-                        .await;
-                        match vc {
-                            Some(ref tr) if tr.task.status == "rework" => {
-                                let rework_msg = format!(
-                                    "PR #{pr_num} has conflicts with {} \
+                        let has_worker = workers.iter().any(|w| w.task_id == reviewer_task_id);
+
+                        if !has_worker {
+                            // Review-only: no worker to rebase. Fire MergeFailed
+                            // (merging → in-review) and park as merge-blocked;
+                            // orphan handler retries when PR becomes MERGEABLE.
+                            log(&format!(
+                                "PR #{pr_num} is CONFLICTING (review-only) — firing MergeFailed"
+                            ));
+                            fire_event(
+                                &db_path,
+                                "system",
+                                reviewer_task_id,
+                                &Event::MergeFailed {
+                                    reason: format!(
+                                        "PR #{pr_num} has conflicts with {}",
+                                        config.base_branch
+                                    ),
+                                },
+                            )
+                            .await;
+                            log(&format!(
+                                "review-only task #{reviewer_task_id}: \
+                                 merge blocked (conflict) — parking, not failing"
+                            ));
+                            set_task_body(&db_path, reviewer_task_id, tasks::MERGE_BLOCKED_BODY)
+                                .await;
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                .await;
+                        } else {
+                            // Non-review-only: fire MergeConflict (merging → rework
+                            // directly, skipping the reviewer hop).
+                            log(&format!(
+                                "PR #{pr_num} is CONFLICTING — firing MergeConflict"
+                            ));
+                            let mc = fire_event(
+                                &db_path,
+                                "system",
+                                reviewer_task_id,
+                                &Event::MergeConflict,
+                            )
+                            .await;
+                            match mc {
+                                Some(ref tr) if tr.task.status == "rework" => {
+                                    let rework_msg = format!(
+                                        "PR #{pr_num} has conflicts with {} \
                                      (a sibling PR likely merged first).\n\n\
                                      Rebase on {}, resolve conflicts, \
                                      and push again.",
-                                    config.base_branch, config.base_branch
-                                );
-                                // Reviewer stays alive (sticky-agent).
-                                if let Some(wi) =
-                                    workers.iter().position(|w| w.task_id == reviewer_task_id)
-                                {
+                                        config.base_branch, config.base_branch
+                                    );
+                                    let wi = workers
+                                        .iter()
+                                        .position(|w| w.task_id == reviewer_task_id)
+                                        .unwrap();
                                     let rework_turn = reviewer::build_rework_turn(
                                         &workers[wi].agent_name,
                                         workers[wi].task_id,
@@ -1244,33 +1400,37 @@ async fn tick(
                                             w.agent_name, w.rework_count
                                         ));
                                     }
-                                } else {
-                                    fire_event(
-                                        &db_path,
-                                        "daemon",
-                                        reviewer_task_id,
-                                        &Event::AgentFailed {
-                                            reason: "no worker for rework".into(),
-                                        },
+                                }
+                                Some(_) => {
+                                    // Rework cap exceeded → failed. Clean up.
+                                    let r = reviewers.remove(ri);
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
+                                    if let Some(wi) =
+                                        workers.iter().position(|w| w.task_id == reviewer_task_id)
+                                    {
+                                        let w = workers.remove(wi);
+                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                    }
+                                }
+                                None => {
+                                    // MergeConflict event failed — clean up.
+                                    let r = reviewers.remove(ri);
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
                                     )
                                     .await;
                                 }
-                            }
-                            Some(_) => {
-                                // Rework cap exceeded → failed. Clean up.
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                                if let Some(wi) =
-                                    workers.iter().position(|w| w.task_id == reviewer_task_id)
-                                {
-                                    let w = workers.remove(wi);
-                                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
-                                }
-                            }
-                            None => {
-                                // VerdictChanges failed — clean up.
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
                             }
                         }
                         if !consume_mailbox_row(&db_path, *id).await {
@@ -1444,7 +1604,14 @@ async fn tick(
                                 Some(_) => {
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
@@ -1454,7 +1621,14 @@ async fn tick(
                                 }
                                 None => {
                                     let r = reviewers.remove(ri);
-                                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
                                 }
                             }
                             if !consume_mailbox_row(&db_path, *id).await {
@@ -1478,7 +1652,8 @@ async fn tick(
                             )
                             .await;
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                .await;
                             if let Some(wi) =
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
@@ -1526,7 +1701,7 @@ async fn tick(
                                     author,
                                     reviewer: reviewer_name,
                                     verdict: "approved".to_string(),
-                                    blocking_count: 0,
+                                    blocking_count: gated.blocking_count.unwrap_or(0) as i64,
                                     approved_head_sha: head,
                                 };
                                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1691,8 +1866,27 @@ async fn tick(
                             let sha = format!("post-merge-pr-{pr_num}");
                             drain_state.start_drain(&sha);
                         }
+
+                        // R2 audit: capture R1 info before teardown, maybe spawn R2.
+                        let r1_name = reviewers[ri].agent_name.clone();
+                        let r1_run_id = reviewers[ri].agent_run_id;
+                        if config.r2_enabled && !drain_state.draining {
+                            maybe_spawn_r2(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                &mut *auditors,
+                                lifetime_roster,
+                                pr_num,
+                                reviewer_task_id,
+                                &r1_name,
+                                r1_run_id,
+                            )
+                            .await;
+                        }
+
                         let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
@@ -1722,7 +1916,8 @@ async fn tick(
                                 )
                                 .await;
                                 let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                    .await;
                                 if let Some(wi) =
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
@@ -1736,8 +1931,8 @@ async fn tick(
                                      — firing MergeFailed",
                                     merge_result.message
                                 ));
-                                // merging → in-review
-                                fire_event(
+                                // merging → in-review (NotifyOwner alert posted by lifecycle)
+                                let mf = fire_event(
                                     &db_path,
                                     "system",
                                     reviewer_task_id,
@@ -1749,108 +1944,154 @@ async fn tick(
                                     },
                                 )
                                 .await;
-                                // in-review → rework
-                                let reviewer_name = reviewers[ri].agent_name.clone();
-                                let vc = fire_event(
-                                    &db_path,
-                                    &reviewer_name,
-                                    reviewer_task_id,
-                                    &Event::VerdictChanges,
-                                )
-                                .await;
-                                match vc {
-                                    Some(ref tr) if tr.task.status == "rework" => {
-                                        let rework_msg = format!(
-                                            "Merge of PR #{pr_num} failed: {}\n\n\
+
+                                let is_review_only =
+                                    mf.as_ref().is_some_and(|tr| tr.task.review_only);
+
+                                if is_review_only {
+                                    log(&format!(
+                                        "review-only task #{reviewer_task_id}: \
+                                         merge blocked (retryable) — parking, not failing"
+                                    ));
+                                    set_task_body(
+                                        &db_path,
+                                        reviewer_task_id,
+                                        tasks::MERGE_BLOCKED_BODY,
+                                    )
+                                    .await;
+                                    let r = reviewers.remove(ri);
+                                    teardown_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        r,
+                                        "verdict:approved",
+                                    )
+                                    .await;
+                                } else {
+                                    // in-review → rework
+                                    let reviewer_name = reviewers[ri].agent_name.clone();
+                                    let vc = fire_event(
+                                        &db_path,
+                                        &reviewer_name,
+                                        reviewer_task_id,
+                                        &Event::VerdictChanges,
+                                    )
+                                    .await;
+                                    match vc {
+                                        Some(ref tr) if tr.task.status == "rework" => {
+                                            let rework_msg = format!(
+                                                "Merge of PR #{pr_num} failed: {}\n\n\
                                              Rebase on {}, resolve any conflicts, \
                                              and push again.",
-                                            merge_result.message, config.base_branch
-                                        );
-                                        // Reviewer stays alive (sticky-agent).
-                                        if let Some(wi) = workers
-                                            .iter()
-                                            .position(|w| w.task_id == reviewer_task_id)
-                                        {
-                                            let rework_turn = reviewer::build_rework_turn(
-                                                &workers[wi].agent_name,
-                                                workers[wi].task_id,
-                                                pr_num,
-                                                &rework_msg,
-                                                workers[wi].cost_usd,
-                                                config.limits.max_task_cost_usd,
+                                                merge_result.message, config.base_branch
                                             );
-                                            if let Err(e) =
-                                                workers[wi].proc.feed_turn(&rework_turn).await
+                                            // Reviewer stays alive (sticky-agent).
+                                            if let Some(wi) = workers
+                                                .iter()
+                                                .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                log(&format!(
+                                                let rework_turn = reviewer::build_rework_turn(
+                                                    &workers[wi].agent_name,
+                                                    workers[wi].task_id,
+                                                    pr_num,
+                                                    &rework_msg,
+                                                    workers[wi].cost_usd,
+                                                    config.limits.max_task_cost_usd,
+                                                );
+                                                if let Err(e) =
+                                                    workers[wi].proc.feed_turn(&rework_turn).await
+                                                {
+                                                    log(&format!(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
                                                 ));
-                                                let w = workers.remove(wi);
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config, wt_mgr, name_pool, w, None,
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    let w = &mut workers[wi];
+                                                    w.draining = true;
+                                                    w.pr = None;
+                                                    w.rework_count += 1;
+                                                    w.turn_started_at = std::time::Instant::now();
+                                                    if let Some(ref mut sl) = w.session_log {
+                                                        sl.log_rework(w.rework_count);
+                                                    }
+                                                    let p = db_path.clone();
+                                                    let entry =
+                                                        slot_journal_entry(w, "worker", "working");
+                                                    tokio::task::spawn_blocking(
+                                                        move || -> Result<()> {
+                                                            let mut conn =
+                                                                quorum_core::db::open(&p)?;
+                                                            journal::upsert(&mut conn, &entry)
+                                                        },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                    log(&format!(
+                                                        "worker {} rework #{} (merge failure)",
+                                                        w.agent_name, w.rework_count
+                                                    ));
+                                                }
+                                            } else {
                                                 fire_event(
                                                     &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
+                                                    "daemon",
+                                                    reviewer_task_id,
                                                     &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
+                                                        reason: "no worker for rework".into(),
                                                     },
                                                 )
                                                 .await;
+                                            }
+                                        }
+                                        Some(_) => {
+                                            // Rework cap exceeded → failed. Clean up.
+                                            let r = reviewers.remove(ri);
+                                            teardown_reviewer(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                r,
+                                                "verdict:approved",
+                                            )
+                                            .await;
+                                            if let Some(wi) = workers
+                                                .iter()
+                                                .position(|w| w.task_id == reviewer_task_id)
+                                            {
+                                                let w = workers.remove(wi);
                                                 cleanup_slot(config, wt_mgr, name_pool, w, None)
                                                     .await;
-                                            } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
-                                                )
-                                                .await
-                                                .ok();
-                                                log(&format!(
-                                                    "worker {} rework #{} (merge failure)",
-                                                    w.agent_name, w.rework_count
-                                                ));
                                             }
-                                        } else {
-                                            fire_event(
-                                                &db_path,
-                                                "daemon",
-                                                reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker for rework".into(),
-                                                },
+                                        }
+                                        None => {
+                                            let r = reviewers.remove(ri);
+                                            teardown_reviewer(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                r,
+                                                "verdict:approved",
                                             )
                                             .await;
                                         }
                                     }
-                                    Some(_) => {
-                                        // Rework cap exceeded → failed. Clean up.
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                                        if let Some(wi) = workers
-                                            .iter()
-                                            .position(|w| w.task_id == reviewer_task_id)
-                                        {
-                                            let w = workers.remove(wi);
-                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
-                                        }
-                                    }
-                                    None => {
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(config, wt_mgr, name_pool, r).await;
-                                    }
-                                }
+                                } // end !review_only
                             }
                         }
                     }
@@ -1892,6 +2133,35 @@ async fn tick(
                             Err(e) => log(&format!(
                                 "REQUEST_CHANGES spawn_blocking join failed (non-blocking): {e}"
                             )),
+                        }
+                    }
+
+                    // #90: record the changes verdict in approvals (mirrors approved path).
+                    if let Some(pr_num) = row.pr {
+                        let reviewer_name = reviewers[ri].agent_name.clone();
+                        let author = workers
+                            .iter()
+                            .find(|w| w.task_id == reviewer_task_id)
+                            .map(|w| w.agent_name.clone());
+                        if let Some(author) = author {
+                            let blocking = gated.blocking_count.unwrap_or(0) as i64;
+                            let p = db_path.clone();
+                            let record = quorum_core::approvals::Approval {
+                                pr_number: pr_num,
+                                task_id: reviewer_task_id,
+                                author,
+                                reviewer: reviewer_name,
+                                verdict: "changes".to_string(),
+                                blocking_count: blocking,
+                                approved_head_sha: String::new(),
+                            };
+                            tokio::task::spawn_blocking(move || -> Result<()> {
+                                let mut conn = quorum_core::db::open(&p)?;
+                                quorum_core::approvals::record(&mut conn, &record)
+                            })
+                            .await
+                            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                            .ok();
                         }
                     }
 
@@ -1976,7 +2246,8 @@ async fn tick(
                         Some(_) => {
                             // Rework cap exceeded → failed. Clean up both.
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:changes")
+                                .await;
                             if let Some(wi) =
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
@@ -1986,7 +2257,8 @@ async fn tick(
                         }
                         None => {
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:changes")
+                                .await;
                         }
                     }
                 }
@@ -2005,7 +2277,7 @@ async fn tick(
                         },
                     )
                     .await;
-                    teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                    teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:none").await;
                     if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id) {
                         workers[wi].pr = None;
                     }
@@ -2037,7 +2309,51 @@ async fn tick(
                 ));
             }
 
-            if let Some(pr) = row.pr {
+            // #101: resolve PR — prefer explicit row.pr, fall back to
+            // task refs so a done-without-`--pr` doesn't silently close
+            // a task whose refs already carry a PR number.
+            let effective_pr = if row.pr.is_some() {
+                Ok(row.pr)
+            } else {
+                let p = db_path.clone();
+                let tid = workers[wi].task_id;
+                let result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    let task = tasks::get(&conn, tid)?;
+                    Ok(task.and_then(|t| tasks::extract_pr_number(&t.refs)))
+                })
+                .await;
+                match result {
+                    Ok(Ok(pr)) => {
+                        if let Some(n) = pr {
+                            log(&format!(
+                                "BACKFILL: worker {} done without --pr but task #{} refs \
+                                 carry pr#{} — routing to review flow",
+                                workers[wi].agent_name, workers[wi].task_id, n
+                            ));
+                        }
+                        Ok(pr)
+                    }
+                    Ok(Err(e)) => Err(format!("DB error loading refs for task #{tid}: {e}")),
+                    Err(e) => Err(format!("spawn_blocking join error for task #{tid}: {e}")),
+                }
+            };
+
+            // DB error during refs lookup — log loudly, leave mailbox row
+            // unconsumed so next tick retries. Never fall through to direct-close.
+            let effective_pr = match effective_pr {
+                Ok(pr) => pr,
+                Err(msg) => {
+                    log(&format!(
+                        "ERROR: refs backfill lookup failed for worker {} — \
+                         skipping done processing (will retry): {msg}",
+                        workers[wi].agent_name
+                    ));
+                    break;
+                }
+            };
+
+            if let Some(pr) = effective_pr {
                 // Fire the appropriate lifecycle event based on whether
                 // this is the first done signal or a rework-pushed.
                 let event = if workers[wi].rework_count > 0 {
@@ -2081,7 +2397,10 @@ async fn tick(
                                                 workers[wi].task_id
                                             ));
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+                                            teardown_reviewer(
+                                                config, wt_mgr, name_pool, r, "failed",
+                                            )
+                                            .await;
                                         } else {
                                             log(&format!(
                                                 "ResumeReviewer: fed re-review turn \
@@ -2230,7 +2549,89 @@ async fn tick(
             },
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
+    }
+
+    // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
+    let idle_timeout = config.limits.idle_timeout_secs.unwrap_or(300);
+    let mut idle_reviewers: Vec<usize> = Vec::new();
+    for (i, r) in reviewers.iter().enumerate() {
+        if r.draining {
+            continue;
+        }
+        if let Some(ended) = r.turn_ended_at {
+            if ended.elapsed().as_secs() > idle_timeout {
+                log(&format!(
+                    "WATCHDOG: reviewer {} idle {}s (limit {}s) — killing zombie",
+                    r.agent_name,
+                    ended.elapsed().as_secs(),
+                    idle_timeout
+                ));
+                idle_reviewers.push(i);
+            }
+        }
+    }
+    for &i in idle_reviewers.iter().rev() {
+        let dead = reviewers.remove(i);
+        fire_event(
+            &db_path,
+            &dead.agent_name,
+            dead.task_id,
+            &Event::AgentFailed {
+                reason: format!(
+                    "reviewer idle {}s between turns (limit {}s) — zombie reaped",
+                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
+                    idle_timeout
+                ),
+            },
+        )
+        .await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
+    }
+
+    // ── Phase 3-R2: Drain events from R2 auditors (shadow — no lifecycle) ──
+    let mut auditors_to_kill: Vec<usize> = Vec::new();
+    for (i, a) in auditors.iter_mut().enumerate() {
+        if !a.draining {
+            continue;
+        }
+        if let Some(breach) = check_wall_clock_limits(&config.limits, a) {
+            log(&format!("R2 auditor {} killed — {}", a.agent_name, breach));
+            auditors_to_kill.push(i);
+            continue;
+        }
+        if let Some(breach) = drain_events(a, &db_path, "auditor", &config.limits).await? {
+            log(&format!("R2 auditor {} killed — {}", a.agent_name, breach));
+            auditors_to_kill.push(i);
+        }
+    }
+    for &i in auditors_to_kill.iter().rev() {
+        let dead = auditors.remove(i);
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
+    }
+    // R2 idle watchdog
+    {
+        let mut idle_auditors: Vec<usize> = Vec::new();
+        for (i, a) in auditors.iter().enumerate() {
+            if a.draining {
+                continue;
+            }
+            if let Some(ended) = a.turn_ended_at {
+                if ended.elapsed().as_secs() > idle_timeout {
+                    log(&format!(
+                        "R2 auditor {} idle {}s — killing zombie",
+                        a.agent_name,
+                        ended.elapsed().as_secs()
+                    ));
+                    idle_auditors.push(i);
+                }
+            }
+        }
+        for &i in idle_auditors.iter().rev() {
+            let dead = auditors.remove(i);
+            R2_META.lock().unwrap().remove(&dead.agent_name);
+            teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
+        }
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
@@ -2263,6 +2664,45 @@ async fn tick(
             dead.task_id,
             &Event::AgentFailed {
                 reason: "worker killed by watchdog".into(),
+            },
+        )
+        .await;
+        cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+    }
+
+    // ── Phase 4-idle: Kill workers idle too long between turns ─────────
+    // A worker that completed a turn (draining=false) but never gets a new
+    // turn is a zombie — e.g. it asked a question in dontAsk mode (#74).
+    let mut idle_zombies: Vec<usize> = Vec::new();
+    for (i, w) in workers.iter().enumerate() {
+        if w.draining || w.error_turn_count > 0 {
+            continue;
+        }
+        if let Some(ended) = w.turn_ended_at {
+            if ended.elapsed().as_secs() > idle_timeout {
+                log(&format!(
+                    "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
+                    w.agent_name,
+                    ended.elapsed().as_secs(),
+                    w.task_id,
+                    idle_timeout
+                ));
+                idle_zombies.push(i);
+            }
+        }
+    }
+    for &i in idle_zombies.iter().rev() {
+        let dead = workers.remove(i);
+        fire_event(
+            &db_path,
+            &dead.agent_name,
+            dead.task_id,
+            &Event::AgentFailed {
+                reason: format!(
+                    "worker idle {}s between turns (limit {}s) — zombie reaped",
+                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
+                    idle_timeout
+                ),
             },
         )
         .await;
@@ -2375,7 +2815,21 @@ async fn tick(
                 },
             )
             .await;
-            teardown_reviewer(config, wt_mgr, name_pool, r).await;
+            teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await;
+        }
+
+        // R2 auditors: shadow mode — no lifecycle events, just tear down.
+        let drain_auditors: Vec<usize> = auditors
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.draining)
+            .map(|(i, _)| i)
+            .collect();
+        for &i in drain_auditors.iter().rev() {
+            let a = auditors.remove(i);
+            log(&format!("DRAIN: tearing down R2 auditor {}", a.agent_name));
+            R2_META.lock().unwrap().remove(&a.agent_name);
+            teardown_reviewer(config, wt_mgr, name_pool, a, "drain").await;
         }
     }
 
@@ -2481,7 +2935,74 @@ async fn tick(
             },
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead).await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+    }
+
+    // Dead R2 auditors — shadow, no lifecycle events.
+    let mut dead_auditors: Vec<usize> = Vec::new();
+    for (i, a) in auditors.iter_mut().enumerate() {
+        if matches!(a.proc.try_wait(), Ok(Some(_))) {
+            log(&format!("R2 auditor {} died — cleaning up", a.agent_name));
+            dead_auditors.push(i);
+        }
+    }
+    for &i in dead_auditors.iter().rev() {
+        let dead = auditors.remove(i);
+        R2_META.lock().unwrap().remove(&dead.agent_name);
+        teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+    }
+
+    // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────
+    // A creator (or another daemon) may cancel/complete a task while our
+    // worker is still running on it. Poll the DB for current status of all
+    // held tasks; tear down any whose task reached a terminal state.
+    {
+        let held_task_ids: Vec<i64> = workers
+            .iter()
+            .map(|w| w.task_id)
+            .chain(reviewers.iter().map(|r| r.task_id))
+            .collect();
+        if !held_task_ids.is_empty() {
+            let p = db_path.clone();
+            let terminal_tasks: Vec<(i64, String)> = tokio::task::spawn_blocking(move || {
+                let conn = quorum_core::db::open(&p)?;
+                let mut result = Vec::new();
+                for tid in held_task_ids {
+                    if let Some(task) = tasks::get(&conn, tid)? {
+                        if task
+                            .status
+                            .parse::<lifecycle::Status>()
+                            .is_ok_and(|s| s.is_terminal())
+                        {
+                            result.push((tid, task.status));
+                        }
+                    }
+                }
+                Ok::<_, QuorumError>(result)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .unwrap_or_default();
+
+            for (tid, status) in terminal_tasks {
+                if let Some(wi) = workers.iter().position(|w| w.task_id == tid) {
+                    log(&format!(
+                        "task #{tid} externally moved to {status} — tearing down worker {}",
+                        workers[wi].agent_name,
+                    ));
+                    let w = workers.remove(wi);
+                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                }
+                if let Some(ri) = reviewers.iter().position(|r| r.task_id == tid) {
+                    log(&format!(
+                        "task #{tid} externally moved to {status} — tearing down reviewer {}",
+                        reviewers[ri].agent_name,
+                    ));
+                    let r = reviewers.remove(ri);
+                    teardown_reviewer(config, wt_mgr, name_pool, r, "cancelled").await;
+                }
+            }
+        }
     }
 
     // ── Phase 4c: Deliver queued messages to idle workers (M5) ──────────
@@ -2562,6 +3083,7 @@ async fn tick(
             })
             .collect();
         let mut parked_workers: Vec<usize> = Vec::new();
+        let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
             let pr_state = {
@@ -2591,6 +3113,19 @@ async fn tick(
                 }
                 _ => {}
             }
+            // #75: detect cross-repo PR before burning provision strikes
+            let task_refs = lookup_task_refs(&db_path, *task_id).await;
+            if let Some(task_repo) =
+                check_repo_mismatch(&task_refs, &config.repo, config.self_repo.as_deref())
+            {
+                log(&format!(
+                    "REPO MISMATCH: task #{task_id} PR #{pr} belongs to {task_repo}, \
+                     not {} — parking immediately",
+                    config.repo
+                ));
+                repo_mismatch_workers.push((*wi, task_repo));
+                continue;
+            }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
                     "reviewer provision exhausted for task #{task_id} PR #{pr} \
@@ -2614,6 +3149,39 @@ async fn tick(
         }
         for &wi in pr_closed_workers.iter().rev() {
             let w = workers.remove(wi);
+            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+        }
+        // #75: park repo-mismatch workers without burning strikes
+        // Process in reverse index order to avoid index invalidation.
+        repo_mismatch_workers.sort_by_key(|b| std::cmp::Reverse(b.0));
+        for (wi, task_repo) in repo_mismatch_workers {
+            let w = workers.remove(wi);
+            let pr_label =
+                w.pr.map(|n| format!("#{n}"))
+                    .unwrap_or_else(|| "unknown".to_string());
+            fire_event(
+                &db_path,
+                &w.agent_name,
+                w.task_id,
+                &Event::Cancelled {
+                    by: "daemon:parked:repo-mismatch".into(),
+                },
+            )
+            .await;
+            let body = format!(
+                "{}repo-mismatch | PR {pr_label} belongs to {task_repo}, \
+                 not {} — cannot provision reviewer from this daemon",
+                tasks::PARKED_BODY_PREFIX,
+                config.repo
+            );
+            set_task_body(&db_path, w.task_id, &body).await;
+            notify_provision_failure(
+                &db_path,
+                w.task_id,
+                &format!("repo mismatch ({task_repo} vs {})", config.repo),
+                &pr_label,
+            )
+            .await;
             cleanup_slot(config, wt_mgr, name_pool, w, None).await;
         }
         for &wi in parked_workers.iter().rev() {
@@ -2640,6 +3208,13 @@ async fn tick(
                 ),
             )
             .await;
+            notify_provision_failure(
+                &db_path,
+                w.task_id,
+                "reviewer provision exhausted",
+                &pr_label,
+            )
+            .await;
             cleanup_slot(config, wt_mgr, name_pool, w, None).await;
         }
 
@@ -2647,16 +3222,26 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        let orphan_in_review: Vec<(i64, i64, String, bool)> = {
+        // (task_id, pr, author, review_only, body, reviewer, refs)
+        type OrphanRow = (
+            i64,
+            i64,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let orphan_in_review: Vec<OrphanRow> = {
             let p = db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<Vec<(i64, i64, String, bool)>> {
+            tokio::task::spawn_blocking(move || -> Result<Vec<OrphanRow>> {
                 let conn = quorum_core::db::open(&p)?;
                 let ir_tasks = tasks::list(&conn, Some("in-review"), None, None)?;
                 let mut result = Vec::new();
                 for t in ir_tasks {
                     if let Some(pr) = tasks::extract_pr_number(&t.refs) {
                         let author = t.author.unwrap_or_default();
-                        result.push((t.id, pr, author, t.review_only));
+                        result.push((t.id, pr, author, t.review_only, t.body, t.reviewer, t.refs));
                     }
                 }
                 Ok(result)
@@ -2665,7 +3250,7 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author, review_only) in &orphan_in_review {
+        for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -2696,7 +3281,75 @@ async fn tick(
                     fire_event(&db_path, "system", *task_id, &Event::PrFoundClosed).await;
                     continue;
                 }
+                merge::MergeabilityState::Conflicting
+                    if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) =>
+                {
+                    continue;
+                }
                 _ => {}
+            }
+
+            // Merge-blocked retry: approved review-only task waiting for
+            // PR to become mergeable again.
+            if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
+                if let Some(reviewer_name) = reviewer.as_deref() {
+                    log(&format!(
+                        "merge-blocked task #{task_id} PR #{pr}: \
+                         PR is now mergeable — retrying merge"
+                    ));
+                    set_task_body(&db_path, *task_id, "").await;
+                    fire_event(&db_path, reviewer_name, *task_id, &Event::VerdictApprove).await;
+                } else {
+                    log(&format!(
+                        "merge-blocked task #{task_id} PR #{pr}: \
+                         no reviewer on record — cannot retry merge"
+                    ));
+                    fire_event(
+                        &db_path,
+                        "system",
+                        *task_id,
+                        &Event::AgentFailed {
+                            reason: "merge-blocked but no reviewer to re-approve".into(),
+                        },
+                    )
+                    .await;
+                }
+                continue;
+            }
+
+            // #75: detect cross-repo PR before burning provision strikes
+            if let Some(other_repo) =
+                check_repo_mismatch(task_refs, &config.repo, config.self_repo.as_deref())
+            {
+                log(&format!(
+                    "REPO MISMATCH: orphan in-review task #{task_id} PR #{pr} \
+                     belongs to {other_repo}, not {} — parking",
+                    config.repo
+                ));
+                fire_event(
+                    &db_path,
+                    "daemon",
+                    *task_id,
+                    &Event::Cancelled {
+                        by: "daemon:parked:repo-mismatch".into(),
+                    },
+                )
+                .await;
+                let body = format!(
+                    "{}repo-mismatch | PR #{pr} belongs to {other_repo}, \
+                     not {} — cannot provision reviewer from this daemon",
+                    tasks::PARKED_BODY_PREFIX,
+                    config.repo
+                );
+                set_task_body(&db_path, *task_id, &body).await;
+                notify_provision_failure(
+                    &db_path,
+                    *task_id,
+                    &format!("repo mismatch ({other_repo} vs {})", config.repo),
+                    &format!("#{pr}"),
+                )
+                .await;
+                continue;
             }
             if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
                 log(&format!(
@@ -2720,6 +3373,13 @@ async fn tick(
                          reviewer provision failed (orphan in-review)",
                         tasks::PARKED_BODY_PREFIX
                     ),
+                )
+                .await;
+                notify_provision_failure(
+                    &db_path,
+                    *task_id,
+                    "reviewer provision exhausted (orphan in-review)",
+                    &format!("#{pr}"),
                 )
                 .await;
                 continue;
@@ -2902,6 +3562,108 @@ async fn tick(
                     Err(e) => {
                         log(&format!("classifier: spawn failed: {e}"));
                     }
+                }
+            }
+        }
+    }
+
+    // ── Phase 8: Doctor agent ────────────────────────────────────────
+    // 8a: Drain events from in-flight doctor.
+    if let Some(slot) = doctor_slot.as_mut() {
+        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+
+        if let Some(result) = doctor::drain_doctor_events(slot).await {
+            let tid = slot.task_id;
+            match result {
+                doctor::DoctorResult::Done(text) => {
+                    log(&format!(
+                        "doctor: finished for task #{tid} ({}b)",
+                        text.len()
+                    ));
+                }
+                doctor::DoctorResult::Error(e) => {
+                    log(&format!("doctor: error on task #{tid}: {e}"));
+                }
+            }
+            doctored_tasks.insert(tid);
+            *doctor_slot = None;
+        } else if exited {
+            let tid = slot.task_id;
+            log(&format!("doctor: process exited for task #{tid}"));
+            doctored_tasks.insert(tid);
+            *doctor_slot = None;
+        }
+    }
+
+    // 8b: Spawn doctor if enabled, idle, not draining, and a stalled task exists.
+    if config.doctor_enabled && doctor_slot.is_none() && !drain_state.draining {
+        let p = db_path.clone();
+        let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+        let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
+        let already_doctored = doctored_tasks.clone();
+
+        let stalled =
+            tokio::task::spawn_blocking(move || -> Result<Option<doctor::EvidenceBundle>> {
+                let conn = quorum_core::db::open(&p)?;
+                let working = tasks::list(&conn, Some("working"), None, None)?;
+                let in_review = tasks::list(&conn, Some("in-review"), None, None)?;
+                let candidates: Vec<_> = working.into_iter().chain(in_review).collect();
+                for task in candidates {
+                    if active_worker_task_ids.contains(&task.id)
+                        || active_reviewer_task_ids.contains(&task.id)
+                        || already_doctored.contains(&task.id)
+                    {
+                        continue;
+                    }
+                    let refs_json: Option<serde_json::Value> = task
+                        .refs
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok());
+                    let pr = refs_json.as_ref().and_then(|v| v["pr"].as_i64());
+                    let worktree_path = refs_json
+                        .as_ref()
+                        .and_then(|v| v["worktree"].as_str().map(|s| s.to_string()));
+                    return Ok(Some(doctor::EvidenceBundle {
+                        task_id: task.id,
+                        task_title: task.title,
+                        task_status: task.status,
+                        task_body: task.body,
+                        author: task.assignee,
+                        pr,
+                        worktree_path,
+                        repo: String::new(),
+                    }));
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+
+        if let Ok(Some(mut evidence)) = stalled {
+            evidence.repo = config.repo.clone();
+            let allowed = config
+                .allowed_tools
+                .as_deref()
+                .unwrap_or(agent::ALLOWED_TOOLS);
+            let turn = doctor::doctor_turn(&evidence);
+            match doctor::spawn_doctor(
+                evidence.task_id,
+                &config.repo_dir,
+                config.agent_bin.as_deref(),
+                config.bare_agent,
+                allowed,
+                &config.repo,
+            ) {
+                Ok(mut slot) => {
+                    if let Err(e) = slot.proc.feed_turn(&turn).await {
+                        log(&format!("doctor: feed_turn failed: {e}"));
+                    } else {
+                        log(&format!("doctor: spawned for task #{}", evidence.task_id));
+                        *doctor_slot = Some(slot);
+                    }
+                }
+                Err(e) => {
+                    log(&format!("doctor: spawn failed: {e}"));
                 }
             }
         }
@@ -3118,6 +3880,7 @@ async fn drain_events(
                 .ok();
 
                 slot.draining = false;
+                slot.turn_ended_at = Some(std::time::Instant::now());
                 slot.live_stats.mid_turn_tokens = 0;
                 slot.live_stats.record_event();
                 write_live_sidecar(slot);
@@ -3143,17 +3906,24 @@ async fn drain_events(
                 return Ok(breach);
             }
             stream::Event::Assistant { message } => {
-                if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                    let preview = if content.len() > 80 {
-                        let end = content
-                            .char_indices()
-                            .nth(80)
-                            .map_or(content.len(), |(i, _)| i);
-                        format!("{}…", &content[..end])
-                    } else {
-                        content.to_string()
-                    };
-                    log(&format!("{role} {}: {preview}", slot.agent_name));
+                let content = message.get("content");
+                if let Some(blocks) = content.and_then(|c| c.as_array()) {
+                    // Agent text blocks are captured in the per-session log
+                    // (stream.jsonl + transcript.md); do NOT echo them to daemon
+                    // stderr — they drown real serve decisions/errors. Only
+                    // tool_use blocks update live stats here.
+                    for block in blocks {
+                        if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
+                            if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                let input = block
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                slot.live_stats.tool_count += 1;
+                                slot.live_stats.now_label = now_label(name, &input);
+                            }
+                        }
+                    }
                 }
                 if let Some(usage) = message.get("usage") {
                     let input = usage
@@ -3445,6 +4215,7 @@ async fn spawn_reviewer_for_worker(
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), reviewer_name.clone()),
         ],
+        config.allowed_tools.as_deref(),
     )
     .await
     {
@@ -3548,6 +4319,7 @@ async fn spawn_reviewer_for_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                turn_ended_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
@@ -3614,7 +4386,7 @@ async fn spawn_worker(
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
 
-    let task = match ready_task {
+    let mut task = match ready_task {
         Some(t) => t,
         None => return Ok(false),
     };
@@ -3684,16 +4456,22 @@ async fn spawn_worker(
             name_pool.release(&agent_name);
             return Ok(false);
         }
-        Ok(Some(_)) => {}
+        Ok(Some(claimed_task)) => {
+            task = claimed_task;
+        }
     }
 
     let worker_repo_dir = &config.repo_dir;
 
+    // Branch keyed to task + original author, not current assignee — a rework
+    // re-claim by a different agent continues the original branch instead of
+    // forking a duplicate PR (#340).
+    let branch_agent = task.author.as_deref().unwrap_or(&agent_name);
     let session_id = agent::new_session_id();
-    let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task.id);
+    let branch = format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id);
     let wt_path = config
         .worktree_base
-        .join(format!("{}-t{}", agent_name, task.id));
+        .join(format!("{}-t{}", branch_agent, task.id));
 
     match wt_mgr
         .provision(
@@ -3771,7 +4549,10 @@ async fn spawn_worker(
         session_id: session_id.clone(),
         worktree: wt_path.clone(),
         bare: config.bare_agent,
-        allowed_tools: agent::ALLOWED_TOOLS.to_string(),
+        allowed_tools: config
+            .allowed_tools
+            .clone()
+            .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
         env_vars: vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), agent_name.clone()),
@@ -3863,6 +4644,7 @@ async fn spawn_worker(
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
+                turn_ended_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
@@ -3976,6 +4758,22 @@ async fn fire_event(
     }
 }
 
+async fn emit_kill_event(db_path: &std::path::Path, target: &str, by: &str, reason: &str) {
+    let p = db_path.to_path_buf();
+    let subj = format!("agent:{target}");
+    let body = format!("killed by {by}: {reason}");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        quorum_core::events::emit(&tx, "agent_killed", &subj, &body, now)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .ok();
+}
+
 async fn set_task_body(db_path: &std::path::Path, task_id: i64, body: &str) {
     let p = db_path.to_path_buf();
     let b = body.to_string();
@@ -3992,6 +4790,84 @@ async fn set_task_body(db_path: &std::path::Path, task_id: i64, body: &str) {
         )),
         Ok(Ok(())) => {}
     }
+}
+
+/// Post a direct message to a task's creator when the daemon parks a task
+/// due to provision failure (exhausted strikes or repo mismatch).
+async fn notify_provision_failure(
+    db_path: &std::path::Path,
+    task_id: i64,
+    reason: &str,
+    pr_label: &str,
+) {
+    let p = db_path.to_path_buf();
+    let tid = task_id;
+    let reason_owned = reason.to_string();
+    let pr_label_owned = pr_label.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        let body = format!(
+            "task #{tid} parked: {reason_owned} | PR {pr_label_owned} — \
+             review linkage lost, manual re-queue may be needed"
+        );
+        quorum_core::feed::post(
+            &mut conn,
+            "daemon",
+            "critical",
+            None,
+            &body,
+            None,
+            Some("owner"),
+            86400,
+            now,
+        )?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Err(e)) => log(&format!(
+            "notify_provision_failure failed for task #{task_id}: {e}"
+        )),
+        Err(e) => log(&format!(
+            "notify_provision_failure join error for task #{task_id}: {e}"
+        )),
+        Ok(Ok(())) => log(&format!(
+            "notified creator of task #{task_id} about provision failure"
+        )),
+    }
+}
+
+/// Check if a task's refs.repo mismatches all repos this daemon can provision from.
+/// Returns `Some(task_repo)` on mismatch, `None` if matching or unknown.
+fn check_repo_mismatch(
+    task_refs: &Option<String>,
+    daemon_repo: &str,
+    self_repo: Option<&str>,
+) -> Option<String> {
+    let task_repo = tasks::extract_repo(task_refs)?;
+    if task_repo == daemon_repo {
+        return None;
+    }
+    if let Some(sr) = self_repo {
+        if task_repo == sr {
+            return None;
+        }
+    }
+    Some(task_repo)
+}
+
+/// Look up a task's refs from the DB. Returns None on any failure.
+async fn lookup_task_refs(db_path: &std::path::Path, task_id: i64) -> Option<String> {
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Option<String> {
+        let conn = quorum_core::db::open(&p).ok()?;
+        let task = tasks::get(&conn, task_id).ok()??;
+        task.refs
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Clean up a worker slot's resources without updating task status.
@@ -4128,6 +5004,7 @@ async fn teardown_reviewer(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     mut state: SlotState,
+    end_reason: &str,
 ) {
     log(&format!("tearing down reviewer {}", state.agent_name));
 
@@ -4136,7 +5013,7 @@ async fn teardown_reviewer(
     }
 
     state.proc.kill_and_reap().await;
-    close_agent_run(&config.db_path, state.agent_run_id, "verdict").await;
+    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
@@ -4154,6 +5031,292 @@ async fn teardown_reviewer(
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
+}
+
+// ── R2 review-audit helpers ──────────────────────────────────────────────
+
+/// R2 metadata stashed alongside the SlotState for audit recording.
+struct R2Meta {
+    r1_reviewer: String,
+    r1_run_id: Option<i64>,
+    worker_model: String,
+    worker_effort: String,
+    cx_bucket: String,
+}
+
+/// Map from R2 agent_name → R2Meta. Separate from SlotState to avoid bloating it.
+static R2_META: std::sync::LazyLock<std::sync::Mutex<HashMap<String, R2Meta>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_spawn_r2(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    auditors: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    pr: i64,
+    task_id: i64,
+    r1_reviewer: &str,
+    r1_run_id: Option<i64>,
+) {
+    // Query stratum data from DB.
+    let p = config.db_path.clone();
+    let tid = task_id;
+    let target = config.r2_target_per_stratum;
+    let prob = config.r2_steady_state_p;
+    let default_model = config.model.clone();
+    let default_effort = config.effort.clone();
+
+    let sample_result =
+        tokio::task::spawn_blocking(move || -> Result<Option<(String, String, String)>> {
+            let conn = quorum_core::db::open(&p)?;
+            let stratum = quorum_core::review_audits::task_stratum(
+                &conn,
+                tid,
+                &default_model,
+                &default_effort,
+            )?;
+            let counts = quorum_core::review_audits::stratum_counts(&conn)?;
+            // ponytail: use task_id as seed — deterministic per-task, varies across tasks
+            let should = quorum_core::review_audits::should_sample(
+                &counts, &stratum, target, prob, tid as u64,
+            );
+            if should {
+                let (model, effort, cx) = stratum;
+                Ok(Some((model, effort, cx)))
+            } else {
+                Ok(None)
+            }
+        })
+        .await;
+
+    let Some(Ok(Some((model, effort, cx)))) = sample_result.ok() else {
+        return;
+    };
+
+    log(&format!(
+        "R2: spawning auditor for PR #{pr} (stratum: {model}/{effort}/{cx})"
+    ));
+
+    let acquire_result = name_pool.acquire();
+    let r2_name = acquire_result.into_name();
+    lifetime_roster.register(&r2_name);
+
+    // Drain stale mailbox rows.
+    {
+        let p = config.db_path.clone();
+        let name = r2_name.clone();
+        let _ = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = quorum_core::db::open(&p)?;
+            mailbox::consume_all_for_agent(&mut conn, &name)
+        })
+        .await;
+    }
+
+    let session_id = agent::new_session_id();
+    let branch = reviewer::reviewer_branch(pr, &r2_name);
+    let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &r2_name);
+
+    // Provision worktree from origin/main (post-merge, the PR branch is gone).
+    let provision_ok = wt_mgr
+        .fetch_and_provision(&config.repo_dir, &branch, &wt_path, &config.base_branch)
+        .await
+        .is_ok();
+    if !provision_ok {
+        log(&format!(
+            "R2: worktree provision failed for PR #{pr} — skipping"
+        ));
+        name_pool.release(&r2_name);
+        return;
+    }
+
+    // Record agent_run with sub_role='r2'.
+    let agent_run_id = {
+        let p = config.db_path.clone();
+        let name = r2_name.clone();
+        let m = model.clone();
+        let e = effort.clone();
+        tokio::task::spawn_blocking(move || -> Result<i64> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::insert_r2(&conn, task_id, &name, &m, &e, now_unix())
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+    };
+
+    // Stash R2 metadata for later audit recording.
+    R2_META.lock().unwrap().insert(
+        r2_name.clone(),
+        R2Meta {
+            r1_reviewer: r1_reviewer.to_string(),
+            r1_run_id,
+            worker_model: model.clone(),
+            worker_effort: effort.clone(),
+            cx_bucket: cx,
+        },
+    );
+
+    // Journal + spawn.
+    let spec = reviewer::R2AuditSpec {
+        pr,
+        r1_reviewer: r1_reviewer.to_string(),
+        r2_name: r2_name.clone(),
+    };
+    let prompt = reviewer::build_r2_audit_prompt(&spec);
+
+    let session_log = config.log_dir.as_ref().and_then(|d| {
+        session_log::SessionLog::create(
+            d,
+            &r2_name,
+            "auditor",
+            Some(task_id),
+            &session_id,
+            &branch,
+            now_unix(),
+        )
+        .ok()
+    });
+
+    match reviewer::spawn_reviewer(
+        &model,
+        &effort,
+        &session_id,
+        &wt_path,
+        config.agent_bin.as_deref(),
+        config.bare_agent,
+        vec![],
+        config.allowed_tools.as_deref(),
+    )
+    .await
+    {
+        Ok(mut proc) => {
+            let _ = proc.feed_turn(&prompt).await;
+            let now_inst = std::time::Instant::now();
+            let slot = SlotState {
+                agent_name: r2_name.clone(),
+                proc,
+                task_id,
+                session_id,
+                worktree_path: wt_path,
+                branch,
+                draining: true,
+                pr: Some(pr),
+                rework_count: 0,
+                cost_tokens: 0,
+                cost_usd: 0.0,
+                task_started_at: now_inst,
+                turn_started_at: now_inst,
+                turn_ended_at: None,
+                agent_state: None,
+                session_log,
+                live_stats: LiveStats::new(),
+                error_turn_count: 0,
+                agent_run_id,
+            };
+            // Journal the R2 as a reviewer in "auditing" phase.
+            {
+                let p = config.db_path.clone();
+                let entry = slot_journal_entry(&slot, "reviewer", "auditing");
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut conn) = quorum_core::db::open(&p) {
+                        let _ = journal::upsert(&mut conn, &entry);
+                    }
+                })
+                .await
+                .ok();
+            }
+            auditors.push(slot);
+            log(&format!("R2: auditor {r2_name} spawned for PR #{pr}"));
+        }
+        Err(e) => {
+            log(&format!("R2: failed to spawn auditor: {e}"));
+            R2_META.lock().unwrap().remove(&r2_name);
+            close_agent_run(&config.db_path, agent_run_id, "spawn-failed").await;
+            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+            name_pool.release(&r2_name);
+        }
+    }
+}
+
+async fn handle_r2_done(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    auditors: &mut Vec<SlotState>,
+    ai: usize,
+    row: &quorum_core::mailbox::MailboxRow,
+) {
+    let a = auditors.remove(ai);
+    let r2_name = a.agent_name.clone();
+    let r2_run_id = a.agent_run_id;
+
+    // Parse R2 findings from the note/payload.
+    let (missed_count, overcaught_count, r2_verdict) = parse_r2_payload(row);
+
+    // Retrieve stashed R2 metadata.
+    let meta = R2_META.lock().unwrap().remove(&r2_name);
+
+    if let Some(meta) = meta {
+        let audit = quorum_core::review_audits::ReviewAudit {
+            task_id: a.task_id,
+            pr_number: row.pr.unwrap_or(0),
+            r1_run_id: meta.r1_run_id.unwrap_or(0),
+            r2_run_id: r2_run_id.unwrap_or(0),
+            r1_reviewer: meta.r1_reviewer,
+            r2_reviewer: r2_name.clone(),
+            model: meta.worker_model,
+            effort: meta.worker_effort,
+            cx_bucket: meta.cx_bucket,
+            missed_count,
+            overcaught_count,
+            r1_verdict: "approved".into(),
+            r2_verdict: r2_verdict.clone(),
+            created_at: now_unix(),
+        };
+        let p = config.db_path.clone();
+        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::review_audits::insert(&conn, &audit)?;
+            Ok(())
+        })
+        .await;
+        log(&format!(
+            "R2: audit recorded for PR #{} — missed={}, overcaught={}, verdict={:?}",
+            row.pr.unwrap_or(0),
+            missed_count,
+            overcaught_count,
+            r2_verdict
+        ));
+    }
+
+    teardown_reviewer(config, wt_mgr, name_pool, a, "r2-done").await;
+}
+
+fn parse_r2_payload(row: &quorum_core::mailbox::MailboxRow) -> (i64, i64, Option<String>) {
+    let verdict = row.verdict.clone();
+    // Try to parse structured findings from note or payload.
+    let text = row.note.as_deref().or(row.payload.as_deref()).unwrap_or("");
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        let missed = v
+            .get("missed")
+            .and_then(|a| a.as_array())
+            .map(|a| a.len() as i64)
+            .unwrap_or(0);
+        let overcaught = v
+            .get("overcaught")
+            .and_then(|a| a.as_array())
+            .map(|a| a.len() as i64)
+            .unwrap_or(0);
+        let v_from_json = v
+            .get("verdict")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        return (missed, overcaught, verdict.or(v_from_json));
+    }
+    // Fallback: use blocking count from verdict gate if available.
+    (0, 0, verdict)
 }
 
 #[cfg(test)]
@@ -4300,6 +5463,7 @@ mod tests {
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
+            turn_ended_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -4449,6 +5613,54 @@ mod tests {
         assert!(limits.max_task_cost_usd.is_none());
         assert!(limits.max_turn_wall_secs.is_none());
         assert!(limits.max_task_wall_secs.is_none());
+        assert!(limits.idle_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn idle_timeout_detects_zombie_slot() {
+        let mut slot = make_dummy_slot();
+        // Simulate: turn ended 400s ago, not draining, no errors
+        slot.draining = false;
+        slot.error_turn_count = 0;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        let timeout = 300u64;
+        let is_zombie = !slot.draining
+            && slot.error_turn_count == 0
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(is_zombie);
+    }
+
+    #[test]
+    fn idle_timeout_ignores_draining_slot() {
+        let mut slot = make_dummy_slot();
+        slot.draining = true;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
+
+        let timeout = 300u64;
+        let is_zombie = !slot.draining
+            && slot.error_turn_count == 0
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(!is_zombie);
+    }
+
+    #[test]
+    fn idle_timeout_ignores_fresh_idle_slot() {
+        let mut slot = make_dummy_slot();
+        slot.draining = false;
+        slot.turn_ended_at = Some(std::time::Instant::now());
+
+        let timeout = 300u64;
+        let is_zombie = !slot.draining
+            && slot.error_turn_count == 0
+            && slot
+                .turn_ended_at
+                .is_some_and(|t| t.elapsed().as_secs() > timeout);
+        assert!(!is_zombie);
     }
 
     #[test]
@@ -4671,6 +5883,39 @@ mod tests {
     }
 
     #[test]
+    fn check_repo_mismatch_detects_cross_repo() {
+        let refs = Some(r#"{"pr":318,"repo":"ag2trust/quorum"}"#.to_string());
+        let result = check_repo_mismatch(&refs, "ag2trust/ag2trust", None);
+        assert_eq!(result, Some("ag2trust/quorum".to_string()));
+    }
+
+    #[test]
+    fn check_repo_mismatch_same_repo_returns_none() {
+        let refs = Some(r#"{"pr":318,"repo":"ag2trust/quorum"}"#.to_string());
+        assert_eq!(check_repo_mismatch(&refs, "ag2trust/quorum", None), None);
+    }
+
+    #[test]
+    fn check_repo_mismatch_self_repo_returns_none() {
+        let refs = Some(r#"{"pr":318,"repo":"ag2trust/quorum"}"#.to_string());
+        assert_eq!(
+            check_repo_mismatch(&refs, "ag2trust/ag2trust", Some("ag2trust/quorum")),
+            None
+        );
+    }
+
+    #[test]
+    fn check_repo_mismatch_no_repo_returns_none() {
+        let refs = Some(r#"{"pr":318}"#.to_string());
+        assert_eq!(check_repo_mismatch(&refs, "ag2trust/ag2trust", None), None);
+    }
+
+    #[test]
+    fn check_repo_mismatch_none_refs_returns_none() {
+        assert_eq!(check_repo_mismatch(&None, "ag2trust/ag2trust", None), None);
+    }
+
+    #[test]
     fn now_label_bash_command() {
         let input = serde_json::json!({"command": "cargo test"});
         assert_eq!(now_label("Bash", &input), "Bash: cargo test");
@@ -4694,6 +5939,35 @@ mod tests {
     fn now_label_unknown_tool() {
         let input = serde_json::json!({});
         assert_eq!(now_label("UnknownTool", &input), "UnknownTool");
+    }
+
+    #[test]
+    fn assistant_content_array_extracts_tool_use() {
+        let message = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "Let me check that."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/foo/bar.rs"}}
+            ]
+        });
+        let mut tool_count: u32 = 0;
+        let mut last_now = String::new();
+        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                        let input = block
+                            .get("input")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        tool_count += 1;
+                        last_now = now_label(name, &input);
+                    }
+                }
+            }
+        }
+        assert_eq!(tool_count, 2);
+        assert_eq!(last_now, "Read: bar.rs");
     }
 
     #[test]

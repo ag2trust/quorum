@@ -62,6 +62,8 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Tail { .. } => "tail",
         cli::Command::Perf { .. } => "perf",
         cli::Command::Classify { .. } => "classify",
+        cli::Command::Kill { .. } => "kill",
+        cli::Command::ReviewInterpret { .. } => "review-interpret",
         cli::Command::Help => "help",
     }
 }
@@ -119,6 +121,22 @@ fn read_optional_text(
 /// so a malformed config never breaks recovery (`help`) or maintenance (`sweep`/`init`).
 fn load_cfg() -> Result<config::Config> {
     config::load(&paths::config_path()?)
+}
+
+/// Resolve repo identity: explicit `--repo owner/name` override, or cwd/env fallback.
+fn resolve_repo_override(repo: Option<&str>) -> Result<String> {
+    match repo {
+        Some(r) => {
+            let slash_count = r.chars().filter(|&c| c == '/').count();
+            if slash_count != 1 || r.starts_with('/') || r.ends_with('/') {
+                return Err(QuorumError::Usage(format!(
+                    "--repo must be owner/name (got {r:?})"
+                )));
+            }
+            Ok(r.to_string())
+        }
+        None => paths::resolve_repo(),
+    }
 }
 
 fn best_effort_errlog(source: &str, detail: &str) {
@@ -292,9 +310,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             depends_on,
             review_pr,
             body_file,
+            repo,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
             let id = quorum_core::tasks::create(
                 &mut conn,
                 &created_by,
@@ -307,7 +327,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 review_pr,
                 now,
             )?;
-            output::emit(&serde_json::json!({ "id": id }));
+            output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
         }
         cli::Command::TaskClaim {
@@ -315,12 +335,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             task_id,
             match_label,
             ttl,
+            repo,
         } => {
             let ttl = match ttl {
                 Some(s) => parse_ttl(&s)?,
                 None => load_cfg()?.task_lease_ttl_secs,
             };
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
             let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
             match quorum_core::tasks::claim(&mut conn, &agent, task_id, &labels, ttl, now)? {
                 Some(t) => {
@@ -347,12 +369,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     compact.suggested_branch = Some(alloc.branch);
                     compact.suggested_worktree = Some(alloc.worktree);
                     compact.branch_exists = Some(alloc.existed);
+                    compact.repo = Some(resolved_repo.clone());
                     output::emit(&compact);
                     Ok(0)
                 }
                 None => {
                     output::emit(
-                        &serde_json::json!({ "ok": false, "reason": "no claimable task" }),
+                        &serde_json::json!({ "ok": false, "reason": "no claimable task", "repo": resolved_repo }),
                     );
                     Ok(1)
                 }
@@ -830,6 +853,30 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
+        cli::Command::Kill {
+            agent,
+            by,
+            reason_stdin,
+            reason_file,
+        } => {
+            let reason = read_optional_body(reason_stdin, reason_file)?;
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+            let row = quorum_core::mailbox::MailboxRow {
+                agent: by,
+                kind: quorum_core::mailbox::MailboxKind::Kill,
+                task_id: None,
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: reason,
+                to_agent: Some(agent),
+                payload: None,
+            };
+            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            Ok(0)
+        }
         cli::Command::Serve {
             config: config_flag,
             cap,
@@ -852,6 +899,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_task_cost_usd,
             max_turn_wall_secs,
             max_task_wall_secs,
+            idle_timeout_secs,
+            allowed_tools,
             log_dir,
             self_update_drain,
             drain_timeout_secs,
@@ -860,6 +909,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo,
             base_branch,
             exit_when_gone,
+            doctor_enabled,
         } => {
             use serve_config::*;
 
@@ -940,6 +990,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
+            let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);
+            let r_allowed_tools =
+                resolve_opt_str(allowed_tools.as_deref(), file_cfg.allowed_tools.as_deref());
             let r_log_dir = resolve_opt_str(log_dir.as_deref(), file_cfg.log_dir.as_deref());
             let r_self_update = resolve_bool(self_update_drain, file_cfg.self_update_drain, false);
             let r_drain_timeout = resolve_val(drain_timeout_secs, file_cfg.drain_timeout_secs, 900);
@@ -961,6 +1014,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_required_jobs: Vec<String> = file_cfg.required_jobs.clone().unwrap_or_default();
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
+            let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
+            let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(false);
+            let r_r2_target_per_stratum = file_cfg.r2_target_per_stratum.unwrap_or(5);
+            let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(0.10);
+            let r_r2_blocking = file_cfg.r2_blocking.unwrap_or(false);
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -978,6 +1036,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 drain_timeout_secs: &r_drain_timeout,
                 max_turn_wall_secs: &r_max_turn_wall,
                 max_task_wall_secs: &r_max_task_wall,
+                idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
                 max_task_tokens: &r_max_task_tokens,
                 max_turn_cost_usd: &r_max_turn_cost,
@@ -986,6 +1045,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 required_jobs: &r_required_jobs,
                 master_ci_gate: &r_master_ci_gate,
                 master_ci_timeout_secs: &r_master_ci_timeout,
+                doctor_enabled: &r_doctor_enabled,
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1044,6 +1104,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     max_task_cost_usd: r_max_task_cost.value,
                     max_turn_wall_secs: r_max_turn_wall.value,
                     max_task_wall_secs: r_max_task_wall.value,
+                    idle_timeout_secs: r_idle_timeout.value,
                 },
                 log_dir: resolved_log_dir,
                 self_update_drain: r_self_update.value,
@@ -1058,6 +1119,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 required_jobs: r_required_jobs,
                 master_ci_gate: r_master_ci_gate.value,
                 master_ci_timeout_secs: r_master_ci_timeout.value,
+                allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
+                doctor_enabled: r_doctor_enabled.value,
+                r2_enabled: r_r2_enabled,
+                r2_target_per_stratum: r_r2_target_per_stratum,
+                r2_steady_state_p: r_r2_steady_state_p,
+                r2_blocking: r_r2_blocking,
             };
             Ok(serve::run_serve(config)?)
         }
@@ -1133,8 +1200,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     )));
                 }
             };
+            let repo = paths::resolve_repo()?;
+            let cfg_path = serve_config::default_config_path(&repo)?;
+            let file_cfg = serve_config::load(&cfg_path, false)?;
+            let default_model = file_cfg.model.as_deref().unwrap_or("sonnet");
+            let default_effort = file_cfg.effort.as_deref().unwrap_or("high");
             let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let report = quorum_core::perf::perf(&conn, cut)?;
+            let report = quorum_core::perf::perf(&conn, cut, default_model, default_effort)?;
             if json {
                 output::emit(&report);
             } else {
@@ -1260,6 +1332,160 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             }));
             Ok(0)
         }
+        cli::Command::ReviewInterpret {
+            pr,
+            repo,
+            task_id,
+            agent_bin,
+            no_bare_agent,
+            json,
+        } => {
+            let db = paths::db_path()?;
+            let mut conn = quorum_core::db::open(&db)?;
+
+            // Fetch both comment endpoints via `gh api`.
+            let repo_flag: Vec<String> = repo
+                .as_deref()
+                .map(|r| vec!["-R".into(), r.into()])
+                .unwrap_or_default();
+
+            let fetch_comments = |endpoint: &str| -> Result<String> {
+                let mut cmd = std::process::Command::new("gh");
+                cmd.arg("api").args(&repo_flag);
+                cmd.arg(format!("repos/{{owner}}/{{repo}}/{endpoint}/{pr}/comments"));
+                let out = cmd
+                    .output()
+                    .map_err(|e| QuorumError::Io(format!("gh api: {e}")))?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    return Err(QuorumError::Io(format!(
+                        "gh api {endpoint} failed: {stderr}"
+                    )));
+                }
+                String::from_utf8(out.stdout)
+                    .map_err(|e| QuorumError::Io(format!("invalid utf8: {e}")))
+            };
+
+            let pulls_comments = fetch_comments("pulls")?;
+            let issues_comments = fetch_comments("issues")?;
+
+            // Build prompt and send to Haiku via claude CLI.
+            let prompt =
+                quorum_core::review_findings::build_prompt(&pulls_comments, &issues_comments, pr);
+            let turn = serve::agent::user_turn(&prompt);
+
+            let spec = serve::agent::AgentSpec {
+                model: serve::classifier::CLASSIFIER_MODEL.to_string(),
+                effort: serve::classifier::CLASSIFIER_EFFORT.to_string(),
+                session_id: serve::agent::new_session_id(),
+                worktree: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                bare: !no_bare_agent,
+                allowed_tools: String::new(),
+                env_vars: vec![],
+            };
+
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;
+
+            let findings = rt.block_on(async {
+                let mut proc = serve::agent::AgentProc::spawn(&spec, agent_bin.as_deref())
+                    .map_err(|e| QuorumError::Io(format!("spawn interpreter: {e}")))?;
+
+                proc.feed_turn(&turn)
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
+
+                let mut response_text = String::new();
+                let timeout_dur = std::time::Duration::from_secs(120);
+                let deadline = tokio::time::Instant::now() + timeout_dur;
+
+                loop {
+                    let remaining = deadline - tokio::time::Instant::now();
+                    match tokio::time::timeout(remaining, proc.next_event()).await {
+                        Ok(Some(serve::stream::Event::Result {
+                            result, is_error, ..
+                        })) => {
+                            if is_error.unwrap_or(false) {
+                                return Err(QuorumError::Io(
+                                    "interpreter agent returned an error".into(),
+                                ));
+                            }
+                            let text = result
+                                .as_str()
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| result.to_string());
+                            if !text.is_empty() {
+                                response_text = text;
+                            }
+                            break;
+                        }
+                        Ok(Some(serve::stream::Event::Assistant { message })) => {
+                            if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+                                response_text.push_str(content);
+                            }
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            return Err(QuorumError::Io(format!(
+                                "interpreter timeout for PR #{pr}"
+                            )));
+                        }
+                    }
+                }
+
+                proc.kill_and_reap().await;
+
+                if response_text.is_empty() {
+                    return Ok(vec![]);
+                }
+
+                quorum_core::review_findings::parse_response(&response_text, pr, task_id)
+                    .ok_or_else(|| {
+                        QuorumError::Io(format!(
+                            "failed to parse interpreter response for PR #{pr}"
+                        ))
+                    })
+            })?;
+
+            quorum_core::review_findings::replace_for_pr(&mut conn, pr, &findings)?;
+
+            if json {
+                output::emit(&serde_json::json!({
+                    "pr": pr,
+                    "findings_count": findings.len(),
+                    "findings": findings,
+                }));
+            } else {
+                eprintln!(
+                    "PR #{}: {} findings stored in review_findings",
+                    pr,
+                    findings.len()
+                );
+                for f in &findings {
+                    let pushback = if f.author_pushback {
+                        let accepted = match f.pushback_accepted {
+                            Some(true) => " (accepted)",
+                            Some(false) => " (overridden)",
+                            None => "",
+                        };
+                        format!(" [pushback{accepted}]")
+                    } else {
+                        String::new()
+                    };
+                    eprintln!(
+                        "  [{}/{}] {}{} (from {})",
+                        f.kind,
+                        f.severity.as_deref().unwrap_or("?"),
+                        f.text,
+                        pushback,
+                        f.source_endpoint,
+                    );
+                }
+            }
+
+            Ok(0)
+        }
         cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);
             Ok(0)
@@ -1279,7 +1505,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ttl, wait_child_stdout};
+    use super::{parse_ttl, resolve_repo_override, wait_child_stdout};
 
     #[test]
     fn parse_ttl_units() {
@@ -1355,5 +1581,23 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "must not wait for the full sleep; elapsed: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn resolve_repo_override_accepts_valid_slug() {
+        assert_eq!(
+            resolve_repo_override(Some("ag2trust/quorum")).unwrap(),
+            "ag2trust/quorum"
+        );
+    }
+
+    #[test]
+    fn resolve_repo_override_rejects_malformed() {
+        for bad in &["noslash", "too/many/slashes", "/leading", "trailing/", ""] {
+            assert!(
+                resolve_repo_override(Some(bad)).is_err(),
+                "should reject {bad:?}"
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 20). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 23). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -271,7 +271,10 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     effort      TEXT NOT NULL,
     spawned_at  INTEGER NOT NULL,
     ended_at    INTEGER,
-    end_reason  TEXT
+    end_reason  TEXT,
+    -- v23: NULL = normal R1/worker run. 'r2' = R2 adversarial audit pass.
+    -- Perf queries filter `sub_role IS NULL` to exclude R2 from R1 stats.
+    sub_role    TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 
@@ -288,3 +291,47 @@ CREATE TABLE IF NOT EXISTS activity_events (
 );
 CREATE INDEX IF NOT EXISTS activity_events_agent_ts ON activity_events(agent_name, ts DESC);
 CREATE INDEX IF NOT EXISTS activity_events_expires  ON activity_events(expires_at);
+
+-- Review-comment interpreter output (#93): structured findings parsed from PR
+-- comment threads by a cheap Haiku pass. Captures blocking findings, non-blocking
+-- suggestions, and author rebuttals that would otherwise be lost as free text.
+-- Not TTL'd — durable historical data for review quality analysis.
+CREATE TABLE IF NOT EXISTS review_findings (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_number           INTEGER NOT NULL,
+    task_id             INTEGER,
+    reviewer            TEXT NOT NULL,
+    kind                TEXT NOT NULL CHECK(kind IN ('blocking', 'suggestion')),
+    author_pushback     INTEGER NOT NULL DEFAULT 0,
+    pushback_accepted   INTEGER,
+    severity            TEXT,
+    text                TEXT NOT NULL,
+    source_endpoint     TEXT NOT NULL CHECK(source_endpoint IN ('pulls', 'issues')),
+    created_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS review_findings_pr ON review_findings(pr_number);
+CREATE INDEX IF NOT EXISTS review_findings_task ON review_findings(task_id);
+
+-- R2 review-audit capture (#92): one row per second-reviewer (R2) adversarial
+-- audit of an R1 review. Stratified-sampled on (model, effort, cx_bucket).
+-- Shadow mode: R2 verdict is recorded but does NOT block merges (see
+-- serve-config `r2_blocking`). Not TTL'd — durable historical data.
+CREATE TABLE IF NOT EXISTS review_audits (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id           INTEGER NOT NULL,
+    pr_number         INTEGER NOT NULL,
+    r1_run_id         INTEGER NOT NULL,
+    r2_run_id         INTEGER NOT NULL,
+    r1_reviewer       TEXT NOT NULL,
+    r2_reviewer       TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    effort            TEXT NOT NULL,
+    cx_bucket         TEXT NOT NULL,
+    missed_count      INTEGER NOT NULL DEFAULT 0,
+    overcaught_count  INTEGER NOT NULL DEFAULT 0,
+    r1_verdict        TEXT NOT NULL,
+    r2_verdict        TEXT,
+    created_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS review_audits_task ON review_audits(task_id);
+CREATE INDEX IF NOT EXISTS review_audits_stratum ON review_audits(model, effort, cx_bucket);
