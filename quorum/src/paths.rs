@@ -115,6 +115,30 @@ pub fn ensure_repo_dir(repo: &str) -> Result<PathBuf> {
     Ok(db)
 }
 
+/// Return the git working-tree root for the current directory, or `None` if not
+/// inside a git repo. Works from linked worktrees.
+pub fn git_toplevel() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(s))
+}
+
+/// Try to resolve repo slug (env var then git), returning `None` instead of
+/// erroring when neither is available.
+pub fn try_resolve_repo() -> Option<String> {
+    resolve_repo().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

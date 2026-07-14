@@ -18,6 +18,62 @@ mod verdict;
 use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
 
+const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
+
+const DEFAULT_SERVE_TOML: &str = "\
+# quorum serve config — uncomment and edit values as needed.
+# CLI flags override these; missing keys use built-in defaults.
+# See `quorum serve --help` for flag equivalents.
+
+## Required — no defaults (serve will error without these or equivalent flags)
+# repo = \"owner/name\"
+# repo_dir = \"/path/to/checkout\"
+# worktree_base = \"/path/to/worktrees\"
+
+## Worker / model
+# cap = 4
+# model = \"sonnet\"
+# effort = \"high\"
+# names_file = \"/path/to/names.txt\"
+# agent_bin = \"claude\"
+# no_bare_agent = false
+# allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
+# base_branch = \"main\"
+
+## Token / cost / wall-clock limits (unlimited when absent)
+# max_turn_tokens = 200000
+# max_task_tokens = 1000000
+# max_turn_cost_usd = 5.0
+# max_task_cost_usd = 50.0
+# max_turn_wall_secs = 2700
+# max_task_wall_secs = 14400
+# idle_timeout_secs = 300
+
+## Merge
+# merge_token_file = \"/path/to/token\"
+# merge_checks_timeout_secs = 900
+# merge_checks_poll_secs = 30
+# required_jobs = [\"ci\"]
+# master_ci_gate = false
+# master_ci_timeout_secs = 300
+
+## Self-update drain
+# self_update_drain = false
+# drain_timeout_secs = 900
+# self_repo = \"owner/name\"
+# sha_poll_interval_secs = 60
+
+## Diagnostics
+# log_dir = \"/path/to/logs\"
+# doctor_enabled = false
+
+## R2 review-audit (shadow review)
+# r2_enabled = false
+# r2_target_per_stratum = 5
+# r2_steady_state_p = 0.10
+# r2_blocking = false
+";
+
 fn run() -> Result<i32> {
     let cli = cli::Cli::parse();
     let source = command_source(&cli.command);
@@ -268,6 +324,45 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             if info.migrated_from > 0 && info.migrated_from != info.schema_version {
                 out["migrated_from"] = serde_json::json!(info.migrated_from);
             }
+
+            // Repo skill: write .claude/skills/quorum/SKILL.md if inside a git repo.
+            if let Some(toplevel) = paths::git_toplevel() {
+                let skill_path = toplevel.join(".claude/skills/quorum/SKILL.md");
+                let needs_write = match std::fs::read_to_string(&skill_path) {
+                    Ok(existing) => existing != EMBEDDED_SKILL,
+                    Err(_) => true,
+                };
+                if needs_write {
+                    if let Some(parent) = skill_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| QuorumError::Io(e.to_string()))?;
+                    }
+                    std::fs::write(&skill_path, EMBEDDED_SKILL)
+                        .map_err(|e| QuorumError::Io(e.to_string()))?;
+                    out["skill"] = serde_json::json!({
+                        "path": skill_path.to_string_lossy(),
+                        "action": "written",
+                    });
+                }
+            }
+
+            // Serve config scaffold: create ~/.quorum/serve/<slug>.toml if absent.
+            if let Some(repo_slug) = paths::try_resolve_repo() {
+                let serve_path = serve_config::default_config_path(&repo_slug)?;
+                if !serve_path.exists() {
+                    if let Some(parent) = serve_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| QuorumError::Io(e.to_string()))?;
+                    }
+                    std::fs::write(&serve_path, DEFAULT_SERVE_TOML)
+                        .map_err(|e| QuorumError::Io(e.to_string()))?;
+                    out["serve_config"] = serde_json::json!({
+                        "path": serve_path.to_string_lossy(),
+                        "action": "scaffolded",
+                    });
+                }
+            }
+
             output::emit(&out);
             Ok(0)
         }

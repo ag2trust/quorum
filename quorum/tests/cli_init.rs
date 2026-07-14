@@ -149,6 +149,88 @@ fn concurrent_init_is_safe() {
     }
 }
 
+// -- repo provisioning (task #106) --------------------------------------------------------
+
+#[test]
+fn init_creates_serve_config_scaffold() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    let toml_path = home.path().join("serve/test__repo.toml");
+    assert!(toml_path.exists(), "serve config scaffold must be created");
+    let content = std::fs::read_to_string(&toml_path).unwrap();
+    assert!(
+        content.contains("r2_enabled"),
+        "scaffold must surface r2_enabled"
+    );
+    assert!(
+        content.contains("r2_target_per_stratum"),
+        "scaffold must surface r2_target_per_stratum"
+    );
+    assert!(
+        content.contains("r2_steady_state_p"),
+        "scaffold must surface r2_steady_state_p"
+    );
+}
+
+#[test]
+fn init_does_not_clobber_existing_serve_config() {
+    let home = tempfile::tempdir().unwrap();
+    let toml_path = home.path().join("serve/test__repo.toml");
+    std::fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+    let custom = "cap = 16\n";
+    std::fs::write(&toml_path, custom).unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    let after = std::fs::read_to_string(&toml_path).unwrap();
+    assert_eq!(after, custom, "user edits must be preserved byte-for-byte");
+}
+
+#[test]
+fn init_no_git_repo_skips_skill_cleanly() {
+    let home = tempfile::tempdir().unwrap();
+    let non_git = tempfile::tempdir().unwrap();
+    Command::cargo_bin("quorum")
+        .unwrap()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .current_dir(non_git.path())
+        .arg("init")
+        .assert()
+        .success();
+    // No .claude dir created in the non-git directory.
+    assert!(
+        !non_git.path().join(".claude").exists(),
+        "skill must not be written outside a git repo"
+    );
+}
+
+#[test]
+fn init_idempotent_serve_config_and_skill() {
+    let home = tempfile::tempdir().unwrap();
+    // First run creates everything.
+    quorum(home.path()).arg("init").assert().success();
+    let toml_path = home.path().join("serve/test__repo.toml");
+    let toml_before = std::fs::read_to_string(&toml_path).unwrap();
+    let mtime_before = std::fs::metadata(&toml_path).unwrap().modified().unwrap();
+    // Small sleep so mtime would differ if file were rewritten.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Second run: no changes.
+    let out = quorum(home.path()).arg("init").output().unwrap();
+    assert!(out.status.success());
+    let toml_after = std::fs::read_to_string(&toml_path).unwrap();
+    assert_eq!(toml_before, toml_after);
+    let mtime_after = std::fs::metadata(&toml_path).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_before, mtime_after,
+        "serve toml must not be rewritten on idempotent run"
+    );
+    // JSON output should not contain serve_config action on second run.
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        json.get("serve_config").is_none(),
+        "second init must not report serve_config action"
+    );
+}
+
 // -- reset (#59) --------------------------------------------------------------------------
 
 #[test]
