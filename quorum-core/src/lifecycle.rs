@@ -187,20 +187,24 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Working, Event::SignaledDone { .. }) => {
             Ok((Status::InReview, vec![Effect::SpawnReviewer]))
         }
-        (Status::Working, Event::AgentFailed { reason }) => Ok((
-            Status::Open,
-            vec![
-                Effect::ReleaseLease,
-                Effect::ClearAuthor,
-                Effect::NotifyOwner {
-                    reason: reason.clone(),
-                },
-            ],
-        )),
-        (Status::Working, Event::LeaseExpired) => Ok((
-            Status::Open,
-            vec![Effect::ReleaseLease, Effect::ClearAuthor],
-        )),
+        (Status::Working, Event::AgentFailed { reason }) => {
+            let mut effects = vec![Effect::ReleaseLease];
+            // Preserve author when task has an open PR — the work survives the worker
+            if t.pr.is_none() {
+                effects.push(Effect::ClearAuthor);
+            }
+            effects.push(Effect::NotifyOwner {
+                reason: reason.clone(),
+            });
+            Ok((Status::Open, effects))
+        }
+        (Status::Working, Event::LeaseExpired) => {
+            let mut effects = vec![Effect::ReleaseLease];
+            if t.pr.is_none() {
+                effects.push(Effect::ClearAuthor);
+            }
+            Ok((Status::Open, effects))
+        }
         (Status::Working, Event::Cancelled { by }) => Ok((
             Status::Cancelled,
             vec![
@@ -591,6 +595,39 @@ mod tests {
             &Event::LeaseExpired,
             Status::Open,
             &[Effect::ReleaseLease, Effect::ClearAuthor],
+        );
+    }
+
+    #[test]
+    fn working_agent_failed_with_pr_preserves_author() {
+        let mut t = view(Status::Working);
+        t.pr = Some("42".into());
+        t.author = Some("W1".into());
+        assert_ok(
+            &t,
+            &Event::AgentFailed {
+                reason: "idle".into(),
+            },
+            Status::Open,
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "idle".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn working_lease_expired_with_pr_preserves_author() {
+        let mut t = view(Status::Working);
+        t.pr = Some("42".into());
+        t.author = Some("W1".into());
+        assert_ok(
+            &t,
+            &Event::LeaseExpired,
+            Status::Open,
+            &[Effect::ReleaseLease],
         );
     }
 
