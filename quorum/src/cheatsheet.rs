@@ -44,6 +44,14 @@ TASKS (work queue) — lifecycle: open -> claimed -> done -> closed (+ terminal 
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # Lifecycle: open -> working -> in-review -> merging -> done (with rework loop).
 
+SUBMIT (canonical hand-off — aliased as `done`, which is deprecated)
+  quorum submit --agent <id> --pr <N>                                  # worker: signal task completion (PR posted)
+  quorum submit --agent <id> --pr <N> --verdict approved --blocking 0  # reviewer: approve
+  quorum submit --agent <id> --pr <N> --verdict changes --blocking <N> --feedback "..."
+                                                                       # reviewer: request changes
+  # Writes a mailbox row for the daemon. Verdict contract (#206): approved requires
+  # --blocking 0; changes requires --feedback. `quorum done` is accepted but deprecated.
+
 REVIEW (lifecycle-driven)
   Lifecycle:  T: open -> working(claim) -> in-review(SignaledDone --pr N)
               Reviewer attaches via task-claim on in-review task (self-review blocked: author != reviewer)

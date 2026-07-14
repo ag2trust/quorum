@@ -18,7 +18,7 @@
 //! - `FAKE_AGENT_EMIT_TOOL_USE=1`: emits 2-3 tool_use stream events per turn
 //!   before the result, so the daemon's tool_count/now_label code paths get exercised.
 //! - `FAKE_AGENT_SIDE_EFFECTS=1`: after the result event on turn 1, calls
-//!   `quorum done --agent $QUORUM_AGENT` as a real subprocess, creating a mailbox row.
+//!   `quorum submit --agent $QUORUM_AGENT` as a real subprocess, creating a mailbox row.
 //! - `FAKE_AGENT_ERROR_RESULT=N`: emits `is_error: true` on the first N turns,
 //!   then succeeds on subsequent turns. Used to test the daemon's error-refeed logic.
 
@@ -116,27 +116,27 @@ fn quorum_bin_path() -> std::path::PathBuf {
     exe.parent().expect("exe has no parent dir").join("quorum")
 }
 
-fn run_quorum_done() {
+fn run_quorum_submit() {
     let agent = match std::env::var("QUORUM_AGENT") {
         Ok(a) => a,
         Err(_) => {
-            eprintln!("fake-agent: QUORUM_AGENT not set, skipping done side-effect");
+            eprintln!("fake-agent: QUORUM_AGENT not set, skipping submit side-effect");
             return;
         }
     };
     let bin = quorum_bin_path();
     let status = Command::new(&bin)
-        .args(["done", "--agent", &agent])
+        .args(["submit", "--agent", &agent])
         .status();
     match status {
         Ok(s) if s.success() => {
-            eprintln!("fake-agent: quorum done succeeded for {agent}");
+            eprintln!("fake-agent: quorum submit succeeded for {agent}");
         }
         Ok(s) => {
-            eprintln!("fake-agent: quorum done exited {s} for {agent}");
+            eprintln!("fake-agent: quorum submit exited {s} for {agent}");
         }
         Err(e) => {
-            eprintln!("fake-agent: quorum done failed to run: {e}");
+            eprintln!("fake-agent: quorum submit failed to run: {e}");
         }
     }
 }
@@ -232,7 +232,7 @@ fn main() {
         emit_result(turn, cumulative_cost, is_error);
 
         if side_effects && turn == 1 {
-            run_quorum_done();
+            run_quorum_submit();
         }
     }
 }

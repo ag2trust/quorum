@@ -111,7 +111,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sweep => "sweep",
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
-        cli::Command::Done { .. } => "done",
+        cli::Command::Submit { .. } => "submit",
         cli::Command::Serve { .. } => "serve",
         cli::Command::SessionRegister { .. } => "session-register",
         cli::Command::Activity { .. } => "activity",
@@ -911,7 +911,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
-        cli::Command::Done {
+        cli::Command::Submit {
             agent,
             pr,
             summary,

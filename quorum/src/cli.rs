@@ -100,7 +100,7 @@ pub enum Command {
     ///
     /// Valid `--status` values and their guards:
     ///   `done`      — assignee-only, from `claimed`. Sets terminal status only;
-    ///                  review spawning happens via `quorum done`, not task-update.
+    ///                  review spawning happens via `quorum submit`, not task-update.
     ///   `open`      — assignee-only, from `claimed` (release/give-up semantics).
     ///   `cancelled` — creator OR assignee, from non-terminal (won't-do).
     ///   Omitted     — metadata-only update (body/refs/note). Assignee guard if
@@ -356,7 +356,9 @@ pub enum Command {
     },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// Writes a mailbox row for the daemon to consume.
-    Done {
+    /// `quorum done` is a deprecated alias — use `quorum submit`.
+    #[command(alias = "done")]
+    Submit {
         #[arg(long)]
         agent: String,
         #[arg(long)]
