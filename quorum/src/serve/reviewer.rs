@@ -16,10 +16,10 @@ pub struct ReviewerSpec {
     pub reviewer_name: String,
 }
 
-pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
+pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
     format!(
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
-         Invoke the builtin `review` skill (via the Skill tool) at effort level medium \
+         Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
          and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
@@ -49,6 +49,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec) -> String {
         name = spec.reviewer_name,
         pr = spec.pr,
         worker = spec.worker_agent,
+        effort = effort,
     )
 }
 
@@ -168,12 +169,17 @@ pub fn build_worker_turn(
     ))
 }
 
-pub fn build_rereview_turn(reviewer_name: &str, pr: i64, worker_agent: &str) -> String {
+pub fn build_rereview_turn(
+    reviewer_name: &str,
+    pr: i64,
+    worker_agent: &str,
+    effort: &str,
+) -> String {
     super::agent::user_turn(&format!(
         "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
          Verify the branch actually advanced (new commits since prior review) — approving \
          an unchanged diff over prior blocking findings is forbidden.\n\n\
-         Invoke the builtin `review` skill (via the Skill tool) at effort level medium \
+         Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology. If the builtin skill is unavailable, read the full \
          PR diff and surrounding code, check the repo CLAUDE.md invariants, and check \
          the PR's verification evidence.\n\n\
@@ -228,7 +234,7 @@ mod tests {
             worker_agent: "Worker-1".into(),
             reviewer_name: "Reviewer-1".into(),
         };
-        let prompt = build_review_prompt(&spec);
+        let prompt = build_review_prompt(&spec, "high");
         assert!(prompt.contains("PR #42"));
         assert!(prompt.contains("Worker-1"));
         assert!(prompt.contains("Reviewer-1"));
@@ -246,8 +252,14 @@ mod tests {
             "prompt must NOT reference the retired pr-review skill"
         );
         assert!(
-            prompt.contains("effort level medium"),
-            "prompt must cap review effort to control daemon cost"
+            prompt.contains("effort level high"),
+            "prompt must state the configured effort level"
+        );
+        // Verify a different effort value interpolates correctly.
+        let prompt_med = build_review_prompt(&spec, "medium");
+        assert!(
+            prompt_med.contains("effort level medium"),
+            "prompt must interpolate the effort parameter"
         );
         assert!(
             prompt.contains("--blocking 0"),
@@ -368,7 +380,7 @@ mod tests {
 
     #[test]
     fn rereview_turn_contains_pr_and_agents() {
-        let turn = build_rereview_turn("Rev-1", 42, "Worker-1");
+        let turn = build_rereview_turn("Rev-1", 42, "Worker-1", "high");
         assert!(turn.contains("PR #42"));
         assert!(turn.contains("Worker-1"));
         assert!(turn.contains("Rev-1"));
@@ -475,9 +487,9 @@ mod tests {
         };
         let templates: &[(&str, String)] = &[
             ("worker", build_worker_turn("A", 1, "t", "b", None)),
-            ("reviewer", build_review_prompt(&spec)),
+            ("reviewer", build_review_prompt(&spec, "medium")),
             ("rework", build_rework_turn("A", 1, 1, "fix it", 0.0, None)),
-            ("rereview", build_rereview_turn("R", 1, "W")),
+            ("rereview", build_rereview_turn("R", 1, "W", "medium")),
         ];
 
         let clap_cmd = crate::cli::Cli::command();
