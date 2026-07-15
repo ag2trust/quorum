@@ -266,6 +266,26 @@ calls:
   task state and state what happens in each cell (in the PR body or a test). The
   unenumerated cell is where the bug lives.
 
+### 8. Interactive owner-facing sessions are coordinator-only by default
+
+When running as an interactive session with the owner (human), default to **coordinator
+mode**: analyze, inspect, recommend, or file Quorum tasks — but do NOT edit files, create
+branches/worktrees, commit, push, open/close PRs, merge, or implement changes.
+
+Exploratory phrasing — "can we", "could we", "what about", "how should we" — authorizes
+analysis and read-only inspection only. When Quorum is available, enqueue implementation
+and review work as Quorum tasks rather than acting directly.
+
+Implementation in the current interactive session is authorized only when the owner gives
+an explicit, unambiguous directive to implement (e.g. "do it", "make that change",
+"implement it here").
+
+Read-only operations (status checks, diagnosis, code inspection, `quorum status`) remain
+always allowed.
+
+**Origin:** PR #365 was implemented directly after an interactive session read "can we
+make it" as an implementation directive.
+
 ## Provider-specific guidance
 
 Everything above applies equally to Claude and Codex. The sections below apply only to the
