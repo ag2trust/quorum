@@ -272,7 +272,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-get --task-id <n>`
 
 ### Ops
-- `quorum status [--watch]` → read-only health snapshot. **`--watch` opens a fresh short read
+- `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are
+  displayed and affect health only for 12 hours; they remain available through the feed until
+  their normal message TTL expires. **`--watch` opens a fresh short read
   per ~1–2s tick (connect→read→close) — never holds a transaction across ticks** (else it
   pins the WAL; verified). Read-only; never blocks writers under WAL.
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;

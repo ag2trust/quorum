@@ -19,6 +19,8 @@ pub const RECENT_MSG_LIMIT: i64 = 5;
 pub const MSG_PREVIEW_CHARS: usize = 80;
 /// A `done` task older than this is "stuck awaiting review" — surfaces stalled review loops.
 pub const DONE_STUCK_THRESHOLD_SECS: i64 = 30 * 60;
+/// Alerts older than this stay in the feed but no longer affect the status snapshot.
+pub const ALERT_WINDOW_SECS: i64 = 12 * 60 * 60;
 
 /// Sidecar file written by the daemon per agent slot — carries live progress
 /// stats that the status reader picks up without a DB schema change.
@@ -1112,17 +1114,18 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
     Ok((recent, older))
 }
 
-/// Recent owner-alert messages (kind = alert/critical) for the ALERTS cockpit section (#88).
+/// Owner-alert messages from the last 12 hours for the ALERTS cockpit section (#88).
 fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
+    let window_start = now - ALERT_WINDOW_SECS;
     let mut stmt = conn.prepare(
         "SELECT body, refs, ts, kind
          FROM messages
-         WHERE expires_at > ?1 AND kind IN ('alert', 'critical')
+         WHERE expires_at > ?1 AND ts > ?2 AND kind IN ('alert', 'critical')
          ORDER BY ts DESC
          LIMIT 10",
     )?;
     let rows = stmt
-        .query_map(params![now], |r| {
+        .query_map(params![now, window_start], |r| {
             Ok(AlertMessage {
                 body: r.get(0)?,
                 refs: r.get(1)?,
@@ -2329,6 +2332,47 @@ mod tests {
         let tasks = pipeline_tasks(&c, now).unwrap();
         assert_eq!(tasks.len(), 1, "only recently-done task should appear");
         assert_eq!(tasks[0].id, t_recent);
+    }
+
+    #[test]
+    fn alerts_older_than_twelve_hours_leave_status_and_health() {
+        let (_d, mut c) = open_tmp();
+        let now = 100_000_i64;
+        let ttl = 7 * 24 * 60 * 60;
+
+        crate::feed::post(
+            &mut c,
+            "daemon",
+            "critical",
+            None,
+            "old alert",
+            None,
+            None,
+            ttl,
+            now - ALERT_WINDOW_SECS - 1,
+        )
+        .unwrap();
+        crate::feed::post(
+            &mut c,
+            "daemon",
+            "alert",
+            None,
+            "recent alert",
+            None,
+            None,
+            ttl,
+            now - ALERT_WINDOW_SECS + 1,
+        )
+        .unwrap();
+
+        let with_recent = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(with_recent.alerts.len(), 1);
+        assert_eq!(with_recent.alerts[0].body, "recent alert");
+        assert_eq!(with_recent.health, HealthVerdict::Attention);
+
+        let after_window = stats(&c, now + 2, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(after_window.alerts.is_empty());
+        assert_eq!(after_window.health, HealthVerdict::OnTrack);
     }
 
     #[test]
