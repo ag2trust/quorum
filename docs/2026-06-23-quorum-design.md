@@ -509,7 +509,10 @@ firing `VerdictApprove` and replaces R1 with an R2 reviewer:
 2. **R1 teardown** — R1 is torn down (end reason `r2-superseded`). Task stays InReview.
 3. **R2 spawn** — R2 is spawned as a normal pre-merge reviewer with the same escalation
    policy as R1 (one tier above worker model, capped at top tier, respecting config
-   floor). R2's prompt frames it as a second reviewer catching what R1 missed.
+   floor). R2's prompt frames it as an adversarial second reviewer that attempts
+   to falsify the merge-safety claim, reviews independently before comparing
+   against R1, and requires evidence-bound findings (concrete code paths with
+   demonstrated failures).
 4. **Verdict flow** — R2's verdict drives lifecycle:
    - Approved → fire VerdictApprove → proceed to merge (with stale-SHA check).
    - Changes → fire VerdictChanges → rework → author pushes → ReworkPushed resumes

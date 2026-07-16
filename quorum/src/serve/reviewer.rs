@@ -25,6 +25,10 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
          invariants, and check the PR's verification evidence — then apply the contract \
          below.\n\n\
+         Calibration: review with independent judgment. Zero blocking findings is a \
+         valid outcome — do not manufacture findings to justify requesting changes. \
+         Every BLOCKING finding must cite a concrete code path and explain a \
+         reproducible or logically demonstrated failure.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
@@ -129,9 +133,27 @@ pub struct R2ReviewSpec {
 
 pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
     format!(
-        "You are R2 reviewer {name}, a pre-merge second reviewer for PR #{pr} \
-         opened by worker {worker}. R1 reviewer {r1} already approved this PR. \
-         Your job is to catch anything R1 missed.\n\n\
+        "You are R2 reviewer {name}, an adversarial pre-merge second reviewer for \
+         PR #{pr} opened by worker {worker}. R1 reviewer {r1} already approved this \
+         PR.\n\n\
+         ## Adversarial mandate\n\n\
+         Your goal is to attempt to falsify the claim that this PR is safe to merge. \
+         Focus on: failure modes, invariant violations, concurrency hazards, negative \
+         paths, incomplete verification evidence, and interactions with code outside \
+         the changed hunks.\n\n\
+         ## Independent-first review\n\n\
+         Review the full diff and surrounding code BEFORE reading R1's comments or \
+         verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
+         Only after your independent review, compare against R1's conclusion:\n\
+         1. Identify material issues R1 missed (false negatives).\n\
+         2. Disprove apparent concerns that surrounding code or tests already address \
+         (false positives you would have raised without checking).\n\n\
+         ## Evidence-bound requirement\n\n\
+         Zero blocking findings is a valid outcome after a thorough review. Every \
+         BLOCKING finding must cite a concrete code path (file:line or function) and \
+         explain a reproducible or logically demonstrated failure. Speculative, \
+         contrarian, or \"what if\" findings without a concrete failure scenario are \
+         not blocking.\n\n\
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
@@ -545,11 +567,18 @@ mod tests {
             worker_agent: "W".into(),
             reviewer_name: "R".into(),
         };
+        let r2_spec = R2ReviewSpec {
+            pr: 1,
+            worker_agent: "W".into(),
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
         let templates: &[(&str, String)] = &[
             ("worker", build_worker_turn("A", 1, "t", "b", None)),
             ("reviewer", build_review_prompt(&spec, "medium")),
             ("rework", build_rework_turn("A", 1, 1, "fix it", 0.0, None)),
             ("rereview", build_rereview_turn("R", 1, "W", "medium")),
+            ("r2_review", build_r2_review_prompt(&r2_spec, "medium")),
         ];
 
         let clap_cmd = crate::cli::Cli::command();
@@ -638,6 +667,92 @@ mod tests {
         assert!(
             prompt.contains("NOT review input"),
             "R2 prompt must warn that worker comments are not review input"
+        );
+    }
+
+    #[test]
+    fn r2_review_prompt_is_adversarial_and_evidence_bound() {
+        let spec = R2ReviewSpec {
+            pr: 10,
+            worker_agent: "W".into(),
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
+        let prompt = build_r2_review_prompt(&spec, "high");
+        assert!(
+            prompt.contains("adversarial"),
+            "R2 prompt must carry the adversarial mandate"
+        );
+        assert!(
+            prompt.contains("falsify"),
+            "R2 prompt must instruct falsification of merge-safety claim"
+        );
+        assert!(
+            prompt.contains("failure modes")
+                && prompt.contains("invariant violation")
+                && prompt.contains("concurrency"),
+            "R2 prompt must specify adversarial focus areas"
+        );
+        assert!(
+            prompt.contains("BEFORE reading R1"),
+            "R2 prompt must instruct independent-first review (review before reading R1)"
+        );
+        assert!(
+            prompt.contains("avoid anchoring"),
+            "R2 prompt must warn against anchoring on R1's judgment"
+        );
+        assert!(
+            prompt.contains("Zero blocking findings is a valid outcome"),
+            "R2 prompt must state that zero findings is valid"
+        );
+        assert!(
+            prompt.contains("cite a concrete code path"),
+            "R2 prompt must require evidence-bound findings with concrete code paths"
+        );
+        assert!(
+            prompt.contains("Speculative") || prompt.contains("contrarian"),
+            "R2 prompt must reject speculative/contrarian findings"
+        );
+        assert!(
+            prompt.contains("R1 missed"),
+            "R2 prompt must instruct identifying what R1 missed"
+        );
+        assert!(
+            prompt.contains("Disprove") || prompt.contains("false positive"),
+            "R2 prompt must instruct disproving apparent concerns already addressed"
+        );
+    }
+
+    #[test]
+    fn r1_r2_prompts_are_distinct() {
+        let r1_spec = ReviewerSpec {
+            pr: 1,
+            worker_agent: "W".into(),
+            reviewer_name: "R1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 1,
+            worker_agent: "W".into(),
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
+        let r1 = build_review_prompt(&r1_spec, "high");
+        let r2 = build_r2_review_prompt(&r2_spec, "high");
+        assert!(
+            !r1.contains("adversarial") && r2.contains("adversarial"),
+            "only R2 should carry the adversarial mandate, not R1"
+        );
+        assert!(
+            !r1.contains("falsify") && r2.contains("falsify"),
+            "only R2 should instruct falsification"
+        );
+        assert!(
+            r1.contains("do not manufacture findings"),
+            "R1 must be calibrated: no pressure to manufacture findings"
+        );
+        assert!(
+            r1.contains("cite a concrete code path"),
+            "R1 must also require evidence-bound findings"
         );
     }
 
