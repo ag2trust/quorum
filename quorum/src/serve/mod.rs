@@ -426,7 +426,7 @@ pub struct ServeConfig {
     /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
     /// with no active worker/reviewer. Default: false.
     pub doctor_enabled: bool,
-    /// R2 review-audit: spawn a second reviewer to adversarially audit R1.
+    /// R2: spawn an adversarial pre-merge second reviewer (sampled at R1 approval).
     pub r2_enabled: bool,
     /// R2: minimum samples per (model, effort, cx_bucket) stratum before
     /// switching to steady-state probability. Default: 5.
@@ -2098,8 +2098,10 @@ async fn tick(
                             drain_state.start_drain(&sha);
                         }
 
-                        // R2 now runs pre-merge (sampled at R1 approval).
-                        // Post-merge shadow audits are no longer spawned.
+                        // R2 runs pre-merge as an adversarial second reviewer
+                        // (sampled at R1 approval). Legacy post-merge shadow
+                        // audit path (maybe_spawn_r2) still exists but is
+                        // no longer the primary R2 flow.
 
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
