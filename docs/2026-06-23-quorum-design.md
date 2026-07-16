@@ -497,15 +497,44 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
   assigned to passive agents (not found in the journal). This gives interactive Claude Code
   sessions the same review lifecycle as daemon-managed workers.
 
+### R2 pre-merge review gate
+
+When R1 (first reviewer) approves and the task is selected for R2 by the existing
+stratified sampler (`review_audits::should_sample`), the daemon intercepts **before**
+firing `VerdictApprove` and replaces R1 with an R2 reviewer:
+
+1. **Sampling** — same stratum-based logic as before: under target → always sample;
+   at/over target → sample with `r2_steady_state_p` probability. R2 is NOT mandatory
+   for every PR.
+2. **R1 teardown** — R1 is torn down (end reason `r2-superseded`). Task stays InReview.
+3. **R2 spawn** — R2 is spawned as a normal pre-merge reviewer with the same escalation
+   policy as R1 (one tier above worker model, capped at top tier, respecting config
+   floor). R2's prompt frames it as a second reviewer catching what R1 missed.
+4. **Verdict flow** — R2's verdict drives lifecycle:
+   - Approved → fire VerdictApprove → proceed to merge (with stale-SHA check).
+   - Changes → fire VerdictChanges → rework → author pushes → ReworkPushed resumes
+     R2 (not R1). The `r2_origin` flag on the slot ensures rework routes back to R2.
+5. **Stale-SHA gate** — head SHA is recorded at R2 spawn and refreshed on re-review.
+   Before merge, the daemon compares the reviewed SHA to the current head. A mismatch
+   fires MergeFailed so the PR goes through another review cycle.
+6. **Rework routing** — after R2-requested rework, `ReworkPushed` yields
+   `ResumeReviewer` (not `SpawnReviewer`). The daemon feeds this to R2, not R1.
+7. **Audit recording** — on both approved and changes verdicts, the daemon records an
+   R2 audit row via `review_audits::insert` for stratum coverage tracking.
+
+No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
+
 ### Daemon merge flow
 
 After VerdictApprove (InReview → Merging):
-1. Check mergeability — if conflicting, MergeFailed → rework cycle.
-2. Wait for CI checks — failed → rework; timed out → cancelled.
-3. Persist approval record (instance-independent, survives restart).
-4. Execute `gh pr merge` — success → Done; policy-blocked → Cancelled;
+1. Check stale SHA — if reviewer recorded a head SHA and it differs from current, fire
+   MergeFailed → rework cycle (prevents stale approval from authorizing a changed diff).
+2. Check mergeability — if conflicting, MergeFailed → rework cycle.
+3. Wait for CI checks — failed → rework; timed out → cancelled.
+4. Persist approval record (instance-independent, survives restart).
+5. Execute `gh pr merge` — success → Done; policy-blocked → Cancelled;
    retryable failure → rework.
-5. Self-update drain: if enabled, a successful merge triggers drain mode →
+6. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
 
 ## Decisions & non-goals
