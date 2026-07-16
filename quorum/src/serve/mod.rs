@@ -575,6 +575,12 @@ pub(crate) struct SlotState {
     live_stats: LiveStats,
     error_turn_count: u32,
     agent_run_id: Option<i64>,
+    /// True when this reviewer slot is an R2 pre-merge reviewer. Survives
+    /// across rework so the daemon routes re-submissions back to R2.
+    r2_origin: bool,
+    /// PR head SHA at reviewer spawn time. Used to detect stale approvals
+    /// when the author pushes new commits between review and merge.
+    reviewed_head_sha: Option<String>,
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -1318,6 +1324,96 @@ async fn tick(
                         continue;
                     };
 
+                    // R2 gate: when R1 (non-R2) approves and the task is
+                    // sampled for R2, intercept BEFORE VerdictApprove. Spawn
+                    // R2 first; only tear down R1 after R2 is confirmed alive.
+                    // Skip entirely when no worker slot exists (review-only,
+                    // adopted PRs) — those fall through to VerdictApprove.
+                    if config.r2_enabled
+                        && !reviewers[ri].r2_origin
+                        && !drain_state.draining
+                        && workers.iter().any(|w| w.task_id == reviewer_task_id)
+                    {
+                        let r2_sampled = {
+                            let p = config.db_path.clone();
+                            let tid = reviewer_task_id;
+                            let target = config.r2_target_per_stratum;
+                            let prob = config.r2_steady_state_p;
+                            let dm = config.model.clone();
+                            let de = config.effort.clone();
+                            tokio::task::spawn_blocking(move || -> bool {
+                                let Ok(conn) = quorum_core::db::open(&p) else {
+                                    return false;
+                                };
+                                let Ok(stratum) =
+                                    quorum_core::review_audits::task_stratum(&conn, tid, &dm, &de)
+                                else {
+                                    return false;
+                                };
+                                let Ok(counts) = quorum_core::review_audits::stratum_counts(&conn)
+                                else {
+                                    return false;
+                                };
+                                quorum_core::review_audits::should_sample(
+                                    &counts, &stratum, target, prob, tid as u64,
+                                )
+                            })
+                            .await
+                            .unwrap_or(false)
+                        };
+
+                        if r2_sampled {
+                            let r1_name = reviewers[ri].agent_name.clone();
+                            let r1_run_id = reviewers[ri].agent_run_id;
+
+                            let worker_cp = workers
+                                .iter()
+                                .find(|w| w.task_id == reviewer_task_id)
+                                .map(ReviewCounterpart::from)
+                                .unwrap(); // safe: gate checked worker exists
+
+                            // Spawn R2 before tearing down R1 — if spawn
+                            // fails, R1 stays alive and we fall through to
+                            // VerdictApprove.
+                            let pre_count = reviewers.len();
+                            spawn_r2_reviewer(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                reviewers,
+                                lifetime_roster,
+                                pr_num,
+                                worker_cp,
+                                &r1_name,
+                                r1_run_id,
+                            )
+                            .await
+                            .ok();
+                            let r2_added = reviewers.len() > pre_count;
+
+                            if r2_added {
+                                log(&format!(
+                                    "R2 GATE: PR #{pr_num} selected for R2 pre-merge review \
+                                     — tearing down R1 reviewer {}",
+                                    r1_name
+                                ));
+                                // ri still valid: spawn appended to end.
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-superseded")
+                                    .await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                continue;
+                            } else {
+                                log(&format!(
+                                    "R2 GATE: R2 spawn failed for PR #{pr_num} \
+                                     — R1 still alive, falling through to merge"
+                                ));
+                            }
+                        }
+                    }
+
                     // Lifecycle: in-review → merging
                     if fire_event(
                         &db_path,
@@ -1341,6 +1437,62 @@ async fn tick(
                             break;
                         }
                         continue;
+                    }
+
+                    // R2 audit: record completed R2 review for the stratum.
+                    if reviewers[ri].r2_origin {
+                        record_r2_audit(
+                            config,
+                            &reviewers[ri].agent_name,
+                            reviewers[ri].agent_run_id,
+                            reviewers[ri].task_id,
+                            row.pr,
+                            gated.verdict.as_deref(),
+                        )
+                        .await;
+                    }
+
+                    // Stale-SHA gate: if the reviewer recorded a head SHA at
+                    // spawn time, verify the PR head hasn't moved. A stale
+                    // approval cannot authorize a changed diff.
+                    if let Some(ref expected_sha) = reviewers[ri].reviewed_head_sha {
+                        let current_sha = {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
+                                .await
+                                .ok()
+                                .flatten()
+                        };
+                        if let Some(ref current) = current_sha {
+                            if current != expected_sha {
+                                log(&format!(
+                                    "STALE SHA: reviewer {} approved head {} but current \
+                                     head is {} — firing MergeFailed for rework",
+                                    reviewers[ri].agent_name, expected_sha, current
+                                ));
+                                fire_event(
+                                    &db_path,
+                                    "system",
+                                    reviewer_task_id,
+                                    &Event::MergeFailed {
+                                        reason: format!(
+                                            "PR #{pr_num} head moved since review \
+                                             (approved {}, now {})",
+                                            &expected_sha[..8.min(expected_sha.len())],
+                                            &current[..8.min(current.len())]
+                                        ),
+                                    },
+                                )
+                                .await;
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
                     }
 
                     // Pre-merge mergeability check: if the PR is conflicting
@@ -1946,23 +2098,8 @@ async fn tick(
                             drain_state.start_drain(&sha);
                         }
 
-                        // R2 audit: capture R1 info before teardown, maybe spawn R2.
-                        let r1_name = reviewers[ri].agent_name.clone();
-                        let r1_run_id = reviewers[ri].agent_run_id;
-                        if config.r2_enabled && !drain_state.draining {
-                            maybe_spawn_r2(
-                                config,
-                                wt_mgr,
-                                name_pool,
-                                &mut *auditors,
-                                lifetime_roster,
-                                pr_num,
-                                reviewer_task_id,
-                                &r1_name,
-                                r1_run_id,
-                            )
-                            .await;
-                        }
+                        // R2 now runs pre-merge (sampled at R1 approval).
+                        // Post-merge shadow audits are no longer spawned.
 
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
@@ -2191,6 +2328,19 @@ async fn tick(
                     log(&format!(
                         "verdict: changes — feeding rework to worker (feedback: {feedback})"
                     ));
+
+                    // R2 audit: record completed R2 review.
+                    if reviewers[ri].r2_origin {
+                        record_r2_audit(
+                            config,
+                            &reviewers[ri].agent_name,
+                            reviewers[ri].agent_run_id,
+                            reviewers[ri].task_id,
+                            row.pr,
+                            Some("changes"),
+                        )
+                        .await;
+                    }
 
                     // Mirror the changes verdict to GitHub (best-effort).
                     if let Some(pr_num) = row.pr {
@@ -2489,6 +2639,19 @@ async fn tick(
                                             ));
                                             reviewers[ri].turn_started_at =
                                                 std::time::Instant::now();
+                                            // Update reviewed head SHA for stale
+                                            // approval detection on re-review.
+                                            if reviewers[ri].r2_origin {
+                                                let repo = config.repo_dir.clone();
+                                                let executor = Arc::clone(&config.merge_executor);
+                                                reviewers[ri].reviewed_head_sha =
+                                                    tokio::task::spawn_blocking(move || {
+                                                        executor.head_sha(pr, &repo)
+                                                    })
+                                                    .await
+                                                    .ok()
+                                                    .flatten();
+                                            }
                                         }
                                     }
                                 }
@@ -4494,6 +4657,8 @@ async fn spawn_reviewer_for_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 agent_run_id: reviewer_run_id,
+                r2_origin: false,
+                reviewed_head_sha: None,
             });
         }
         Err(e) => {
@@ -4871,6 +5036,8 @@ async fn spawn_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 agent_run_id: worker_run_id,
+                r2_origin: false,
+                reviewed_head_sha: None,
             });
         }
         Err(e) => {
@@ -5254,6 +5421,292 @@ async fn teardown_reviewer(
     log(&format!("reviewer {} torn down", state.agent_name));
 }
 
+// ── R2 pre-merge reviewer ────────────────────────────────────────────────
+
+/// Spawn an R2 pre-merge reviewer that replaces R1. Uses the same
+/// escalation policy as R1 (one tier above worker, capped at top).
+/// The reviewer slot is marked `r2_origin = true` so rework routes back
+/// to R2, not R1.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_r2_reviewer(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    reviewers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    pr: i64,
+    worker: ReviewCounterpart<'_>,
+    r1_reviewer: &str,
+    r1_run_id: Option<i64>,
+) -> Result<()> {
+    let r2_name = name_pool.acquire().into_name();
+    lifetime_roster.register(&r2_name);
+
+    // Drain stale mailbox rows.
+    {
+        let p = config.db_path.clone();
+        let name = r2_name.clone();
+        let _ = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = quorum_core::db::open(&p)?;
+            mailbox::consume_all_for_agent(&mut conn, &name)
+        })
+        .await;
+    }
+
+    let session_id = agent::new_session_id();
+    let branch = reviewer::reviewer_branch(pr, &r2_name);
+    let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &r2_name);
+
+    let task_repo_dir = &config.repo_dir;
+    let provision_ok = wt_mgr
+        .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
+        .await
+        .is_ok();
+    if !provision_ok {
+        log(&format!(
+            "R2: reviewer worktree provision failed for PR #{pr} — skipping R2"
+        ));
+        name_pool.release(&r2_name);
+        return Ok(());
+    }
+
+    let reviewer_model = {
+        let p = config.db_path.clone();
+        let tid = worker.task_id;
+        let cfg_model = config.model.clone();
+        tokio::task::spawn_blocking(move || -> String {
+            let worker_model = quorum_core::db::open(&p)
+                .ok()
+                .and_then(|conn| {
+                    quorum_core::agent_runs::worker_model(&conn, tid)
+                        .ok()
+                        .flatten()
+                })
+                .unwrap_or_else(|| cfg_model.clone());
+            escalated_reviewer_model(&worker_model, &cfg_model)
+        })
+        .await
+        .unwrap_or_else(|_| config.model.clone())
+    };
+    log(&format!(
+        "R2: reviewer model escalated to {reviewer_model} for task {}",
+        worker.task_id
+    ));
+
+    let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
+        session_log::SessionLog::create(
+            ld,
+            &r2_name,
+            "reviewer",
+            Some(worker.task_id),
+            &session_id,
+            &branch,
+            now_unix(),
+        )
+        .ok()
+    });
+
+    // Journal entry.
+    {
+        let p = config.db_path.clone();
+        let entry = JournalEntry {
+            agent: r2_name.clone(),
+            role: "reviewer".into(),
+            task_id: Some(worker.task_id),
+            session_id: session_id.clone(),
+            worktree: Some(wt_path.to_string_lossy().into()),
+            branch: Some(branch.clone()),
+            phase: "reviewing".into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: reviewer_session_log
+                .as_ref()
+                .map(|l| l.dir().to_string_lossy().into()),
+            pid: None,
+            pr: Some(pr),
+            rework_count: 0,
+        };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            journal::upsert(&mut conn, &entry)
+        })
+        .await
+        .ok();
+    }
+
+    let spec = reviewer::R2ReviewSpec {
+        pr,
+        worker_agent: worker.agent_name.to_string(),
+        r1_reviewer: r1_reviewer.to_string(),
+        r2_name: r2_name.clone(),
+    };
+
+    match reviewer::spawn_reviewer(
+        &reviewer_model,
+        &config.effort,
+        &session_id,
+        &wt_path,
+        config.agent_bin.as_deref(),
+        config.bare_agent,
+        vec![
+            ("QUORUM_REPO".into(), config.repo.clone()),
+            ("QUORUM_AGENT".into(), r2_name.clone()),
+        ],
+        config.allowed_tools.as_deref(),
+    )
+    .await
+    {
+        Ok(mut proc) => {
+            let prompt = reviewer::build_r2_review_prompt(&spec, &config.effort);
+            let turn1 = agent::user_turn(&prompt);
+            if let Err(e) = proc.feed_turn(&turn1).await {
+                log(&format!("R2: reviewer feed_turn failed: {e}"));
+                proc.kill_and_reap().await;
+                name_pool.release(&r2_name);
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                return Ok(());
+            }
+
+            fire_event(
+                &config.db_path,
+                &r2_name,
+                worker.task_id,
+                &Event::ReviewerAttached {
+                    agent: r2_name.clone(),
+                },
+            )
+            .await;
+
+            let reviewer_run_id = {
+                let p = config.db_path.clone();
+                let name = r2_name.clone();
+                let m = reviewer_model.clone();
+                let e = config.effort.clone();
+                let tid = worker.task_id;
+                tokio::task::spawn_blocking(move || -> Result<i64> {
+                    let conn = quorum_core::db::open(&p)?;
+                    quorum_core::agent_runs::insert_r2(&conn, tid, &name, &m, &e, now_unix())
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+            };
+
+            // Stash R2 metadata for audit recording when done.
+            {
+                let p = config.db_path.clone();
+                let tid = worker.task_id;
+                let dm = config.model.clone();
+                let de = config.effort.clone();
+                let r1_rev = r1_reviewer.to_string();
+                let r2n = r2_name.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = quorum_core::db::open(&p) {
+                        let stratum =
+                            quorum_core::review_audits::task_stratum(&conn, tid, &dm, &de)
+                                .unwrap_or_else(|_| (dm, de, "untagged".into()));
+                        R2_META.lock().unwrap().insert(
+                            r2n,
+                            R2Meta {
+                                r1_reviewer: r1_rev,
+                                r1_run_id,
+                                worker_model: stratum.0,
+                                worker_effort: stratum.1,
+                                cx_bucket: stratum.2,
+                            },
+                        );
+                    }
+                })
+                .await;
+            }
+
+            // Record PR head SHA at R2 spawn time for stale-approval detection.
+            let spawn_head_sha = {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                    .await
+                    .ok()
+                    .flatten()
+            };
+
+            let now_instant = std::time::Instant::now();
+            reviewers.push(SlotState {
+                agent_name: r2_name.clone(),
+                proc,
+                task_id: worker.task_id,
+                session_id,
+                worktree_path: wt_path,
+                branch,
+                draining: true,
+                pr: Some(pr),
+                rework_count: 0,
+                cost_tokens: 0,
+                cost_usd: 0.0,
+                task_started_at: now_instant,
+                turn_started_at: now_instant,
+                turn_ended_at: None,
+                agent_state: None,
+                session_log: reviewer_session_log,
+                live_stats: LiveStats::new(),
+                error_turn_count: 0,
+                agent_run_id: reviewer_run_id,
+                r2_origin: true,
+                reviewed_head_sha: spawn_head_sha,
+            });
+
+            log(&format!(
+                "R2: pre-merge reviewer {r2_name} spawned for PR #{pr}"
+            ));
+        }
+        Err(e) => {
+            log(&format!("R2: failed to spawn reviewer: {e}"));
+            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+            name_pool.release(&r2_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Record an R2 audit row from stashed metadata (best-effort).
+async fn record_r2_audit(
+    config: &ServeConfig,
+    r2_name: &str,
+    r2_run_id: Option<i64>,
+    task_id: i64,
+    pr: Option<i64>,
+    verdict: Option<&str>,
+) {
+    let meta = R2_META.lock().unwrap().remove(r2_name);
+    let Some(meta) = meta else { return };
+    let audit = quorum_core::review_audits::ReviewAudit {
+        task_id,
+        pr_number: pr.unwrap_or(0),
+        r1_run_id: meta.r1_run_id.unwrap_or(0),
+        r2_run_id: r2_run_id.unwrap_or(0),
+        r1_reviewer: meta.r1_reviewer,
+        r2_reviewer: r2_name.to_string(),
+        model: meta.worker_model,
+        effort: meta.worker_effort,
+        cx_bucket: meta.cx_bucket,
+        missed_count: 0,
+        overcaught_count: 0,
+        r1_verdict: "approved".into(),
+        r2_verdict: verdict.map(|s| s.to_string()),
+        created_at: now_unix(),
+    };
+    let p = config.db_path.clone();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = quorum_core::db::open(&p)?;
+        quorum_core::review_audits::insert(&conn, &audit)?;
+        Ok(())
+    })
+    .await;
+}
+
 // ── R2 review-audit helpers ──────────────────────────────────────────────
 
 /// R2 metadata stashed alongside the SlotState for audit recording.
@@ -5269,7 +5722,7 @@ struct R2Meta {
 static R2_META: std::sync::LazyLock<std::sync::Mutex<HashMap<String, R2Meta>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 async fn maybe_spawn_r2(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -5443,6 +5896,8 @@ async fn maybe_spawn_r2(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 agent_run_id,
+                r2_origin: true,
+                reviewed_head_sha: None,
             };
             // Journal the R2 as a reviewer in "auditing" phase.
             {
@@ -5699,6 +6154,43 @@ mod tests {
         assert_eq!(
             escalated_reviewer_model("unknown-model", "claude-opus-4-6"),
             "claude-opus-4-6"
+        );
+    }
+
+    // R2 model-routing: Sonnet worker → Opus 4.6 reviewer
+    #[test]
+    fn r2_model_routing_sonnet_to_opus_46() {
+        assert_eq!(
+            escalated_reviewer_model("claude-sonnet-5", "claude-sonnet-5"),
+            "claude-opus-4-6"
+        );
+    }
+
+    // R2 model-routing: Opus 4.6 worker → Opus 4.7 reviewer
+    #[test]
+    fn r2_model_routing_opus_46_to_opus_47() {
+        assert_eq!(
+            escalated_reviewer_model("claude-opus-4-6", "claude-sonnet-5"),
+            "claude-opus-4-7"
+        );
+    }
+
+    // R2 model-routing: top-tier worker caps at top tier
+    #[test]
+    fn r2_model_routing_top_tier_capped() {
+        assert_eq!(
+            escalated_reviewer_model("claude-opus-4-8", "claude-sonnet-5"),
+            "claude-opus-4-8"
+        );
+    }
+
+    // R2 model-routing: floor config raises below-escalation reviewer
+    #[test]
+    fn r2_model_routing_floor_overrides_escalation() {
+        assert_eq!(
+            escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7"),
+            "claude-opus-4-7",
+            "config floor must override natural escalation when higher"
         );
     }
 
@@ -5975,6 +6467,8 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             agent_run_id: None,
+            r2_origin: false,
+            reviewed_head_sha: None,
         }
     }
 

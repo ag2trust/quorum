@@ -327,6 +327,78 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_pushback_compact_state() {
+        let response = r#"{"findings": [
+            {"reviewer": "R2", "kind": "blocking", "author_pushback": true,
+             "pushback_accepted": false, "severity": "major",
+             "text": "Race condition in claim path", "source_endpoint": "pulls"},
+            {"reviewer": "R2", "kind": "blocking", "author_pushback": true,
+             "pushback_accepted": true, "severity": "minor",
+             "text": "Naming convention mismatch", "source_endpoint": "issues"},
+            {"reviewer": "R2", "kind": "suggestion", "author_pushback": false,
+             "pushback_accepted": null, "severity": "nit",
+             "text": "Consider doc comment", "source_endpoint": "pulls"}
+        ]}"#;
+        let findings = parse_response(response, 500, Some(100)).unwrap();
+        assert_eq!(findings.len(), 3);
+
+        // Pushback overridden (blocking stands)
+        assert!(findings[0].author_pushback);
+        assert_eq!(findings[0].pushback_accepted, Some(false));
+        assert_eq!(findings[0].kind, "blocking");
+
+        // Pushback accepted (finding dropped)
+        assert!(findings[1].author_pushback);
+        assert_eq!(findings[1].pushback_accepted, Some(true));
+
+        // No pushback
+        assert!(!findings[2].author_pushback);
+        assert_eq!(findings[2].pushback_accepted, None);
+
+        // All carry correct PR/task context
+        for f in &findings {
+            assert_eq!(f.pr_number, 500);
+            assert_eq!(f.task_id, Some(100));
+        }
+    }
+
+    #[test]
+    fn pushback_accepted_round_trips_through_db() {
+        let (mut conn, _dir) = test_conn();
+        let findings = vec![
+            ReviewFinding {
+                id: 0,
+                pr_number: 400,
+                task_id: Some(80),
+                reviewer: "R2".into(),
+                kind: "blocking".into(),
+                author_pushback: true,
+                pushback_accepted: Some(false),
+                severity: Some("major".into()),
+                text: "Race condition".into(),
+                source_endpoint: "pulls".into(),
+            },
+            ReviewFinding {
+                id: 0,
+                pr_number: 400,
+                task_id: Some(80),
+                reviewer: "R2".into(),
+                kind: "blocking".into(),
+                author_pushback: true,
+                pushback_accepted: Some(true),
+                severity: Some("minor".into()),
+                text: "Naming".into(),
+                source_endpoint: "issues".into(),
+            },
+        ];
+        replace_for_pr(&mut conn, 400, &findings).unwrap();
+        let got = list_for_pr(&conn, 400).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].pushback_accepted, Some(false));
+        assert_eq!(got[1].pushback_accepted, Some(true));
+    }
+
+    #[test]
     fn both_endpoints_captured() {
         let (mut conn, _dir) = test_conn();
         let findings = vec![

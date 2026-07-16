@@ -1529,6 +1529,136 @@ mod tests {
         assert_eq!(next, Status::Done);
     }
 
+    // R2 pre-merge gate: R1 approves → R2 attaches as replacement reviewer
+    // → R2 requests changes → rework → push → R2 resumes → R2 approves → merge → done.
+    // This proves the existing lifecycle transitions support the R2 flow without new states.
+    #[test]
+    fn walk_r2_pre_merge_gate_full_cycle() {
+        let mut t = view(Status::Open);
+
+        // open → working
+        let (next, _) = transition(&t, &Event::Claimed { agent: "W1".into() }).unwrap();
+        t.status = next;
+        t.author = Some("W1".into());
+
+        // working → in-review (spawns R1)
+        let (next, _) = transition(&t, &Event::SignaledDone { pr: "42".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        t.status = next;
+        t.pr = Some("42".into());
+
+        // R1 attaches
+        let (next, _) = transition(&t, &Event::ReviewerAttached { agent: "R1".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        t.reviewer = Some("R1".into());
+
+        // R1 approves → Merging (in the daemon, R2 gate intercepts BEFORE this
+        // transition fires; the lifecycle doesn't see VerdictApprove for R1.
+        // Instead, R2 replaces R1 as the reviewer.)
+        // R2 attaches (replacing R1 — daemon tears down R1 first)
+        let (next, effects) =
+            transition(&t, &Event::ReviewerAttached { agent: "R2".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::SetReviewer { agent: "R2".into() }]);
+        t.reviewer = Some("R2".into());
+
+        // R2 requests changes → rework
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        assert!(effects.contains(&Effect::ResumeWorker));
+        t.status = next;
+        t.rework_round += 1;
+
+        // Worker pushes rework → back to in-review (ResumeReviewer = R2)
+        let (next, effects) = transition(&t, &Event::ReworkPushed).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::ResumeReviewer]);
+        t.status = next;
+
+        // R2 approves on re-review → merging
+        let (next, effects) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        assert!(effects.contains(&Effect::MergePr { pr: "42".into() }));
+        t.status = next;
+
+        // Merge succeeds → done
+        let (next, _) = transition(&t, &Event::MergeSucceeded).unwrap();
+        assert_eq!(next, Status::Done);
+        assert!(next.is_terminal());
+    }
+
+    // R2 approves without rework → direct merge
+    #[test]
+    fn walk_r2_approves_immediately_permits_merge() {
+        let mut t = view(Status::InReview);
+        t.author = Some("W1".into());
+        t.pr = Some("99".into());
+
+        // R2 attaches (after R1 was torn down by daemon)
+        let (next, _) = transition(&t, &Event::ReviewerAttached { agent: "R2".into() }).unwrap();
+        assert_eq!(next, Status::InReview);
+        t.reviewer = Some("R2".into());
+
+        // R2 approves → merging (no rework needed)
+        let (next, effects) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        assert!(effects.contains(&Effect::MergePr { pr: "99".into() }));
+    }
+
+    // After R2-requested rework, ReworkPushed yields ResumeReviewer (not
+    // SpawnReviewer). The daemon feeds this back to R2, not R1.
+    #[test]
+    fn walk_r2_rework_routes_back_to_reviewer_not_spawn() {
+        let mut t = view(Status::InReview);
+        t.author = Some("W1".into());
+        t.reviewer = Some("R2".into());
+        t.pr = Some("42".into());
+
+        // R2 requests changes
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::ResumeWorker));
+        assert!(!effects.contains(&Effect::SpawnReviewer));
+        t.status = next;
+        t.rework_round += 1;
+
+        // Worker pushes rework
+        let (next, effects) = transition(&t, &Event::ReworkPushed).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::ResumeReviewer]);
+        assert!(!effects.contains(&Effect::SpawnReviewer));
+    }
+
+    // Stale-SHA scenario: after R2 approves, MergeFailed fires (daemon detects
+    // head moved). This puts the task back to InReview with ResumeReviewer.
+    #[test]
+    fn walk_stale_sha_fires_merge_failed() {
+        let mut t = view(Status::InReview);
+        t.author = Some("W1".into());
+        t.reviewer = Some("R2".into());
+        t.pr = Some("42".into());
+
+        // R2 approves → merging
+        let (next, _) = transition(&t, &Event::VerdictApprove).unwrap();
+        assert_eq!(next, Status::Merging);
+        t.status = next;
+
+        // Daemon detects stale SHA → MergeFailed
+        let (next, effects) = transition(
+            &t,
+            &Event::MergeFailed {
+                reason: "PR #42 head moved since review".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(effects.contains(&Effect::ResumeReviewer));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+    }
+
     // MergeConflict at rework cap → Failed
     #[test]
     fn walk_merge_conflict_at_cap_fails() {
