@@ -1325,10 +1325,15 @@ async fn tick(
                     };
 
                     // R2 gate: when R1 (non-R2) approves and the task is
-                    // sampled for R2, intercept BEFORE VerdictApprove. Tear
-                    // down R1 and spawn R2 as the new reviewer. Task stays
-                    // InReview; R2's verdict drives the merge.
-                    if config.r2_enabled && !reviewers[ri].r2_origin && !drain_state.draining {
+                    // sampled for R2, intercept BEFORE VerdictApprove. Spawn
+                    // R2 first; only tear down R1 after R2 is confirmed alive.
+                    // Skip entirely when no worker slot exists (review-only,
+                    // adopted PRs) — those fall through to VerdictApprove.
+                    if config.r2_enabled
+                        && !reviewers[ri].r2_origin
+                        && !drain_state.draining
+                        && workers.iter().any(|w| w.task_id == reviewer_task_id)
+                    {
                         let r2_sampled = {
                             let p = config.db_path.clone();
                             let tid = reviewer_task_id;
@@ -1358,50 +1363,54 @@ async fn tick(
                         };
 
                         if r2_sampled {
-                            log(&format!(
-                                "R2 GATE: PR #{pr_num} selected for R2 pre-merge review \
-                                 — tearing down R1 reviewer {}, spawning R2",
-                                reviewers[ri].agent_name
-                            ));
-
-                            // Capture R1 info for audit record.
                             let r1_name = reviewers[ri].agent_name.clone();
                             let r1_run_id = reviewers[ri].agent_run_id;
 
-                            // Tear down R1.
-                            let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-superseded").await;
-
-                            // Spawn R2 as the new reviewer for this task.
                             let worker_cp = workers
                                 .iter()
                                 .find(|w| w.task_id == reviewer_task_id)
-                                .map(ReviewCounterpart::from);
-                            if let Some(worker) = worker_cp {
-                                spawn_r2_reviewer(
-                                    config,
-                                    wt_mgr,
-                                    name_pool,
-                                    reviewers,
-                                    lifetime_roster,
-                                    pr_num,
-                                    worker,
-                                    &r1_name,
-                                    r1_run_id,
-                                )
-                                .await
-                                .ok();
+                                .map(ReviewCounterpart::from)
+                                .unwrap(); // safe: gate checked worker exists
+
+                            // Spawn R2 before tearing down R1 — if spawn
+                            // fails, R1 stays alive and we fall through to
+                            // VerdictApprove.
+                            let pre_count = reviewers.len();
+                            spawn_r2_reviewer(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                reviewers,
+                                lifetime_roster,
+                                pr_num,
+                                worker_cp,
+                                &r1_name,
+                                r1_run_id,
+                            )
+                            .await
+                            .ok();
+                            let r2_added = reviewers.len() > pre_count;
+
+                            if r2_added {
+                                log(&format!(
+                                    "R2 GATE: PR #{pr_num} selected for R2 pre-merge review \
+                                     — tearing down R1 reviewer {}",
+                                    r1_name
+                                ));
+                                // ri still valid: spawn appended to end.
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-superseded")
+                                    .await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                continue;
                             } else {
                                 log(&format!(
-                                    "R2 GATE: no worker found for task #{reviewer_task_id} \
-                                     — skipping R2, proceeding without merge"
+                                    "R2 GATE: R2 spawn failed for PR #{pr_num} \
+                                     — R1 still alive, falling through to merge"
                                 ));
                             }
-
-                            if !consume_mailbox_row(&db_path, *id).await {
-                                break;
-                            }
-                            continue;
                         }
                     }
 
