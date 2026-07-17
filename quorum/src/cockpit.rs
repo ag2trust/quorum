@@ -279,8 +279,8 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
     let _ = writeln!(
         w,
-        "  {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
-        "AGENT", "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
+        "  {:<12}  {:<8} {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
+        "AGENT", "MODEL", "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
     );
 
     for d in &workers {
@@ -302,8 +302,7 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
 fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
     let dot = sty.freshness_dot(d.last_activity_age_secs);
-    let eff = d.tier_eff.as_deref().unwrap_or("—");
-    let eff_short = eff.rsplit('·').next().unwrap_or(eff);
+    let (model, effort) = split_tier_eff(d.tier_eff.as_deref());
     let task_str = d
         .task_id
         .map(|id| format!("#{id}"))
@@ -338,10 +337,11 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
 
     let _ = writeln!(
         w,
-        "{} {:<12}  {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
+        "{} {:<12}  {:<8} {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
         dot,
         agent_label,
-        eff_short,
+        model,
+        effort,
         task_str,
         title,
         up,
@@ -351,6 +351,11 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
         now_display,
         rework_suffix,
     );
+}
+
+fn split_tier_eff(tier_eff: Option<&str>) -> (&str, &str) {
+    let value = tier_eff.unwrap_or("—");
+    value.split_once('·').unwrap_or((value, "—"))
 }
 
 fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
@@ -390,16 +395,23 @@ fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usiz
         let _ = writeln!(w, "  {}", sty.dim("(empty)"));
         return;
     }
+    let _ = writeln!(
+        w,
+        "  {:<6} {:<24} {:<8} {:<4} {:>3}  PR",
+        "TASK", "WHAT", "MODEL", "EFF", "PRI"
+    );
     for q in queue {
+        let (model, effort) = split_tier_eff(Some(&q.tier_eff));
         let pr_str =
             q.pr.map(|p| format!("#{p}"))
                 .unwrap_or_else(|| "—".to_string());
         let _ = writeln!(
             w,
-            "  #{:<5} {:<24} {:<14} pri {:>3}   {}",
+            "  #{:<5} {:<24} {:<8} {:<4} {:>3}  {}",
             q.id,
             truncate(&q.title, 24),
-            q.tier_eff,
+            model,
+            effort,
             q.priority,
             pr_str,
         );
@@ -413,7 +425,13 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         let _ = writeln!(w, "  {}", sty.dim("(none)"));
         return;
     }
+    let _ = writeln!(
+        w,
+        "  {:<6} {:<24} {:<8} {:<4} BLOCKER",
+        "TASK", "WHAT", "MODEL", "EFF"
+    );
     for b in blocked {
+        let (model, effort) = split_tier_eff(Some(&b.tier_eff));
         let dep = b
             .waiting_on
             .first()
@@ -441,9 +459,11 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<24} {} waits on {}{}",
+            "  #{:<5} {:<24} {:<8} {:<4} {} waits on {}{}",
             b.id,
             truncate(&b.title, 24),
+            model,
+            effort,
             block_icon,
             dep,
             suffix,
@@ -671,6 +691,62 @@ mod tests {
         assert!(output.contains("BLOCKED"));
         assert!(output.contains("PIPELINE"));
         assert!(output.contains("ERRORS"));
+    }
+
+    #[test]
+    fn model_and_effort_are_visible_across_active_queue_and_blocked_work() {
+        let mut s = default_stats();
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "Worker-a1".into(),
+            role: "worker".into(),
+            sub_role: None,
+            task_id: Some(1),
+            phase: "working".into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
+            last_activity_age_secs: Some(1),
+            task_title: Some("active task".into()),
+            tier_eff: Some("opus48·hi".into()),
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: Some(1),
+        });
+        s.queue_tasks.push(QueueTask {
+            id: 2,
+            title: "queued task".into(),
+            tier_eff: "opus47·md".into(),
+            priority: 10,
+            pr: None,
+        });
+        s.blocked.push(BlockedTask {
+            id: 3,
+            title: "blocked task".into(),
+            tier_eff: "opus46·hi".into(),
+            waiting_on: vec![1],
+            deadlocked_on: vec![],
+        });
+
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("MODEL"), "missing MODEL header: {output}");
+        for (title, model, effort) in [
+            ("active task", "opus48", "hi"),
+            ("queued task", "opus47", "md"),
+            ("blocked task", "opus46", "hi"),
+        ] {
+            assert!(
+                output.lines().any(|line| line.contains(title)
+                    && line.contains(model)
+                    && line.contains(effort)),
+                "{title} model/effort missing: {output}"
+            );
+        }
     }
 
     #[test]
