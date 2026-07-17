@@ -949,15 +949,15 @@ mod tests {
     }
 
     #[test]
-    fn r2_auditor_shows_marker() {
+    fn r2_reviewer_shows_marker() {
         let mut s = default_stats();
-        // Worker whose task is done — R2 auditor is orphan.
+        // Active R2 pre-merge reviewer (sampled at R1 approval).
         s.daemon_agents.push(DaemonAgentView {
             agent: "Keel-8z3a".into(),
             role: "reviewer".into(),
             sub_role: Some("r2".into()),
             task_id: Some(85),
-            phase: "auditing".into(),
+            phase: "reviewing".into(),
             cost_tokens: 5000,
             agent_state: None,
             cost_usd: 0.06,
@@ -978,16 +978,16 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(
             output.contains("(r2)"),
-            "R2 auditor must show (r2) marker: {output}"
+            "R2 reviewer must show (r2) marker: {output}"
         );
         assert!(
             output.contains("Keel-8z3a"),
-            "R2 auditor name must appear: {output}"
+            "R2 reviewer name must appear: {output}"
         );
     }
 
     #[test]
-    fn r2_auditor_subrow_shows_r2_audit_label() {
+    fn r2_reviewer_subrow_shows_r2_audit_label() {
         let mut s = default_stats();
         s.daemon_agents.push(DaemonAgentView {
             agent: "W1".into(),
@@ -1014,7 +1014,7 @@ mod tests {
             role: "reviewer".into(),
             sub_role: Some("r2".into()),
             task_id: Some(10),
-            phase: "auditing".into(),
+            phase: "reviewing".into(),
             cost_tokens: 2000,
             agent_state: None,
             cost_usd: 0.02,

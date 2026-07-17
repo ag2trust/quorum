@@ -1,5 +1,7 @@
-//! R2 review-audit capture: one row per second-reviewer (R2) pass on a PR.
-//! Stratified sampling and persistence for adversarial audit of R1 reviews.
+//! R2 review-audit capture: one row per adversarial pre-merge second-reviewer
+//! (R2) pass on an R1-approved PR. R2 replaces R1 as the pre-merge gate.
+//! Stratified sampling picks which PRs get an R2 pass; the audit row is a
+//! durable stratum-coverage record.
 
 use crate::error::Result;
 use rusqlite::{params, Connection};
