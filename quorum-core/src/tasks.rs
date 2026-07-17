@@ -843,16 +843,19 @@ pub fn update(
 pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -> Result<bool> {
     let tx = begin_immediate(conn)?;
     let n = tx.execute(
-        "UPDATE tasks SET status='done', assignee=NULL,
-            body=?2, updated_at=?3
+        "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
          WHERE id=?1 AND status NOT IN ('done', 'failed', 'cancelled')",
-        params![id, note, now],
+        params![id, now],
     )?;
     if n == 0 {
         tx.commit()?;
         return Ok(false);
     }
     deactivate_lease(&tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, note],
+    )?;
     crate::events::emit(
         &tx,
         "task_done",
@@ -1968,6 +1971,41 @@ mod tests {
     }
 
     #[test]
+    fn close_after_merge_preserves_body() {
+        let (_d, mut c) = open_tmp();
+        let original_body = "implement the flux capacitor with detailed design notes";
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            Some(original_body),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        let merge_note = "daemon: PR #999 merged on restart recovery (approved by R, #228)";
+        let changed = close_after_merge(&mut c, id, merge_note, 1001).unwrap();
+        assert!(changed);
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "done");
+        assert_eq!(
+            t.body.as_deref(),
+            Some(original_body),
+            "body must be byte-exact preserved"
+        );
+        let td = get_with_notes(&c, id).unwrap().unwrap();
+        assert!(
+            td.notes.iter().any(|n| n.body.contains("PR #999")),
+            "merge evidence must appear as a task note"
+        );
+    }
+
+    #[test]
     fn close_after_merge_idempotent() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
@@ -1975,6 +2013,38 @@ mod tests {
         close_after_merge(&mut c, id, "merged", 1001).unwrap();
         let changed = close_after_merge(&mut c, id, "merged", 1002).unwrap();
         assert!(!changed, "already done — should be idempotent");
+    }
+
+    #[test]
+    fn close_after_merge_idempotent_no_duplicate_notes() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            Some("original"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        close_after_merge(&mut c, id, "merged", 1001).unwrap();
+        close_after_merge(&mut c, id, "merged", 1002).unwrap();
+        let td = get_with_notes(&c, id).unwrap().unwrap();
+        let merge_notes: Vec<_> = td
+            .notes
+            .iter()
+            .filter(|n| n.body.contains("merged"))
+            .collect();
+        assert_eq!(
+            merge_notes.len(),
+            1,
+            "idempotent call must not duplicate notes"
+        );
     }
 
     // ── close_manual ────────────────────────────────────────────────────────
