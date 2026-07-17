@@ -114,7 +114,17 @@ pub async fn run_collection(request: &CollectionRequest) -> Result<CollectionOut
             return Err(QuorumError::Io(err_text));
         }
     };
+    run_collection_with_inputs(request, inputs, attempted_at).await
+}
 
+/// Same as [`run_collection`] but skips the deterministic fetch — the caller
+/// supplies a fully-built [`CollectorInputs`]. Tests bypass `gh` here; the
+/// production caller is [`run_collection`], which fetches then delegates.
+pub async fn run_collection_with_inputs(
+    request: &CollectionRequest,
+    inputs: CollectorInputs,
+    attempted_at: i64,
+) -> Result<CollectionOutcome> {
     // 2) Spawn classifier + await bounded turn.
     let response_text = match spawn_and_run_classifier(request, &inputs).await {
         Ok(t) => t,
@@ -224,9 +234,16 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
 }
 
 /// Deterministically fetch every input the classifier will read. Failures at
-/// any single sub-fetch return an error — better to record one failed run than
-/// to hand the model a partial view. Bounded via [`MAX_PAYLOAD_BYTES`] so a
-/// pathological PR does not blow up the classifier's context budget.
+/// any single sub-fetch propagate — better to record one loud failed run and
+/// preserve any prior good analytics than to hand the model a partial view and
+/// overwrite prior findings with a degraded record. Bounded via
+/// [`MAX_PAYLOAD_BYTES`] so a pathological PR does not blow up the classifier's
+/// context budget.
+///
+/// Pagination: list endpoints (reviews, comments, commits) are fetched via
+/// `gh api --paginate --slurp` so every page is retained as a single JSON
+/// array. Repo targeting: `--repo owner/name` is threaded via `GH_REPO` env
+/// var — `gh api` does not accept `-R`.
 pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs> {
     let pr = request.pr_number;
     let repo = request.repo_slug.clone();
@@ -236,43 +253,39 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
         &repo,
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}"),
+        false,
     )
-    .await
-    .unwrap_or_else(|_| "{}".to_string());
+    .await?;
     let reviews_json = gh_api(
         &repo,
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews"),
+        true,
     )
-    .await
-    .unwrap_or_else(|_| "[]".to_string());
+    .await?;
     let review_comments_json = gh_api(
         &repo,
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments"),
+        true,
     )
-    .await
-    .unwrap_or_else(|_| "[]".to_string());
+    .await?;
     let issue_comments_json = gh_api(
         &repo,
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments"),
+        true,
     )
-    .await
-    .unwrap_or_else(|_| "[]".to_string());
+    .await?;
     let commits_json = gh_api(
         &repo,
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/commits"),
+        true,
     )
-    .await
-    .unwrap_or_else(|_| "[]".to_string());
-    let diff_stat = gh_diff_stat(&repo, &repo_dir, pr)
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
-    let checks_summary = gh_checks_summary(&repo, &repo_dir, pr)
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
+    .await?;
+    let diff_stat = gh_diff_stat(&repo, &repo_dir, pr).await?;
+    let checks_summary = gh_checks_summary(&repo, &repo_dir, pr).await?;
 
     // DB context (task metadata + agent runs + verdicts). All best-effort;
     // absence produces empty context rather than a hard failure.
@@ -359,17 +372,43 @@ async fn build_task_context(db_path: &Path, task_id: Option<i64>) -> TaskContext
     })
 }
 
-async fn gh_api(repo: &Option<String>, cwd: &Path, endpoint: &str) -> Result<String> {
+/// Build the `gh api` argv. Repo is NOT threaded via `-R` (unsupported by
+/// `gh api`); the caller sets `GH_REPO` in the child env via [`gh_env`]. When
+/// `paginate` is true, adds `--paginate --slurp` so multi-page collections
+/// return a single JSON array with every page's records preserved.
+pub(crate) fn build_gh_api_args(endpoint: &str, paginate: bool) -> Vec<String> {
     let mut args: Vec<String> = vec!["api".into()];
-    if let Some(r) = repo {
-        args.push("-R".into());
-        args.push(r.clone());
+    if paginate {
+        args.push("--paginate".into());
+        args.push("--slurp".into());
     }
     args.push(endpoint.to_string());
-    run_gh(&args, cwd).await
+    args
+}
+
+/// Env vars to set on any spawned `gh` process so `--repo owner/name` overrides
+/// take effect without relying on the `-R` shorthand (which `gh api` rejects).
+pub(crate) fn gh_env(repo: &Option<String>) -> Vec<(String, String)> {
+    match repo {
+        Some(r) if !r.is_empty() => vec![("GH_REPO".to_string(), r.clone())],
+        _ => Vec::new(),
+    }
+}
+
+async fn gh_api(
+    repo: &Option<String>,
+    cwd: &Path,
+    endpoint: &str,
+    paginate: bool,
+) -> Result<String> {
+    let args = build_gh_api_args(endpoint, paginate);
+    run_gh(&args, cwd, &gh_env(repo)).await
 }
 
 async fn gh_diff_stat(repo: &Option<String>, cwd: &Path, pr: i64) -> Result<String> {
+    // `gh pr view` accepts `-R` and it is the canonical way to override repo for
+    // the higher-level `gh pr *` surface. Keep it explicit here (belt + braces:
+    // GH_REPO is also set) so a shim that greps the argv sees the target repo.
     let mut args: Vec<String> = vec![
         "pr".into(),
         "view".into(),
@@ -381,7 +420,7 @@ async fn gh_diff_stat(repo: &Option<String>, cwd: &Path, pr: i64) -> Result<Stri
         args.push("-R".into());
         args.push(r.clone());
     }
-    run_gh(&args, cwd).await
+    run_gh(&args, cwd, &gh_env(repo)).await
 }
 
 async fn gh_checks_summary(repo: &Option<String>, cwd: &Path, pr: i64) -> Result<String> {
@@ -390,16 +429,20 @@ async fn gh_checks_summary(repo: &Option<String>, cwd: &Path, pr: i64) -> Result
         args.push("-R".into());
         args.push(r.clone());
     }
-    run_gh(&args, cwd).await
+    run_gh(&args, cwd, &gh_env(repo)).await
 }
 
-async fn run_gh(args: &[String], cwd: &Path) -> Result<String> {
+async fn run_gh(args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<String> {
     let cwd = cwd.to_path_buf();
     let args = args.to_vec();
+    let env = env.to_vec();
     let handle = tokio::task::spawn_blocking(move || -> Result<String> {
-        let out = std::process::Command::new("gh")
-            .args(&args)
-            .current_dir(&cwd)
+        let mut cmd = std::process::Command::new("gh");
+        cmd.args(&args).current_dir(&cwd);
+        for (k, v) in &env {
+            cmd.env(k, v);
+        }
+        let out = cmd
             .output()
             .map_err(|e| QuorumError::Io(format!("gh: {e}")))?;
         if !out.status.success() {
@@ -632,16 +675,11 @@ mod tests {
     // ------------------------------------------------------------------
     // Live end-to-end tests driving the built `fake-agent` binary.
     //
-    // These cover:
-    // - positive: merge → collector run → structured findings + success row
-    // - negative: classifier failure → task/merge untouched, row='failed', errlog
-    // - idempotency: retry does not duplicate findings or run rows
-    // - failure→success retry: bad row overwritten by good one
-    //
-    // `fetch_inputs` degrades gracefully when `gh` is absent (each fetch
-    // falls back to its default empty JSON string), so the tests don't need
-    // GitHub or a real repo — they exercise the full pipeline against the
-    // fake-agent binary built in the same cargo run.
+    // These cover the classifier → parse → persist pipeline via
+    // `run_collection_with_inputs`, so they don't need `gh` or a real repo.
+    // The fetch layer is covered separately by the arg-builder unit tests
+    // plus the PATH-shim gh integration test — keeping the pipeline halves
+    // decoupled so a broken shim never masks a classifier regression.
     // ------------------------------------------------------------------
 
     fn fake_agent_path() -> std::path::PathBuf {
@@ -650,13 +688,25 @@ mod tests {
 
     fn setup_git_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        // A `git init` cwd keeps the collector-driven `gh` invocations happy
-        // (they still fail — no repo — but the fall-through defaults kick in).
         let d = dir.path().to_string_lossy();
         let _ = std::process::Command::new("git")
             .args(["-C", &d, "init", "-b", "main"])
             .output();
         dir
+    }
+
+    fn synthetic_inputs(pr: i64) -> CollectorInputs {
+        CollectorInputs {
+            pr_number: pr,
+            pr_metadata_json: "{}".into(),
+            reviews_json: "[]".into(),
+            review_comments_json: "[]".into(),
+            issue_comments_json: "[]".into(),
+            commits_json: "[]".into(),
+            checks_summary: "unknown".into(),
+            diff_stat: "unknown".into(),
+            task_context: TaskContext::default(),
+        }
     }
 
     fn live_request(
@@ -668,8 +718,6 @@ mod tests {
     ) -> CollectionRequest {
         let mut env_vars = Vec::new();
         if force_fail {
-            // Per-request env keeps concurrent tests isolated — a process-global
-            // `set_var` would leak into a sibling test's fake-agent spawn.
             env_vars.push(("FAKE_AGENT_COLLECTOR_FAIL".to_string(), "1".to_string()));
         }
         CollectionRequest {
@@ -684,6 +732,10 @@ mod tests {
         }
     }
 
+    async fn run_live(request: &CollectionRequest) -> Result<CollectionOutcome> {
+        run_collection_with_inputs(request, synthetic_inputs(request.pr_number), 1000).await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn live_positive_run_stores_findings_and_run_row() {
         let dir = setup_git_dir();
@@ -691,7 +743,7 @@ mod tests {
         let _ = db::open(&db).unwrap();
         let request = live_request(dir.path(), &db, 42, Some(7), false);
 
-        let outcome = run_collection(&request)
+        let outcome = run_live(&request)
             .await
             .expect("fake-agent should produce a valid collector response");
         assert_eq!(outcome.findings_count, 2);
@@ -757,7 +809,7 @@ mod tests {
         }
 
         let request = live_request(dir.path(), &db, 88, Some(1), true);
-        let result = run_collection(&request).await;
+        let result = run_live(&request).await;
 
         assert!(
             result.is_err(),
@@ -800,8 +852,8 @@ mod tests {
         let _ = db::open(&db).unwrap();
         let request = live_request(dir.path(), &db, 200, Some(9), false);
 
-        run_collection(&request).await.unwrap();
-        run_collection(&request).await.unwrap();
+        run_live(&request).await.unwrap();
+        run_live(&request).await.unwrap();
 
         let conn = db::open(&db).unwrap();
         let run_count: i64 = conn
@@ -831,7 +883,7 @@ mod tests {
 
         // First attempt: force failure.
         let fail_request = live_request(dir.path(), &db, 301, Some(11), true);
-        let _ = run_collection(&fail_request).await;
+        let _ = run_live(&fail_request).await;
 
         {
             let conn = db::open(&db).unwrap();
@@ -841,12 +893,242 @@ mod tests {
 
         // Second attempt: success (no fail env). UPSERT flips the row.
         let ok_request = live_request(dir.path(), &db, 301, Some(11), false);
-        run_collection(&ok_request).await.expect("retry succeeds");
+        run_live(&ok_request).await.expect("retry succeeds");
 
         let conn = db::open(&db).unwrap();
         let run = review_findings::get_run(&conn, 301).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.findings_count, 2);
         assert!(run.error.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Repo-targeting + pagination unit tests (#126). `gh api` does not
+    // accept `-R`; the collector routes explicit repo overrides via
+    // `GH_REPO` env and adds `--paginate --slurp` for list endpoints so
+    // GitHub cannot silently truncate at page 1.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_gh_api_args_never_uses_dash_r_flag() {
+        // Regression for the installed-gh failure mode: `gh api -R owner/name`
+        // → "unknown shorthand flag: R". If this constant slipped back into the
+        // argv, every collector run would fail before the classifier boots.
+        let args = build_gh_api_args("repos/{owner}/{repo}/pulls/42", false);
+        assert!(
+            !args.iter().any(|a| a == "-R" || a == "--repo"),
+            "gh api argv must not carry -R/--repo (unsupported); saw {args:?}"
+        );
+        assert_eq!(args[0], "api");
+        assert!(args.iter().any(|a| a == "repos/{owner}/{repo}/pulls/42"));
+    }
+
+    #[test]
+    fn build_gh_api_args_paginates_list_endpoints() {
+        let args = build_gh_api_args("repos/{owner}/{repo}/pulls/42/comments", true);
+        assert!(
+            args.iter().any(|a| a == "--paginate"),
+            "list endpoints must paginate; saw {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--slurp"),
+            "--slurp keeps every page in one JSON array; saw {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_gh_api_args_single_object_skips_pagination() {
+        // pulls/{pr} (metadata) is not a list — paginating a single-object
+        // endpoint would still work but the --slurp shape would confuse the
+        // downstream prompt that expects a plain object.
+        let args = build_gh_api_args("repos/{owner}/{repo}/pulls/42", false);
+        assert!(!args.iter().any(|a| a == "--paginate"));
+        assert!(!args.iter().any(|a| a == "--slurp"));
+    }
+
+    #[test]
+    fn gh_env_sets_gh_repo_when_repo_provided() {
+        let env = gh_env(&Some("owner/name".into()));
+        assert_eq!(env, vec![("GH_REPO".to_string(), "owner/name".to_string())]);
+    }
+
+    #[test]
+    fn gh_env_empty_when_no_repo_override() {
+        assert!(gh_env(&None).is_empty());
+        assert!(gh_env(&Some(String::new())).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_failure_preserves_prior_good_findings() {
+        // A subsequent collector run that fails at fetch (loud error) must NOT
+        // wipe the prior successful findings — analytics stay authoritative
+        // until a replacement good run lands.
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+
+        // Seed a good result for PR #77 via the classifier pipeline.
+        let good = live_request(dir.path(), &db, 77, Some(3), false);
+        run_live(&good).await.unwrap();
+
+        {
+            let conn = db::open(&db).unwrap();
+            let findings = review_findings::list_for_pr(&conn, 77).unwrap();
+            assert_eq!(findings.len(), 2, "seed findings should land");
+        }
+
+        // Now retry via the real fetch path against a bogus repo slug. Either
+        // outcome is a loud fetch failure (gh missing → "gh: ..."; gh present
+        // → 404). Both must record a failed run and preserve prior findings.
+        // We point `agent_bin` at a nonexistent path so that even if fetch
+        // somehow succeeded, the classifier spawn would still fail — either
+        // way the test asserts the boundary: prior good rows survive.
+        let retry = CollectionRequest {
+            pr_number: 77,
+            task_id: Some(3),
+            repo_slug: Some(
+                "quorum-collector-nonexistent-owner-t126/quorum-collector-nonexistent-repo-t126"
+                    .into(),
+            ),
+            db_path: db.clone(),
+            repo_dir: dir.path().to_path_buf(),
+            agent_bin: Some("/nonexistent/quorum-fake-agent-t126".into()),
+            bare_agent: true,
+            env_vars: vec![],
+        };
+        let result = run_collection(&retry).await;
+
+        assert!(result.is_err(), "bogus target must produce loud failure");
+
+        // Prior good findings survive — the replace_for_pr on the good path
+        // is scoped to the success branch, so a failed retry never runs it.
+        let conn = db::open(&db).unwrap();
+        let findings = review_findings::list_for_pr(&conn, 77).unwrap();
+        assert_eq!(
+            findings.len(),
+            2,
+            "fetch/spawn failure must not clobber prior good analytics"
+        );
+        let run = review_findings::get_run(&conn, 77).unwrap().unwrap();
+        assert_eq!(
+            run.status,
+            RunStatus::Failed,
+            "retry attempt records a loud failed run"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Executable CLI + shim-`gh` integration test (#126). Puts a Rust-built
+    // `gh` shim on PATH and drives `quorum review-interpret --repo owner/name`
+    // end-to-end. Proves: (a) `--repo` doesn't inject `-R` into `gh api`
+    // (which would fail), (b) `--paginate --slurp` is applied to list
+    // endpoints and the classifier sees late-page records verbatim.
+    // ------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cli_review_interpret_with_repo_override_and_paginated_gh_shim() {
+        // Build the shim gh binary from a small script — writes captured argv
+        // + GH_REPO to a log, echoes multi-page slurped JSON for list endpoints.
+        let shim_dir = tempfile::tempdir().unwrap();
+        let log_path = shim_dir.path().join("gh-invocations.log");
+        let shim_path = shim_dir.path().join("gh");
+        let shim_script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+echo "GH_REPO=${{GH_REPO:-}} ARGS=$*" >> "{log}"
+# Fail loudly if the CLI ever passes -R to `gh api`.
+if [[ "$1" == "api" ]]; then
+  for a in "$@"; do
+    if [[ "$a" == "-R" ]]; then
+      echo "unknown shorthand flag: R" >&2
+      exit 1
+    fi
+  done
+fi
+case "$*" in
+  *"pulls/1/comments"*)
+    # Two "pages" slurped into a single outer array — proves late-page
+    # records survive. IDs 101 (page 1) and 102 (page 2 late record).
+    echo '[[{{"id":101,"body":"first-page"}}],[{{"id":102,"body":"late-page"}}]]'
+    ;;
+  *"pulls/1/reviews"*|*"pulls/1/commits"*|*"issues/1/comments"*)
+    echo '[]'
+    ;;
+  *"pulls/1"*)
+    echo '{{}}'
+    ;;
+  *"pr view"*|*"pr checks"*)
+    echo 'ok'
+    ;;
+  *)
+    echo '{{}}'
+    ;;
+esac
+"#,
+            log = log_path.display()
+        );
+        std::fs::write(&shim_path, shim_script).unwrap();
+        let out = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&shim_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "chmod +x failed");
+
+        // Isolated QUORUM_HOME so parallel tests don't collide on ~/.quorum.
+        let home = tempfile::tempdir().unwrap();
+
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            orig_path.to_string_lossy()
+        );
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            assert_cmd::Command::cargo_bin("quorum")
+                .unwrap()
+                .env("PATH", &new_path)
+                .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "shim-owner/shim-repo")
+                .args([
+                    "review-interpret",
+                    "--pr",
+                    "1",
+                    "--repo",
+                    "override-owner/override-repo",
+                    "--agent-bin",
+                    fake_agent_path().to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.status.success(),
+            "quorum review-interpret exit {}: stdout={} stderr={}",
+            outcome.status,
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr),
+        );
+
+        // Shim log proves:
+        //  1. `--repo` was threaded via GH_REPO env, not `-R` on `gh api`.
+        //  2. list endpoints used `--paginate --slurp`.
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("GH_REPO=override-owner/override-repo"),
+            "log:\n{log}"
+        );
+        assert!(log.contains("api --paginate --slurp"), "log:\n{log}");
+        // And never `-R` on any `gh api` invocation.
+        for line in log.lines() {
+            if line.contains("ARGS=api ") {
+                assert!(!line.contains(" -R "), "gh api must not carry -R: {line}");
+            }
+        }
     }
 }
