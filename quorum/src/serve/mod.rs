@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod approvals;
 pub mod classifier;
+pub mod collector;
 pub mod doctor;
 pub mod merge;
 pub mod names;
@@ -158,6 +159,33 @@ fn query_pr_head_ref(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<
 
 fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
+}
+
+/// Fire off a detached post-merge review-analytics collection for `pr_num`.
+///
+/// The daemon already fired `MergeSucceeded` before this runs — the task is
+/// `done` and the reviewer verdict is final. The collector is analytics-only:
+/// it never mutates lifecycle, verdicts, or GitHub. Failures land in the
+/// `review_collection_runs` table (loud, observable, retryable) and MUST NOT
+/// touch the completed task. See serve/collector.rs.
+fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
+    let request = collector::CollectionRequest::new(
+        pr_num,
+        Some(task_id),
+        // ServeConfig::repo is the "owner/name" slug this daemon manages —
+        // pass it explicitly so `gh api` targets the right repo when the
+        // daemon's cwd is a worktree or unrelated dir.
+        if config.repo.is_empty() {
+            None
+        } else {
+            Some(config.repo.clone())
+        },
+        config.db_path.clone(),
+        config.repo_dir.clone(),
+        config.agent_bin.clone(),
+        config.bare_agent,
+    );
+    collector::spawn_detached(request);
 }
 
 /// Build the daemon-authored branch name for an orphan in-review task.
@@ -1516,6 +1544,7 @@ async fn tick(
                         ));
                         fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
                             .await;
+                        spawn_post_merge_collector(config, pr_num, reviewer_task_id);
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
@@ -2093,6 +2122,7 @@ async fn tick(
                         log(&format!("PR #{pr_num} merged — firing MergeSucceeded"));
                         fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
                             .await;
+                        spawn_post_merge_collector(config, pr_num, reviewer_task_id);
                         if config.self_update_drain && config.self_repo.is_some() {
                             let sha = format!("post-merge-pr-{pr_num}");
                             drain_state.start_drain(&sha);

@@ -572,6 +572,55 @@ After VerdictApprove (InReview → Merging):
    retryable failure → rework.
 6. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
+7. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs
+   after `MergeSucceeded`. Analytics-only; can never mutate lifecycle, verdict, or
+   merge outcome. See below.
+
+### Post-merge review-analytics collector (#125)
+
+Every successful merge kicks off a detached `serve::collector::run_collection` task
+that classifies the finished PR into structured `review_findings`. The collector
+runs **after** `MergeSucceeded` fires — the task is already `done`, the verdict is
+already final — so its results are retrospective analytics only. Nothing it does
+can undo the merge or change the task.
+
+**Pipeline:**
+1. **Deterministic input assembly** (Rust code, not the model): fetches PR
+   metadata, submitted reviews (`pulls/{pr}/reviews`), inline review comments
+   with reply threads (`pulls/{pr}/comments`), conversation comments
+   (`issues/{pr}/comments`), commits, `gh pr checks` summary, and diff stat.
+   Each payload is capped at 64 KB. Task context (author, reviewer, rework
+   round, agent runs, verdicts) is joined in from the local DB.
+2. **Bounded classifier turn** — a Haiku-class agent (`CLASSIFIER_MODEL` /
+   `CLASSIFIER_EFFORT`) is spawned with an EMPTY tool allowlist (no Bash,
+   Read, Write, Edit, gh — response-only). 3-minute wall-clock cap.
+3. **Structured output** — response must be `{"findings":[...]}` with each
+   finding carrying `kind` (blocking/suggestion), `author_pushback`,
+   `pushback_accepted` (true/false/null), `addressed_status`
+   (addressed/unaddressed/partial/unclear), and an `evidence` array of
+   `{kind,id}` pointers to GitHub review/comment ids. Prose-only findings
+   are rejected by contract.
+4. **Idempotent write** — `replace_for_pr` deletes and re-inserts all findings
+   for the PR; `record_run` UPSERTs a single row in `review_collection_runs`
+   keyed on `pr_number`. Retrying overwrites; there is no history bloat.
+5. **Loud failure surface** — any pipeline error (fetch, classifier timeout,
+   classifier `is_error=true`, unparseable response, DB write) records a
+   `review_collection_runs` row with `status='failed'` + error text and logs
+   an `errors` row (`source='review-collector'`). The task lifecycle is
+   NEVER touched on failure.
+
+**Boundary invariants:**
+- The classifier cannot post to GitHub (no gh in allowed tools; empty tool list).
+- The classifier cannot mutate DB rows other than through the collector's own
+  post-parse writes.
+- Collection is scoped to `pr_number`; concurrent collections of different PRs
+  don't interfere.
+- `collector_model` and `collector_version` are stamped on every row so future
+  analyses can filter by generation and re-interpretation replaces atomically.
+
+**Retry surface:** `quorum review-interpret --pr N [--task-id N]` re-runs the
+same pipeline manually. Used for backfill on historic PRs and for retrying
+recorded failures (`SELECT * FROM review_collection_runs WHERE status='failed'`).
 
 ## Decisions & non-goals
 

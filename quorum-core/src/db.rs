@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -335,6 +335,37 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // SCHEMA_SQL) + `agent_runs.sub_role` to distinguish R2 from R1 runs.
         if current < 23 && !column_exists(conn, "agent_runs", "sub_role")? {
             conn.execute("ALTER TABLE agent_runs ADD COLUMN sub_role TEXT", [])?;
+        }
+        // v24 = automatic post-merge review analytics collector (#125).
+        // Additive columns on `review_findings` to carry addressed-status,
+        // provenance evidence ids, and collector model/version; net-new
+        // `review_collection_runs` table (via SCHEMA_SQL) records each attempt
+        // so failures are observable without touching lifecycle.
+        if current < 24 {
+            if !column_exists(conn, "review_findings", "addressed_status")? {
+                conn.execute(
+                    "ALTER TABLE review_findings ADD COLUMN addressed_status TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "review_findings", "evidence_ids")? {
+                conn.execute(
+                    "ALTER TABLE review_findings ADD COLUMN evidence_ids TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "review_findings", "collector_model")? {
+                conn.execute(
+                    "ALTER TABLE review_findings ADD COLUMN collector_model TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "review_findings", "collector_version")? {
+                conn.execute(
+                    "ALTER TABLE review_findings ADD COLUMN collector_version TEXT",
+                    [],
+                )?;
+            }
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
