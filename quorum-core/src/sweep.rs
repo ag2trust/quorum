@@ -130,6 +130,8 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // alongside the rest. Both are stats-only — losing rows past TTL is by design.
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
+    crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
+    delete_bounded(conn, "task_messages", now, limit)?;
     conn.execute(
         "DELETE FROM tasks WHERE rowid IN \
          (SELECT rowid FROM tasks WHERE status='done' AND updated_at < ?1 LIMIT ?2)",
@@ -153,6 +155,11 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     )?;
     conn.execute(
         "DELETE FROM activity_events WHERE expires_at <= ?1",
+        params![now],
+    )?;
+    crate::task_messages::expire_stale_deliveries(conn, now, usize::MAX)?;
+    conn.execute(
+        "DELETE FROM task_messages WHERE expires_at <= ?1",
         params![now],
     )?;
     conn.execute(
