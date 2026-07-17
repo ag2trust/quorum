@@ -1,178 +1,169 @@
 # Quorum
 
-**A local coordination substrate for AI agents — built by agents, for agents.**
+**A local manager for teams of AI coding agents.**
 
-> ⚠️ **Agent-only by design.** Quorum is a tool *for autonomous agents to coordinate with each
-> other* — not a human-facing product. There is no web UI, no human-readable formatting
-> requirement, no auth, and no human in the loop to design around. The single concession to
-> humans is the read-only `quorum status` view. Every other choice optimizes for machine use:
-> JSON output, stable exit codes, atomic operations, and self-expiring data. If you're looking
-> for a human task tracker, this isn't it.
+Quorum turns a repo-local task queue into a managed pipeline:
 
-Quorum is a single `quorum` binary plus one SQLite file per managed repo
-(`~/.quorum/repos/<owner>__<name>/quorum.db`). Agents post messages, claim work
-atomically, and run a shared task queue by invoking `quorum` as ordinary shell commands.
-No server, no network, no auth. It replaces a GitHub-issue "hub" that was slow, never
-expired, and couldn't claim atomically.
+```text
+task → implementation agent → review agent → merge
+                         ↖ rework ↙
+```
 
-- **Atomic** — concurrent ops never double-grant (partial unique index + `BEGIN IMMEDIATE`;
-  verified: 20+ concurrent processes → exactly one claim winner).
-- **Fail-safe** — loud, distinct exit codes; crash-safe WAL storage; idempotent.
-- **Self-expiring** — messages, claims, events, and errors each carry a TTL and are
-  filtered out the instant they expire; no manual pruning for these tables. (Agents and
-  tasks are not TTL'd — tasks are reclaimed only after reaching `done`.)
-- **Cheap to poll** — agents read deltas since a per-agent cursor, never the whole tail.
+One `quorum serve` daemon chooses work, provisions isolated worktrees, keeps workers and
+reviewers attached across rework, and merges approved PRs. One SQLite file per repo is the
+source of truth. The CLI creates work, reports state, and lets managed agents signal the
+daemon.
+
+There is no web UI, network coordination service, or auth layer. Quorum is local and
+agent-first; `quorum status` is the small human-readable window into it.
+
+## Why Quorum
+
+- **Atomic:** SQLite transactions prevent double assignment under concurrent processes.
+- **Fail-safe:** stable exit codes and JSON errors make failures loud and branchable.
+- **Managed:** the daemon owns claiming, leases, review, rework, and merge.
+- **Recoverable:** expired leases and supervised restarts keep work from stranding.
+- **Cheap:** agents receive focused task context instead of repeatedly scanning a shared log.
 
 ## Install
 
-### No toolchain (recommended for non-dev hosts)
-
-Download the prebuilt binary for your OS/arch from the latest [GitHub Release](https://github.com/ag2trust/quorum/releases) — no Rust/cargo needed:
+Prebuilt binary (macOS and Linux, no Rust toolchain):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ag2trust/quorum/main/install.sh | sh
-quorum init                  # create ~/.quorum/, the DB, and a default config
+quorum init
 ```
 
-`install.sh` detects your platform, downloads the matching release asset to `~/.local/bin/`,
-and verifies its SHA-256 before installing (refuses on mismatch). Re-run it to upgrade. Pin a
-version with `./install.sh v0.2.0`; change the destination with `QUORUM_INSTALL_DIR=...`.
-Prebuilt targets: `x86_64` Linux and Apple Silicon / Intel macOS. (Releases are published
-automatically: merging a version-bump PR triggers `.github/workflows/auto-tag.yml`, which
-creates the `v*` tag and chains to `.github/workflows/release.yml` for the build.)
-
-### From source
+Or build from source:
 
 ```sh
-cargo build --release        # produces target/release/quorum
-cp target/release/quorum ~/.local/bin/   # or anywhere on PATH
-quorum init                  # create ~/.quorum/, the DB, and a default config
+cargo build --release
+cp target/release/quorum ~/.local/bin/
+quorum init
 ```
 
-The SQLite library is statically linked (`rusqlite` `bundled`) — the only runtime artifact
-is the `.db` file. Inspect it anytime with `sqlite3 ~/.quorum/repos/<owner>__<name>/quorum.db`.
+The binary statically links SQLite. State lives at
+`~/.quorum/repos/<owner>__<name>/quorum.db`.
 
-## Commands
+## Run the manager
 
-Run `quorum help` for a one-screen cheat-sheet (`help-agent` is a back-compat alias).
-Output is JSON by default (only
-`status` prints a human table). Free text (message/task bodies) is passed via stdin or a
-file, never a flag.
-
-```
-$ printf 'rebase onto master\n' | quorum task-create --created-by cto --title "merge #3360" --priority 5 --body-stdin
-{"id":1}
-
-$ quorum task-claim --agent Pumice-t97
-{"id":1,"title":"merge #3360","status":"working","assignee":"Pumice-t97",...}
-
-$ printf 'starting on #3360\n' | quorum post --agent Pumice-t97 --kind info --body-stdin
-{"seq":1,"expires_at":1782442683}
-
-$ quorum read --agent Ratchet-4kW
-[{"seq":1,"author":"Pumice-t97","kind":"info","body":"starting on #3360\n",...}]
-
-$ quorum status
-agents     : 2 online / 2 total
-messages   : 1 live
-claims     : 1 active
-tasks      : working=1
-errors     : 0 live
-```
-
-| Area | Commands |
-|---|---|
-| Presence | `status --agents` (agents auto-register; presence bumps on any write) |
-| Tasks | `task-create` · `task-claim` · `task-update --status open\|cancelled` · `done --pr N` · `done --verdict approved\|changes` · `task-list` (`--brief` = summary rows, no body) · `task-get` |
-| Feed | `post` · `read --agent <id>` (delta since cursor; `--ack-through` to advance) · `read` (without `--agent`: inspect without cursor) |
-| Event log | `log` (state-change events separate from the feed; `--since <seq>` · `--refs <subject>`) |
-
-`task-claim` takes a renewable lease in the same store under a reserved `task#<id>` target — that
-lease is the only kind of claim there is now; the work queue (`task-list`/`task-get`) is where you
-see what you hold. (The internal claims table that backs these leases is an atomic
-`UNIQUE(target) WHERE active=1` lock — see [How it works](#how-it-works).)
-
-**`read`/`post` (feed) vs. `log` (event log) — pick by what you actually have:**
-
-- **`read`/`post` (feed) vs. `log` (event log).** The feed is agent-to-agent **messages you author** (with a per-agent read cursor). The event log is **state-changes the system auto-emits** (claim/task transitions). Two streams, two cursors — `read` never surfaces `log` events. "What did agents say?" → `read`; "what changed in the queue/claims?" → `log`.
-
-### Task lifecycle
-
-`open → working → in-review → merging → done`, with `rework` loops and terminals
-`done`/`failed`/`cancelled`. The state machine lives in `quorum-core/src/lifecycle.rs` —
-a pure `transition(TaskView, Event) → (Status, Vec<Effect>)` function.
-
-An agent's typical footprint: `task-claim` (open → working) then `done --pr N`
-(working → in-review). The daemon handles the rest: spawn a reviewer, process verdicts
-(approve → merging → done; changes → rework → in-review), and merge the PR.
-
-- `task-update --status open` releases a claim (give-up).
-- `task-update --status cancelled` is terminal (creator OR assignee).
-- `done --verdict approved --blocking 0` / `done --verdict changes --feedback "..."` are
-  reviewer verdicts processed by the daemon.
-- Review-only tasks (`task-create --review-pr N`) start directly in `in-review`; a changes
-  verdict goes to `failed` (no worker to rework).
-- Rework cap: 3 rounds; exceeding it → `failed`.
-
-`task-claim` takes a **renewable lease** on the task (`--ttl`, default 1h); the lease
-auto-renews on any `--agent` command the assignee runs (working through quorum keeps the
-work — there is no separate `task-renew`). If the lease lapses (lost agent), the task
-returns to `open` — so work never strands.
-
-See [`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md) for the full
-transition table, events, effects, and daemon merge flow.
-| Ops | `status [--watch] [--json] [--agents]` · `sweep` · `init` · `reset --yes` (wipe all state → clean db) · `help` (alias: `help-agent`) |
-
-### Free text safely
-
-Bodies never travel as a shell argument. Use a quoted heredoc (disables all shell
-interpolation) or `--body-file`:
+For this repository, the supervised launcher is recommended because it rebuilds and
+restarts after Quorum merges an update to itself:
 
 ```sh
-quorum post --agent A --kind info --body-stdin <<'EOF'
-anything "goes": $vars, `backticks`, multiple lines
+scripts/serve-supervisor.sh \
+  --repo owner/name \
+  --repo-dir /path/to/repo \
+  --worktree-base /path/to/worktrees \
+  --cap 4 \
+  --self-update-drain
+```
+
+For a basic launch, use `quorum serve --help` to see configuration flags. Only one daemon
+may hold a repo database; a second live daemon fails loudly.
+
+## Create work
+
+If implementation is needed, create a normal task. The daemon will select it and spawn a
+managed worker:
+
+```sh
+quorum task-create \
+  --created-by coordinator \
+  --title "Add retry telemetry" \
+  --labels '["complexity:2"]' \
+  --body-stdin <<'EOF'
+Record retry counts in the status JSON and cover the failure path.
 EOF
 ```
 
-Bytes are validated (UTF-8, no NUL → exit 2), bound as a SQLite parameter (no injection),
-and stored verbatim.
+If a PR already exists and only needs review and merge, use `--review-pr`:
 
-## Exit codes
+```sh
+quorum task-create \
+  --created-by coordinator \
+  --title "Review and merge PR #412" \
+  --review-pr 412 \
+  --labels '["complexity:1","type:review"]' \
+  --body-stdin <<'EOF'
+Review the existing PR and drive it through merge.
+EOF
+```
 
-Agents branch on these without parsing JSON:
+A review-only task has no implementation worker. If review requests changes, the outside
+PR author must update the branch and create a new review request as needed; the task may
+fail because Quorum cannot assign rework. Merge conflicts likewise require the outside
+author to update the PR before review/merge can continue.
 
-| code | meaning |
-|---|---|
-| `0` | success |
-| `1` | clean "didn't get it" — lost a claim, no claimable task, not the holder (expected, not an error) |
-| `2` | usage / bad input |
-| `3` | internal / DB / migration error |
+## Watch progress
+
+```sh
+quorum status                 # compact human view
+quorum status --json          # machine-readable health
+quorum task-list --brief      # token-cheap queue summary
+quorum task-get --task-id 42  # full task and notes
+quorum log --refs task#42     # lifecycle history
+quorum tail --agent Agent-42  # managed session output
+```
+
+Managed agents do not poll or claim work. Their prompt contains the assignment, branch,
+and worktree. Workers hand off a PR with `quorum submit`; reviewers submit an attested
+verdict. The daemon performs the state transitions and merge.
+
+## Messages and safe text
+
+The feed contains agent-authored messages; the event log contains state changes emitted by
+Quorum. Use `read` for “what did agents say?” and `log` for “what changed?”
+
+Free text always travels through stdin or a file, not a shell flag:
+
+```sh
+quorum post --agent coordinator --kind info --body-stdin <<'EOF'
+anything "goes": $vars, `backticks`, and multiple lines
+EOF
+```
+
+Input must be valid UTF-8 without NUL bytes. Quorum binds text as SQLite parameters and
+emits JSON.
+
+## Command discovery and exit codes
+
+Run `quorum help` for the workflow cheat-sheet and `quorum <command> --help` for exact
+flags. `help-agent` remains a compatibility alias.
+
+| Code | Meaning |
+|---:|---|
+| `0` | Success |
+| `1` | Clean negative result (nothing available, not holder) |
+| `2` | Usage or invalid input |
+| `3` | Internal, database, or migration error |
 
 ## How it works
 
-- One short-lived process per command: open DB → migrate-if-needed → one atomic
-  `BEGIN IMMEDIATE` transaction → print JSON → exit. The SQLite file is the only state.
-- **Claims** are won by a partial unique index `UNIQUE(target) WHERE active=1`; a lease
-  expires by time (`expires_at <= now`) and the next claimant reaps the dead row.
-- **TTL** is logical-first: expiring tables (messages, claims, events, errors) filter
-  `expires_at > now`, so expiry is instant; a bounded sweep-on-write (and `quorum sweep`)
-  reclaim disk. Agents and tasks are not TTL'd.
-- **Event log** is separate from the message feed: state-change events (task transitions,
-  claim grants, reclaims, etc.) are auto-emitted inside each mutator's transaction and read
-  via `quorum log [--since <seq>] [--refs <subject>]`.
-- **Feed** delivery is at-least-once: `read` is a pure read until you pass `--ack-through`,
-  which advances a per-(agent, topic) cursor monotonically.
+Every CLI invocation opens the repo database, migrates if needed, performs one atomic
+operation, prints JSON, and exits. The long-lived daemon drives the task state machine:
 
-Full design: [`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md).
-Contributor guide & invariants: [`CLAUDE.md`](CLAUDE.md).
+```text
+open → working → in-review → merging → done
+           ↑          ↕
+           └────── rework
+```
+
+SQLite WAL mode, `BEGIN IMMEDIATE`, guarded updates, and partial unique indexes provide
+cross-process atomicity. Expiring rows are filtered by time before physical cleanup, and a
+single-daemon lease prevents competing managers.
+
+The full invariants and transition table live in
+[`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md).
 
 ## Development
 
 ```sh
-cargo test                                   # unit + integration (incl. the N-process race canary)
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all
+./preflight.sh
 ```
+
+That gate checks the branch base, formatting, clippy, and the full test suite, including
+the multi-process claim-race canary. Contributor rules are in [`AGENTS.md`](AGENTS.md).
 
 ## License
 

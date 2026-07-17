@@ -8,7 +8,7 @@ pub fn cheatsheet() -> String {
     format!(
         r#"quorum — local agent coordination (by agents, for agents)
 
-TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
+TASKS (daemon-managed queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{{"pr":N}}'] [--body-stdin]
                                                                # --labels complexity:N (1-5): {rubric}
                                                                # --depends-on gates the claim: dependent stays unclaimable
@@ -16,22 +16,26 @@ TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> don
                                                                # --refs: structured external-ref JSON (e.g. {{"pr":N}}) — load-bearing
                                                                # for review-loop traceability (#10 + creator monitor #62).
                                                                # Malformed JSON → exit 2 at create (never poisons reads).
+  quorum task-create  --created-by <id> --title <s> --review-pr <N> [--labels '["complexity:1","type:review"]'] [--body-stdin]
+                                                               # Existing PR: skip implementation and start in-review.
+                                                               # No managed worker exists for requested changes or conflicts;
+                                                               # the outside PR author remains responsible for updating the PR.
   quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{{"pr":N}}'] [--note-stdin]
-                                                               # --status open: assignee-only release/give-up (hand-off = open + re-claim)
+                                                               # --status open: compatibility release path; daemon owns normal assignment
                                                                # --status cancelled: creator OR assignee terminal won't-do
                                                                # --refs: link PR ref, e.g. `--refs '{{"pr":2459}}'`
-                                                               #   surfaced through `log --refs pr#N` + creator sync (#62).
+                                                               #   surfaced through `log --refs pr#N` + task inspection.
                                                                # NOTE: `done` is lifecycle-only — use `quorum submit` or `quorum task-close`.
                                                                #   Verdict transitions are daemon-managed only (#130).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
   quorum task-close --agent <id> --task-id <n> --reason-stdin   # manual/external terminal close (merged by hand, fixed elsewhere,
                                                                # obsolete). Emits `task_closed_manual` event — NEVER `task_done`.
-                                                               # Owner/manual use; agents finishing work must use `quorum done`.
+                                                               # Owner/manual use; managed agents finishing work use `quorum submit`.
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
                                                                # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
-  # COMPACT WRITE RESPONSES (#64): task-claim/task-update return only {{id, status, assignee, refs}}
-  # (+ lease_expires_at on claim, + note_id on --note-*). Body and descriptive fields are omitted —
+  # COMPACT WRITE RESPONSES (#64): task-update returns only {{id, status, assignee, refs}}
+  # (+ note_id on --note-*). Body and descriptive fields are omitted —
   # you just wrote them, no need to re-pay tokens. Use `task-get <id>` for the full record.
   # LEASE RENEWAL (#130): the daemon renews the exact task lease for active workers each tick.
   # External writes no longer auto-extend leases. Silence past the lease lapses it.
@@ -56,9 +60,14 @@ SUBMIT (canonical hand-off — aliased as `done`, which is deprecated)
   # Writes a mailbox row for the daemon. Verdict contract (#206): approved requires
   # --blocking 0; changes requires --feedback. `quorum done` is accepted but deprecated.
 
+ROLES
+  External callers create/inspect tasks and messages; they do not sync, claim, release, or submit work.
+  Managed workers/reviewers receive task context from `quorum serve` and use submit/react for that run.
+  Operators start `quorum serve` (or scripts/serve-supervisor.sh), inspect health, and use kill for emergencies.
+
 REVIEW (lifecycle-driven)
   Lifecycle:  T: open -> working(claim) -> in-review(SignaledDone --pr N)
-              Reviewer attaches via task-claim on in-review task (self-review blocked: author != reviewer)
+              Daemon attaches a reviewer (self-review blocked: author != reviewer)
               approve -> merging -> done(MergeSucceeded)
               changes -> rework(author resumes) -> in-review(ReworkPushed) [rework_round increments]
 
@@ -130,4 +139,24 @@ interpolation), or --body-file:
 EXIT CODES: 0 success · 1 clean "didn't get it"/not-holder (expected) · 2 usage/bad input · 3 internal/DB error
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cheatsheet;
+
+    #[test]
+    fn help_shows_review_only_intake_and_ownership() {
+        let help = cheatsheet();
+        assert!(help.contains("--review-pr <N>"));
+        assert!(help.contains("outside PR author remains responsible"));
+    }
+
+    #[test]
+    fn help_teaches_daemon_managed_roles() {
+        let help = cheatsheet();
+        assert!(help.contains("TASKS (daemon-managed queue)"));
+        assert!(help.contains("External callers create/inspect tasks"));
+        assert!(help.contains("Daemon attaches a reviewer"));
+    }
 }
