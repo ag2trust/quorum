@@ -40,9 +40,21 @@ pub fn issue(
 }
 
 /// Validate a run capability: it must exist, not be revoked, and its derived
-/// identity must match the expected agent. Returns the capability on success,
-/// or an error describing the mismatch.
-pub fn validate(conn: &Connection, run_id: &str) -> Result<RunCapability> {
+/// identity must match the expected agent + role (+ optionally task). Returns
+/// the capability on success, or an error describing the mismatch.
+///
+/// Role is checked so a `worker`-role capability cannot sign a reviewer-shaped
+/// submit (or vice-versa) — the module contract is "agent + role + task", not
+/// agent alone. `expected_task_id` is `Option<i64>` because callers on the CLI
+/// boundary (submit, report) don't always know the task id; when provided it
+/// is enforced.
+pub fn validate(
+    conn: &Connection,
+    run_id: &str,
+    expected_agent: &str,
+    expected_role: &str,
+    expected_task_id: Option<i64>,
+) -> Result<RunCapability> {
     let cap = conn
         .query_row(
             "SELECT run_id, task_id, agent, role, created_at, revoked_at
@@ -60,15 +72,40 @@ pub fn validate(conn: &Connection, run_id: &str) -> Result<RunCapability> {
             },
         )
         .optional()?;
-    match cap {
-        None => Err(QuorumError::Usage(format!(
-            "unknown run_id '{run_id}' — not issued by this daemon"
-        ))),
-        Some(c) if c.revoked_at.is_some() => Err(QuorumError::Usage(format!(
-            "run_id '{run_id}' has been revoked"
-        ))),
-        Some(c) => Ok(c),
+    let c = match cap {
+        None => {
+            return Err(QuorumError::Usage(format!(
+                "unknown run_id '{run_id}' — not issued by this daemon"
+            )));
+        }
+        Some(c) if c.revoked_at.is_some() => {
+            return Err(QuorumError::Usage(format!(
+                "run_id '{run_id}' has been revoked"
+            )));
+        }
+        Some(c) => c,
+    };
+    if c.agent != expected_agent {
+        return Err(QuorumError::Usage(format!(
+            "run_id '{run_id}' agent mismatch: capability='{}', request='{expected_agent}'",
+            c.agent
+        )));
     }
+    if c.role != expected_role {
+        return Err(QuorumError::Usage(format!(
+            "run_id '{run_id}' role mismatch: capability='{}', request='{expected_role}'",
+            c.role
+        )));
+    }
+    if let Some(tid) = expected_task_id {
+        if c.task_id != tid {
+            return Err(QuorumError::Usage(format!(
+                "run_id '{run_id}' task mismatch: capability={}, request={tid}",
+                c.task_id
+            )));
+        }
+    }
+    Ok(c)
 }
 
 /// Revoke a capability (e.g. on agent death or task terminal transition).
@@ -133,7 +170,7 @@ mod tests {
     fn issue_and_validate_round_trips() {
         let (_d, mut c) = open_tmp();
         issue(&mut c, "run-001", 42, "Worker-1", "worker", 1000).unwrap();
-        let cap = validate(&c, "run-001").unwrap();
+        let cap = validate(&c, "run-001", "Worker-1", "worker", Some(42)).unwrap();
         assert_eq!(cap.task_id, 42);
         assert_eq!(cap.agent, "Worker-1");
         assert_eq!(cap.role, "worker");
@@ -143,7 +180,7 @@ mod tests {
     #[test]
     fn validate_unknown_run_id_fails() {
         let (_d, c) = open_tmp();
-        let err = validate(&c, "nonexistent").unwrap_err();
+        let err = validate(&c, "nonexistent", "any", "worker", None).unwrap_err();
         assert!(
             format!("{err}").contains("unknown run_id"),
             "expected unknown error, got: {err}"
@@ -156,7 +193,7 @@ mod tests {
         issue(&mut c, "run-002", 10, "Agent-A", "reviewer", 1000).unwrap();
         let revoked = revoke(&mut c, "run-002", 2000).unwrap();
         assert!(revoked);
-        let err = validate(&c, "run-002").unwrap_err();
+        let err = validate(&c, "run-002", "Agent-A", "reviewer", None).unwrap_err();
         assert!(format!("{err}").contains("revoked"));
     }
 
@@ -176,9 +213,43 @@ mod tests {
         issue(&mut c, "run-b1", 3, "Beta", "worker", 1200).unwrap();
         let count = revoke_all_for_agent(&mut c, "Alpha", 2000).unwrap();
         assert_eq!(count, 2);
-        assert!(validate(&c, "run-a1").is_err());
-        assert!(validate(&c, "run-a2").is_err());
-        assert!(validate(&c, "run-b1").is_ok());
+        assert!(validate(&c, "run-a1", "Alpha", "worker", None).is_err());
+        assert!(validate(&c, "run-a2", "Alpha", "reviewer", None).is_err());
+        assert!(validate(&c, "run-b1", "Beta", "worker", None).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_agent() {
+        let (_d, mut c) = open_tmp();
+        issue(&mut c, "run-agent", 1, "Real", "worker", 1000).unwrap();
+        let err = validate(&c, "run-agent", "Impostor", "worker", None).unwrap_err();
+        assert!(
+            format!("{err}").contains("agent mismatch"),
+            "expected agent mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_role() {
+        // A worker-role capability must not be usable for a reviewer-shaped submit:
+        // the module contract is agent+role+task, not agent alone.
+        let (_d, mut c) = open_tmp();
+        issue(&mut c, "run-role", 1, "Multi", "worker", 1000).unwrap();
+        let err = validate(&c, "run-role", "Multi", "reviewer", None).unwrap_err();
+        assert!(
+            format!("{err}").contains("role mismatch"),
+            "expected role mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_task_when_provided() {
+        let (_d, mut c) = open_tmp();
+        issue(&mut c, "run-task", 42, "T", "worker", 1000).unwrap();
+        // Some(mismatch) rejects; None skips the check.
+        assert!(validate(&c, "run-task", "T", "worker", Some(43)).is_err());
+        assert!(validate(&c, "run-task", "T", "worker", Some(42)).is_ok());
+        assert!(validate(&c, "run-task", "T", "worker", None).is_ok());
     }
 
     #[test]

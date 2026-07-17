@@ -246,7 +246,50 @@ fn submit_with_mismatched_agent_fails() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("does not match"));
+        .stderr(predicate::str::contains("agent mismatch"));
+}
+
+#[test]
+fn submit_with_mismatched_role_fails() {
+    // A reviewer-role capability must not sign a worker submit (and vice-versa):
+    // capability derives identity from agent + role + task, not agent alone.
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::capabilities::issue(
+            &mut conn,
+            "run-wrong-role",
+            1,
+            "TestAgent",
+            "reviewer",
+            1000,
+        )
+        .unwrap();
+    }
+
+    // Worker-shaped submit (no --verdict) → expected_role=worker, cap.role=reviewer.
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "TestAgent",
+            "--pr",
+            "42",
+            "--run-id",
+            "run-wrong-role",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("role mismatch"));
 }
 
 #[test]

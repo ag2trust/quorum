@@ -4668,6 +4668,30 @@ async fn spawn_reviewer_for_worker(
         reviewer_name: reviewer_name.clone(),
     };
 
+    // #130: issue the run capability BEFORE spawning so the reviewer inherits
+    // QUORUM_RUN_ID in its environment. Reviewer `submit --verdict` uses this
+    // to authenticate against the daemon-owned run instead of falling back to
+    // agent-name compat auth. Any issue failure is loud (see below).
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    {
+        let p = config.db_path.clone();
+        let rid = cap_run_id.clone();
+        let name = reviewer_name.clone();
+        let tid = worker.task_id;
+        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        if let Err(e) = issue_res {
+            log(&format!(
+                "reviewer capability issue failed for task {} agent {}: {e} — reviewer will fall back to compat auth",
+                worker.task_id, reviewer_name
+            ));
+        }
+    }
+
     match reviewer::spawn_reviewer(
         &reviewer_model,
         &config.effort,
@@ -4678,6 +4702,7 @@ async fn spawn_reviewer_for_worker(
         vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), reviewer_name.clone()),
+            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
         ],
         config.allowed_tools.as_deref(),
     )
@@ -4767,29 +4792,6 @@ async fn spawn_reviewer_for_worker(
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
                 .ok()
             };
-
-            // #130: issue run capability for this reviewer
-            let cap_run_id = uuid::Uuid::new_v4().to_string();
-            {
-                let p = config.db_path.clone();
-                let rid = cap_run_id.clone();
-                let name = reviewer_name.clone();
-                let tid = worker.task_id;
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(mut conn) = quorum_core::db::open(&p) {
-                        let _ = quorum_core::capabilities::issue(
-                            &mut conn,
-                            &rid,
-                            tid,
-                            &name,
-                            "reviewer",
-                            now_unix(),
-                        );
-                    }
-                })
-                .await
-                .ok();
-            }
 
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
@@ -5085,27 +5087,28 @@ async fn spawn_worker(
         }
     }
 
-    // #130: issue run capability for this worker (before spawn so env var is available)
+    // #130: issue run capability for this worker (before spawn so env var is available).
+    // A silent issue failure would leave the worker holding a QUORUM_RUN_ID pointing at
+    // no row — every capability-validated submit would then exit 2 and only the compat
+    // (agent-name) path could save it. Log loudly so the operator sees the degrade.
     let cap_run_id = uuid::Uuid::new_v4().to_string();
     {
         let p = db_path.clone();
         let rid = cap_run_id.clone();
         let name = agent_name.clone();
         let tid = task.id;
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = quorum_core::db::open(&p) {
-                let _ = quorum_core::capabilities::issue(
-                    &mut conn,
-                    &rid,
-                    tid,
-                    &name,
-                    "worker",
-                    now_unix(),
-                );
-            }
+        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", now_unix())
         })
         .await
-        .ok();
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        if let Err(e) = issue_res {
+            log(&format!(
+                "worker capability issue failed for task {} agent {agent_name}: {e} — worker will fall back to compat auth",
+                task.id
+            ));
+        }
     }
 
     let spec = AgentSpec {
@@ -5749,6 +5752,27 @@ async fn spawn_r2_reviewer(
         r2_name: r2_name.clone(),
     };
 
+    // #130: issue R2 run capability BEFORE spawn so QUORUM_RUN_ID is inherited.
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    {
+        let p = config.db_path.clone();
+        let rid = cap_run_id.clone();
+        let name = r2_name.clone();
+        let tid = worker.task_id;
+        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        if let Err(e) = issue_res {
+            log(&format!(
+                "R2 capability issue failed for task {} agent {r2_name}: {e} — R2 will fall back to compat auth",
+                worker.task_id
+            ));
+        }
+    }
+
     match reviewer::spawn_reviewer(
         &reviewer_model,
         &config.effort,
@@ -5759,6 +5783,7 @@ async fn spawn_r2_reviewer(
         vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), r2_name.clone()),
+            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
         ],
         config.allowed_tools.as_deref(),
     )
@@ -5838,29 +5863,6 @@ async fn spawn_r2_reviewer(
                     .ok()
                     .flatten()
             };
-
-            // #130: issue run capability for R2 reviewer
-            let cap_run_id = uuid::Uuid::new_v4().to_string();
-            {
-                let p = config.db_path.clone();
-                let rid = cap_run_id.clone();
-                let name = r2_name.clone();
-                let tid = worker.task_id;
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(mut conn) = quorum_core::db::open(&p) {
-                        let _ = quorum_core::capabilities::issue(
-                            &mut conn,
-                            &rid,
-                            tid,
-                            &name,
-                            "reviewer",
-                            now_unix(),
-                        );
-                    }
-                })
-                .await
-                .ok();
-            }
 
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {

@@ -273,6 +273,70 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
     );
 }
 
+// ── #130 negative-path: unmatched Done does NOT drive lifecycle ────────
+//
+// R1 advisory #4: replaces the deleted passive-agent submit coverage. Asserts
+// that a Done row from an agent with no active slot is consumed as a phantom
+// AND that no lifecycle transition occurs — task stays `open`, no
+// `SignaledDone` event is emitted. Locks the invariant against silent
+// regressions where a stray Done could still drive the state machine.
+
+#[test]
+fn unmatched_done_row_does_not_drive_lifecycle() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    // No tasks seeded — the daemon idles, no worker gets spawned. Any lifecycle
+    // event that shows up can only be a phantom driven by the ghost Done row.
+    quorum_done(home.path(), &["--agent", "GhostAgent", "--pr", "42"]);
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Daemon must consume the row (invariant: single-daemon-per-DB).
+    assert!(
+        handle.wait_for("consuming unmatched Done row from GhostAgent", 15),
+        "daemon did not consume ghost row. Lines: {:?}",
+        handle.lines
+    );
+
+    std::thread::sleep(Duration::from_secs(1));
+    handle.stop();
+
+    // Row consumed as phantom.
+    assert_eq!(count_unconsumed(home.path(), "GhostAgent"), 0);
+
+    // No lifecycle transition event may have fired: no task_in_review,
+    // no task_working, no task_done. The event kind is emitted as
+    // `task_{new_status.replace('-', '_')}` (tasks.rs:653) — assert the
+    // full family stayed empty since no worker was ever spawned.
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let lifecycle_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE kind IN ('task_in_review', 'task_working', 'task_done',
+                            'task_merging', 'task_rework')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        lifecycle_events, 0,
+        "unmatched Done row triggered a lifecycle event (phantom drove state machine)"
+    );
+}
+
 // ── #181: F9 phantom-row GC preserved WITHIN the same instance ─────────
 //
 // A row for an agent name we HAVE owned (spawned) previously must still be

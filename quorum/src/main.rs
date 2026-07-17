@@ -931,16 +931,17 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .map_err(QuorumError::Usage)?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
-            // Validate run capability if provided.
+            // Validate run capability if provided. Role is derived from the submit
+            // shape — `--verdict` present → reviewer, absent → worker — so a
+            // worker-role capability cannot sign a reviewer submit and vice-versa.
             if let Some(ref rid) = run_id {
-                let cap = quorum_core::capabilities::validate(&conn, rid)
+                let expected_role = if verdict.is_some() {
+                    "reviewer"
+                } else {
+                    "worker"
+                };
+                quorum_core::capabilities::validate(&conn, rid, &agent, expected_role, None)
                     .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-                if cap.agent != agent {
-                    return Err(QuorumError::Usage(format!(
-                        "--agent '{}' does not match run-id agent '{}'",
-                        agent, cap.agent
-                    )));
-                }
             }
             let kind = quorum_core::mailbox::MailboxKind::Done;
             let row = quorum_core::mailbox::MailboxRow {

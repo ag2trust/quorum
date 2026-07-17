@@ -1701,9 +1701,9 @@ mod tests {
         // The table must be writable via the module API (round-trip proves
         // the CHECK constraint and columns match the code path).
         let mut c = c;
-        crate::capabilities::issue(&mut c, "run-v26", 1, "Agent-Upgrade", "worker", 1_000)
+        crate::capabilities::issue(&mut c, "run-v26", 1, "Agent-Upgrade", "worker", 1_000).unwrap();
+        let cap = crate::capabilities::validate(&c, "run-v26", "Agent-Upgrade", "worker", Some(1))
             .unwrap();
-        let cap = crate::capabilities::validate(&c, "run-v26").unwrap();
         assert_eq!(cap.agent, "Agent-Upgrade");
     }
 }
