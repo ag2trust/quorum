@@ -76,8 +76,16 @@ Task lifecycle: `open → working → in-review → merging → done`, with a re
 - **Never review your own work.** Reviewer verdicts (`done --verdict approved|changes`)
   must come from a different agent than the task's author.
 - Filing work: `task-create` with a clear title, body via `--body-stdin`/`--body-file`,
-  `complexity:1-5` label (1 = mechanical one-liner … 5 = cross-cutting refactor), and
-  `--depends-on` if it must wait on other tasks.
+  `complexity:1-5` label, and `--depends-on` if it must wait on other tasks.
+  Complexity rubric (also used by the classifier):
+    1: Trivial — config tweak, typo fix, simple rename
+    2: Simple — single-file change, clear spec, < 15 min agent work
+    3: Moderate — multi-file change, some design decisions, 15-30 min
+    4: Complex — cross-cutting change, multiple components, 30-60 min
+    5: Very complex — architectural change, new subsystem, > 60 min
+  Default model/effort recommendations: 1→sonnet-5/medium, 2→opus-4-6/medium,
+  3→opus-4-6/high, 4→opus-4-7/high, 5→opus-4-8/high. Daemon `suggested_models`
+  config overrides these. Explicit `tier:`/`effort:` labels take precedence.
 
 ## Feed vs event log
 

@@ -1,6 +1,12 @@
 //! One-call orientation for an agent: command list, the safe text pattern, and exit codes.
 
-pub const CHEATSHEET: &str = r#"quorum — local agent coordination (by agents, for agents)
+pub fn cheatsheet() -> String {
+    let rubric = quorum_core::complexity::rubric_inline();
+    let rubric_full = quorum_core::complexity::rubric_lines();
+    let recommendations = quorum_core::complexity::recommendation_lines();
+
+    format!(
+        r#"quorum — local agent coordination (by agents, for agents)
 
 SYNC (the agent's compass — one call per tick)
   quorum sync --agent <id> [--match-label <L> ...]
@@ -12,21 +18,20 @@ SYNC (the agent's compass — one call per tick)
                                               # --match-label scopes next_task only (capability filter).
 
 TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
-  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{"pr":N}'] [--body-stdin]
-                                                               # --labels complexity:N (1-5): 1=mechanical one-liner, 2=single-file,
-                                                               #   3=multi-file design, 4=cross-module, 5=cross-cutting refactor
+  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{{"pr":N}}'] [--body-stdin]
+                                                               # --labels complexity:N (1-5): {rubric}
                                                                # --depends-on gates the claim: dependent stays unclaimable
                                                                # until every listed task is `closed` (#2 alignment).
-                                                               # --refs: structured external-ref JSON (e.g. {"pr":N}) — load-bearing
+                                                               # --refs: structured external-ref JSON (e.g. {{"pr":N}}) — load-bearing
                                                                # for review-loop traceability (#10 + creator monitor #62).
                                                                # Malformed JSON → exit 2 at create (never poisons reads).
   quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
                                                                # no id = highest-priority open; --match-label = AND on labels
                                                                # takes a lease; exit 1 = none claimable
-  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{"pr":N}'] [--verdict approve|changes] [--note-stdin]
+  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{{"pr":N}}'] [--verdict approve|changes] [--note-stdin]
                                                                # --status open: assignee-only release/give-up (hand-off = open + re-claim)
                                                                # --status cancelled: creator OR assignee terminal won't-do
-                                                               # --refs: link PR ref, e.g. `--refs '{"pr":2459}'`
+                                                               # --refs: link PR ref, e.g. `--refs '{{"pr":2459}}'`
                                                                #   surfaced through `log --refs pr#N` + creator sync (#62).
                                                                # NOTE: `done` is lifecycle-only — use `quorum submit` or `quorum task-close`.
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
@@ -37,7 +42,7 @@ TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> don
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]
                                                                # --brief: summary rows (no body) for a token-cheap queue scan
   quorum task-get  --task-id <n>                               # includes append-only notes history
-  # COMPACT WRITE RESPONSES (#64): task-claim/task-update return only {id, status, assignee, refs}
+  # COMPACT WRITE RESPONSES (#64): task-claim/task-update return only {{id, status, assignee, refs}}
   # (+ lease_expires_at on claim, + note_id on --note-*). Body and descriptive fields are omitted —
   # you just wrote them, no need to re-pay tokens. Use `task-get <id>` for the full record.
   # AUTO-RENEW (#55): every `--agent`-identified command (task-claim, task-update, post,
@@ -46,6 +51,15 @@ TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> don
   # it (lost-agent recovery, unchanged). No more manual `task-renew` — the lease just rides along.
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # Lifecycle: open -> working -> in-review -> merging -> done (with rework loop).
+
+COMPLEXITY RUBRIC (used by classifier and for task-creation guidance)
+{rubric_full}
+
+  Default model/effort recommendations per complexity level:
+{recommendations}
+  Daemon `suggested_models` config overrides these defaults when set.
+  Explicit tier:/effort: labels on a task take precedence over defaults.
+  Mismatch alerts are advisory — the daemon posts a note when actual < suggested.
 
 SUBMIT (canonical hand-off — aliased as `done`, which is deprecated)
   quorum submit --agent <id> --pr <N>                                  # worker: signal task completion (PR posted)
@@ -127,4 +141,6 @@ interpolation), or --body-file:
   EOF
 
 EXIT CODES: 0 success · 1 clean "didn't get it"/not-holder (expected) · 2 usage/bad input · 3 internal/DB error
-"#;
+"#
+    )
+}
