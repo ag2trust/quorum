@@ -28,4 +28,5 @@ pub mod review_findings;
 pub mod stats;
 pub mod sweep;
 pub mod sync;
+pub mod task_messages;
 pub mod tasks;

@@ -366,3 +366,42 @@ CREATE TABLE IF NOT EXISTS review_audits (
 );
 CREATE INDEX IF NOT EXISTS review_audits_task ON review_audits(task_id);
 CREATE INDEX IF NOT EXISTS review_audits_stratum ON review_audits(model, effort, cx_bucket);
+
+-- Run-targeted task messages (#131): durable, non-interrupting messages scoped
+-- to a task. Each send creates one message row plus per-recipient delivery rows
+-- keyed by agent_runs.id (run ID), never reusable agent name. Messages are
+-- TTL'd (swept like the broadcast feed); delivery rows are durable history.
+CREATE TABLE IF NOT EXISTS task_messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         INTEGER NOT NULL,
+    sender_run_id   INTEGER NOT NULL,
+    sender_agent    TEXT NOT NULL,
+    kind            TEXT NOT NULL CHECK(kind IN ('direct', 'broadcast')),
+    target_run_id   INTEGER,
+    body            TEXT NOT NULL,
+    recipient_count INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_messages_task ON task_messages(task_id);
+CREATE INDEX IF NOT EXISTS task_messages_expires ON task_messages(expires_at);
+
+-- Per-recipient delivery tracking keyed by run ID. Immutable once terminal
+-- (delivered/undeliverable/expired). Not TTL'd — durable inspectable history.
+-- Absence vs expiry is distinguishable: no row = not in audience; row with
+-- status='expired' = was in audience but message expired before delivery.
+CREATE TABLE IF NOT EXISTS task_message_deliveries (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id        INTEGER NOT NULL,
+    recipient_run_id  INTEGER NOT NULL,
+    recipient_agent   TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'queued'
+                      CHECK(status IN ('queued', 'delivered', 'undeliverable', 'expired')),
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at   INTEGER,
+    last_error        TEXT,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_message_deliveries_msg ON task_message_deliveries(message_id);
+CREATE INDEX IF NOT EXISTS task_message_deliveries_run ON task_message_deliveries(recipient_run_id, status);
