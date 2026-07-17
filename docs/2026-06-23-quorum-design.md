@@ -591,6 +591,21 @@ can undo the merge or change the task.
    (`issues/{pr}/comments`), commits, `gh pr checks` summary, and diff stat.
    Each payload is capped at 64 KB. Task context (author, reviewer, rework
    round, agent runs, verdicts) is joined in from the local DB.
+   - **List endpoints paginate:** reviews, review comments, issue comments, and
+     commits are fetched with `gh api --paginate --slurp` so multi-page
+     collections return every record as a single JSON array — GitHub cannot
+     silently truncate at page 1. Single-object endpoints (`pulls/{pr}`) skip
+     both flags.
+   - **Repo targeting via `GH_REPO` env:** `--repo owner/name` overrides
+     (from `quorum review-interpret --repo` or the daemon's per-repo context)
+     are threaded into `GH_REPO` on the spawned `gh` child. `gh api` does not
+     accept the `-R` shorthand and would exit 1 with `unknown shorthand flag: R`
+     if it were passed. `gh pr view` / `gh pr checks` accept `-R` and retain it
+     (belt + braces alongside `GH_REPO`).
+   - **Fetch failures are loud:** if any sub-fetch errors (gh missing, HTTP
+     failure, unauthenticated), the collector records a `failed` run and does
+     NOT call `replace_for_pr` — prior good analytics are preserved verbatim
+     until a subsequent successful run replaces them.
 2. **Bounded classifier turn** — a Haiku-class agent (`CLASSIFIER_MODEL` /
    `CLASSIFIER_EFFORT`) is spawned with an EMPTY tool allowlist (no Bash,
    Read, Write, Edit, gh — response-only). 3-minute wall-clock cap.
@@ -618,8 +633,10 @@ can undo the merge or change the task.
 - `collector_model` and `collector_version` are stamped on every row so future
   analyses can filter by generation and re-interpretation replaces atomically.
 
-**Retry surface:** `quorum review-interpret --pr N [--task-id N]` re-runs the
-same pipeline manually. Used for backfill on historic PRs and for retrying
+**Retry surface:** `quorum review-interpret --pr N [--task-id N] [--repo owner/name]`
+re-runs the same pipeline manually. It calls `serve::collector::run_collection`
+directly — the manual backfill and the automatic post-merge path share one
+ingestion implementation. Used for backfill on historic PRs and for retrying
 recorded failures (`SELECT * FROM review_collection_runs WHERE status='failed'`).
 
 ## Decisions & non-goals
