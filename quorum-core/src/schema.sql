@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 23). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 24). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -307,10 +307,40 @@ CREATE TABLE IF NOT EXISTS review_findings (
     severity            TEXT,
     text                TEXT NOT NULL,
     source_endpoint     TEXT NOT NULL CHECK(source_endpoint IN ('pulls', 'issues')),
-    created_at          INTEGER NOT NULL
+    created_at          INTEGER NOT NULL,
+    -- v24 collector fields (#125). Nullable so pre-v24 rows keep round-tripping.
+    -- addressed_status: 'addressed' | 'unaddressed' | 'partial' | 'unclear'.
+    -- Distinguishes "the author fixed this before merge" from a merged-anyway
+    -- blocking find (which is a review-quality signal, not a lifecycle problem).
+    addressed_status    TEXT,
+    -- JSON array of {"kind":"review"|"review_comment"|"issue_comment","id":<gh_id>}
+    -- tying the classification to concrete GitHub records — no prose-only findings.
+    evidence_ids        TEXT,
+    -- Provenance so re-interpretation replaces old rows cleanly, and analytics can
+    -- filter by which collector generation produced them.
+    collector_model     TEXT,
+    collector_version   TEXT
 );
 CREATE INDEX IF NOT EXISTS review_findings_pr ON review_findings(pr_number);
 CREATE INDEX IF NOT EXISTS review_findings_task ON review_findings(task_id);
+
+-- Post-merge collector run record (#125). One row per PR — a retry replaces
+-- the prior row via UPSERT so re-running is idempotent. Failed rows are the
+-- observable surface for collector failures (they must never touch the merged
+-- task's lifecycle); the manual `quorum review-interpret` command retries by
+-- overwriting this row plus the findings for the PR. Not TTL'd — durable audit.
+CREATE TABLE IF NOT EXISTS review_collection_runs (
+    pr_number           INTEGER PRIMARY KEY,
+    task_id             INTEGER,
+    status              TEXT NOT NULL CHECK(status IN ('success', 'failed')),
+    error               TEXT,
+    collector_model     TEXT NOT NULL,
+    collector_version   TEXT NOT NULL,
+    findings_count      INTEGER NOT NULL DEFAULT 0,
+    attempted_at        INTEGER NOT NULL,
+    completed_at        INTEGER
+);
+CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
 
 -- R2 review-audit capture (#92): one row per second-reviewer (R2) adversarial
 -- audit of an R1 review. Stratified-sampled on (model, effort, cx_bucket).

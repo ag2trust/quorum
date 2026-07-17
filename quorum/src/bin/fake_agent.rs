@@ -111,6 +111,56 @@ fn emit_classifier_result(line: &str, bare: bool) {
     io::stdout().flush().ok();
 }
 
+/// Answer a post-merge collector prompt with a canned findings envelope. Fixed
+/// evidence ids let integration tests assert provenance passes through end-to-end.
+fn emit_collector_result(fail: bool) {
+    let (result, is_error) = if fail {
+        (
+            serde_json::Value::String("Collector fake failure".to_string()),
+            true,
+        )
+    } else {
+        let findings = serde_json::json!({
+            "findings": [
+                {
+                    "reviewer": "fake-reviewer",
+                    "kind": "blocking",
+                    "author_pushback": false,
+                    "pushback_accepted": null,
+                    "severity": "major",
+                    "text": "Missing null check on config path",
+                    "source_endpoint": "pulls",
+                    "addressed_status": "addressed",
+                    "evidence": [{"kind": "review_comment", "id": 101}]
+                },
+                {
+                    "reviewer": "fake-reviewer",
+                    "kind": "suggestion",
+                    "author_pushback": true,
+                    "pushback_accepted": true,
+                    "severity": "nit",
+                    "text": "Rename var to something less generic",
+                    "source_endpoint": "issues",
+                    "addressed_status": "unaddressed",
+                    "evidence": [{"kind": "issue_comment", "id": 202}]
+                }
+            ]
+        });
+        (serde_json::Value::String(findings.to_string()), false)
+    };
+    let msg = serde_json::json!({
+        "type": "result",
+        "result": result,
+        "usage": {"input_tokens": 500, "output_tokens": 100},
+        "total_cost_usd": 0.002,
+        "num_turns": 1,
+        "duration_ms": 100,
+        "is_error": is_error,
+    });
+    println!("{msg}");
+    io::stdout().flush().ok();
+}
+
 fn quorum_bin_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("cannot resolve own exe path");
     exe.parent().expect("exe has no parent dir").join("quorum")
@@ -189,6 +239,19 @@ fn main() {
         // subscription-login machines).
         if line.contains("You are a task classifier") {
             emit_classifier_result(&line, bare);
+            continue;
+        }
+
+        // Post-merge review-analytics collector prompt. If the caller opted
+        // into failure mode via FAKE_AGENT_COLLECTOR_FAIL, emit is_error=true
+        // so the daemon's failure path (record_failure + errlog) exercises.
+        // Otherwise emit a fixed-shape findings envelope so integration tests
+        // can assert the row landed and covers both endpoints.
+        if line.contains("post-merge review-analytics classifier") {
+            let fail = std::env::var("FAKE_AGENT_COLLECTOR_FAIL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            emit_collector_result(fail);
             continue;
         }
 
