@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -377,6 +377,13 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 )?;
             }
         }
+        // v26 = daemon-issued run capabilities (#130). Net-new
+        // `run_capabilities` table via SCHEMA_SQL — no ALTER needed. Landing at
+        // v26 (not v25) because main already shipped SCHEMA_VERSION=25 for the
+        // post-merge review analytics collector (#127), and the `current ==
+        // SCHEMA_VERSION` early-return above short-circuits SCHEMA_SQL — a live
+        // DB stopped at user_version=25 would otherwise never see the new table.
+        // v26 forces the migration path to run once.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1627,5 +1634,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn migrates_v25_to_v26_adds_run_capabilities_table() {
+        // Regression guard for the "already-at-latest short-circuit" trap:
+        // main shipped SCHEMA_VERSION=25 without `run_capabilities`, so a
+        // daemon DB stopped at user_version=25 would silently skip SCHEMA_SQL
+        // if this PR reused v25. Landing at v26 forces the migration path.
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE review_interpret_jobs (
+                 pr_number INTEGER PRIMARY KEY,
+                 task_id INTEGER NOT NULL,
+                 repo TEXT,
+                 interpreter_version TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 last_attempt_at INTEGER,
+                 last_error TEXT,
+                 created_at INTEGER NOT NULL
+             );
+             PRAGMA user_version = 25;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let raw = Connection::open(&path).unwrap();
+        let pre: i64 = raw
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='run_capabilities'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0, "seed must not include run_capabilities");
+        drop(raw);
+
+        // Production path: this is what the daemon does on every open.
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='run_capabilities'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "run_capabilities must exist after v25→v26 migration \
+             — otherwise capability issue/validate raise 'no such table'"
+        );
+        // The table must be writable via the module API (round-trip proves
+        // the CHECK constraint and columns match the code path).
+        let mut c = c;
+        crate::capabilities::issue(&mut c, "run-v26", 1, "Agent-Upgrade", "worker", 1_000)
+            .unwrap();
+        let cap = crate::capabilities::validate(&c, "run-v26").unwrap();
+        assert_eq!(cap.agent, "Agent-Upgrade");
     }
 }

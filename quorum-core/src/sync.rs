@@ -528,24 +528,17 @@ fn reap_before_gather(conn: &mut Connection, now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Touch the agent (presence bump + auto-renew live leases per #55) AND advance the
-/// message cursor past everything we just surfaced. Both writes happen inside the SAME
-/// `begin_immediate` transaction — atomic by construction, and one connection write
-/// rather than two.
+/// Touch the agent (presence-only, #130) AND advance the message cursor past
+/// everything we just surfaced. Both writes happen inside the SAME `begin_immediate`
+/// transaction — atomic by construction.
 ///
-/// **Why touch lives here instead of inside `gather`:** `gather` is the read-only entry
-/// point. `tick` is where the agent's loop is — its purpose is the cursor advance + the
-/// presence/renew side effects. Folding touch in the write txn means an agent that calls
-/// only `quorum sync` (the design's whole point) still auto-renews its leases through
-/// `agents::touch`'s renew clause (#55). This is the load-bearing piece that closes the
-/// dogfood loop's "manual renew" hole.
+/// **Lease renewal is NOT done here** — the daemon renews only the exact task lease
+/// for the exact active run (#130). External writes never extend task leases.
 ///
-/// **Cursor advance** is bounded by what `bucket_messages` actually read. In the current
-/// design that's "everything > old_cursor that wasn't expired" — exactly what auto-ack
-/// should cover. Even if a bucket's body was truncated by `DEFAULT_MSG_LIMIT`, we still
-/// acked the seq beyond the truncation point (count is correct; just some bodies aren't
-/// inlined). The cursor advance is a no-op when there's nothing new — but `touch` ALWAYS
-/// runs (every `tick` is an `--agent` call by definition).
+/// **Cursor advance** is bounded by what `bucket_messages` actually read. Even if a
+/// bucket's body was truncated by `DEFAULT_MSG_LIMIT`, we still acked the seq beyond
+/// the truncation point. The cursor advance is a no-op when nothing is new — but
+/// `touch` ALWAYS runs (every `tick` is an `--agent` call by definition).
 fn touch_and_advance_cursor(
     conn: &mut Connection,
     agent: &str,
@@ -575,8 +568,8 @@ fn touch_and_advance_cursor(
         }
     }
 
-    // ALWAYS write a txn — even on a quiet tick, `touch` runs (presence + auto-renew).
-    // Three updates, one transaction:
+    // ALWAYS write a txn — even on a quiet tick, `touch` runs (presence bump).
+    // Updates in one transaction:
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     // Persist the agent's declared tier from --match-label (#82).

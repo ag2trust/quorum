@@ -73,25 +73,18 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// Atomically claim a task (a specific --task-id, or the highest-priority open task), taking
-    /// a renewable lease. A lapsed lease returns the task to `open` (reaper).
-    ///
-    /// `--match-label <L>` (repeatable, AND) restricts the auto-pick to tasks whose `labels`
-    /// contain every supplied label — useful for capability/tier matching. Mutually exclusive
-    /// with `--task-id` (an explicit id is already a more specific selector).
+    /// [INTERNAL] Atomically claim a task. Daemon-only — not part of the public CLI surface.
+    /// Retained for internal daemon use and concurrency canary tests.
+    #[command(hide = true)]
     TaskClaim {
         #[arg(long)]
         agent: String,
         #[arg(long = "task-id", conflicts_with = "match_label")]
         task_id: Option<i64>,
-        /// Restrict the auto-pick to tasks whose labels contain this label. Repeatable = AND.
         #[arg(long = "match-label")]
         match_label: Vec<String>,
-        /// Lease duration, e.g. 45m, 1h, 30s, or bare seconds. Defaults to the config lease TTL.
         #[arg(long)]
         ttl: Option<String>,
-        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that repo's DB
-        /// instead of resolving from cwd/env.
         #[arg(long)]
         repo: Option<String>,
     },
@@ -112,8 +105,7 @@ pub enum Command {
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
     /// other field updates in the same call.
     ///
-    /// `--verdict approve|changes` is the reviewer's verdict on an in-review task.
-    /// `approve` transitions to merging; `changes` transitions to rework.
+    /// Verdict transitions are daemon-managed only — use `quorum submit --verdict` (#130).
     TaskUpdate {
         #[arg(long)]
         agent: String,
@@ -133,14 +125,6 @@ pub enum Command {
         /// Read a free-text note from a file and append it to the task's history.
         #[arg(long = "note-file")]
         note_file: Option<PathBuf>,
-        /// Reviewer's verdict on an in-review task. One of: approve, changes.
-        #[arg(long)]
-        verdict: Option<String>,
-        /// Count of BLOCKING findings in your review (#206). `--verdict approve`
-        /// requires `--blocking 0` — any blocking finding requires
-        /// `--verdict changes`.
-        #[arg(long)]
-        blocking: Option<u32>,
         /// Replace this task's dependency list. JSON array of task ids, e.g. '[1,3]'.
         /// Pass '[]' to clear all dependencies. Creator or assignee guard; blocked on
         /// terminal tasks (done/failed).
@@ -275,24 +259,12 @@ pub enum Command {
     },
     /// List every active pinned notice (oldest first). Read-only.
     Pins,
-    /// Single-call agent tick — the "compass." Returns one JSON payload with everything the
-    /// agent needs to orient: `current_task` (or `next_task` if idle), unread direct +
-    /// critical messages, a broadcast `count` + critical bodies, and a scoped event log.
-    /// State-adaptive XOR — `current_task` ⇔ `next_task`, never both. Omit-empty so a quiet
-    /// tick is near-empty JSON.
-    ///
-    /// Auto-acks the message cursor as a side effect (use `read --ack-through` explicitly if
-    /// you need strict at-least-once instead of at-most-once). `current_task`/`next_task`
-    /// bodies are omitted — fetch once with `task-get`.
-    ///
-    /// `--match-label <L>` (repeatable, AND) restricts the `next_task` pick to tasks whose
-    /// `labels` contain every supplied label — capability/tier matching. Does NOT affect
-    /// `current_task` (you keep what you hold).
+    /// [INTERNAL] Single-call agent tick. Daemon-only — not part of the public CLI surface.
+    /// Retained for internal daemon use and tests.
+    #[command(hide = true)]
     Sync {
         #[arg(long)]
         agent: String,
-        /// Restrict the auto-picked `next_task` to tasks whose labels contain this label.
-        /// Repeatable = AND. Does not affect `current_task`.
         #[arg(long = "match-label")]
         match_label: Vec<String>,
     },
@@ -358,6 +330,12 @@ pub enum Command {
     },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// Writes a mailbox row for the daemon to consume.
+    ///
+    /// `--run-id` is the daemon-issued capability token binding this operation
+    /// to a specific (task, agent, role) tuple. When present, identity is derived
+    /// from the capability — `--agent` is still required for backwards compat but
+    /// must match. When absent, falls back to agent-name-only auth (compat path).
+    ///
     /// `quorum done` is a deprecated alias — use `quorum submit`.
     #[command(alias = "done")]
     Submit {
@@ -379,6 +357,9 @@ pub enum Command {
         /// `--verdict changes`.
         #[arg(long)]
         blocking: Option<u32>,
+        /// Daemon-issued run capability token. Validates identity, task, and role.
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
     },
     /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
     /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.

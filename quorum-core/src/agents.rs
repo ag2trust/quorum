@@ -49,27 +49,16 @@ pub struct AgentView {
     pub online: bool,
 }
 
-/// Auto-create the agent (if new), bump its `last_seen` to `now`, AND **auto-renew every
-/// active lease the agent holds** (#55).
+/// Auto-create the agent (if new) and bump its `last_seen` to `now`.
 ///
-/// Folding lease-renew into `touch` makes "an agent that's working through quorum keeps
-/// its work" automatic: every `--agent`-identified command (claim, task-claim, task-update,
-/// post, read with ack, sync::tick, …) calls `touch` inside its own `BEGIN IMMEDIATE`
-/// transaction, so the renew rides on the existing presence bump with **no new write
-/// surface** and no extra round-trip. Only true silence (no `--agent` touch for > TTL)
-/// lapses the lease → reaper returns the task to `open` (lost-agent recovery, unchanged).
-///
-/// **Renew shape:** `expires_at = MAX(expires_at, now + DEFAULT_LEASE_TTL_SECS)` on every
-/// row matching `holder=id AND active=1 AND expires_at > now`. The `MAX` is monotonic
-/// (an agent that explicitly claimed with a longer TTL keeps the longer TTL); the
-/// `expires_at > now` guard explicitly excludes lapsed leases (the lost-agent path is
-/// owned by the reaper, not `touch` — a returning agent does NOT silently resurrect a
-/// task the reaper has reclaimed or is about to reclaim).
+/// **Presence-only** — does NOT renew leases (#130). External writes (post, read,
+/// task-update) update presence but never extend task leases. The daemon renews
+/// only the exact task lease for the exact active run via [`renew_task_lease`].
 ///
 /// Takes `&Connection`; callers holding a `Transaction` pass it directly (deref coercion),
 /// so both writes join the caller's atomic txn. Pure reads must NOT call this.
 pub fn touch(conn: &Connection, id: &str, now: i64) -> Result<()> {
-    // 1. Presence bump (always — auto-create row if first time).
+    // Presence bump (always — auto-create row if first time).
     //    Session reset (issue #125): when the agent has been offline for >= ONLINE_WINDOW_SECS,
     //    this is a new session — reset first_seen + retire_status so the wall-clock budget
     //    measures SESSION age, not NAME age. A retired agent that continues ticking (within
@@ -96,14 +85,20 @@ pub fn touch(conn: &Connection, id: &str, now: i64) -> Result<()> {
            END",
         params![id, now, ONLINE_WINDOW_SECS],
     )?;
-    // 2. Auto-renew this agent's live leases (#55). Monotonic via MAX so an explicit long
-    //    TTL is never shortened. Lapsed (expires_at <= now) rows are deliberately not
-    //    touched — they belong to the reaper.
+    Ok(())
+}
+
+/// Renew the lease on a specific task for a specific agent. **Daemon-only** —
+/// called from the tick loop for the exact active run. Monotonic via MAX so an
+/// explicit long TTL is never shortened. Lapsed leases are not touched (reaper
+/// owns the recovery path).
+pub fn renew_task_lease(conn: &Connection, agent: &str, task_id: i64, now: i64) -> Result<()> {
+    let target = format!("task#{task_id}");
     conn.execute(
         "UPDATE claims
          SET expires_at = MAX(expires_at, ?2 + ?3)
-         WHERE holder = ?1 AND active = 1 AND expires_at > ?2",
-        params![id, now, crate::tasks::DEFAULT_LEASE_TTL_SECS],
+         WHERE holder = ?1 AND target = ?4 AND active = 1 AND expires_at > ?2",
+        params![agent, now, crate::tasks::DEFAULT_LEASE_TTL_SECS, target],
     )?;
     Ok(())
 }
@@ -333,11 +328,9 @@ mod tests {
         assert_eq!(t2, Some("tier:opus-46".to_string()));
     }
 
-    // -- Auto-renew on touch (#55) --------------------------------------------------------
+    // -- Touch no longer renews leases (#130) -----------------------------------------------
+    // touch() is presence-only. Lease renewal is daemon-owned via renew_task_lease().
 
-    /// Helper: stamp an `active=1` claim row directly (skip the higher-level `claims::claim`
-    /// path so we can pin pre-touch state without entangling these tests with claim's own
-    /// logic). Returns nothing — caller queries by holder/target if needed.
     fn stamp_claim(conn: &Connection, holder: &str, target: &str, expires_at: i64, now: i64) {
         conn.execute(
             "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
@@ -356,104 +349,58 @@ mod tests {
     }
 
     #[test]
-    fn touch_auto_renews_active_lease_to_now_plus_default_ttl() {
+    fn touch_does_not_renew_leases() {
         let (_d, c) = open_tmp();
-        // A holds an active lease expiring at 1100 (60s from now). After touching at now=1100
-        // — wait, 1100 is exactly expiry; pick 1090 so the lease is still live (`> now`).
-        stamp_claim(&c, "A", "pr#1", 1100, 1000);
-        touch(&c, "A", 1090).unwrap();
-        let new_exp = lease_expires(&c, "A", "pr#1").unwrap();
+        stamp_claim(&c, "A", "task#1", 1100, 1000);
+        touch(&c, "A", 1050).unwrap();
+        let exp = lease_expires(&c, "A", "task#1").unwrap();
+        assert_eq!(exp, 1100, "touch must NOT renew leases (#130)");
+    }
+
+    // -- renew_task_lease (daemon-owned) (#130) -------------------------------------------
+
+    #[test]
+    fn renew_task_lease_extends_active_lease() {
+        let (_d, c) = open_tmp();
+        stamp_claim(&c, "A", "task#42", 1100, 1000);
+        renew_task_lease(&c, "A", 42, 1090).unwrap();
+        let new_exp = lease_expires(&c, "A", "task#42").unwrap();
         assert_eq!(
             new_exp,
             1090 + crate::tasks::DEFAULT_LEASE_TTL_SECS,
-            "lease must extend to now + DEFAULT_LEASE_TTL_SECS"
+            "renew_task_lease must extend to now + DEFAULT_LEASE_TTL_SECS"
         );
     }
 
     #[test]
-    fn touch_renew_is_monotonic_does_not_shorten_long_lease() {
+    fn renew_task_lease_is_monotonic() {
         let (_d, c) = open_tmp();
-        // A claimed `pr#1` with a 24h TTL (`expires_at = 1000 + 86400`).
         let long_exp = 1000 + 24 * 3600;
-        stamp_claim(&c, "A", "pr#1", long_exp, 1000);
-        // 5 min later A touches. now + DEFAULT_LEASE_TTL_SECS (= 1300 + 3600 = 4900) is
-        // WAY less than 24h. Monotonic MAX must preserve the longer existing expiry.
-        touch(&c, "A", 1300).unwrap();
-        let new_exp = lease_expires(&c, "A", "pr#1").unwrap();
-        assert_eq!(
-            new_exp, long_exp,
-            "monotonic MAX must keep the longer existing expiry, not shorten it"
-        );
+        stamp_claim(&c, "A", "task#42", long_exp, 1000);
+        renew_task_lease(&c, "A", 42, 1300).unwrap();
+        let new_exp = lease_expires(&c, "A", "task#42").unwrap();
+        assert_eq!(new_exp, long_exp, "monotonic MAX must keep longer expiry");
     }
 
     #[test]
-    fn touch_does_not_resurrect_lapsed_lease() {
+    fn renew_task_lease_does_not_resurrect_lapsed() {
         let (_d, c) = open_tmp();
-        // A's lease expired at 1100. now=2000 (way past). Touch must NOT extend it — the
-        // reaper owns the lost-agent recovery path.
-        stamp_claim(&c, "A", "pr#1", 1100, 1000);
-        touch(&c, "A", 2000).unwrap();
-        let new_exp = lease_expires(&c, "A", "pr#1").unwrap();
-        assert_eq!(
-            new_exp, 1100,
-            "touch must not extend a lapsed lease (lost-agent recovery is the reaper's)"
-        );
+        stamp_claim(&c, "A", "task#42", 1100, 1000);
+        renew_task_lease(&c, "A", 42, 2000).unwrap();
+        let exp = lease_expires(&c, "A", "task#42").unwrap();
+        assert_eq!(exp, 1100, "must not extend a lapsed lease");
     }
 
     #[test]
-    fn touch_only_renews_callers_own_leases() {
+    fn renew_task_lease_scoped_to_specific_task() {
         let (_d, c) = open_tmp();
-        // A and B each hold one live lease at 1100 (60s).
-        stamp_claim(&c, "A", "pr#1", 1100, 1000);
-        stamp_claim(&c, "B", "pr#2", 1100, 1000);
-        // A touches at 1050 — only A's expires_at should advance.
-        touch(&c, "A", 1050).unwrap();
-        let a_exp = lease_expires(&c, "A", "pr#1").unwrap();
-        let b_exp = lease_expires(&c, "B", "pr#2").unwrap();
-        assert_eq!(
-            a_exp,
-            1050 + crate::tasks::DEFAULT_LEASE_TTL_SECS,
-            "A's lease must extend"
-        );
-        assert_eq!(b_exp, 1100, "B's lease must NOT change on A's touch");
-    }
-
-    #[test]
-    fn touch_does_not_renew_inactive_lease() {
-        let (_d, c) = open_tmp();
-        // A had an active lease that was later released (active=0). expires_at is still in
-        // the future but the row is logically dead. Touch must NOT re-activate or extend it.
-        c.execute(
-            "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,0)",
-            params!["pr#1", "A", 1000, 1100],
-        )
-        .unwrap();
-        touch(&c, "A", 1050).unwrap();
-        let exp: i64 = c
-            .query_row(
-                "SELECT expires_at FROM claims WHERE holder='A' AND target='pr#1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(exp, 1100, "inactive lease must stay untouched");
-    }
-
-    #[test]
-    fn touch_renews_multiple_active_leases_in_one_call() {
-        let (_d, c) = open_tmp();
-        // A holds three live leases (typical of an agent juggling claims + a task). Single
-        // touch must extend all three with one UPDATE — that's the design's "no per-row
-        // overhead" guarantee.
-        stamp_claim(&c, "A", "pr#1", 1100, 1000);
-        stamp_claim(&c, "A", "pr#2", 1200, 1000);
-        stamp_claim(&c, "A", "task#5", 1500, 1000);
-        touch(&c, "A", 1050).unwrap();
-        let want = 1050 + crate::tasks::DEFAULT_LEASE_TTL_SECS;
-        for target in ["pr#1", "pr#2", "task#5"] {
-            let exp = lease_expires(&c, "A", target).unwrap();
-            assert_eq!(exp, want, "{target} not extended");
-        }
+        stamp_claim(&c, "A", "task#1", 1100, 1000);
+        stamp_claim(&c, "A", "task#2", 1100, 1000);
+        renew_task_lease(&c, "A", 1, 1050).unwrap();
+        let exp1 = lease_expires(&c, "A", "task#1").unwrap();
+        let exp2 = lease_expires(&c, "A", "task#2").unwrap();
+        assert_eq!(exp1, 1050 + crate::tasks::DEFAULT_LEASE_TTL_SECS);
+        assert_eq!(exp2, 1100, "must NOT renew other task leases");
     }
 
     // -- Retirement state machine (issue #97) ---------------------------------------------

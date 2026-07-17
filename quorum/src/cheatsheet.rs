@@ -8,15 +8,6 @@ pub fn cheatsheet() -> String {
     format!(
         r#"quorum — local agent coordination (by agents, for agents)
 
-SYNC (the agent's compass — one call per tick)
-  quorum sync --agent <id> [--match-label <L> ...]
-                                              # one JSON: current_task XOR next_task,
-                                              # direct + critical messages, broadcast count,
-                                              # scoped event log. Omit-empty so quiet ticks
-                                              # are near-empty. Auto-acks the message cursor
-                                              # (use `read --ack-through` for strict at-least-once).
-                                              # --match-label scopes next_task only (capability filter).
-
 TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
   quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{{"pr":N}}'] [--body-stdin]
                                                                # --labels complexity:N (1-5): {rubric}
@@ -25,17 +16,14 @@ TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> don
                                                                # --refs: structured external-ref JSON (e.g. {{"pr":N}}) — load-bearing
                                                                # for review-loop traceability (#10 + creator monitor #62).
                                                                # Malformed JSON → exit 2 at create (never poisons reads).
-  quorum task-claim   --agent <id> [--task-id <n>] [--match-label <L> ...] [--ttl 1h]
-                                                               # no id = highest-priority open; --match-label = AND on labels
-                                                               # takes a lease; exit 1 = none claimable
-  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{{"pr":N}}'] [--verdict approve|changes] [--note-stdin]
+  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{{"pr":N}}'] [--note-stdin]
                                                                # --status open: assignee-only release/give-up (hand-off = open + re-claim)
                                                                # --status cancelled: creator OR assignee terminal won't-do
                                                                # --refs: link PR ref, e.g. `--refs '{{"pr":2459}}'`
                                                                #   surfaced through `log --refs pr#N` + creator sync (#62).
                                                                # NOTE: `done` is lifecycle-only — use `quorum submit` or `quorum task-close`.
+                                                               #   Verdict transitions are daemon-managed only (#130).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
-                                                               # --verdict approve|changes: reviewer verdict (lifecycle transition).
   quorum task-close --agent <id> --task-id <n> --reason-stdin   # manual/external terminal close (merged by hand, fixed elsewhere,
                                                                # obsolete). Emits `task_closed_manual` event — NEVER `task_done`.
                                                                # Owner/manual use; agents finishing work must use `quorum done`.
@@ -45,10 +33,8 @@ TASKS (work queue) — lifecycle: open -> working -> in-review -> merging -> don
   # COMPACT WRITE RESPONSES (#64): task-claim/task-update return only {{id, status, assignee, refs}}
   # (+ lease_expires_at on claim, + note_id on --note-*). Body and descriptive fields are omitted —
   # you just wrote them, no need to re-pay tokens. Use `task-get <id>` for the full record.
-  # AUTO-RENEW (#55): every `--agent`-identified command (task-claim, task-update, post,
-  # read --ack-through, sync, etc.) auto-extends YOUR active leases to now + DEFAULT_LEASE_TTL_SECS.
-  # Monotonic — an explicit longer TTL is never shortened. Only true silence past the lease lapses
-  # it (lost-agent recovery, unchanged). No more manual `task-renew` — the lease just rides along.
+  # LEASE RENEWAL (#130): the daemon renews the exact task lease for active workers each tick.
+  # External writes no longer auto-extend leases. Silence past the lease lapses it.
   # A lapsed lease returns a claimed task to open (reaper, on next write) + posts a `reclaimed` event.
   # Lifecycle: open -> working -> in-review -> merging -> done (with rework loop).
 
@@ -62,7 +48,8 @@ COMPLEXITY RUBRIC (used by classifier and for task-creation guidance)
   Mismatch alerts are advisory — the daemon posts a note when actual < suggested.
 
 SUBMIT (canonical hand-off — aliased as `done`, which is deprecated)
-  quorum submit --agent <id> --pr <N>                                  # worker: signal task completion (PR posted)
+  quorum submit --agent <id> --pr <N> [--run-id <uuid>]                # worker: signal task completion (PR posted)
+                                                                       # --run-id: daemon-issued capability (managed agents)
   quorum submit --agent <id> --pr <N> --verdict approved --blocking 0  # reviewer: approve
   quorum submit --agent <id> --pr <N> --verdict changes --blocking <N> --feedback "..."
                                                                        # reviewer: request changes

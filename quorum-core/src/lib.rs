@@ -7,6 +7,7 @@ pub mod agent_runs;
 pub mod agents;
 pub mod approvals;
 pub mod branches;
+pub mod capabilities;
 pub mod claims;
 pub mod classify;
 pub mod clock;

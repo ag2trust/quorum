@@ -151,6 +151,137 @@ fn submit_changes_without_feedback_is_refused() {
         .stderr(predicate::str::contains("--feedback"));
 }
 
+// --- #130 capability validation ---
+
+#[test]
+fn submit_with_unknown_run_id_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "TestAgent",
+            "--pr",
+            "42",
+            "--run-id",
+            "nonexistent-run-id",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown run_id"));
+}
+
+#[test]
+fn submit_with_revoked_run_id_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::capabilities::issue(&mut conn, "run-revoked", 1, "TestAgent", "worker", 1000)
+            .unwrap();
+        quorum_core::capabilities::revoke(&mut conn, "run-revoked", 2000).unwrap();
+    }
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "TestAgent",
+            "--pr",
+            "42",
+            "--run-id",
+            "run-revoked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("revoked"));
+}
+
+#[test]
+fn submit_with_mismatched_agent_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::capabilities::issue(
+            &mut conn,
+            "run-mismatch",
+            1,
+            "OtherAgent",
+            "worker",
+            1000,
+        )
+        .unwrap();
+    }
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "TestAgent",
+            "--pr",
+            "42",
+            "--run-id",
+            "run-mismatch",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not match"));
+}
+
+#[test]
+fn submit_with_valid_run_id_succeeds() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::capabilities::issue(&mut conn, "run-valid", 1, "TestAgent", "worker", 1000)
+            .unwrap();
+    }
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "TestAgent",
+            "--pr",
+            "42",
+            "--run-id",
+            "run-valid",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\":true"));
+}
+
 // --- `quorum done` (deprecated alias, must still work) ---
 
 #[test]

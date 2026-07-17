@@ -504,40 +504,21 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             body_file,
             note_stdin,
             note_file,
-            verdict,
-            blocking,
             depends_on,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
             let note = read_optional_note(note_stdin, note_file)?;
-            verdict::validate(verdict.as_deref(), blocking, None, false)
-                .map_err(QuorumError::Usage)?;
-            let has_field_update = status.is_some()
-                || refs.is_some()
-                || body.is_some()
-                || verdict.is_some()
-                || depends_on.is_some();
+            let has_field_update =
+                status.is_some() || refs.is_some() || body.is_some() || depends_on.is_some();
             if !has_field_update && note.is_none() {
                 return Err(QuorumError::Usage(
-                    "task-update needs at least one of --status/--refs/--verdict/\
-                     --body-stdin/--body-file/--note-stdin/--note-file"
+                    "task-update needs at least one of --status/--refs/\
+                     --body-stdin/--body-file/--note-stdin/--note-file/--depends-on"
                         .into(),
                 ));
             }
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let (task, effects) = if let Some(v) = &verdict {
-                let event = match v.as_str() {
-                    "approve" | "approved" => quorum_core::lifecycle::Event::VerdictApprove,
-                    "changes" => quorum_core::lifecycle::Event::VerdictChanges,
-                    _ => {
-                        return Err(QuorumError::Usage(format!(
-                            "--verdict must be 'approve' or 'changes' (got '{v}')"
-                        )));
-                    }
-                };
-                let r = quorum_core::tasks::apply_event(&mut conn, &agent, task_id, &event, now)?;
-                (r.task, r.effects)
-            } else if has_field_update {
+            let task = if has_field_update {
                 let fields = quorum_core::tasks::TaskUpdate {
                     status: status.as_deref(),
                     body: body.as_deref(),
@@ -545,11 +526,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     verdict: None,
                     depends_on: depends_on.as_deref(),
                 };
-                let t = quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?;
-                (t, vec![])
+                quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?
             } else {
                 match quorum_core::tasks::get(&conn, task_id)? {
-                    Some(t) => (t, vec![]),
+                    Some(t) => t,
                     None => {
                         output::emit(&serde_json::json!({ "ok": false, "reason": "not found" }));
                         return Ok(1);
@@ -569,10 +549,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             };
             let mut compact = quorum_core::tasks::TaskCompact::from(&task);
             compact.note_id = note_id;
-            compact.effects = effects
-                .iter()
-                .map(quorum_core::tasks::effect_name)
-                .collect();
             output::emit(&compact);
             Ok(0)
         }
@@ -939,6 +915,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             verdict,
             feedback,
             blocking,
+            run_id,
         } => {
             if let Some(ref v) = verdict {
                 match v.as_str() {
@@ -950,13 +927,21 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     }
                 }
             }
-            // #206: the verdict must be consistent with the review's own
-            // findings — `approved` needs an explicit zero-blocking
-            // attestation, `changes` needs actionable feedback.
             verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
                 .map_err(QuorumError::Usage)?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
+            // Validate run capability if provided.
+            if let Some(ref rid) = run_id {
+                let cap = quorum_core::capabilities::validate(&conn, rid)
+                    .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
+                if cap.agent != agent {
+                    return Err(QuorumError::Usage(format!(
+                        "--agent '{}' does not match run-id agent '{}'",
+                        agent, cap.agent
+                    )));
+                }
+            }
             let kind = quorum_core::mailbox::MailboxKind::Done;
             let row = quorum_core::mailbox::MailboxRow {
                 agent,

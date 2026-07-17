@@ -206,7 +206,7 @@ fn help_lists_commands_and_safety() {
         .success()
         .stdout(predicates::str::contains("--body-stdin"))
         .stdout(predicates::str::contains("EXIT CODES"))
-        .stdout(predicates::str::contains("quorum task-claim"));
+        .stdout(predicates::str::contains("quorum task-create"));
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn help_works_with_no_quorum_home() {
         .arg("help")
         .assert()
         .success()
-        .stdout(predicates::str::contains("quorum task-claim"));
+        .stdout(predicates::str::contains("quorum task-create"));
 }
 
 #[test]

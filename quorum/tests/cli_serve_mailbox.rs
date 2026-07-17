@@ -226,10 +226,10 @@ fn count_unconsumed(home: &std::path::Path, agent: &str) -> usize {
     .unwrap()
 }
 
-// ── Non-roster Done row is consumed (single daemon per DB) ───────────
+// ── Unmatched Done row is consumed (#130) ────────────────────────────
 //
 // daemon_lock (invariant 11) guarantees one daemon per DB. A Done row from
-// a non-roster agent with no working task is consumed as a phantom.
+// an agent with no active slot is consumed as an unmatched phantom.
 
 #[test]
 fn unmatched_done_row_consumed_as_passive_phantom() {
@@ -256,7 +256,7 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
 
     // Daemon should process the row as a passive agent phantom (no working task).
     assert!(
-        handle.wait_for("passive agent GhostAgent submit: no working task found", 15),
+        handle.wait_for("consuming unmatched Done row from GhostAgent", 15),
         "daemon did not process GhostAgent row. Lines: {:?}",
         handle.lines
     );
@@ -382,7 +382,7 @@ fn non_roster_done_rows_consumed_as_phantoms() {
 
     // Both rows consumed as passive agent phantoms (no working task found).
     assert!(
-        handle.wait_for("passive agent Aardvark0 submit: no working task found", 15),
+        handle.wait_for("consuming unmatched Done row from Aardvark0", 15),
         "Aardvark0 row not processed. Lines: {:?}",
         handle.lines
     );
@@ -498,7 +498,7 @@ fn stale_done_row_drained_on_name_reuse() {
     // The stale Done row is consumed via the passive agent phantom path
     // (no working task found for Agent0) before the at-spawn drain fires.
     assert!(
-        handle.wait_for("passive agent Agent0 submit: no working task found", 15),
+        handle.wait_for("consuming unmatched Done row from Agent0", 15),
         "stale Agent0 row not consumed. Lines: {:?}",
         handle.lines
     );
