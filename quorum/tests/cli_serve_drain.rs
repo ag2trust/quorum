@@ -527,12 +527,7 @@ fn drain_timeout_force_kills_and_exits_75() {
 /// inside wait_for_checks. With drain_timeout_secs=2 and
 /// merge_checks_timeout_secs=30, the daemon must exit within the drain window,
 /// not after the merge-checks timeout.
-///
-/// Expected: FAILS against current code (wait_for_checks blocks the tick loop,
-/// preventing the drain-timeout check from firing). Ignored until the fix
-/// lands — un-ignore to verify the fix.
 #[test]
-#[ignore]
 fn drain_timeout_honored_during_merge_checks() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -645,11 +640,17 @@ fn drain_timeout_honored_during_merge_checks() {
         .wait_exit(8)
         .expect("daemon did not exit within 8s (drain timeout is 2s)");
 
+    // Drain remaining stderr for diagnostics
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+
     let elapsed = drain_start.elapsed();
     assert!(
         elapsed < Duration::from_secs(10),
         "daemon took {elapsed:?} to exit — drain_timeout_secs=2 was violated \
-         (wait_for_checks blocked the tick loop)"
+         (wait_for_checks blocked the tick loop). All lines: {:?}",
+        handle.lines
     );
 
     assert_eq!(
@@ -659,4 +660,112 @@ fn drain_timeout_honored_during_merge_checks() {
         status.code(),
         handle.lines
     );
+}
+
+/// Negative path: when no drain is active, pending checks that time out should
+/// follow the normal rework path (MergeFailed + VerdictChanges) — the merge
+/// must not be lost or silently swallowed.
+#[test]
+fn pending_checks_timeout_without_drain_triggers_rework() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task_with_refs(
+        home.path(),
+        "Task with short checks timeout",
+        r#"{"repo":"test/repo"}"#,
+    );
+
+    // checks-cmd always returns "pending" → times out after 3s.
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            "echo pending",
+            "--merge-checks-timeout-secs",
+            "3",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned: {:?}",
+        handle.lines
+    );
+
+    let agent_name = handle
+        .extract_agent_name("spawning agent ")
+        .expect("could not extract agent name");
+
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen: {:?}",
+        handle.lines
+    );
+
+    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned: {:?}",
+        handle.lines
+    );
+
+    let reviewer_name = handle
+        .extract_agent_name("spawning reviewer ")
+        .expect("could not extract reviewer name");
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen: {:?}",
+        handle.lines
+    );
+
+    // Reviewer approves → daemon enters wait_for_checks (times out after 3s).
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "42",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("waiting for checks", 15),
+        "daemon did not enter merge-checks wait: {:?}",
+        handle.lines
+    );
+
+    // No drain signal — let the timeout expire naturally.
+    // Should see checks timeout → task cancelled.
+    assert!(
+        handle.wait_for("cancelling task", 20),
+        "checks did not time out and cancel as expected: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
 }
