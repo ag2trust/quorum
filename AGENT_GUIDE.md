@@ -363,13 +363,11 @@ No additional Codex-only project instructions currently.
   the state machine), `quorum task-close --reason-stdin` (manual/external terminal close with
   distinct `task_closed_manual` audit event), and the `done` state itself (set only by the
   system after approve + merge). See `quorum help` for the canonical surface.
-- **An agent shown in WORKING after its task merged may be a legacy R2 shadow auditor
-  (post-merge), not a zombie.** Active R2 now runs as a pre-merge adversarial reviewer
-  (`spawn_r2_reviewer`) sampled at R1 approval — it blocks merge, not shadows it.
-  The legacy `maybe_spawn_r2` post-merge auditor path still exists in code but is no
-  longer the primary R2 flow. Check `agent_runs.sub_role` (`r2`) and `end_reason`
-  (`r2-done`) before diagnosing a leak — quorum task #116 tracks labeling these in
-  the cockpit.
+- **R2 is a pre-merge adversarial second reviewer** (`spawn_r2_reviewer`) sampled at R1
+  approval — it replaces R1 as the pre-merge gate and its verdict drives lifecycle
+  (approve → merge, changes → rework). Check `agent_runs.sub_role` (`r2`) before
+  diagnosing an unexpected reviewer slot. The legacy post-merge shadow R2 auditor
+  path was removed in #128.
 
 ## Design notes & known limitations (v1)
 

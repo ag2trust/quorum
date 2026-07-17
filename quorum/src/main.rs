@@ -67,11 +67,10 @@ const DEFAULT_SERVE_TOML: &str = "\
 # log_dir = \"/path/to/logs\"
 # doctor_enabled = false
 
-## R2 review-audit (shadow review)
+## R2 pre-merge review (adversarial second reviewer, sampled at R1 approval)
 # r2_enabled = false
 # r2_target_per_stratum = 5
 # r2_steady_state_p = 0.10
-# r2_blocking = false
 ";
 
 fn run() -> Result<i32> {
@@ -1162,7 +1161,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(false);
             let r_r2_target_per_stratum = file_cfg.r2_target_per_stratum.unwrap_or(5);
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(0.10);
-            let r_r2_blocking = file_cfg.r2_blocking.unwrap_or(false);
 
             let r_suggested_models = file_cfg.suggested_models.unwrap_or_default();
             for (k, v) in &r_suggested_models {
@@ -1282,7 +1280,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
-                r2_blocking: r_r2_blocking,
                 suggested_models: r_suggested_models,
             };
             Ok(serve::run_serve(config)?)

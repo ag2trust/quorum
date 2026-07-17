@@ -117,42 +117,6 @@ pub async fn spawn_reviewer(
     AgentProc::spawn(&agent_spec, agent_bin)
 }
 
-#[allow(dead_code)]
-pub struct R2AuditSpec {
-    pub pr: i64,
-    pub r1_reviewer: String,
-    pub r2_name: String,
-}
-
-#[allow(dead_code)]
-pub fn build_r2_audit_prompt(spec: &R2AuditSpec) -> String {
-    super::agent::user_turn(&format!(
-        "You are R2 auditor {name}. Adversarially audit the review by R1 reviewer \
-         {r1} on PR #{pr}.\n\n\
-         Read the full PR diff AND all review comments from {r1}. Your job is two-sided:\n\
-         1. `missed` — real problems R1 failed to flag (false negatives). Each with severity \
-         (critical/major/minor) and confidence (0-100).\n\
-         2. `overcaught` — fixes R1 demanded that were not actually needed (false positives).\n\n\
-         Output your findings as a JSON object on stdout (no markdown fences):\n\
-         ```\n\
-         {{\n\
-           \"missed\": [{{\"description\": \"...\", \"severity\": \"major\", \"confidence\": 80}}],\n\
-           \"overcaught\": [{{\"description\": \"...\"}}],\n\
-           \"verdict\": \"approved\" | \"changes\"\n\
-         }}\n\
-         ```\n\n\
-         Then signal completion:\n\
-         quorum submit --agent {name} --pr {pr} --verdict <your_verdict> \
-         --blocking <count_of_missed_with_confidence_ge_70>\n\n\
-         Do NOT merge the PR. Do NOT run `gh pr review --approve` — the daemon \
-         posts the formal GitHub approval. Do NOT mark the task done. Shadow mode — \
-         your verdict is recorded but does not affect the merge outcome.",
-        name = spec.r2_name,
-        r1 = spec.r1_reviewer,
-        pr = spec.pr,
-    ))
-}
-
 pub struct R2ReviewSpec {
     pub pr: i64,
     pub worker_agent: String,
@@ -477,31 +441,6 @@ mod tests {
     fn reviewer_branch_format() {
         let branch = reviewer_branch(55, "Rev-1");
         assert_eq!(branch, "review/pr-55-rev-1");
-    }
-
-    #[test]
-    fn r2_audit_prompt_is_valid_user_turn() {
-        let spec = R2AuditSpec {
-            pr: 10,
-            r1_reviewer: "R1".into(),
-            r2_name: "R2".into(),
-        };
-        let prompt = build_r2_audit_prompt(&spec);
-        let parsed: serde_json::Value = serde_json::from_str(&prompt).unwrap();
-        assert_eq!(parsed["type"], "user");
-        assert_eq!(
-            parsed["message"]["role"], "user",
-            "claude CLI rejects turns without message.role"
-        );
-        let content = parsed["message"]["content"].as_str().unwrap();
-        assert!(
-            content.contains("Do NOT run `gh pr review --approve`"),
-            "R2 audit prompt must forbid gh pr review --approve"
-        );
-        assert!(
-            content.contains("R2 auditor R2"),
-            "prompt must name the auditor"
-        );
     }
 
     #[test]

@@ -342,10 +342,11 @@ CREATE TABLE IF NOT EXISTS review_collection_runs (
 );
 CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
 
--- R2 review-audit capture (#92): one row per second-reviewer (R2) adversarial
--- audit of an R1 review. Stratified-sampled on (model, effort, cx_bucket).
--- Shadow mode: R2 verdict is recorded but does NOT block merges (see
--- serve-config `r2_blocking`). Not TTL'd — durable historical data.
+-- R2 review-audit capture (#92): one row per adversarial pre-merge second
+-- reviewer (R2) pass on an R1-approved PR. Stratified-sampled on
+-- (model, effort, cx_bucket). R2 replaces R1 as the pre-merge gate — its
+-- verdict drives lifecycle (approve → merge, changes → rework). The audit
+-- row is a durable stratum-coverage record, not a shadow ledger. Not TTL'd.
 CREATE TABLE IF NOT EXISTS review_audits (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id           INTEGER NOT NULL,
