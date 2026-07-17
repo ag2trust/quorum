@@ -48,6 +48,77 @@ pub fn parse_line(line: &str) -> Option<Event> {
     serde_json::from_str(line).ok()
 }
 
+/// Extract the plain text emitted by an assistant turn, regardless of
+/// stream-json content shape.
+///
+/// Real Claude assistant messages carry `content` as an ARRAY of typed blocks
+/// (`{"type":"text","text":"..."}`, `{"type":"tool_use",...}`, `{"type":"thinking",...}`).
+/// A minority of stubbed/legacy streams send `content` as a plain string. Both
+/// shapes must accumulate correctly; anything else (thinking blocks, tool_use
+/// blocks, `content` absent) yields `None`, so the caller's accumulator only
+/// grows with real user-visible text.
+///
+/// Used by the classifier, the CLI `review-interpret` command, and the daemon
+/// post-merge interpreter — all three previously accepted `content` only when
+/// it was a string and would silently drop every block-array turn, losing the
+/// response body before the terminal Result event.
+pub fn assistant_text(message: &serde_json::Value) -> Option<String> {
+    let content = message.get("content")?;
+
+    if let Some(s) = content.as_str() {
+        return if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
+    }
+
+    let blocks = content.as_array()?;
+    let mut out = String::new();
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+            continue;
+        }
+        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+            out.push_str(text);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Coerce a Result-event `result` field into plain text. Real streams send
+/// either a string (`"result":"..."`), an object/array (JSON payload),
+/// or — rarely — the same content-block array shape as an assistant message.
+/// The stringify fallback keeps parseable JSON intact so downstream JSON
+/// extraction (fenced blocks, direct object) still works.
+pub fn result_text(result: &serde_json::Value) -> String {
+    if let Some(s) = result.as_str() {
+        return s.to_string();
+    }
+    // Some agents wrap the final answer in a content-block array on the
+    // Result event too — flatten to the concatenated text if so.
+    if let Some(blocks) = result.as_array() {
+        let mut has_text_block = false;
+        let mut out = String::new();
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    has_text_block = true;
+                    out.push_str(text);
+                }
+            }
+        }
+        if has_text_block {
+            return out;
+        }
+    }
+    result.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +211,77 @@ mod tests {
             }
             _ => panic!("expected Result event"),
         }
+    }
+
+    #[test]
+    fn assistant_text_extracts_from_string_content() {
+        let msg = serde_json::json!({"content": "hello there"});
+        assert_eq!(assistant_text(&msg).as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn assistant_text_extracts_from_content_block_array() {
+        let msg = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "part one "},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "text", "text": "part two"},
+            ]
+        });
+        assert_eq!(assistant_text(&msg).as_deref(), Some("part one part two"));
+    }
+
+    #[test]
+    fn assistant_text_ignores_thinking_and_tool_use_blocks() {
+        let msg = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "internal"},
+                {"type": "tool_use", "name": "Bash", "input": {}},
+            ]
+        });
+        assert!(assistant_text(&msg).is_none());
+    }
+
+    #[test]
+    fn assistant_text_none_when_content_missing() {
+        assert!(assistant_text(&serde_json::json!({})).is_none());
+    }
+
+    /// Real stream-json assistant event from Claude — regression pin for #127.
+    /// Prior code accepted `content` only when it was a string, so it silently
+    /// dropped this shape and left the interpreter response empty.
+    #[test]
+    fn assistant_text_parses_real_stream_event() {
+        let line = r#"{"type":"assistant","message":{"content":[{"text":"{\"findings\": []}","type":"text"}],"id":"msg_01","role":"assistant","type":"message"}}"#;
+        let event: Event = serde_json::from_str(line).unwrap();
+        let Event::Assistant { message } = event else {
+            panic!("expected assistant event");
+        };
+        assert_eq!(
+            assistant_text(&message).as_deref(),
+            Some(r#"{"findings": []}"#)
+        );
+    }
+
+    #[test]
+    fn result_text_handles_string() {
+        let v = serde_json::json!("plain");
+        assert_eq!(result_text(&v), "plain");
+    }
+
+    #[test]
+    fn result_text_handles_content_block_array() {
+        let v = serde_json::json!([
+            {"type": "text", "text": "hello "},
+            {"type": "text", "text": "world"},
+        ]);
+        assert_eq!(result_text(&v), "hello world");
+    }
+
+    #[test]
+    fn result_text_stringifies_json_object() {
+        let v = serde_json::json!({"findings": []});
+        assert_eq!(result_text(&v), r#"{"findings":[]}"#);
     }
 
     #[test]

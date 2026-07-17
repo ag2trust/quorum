@@ -78,18 +78,19 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                         "classifier agent returned an error".into(),
                     ));
                 }
-                let text = result
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| result.to_string());
+                let text = stream::result_text(result);
                 if !text.is_empty() {
                     slot.response_text = text;
                 }
                 return Some(ClassifierResult::Done(slot.response_text.clone()));
             }
             stream::Event::Assistant { message } => {
-                if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                    slot.response_text.push_str(content);
+                // #127: real stream-json content is a typed block array — the
+                // prior `.as_str()`-only branch dropped every non-string
+                // content shape, leaving the classifier response empty and
+                // the daemon respawn-looping. Shared helper handles both.
+                if let Some(text) = stream::assistant_text(message) {
+                    slot.response_text.push_str(&text);
                 }
             }
             _ => {}

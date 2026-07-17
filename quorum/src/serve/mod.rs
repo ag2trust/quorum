@@ -349,6 +349,50 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+/// Durably enqueue a post-merge interpret retry job (#127). Best-effort — a
+/// write failure only means the row is not durably captured for retry; the
+/// primary analytics path (`spawn_post_merge_collector`, #125) still runs.
+/// Reconcile at next startup rebuilds any missing job from task state.
+async fn enqueue_interpret_job(db_path: &std::path::Path, pr_num: i64, task_id: i64, repo: &str) {
+    let p = db_path.to_path_buf();
+    let repo_opt = if repo.is_empty() {
+        None
+    } else {
+        Some(repo.to_string())
+    };
+    let outcome = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        quorum_core::review_interpret_jobs::enqueue(
+            &mut conn,
+            pr_num,
+            task_id,
+            repo_opt.as_deref(),
+            collector::COLLECTOR_VERSION,
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log(&format!(
+            "interpret: enqueue for PR #{pr_num} failed \
+             (reconcile will catch it): {e}"
+        )),
+        Err(e) => log(&format!(
+            "interpret: enqueue spawn_blocking join failed for PR #{pr_num}: {e}"
+        )),
+    }
+}
+
+/// One tick's post-merge collector-queue work packed for the spawn_blocking
+/// boundary. `converged` counts jobs whose successful run just landed;
+/// `next` is the job (if any) whose attempt was reserved and now needs an
+/// out-of-tokio spawn; `dead` is the dead-letter view for the operator log.
+struct InterpretTickOutcome {
+    converged: usize,
+    next: Option<quorum_core::review_interpret_jobs::InterpretJob>,
+    dead: Vec<quorum_core::review_interpret_jobs::InterpretJob>,
+}
+
 async fn close_agent_run(db_path: &std::path::Path, run_id: Option<i64>, end_reason: &str) {
     if let Some(rid) = run_id {
         let p = db_path.to_path_buf();
@@ -876,6 +920,49 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
     if let Err(e) = recovery::recover(config, &wt_mgr).await {
         log(&format!("recovery failed: {e} — starting fresh"));
+    }
+
+    // #127: reconcile the durable review-interpret retry queue. Catches any
+    // merged task whose MergeSucceeded hook missed the enqueue (daemon killed
+    // between merge and enqueue) or whose findings were written under an
+    // older collector version. Also surfaces any over-cap (dead-lettered)
+    // rows so an operator sees poison PRs at startup. Never mutates task
+    // `done` state — only inserts job rows so the tick loop discovers pending
+    // work.
+    {
+        let p = config.db_path.clone();
+        let outcome = tokio::task::spawn_blocking(
+            move || -> Result<(usize, Vec<quorum_core::review_interpret_jobs::InterpretJob>)> {
+                let mut conn = quorum_core::db::open(&p)?;
+                let n = quorum_core::review_interpret_jobs::reconcile(
+                    &mut conn,
+                    collector::COLLECTOR_VERSION,
+                )?;
+                let dead = quorum_core::review_interpret_jobs::over_cap(&conn)?;
+                Ok((n, dead))
+            },
+        )
+        .await
+        .map_err(|e| QuorumError::Io(format!("interpret reconcile join: {e}")))?;
+        match outcome {
+            Ok((n, dead)) => {
+                if n > 0 {
+                    log(&format!(
+                        "interpret: reconciled {n} missed post-merge job(s)"
+                    ));
+                }
+                for job in &dead {
+                    log(&format!(
+                        "interpret: DEAD-LETTER PR #{} (task #{}, attempts={}): {}",
+                        job.pr_number,
+                        job.task_id,
+                        job.attempts,
+                        job.last_error.as_deref().unwrap_or("(no error recorded)")
+                    ));
+                }
+            }
+            Err(e) => log(&format!("interpret reconcile failed: {e} — continuing")),
+        }
     }
 
     log(&format!("serving (cap={})", config.cap));
@@ -1503,7 +1590,14 @@ async fn tick(
                         ));
                         fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
                             .await;
+                        // #125 fires the collector immediately (best-effort).
+                        // #127 also durably enqueues so a daemon crash before
+                        // or during collection is caught by reconcile() on
+                        // next startup — the tick loop retries with backoff
+                        // and cap; a successful run deletes the job.
                         spawn_post_merge_collector(config, pr_num, reviewer_task_id);
+                        enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
+                            .await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
@@ -2081,7 +2175,14 @@ async fn tick(
                         log(&format!("PR #{pr_num} merged — firing MergeSucceeded"));
                         fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
                             .await;
+                        // #125 fires the collector immediately (best-effort).
+                        // #127 also durably enqueues so a daemon crash before
+                        // or during collection is caught by reconcile() on
+                        // next startup — the tick loop retries with backoff
+                        // and cap; a successful run deletes the job.
                         spawn_post_merge_collector(config, pr_num, reviewer_task_id);
+                        enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
+                            .await;
                         if config.self_update_drain && config.self_repo.is_some() {
                             let sha = format!("post-merge-pr-{pr_num}");
                             drain_state.start_drain(&sha);
@@ -3772,6 +3873,109 @@ async fn tick(
                     }
                 }
             }
+        }
+    }
+
+    // ── Phase 7.5: Post-merge collector retry queue (#127) ─────────────
+    // Complements #125's fire-and-forget `spawn_post_merge_collector`. Every
+    // merged PR is durably enqueued at merge time. Here we (a) sweep jobs
+    // whose collector run has since recorded a success at the current version
+    // (converged — delete the row), (b) spawn one retry for the highest-
+    // priority ready job (attempts asc, past backoff, under cap), and (c)
+    // log dead-lettered rows so operators see poison PRs instead of silent
+    // starvation. Never touches task lifecycle: analytics-only, retry-only.
+    if !drain_state.draining {
+        let p = db_path.clone();
+        let now_ts = now_unix();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<InterpretTickOutcome> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let version = collector::COLLECTOR_VERSION;
+            // 7.5a: converge — delete any job whose successful run at
+            // the current version has landed since we last swept.
+            let mut converged = 0usize;
+            for job in quorum_core::review_interpret_jobs::list_all(&conn)? {
+                if let Some(run) = quorum_core::review_findings::get_run(&conn, job.pr_number)? {
+                    if matches!(run.status, quorum_core::review_findings::RunStatus::Success)
+                        && run.collector_version == version
+                    {
+                        quorum_core::review_interpret_jobs::delete(&mut conn, job.pr_number)?;
+                        converged += 1;
+                    }
+                }
+            }
+            // 7.5b: pick one ready job. `list_ready` orders by
+            // (attempts asc, oldest last_attempt_at asc), so a fresh
+            // job always beats a retry and a poison job cannot starve
+            // later work. `list_ready` also excludes rows at MAX_ATTEMPTS.
+            let ready = quorum_core::review_interpret_jobs::list_ready(&conn, now_ts)?;
+            let next = ready.into_iter().next();
+            // 7.5c: surface dead-lettered rows in the tick log.
+            let dead = quorum_core::review_interpret_jobs::over_cap(&conn)?;
+            // If we're about to spawn, reserve the attempt now so that
+            // this same job cannot be re-picked next tick if the spawn
+            // races ahead of its run-record write. Reserving = mark_error
+            // with a placeholder — the run-record itself (success or
+            // failed) is the ground truth; the queue row's last_error
+            // is only informational.
+            if let Some(job) = &next {
+                quorum_core::review_interpret_jobs::mark_error(
+                    &mut conn,
+                    job.pr_number,
+                    "retry-spawn-in-flight",
+                )?;
+            }
+            Ok(InterpretTickOutcome {
+                converged,
+                next,
+                dead,
+            })
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("interpret sweep join: {e}")))??;
+
+        if outcome.converged > 0 {
+            log(&format!(
+                "interpret: {} job(s) converged (successful run at {})",
+                outcome.converged,
+                collector::COLLECTOR_VERSION
+            ));
+        }
+        for job in &outcome.dead {
+            log(&format!(
+                "interpret: DEAD-LETTER PR #{} (task #{}, attempts={}): {}",
+                job.pr_number,
+                job.task_id,
+                job.attempts,
+                job.last_error.as_deref().unwrap_or("(no error recorded)")
+            ));
+        }
+        if let Some(job) = outcome.next {
+            log(&format!(
+                "interpret: retrying PR #{} (task #{}, attempt {})",
+                job.pr_number,
+                job.task_id,
+                job.attempts + 1
+            ));
+            // Reuse #125's collector spawn: it writes review_collection_runs
+            // on both success and failure, so the next tick's converge step
+            // catches successes and the mark_error above blocks re-picking
+            // until the backoff window elapses.
+            let request = collector::CollectionRequest::new(
+                job.pr_number,
+                Some(job.task_id),
+                job.repo.clone().or_else(|| {
+                    if config.repo.is_empty() {
+                        None
+                    } else {
+                        Some(config.repo.clone())
+                    }
+                }),
+                config.db_path.clone(),
+                config.repo_dir.clone(),
+                config.agent_bin.clone(),
+                config.bare_agent,
+            );
+            collector::spawn_detached(request);
         }
     }
 

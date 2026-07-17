@@ -25,6 +25,7 @@ pub mod perf;
 pub mod pinned;
 pub mod review_audits;
 pub mod review_findings;
+pub mod review_interpret_jobs;
 pub mod stats;
 pub mod sweep;
 pub mod sync;

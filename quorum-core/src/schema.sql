@@ -342,6 +342,29 @@ CREATE TABLE IF NOT EXISTS review_collection_runs (
 );
 CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
 
+-- v24 (#127): durable post-merge collector retry queue. Each row is a pending
+-- collector invocation — the daemon enqueues one at MergeSucceeded, reconciles
+-- missed rows on startup, and drains one job per tick with a bounded retry
+-- budget (attempts cap + linear backoff). Deleted on success. Complements
+-- `review_collection_runs` (an audit record per PR) by providing durable
+-- retry state that survives daemon crashes; failure is observable via
+-- `last_error` but never mutates the completed task's `done` state.
+--
+-- `interpreter_version` here mirrors `collector_version` written on runs —
+-- a version bump legitimately re-targets the same PR, and the reconciler uses
+-- the value to decide whether existing findings are stale.
+CREATE TABLE IF NOT EXISTS review_interpret_jobs (
+    pr_number           INTEGER PRIMARY KEY,
+    task_id             INTEGER NOT NULL,
+    repo                TEXT,
+    interpreter_version TEXT NOT NULL,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at     INTEGER,
+    last_error          TEXT,
+    created_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS review_interpret_jobs_task ON review_interpret_jobs(task_id);
+
 -- R2 review-audit capture (#92): one row per adversarial pre-merge second
 -- reviewer (R2) pass on an R1-approved PR. Stratified-sampled on
 -- (model, effort, cx_bucket). R2 replaces R1 as the pre-merge gate — its
