@@ -249,7 +249,7 @@ pub fn build_prompt(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
 ) -> String {
-    let mut prompt = String::from(CLASSIFIER_RUBRIC);
+    let mut prompt = classifier_rubric();
 
     prompt.push_str("\n\n## Tasks to classify\n\n");
     for t in tasks {
@@ -295,14 +295,14 @@ pub fn build_prompt(
     prompt
 }
 
-const CLASSIFIER_RUBRIC: &str = r#"You are a task classifier for an AI agent coordination system. For each task, produce:
+/// Build the classifier rubric text from the shared complexity constants.
+fn classifier_rubric() -> String {
+    let rubric_lines = crate::complexity::rubric_lines();
+    format!(
+        r#"You are a task classifier for an AI agent coordination system. For each task, produce:
 
 1. **cx_est** (integer 1-5): Complexity estimate based on the task description AS WRITTEN at creation time.
-   - 1: Trivial — config tweak, typo fix, simple rename
-   - 2: Simple — single-file change, clear spec, < 15 min agent work
-   - 3: Moderate — multi-file change, some design decisions, 15-30 min
-   - 4: Complex — cross-cutting change, multiple components, 30-60 min
-   - 5: Very complex — architectural change, new subsystem, > 60 min
+{rubric_lines}
 
 2. **cx_flags** (array of strings, may be empty): Shape-lint flags.
    - "oversized": Task looks like > ~30-45 min of agent work (complexity 4-5 with broad scope)
@@ -317,7 +317,9 @@ const CLASSIFIER_RUBRIC: &str = r#"You are a task classifier for an AI agent coo
 Score based ONLY on the task description — never on execution outcomes, diffs, or agent performance.
 
 Output format (JSON array wrapped in an object):
-{"tasks": [{"task_id": 1, "cx_est": 3, "cx_flags": [], "cx_tags": ["kind:feature", "area:daemon"], "cx_dup_of": []}, ...]}"#;
+{{"tasks": [{{"task_id": 1, "cx_est": 3, "cx_flags": [], "cx_tags": ["kind:feature", "area:daemon"], "cx_dup_of": []}}]}}"#
+    )
+}
 
 /// Classifier version string for `cx_by`.
 pub const CLASSIFIER_VERSION: &str = "haiku-45:v1";
@@ -616,5 +618,27 @@ mod tests {
 
         let missing = tasks_missing_cx_all(&conn).unwrap();
         assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn classifier_prompt_contains_shared_rubric_descriptions() {
+        let rubric = classifier_rubric();
+        for (level, label, desc, _time) in &crate::complexity::RUBRIC {
+            assert!(
+                rubric.contains(&format!("{level}: {label}")) && rubric.contains(*desc),
+                "classifier rubric missing level {level} ({label} — {desc})"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_file_contains_shared_rubric_descriptions() {
+        let skill = include_str!("../../.claude/skills/quorum/SKILL.md");
+        for (_level, _label, desc, _time) in &crate::complexity::RUBRIC {
+            assert!(
+                skill.contains(*desc),
+                "skill file missing rubric description: {desc}"
+            );
+        }
     }
 }

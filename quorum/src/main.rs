@@ -1604,7 +1604,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             Ok(0)
         }
         cli::Command::Help => {
-            print!("{}", cheatsheet::CHEATSHEET);
+            print!("{}", cheatsheet::cheatsheet());
             Ok(0)
         }
     }

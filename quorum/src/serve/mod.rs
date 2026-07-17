@@ -262,14 +262,7 @@ fn effort_rank(effort: &str) -> u8 {
     }
 }
 
-/// Default suggested (tier, effort) per complexity level.
-const SUGGESTED_DEFAULTS: [(u8, &str, &str); 5] = [
-    (1, "claude-sonnet-5", "medium"),
-    (2, "claude-opus-4-6", "medium"),
-    (3, "claude-opus-4-6", "high"),
-    (4, "claude-opus-4-7", "high"),
-    (5, "claude-opus-4-8", "high"),
-];
+use quorum_core::complexity::DEFAULT_RECOMMENDATIONS as SUGGESTED_DEFAULTS;
 
 fn suggested_for(
     cx: u8,

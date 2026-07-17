@@ -10,6 +10,7 @@ pub mod branches;
 pub mod claims;
 pub mod classify;
 pub mod clock;
+pub mod complexity;
 pub mod control;
 pub mod daemon_lock;
 pub mod db;
