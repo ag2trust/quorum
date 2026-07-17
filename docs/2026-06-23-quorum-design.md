@@ -420,6 +420,7 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 | `ReworkPushed` | — | `submit --pr N` when `rework_round > 0` |
 | `MergeSucceeded` | — | Daemon after successful `gh pr merge` |
 | `MergeFailed { reason }` | description | Daemon after merge failure |
+| `MergeConflict` | — | Daemon: PR has conflicts with base branch |
 | `LeaseExpired` | — | Lease reaper |
 | `AgentFailed { reason }` | description | Worker/reviewer process died |
 | `Cancelled { by }` | who | `task-update --status cancelled` or daemon policy |
@@ -467,6 +468,8 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 **From Merging:**
 - `MergeSucceeded` → Done · effects: ReleaseLease
 - `MergeFailed { reason }` → InReview · effects: NotifyOwner, ResumeReviewer
+- `MergeConflict` → Rework · effects: IncrementReworkRound, ResumeWorker
+  (at rework cap → Failed · effects: NotifyOwner, ReleaseLease)
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **Terminals (Done, Failed, Cancelled):** reject all events.
@@ -564,16 +567,29 @@ No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` t
 After VerdictApprove (InReview → Merging):
 1. Check stale SHA — if reviewer recorded a head SHA and it differs from current, fire
    MergeFailed → rework cycle (prevents stale approval from authorizing a changed diff).
-2. Check mergeability — if conflicting, MergeFailed → rework cycle.
-3. Wait for CI checks — failed → rework; timed out → cancelled.
+2. Check mergeability — if conflicting, MergeConflict → rework cycle (worker rebases).
+3. Wait for CI checks — failed → rework; timed out → see step 3a.
+   - **3a. Post-timeout mergeability recheck (#153):** if the PR became conflicting during
+     the checks wait (base branch advanced), fire MergeConflict → rework (worker rebases
+     and resolves conflicts). If the PR is still mergeable, fire MergeFailed + VerdictChanges
+     → rework (worker fixes stuck CI). Neither outcome is terminal — the rework cap governs
+     eventual failure. Drain-interrupted timeout preserves state for restart recovery.
 4. Persist approval record (instance-independent, survives restart).
-5. Execute `gh pr merge` — success → Done; policy-blocked → Cancelled;
+5. **Pre-merge mergeability recheck (#153):** recheck PR mergeability immediately before
+   the merge attempt — the window from step 2 through the master-CI gate can span minutes.
+   If conflicting, fire MergeConflict → rework cycle. If mergeable, proceed.
+6. Execute `gh pr merge` — success → Done; policy-blocked → Cancelled;
    retryable failure → rework.
-6. Self-update drain: if enabled, a successful merge triggers drain mode →
+7. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
-7. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs
+8. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs
    after `MergeSucceeded`. Analytics-only; can never mutate lifecycle, verdict, or
    merge outcome. See below.
+
+**Post-conflict review requirement (#153):** after a MergeConflict → rework → push cycle,
+the task transitions ReworkPushed → InReview, requiring a fresh review of the new head.
+The stale-SHA check (step 1) ensures a prior approval for a different head cannot
+authorize the merge — no approval is reused across conflict resolution.
 
 ### Post-merge review-analytics collector (#125)
 

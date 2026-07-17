@@ -3,7 +3,7 @@
 //! Verifies that the daemon waits for required CI checks before merging:
 //! - checks pass → merge proceeds
 //! - checks fail → Retryable rework with failing check names
-//! - checks timeout → PolicyBlocked park
+//! - checks timeout → rework (recoverable, not terminal cancel)
 //! - merge is NOT attempted while checks are pending (negative path)
 
 use std::io::{BufRead, BufReader, Write};
@@ -478,8 +478,13 @@ fn checks_timeout_parks_task() {
         handle.lines
     );
     assert!(
-        handle.lines.iter().any(|l| l.contains("checks timed out")),
+        handle.lines.iter().any(|l| l.contains("timed out")),
         "timeout reason not in log. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework", 15),
+        "rework not triggered after checks timeout. Lines: {:?}",
         handle.lines
     );
 
@@ -493,20 +498,15 @@ fn checks_timeout_parks_task() {
         handle.lines
     );
 
-    handle.stop();
-
-    let get_out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .env("QUORUM_REPO", "test/repo")
-        .args(["task-get", "--task-id", "1"])
-        .output()
-        .unwrap();
-    assert!(get_out.status.success());
-    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    // #153: checks timeout fires rework, not terminal cancel.
+    let saw_cancelled = handle.lines.iter().any(|l| l.contains("cancelling"));
     assert!(
-        stdout.contains("\"status\":\"cancelled\"") || stdout.contains("\"status\": \"cancelled\""),
-        "task should be cancelled after checks timeout, got: {stdout}"
+        !saw_cancelled,
+        "task should NOT be cancelled after checks timeout. Lines: {:?}",
+        handle.lines
     );
+
+    handle.stop();
 }
 
 /// Negative path: checks pending → transition to ready → merge proceeds.
@@ -978,6 +978,120 @@ fn approved_without_pr_skips_merge() {
     assert!(
         !saw_merge_attempt,
         "merge should NOT be attempted without PR number. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+/// #153: PR is mergeable at initial check, becomes conflicting during the
+/// checks wait, and checks time out. Task must transition to rework (not
+/// cancelled), and the worker must receive a rework turn with conflict
+/// resolution instructions.
+#[test]
+fn conflict_during_checks_wait_triggers_rework_not_cancel() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for conflict-during-checks test");
+
+    // mergeability-cmd: returns "mergeable" for the first N calls (Phase 5
+    // worker-needs-reviewer check + pre-merge check), then "conflicting"
+    // on the post-timeout recheck. Uses a counter file.
+    let counter_file = home.path().join("mergeability_counter");
+    std::fs::write(&counter_file, "0").unwrap();
+    let mergeability_script = format!(
+        "n=$(cat {f}); n=$((n + 1)); echo $n > {f}; \
+         if [ $n -le 2 ]; then echo mergeable; else echo conflicting; fi",
+        f = counter_file.display()
+    );
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            "echo pending",
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+            "--merge-mergeability-cmd",
+            &mergeability_script,
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    // Should see the conflict detected after timeout, NOT a cancel.
+    assert!(
+        handle.wait_for("CONFLICTING during checks", 20),
+        "conflict-during-checks log not seen. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework", 15),
+        "rework not triggered for conflict during checks. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_cancelled = handle.lines.iter().any(|l| l.contains("cancelling"));
+    assert!(
+        !saw_cancelled,
+        "task should NOT be cancelled for conflict during checks. Lines: {:?}",
         handle.lines
     );
 
