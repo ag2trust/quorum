@@ -256,9 +256,9 @@ fn validate_labels(s: &str) -> Result<()> {
         if let Some(complexity) = label.strip_prefix("complexity:") {
             if !complexity.is_empty() && !KNOWN_COMPLEXITIES.contains(&complexity) {
                 return Err(QuorumError::Usage(format!(
-                    "invalid complexity '{complexity}' in --labels; only {} are accepted \
-                     (1=mechanical one-liner, 2=single-file, 3=multi-file, 4=cross-module, 5=cross-cutting)",
-                    KNOWN_COMPLEXITIES.join(", ")
+                    "invalid complexity '{complexity}' in --labels; only {} are accepted ({})",
+                    KNOWN_COMPLEXITIES.join(", "),
+                    crate::complexity::rubric_inline(),
                 )));
             }
         }
@@ -2713,6 +2713,18 @@ mod tests {
         );
         assert!(validate_labels(r#"["complexity:6"]"#).is_err());
         assert!(validate_labels(r#"["complexity:easy"]"#).is_err());
+    }
+
+    #[test]
+    fn validate_labels_error_uses_shared_rubric() {
+        let err = validate_labels(r#"["complexity:0"]"#).unwrap_err();
+        let msg = format!("{err}");
+        for (_level, _label, desc, _time) in &crate::complexity::RUBRIC {
+            assert!(
+                msg.contains(*desc),
+                "validation error missing rubric description: {desc}"
+            );
+        }
     }
 
     // ── T6: lifecycle replay idempotency ──────────────────────────────────
