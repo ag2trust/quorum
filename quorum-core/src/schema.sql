@@ -428,3 +428,17 @@ CREATE TABLE IF NOT EXISTS task_message_deliveries (
 );
 CREATE INDEX IF NOT EXISTS task_message_deliveries_msg ON task_message_deliveries(message_id);
 CREATE INDEX IF NOT EXISTS task_message_deliveries_run ON task_message_deliveries(recipient_run_id, status);
+
+-- v26: daemon-issued run capabilities (#130) — per-run identity binding for
+-- managed submit/report operations. The daemon creates a row at worker/reviewer
+-- spawn; submit validates run_id before processing. Revoked on agent death or
+-- task terminal transition. Not TTL'd — durable audit trail.
+CREATE TABLE IF NOT EXISTS run_capabilities (
+    run_id      TEXT PRIMARY KEY,
+    task_id     INTEGER NOT NULL,
+    agent       TEXT NOT NULL,
+    role        TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+    created_at  INTEGER NOT NULL,
+    revoked_at  INTEGER
+);
+CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHERE revoked_at IS NULL;

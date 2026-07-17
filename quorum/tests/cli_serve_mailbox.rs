@@ -226,10 +226,10 @@ fn count_unconsumed(home: &std::path::Path, agent: &str) -> usize {
     .unwrap()
 }
 
-// ── Non-roster Done row is consumed (single daemon per DB) ───────────
+// ── Unmatched Done row is consumed (#130) ────────────────────────────
 //
 // daemon_lock (invariant 11) guarantees one daemon per DB. A Done row from
-// a non-roster agent with no working task is consumed as a phantom.
+// an agent with no active slot is consumed as an unmatched phantom.
 
 #[test]
 fn unmatched_done_row_consumed_as_passive_phantom() {
@@ -256,7 +256,7 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
 
     // Daemon should process the row as a passive agent phantom (no working task).
     assert!(
-        handle.wait_for("passive agent GhostAgent submit: no working task found", 15),
+        handle.wait_for("consuming unmatched Done row from GhostAgent", 15),
         "daemon did not process GhostAgent row. Lines: {:?}",
         handle.lines
     );
@@ -270,6 +270,70 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
         count_unconsumed(home.path(), "GhostAgent"),
         0,
         "non-roster Done row was not consumed"
+    );
+}
+
+// ── #130 negative-path: unmatched Done does NOT drive lifecycle ────────
+//
+// R1 advisory #4: replaces the deleted passive-agent submit coverage. Asserts
+// that a Done row from an agent with no active slot is consumed as a phantom
+// AND that no lifecycle transition occurs — task stays `open`, no
+// `SignaledDone` event is emitted. Locks the invariant against silent
+// regressions where a stray Done could still drive the state machine.
+
+#[test]
+fn unmatched_done_row_does_not_drive_lifecycle() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    // No tasks seeded — the daemon idles, no worker gets spawned. Any lifecycle
+    // event that shows up can only be a phantom driven by the ghost Done row.
+    quorum_done(home.path(), &["--agent", "GhostAgent", "--pr", "42"]);
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    // Daemon must consume the row (invariant: single-daemon-per-DB).
+    assert!(
+        handle.wait_for("consuming unmatched Done row from GhostAgent", 15),
+        "daemon did not consume ghost row. Lines: {:?}",
+        handle.lines
+    );
+
+    std::thread::sleep(Duration::from_secs(1));
+    handle.stop();
+
+    // Row consumed as phantom.
+    assert_eq!(count_unconsumed(home.path(), "GhostAgent"), 0);
+
+    // No lifecycle transition event may have fired: no task_in_review,
+    // no task_working, no task_done. The event kind is emitted as
+    // `task_{new_status.replace('-', '_')}` (tasks.rs:653) — assert the
+    // full family stayed empty since no worker was ever spawned.
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let lifecycle_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE kind IN ('task_in_review', 'task_working', 'task_done',
+                            'task_merging', 'task_rework')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        lifecycle_events, 0,
+        "unmatched Done row triggered a lifecycle event (phantom drove state machine)"
     );
 }
 
@@ -382,7 +446,7 @@ fn non_roster_done_rows_consumed_as_phantoms() {
 
     // Both rows consumed as passive agent phantoms (no working task found).
     assert!(
-        handle.wait_for("passive agent Aardvark0 submit: no working task found", 15),
+        handle.wait_for("consuming unmatched Done row from Aardvark0", 15),
         "Aardvark0 row not processed. Lines: {:?}",
         handle.lines
     );
@@ -498,7 +562,7 @@ fn stale_done_row_drained_on_name_reuse() {
     // The stale Done row is consumed via the passive agent phantom path
     // (no working task found for Agent0) before the at-spawn drain fires.
     assert!(
-        handle.wait_for("passive agent Agent0 submit: no working task found", 15),
+        handle.wait_for("consuming unmatched Done row from Agent0", 15),
         "stale Agent0 row not consumed. Lines: {:?}",
         handle.lines
     );

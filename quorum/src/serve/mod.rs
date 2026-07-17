@@ -644,6 +644,8 @@ pub(crate) struct SlotState {
     live_stats: LiveStats,
     error_turn_count: u32,
     agent_run_id: Option<i64>,
+    /// Daemon-issued run capability id (#130). Used for revocation on teardown.
+    cap_run_id: Option<String>,
     /// True when this reviewer slot is an R2 pre-merge reviewer. Survives
     /// across rework so the daemon routes re-submissions back to R2.
     r2_origin: bool,
@@ -1296,17 +1298,11 @@ async fn tick(
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
                 .ok();
-            } else if lifetime_roster.owns(&row.agent) {
+            } else {
+                // #130: no passive agent handling — unmatched task_updates
+                // are consumed as phantoms.
                 log(&format!(
                     "consuming unmatched task_update from {} (no active worker)",
-                    row.agent
-                ));
-            } else {
-                // Passive agent task_update — no worker slot, but consume
-                // so it doesn't accumulate. daemon_lock (invariant 11)
-                // guarantees single daemon per DB.
-                log(&format!(
-                    "consuming task_update from passive agent {} (no active worker)",
                     row.agent
                 ));
             }
@@ -2896,100 +2892,14 @@ async fn tick(
         }
 
         // F9: Done row matches neither worker nor reviewer.
-        //
-        // Roster-owned names with no active slot are phantoms from a prior
-        // turn — consume (F9) so they don't re-poll.
-        //
-        // Non-roster names are passive/interactive agents. daemon_lock
-        // (invariant 11) guarantees a single daemon per DB, so there is no
-        // sibling instance to defer to. Look up the agent's working task
-        // and fire the lifecycle event so passive agents enter review.
-        if lifetime_roster.owns(&row.agent) {
-            log(&format!(
-                "consuming unmatched Done row from {} (matches no active agent)",
-                row.agent
-            ));
-            if !consume_mailbox_row(&db_path, *id).await {
-                break;
-            }
-        } else {
-            // Passive agent submit: find their working task and fire lifecycle.
-            let agent_name = row.agent.clone();
-            let row_pr = row.pr;
-            let passive_task = {
-                let p = db_path.clone();
-                let a = agent_name.clone();
-                tokio::task::spawn_blocking(move || -> Result<Option<(i64, Option<i64>)>> {
-                    let conn = quorum_core::db::open(&p)?;
-                    let working = tasks::list(&conn, Some("working"), None, Some(&a))?;
-                    Ok(working
-                        .first()
-                        .map(|t| (t.id, tasks::extract_pr_number(&t.refs))))
-                })
-                .await
-            };
-            match passive_task {
-                Ok(Ok(Some((task_id, refs_pr)))) => {
-                    let effective_pr = row_pr.or(refs_pr);
-                    if let Some(pr) = effective_pr {
-                        log(&format!(
-                            "passive agent {} submit: task #{task_id} PR #{pr} — firing SignaledDone",
-                            agent_name
-                        ));
-                        let event = Event::SignaledDone { pr: pr.to_string() };
-                        let tr = fire_event(&db_path, &agent_name, task_id, &event).await;
-                        if tr.is_none() {
-                            log(&format!(
-                                "lifecycle rejected SignaledDone for passive agent {} task #{task_id}",
-                                agent_name
-                            ));
-                        }
-                    } else {
-                        // Done without PR — close directly.
-                        log(&format!(
-                            "passive agent {} submit: task #{task_id} no PR — closing directly",
-                            agent_name
-                        ));
-                        let p = db_path.clone();
-                        tokio::task::spawn_blocking(move || -> Result<()> {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            let now = now_unix();
-                            tasks::close_after_merge(
-                                &mut conn,
-                                task_id,
-                                "done without PR (passive)",
-                                now,
-                            )?;
-                            Ok(())
-                        })
-                        .await
-                        .ok();
-                    }
-                }
-                Ok(Ok(None)) => {
-                    log(&format!(
-                        "passive agent {} submit: no working task found — consuming as phantom",
-                        agent_name
-                    ));
-                }
-                Ok(Err(e)) => {
-                    log(&format!(
-                        "ERROR: passive agent {} task lookup failed: {e} — leaving row for retry",
-                        agent_name
-                    ));
-                    continue;
-                }
-                Err(e) => {
-                    log(&format!(
-                        "ERROR: passive agent {} task lookup join error: {e} — leaving row for retry",
-                        agent_name
-                    ));
-                    continue;
-                }
-            }
-            if !consume_mailbox_row(&db_path, *id).await {
-                break;
-            }
+        // #130: no passive agent handling — all unmatched Done rows are
+        // consumed as phantoms regardless of roster ownership.
+        log(&format!(
+            "consuming unmatched Done row from {} (matches no active agent)",
+            row.agent
+        ));
+        if !consume_mailbox_row(&db_path, *id).await {
+            break;
         }
     }
 
@@ -3461,6 +3371,29 @@ async fn tick(
                 log(&format!("consuming message to {target} (no active worker)"));
                 consume_mailbox_row(&db_path, *msg_id).await;
             }
+        }
+    }
+
+    // ── Phase 4d: Renew task leases for active workers (#130) ───────────
+    // The daemon explicitly renews the exact lease for each active worker's
+    // task. External writes (sync, post, etc.) no longer auto-renew leases.
+    {
+        let p = db_path.clone();
+        let active_pairs: Vec<(String, i64)> = workers
+            .iter()
+            .map(|w| (w.agent_name.clone(), w.task_id))
+            .collect();
+        if !active_pairs.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = quorum_core::db::open(&p) {
+                    let now = now_unix();
+                    for (agent, task_id) in &active_pairs {
+                        let _ = quorum_core::agents::renew_task_lease(&conn, agent, *task_id, now);
+                    }
+                }
+            })
+            .await
+            .ok();
         }
     }
 
@@ -4735,6 +4668,30 @@ async fn spawn_reviewer_for_worker(
         reviewer_name: reviewer_name.clone(),
     };
 
+    // #130: issue the run capability BEFORE spawning so the reviewer inherits
+    // QUORUM_RUN_ID in its environment. Reviewer `submit --verdict` uses this
+    // to authenticate against the daemon-owned run instead of falling back to
+    // agent-name compat auth. Any issue failure is loud (see below).
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    {
+        let p = config.db_path.clone();
+        let rid = cap_run_id.clone();
+        let name = reviewer_name.clone();
+        let tid = worker.task_id;
+        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        if let Err(e) = issue_res {
+            log(&format!(
+                "reviewer capability issue failed for task {} agent {}: {e} — reviewer will fall back to compat auth",
+                worker.task_id, reviewer_name
+            ));
+        }
+    }
+
     match reviewer::spawn_reviewer(
         &reviewer_model,
         &config.effort,
@@ -4745,6 +4702,7 @@ async fn spawn_reviewer_for_worker(
         vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), reviewer_name.clone()),
+            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
         ],
         config.allowed_tools.as_deref(),
     )
@@ -4856,6 +4814,7 @@ async fn spawn_reviewer_for_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 agent_run_id: reviewer_run_id,
+                cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
             });
@@ -5128,6 +5087,30 @@ async fn spawn_worker(
         }
     }
 
+    // #130: issue run capability for this worker (before spawn so env var is available).
+    // A silent issue failure would leave the worker holding a QUORUM_RUN_ID pointing at
+    // no row — every capability-validated submit would then exit 2 and only the compat
+    // (agent-name) path could save it. Log loudly so the operator sees the degrade.
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    {
+        let p = db_path.clone();
+        let rid = cap_run_id.clone();
+        let name = agent_name.clone();
+        let tid = task.id;
+        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "worker", now_unix())
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        if let Err(e) = issue_res {
+            log(&format!(
+                "worker capability issue failed for task {} agent {agent_name}: {e} — worker will fall back to compat auth",
+                task.id
+            ));
+        }
+    }
+
     let spec = AgentSpec {
         model: resolved_model.clone(),
         effort: resolved_effort.clone(),
@@ -5141,6 +5124,7 @@ async fn spawn_worker(
         env_vars: vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), agent_name.clone()),
+            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
         ],
     };
     match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
@@ -5235,6 +5219,7 @@ async fn spawn_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 agent_run_id: worker_run_id,
+                cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
             });
@@ -5536,6 +5521,19 @@ async fn teardown_worker_with_body(
     };
     close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
+    // #130: revoke run capability
+    if let Some(ref rid) = state.cap_run_id {
+        let p = config.db_path.clone();
+        let rid = rid.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                let _ = quorum_core::capabilities::revoke(&mut conn, &rid, now_unix());
+            }
+        })
+        .await
+        .ok();
+    }
+
     if task_status == "open" {
         fire_event(
             &config.db_path,
@@ -5601,6 +5599,19 @@ async fn teardown_reviewer(
 
     state.proc.kill_and_reap().await;
     close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
+
+    // #130: revoke run capability
+    if let Some(ref rid) = state.cap_run_id {
+        let p = config.db_path.clone();
+        let rid = rid.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                let _ = quorum_core::capabilities::revoke(&mut conn, &rid, now_unix());
+            }
+        })
+        .await
+        .ok();
+    }
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
@@ -5741,6 +5752,27 @@ async fn spawn_r2_reviewer(
         r2_name: r2_name.clone(),
     };
 
+    // #130: issue R2 run capability BEFORE spawn so QUORUM_RUN_ID is inherited.
+    let cap_run_id = uuid::Uuid::new_v4().to_string();
+    {
+        let p = config.db_path.clone();
+        let rid = cap_run_id.clone();
+        let name = r2_name.clone();
+        let tid = worker.task_id;
+        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        if let Err(e) = issue_res {
+            log(&format!(
+                "R2 capability issue failed for task {} agent {r2_name}: {e} — R2 will fall back to compat auth",
+                worker.task_id
+            ));
+        }
+    }
+
     match reviewer::spawn_reviewer(
         &reviewer_model,
         &config.effort,
@@ -5751,6 +5783,7 @@ async fn spawn_r2_reviewer(
         vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), r2_name.clone()),
+            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
         ],
         config.allowed_tools.as_deref(),
     )
@@ -5852,6 +5885,7 @@ async fn spawn_r2_reviewer(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 agent_run_id: reviewer_run_id,
+                cap_run_id: Some(cap_run_id),
                 r2_origin: true,
                 reviewed_head_sha: spawn_head_sha,
             });
@@ -6385,6 +6419,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             agent_run_id: None,
+            cap_run_id: None,
             r2_origin: false,
             reviewed_head_sha: None,
         }
