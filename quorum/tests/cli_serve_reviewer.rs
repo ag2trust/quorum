@@ -464,6 +464,26 @@ fn changes_verdict_feeds_rework_to_same_warm_worker() {
         handle.lines
     );
 
+    // Task #124: the daemon must NOT mirror the reviewer's `changes` verdict
+    // into a duplicate generic GitHub REQUEST_CHANGES review. Reviewer agents
+    // own their GitHub review interactions on the PR; the daemon retains only
+    // final formal APPROVE + merge. Prior to #124 the daemon logged
+    // `posted REQUEST_CHANGES on PR #N` (or a failure/join-error variant) on
+    // this path; the absence of any REQUEST_CHANGES log is the runtime
+    // guardrail that the mirror is dead, while the rework transition + fed
+    // feedback above prove the lifecycle + worker-context path is preserved.
+    let request_changes_mentions = handle
+        .lines
+        .iter()
+        .filter(|l| l.contains("REQUEST_CHANGES"))
+        .count();
+    assert_eq!(
+        request_changes_mentions, 0,
+        "daemon must not log any REQUEST_CHANGES mirror activity on a changes verdict. \
+         Lines: {:?}",
+        handle.lines
+    );
+
     // Task status: lifecycle transitions to "rework" during rework.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())

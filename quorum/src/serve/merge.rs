@@ -141,17 +141,10 @@ pub trait MergeExecutor: Send + Sync {
         DefaultBranchStatus::Green
     }
 
-    /// Post a formal REQUEST_CHANGES review on the PR — the durable
-    /// GitHub-side record of a `changes` verdict (#206). Best-effort: the
-    /// caller logs failures and proceeds with rework regardless. Default
-    /// no-op so mock executors are unaffected.
-    fn request_changes(&self, _pr: i64, _repo_dir: &Path, _feedback: &str) -> MergeResult {
-        MergeResult {
-            success: true,
-            message: String::new(),
-            failure_kind: None,
-        }
-    }
+    // Task #124: the daemon no longer posts REQUEST_CHANGES reviews. Reviewer
+    // agents own their own GitHub review interactions on the PR (inline
+    // comments, review summaries, `gh pr review --request-changes`). The
+    // daemon retains only the final formal APPROVE + merge.
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
@@ -734,25 +727,6 @@ impl MergeExecutor for GhMergeExecutor {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_default_branch_ci(&stdout)
-    }
-
-    fn request_changes(&self, pr: i64, repo_dir: &Path, feedback: &str) -> MergeResult {
-        let pr_str = pr.to_string();
-        let body = format!(
-            "Changes requested — per daemon reviewer verdict (durable record, \
-             #206 review integrity).\n\n{feedback}"
-        );
-        self.run_gh(
-            &[
-                "pr",
-                "review",
-                &pr_str,
-                "--request-changes",
-                "--body",
-                &body,
-            ],
-            repo_dir,
-        )
     }
 }
 

@@ -2344,28 +2344,14 @@ async fn tick(
                         .await;
                     }
 
-                    // Mirror the changes verdict to GitHub (best-effort).
-                    if let Some(pr_num) = row.pr {
-                        let repo = config.repo_dir.clone();
-                        let executor = Arc::clone(&config.merge_executor);
-                        let fb = feedback.to_string();
-                        match tokio::task::spawn_blocking(move || {
-                            executor.request_changes(pr_num, &repo, &fb)
-                        })
-                        .await
-                        {
-                            Ok(r) if r.success => {
-                                log(&format!("posted REQUEST_CHANGES on PR #{pr_num}"));
-                            }
-                            Ok(r) => log(&format!(
-                                "REQUEST_CHANGES on PR #{pr_num} failed (non-blocking): {}",
-                                r.message
-                            )),
-                            Err(e) => log(&format!(
-                                "REQUEST_CHANGES spawn_blocking join failed (non-blocking): {e}"
-                            )),
-                        }
-                    }
+                    // Task #124: the daemon no longer mirrors the reviewer's
+                    // changes verdict into a duplicate generic GitHub
+                    // REQUEST_CHANGES review. Reviewer agents own their own
+                    // GitHub review interactions (inline comments, review
+                    // summaries, `gh pr review --request-changes`) — the PR is
+                    // the source of truth for findings + author pushback.
+                    // The submit feedback is still fed to the warm worker as
+                    // rework-turn context below.
 
                     // #90: record the changes verdict in approvals (mirrors approved path).
                     if let Some(pr_num) = row.pr {
