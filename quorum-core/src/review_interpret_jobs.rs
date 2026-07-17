@@ -33,6 +33,21 @@ pub const MAX_ATTEMPTS: i64 = 5;
 /// before dead-lettering.
 pub const BACKOFF_BASE_SECS: i64 = 60;
 
+/// Post-enqueue grace window for a freshly-enqueued (attempts=0) job. #125's
+/// `spawn_post_merge_collector` already fires an immediate collector at
+/// MergeSucceeded time; without this grace the tick's Phase 7.5 drain would
+/// respawn a redundant second collector for the same PR ~2s later, doubling
+/// cost on every successful merge. The grace waits long enough for the
+/// primary spawn to write `review_collection_runs` (success or failed) —
+/// once that lands, the tick sweep deletes the queue row entirely. If no
+/// run row appears after the grace (crashed / lost), the retry drain
+/// takes over.
+///
+/// Sized above the classifier's 180s hard timeout in `serve::collector`
+/// so a normally-slow (but eventually-successful) collector still resolves
+/// via the primary path.
+pub const INITIAL_GRACE_SECS: i64 = 240;
+
 /// A pending or in-flight interpretation job. One row per PR (primary key).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InterpretJob {
@@ -120,17 +135,33 @@ pub fn list_all(conn: &Connection) -> Result<Vec<InterpretJob>> {
 /// load-bearing fail-safe: without the exclusion the daemon respawns the
 /// same failing collector every ~2 ticks indefinitely.
 pub fn list_ready(conn: &Connection, now_unix: i64) -> Result<Vec<InterpretJob>> {
+    // The eligibility clause reads as:
+    //  - Never past the retry cap (attempts < MAX_ATTEMPTS).
+    //  - A never-attempted (attempts=0) job waits INITIAL_GRACE_SECS after
+    //    created_at, so the primary #125 spawn has time to write its run
+    //    record. Without this the drain would immediately spawn a redundant
+    //    second collector for every merged PR.
+    //  - A retried (attempts>0) job waits BACKOFF_BASE_SECS * attempts after
+    //    its last attempt — linear backoff.
     let mut stmt = conn.prepare(
         "SELECT pr_number, task_id, repo, interpreter_version, attempts,
                 last_attempt_at, last_error, created_at
          FROM review_interpret_jobs
          WHERE attempts < ?1
-           AND (last_attempt_at IS NULL
-                OR last_attempt_at + (?2 * attempts) <= ?3)
+           AND (
+                (attempts = 0 AND created_at + ?4 <= ?3)
+                OR (attempts > 0 AND (last_attempt_at IS NULL
+                                      OR last_attempt_at + (?2 * attempts) <= ?3))
+           )
          ORDER BY attempts ASC, last_attempt_at ASC, created_at ASC, pr_number ASC",
     )?;
     let rows = stmt.query_map(
-        params![MAX_ATTEMPTS, BACKOFF_BASE_SECS, now_unix],
+        params![
+            MAX_ATTEMPTS,
+            BACKOFF_BASE_SECS,
+            now_unix,
+            INITIAL_GRACE_SECS,
+        ],
         row_from_sql,
     )?;
     let mut out = Vec::new();
@@ -498,8 +529,6 @@ mod tests {
     fn list_ready_respects_backoff_window() {
         let (mut conn, _dir) = test_conn();
         enqueue(&mut conn, 500, 42, None, "v1").unwrap();
-        let now = 1_000_000;
-        assert_eq!(list_ready(&conn, now).unwrap().len(), 1);
 
         mark_error(&mut conn, 500, "boom").unwrap();
         let job = get(&conn, 500).unwrap().unwrap();
@@ -509,6 +538,29 @@ mod tests {
         assert!(list_ready(&conn, mid).unwrap().is_empty());
         let ready_at = just_failed + BACKOFF_BASE_SECS * job.attempts;
         assert_eq!(list_ready(&conn, ready_at).unwrap().len(), 1);
+    }
+
+    /// Grace window on fresh (attempts=0) jobs prevents Phase 7.5 from
+    /// double-spawning the collector that #125 already fires at merge time.
+    /// Before INITIAL_GRACE_SECS elapses: not ready. After: ready.
+    #[test]
+    fn list_ready_honors_initial_grace_for_fresh_jobs() {
+        let (mut conn, _dir) = test_conn();
+        enqueue(&mut conn, 500, 42, None, "v1").unwrap();
+        let created = get(&conn, 500).unwrap().unwrap().created_at;
+        // Immediately after enqueue — not ready (grace window).
+        assert!(list_ready(&conn, created).unwrap().is_empty());
+        // Halfway through the window — still not ready.
+        assert!(list_ready(&conn, created + INITIAL_GRACE_SECS / 2)
+            .unwrap()
+            .is_empty());
+        // At the boundary — ready (crash-safety kicks in).
+        assert_eq!(
+            list_ready(&conn, created + INITIAL_GRACE_SECS)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Fail-safe: a poison job (permanently failing) must NOT wedge the queue.
@@ -522,7 +574,9 @@ mod tests {
             mark_error(&mut conn, 500, "unparseable haiku output").unwrap();
         }
         enqueue(&mut conn, 501, 43, None, "v1").unwrap();
-        let ready = list_ready(&conn, 1_000_000_000).unwrap();
+        // Look far into the future so both jobs are past their eligibility
+        // window (backoff for poison, grace for fresh).
+        let ready = list_ready(&conn, 9_999_999_999).unwrap();
         assert!(!ready.is_empty());
         assert_eq!(
             ready[0].pr_number, 501,

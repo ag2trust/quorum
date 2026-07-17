@@ -386,11 +386,13 @@ async fn enqueue_interpret_job(db_path: &std::path::Path, pr_num: i64, task_id: 
 /// One tick's post-merge collector-queue work packed for the spawn_blocking
 /// boundary. `converged` counts jobs whose successful run just landed;
 /// `next` is the job (if any) whose attempt was reserved and now needs an
-/// out-of-tokio spawn; `dead` is the dead-letter view for the operator log.
+/// out-of-tokio spawn; `just_dead_lettered` is populated when this tick's
+/// reservation caused a row to cross the cap — the operator log line fires
+/// exactly once per PR that dies, not once per tick per PR.
 struct InterpretTickOutcome {
     converged: usize,
     next: Option<quorum_core::review_interpret_jobs::InterpretJob>,
-    dead: Vec<quorum_core::review_interpret_jobs::InterpretJob>,
+    just_dead_lettered: Option<(i64, i64, i64)>,
 }
 
 async fn close_agent_run(db_path: &std::path::Path, run_id: Option<i64>, end_reason: &str) {
@@ -3906,28 +3908,36 @@ async fn tick(
             // 7.5b: pick one ready job. `list_ready` orders by
             // (attempts asc, oldest last_attempt_at asc), so a fresh
             // job always beats a retry and a poison job cannot starve
-            // later work. `list_ready` also excludes rows at MAX_ATTEMPTS.
+            // later work. `list_ready` also excludes rows at MAX_ATTEMPTS
+            // and applies the initial grace + per-attempt backoff (see
+            // review_interpret_jobs::list_ready).
             let ready = quorum_core::review_interpret_jobs::list_ready(&conn, now_ts)?;
             let next = ready.into_iter().next();
-            // 7.5c: surface dead-lettered rows in the tick log.
-            let dead = quorum_core::review_interpret_jobs::over_cap(&conn)?;
             // If we're about to spawn, reserve the attempt now so that
             // this same job cannot be re-picked next tick if the spawn
             // races ahead of its run-record write. Reserving = mark_error
             // with a placeholder — the run-record itself (success or
             // failed) is the ground truth; the queue row's last_error
-            // is only informational.
+            // is only informational. The returned attempt count lets us
+            // log a one-time DEAD-LETTER line at the exact tick a row
+            // crosses the cap (dead-lettered rows are then excluded from
+            // future list_ready calls, so the log never fires again for
+            // the same PR).
+            let mut just_dead_lettered = None;
             if let Some(job) = &next {
-                quorum_core::review_interpret_jobs::mark_error(
+                let attempts = quorum_core::review_interpret_jobs::mark_error(
                     &mut conn,
                     job.pr_number,
                     "retry-spawn-in-flight",
                 )?;
+                if attempts >= quorum_core::review_interpret_jobs::MAX_ATTEMPTS {
+                    just_dead_lettered = Some((job.pr_number, job.task_id, attempts));
+                }
             }
             Ok(InterpretTickOutcome {
                 converged,
                 next,
-                dead,
+                just_dead_lettered,
             })
         })
         .await
@@ -3940,13 +3950,11 @@ async fn tick(
                 collector::COLLECTOR_VERSION
             ));
         }
-        for job in &outcome.dead {
+        if let Some((pr, task_id, attempts)) = outcome.just_dead_lettered {
             log(&format!(
-                "interpret: DEAD-LETTER PR #{} (task #{}, attempts={}): {}",
-                job.pr_number,
-                job.task_id,
-                job.attempts,
-                job.last_error.as_deref().unwrap_or("(no error recorded)")
+                "interpret: DEAD-LETTER PR #{pr} (task #{task_id}) — \
+                 {attempts} failed attempts, giving up (visible via startup \
+                 reconcile until the row is deleted)"
             ));
         }
         if let Some(job) = outcome.next {
