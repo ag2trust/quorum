@@ -122,6 +122,10 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::ReviewInterpret { .. } => "review-interpret",
         cli::Command::Upgrade { .. } => "upgrade",
         cli::Command::Help => "help",
+        cli::Command::InspectMessage { .. } => "inspect-message",
+        cli::Command::InspectMessages { .. } => "inspect-messages",
+        cli::Command::InspectEvents { .. } => "inspect-events",
+        cli::Command::InspectErrors { .. } => "inspect-errors",
     }
 }
 
@@ -1605,6 +1609,177 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::Help => {
             print!("{}", cheatsheet::CHEATSHEET);
+            Ok(0)
+        }
+        cli::Command::InspectMessage { seq, raw } => {
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            match quorum_core::inspect::get_message(&conn, seq, now)? {
+                Some(msg) => {
+                    if raw {
+                        output::emit(&msg);
+                    } else {
+                        output::emit(&serde_json::json!({
+                            "message": msg,
+                            "as_of": now,
+                            "retention": quorum_core::inspect::MESSAGES_RETENTION,
+                        }));
+                    }
+                    Ok(0)
+                }
+                None => {
+                    output::emit(&serde_json::json!({
+                        "ok": false,
+                        "reason": "not found",
+                        "as_of": now,
+                        "retention": quorum_core::inspect::MESSAGES_RETENTION,
+                    }));
+                    Ok(1)
+                }
+            }
+        }
+        cli::Command::InspectMessages {
+            author,
+            recipient,
+            kind,
+            topic,
+            refs_contains,
+            state,
+            since_seq,
+            before_seq,
+            since_ts,
+            before_ts,
+            limit,
+            raw,
+        } => {
+            if let Some(ref s) = state {
+                if s != "live" && s != "expired" {
+                    return Err(QuorumError::Usage(format!(
+                        "--state must be 'live' or 'expired' (got '{s}')"
+                    )));
+                }
+            }
+            check_nonneg("--limit", limit)?;
+            let read_limit = load_cfg()?.read_limit;
+            let effective_limit = limit.unwrap_or(read_limit);
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let f = quorum_core::inspect::MessagesFilter {
+                author: author.as_deref(),
+                recipient: recipient.as_deref(),
+                kind: kind.as_deref(),
+                topic: topic.as_deref(),
+                refs_contains: refs_contains.as_deref(),
+                state: state.as_deref(),
+                since_seq,
+                before_seq,
+                since_ts,
+                before_ts,
+                limit: effective_limit,
+            };
+            let msgs = quorum_core::inspect::list_messages(&conn, &f, now)?;
+            if raw {
+                output::emit(&msgs);
+            } else {
+                let bounded = msgs.len() as i64 >= effective_limit;
+                output::emit(&serde_json::json!({
+                    "messages": msgs,
+                    "count": msgs.len(),
+                    "bounded": bounded,
+                    "as_of": now,
+                    "retention": quorum_core::inspect::MESSAGES_RETENTION,
+                }));
+            }
+            Ok(0)
+        }
+        cli::Command::InspectEvents {
+            kind,
+            subject,
+            state,
+            since_seq,
+            before_seq,
+            since_ts,
+            before_ts,
+            limit,
+            raw,
+        } => {
+            if let Some(ref s) = state {
+                if s != "live" && s != "expired" {
+                    return Err(QuorumError::Usage(format!(
+                        "--state must be 'live' or 'expired' (got '{s}')"
+                    )));
+                }
+            }
+            check_nonneg("--limit", limit)?;
+            let read_limit = load_cfg()?.read_limit;
+            let effective_limit = limit.unwrap_or(read_limit);
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let f = quorum_core::inspect::EventsFilter {
+                kind: kind.as_deref(),
+                subject: subject.as_deref(),
+                state: state.as_deref(),
+                since_seq,
+                before_seq,
+                since_ts,
+                before_ts,
+                limit: effective_limit,
+            };
+            let evts = quorum_core::inspect::list_events(&conn, &f, now)?;
+            if raw {
+                output::emit(&evts);
+            } else {
+                let bounded = evts.len() as i64 >= effective_limit;
+                output::emit(&serde_json::json!({
+                    "events": evts,
+                    "count": evts.len(),
+                    "bounded": bounded,
+                    "as_of": now,
+                    "retention": quorum_core::inspect::EVENTS_RETENTION,
+                }));
+            }
+            Ok(0)
+        }
+        cli::Command::InspectErrors {
+            source,
+            state,
+            since_id,
+            before_id,
+            since_ts,
+            before_ts,
+            limit,
+            raw,
+        } => {
+            if let Some(ref s) = state {
+                if s != "live" && s != "expired" {
+                    return Err(QuorumError::Usage(format!(
+                        "--state must be 'live' or 'expired' (got '{s}')"
+                    )));
+                }
+            }
+            check_nonneg("--limit", limit)?;
+            let read_limit = load_cfg()?.read_limit;
+            let effective_limit = limit.unwrap_or(read_limit);
+            let conn = quorum_core::db::open(&paths::db_path()?)?;
+            let f = quorum_core::inspect::ErrorsFilter {
+                source: source.as_deref(),
+                state: state.as_deref(),
+                since_id,
+                before_id,
+                since_ts,
+                before_ts,
+                limit: effective_limit,
+            };
+            let errs = quorum_core::inspect::list_errors(&conn, &f, now)?;
+            if raw {
+                output::emit(&errs);
+            } else {
+                let bounded = errs.len() as i64 >= effective_limit;
+                output::emit(&serde_json::json!({
+                    "errors": errs,
+                    "count": errs.len(),
+                    "bounded": bounded,
+                    "as_of": now,
+                    "retention": quorum_core::inspect::ERRORS_RETENTION,
+                }));
+            }
             Ok(0)
         }
     }

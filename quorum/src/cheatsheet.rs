@@ -91,6 +91,22 @@ DAEMON IPC (M5 — agent-to-agent messaging + state reactions)
                                                       # hard-terminate a daemon-managed agent (SIGTERM->SIGKILL);
                                                       # task returns to open. daemon-down = row waits until consumed.
 
+INSPECT (read-only diagnostics — includes expired rows, retention caveats)
+  quorum inspect-message --seq <n> [--raw]       # single message by seq (live or expired)
+  quorum inspect-messages [--author <a>] [--recipient <r>] [--kind <k>] [--topic <t>]
+                          [--refs-contains <s>] [--state live|expired]
+                          [--since-seq N] [--before-seq N] [--since-ts N] [--before-ts N]
+                          [--limit N] [--raw]    # bounded message listing with filters
+  quorum inspect-events [--kind <k>] [--subject <s>] [--state live|expired]
+                        [--since-seq N] [--before-seq N] [--since-ts N] [--before-ts N]
+                        [--limit N] [--raw]      # bounded event listing with filters
+  quorum inspect-errors [--source <s>] [--state live|expired]
+                        [--since-id N] [--before-id N] [--since-ts N] [--before-ts N]
+                        [--limit N] [--raw]      # bounded error listing with filters
+  # All inspect outputs include as_of timestamp and retention notes. Absence of a row
+  # does not prove the event/message/error never existed — rows expire per TTL and may
+  # be swept. --raw omits the wrapper (as_of, retention, bounded).
+
 OPS
   quorum status [--watch] [--json] [--agents]    # health snapshot; --agents = agent presence (online/offline)
   quorum perf [--json] [--by complexity|reviewer]

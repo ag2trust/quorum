@@ -18,6 +18,7 @@ pub mod errlog;
 pub mod error;
 pub mod events;
 pub mod feed;
+pub mod inspect;
 pub mod journal;
 pub mod lifecycle;
 pub mod mailbox;
