@@ -94,6 +94,7 @@ pub struct TierQueueCount {
 pub struct BlockedTask {
     pub id: i64,
     pub title: String,
+    pub tier_eff: String,
     pub waiting_on: Vec<i64>,
     /// Dep ids that are cancelled — will never unblock without intervention.
     pub deadlocked_on: Vec<i64>,
@@ -651,18 +652,19 @@ fn queue_by_tier(conn: &Connection) -> Result<Vec<TierQueueCount>> {
 /// list of dep ids it's waiting on (only deps that are NOT yet `closed`).
 fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
+        "SELECT id, title, labels, depends_on FROM tasks WHERE status='open' AND depends_on IS NOT NULL",
     )?;
     let rows = stmt
         .query_map([], |r| {
             let id: i64 = r.get(0)?;
             let title: String = r.get(1)?;
-            let depends_on: Option<String> = r.get(2)?;
-            Ok((id, title, depends_on))
+            let labels: Option<String> = r.get(2)?;
+            let depends_on: Option<String> = r.get(3)?;
+            Ok((id, title, labels, depends_on))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut blocked = Vec::new();
-    for (id, title, depends_on) in rows {
+    for (id, title, labels, depends_on) in rows {
         let ready = crate::tasks::compute_ready(conn, &depends_on)?;
         if ready {
             continue;
@@ -672,6 +674,7 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
         blocked.push(BlockedTask {
             id,
             title,
+            tier_eff: tier_eff_label(labels.as_deref()),
             waiting_on,
             deadlocked_on,
         });
@@ -1840,6 +1843,7 @@ mod tests {
         assert!(b_ids.contains(&t3));
         let b2 = s.blocked.iter().find(|b| b.id == t2).unwrap();
         assert_eq!(b2.waiting_on, vec![t1]);
+        assert_eq!(b2.tier_eff, "opus46");
         let b3 = s.blocked.iter().find(|b| b.id == t3).unwrap();
         assert_eq!(b3.waiting_on, vec![t2]);
     }
