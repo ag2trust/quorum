@@ -432,11 +432,15 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
     );
     for b in blocked {
         let (model, effort) = split_tier_eff(Some(&b.tier_eff));
-        let dep = b
-            .waiting_on
-            .first()
-            .map(|d| format!("#{d}"))
-            .unwrap_or_else(|| "?".to_string());
+        let dep = if b.waiting_on.is_empty() {
+            "?".to_string()
+        } else {
+            b.waiting_on
+                .iter()
+                .map(|d| format!("#{d}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let is_deadlocked = !b.deadlocked_on.is_empty();
         let block_icon = if is_deadlocked {
             if sty.color {
@@ -1112,6 +1116,54 @@ mod tests {
         assert!(
             output.contains("r2 audit"),
             "R2 reviewer subrow must show 'r2 audit' label: {output}"
+        );
+    }
+
+    #[test]
+    fn blocked_shows_all_dependency_ids() {
+        let mut s = default_stats();
+        s.blocked.push(BlockedTask {
+            id: 10,
+            title: "multi-dep task".into(),
+            tier_eff: "opus46·hi".into(),
+            waiting_on: vec![4, 6, 9],
+            deadlocked_on: vec![],
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("#10")).unwrap();
+        assert!(
+            line.contains("#4") && line.contains("#6") && line.contains("#9"),
+            "all dep ids must appear: {line}"
+        );
+        assert!(
+            line.contains("#4, #6, #9"),
+            "dep ids must be comma-separated: {line}"
+        );
+    }
+
+    #[test]
+    fn blocked_mixed_live_and_cancelled_deps() {
+        let mut s = default_stats();
+        s.blocked.push(BlockedTask {
+            id: 20,
+            title: "mixed-dep task".into(),
+            tier_eff: "opus46·md".into(),
+            waiting_on: vec![3, 5, 7],
+            deadlocked_on: vec![5],
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("#20")).unwrap();
+        assert!(
+            line.contains("#3") && line.contains("#5") && line.contains("#7"),
+            "all blocker ids must appear in waits-on: {line}"
+        );
+        assert!(
+            line.contains("CANCELLED") && line.contains("#5"),
+            "cancelled dep detail must appear: {line}"
         );
     }
 
