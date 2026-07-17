@@ -1,8 +1,8 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
-· v2 boundary specified (§ Daemon-only execution)
+· v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
 
 ## Principle (north star)
@@ -263,7 +263,7 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   be `done` before a task is claimable.
 - `quorum task-claim --agent <id> --task-id <n>` (on an `in-review` task) → fires
   `ReviewerAttached { agent }`, sets reviewer. **Guard:** agent must differ from author.
-- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through daemon-only `submit`. See § Daemon-only execution.)**
+- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
   non-terminal state; reason REQUIRED. Sets `done` but emits `task_closed_manual` event
@@ -490,13 +490,11 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
-- **Passive agent support:** `daemon_lock` (invariant 11) guarantees one daemon per DB.
-  A `submit` mailbox row from an agent not in the daemon's spawn roster is treated as a
-  passive/interactive agent submission: the daemon looks up the agent's working task by
-  assignee, fires `SignaledDone { pr }` (or closes directly if no PR), and consumes the
-  row. Phase 5b then spawns a reviewer on the next tick. Recovery skips working tasks
-  assigned to passive agents (not found in the journal). This gives interactive Claude Code
-  sessions the same review lifecycle as daemon-managed workers.
+- **No passive execution (v2).** External/interactive agents cannot claim, execute,
+  review, or submit tasks. The v1 passive-agent path (a `submit` mailbox row from an
+  agent not in the daemon's spawn roster) is removed in v2 (see § Daemon-only execution).
+  External agents that need work reviewed file `task-create --review-pr N` and the daemon
+  handles it through the normal lifecycle.
 
 ### Review responsibility boundary (agents own PR collaboration)
 
@@ -644,46 +642,106 @@ recorded failures (`SELECT * FROM review_collection_runs WHERE status='failed'`)
 
 **Date:** 2026-07-16
 **Status:** Specified, not yet implemented.
+**Supersedes:** PR #375 v2 boundary (merged 2026-07-16). This section is the
+corrected design of record. Where PR #375 text conflicts with this section,
+this section governs. Specific superseded clauses are cited inline with
+**(PR #375 §X — superseded)** markers.
 
 The v1 command surface grew organically: 29 subcommands, several unused by any
 caller, several that only the daemon should invoke but are freely available to
 any process. This section defines the v2 responsibility boundary — which
-commands are public (any named agent), which are daemon-internal (only
-daemon-managed runs), and which are operator/admin — and specifies the revised
-message, pin, and troubleshooting models.
+commands are public (any named agent), which are daemon-internal (Rust
+functions, not CLI commands), and which are operator/admin — and specifies the
+revised message delivery, pin, and troubleshooting models.
 
 ### Design goal
 
 Quorum's command surface should be **impossible to misuse by a well-behaved
-agent** — not merely "documented as off-limits." Daemon-only verbs (claim
-execution, lease management, lifecycle transitions, verdict emission) are
-enforced by capability, not convention. External agents interact through a
+agent** — not merely "documented as off-limits." The daemon drives execution
+(task selection, claiming, lease management, lifecycle transitions, verdict
+processing) through internal Rust functions in `quorum-core`, not through CLI
+subcommands that could be invoked by anyone. External agents interact through a
 small, safe surface: create work, describe it, annotate it, read state, and
-send messages.
+send messages. Names are attribution, not execution authority.
 
-### Capability model: run identity
+**No passive execution.** External callers never claim, execute, review, or
+submit tasks. **(PR #375 § "Passive agent support (preserved)" — superseded;
+PR #375 § `task-submit-external` — superseded.)** The `task-submit-external`
+command and `MailboxKind::ExternalSubmit` variant specified in PR #375 are
+removed from the target interface. The implicit passive-submit path (v1) is
+also removed. If an external/interactive agent needs work reviewed, they file
+a `task-create --review-pr N` and the daemon handles it through the normal
+lifecycle.
 
-Every CLI invocation already identifies itself via `--agent <name>`. The v2
-boundary adds a second axis: **run context**.
+### Capability model: per-run identity
+
+**(PR #375 § "Capability model: run identity" — superseded.)**
+
+PR #375 specified a single shared `QUORUM_DAEMON_TOKEN` — one per-daemon-
+instance secret injected into every spawned agent. This lets any worker
+impersonate any other worker or reviewer by invoking daemon-only CLI commands
+with the shared token. The v2 model replaces this with **immutable per-run
+identity**.
 
 | Context | How identified | What it can do |
 |---|---|---|
-| **Daemon-managed run** | `QUORUM_DAEMON_TOKEN` env var set by `quorum serve` at spawn time. Token is a per-daemon-instance random secret, not a credential — it proves "the daemon spawned me," not "I am authorized." | Full surface: sync, claim, submit, review, react, message (daemon-routed), plus all public commands. |
-| **External named caller** | Any invocation without `QUORUM_DAEMON_TOKEN`. Identified by `--agent <name>`. | Public commands only (see table below). |
-| **Operator / admin** | Human or privileged script. No special token — admin commands are inherently manual (stop/resume/kill affect the running system; misuse is loud and recoverable). | Public + admin commands. |
+| **Daemon-managed run** | `QUORUM_RUN_ID` env var set by `quorum serve` at spawn time. Each run ID is a unique opaque token tied to exactly one `(run_id, task_id, role)` triple. The daemon records it in `agent_runs`. | `submit` and `react` for its own task only. The run ID is verified against `agent_runs` — a run can only signal on the task and role it was spawned for. All public commands are also available. |
+| **External named caller** | Any invocation without `QUORUM_RUN_ID`. Identified by `--agent <name>`. | Public commands only (see table below). |
+| **Operator / admin** | Human or privileged script. No special token — admin commands are inherently manual and loud. | Public + admin commands. |
 
-The daemon generates `QUORUM_DAEMON_TOKEN` (a 128-bit hex string) once at
-startup and injects it into every spawned worker/reviewer environment. CLI
-commands in the daemon-only family check for this token and exit 2 ("not a
-daemon-managed run") if absent or mismatched. The token is **not** persisted —
-it dies with the daemon process, so a stale worker from a previous daemon
-instance cannot impersonate the current one.
+The daemon generates a unique run ID (128-bit hex) for **each** spawned
+worker/reviewer and injects `QUORUM_RUN_ID=<id>` into its environment. The
+run ID is recorded in `agent_runs` with the associated `task_id` and `role`
+(worker/r1/r2). CLI commands that require run identity (`submit`, `react`)
+verify `QUORUM_RUN_ID` against `agent_runs` — a worker for task #5 cannot
+submit on behalf of task #7.
 
-**Why not a DB-stored credential?** The token is a process-tree membership
-proof, not an access-control credential. Storing it in the DB would let any
-process that can read the DB file impersonate a daemon worker — the opposite
-of the goal. The env-var approach is the minimal mechanism that proves "this
-process was spawned by this daemon instance."
+**Why per-run, not per-daemon?** A shared daemon token is a process-tree
+membership proof but not an authorization boundary — it proves "the daemon
+spawned me" but grants the full daemon surface to every spawned agent. Per-run
+identity is the minimal mechanism that ties capability to scope: one run, one
+task, one role.
+
+**Stale-run detection.** A run ID that does not appear in `agent_runs` (daemon
+restarted, worker outlived its daemon) is rejected — exit 2, "unknown run."
+No DB-stored daemon-wide secret to verify against.
+
+### What managed agents can and cannot do
+
+Managed agents (workers, reviewers) are spawned by the daemon. They receive
+task context in their initial prompt — they do not discover or select tasks.
+Their CLI surface is:
+
+| Command | Purpose |
+|---|---|
+| `submit` | Signal task completion (`--pr N`) or emit review verdict (`--verdict approved\|changes`). Requires `QUORUM_RUN_ID`; verified against the run's task and role. |
+| `react` | Signal non-terminal agent state (blocked/failed/needs-info). Requires `QUORUM_RUN_ID`. |
+| `post` | Post a feed message (public command, available to all). |
+| All public commands | See table below. |
+
+**Not available to managed agents as CLI commands:**
+
+- `sync` — **(PR #375 § "Rationale for moving sync to daemon-only" —
+  superseded.)** `sync` is not moved to daemon-only; it is removed from the
+  v2 target interface entirely. The daemon already constructs context directly
+  (prompts, rework turns, messages) via internal Rust functions, never via
+  `quorum sync`. Managed agents receive context through stdin turns, not by
+  polling. External agents use `task-list`, `task-get`, `read`, `pins`,
+  `status`.
+- `task-claim` — **(PR #375 daemon-only `task-claim` — superseded.)**
+  `task-claim` is removed from the v2 target interface, not token-gated. The
+  daemon performs atomic task selection and claiming through internal
+  `quorum-core` functions (`tasks::claim`). Managed agents never invoke claim
+  commands.
+- `claim`/`release`/`renew`/`claims` (generic claims) — **(PR #375 § daemon-
+  only claims and rationale — superseded.)** PR #375 asserted "Generic claims
+  are used by the daemon to coordinate lock targets (PR branches, merge
+  slots)." Verified: the daemon (`quorum/src/serve/`) never calls
+  `claims::claim`/`release`/`renew` — all daemon lock coordination uses
+  `tasks::claim`. Generic claims have no verified production caller. They are
+  removed from the v2 target interface. The `claims` module and its tests
+  remain in `quorum-core` as a reusable primitive; the CLI commands are
+  retired.
 
 ### Command families
 
@@ -701,13 +759,13 @@ emit verdicts.
 | `task-create` | Create a task (status: `open`). Unchanged. | — |
 | `task-list` | List tasks with filters. Unchanged. | — |
 | `task-get` | Full task record including notes. Unchanged. | — |
-| `task-update` | Edit task metadata: title, body, labels, priority, refs, notes. **Cannot set status** (status-setting paths are removed from this command; see daemon-only `submit` and admin `task-close`/`cancel`). | v1 `task-update --status` (status-setting removed) |
+| `task-update` | Edit task metadata: title, body, labels, priority, refs, notes. **Cannot set status** (status-setting paths are removed from this command; see admin `task-close`/`cancel`). | v1 `task-update --status` (status-setting removed) |
 | `task-close` | Terminal close with required reason. Unchanged. | — |
 | `post` | Post a feed message. Unchanged. | — |
 | `read` | Read feed messages (with optional `--ack-through`). Unchanged. | — |
 | `peek` | Non-cursor feed read. Unchanged. | — |
 | `log` | Read event log. Unchanged. | — |
-| `pin` | Post a standing notice. **Gains `--expires-at` / `--ttl`** (see Pins below). | v1 `pin` (non-expiring only) |
+| `pin` | Post a standing notice. **Default TTL: 24h** (see Pins below). | v1 `pin` (non-expiring only) |
 | `unpin` | Remove a standing notice. Unchanged. | — |
 | `pins` | List standing notices. Unchanged. | — |
 | `inspect` | Deep read-only troubleshooting (see Inspect below). | — (new) |
@@ -720,34 +778,16 @@ emit verdicts.
 | `sweep` | Reclaim expired rows + WAL checkpoint. Unchanged. | — |
 | `upgrade` | Update embedded artifacts. Unchanged. | — |
 
-#### Daemon-only commands (require `QUORUM_DAEMON_TOKEN`)
+#### Run-scoped commands (require `QUORUM_RUN_ID`)
 
-These drive the task lifecycle state machine. Only daemon-managed workers and
-reviewers may invoke them. External callers get exit 2.
+These are the managed agent's interface to the lifecycle. The run ID is
+verified against `agent_runs` to ensure the caller can only act on its own
+task in its own role.
 
 | Command | Purpose | Retiring |
 |---|---|---|
-| `sync` | Agent orientation tick. Returns current/next task, messages, pins, signals. Auto-acks cursor, auto-renews leases. | — (was public; now daemon-only) |
-| `task-claim` | Claim a task (atomic). Fires `Claimed`/`ReviewerAttached`. | — (was public; now daemon-only) |
-| `submit` | Signal task completion or emit review verdict. Writes mailbox row for daemon. | — (was public; now daemon-only) |
-| `react` | Signal non-terminal agent state (blocked/failed/needs-info). | — (was public; now daemon-only) |
-| `message` | Send a message to another daemon-managed agent. Daemon delivers as a turn. | — (was public; now daemon-only) |
-| `claim` | Acquire a generic lock target. | — (was public; now daemon-only) |
-| `release` | Release a generic lock. | — (was public; now daemon-only) |
-| `renew` | Renew a generic lock lease. | — (was public; now daemon-only) |
-| `claims` | List active generic locks. | — (was public; now daemon-only) |
-
-**Rationale for moving `sync` to daemon-only:** `sync` is the heartbeat of a
-managed run — it auto-renews leases, auto-acks cursors, and returns the
-`next_task` pick. An external agent running `sync` would silently extend
-leases it shouldn't hold, consume messages intended for managed runs, and
-compete for task picks. External agents that need orientation use `task-list`,
-`task-get`, `read`, `pins`, and `status` — the public read surface.
-
-**Rationale for moving claims to daemon-only:** Generic claims (not task
-claims) are used by the daemon to coordinate lock targets (PR branches, merge
-slots). External callers have no legitimate use for them and could
-accidentally block daemon operations.
+| `submit` | Signal task completion or emit review verdict. Verified against run's `(task_id, role)`. | v1 `submit` (was unscoped) |
+| `react` | Signal non-terminal agent state (blocked/failed/needs-info). Verified against run's task. | v1 `react` (was unscoped) |
 
 #### Admin commands (operator / privileged)
 
@@ -756,190 +796,191 @@ manual, loud, and recoverable.
 
 | Command | Purpose | Retiring |
 |---|---|---|
-| `stop` | Halt agent(s). Non-expiring. | — |
-| `resume` | Clear a stop. | — |
-| `stops` | List active stops. | — |
-| `kill` | Hard-terminate a daemon-managed agent via mailbox. | — |
+| `kill` | Hard-terminate a daemon-managed agent. Emergency only. | — |
 | `serve` | Launch the daemon. | — |
 | `classify` | Manual task classification backfill. | — |
 | `review-interpret` | Manual review-findings extraction. | — |
 | `session-register` | Activity hook registration (experimental). | — |
 | `activity` | Activity hook event (experimental). | — |
 
+**(PR #375 § admin `stop`/`resume`/`stops` — superseded.)** See § Stop and
+kill below.
+
 #### Removed commands (v2)
 
 | Command | Reason | Replacement |
 |---|---|---|
-| `task-update --status <s>` | Status-setting bypasses lifecycle. | `submit` (daemon-only) for completion/verdict; `task-close` (public) for manual terminal close; `task-update --status cancelled` remains as the one exception (cancel is always allowed from non-terminal). |
-| `done` (alias) | Deprecated alias for `submit`. | `submit` (daemon-only). The alias is removed, not just hidden. |
+| `sync` | Daemon constructs context internally; agents receive via stdin. | Daemon-internal functions. External callers use `task-list`/`task-get`/`read`/`pins`/`status`. |
+| `task-claim` | Daemon claims internally; agents receive task context in prompts. | Daemon-internal `tasks::claim`. |
+| `claim`/`release`/`renew`/`claims` | No verified daemon caller (see above). | Removed. `claims` module retained in `quorum-core` as reusable primitive. |
+| `task-submit-external` | **(PR #375 — superseded.)** Passive execution removed entirely. | `task-create --review-pr N` for external review requests. |
+| `task-update --status <s>` | Status-setting bypasses lifecycle. | `task-close` (public) for manual terminal close; `task-update --status cancelled` remains as the one exception. |
+| `done` (alias) | Deprecated alias for `submit`. | `submit` (run-scoped). Alias removed, not hidden. |
+| `stop` | **(PR #375 § cooperative stop/resume — superseded.)** Agent-directed stop polling removed. | Ordinary stop requests are messages (see § Stop and kill). |
+| `resume` | Complement to `stop`; removed with it. | — |
+| `stops` | List active stops; removed with `stop`. | — |
+| `message` (daemon-routed) | Replaced by unified message delivery model. | Feed messages (`post`/`read`) + daemon stdin delivery. |
 
-**Passive agent support (preserved).** The v1 passive-agent path (a `submit`
-mailbox row from an agent not in the daemon's spawn roster) is preserved but
-narrowed: an external agent may invoke a new public command
-`task-submit-external --agent <id> --task-id <n> --pr <N>` that writes a
-`MailboxKind::ExternalSubmit` row. The daemon consumes it identically to
-today's passive-agent path (looks up the agent's working task, fires
-`SignaledDone`, spawns a reviewer). This replaces the implicit "external agent
-calls `submit` without a token" path with an explicit, distinct entry point.
+### Messages: daemon-delivered, non-interrupting
 
-### Messages: durable, non-interrupting turns
+**(PR #375 § "Messages: durable, non-interrupting turns" — partially
+superseded.)** The feed (`post`/`read`/`peek`) remains unchanged for external
+agents. The managed delivery model is corrected:
 
-The v1 message model has two channels: the **feed** (`post`/`read`) for
-broadcast/direct messages, and the **mailbox** for daemon-consumed control
-events. Both remain, with clarifications:
+**For daemon-managed agents,** messages are not delivered via `sync` polling
+(sync is removed). The daemon delivers messages through the same stdin session
+the agent is already running in, at safe boundaries:
 
-**Feed messages** (`post`/`read`/`peek`) are unchanged. Any named agent can
-post. Messages are durable (persisted, cursor-based delivery, TTL-expiring),
-non-interrupting (delivered at the next `sync` tick for managed agents, or
-whenever an external agent calls `read`), and content-only — **ordinary
-message content never changes lifecycle state.** A message saying "please
-cancel task #42" is informational; the recipient must invoke `task-update
---status cancelled` (or `task-close`) to actually cancel.
+1. **Targeting.** A message targets a current active run (by run ID or agent
+   name) or all current runs of a given role (all workers, all R1s, all R2s,
+   or all managed runs). The daemon resolves targeting at delivery time.
+2. **Queuing.** Messages posted while an agent is in an active turn are queued
+   by the daemon. They are not dropped, not delivered mid-turn.
+3. **Delivery.** At the next safe boundary (agent finishes its current turn,
+   or between turn-producing operations), the daemon delivers queued messages
+   as a stdin turn via `AgentProc::feed_turn()`. This is the same mechanism
+   already used for rework turns and Phase 4c message delivery.
+4. **Per-recipient state.** Delivery is tracked per-run. A message delivered
+   to run A does not mark it delivered for run B on the same task.
+5. **Lifecycle-inert.** Message content never triggers a lifecycle transition.
+   A message saying "please cancel task #42" is informational; only `task-
+   update --status cancelled` or `task-close` actually cancels.
 
-**Daemon-routed messages** (`message` command, daemon-only) are a distinct
-delivery path: the CLI writes a `MailboxKind::Message` row, and the daemon
-delivers the payload as a stdin turn to the target agent when it is idle
-(Phase 4c). These are also non-interrupting — "idle" means the agent has no
-pending work, not that it is interrupted mid-task.
-
-**Message audiences for daemon-managed runs.** The daemon controls which
-messages a managed agent sees:
-
-| Audience | Who sees it | How |
-|---|---|---|
-| Worker on task #N | Direct messages to that agent name | `sync` returns `direct` field |
-| R1 reviewer on task #N | Direct messages to that agent name | `sync` returns `direct` field |
-| R2 reviewer on task #N | Direct messages to that agent name | `sync` returns `direct` field |
-| All managed agents | Broadcast messages (`recipient = NULL`) | `sync` returns `notifications.count`; `critical` broadcasts are inlined |
-| Internal daemon helpers (classifier, doctor, collector) | **Excluded by default.** These are headless one-shot agents that do not poll `sync` and have no message cursor. | No delivery path; by design. |
-
-**Delivery states.** A feed message has three states from the recipient's
-perspective:
-
-1. **Undelivered** — `seq > cursor` and `expires_at > now`. The message exists
-   and the recipient hasn't acked past it.
-2. **Delivered** — `seq <= cursor`. The recipient's cursor has advanced past
-   this message (via `read --ack-through` or `sync` auto-ack).
-3. **Expired** — `expires_at <= now`. Invisible to all reads regardless of
-   cursor position.
-
-There is no "read receipt" or "delivered-and-acked" distinction beyond the
-cursor position — at-least-once delivery means the recipient may see a message
-multiple times if their cursor doesn't advance.
+**Retained feed semantics.** External agents use `post`/`read`/`peek` as
+before. Feed messages retain cursor-based at-least-once delivery, TTL expiry
+(default 48h), and the monotonic `MAX(last_seq, ?)` cursor advance. The three
+delivery states (undelivered/delivered/expired) are unchanged.
 
 **Retention.** Feed messages retain their existing TTL model (default 48h,
-configurable). Mailbox rows are consumed (not deleted) by the daemon and swept
-with the normal `done`-task reclamation cycle. No change to retention
-semantics.
+configurable). Daemon message queue rows are swept with the normal `done`-task
+reclamation cycle.
 
-### Pins: standing prompt context with TTL
+### Pins: standing prompt context with default expiry
 
-Pins evolve from non-expiring-only to **optionally expiring**:
+**(PR #375 § "Pins: standing prompt context with TTL" — partially
+superseded.)** The pin model is corrected:
 
-- `quorum pin --agent <id> [--ttl <duration>] --body-stdin` — if `--ttl` is
-  provided, sets `expires_at = now + ttl`. If omitted, the pin has no
-  `expires_at` (non-expiring, same as v1). **Default TTL when `--ttl` is
-  given but the value is omitted: 24h.**
+- `quorum pin --agent <id> [--ttl <duration>] --body-stdin` — **default TTL
+  is 24h** (not optional-non-expiring). If `--ttl` is omitted, `expires_at =
+  now + 24h`. Explicit `--ttl` overrides the default. Explicit `--ttl 0` or
+  `--no-expire` is available for permanent pins but is the exception, not the
+  default.
 - The `pinned` table gains a nullable `expires_at INTEGER` column. Pins with
-  `expires_at IS NULL` never expire. Pins with `expires_at <= now` are
-  filtered out of reads (same predicate as messages/claims).
-- `sweep` reclaims expired pins (physical cleanup, same pattern as messages).
-- **Visibility:** pins are surfaced in every `sync` response (daemon-managed
-  agents) and via `quorum pins` (external agents). They are **safe-boundary
-  context** — delivered at the next poll, never mid-turn.
+  `expires_at IS NULL` are treated as permanent. Pins with `expires_at <= now`
+  are filtered out of reads (same boundary as messages/claims).
+- `sweep` reclaims expired pins (same pattern as messages).
+- **Delivery to managed agents.** Pins do not depend on `sync` (which is
+  removed). Active pins are injected into daemon-managed agent prompts at
+  safe boundaries: included in the initial spawn prompt, and new/changed pins
+  are delivered as stdin turns between agent turns (same mechanism as
+  messages). External agents read pins via `quorum pins`.
+- **Longer TTL must be explicit and bounded.** Any pin TTL longer than 24h
+  requires explicit `--ttl <duration>`. There is no path to unbounded-by-
+  default permanent pins.
 
 **Schema migration:** additive — `ALTER TABLE pinned ADD COLUMN expires_at
 INTEGER` (nullable, no default). Existing pins have `expires_at = NULL` and
-remain non-expiring. Forward-only, idempotent.
+are treated as permanent (grandfathered). New pins get `expires_at = now +
+24h` by default. Forward-only, idempotent.
 
 ### Inspect: deep read-only troubleshooting
 
 `quorum inspect` is a new public command that consolidates deep read-only
 queries that today require multiple commands or direct DB access. It does not
 replace `status` (which remains compact) or `tail` (which remains streaming).
+Inspect is aware of retained artifacts (review findings, collection runs,
+agent runs).
 
 | Subcommand | Purpose | Current equivalent |
 |---|---|---|
 | `inspect task <id>` | Full task record + all notes + event history + agent runs + mailbox rows + review findings | `task-get` + `log --refs task#N` + manual DB queries |
 | `inspect agent <name>` | Agent presence + all current/recent tasks + run history + message cursor positions | `roster` + `task-list --assignee` + manual DB queries |
 | `inspect mailbox [--agent <name>]` | Unconsumed mailbox rows (optionally filtered by agent) | No public equivalent (daemon-internal `poll_unconsumed`) |
-| `inspect claims [--target <t>]` | Active claims with full detail (holder, TTL, timestamps) | `claims` (moving to daemon-only; inspect provides the read-only view) |
 | `inspect db` | Schema version, row counts per table, WAL size, last sweep timestamp | Manual `PRAGMA` queries |
 
 All `inspect` subcommands are read-only (no locks, no side effects, no
 presence bump). Output is JSON. Exit codes follow the standard contract.
 
-### Kill: emergency termination
+### Stop and kill
 
-`quorum kill` remains the emergency termination path. Unchanged from v1: the
-CLI writes a `MailboxKind::Kill` row, and the daemon consumes it by
-SIGTERM→SIGKILL of the target agent process, slot release, and post-mortem
-ladder on any held task.
+**(PR #375 § "Cooperative stop/resume is preserved, not replaced" —
+superseded.)**
 
-**Cooperative stop/resume is preserved, not replaced.** `stop`/`resume` and
-`kill` serve different purposes:
+PR #375 preserved agent-directed cooperative stop/resume as separate admin
+commands (`stop`/`resume`/`stops`) where agents poll `sync` for a stop
+signal and cheap-poll for resume. This model is removed:
 
-- `stop` is **cooperative** — the agent is told to halt but keeps polling. It
-  can resume. Use for "pause everything" or "pause this agent."
-- `kill` is **destructive** — the agent process is terminated. The daemon
-  handles cleanup. Use for zombie workers, stuck processes, or emergency
-  abort.
+- **Ordinary stop requests are messages.** An operator or external agent
+  wanting to halt a managed agent sends a message (via `post` with a
+  `kind:stop` or similar convention). The daemon delivers it at the next safe
+  boundary. The agent acts on it as content — there is no special `sync`-
+  driven stop signal. This keeps the stop path inside the unified message
+  delivery model rather than requiring a separate polling protocol.
+- **`kill` is emergency termination.** Unchanged from v1: the CLI writes a
+  `MailboxKind::Kill` row, and the daemon consumes it by SIGTERM then SIGKILL
+  of the target agent process, slot release, and post-mortem ladder on any
+  held task. Use for zombie workers, stuck processes, or emergency abort.
+- **Self-update drain remains separate.** The `--self-update-drain` mechanism
+  (signal-triggered drain, exit 75 for supervisor rebuild) is orthogonal to
+  agent stop/kill and is unchanged.
 
 Daemon scheduling pause/resume (pausing the daemon's spawn loop without
-stopping individual agents) is **out of scope for v2** — the drain mechanism
-(`--self-update-drain`, signal-triggered drain) covers the "stop spawning new
-work" use case. A future `quorum serve --pause` / `quorum serve --unpause`
-could be added if drain proves insufficient.
+stopping individual agents) is **out of scope for v2** — drain covers the
+"stop spawning new work" use case.
 
 ### Run identity and capability enforcement
 
-**Implementation path for daemon-token gating:**
+**(PR #375 § "Run identity and capability enforcement" — superseded.)**
 
-1. `quorum serve` generates a 128-bit hex token at startup, stores it in
-   memory (not DB), and injects `QUORUM_DAEMON_TOKEN=<token>` into every
-   spawned agent's environment.
-2. Each daemon-only command reads `QUORUM_DAEMON_TOKEN` from the environment.
-   If absent → exit 2 ("this command requires a daemon-managed run"). If
-   present but does not match the current daemon's token (checked via a new
-   `daemon_lock` column `token TEXT`) → exit 2 ("token mismatch — stale
-   run?").
-3. The `daemon_lock` row gains a `token TEXT` column. The daemon writes its
-   token on lock acquisition. Daemon-only commands verify the env token
-   against `daemon_lock.token` — this catches the case where a worker outlives
-   its daemon.
-4. Public commands ignore `QUORUM_DAEMON_TOKEN` entirely — they work the same
-   whether or not it's set.
+**Implementation path for per-run identity:**
 
-**Schema migration:** `ALTER TABLE daemon_lock ADD COLUMN token TEXT`
-(nullable — old daemons without the column still function; the token check is
-skipped if `daemon_lock.token IS NULL`).
+1. `quorum serve` generates a unique 128-bit hex run ID for **each** spawned
+   agent (worker or reviewer) and injects `QUORUM_RUN_ID=<id>` into that
+   agent's environment.
+2. The run ID is recorded in `agent_runs` with the `task_id` and `role`
+   (worker/r1/r2) at spawn time. This is an existing table — no new table
+   needed.
+3. Run-scoped commands (`submit`, `react`) read `QUORUM_RUN_ID` from the
+   environment. If absent → exit 2 ("this command requires a daemon-managed
+   run"). If present, verify against `agent_runs`: the run must exist, be
+   active, and the command must be valid for the run's task and role.
+   Mismatched task/role → exit 2.
+4. Public commands ignore `QUORUM_RUN_ID` entirely.
+5. No daemon-wide shared token. No `daemon_lock.token` column. **(PR #375 §
+   `daemon_lock` token column — superseded.)**
+
+**Schema:** no new columns. `agent_runs` already stores `run_id`, `task_id`,
+`role`, and `status`. The only change is that `run_id` values are injected
+as env vars at spawn time and verified by run-scoped CLI commands.
 
 ### Compatibility and removal sequencing
 
-The transition from v1 to v2 is **not** a flag day. Commands are gated
+**(PR #375 § "Compatibility and removal sequencing" — superseded.)**
+
+The transition from v1 to v2 is **not** a flag day. Commands are removed
 incrementally:
 
-1. **Phase 1 (additive):** Add `QUORUM_DAEMON_TOKEN` generation to `serve`,
-   `token` column to `daemon_lock`, `expires_at` column to `pinned`, the
-   `inspect` command, `task-submit-external`, and `roster` as a standalone
-   command. All v1 commands continue to work — no breakage.
-2. **Phase 2 (soft gate):** Daemon-only commands emit a **warning** (stderr,
-   not exit code) when invoked without `QUORUM_DAEMON_TOKEN`. This gives any
-   stray scripts time to adapt.
-3. **Phase 3 (hard gate):** Daemon-only commands exit 2 without the token.
-   The `done` alias is removed. `task-update --status` is restricted to
-   `cancelled` only.
+1. **Phase 1 (additive):** Add per-run `QUORUM_RUN_ID` generation and env
+   injection to `serve`. Add `expires_at` column to `pinned` (default 24h).
+   Add `inspect` command. Add `roster` as standalone. All v1 commands continue
+   to work — no breakage.
+2. **Phase 2 (soft removal):** `sync`, `task-claim`, generic claims
+   (`claim`/`release`/`renew`/`claims`), `stop`/`resume`/`stops`, and
+   `message` emit a deprecation warning (stderr). `submit` and `react` accept
+   both the old unscoped path and the new `QUORUM_RUN_ID` path.
+3. **Phase 3 (hard removal):** Deprecated commands exit 2. `submit` and
+   `react` require `QUORUM_RUN_ID`. `done` alias removed. `task-update
+   --status` restricted to `cancelled` only.
 4. **Phase 4 (cleanup):** Remove `status --agents` (replaced by `roster`).
-   Remove the implicit passive-agent path from `submit` (replaced by
-   `task-submit-external`).
+   Remove the implicit passive-agent path from `submit`. Remove
+   `task-submit-external` if it was ever added in a partial PR #375
+   implementation.
 
-Each phase is a separate PR. Phase 1 can ship immediately. Phase 2 requires
-daemon restart. Phase 3 requires all external callers to have migrated. Phase
-4 is housekeeping.
+Each phase is a separate PR. Phase 1 can ship immediately.
 
-**DB migration is forward-only and idempotent** (two `ALTER TABLE ... ADD
-COLUMN` statements, both nullable). No data migration. The per-repo DB
-remains disposable — a clean `rm + init` is always a valid recovery path.
+**DB migration is forward-only and idempotent** (one `ALTER TABLE pinned ADD
+COLUMN expires_at INTEGER`, nullable). No data migration. The per-repo DB
+remains disposable.
 
 ### Code paths being retired
 
@@ -947,30 +988,43 @@ remains disposable — a clean `rm + init` is always a valid recovery path.
 |---|---|---|
 | `task-update --status open\|working\|in-review\|...` | `quorum/src/main.rs` (TaskUpdate handler) | Status field restricted to `cancelled` only; all other status transitions go through lifecycle events. |
 | `done` alias on `submit` | `quorum/src/cli.rs:362` | `#[command(alias = "done")]` removed. |
-| `status --agents` | `quorum/src/cli.rs:308`, `quorum/src/main.rs` | Flag removed; `roster` becomes standalone (already implemented as `quorum roster`). |
-| Implicit passive-submit via `submit` without token | `quorum/src/serve/mod.rs` (Phase 2, passive agent detection) | Replaced by explicit `task-submit-external` → `MailboxKind::ExternalSubmit`. |
+| `status --agents` | `quorum/src/cli.rs:308`, `quorum/src/main.rs` | Flag removed; `roster` becomes standalone. |
+| `sync` CLI command | `quorum/src/cli.rs`, `quorum/src/main.rs`, `quorum-core/src/sync.rs` | CLI entry point removed. `sync.rs` module retained in `quorum-core` for any internal daemon use. |
+| `task-claim` CLI command | `quorum/src/cli.rs`, `quorum/src/main.rs` | CLI entry point removed. `tasks::claim` retained as internal function. |
+| Generic claims CLI (`claim`/`release`/`renew`/`claims`) | `quorum/src/cli.rs`, `quorum/src/main.rs` | CLI entry points removed. `quorum-core/src/claims.rs` module retained. |
+| `stop`/`resume`/`stops` CLI | `quorum/src/cli.rs`, `quorum/src/main.rs`, `quorum-core/src/control.rs` | CLI entry points removed. Stop requests become messages. |
+| `message` CLI | `quorum/src/cli.rs`, `quorum/src/main.rs` | CLI entry point removed. Feed `post` + daemon stdin delivery replace it. |
+| Passive-submit detection | `quorum/src/serve/mod.rs` (Phase 2) | Removed entirely (no passive execution). |
+| `task-submit-external` | (if partially implemented from PR #375) | Removed. |
 
 ### Summary of new/changed schema
 
 | Table | Change | Migration |
 |---|---|---|
-| `daemon_lock` | Add `token TEXT` (nullable) | `ALTER TABLE daemon_lock ADD COLUMN token TEXT` |
 | `pinned` | Add `expires_at INTEGER` (nullable) | `ALTER TABLE pinned ADD COLUMN expires_at INTEGER` |
-| `mailbox` | Add `external_submit` to `kind` CHECK constraint (or use text matching as today) | No DDL — `MailboxKind::ExternalSubmit` is a new Rust enum variant mapped to `"external_submit"` string. |
+
+**(PR #375 § `daemon_lock` token column and `MailboxKind::ExternalSubmit` —
+superseded.)** No `daemon_lock.token` column. No `ExternalSubmit` mailbox
+kind. Per-run identity uses the existing `agent_runs` table without schema
+changes.
 
 ### Invariants (new, in addition to the existing 11)
 
-12. **Daemon-token capability gate.** Commands in the daemon-only family
-    require `QUORUM_DAEMON_TOKEN` matching `daemon_lock.token`. Absent or
-    mismatched → exit 2. The token is ephemeral (per-daemon-instance,
-    in-memory, not persisted beyond `daemon_lock.token`).
+12. **Per-run capability gate.** `submit` and `react` require `QUORUM_RUN_ID`
+    matching an active row in `agent_runs` for the correct `(task_id, role)`.
+    Absent or mismatched → exit 2. The run ID is per-spawn, immutable, and
+    dies with the agent process.
 13. **Message content is lifecycle-inert.** No feed message body, kind, or
     ref field triggers a lifecycle transition. Lifecycle transitions happen
     only through the mailbox (consumed by the daemon) or direct CLI commands
     (`task-update --status cancelled`, `task-close`).
-14. **Pin expiry is optional.** `pinned.expires_at IS NULL` means
-    non-expiring. `pinned.expires_at <= now` means expired (same boundary as
-    claims/messages). Sweep reclaims expired pins.
+14. **Pin expiry defaults to 24h.** Pins without explicit `--ttl` expire
+    after 24 hours. `pinned.expires_at <= now` means expired (same boundary
+    as claims/messages). `pinned.expires_at IS NULL` means permanent
+    (grandfathered or explicit `--no-expire`). Sweep reclaims expired pins.
+15. **No passive execution.** External callers cannot claim, execute, review,
+    or submit tasks. Task creation and annotation are the external interface;
+    execution is daemon-only.
 
 ## Decisions & non-goals
 
