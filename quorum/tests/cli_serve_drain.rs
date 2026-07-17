@@ -760,10 +760,15 @@ fn pending_checks_timeout_without_drain_triggers_rework() {
     );
 
     // No drain signal — let the timeout expire naturally.
-    // Should see checks timeout → task cancelled.
+    // #153: checks timeout → rework (recoverable, not terminal cancel).
     assert!(
-        handle.wait_for("cancelling task", 20),
-        "checks did not time out and cancel as expected: {:?}",
+        handle.wait_for("firing rework", 20),
+        "checks did not time out and trigger rework as expected: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework", 20),
+        "rework not seen after checks timeout: {:?}",
         handle.lines
     );
 
