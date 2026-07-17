@@ -497,6 +497,39 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
   assigned to passive agents (not found in the journal). This gives interactive Claude Code
   sessions the same review lifecycle as daemon-managed workers.
 
+### Review responsibility boundary (agents own PR collaboration)
+
+For PR-backed tasks, the GitHub PR is the source of truth for the review conversation:
+findings (BLOCKING and advisory), advisory suggestions, author responses/pushback,
+reviewer resolution of prior findings, and evidence. Quorum coordinates lifecycle,
+provisioning, the final formal APPROVE, and merge — it does **not** proxy the review
+conversation. Concretely:
+
+- **Reviewer agents** post every blocking and advisory finding to the PR — inline
+  comments where a specific file/line applies, review summary comments for
+  cross-cutting findings — and respond to author pushback on the PR itself.
+  Encouraged GitHub operations: normal comments, inline comments, review summary
+  comments, and reviewer-owned `gh pr review --request-changes` (the reviewer's own
+  durable GitHub record when the verdict is `changes`).
+- **Author/rework agents** address findings on the PR. If disagreeing with a finding,
+  the author replies to it on the PR with concrete evidence rather than silently
+  ignoring it. The final PR history must let a later collector determine, for each
+  finding: fixed, accepted, overridden with evidence, or unaddressed.
+- **Lifecycle signal only:** reviewers signal state with
+  `quorum submit --verdict approved|changes --blocking N [--feedback ...]`. The
+  submit payload is a lifecycle signal, not a second review ledger — the ledger is
+  the PR. The `--feedback` string is preserved as rework-turn context for the warm
+  worker but is not the authoritative record.
+- **Daemon retains:** the final formal `gh pr review --approve` (posted from the merge
+  account) and `gh pr merge`. Reviewer-owned APPROVE and merge remain forbidden.
+- **Daemon no longer mirrors** a reviewer's `changes` verdict into a duplicate generic
+  GitHub REQUEST_CHANGES review. That mirror was redundant with reviewer-owned
+  REQUEST_CHANGES and buried the reviewer's actual findings under a generic body.
+
+This preserves #206 verdict attestation, reviewer separation, the rework cap, sticky
+reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
+agents, directly.
+
 ### R2 pre-merge review gate
 
 When R1 (first reviewer) approves and the task is selected for R2 by the existing
