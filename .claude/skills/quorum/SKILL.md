@@ -23,7 +23,7 @@ shell commands. No server, no auth, no human in the loop.
 ## Which mode am I in?
 
 **Daemon-managed worker** — you were spawned by `quorum serve`. Your name, branch, and
-worktree were handed to you in your spawn prompt. Speak to the daemon with `done`
+worktree were handed to you in your spawn prompt. Speak to the daemon with `submit`
 (complete a task or emit a review verdict), `react` (signal blocked/failed/needs-info),
 and `message` (talk to another managed agent). Do not run onboarding; skip to
 Lifecycle etiquette below.
@@ -68,15 +68,37 @@ Task lifecycle: `open → working → in-review → merging → done`, with a re
 - A claim is a **renewable lease**. Any `--agent` command you run auto-renews it —
   working through quorum keeps the work. Going silent lapses the lease and returns the
   task to `open`. Work never strands, but don't ghost a task you hold.
-- Submit with `quorum done --agent <You> --pr <N>` (or
-  `task-update --status done --refs '{"pr":N}'`). The PR ref is load-bearing — it's how
-  reviews and events trace back to your task.
+- A daemon-managed worker submits completed implementation with
+  `quorum submit --agent <You> --pr <N>`. The PR ref is load-bearing — it is how reviews
+  and events trace back to the task. Never set `done` directly; merge success is what
+  completes the lifecycle.
 - Give up cleanly: `task-update --status open` (release), `--status cancelled`
   (terminal won't-do). Never just walk away.
-- **Never review your own work.** Reviewer verdicts (`done --verdict approved|changes`)
+- **Never review your own work.** Reviewer verdicts (`submit --verdict approved|changes`)
   must come from a different agent than the task's author.
-- Filing work: `task-create` with a clear title, body via `--body-stdin`/`--body-file`,
-  `complexity:1-5` label, and `--depends-on` if it must wait on other tasks.
+- **Choose the correct intake path:**
+  - Work still needs implementation: use ordinary `task-create`. It starts `open`, and
+    the daemon will spawn an implementation worker.
+  - A PR is already implemented and only needs Quorum review/merge: create a review-only
+    task with `task-create --review-pr <N>`. It starts directly in `in-review` and does
+    **not** spawn an implementation worker:
+
+    ```sh
+    quorum task-create \
+      --created-by <You> \
+      --title "Review and merge PR #<N>" \
+      --review-pr <N> \
+      --labels '["complexity:1","type:review"]' \
+      --body-stdin <<'EOF'
+    Review the existing implementation, verify it, and drive it through merge.
+    EOF
+    ```
+
+    Do **not** create, reopen, or move an ordinary implementation task to `working` for
+    an existing PR. `working` means implementation is required and can cause the daemon
+    to provision a new worker and worktree from scratch.
+- For either intake path, provide a clear title, body via `--body-stdin`/`--body-file`,
+  a `complexity:1-5` label, and `--depends-on` if it must wait on other tasks.
   Complexity rubric (also used by the classifier):
     1: Trivial — config tweak, typo fix, simple rename
     2: Simple — single-file change, clear spec, < 15 min agent work
