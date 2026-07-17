@@ -608,4 +608,91 @@ pub enum Command {
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]
     Help,
+    /// Inspect a single message by seq number. Read-only diagnostic — includes expired
+    /// rows and retention caveats.
+    InspectMessage {
+        #[arg(long)]
+        seq: i64,
+        /// Emit raw row without wrapper.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Inspect messages with bounded filters. Read-only diagnostic — includes expired
+    /// rows and retention caveats.
+    InspectMessages {
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        recipient: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        topic: Option<String>,
+        /// Filter messages whose refs JSON contains this substring.
+        #[arg(long = "refs-contains")]
+        refs_contains: Option<String>,
+        /// Filter by derived state: live or expired.
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long = "since-seq")]
+        since_seq: Option<i64>,
+        #[arg(long = "before-seq")]
+        before_seq: Option<i64>,
+        #[arg(long = "since-ts")]
+        since_ts: Option<i64>,
+        #[arg(long = "before-ts")]
+        before_ts: Option<i64>,
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Emit raw rows without wrapper.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Inspect events with bounded filters. Read-only diagnostic — includes expired
+    /// rows and retention caveats.
+    InspectEvents {
+        #[arg(long)]
+        kind: Option<String>,
+        /// Exact subject filter (e.g. task#42, pr#2459).
+        #[arg(long)]
+        subject: Option<String>,
+        /// Filter by derived state: live or expired.
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long = "since-seq")]
+        since_seq: Option<i64>,
+        #[arg(long = "before-seq")]
+        before_seq: Option<i64>,
+        #[arg(long = "since-ts")]
+        since_ts: Option<i64>,
+        #[arg(long = "before-ts")]
+        before_ts: Option<i64>,
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Emit raw rows without wrapper.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Inspect errors with bounded filters. Read-only diagnostic — includes expired
+    /// rows and retention caveats.
+    InspectErrors {
+        #[arg(long)]
+        source: Option<String>,
+        /// Filter by derived state: live or expired.
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long = "since-id")]
+        since_id: Option<i64>,
+        #[arg(long = "before-id")]
+        before_id: Option<i64>,
+        #[arg(long = "since-ts")]
+        since_ts: Option<i64>,
+        #[arg(long = "before-ts")]
+        before_ts: Option<i64>,
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Emit raw rows without wrapper.
+        #[arg(long)]
+        raw: bool,
+    },
 }
