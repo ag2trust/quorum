@@ -1,18 +1,60 @@
 //! Serialized git worktree operations for agent isolation.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct WorktreeManager {
     lock: Mutex<()>,
+    git_bin: PathBuf,
+    fetch_timeout: Duration,
+    local_timeout: Duration,
+}
+
+/// Run a git subprocess with a bounded timeout. On timeout the child is killed
+/// via `kill_on_drop` (SIGKILL) before this function returns, so the caller's
+/// mutex guard remains held until the child is dead.
+async fn run_git(
+    mut cmd: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(format!("{label}: {e}")),
+        Err(_) => Err(format!("{label}: timed out after {}s", timeout.as_secs())),
+    }
 }
 
 impl WorktreeManager {
     pub fn new() -> Self {
         Self {
             lock: Mutex::new(()),
+            git_bin: PathBuf::from("git"),
+            fetch_timeout: DEFAULT_FETCH_TIMEOUT,
+            local_timeout: DEFAULT_LOCAL_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_config(git_bin: PathBuf, fetch_timeout: Duration, local_timeout: Duration) -> Self {
+        Self {
+            lock: Mutex::new(()),
+            git_bin,
+            fetch_timeout,
+            local_timeout,
+        }
+    }
+
+    fn git_cmd(&self, repo_dir: &Path) -> Command {
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.arg("-C").arg(repo_dir);
+        cmd
     }
 
     pub async fn provision(
@@ -25,20 +67,10 @@ impl WorktreeManager {
         let _guard = self.lock.lock().await;
 
         let wt_path = worktree_dir.to_path_buf();
-        let add = Command::new("git")
-            .args([
-                "-C",
-                &repo_dir.to_string_lossy(),
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                &wt_path.to_string_lossy(),
-                base_ref,
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("git worktree add failed: {e}"))?;
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["worktree", "add", "-b", branch]);
+        cmd.arg(&wt_path).arg(base_ref);
+        let add = run_git(cmd, self.local_timeout, "git worktree add").await?;
 
         if !add.status.success() {
             return Err(format!(
@@ -59,17 +91,9 @@ impl WorktreeManager {
     ) -> Result<PathBuf, String> {
         let _guard = self.lock.lock().await;
 
-        let fetch = Command::new("git")
-            .args([
-                "-C",
-                &repo_dir.to_string_lossy(),
-                "fetch",
-                "origin",
-                remote_branch,
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("git fetch failed: {e}"))?;
+        let mut fetch_cmd = self.git_cmd(repo_dir);
+        fetch_cmd.args(["fetch", "origin", remote_branch]);
+        let fetch = run_git(fetch_cmd, self.fetch_timeout, "git fetch").await?;
 
         if !fetch.status.success() {
             return Err(format!(
@@ -80,20 +104,10 @@ impl WorktreeManager {
 
         let base_ref = format!("origin/{remote_branch}");
         let wt_path = worktree_dir.to_path_buf();
-        let add = Command::new("git")
-            .args([
-                "-C",
-                &repo_dir.to_string_lossy(),
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                &wt_path.to_string_lossy(),
-                &base_ref,
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("git worktree add failed: {e}"))?;
+        let mut add_cmd = self.git_cmd(repo_dir);
+        add_cmd.args(["worktree", "add", "-b", branch]);
+        add_cmd.arg(&wt_path).arg(&base_ref);
+        let add = run_git(add_cmd, self.local_timeout, "git worktree add").await?;
 
         if !add.status.success() {
             return Err(format!(
@@ -113,11 +127,11 @@ impl WorktreeManager {
     ) -> Vec<String> {
         let _guard = self.lock.lock().await;
 
-        // Prune stale git worktree entries first
-        let _ = Command::new("git")
-            .args(["-C", &repo_dir.to_string_lossy(), "worktree", "prune"])
-            .output()
-            .await;
+        let mut prune_cmd = self.git_cmd(repo_dir);
+        prune_cmd.args(["worktree", "prune"]);
+        if let Err(e) = run_git(prune_cmd, self.local_timeout, "git worktree prune").await {
+            eprintln!("warn: {e}");
+        }
 
         let entries = match std::fs::read_dir(worktree_base) {
             Ok(e) => e,
@@ -135,28 +149,19 @@ impl WorktreeManager {
                 continue;
             }
 
-            let rm = Command::new("git")
-                .args([
-                    "-C",
-                    &repo_dir.to_string_lossy(),
-                    "worktree",
-                    "remove",
-                    &path_str,
-                    "--force",
-                ])
-                .output()
-                .await;
+            let mut rm_cmd = self.git_cmd(repo_dir);
+            rm_cmd.args(["worktree", "remove", &path_str, "--force"]);
+            let git_ok = match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
+                Ok(out) if out.status.success() => true,
+                Ok(_) => false,
+                Err(e) => {
+                    eprintln!("warn: {e}");
+                    false
+                }
+            };
 
-            match rm {
-                Ok(out) if out.status.success() => {
-                    removed.push(path_str);
-                }
-                _ => {
-                    // If git worktree remove fails, try plain directory removal
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        removed.push(path_str);
-                    }
-                }
+            if git_ok || std::fs::remove_dir_all(&path).is_ok() {
+                removed.push(path_str);
             }
         }
         removed
@@ -165,18 +170,10 @@ impl WorktreeManager {
     pub async fn remove(&self, repo_dir: &Path, worktree_dir: &Path) -> Result<(), String> {
         let _guard = self.lock.lock().await;
 
-        let rm = Command::new("git")
-            .args([
-                "-C",
-                &repo_dir.to_string_lossy(),
-                "worktree",
-                "remove",
-                &worktree_dir.to_string_lossy(),
-                "--force",
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("git worktree remove failed: {e}"))?;
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["worktree", "remove"]);
+        cmd.arg(worktree_dir).arg("--force");
+        let rm = run_git(cmd, self.local_timeout, "git worktree remove").await?;
 
         if !rm.status.success() {
             return Err(format!(
@@ -193,12 +190,9 @@ impl WorktreeManager {
     pub async fn delete_branch(&self, repo_dir: &Path, branch: &str) {
         let _guard = self.lock.lock().await;
 
-        let out = Command::new("git")
-            .args(["-C", &repo_dir.to_string_lossy(), "branch", "-D", branch])
-            .output()
-            .await;
-
-        match out {
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["branch", "-D", branch]);
+        match run_git(cmd, self.local_timeout, "git branch -D").await {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
@@ -207,7 +201,7 @@ impl WorktreeManager {
                 }
             }
             Err(e) => {
-                eprintln!("warn: git branch -D {branch} failed: {e}");
+                eprintln!("warn: {e}");
             }
         }
     }
@@ -217,6 +211,7 @@ impl WorktreeManager {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+    use std::sync::Arc;
 
     fn init_git_repo(dir: &Path) {
         let d = dir.to_string_lossy();
@@ -242,6 +237,20 @@ mod tests {
             "git commit failed: {}",
             String::from_utf8_lossy(&commit.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    fn create_hanging_shim(dir: &Path) -> PathBuf {
+        let shim = dir.join("git-hang");
+        std::fs::write(&shim, "#!/bin/sh\nexec sleep 3600\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shim
+    }
+
+    #[cfg(unix)]
+    fn short_timeouts() -> (Duration, Duration) {
+        (Duration::from_millis(300), Duration::from_millis(300))
     }
 
     #[tokio::test]
@@ -414,5 +423,156 @@ mod tests {
 
         // Clean up
         mgr.remove(repo_dir.path(), &wt1).await.ok();
+    }
+
+    // --- Timeout / reap tests (require Unix shims) ---
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_hanging_subprocess() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = create_hanging_shim(shim_dir.path());
+        let (ft, lt) = short_timeouts();
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path().join("wt");
+
+        let start = std::time::Instant::now();
+        let result = mgr.provision(tmp.path(), "branch", &wt, "main").await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should have timed out quickly, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_timeout_kills_and_returns() {
+        // Directly test run_git: a `sleep 3600` must not block beyond the timeout.
+        // If kill_on_drop failed, this call would hang for an hour.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("3600");
+
+        let start = std::time::Instant::now();
+        let result = run_git(cmd, Duration::from_millis(300), "sleep").await;
+        let elapsed = start.elapsed();
+
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run_git should return on timeout, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_releases_mutex_for_subsequent_operations() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = create_hanging_shim(shim_dir.path());
+        let (ft, lt) = short_timeouts();
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First call times out
+        let r1 = mgr
+            .provision(tmp.path(), "b1", &tmp.path().join("wt1"), "main")
+            .await;
+        assert!(r1.unwrap_err().contains("timed out"));
+
+        // Second call also times out — proves mutex was released after first timeout
+        let r2 = mgr
+            .provision(tmp.path(), "b2", &tmp.path().join("wt2"), "main")
+            .await;
+        assert!(r2.unwrap_err().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_concurrent_callers_progress() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = create_hanging_shim(shim_dir.path());
+        let (ft, lt) = short_timeouts();
+        let mgr = Arc::new(WorktreeManager::with_config(shim, ft, lt));
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
+
+        let m1 = mgr.clone();
+        let p1 = base.clone();
+        let t1 =
+            tokio::spawn(async move { m1.provision(&p1, "b1", &p1.join("wt1"), "main").await });
+
+        let m2 = mgr.clone();
+        let p2 = base.clone();
+        let t2 =
+            tokio::spawn(async move { m2.provision(&p2, "b2", &p2.join("wt2"), "main").await });
+
+        let (r1, r2) = tokio::join!(t1, t2);
+        assert!(r1.unwrap().unwrap_err().contains("timed out"));
+        assert!(r2.unwrap().unwrap_err().contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_no_orphan_worktree_corruption() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("test-wt");
+
+        // Provision with real git
+        let real_mgr = WorktreeManager::new();
+        real_mgr
+            .provision(repo_dir.path(), "test-branch", &wt_path, "main")
+            .await
+            .unwrap();
+        assert!(wt_path.exists());
+
+        // Try to remove with hanging shim — will timeout
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = create_hanging_shim(shim_dir.path());
+        let (ft, lt) = short_timeouts();
+        let hang_mgr = WorktreeManager::with_config(shim, ft, lt);
+        let result = hang_mgr.remove(repo_dir.path(), &wt_path).await;
+        assert!(result.unwrap_err().contains("timed out"));
+
+        // Worktree still intact — no corruption from killed subprocess
+        assert!(wt_path.exists());
+
+        // Real git can still clean up successfully
+        real_mgr.remove(repo_dir.path(), &wt_path).await.unwrap();
+        assert!(!wt_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gc_orphaned_timeout_falls_through_to_fs_cleanup() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_base = tempfile::tempdir().unwrap();
+        let orphan = wt_base.path().join("orphan-wt");
+        std::fs::create_dir(&orphan).unwrap();
+
+        // Hanging shim — git commands timeout, but fs fallback still works
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = create_hanging_shim(shim_dir.path());
+        let (ft, lt) = short_timeouts();
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+
+        let removed = mgr.gc_orphaned(repo_dir.path(), wt_base.path(), &[]).await;
+        assert!(
+            removed.contains(&orphan.to_string_lossy().to_string()),
+            "orphan should be cleaned up via fs fallback"
+        );
+        assert!(!orphan.exists());
     }
 }
