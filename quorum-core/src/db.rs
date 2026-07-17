@@ -336,11 +336,21 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 23 && !column_exists(conn, "agent_runs", "sub_role")? {
             conn.execute("ALTER TABLE agent_runs ADD COLUMN sub_role TEXT", [])?;
         }
-        // v24 = automatic post-merge review analytics collector (#125).
-        // Additive columns on `review_findings` to carry addressed-status,
-        // provenance evidence ids, and collector model/version; net-new
-        // `review_collection_runs` table (via SCHEMA_SQL) records each attempt
-        // so failures are observable without touching lifecycle.
+        // v24 = #125 automatic post-merge review analytics collector: additive
+        // columns on `review_findings` for addressed-status + evidence ids +
+        // collector model/version, plus the net-new `review_collection_runs`
+        // table (via SCHEMA_SQL) for per-PR audit rows.
+        //
+        // v25 = #127 crash-safe collector retry: net-new `review_interpret_jobs`
+        // table as a durable retry queue with attempt/backoff state. The table
+        // is created by SCHEMA_SQL above (CREATE TABLE IF NOT EXISTS) — no
+        // ALTER needed. Splitting v25 from v24 is load-bearing: origin/main
+        // already shipped SCHEMA_VERSION=24, so a live daemon DB at
+        // user_version=24 would short-circuit `migrate` (see the early return
+        // above at `current == SCHEMA_VERSION`) and never run SCHEMA_SQL,
+        // leaving the new table absent. Bumping to 25 forces the SCHEMA_SQL
+        // pass on those DBs and the CREATE TABLE IF NOT EXISTS lands the
+        // table cleanly (invariant #8 — repo-vs-running-file drift).
         if current < 24 {
             if !column_exists(conn, "review_findings", "addressed_status")? {
                 conn.execute(
@@ -1447,5 +1457,175 @@ mod tests {
             n, 1,
             "review_audits table must exist after v22→v23 migration"
         );
+    }
+
+    /// v23→v24: covers BOTH #125 (analytics collector — additive columns on
+    /// `review_findings` + `review_collection_runs` table) and #127 (retry
+    /// queue — `review_interpret_jobs` table). Pre-existing findings round-trip
+    /// untouched and default to NULL for every new column.
+    #[test]
+    fn migrates_v23_to_v24_adds_collector_columns_and_new_tables() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE review_findings (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 pr_number INTEGER NOT NULL,
+                 task_id INTEGER,
+                 reviewer TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 author_pushback INTEGER NOT NULL DEFAULT 0,
+                 pushback_accepted INTEGER,
+                 severity TEXT,
+                 text TEXT NOT NULL,
+                 source_endpoint TEXT NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             INSERT INTO review_findings(pr_number, task_id, reviewer, kind, text,
+                 source_endpoint, created_at)
+                 VALUES (99, 5, 'rev', 'blocking', 'pre-v24 finding', 'pulls', 100);
+             PRAGMA user_version = 23;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        for col in [
+            "addressed_status",
+            "evidence_ids",
+            "collector_model",
+            "collector_version",
+        ] {
+            assert!(
+                column_exists(&c, "review_findings", col).unwrap(),
+                "column '{col}' missing — v23→v24 migration silently skipped"
+            );
+        }
+
+        // Pre-existing row must default to NULL for every new column.
+        let (addr, ev, cm, cv): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = c
+            .query_row(
+                "SELECT addressed_status, evidence_ids, collector_model, collector_version
+                 FROM review_findings WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert!(addr.is_none() && ev.is_none() && cm.is_none() && cv.is_none());
+
+        for tbl in ["review_collection_runs", "review_interpret_jobs"] {
+            let n: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [tbl],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{tbl} must exist after v23→v24 migration");
+        }
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM review_interpret_jobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// v24→v25 (#127 rebased): the real upgrade path for a daemon whose DB
+    /// already shipped SCHEMA_VERSION=24 (from #125 before #127 rebased on
+    /// top). The blast radius of getting this wrong: `migrate` early-returns
+    /// on `current == SCHEMA_VERSION` WITHOUT running SCHEMA_SQL, so a v24
+    /// DB would never learn about the net-new `review_interpret_jobs` table
+    /// and every tick's Phase 7.5 (`list_all` / `list_ready`) would raise
+    /// "no such table" out of the daemon loop. Bumping to v25 forces the
+    /// SCHEMA_SQL pass on those DBs and the CREATE TABLE IF NOT EXISTS
+    /// lands the table cleanly (invariant #8 — repo-vs-running-file drift).
+    #[test]
+    fn migrates_v24_to_v25_adds_review_interpret_jobs_table() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        // Seed a minimal v24-shaped DB: only the surface the new table
+        // reads/writes (task rows) needs to exist for the migration itself
+        // to succeed; the SCHEMA_SQL pass creates every missing table.
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE review_collection_runs (
+                 pr_number INTEGER PRIMARY KEY,
+                 task_id INTEGER,
+                 status TEXT NOT NULL,
+                 error TEXT,
+                 collector_model TEXT NOT NULL,
+                 collector_version TEXT NOT NULL,
+                 findings_count INTEGER NOT NULL DEFAULT 0,
+                 attempted_at INTEGER NOT NULL,
+                 completed_at INTEGER
+             );
+             PRAGMA user_version = 24;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        // Pin the pre-open state: table is absent.
+        let raw = Connection::open(&path).unwrap();
+        let pre: i64 = raw
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='review_interpret_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0, "seed must not include the new table");
+        drop(raw);
+
+        // Open through the production path — migration runs.
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // Net-new table must exist and be usable.
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='review_interpret_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "review_interpret_jobs must exist after v24→v25 migration \
+             — otherwise every daemon tick's Phase 7.5 raises 'no such table'"
+        );
+        // A read against it must succeed (not just the existence check).
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM review_interpret_jobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

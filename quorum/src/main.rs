@@ -1525,8 +1525,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;
             let outcome = rt.block_on(serve::collector::run_collection(&request))?;
 
-            let conn = quorum_core::db::open(&db)?;
+            let mut conn = quorum_core::db::open(&db)?;
             let findings = quorum_core::review_findings::list_for_pr(&conn, pr)?;
+            // #127: a successful CLI run consumes any pending daemon retry job
+            // for the same PR — no need for the tick loop to re-run. Idempotent:
+            // no row → no-op. Only clears on a real success; a failed manual
+            // run leaves the row in place so the daemon retries with backoff.
+            if outcome.status == quorum_core::review_findings::RunStatus::Success {
+                let _ = quorum_core::review_interpret_jobs::delete(&mut conn, pr);
+            }
 
             if json {
                 output::emit(&serde_json::json!({
