@@ -507,6 +507,11 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
         let _ = quorum_core::daemon_lock::release(&conn, daemon_pid);
     }
 
+    // Abandoned spawn_blocking threads (e.g. wait_for_checks interrupted by
+    // drain) keep the runtime alive on implicit drop. Shut down with a short
+    // grace period so the process can actually exit.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+
     result
 }
 
@@ -737,6 +742,35 @@ impl DrainState {
     fn timed_out(&self, timeout_secs: u64) -> bool {
         self.drain_started_at
             .is_some_and(|t| t.elapsed().as_secs() >= timeout_secs)
+    }
+}
+
+/// Resolves when a drain deadline should interrupt long-running work inside
+/// tick(). Two modes:
+/// - Already draining: fires after `drain_remaining` elapses.
+/// - Not yet draining: fires as soon as signal_count >= 1 (signal arrival).
+///
+/// In both modes, fires immediately on signal_count >= 2 (force shutdown).
+async fn drain_interrupt(
+    signal_count: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    drain_remaining: Option<std::time::Duration>,
+) {
+    if let Some(remaining) = drain_remaining {
+        let deadline = tokio::time::Instant::now() + remaining;
+        while tokio::time::Instant::now() < deadline {
+            if signal_count.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                return;
+            }
+            let left = deadline - tokio::time::Instant::now();
+            tokio::time::sleep(left.min(std::time::Duration::from_millis(100))).await;
+        }
+    } else {
+        loop {
+            if signal_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -1075,6 +1109,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut classifier_slot,
             &mut doctor_slot,
             &mut doctored_tasks,
+            &signal_count,
         )
         .await
         {
@@ -1127,6 +1162,7 @@ async fn tick(
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
     doctored_tasks: &mut std::collections::HashSet<i64>,
+    signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -1657,16 +1693,35 @@ async fn tick(
 
                     const MAX_POLICY_RETRIES: u32 = 3;
                     let mut policy_retry = 0u32;
+                    let mut drain_interrupted = false;
                     let checks_outcome = {
                         let repo = config.repo_dir.clone();
                         let executor = Arc::clone(&config.merge_executor);
                         let timeout = config.merge_checks_timeout_secs;
                         let poll = config.merge_checks_poll_secs;
-                        tokio::task::spawn_blocking(move || {
+                        let handle = tokio::task::spawn_blocking(move || {
                             executor.wait_for_checks(pr_num, &repo, timeout, poll)
-                        })
-                        .await
-                        .map_err(|e| QuorumError::Io(format!("checks spawn_blocking join: {e}")))?
+                        });
+                        let drain_remaining = if drain_state.draining {
+                            Some(
+                                std::time::Duration::from_secs(config.drain_timeout_secs)
+                                    .saturating_sub(
+                                        drain_state.drain_started_at.unwrap().elapsed(),
+                                    ),
+                            )
+                        } else {
+                            None
+                        };
+                        let sc = std::sync::Arc::clone(signal_count);
+                        tokio::select! {
+                            result = handle => {
+                                result.map_err(|e| QuorumError::Io(format!("checks spawn_blocking join: {e}")))?
+                            }
+                            _ = drain_interrupt(sc, drain_remaining) => {
+                                drain_interrupted = true;
+                                merge::ChecksOutcome::TimedOut
+                            }
+                        }
                     };
 
                     // Required jobs gate: if checks are Ready but configured
@@ -1848,6 +1903,18 @@ async fn tick(
                             }
                             continue;
                         }
+                        merge::ChecksOutcome::TimedOut if drain_interrupted => {
+                            // Drain interrupted the merge-checks wait. Leave
+                            // the mailbox row unconsumed and the task in
+                            // "merging" state — the outer loop will handle
+                            // drain shutdown, and adoption recovery on
+                            // restart will re-process the approval.
+                            log(&format!(
+                                "drain interrupted merge-checks for PR #{pr_num} \
+                                 — preserving state for restart recovery"
+                            ));
+                            return Ok(());
+                        }
                         merge::ChecksOutcome::TimedOut => {
                             log(&format!(
                                 "MERGE BLOCKED: PR #{pr_num} checks timed out after \
@@ -1991,8 +2058,18 @@ async fn tick(
                                 ));
                                 break;
                             }
+                            if signal_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                                log("master-ci gate: drain signal — returning to outer loop");
+                                return Ok(());
+                            }
                             tokio::time::sleep(std::time::Duration::from_secs(poll)).await;
                         }
+                    }
+
+                    // Recheck drain after master CI gate (may have been signaled)
+                    if signal_count.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                        log("drain detected after master-ci gate — returning to outer loop");
+                        return Ok(());
                     }
 
                     let merge_result = 'merge_gate: loop {
@@ -2027,13 +2104,31 @@ async fn tick(
                                 let executor = Arc::clone(&config.merge_executor);
                                 let timeout = config.merge_checks_timeout_secs;
                                 let poll = config.merge_checks_poll_secs;
-                                tokio::task::spawn_blocking(move || {
+                                let handle = tokio::task::spawn_blocking(move || {
                                     executor.wait_for_checks(pr_num, &repo, timeout, poll)
-                                })
-                                .await
-                                .map_err(|e| {
-                                    QuorumError::Io(format!("checks spawn_blocking join: {e}"))
-                                })?
+                                });
+                                let drain_remaining = if drain_state.draining {
+                                    Some(
+                                        std::time::Duration::from_secs(config.drain_timeout_secs)
+                                            .saturating_sub(
+                                                drain_state.drain_started_at.unwrap().elapsed(),
+                                            ),
+                                    )
+                                } else {
+                                    None
+                                };
+                                let sc = std::sync::Arc::clone(signal_count);
+                                tokio::select! {
+                                    result = handle => {
+                                        result.map_err(|e| {
+                                            QuorumError::Io(format!("checks spawn_blocking join: {e}"))
+                                        })?
+                                    }
+                                    _ = drain_interrupt(sc, drain_remaining) => {
+                                        log("policy-retry wait_for_checks interrupted: drain deadline");
+                                        return Ok(());
+                                    }
+                                }
                             };
                             match retry_outcome {
                                 merge::ChecksOutcome::Ready => {
