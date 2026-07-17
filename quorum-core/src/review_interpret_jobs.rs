@@ -1,13 +1,15 @@
 //! Durable post-merge review-interpretation queue (#127).
 //!
 //! When a PR merges, the daemon enqueues a row here BEFORE dropping the
-//! reviewer/worker slot. The row survives daemon crashes and restarts — a
-//! restart runs [`reconcile`] to catch any merged PRs that missed their
-//! MergeSucceeded hook (e.g. daemon killed between merge and enqueue). A
+//! reviewer/worker slot. The row survives daemon crashes and restarts. A
 //! persistent slot in the tick loop drains one job at a time, spawning a
 //! headless interpreter agent; on success the findings are stored idempotently
 //! and the row is deleted. Failures increment `attempts` and populate
 //! `last_error` so the same row is retried on the next tick.
+//!
+//! Historical tasks are NOT backfilled (#157): only PRs that merge under the
+//! current daemon flow get jobs. Daemon startup reports dead-lettered rows but
+//! does not scan terminal tasks to infer missing jobs.
 //!
 //! Independence from lifecycle: this queue never mutates the task's `done`
 //! status. Interpretation is post-hoc analysis; a repeated failure only leaves
@@ -248,98 +250,13 @@ pub fn delete(conn: &mut Connection, pr_number: i64) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// Reconcile: find every `done` task whose `refs.pr` points at a PR that
-/// LACKS a successful [`review_findings::get_run`] at the given collector
-/// version, and enqueue a retry job for it (idempotent — an existing job
-/// for that PR is left alone). Returns the number of newly-enqueued jobs.
-///
-/// This is the crash-safety backstop: if the daemon merged a PR and died
-/// before its detached collector wrote its success row, the next startup
-/// catches it. It also covers a version bump — a merged PR whose only run
-/// is at an older version gets a fresh retry queued.
-///
-/// A PR whose most recent run is `failed` at the current version is treated
-/// like "no successful run" — enqueue and let the drain retry with backoff.
-pub fn reconcile(conn: &mut Connection, collector_version: &str) -> Result<usize> {
-    let mut stmt = conn.prepare(
-        "SELECT id, refs FROM tasks
-         WHERE status = 'done' AND refs IS NOT NULL",
-    )?;
-    let rows: Vec<(i64, String)> = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut candidates: Vec<(i64, i64)> = Vec::new();
-    for (task_id, refs_json) in rows {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&refs_json) {
-            if let Some(pr) = v.get("pr").and_then(|p| {
-                p.as_i64()
-                    .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
-            }) {
-                candidates.push((task_id, pr));
-            }
-        }
-    }
-    drop(stmt);
-
-    let mut enqueued = 0usize;
-    for (task_id, pr) in candidates {
-        if let Some(run) = crate::review_findings::get_run(conn, pr)? {
-            if matches!(run.status, crate::review_findings::RunStatus::Success)
-                && run.collector_version == collector_version
-            {
-                continue;
-            }
-        }
-        // enqueue is a no-op on existing (ON CONFLICT keeps attempts/last_error),
-        // so we only count truly new inserts.
-        let existed = get(conn, pr)?.is_some();
-        enqueue(conn, pr, task_id, None, collector_version)?;
-        if !existed {
-            enqueued += 1;
-        }
-    }
-    Ok(enqueued)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db;
-    use crate::review_findings::{self, CollectionRun, ReviewFinding, RunStatus};
+    use crate::review_findings::{self, ReviewFinding};
 
-    /// Version stamp used across these tests (mirrors the daemon's real
-    /// `serve::collector::COLLECTOR_VERSION` but decoupled so quorum-core
-    /// stays independent of the binary crate).
     const TEST_VERSION: &str = "v1";
-
-    fn success_run(pr: i64) -> CollectionRun {
-        CollectionRun {
-            pr_number: pr,
-            task_id: Some(50),
-            status: RunStatus::Success,
-            error: None,
-            collector_model: "haiku-4.5".into(),
-            collector_version: TEST_VERSION.into(),
-            findings_count: 0,
-            attempted_at: 100,
-            completed_at: Some(101),
-        }
-    }
-
-    fn failed_run(pr: i64) -> CollectionRun {
-        CollectionRun {
-            pr_number: pr,
-            task_id: Some(50),
-            status: RunStatus::Failed,
-            error: Some("classifier timeout".into()),
-            collector_model: "haiku-4.5".into(),
-            collector_version: TEST_VERSION.into(),
-            findings_count: 0,
-            attempted_at: 100,
-            completed_at: Some(101),
-        }
-    }
 
     fn test_conn() -> (Connection, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -416,93 +333,20 @@ mod tests {
         assert!(got.last_attempt_at.is_some());
     }
 
+    /// Negative-path (#157): historical terminal tasks must NOT produce
+    /// interpret jobs. The queue only receives rows from the live
+    /// MergeSucceeded path — there is no startup scan of task history.
     #[test]
-    fn reconcile_enqueues_merged_task_without_run() {
+    fn historical_done_tasks_do_not_create_jobs() {
         let (mut conn, _dir) = test_conn();
         seed_done_task_with_pr(&mut conn, 100, 500);
-        let n = reconcile(&mut conn, TEST_VERSION).unwrap();
-        assert_eq!(n, 1);
-        let job = get(&conn, 500).unwrap().unwrap();
-        assert_eq!(job.task_id, 100);
-        assert_eq!(job.interpreter_version, TEST_VERSION);
-    }
-
-    #[test]
-    fn reconcile_skips_task_with_successful_run_at_current_version() {
-        let (mut conn, _dir) = test_conn();
-        seed_done_task_with_pr(&mut conn, 100, 500);
-        review_findings::record_run(&conn, &success_run(500)).unwrap();
-        let n = reconcile(&mut conn, TEST_VERSION).unwrap();
-        assert_eq!(n, 0);
-        assert!(get(&conn, 500).unwrap().is_none());
-    }
-
-    #[test]
-    fn reconcile_enqueues_when_run_is_at_older_version() {
-        let (mut conn, _dir) = test_conn();
-        seed_done_task_with_pr(&mut conn, 100, 500);
-        // A run recorded at an OLD version — reconciler must enqueue at the
-        // current version because a version bump legitimately re-targets
-        // the same PR.
-        let mut old_run = success_run(500);
-        old_run.collector_version = "old-version".into();
-        review_findings::record_run(&conn, &old_run).unwrap();
-        let n = reconcile(&mut conn, "new-version").unwrap();
-        assert_eq!(n, 1);
-        let job = get(&conn, 500).unwrap().unwrap();
-        assert_eq!(job.interpreter_version, "new-version");
-    }
-
-    /// A failed run at the current version is treated like "no successful
-    /// run" — the reconciler enqueues so the drain retries with backoff.
-    #[test]
-    fn reconcile_enqueues_when_only_run_is_failed() {
-        let (mut conn, _dir) = test_conn();
-        seed_done_task_with_pr(&mut conn, 100, 500);
-        review_findings::record_run(&conn, &failed_run(500)).unwrap();
-        let n = reconcile(&mut conn, TEST_VERSION).unwrap();
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn reconcile_skips_non_done_tasks() {
-        let (mut conn, _dir) = test_conn();
-        // Seed an open task with refs.pr — must NOT be enqueued (interpretation
-        // is post-merge only).
-        conn.execute(
-            "INSERT INTO tasks (id, title, status, priority, created_by, created_at, updated_at, refs)
-             VALUES (100, 'open task', 'open', 50, 'boss', 1000, 1001, '{\"pr\": 500}')",
-            [],
-        )
-        .unwrap();
-        let n = reconcile(&mut conn, "v1").unwrap();
-        assert_eq!(n, 0);
-    }
-
-    /// Acceptance (#127): if the daemon crashes after MergeSucceeded but
-    /// BEFORE enqueue, a restart reconstructs the pending job purely from
-    /// task state — no live signal required. Task `done` status is not touched.
-    #[test]
-    fn crash_after_merge_before_enqueue_recovers_via_reconcile() {
-        let (mut conn, _dir) = test_conn();
-        // Simulate the post-merge world: task is done, PR is set, but no
-        // job row exists (daemon died before enqueue) and no findings yet.
-        seed_done_task_with_pr(&mut conn, 100, 500);
-        assert!(get(&conn, 500).unwrap().is_none());
-        let status_before: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 100", [], |r| r.get(0))
-            .unwrap();
-
-        // Restart-time reconcile catches the missed PR.
-        let n = reconcile(&mut conn, TEST_VERSION).unwrap();
-        assert_eq!(n, 1);
-
-        // Task lifecycle is NOT mutated by reconciliation.
-        let status_after: String = conn
-            .query_row("SELECT status FROM tasks WHERE id = 100", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(status_before, status_after);
-        assert_eq!(status_after, "done");
+        seed_done_task_with_pr(&mut conn, 101, 501);
+        seed_done_task_with_pr(&mut conn, 102, 502);
+        // No enqueue calls — simulates daemon startup with pre-existing
+        // terminal tasks. The queue must remain empty.
+        assert!(list_all(&conn).unwrap().is_empty());
+        assert!(list_ready(&conn, 9_999_999_999).unwrap().is_empty());
+        assert!(over_cap(&conn).unwrap().is_empty());
     }
 
     /// Acceptance (#127): re-running interpretation for the same PR does

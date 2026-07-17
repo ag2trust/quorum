@@ -366,10 +366,7 @@ async fn enqueue_interpret_job(db_path: &std::path::Path, pr_num: i64, task_id: 
     .await;
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => log(&format!(
-            "interpret: enqueue for PR #{pr_num} failed \
-             (reconcile will catch it): {e}"
-        )),
+        Ok(Err(e)) => log(&format!("interpret: enqueue for PR #{pr_num} failed: {e}")),
         Err(e) => log(&format!(
             "interpret: enqueue spawn_blocking join failed for PR #{pr_num}: {e}"
         )),
@@ -953,35 +950,22 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         log(&format!("recovery failed: {e} — starting fresh"));
     }
 
-    // #127: reconcile the durable review-interpret retry queue. Catches any
-    // merged task whose MergeSucceeded hook missed the enqueue (daemon killed
-    // between merge and enqueue) or whose findings were written under an
-    // older collector version. Also surfaces any over-cap (dead-lettered)
-    // rows so an operator sees poison PRs at startup. Never mutates task
-    // `done` state — only inserts job rows so the tick loop discovers pending
-    // work.
+    // #127/#157: report dead-lettered interpret jobs at startup. Historical
+    // terminal tasks are NOT scanned — jobs come only from the MergeSucceeded
+    // enqueue path. Already-enqueued rows (from prior merges) remain in the
+    // queue for the tick drain to process normally.
     {
         let p = config.db_path.clone();
         let outcome = tokio::task::spawn_blocking(
-            move || -> Result<(usize, Vec<quorum_core::review_interpret_jobs::InterpretJob>)> {
-                let mut conn = quorum_core::db::open(&p)?;
-                let n = quorum_core::review_interpret_jobs::reconcile(
-                    &mut conn,
-                    collector::COLLECTOR_VERSION,
-                )?;
-                let dead = quorum_core::review_interpret_jobs::over_cap(&conn)?;
-                Ok((n, dead))
+            move || -> Result<Vec<quorum_core::review_interpret_jobs::InterpretJob>> {
+                let conn = quorum_core::db::open(&p)?;
+                quorum_core::review_interpret_jobs::over_cap(&conn)
             },
         )
         .await
-        .map_err(|e| QuorumError::Io(format!("interpret reconcile join: {e}")))?;
+        .map_err(|e| QuorumError::Io(format!("interpret startup join: {e}")))?;
         match outcome {
-            Ok((n, dead)) => {
-                if n > 0 {
-                    log(&format!(
-                        "interpret: reconciled {n} missed post-merge job(s)"
-                    ));
-                }
+            Ok(dead) => {
                 for job in &dead {
                     log(&format!(
                         "interpret: DEAD-LETTER PR #{} (task #{}, attempts={}): {}",
@@ -992,7 +976,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     ));
                 }
             }
-            Err(e) => log(&format!("interpret reconcile failed: {e} — continuing")),
+            Err(e) => log(&format!("interpret startup check failed: {e} — continuing")),
         }
     }
 
@@ -1618,10 +1602,9 @@ async fn tick(
                         fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
                             .await;
                         // #125 fires the collector immediately (best-effort).
-                        // #127 also durably enqueues so a daemon crash before
-                        // or during collection is caught by reconcile() on
-                        // next startup — the tick loop retries with backoff
-                        // and cap; a successful run deletes the job.
+                        // #127 also durably enqueues so the tick loop retries
+                        // with backoff and cap; a successful run deletes the
+                        // job.
                         spawn_post_merge_collector(config, pr_num, reviewer_task_id);
                         enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
                             .await;
@@ -2650,10 +2633,9 @@ async fn tick(
                         fire_event(&db_path, "system", reviewer_task_id, &Event::MergeSucceeded)
                             .await;
                         // #125 fires the collector immediately (best-effort).
-                        // #127 also durably enqueues so a daemon crash before
-                        // or during collection is caught by reconcile() on
-                        // next startup — the tick loop retries with backoff
-                        // and cap; a successful run deletes the job.
+                        // #127 also durably enqueues so the tick loop retries
+                        // with backoff and cap; a successful run deletes the
+                        // job.
                         spawn_post_merge_collector(config, pr_num, reviewer_task_id);
                         enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
                             .await;
@@ -4362,8 +4344,8 @@ async fn tick(
         if let Some((pr, task_id, attempts)) = outcome.just_dead_lettered {
             log(&format!(
                 "interpret: DEAD-LETTER PR #{pr} (task #{task_id}) — \
-                 {attempts} failed attempts, giving up (visible via startup \
-                 reconcile until the row is deleted)"
+                 {attempts} failed attempts, giving up (row preserved for \
+                 operator visibility)"
             ));
         }
         if let Some(job) = outcome.next {
