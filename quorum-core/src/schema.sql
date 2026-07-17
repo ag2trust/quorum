@@ -343,16 +343,12 @@ CREATE TABLE IF NOT EXISTS review_collection_runs (
 CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
 
 -- v24 (#127): durable post-merge collector retry queue. Each row is a pending
--- collector invocation — the daemon enqueues one at MergeSucceeded, reconciles
--- missed rows on startup, and drains one job per tick with a bounded retry
--- budget (attempts cap + linear backoff). Deleted on success. Complements
--- `review_collection_runs` (an audit record per PR) by providing durable
--- retry state that survives daemon crashes; failure is observable via
+-- collector invocation — the daemon enqueues one at MergeSucceeded and drains
+-- one job per tick with a bounded retry budget (attempts cap + linear backoff).
+-- Deleted on success. Historical terminal tasks are NOT backfilled (#157).
+-- Complements `review_collection_runs` (an audit record per PR) by providing
+-- durable retry state that survives daemon crashes; failure is observable via
 -- `last_error` but never mutates the completed task's `done` state.
---
--- `interpreter_version` here mirrors `collector_version` written on runs —
--- a version bump legitimately re-targets the same PR, and the reconciler uses
--- the value to decide whether existing findings are stale.
 CREATE TABLE IF NOT EXISTS review_interpret_jobs (
     pr_number           INTEGER PRIMARY KEY,
     task_id             INTEGER NOT NULL,

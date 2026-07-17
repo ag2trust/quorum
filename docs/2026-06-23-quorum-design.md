@@ -650,9 +650,15 @@ can undo the merge or change the task.
 
 **Retry surface:** `quorum review-interpret --pr N [--task-id N] [--repo owner/name]`
 re-runs the same pipeline manually. It calls `serve::collector::run_collection`
-directly — the manual backfill and the automatic post-merge path share one
-ingestion implementation. Used for backfill on historic PRs and for retrying
-recorded failures (`SELECT * FROM review_collection_runs WHERE status='failed'`).
+directly — the manual CLI path and the automatic post-merge path share one
+ingestion implementation. Used for retrying recorded failures
+(`SELECT * FROM review_collection_runs WHERE status='failed'`).
+
+**No historical backfill (#157):** the daemon does NOT scan terminal tasks at
+startup to infer missing interpretation jobs. Jobs enter the durable queue only
+via the `MergeSucceeded` enqueue path. Already-enqueued rows from prior merges
+are drained normally by the tick loop; historical tasks without a queue row are
+left untouched.
 
 ## Daemon-only execution and lean interface (v2 boundary)
 
