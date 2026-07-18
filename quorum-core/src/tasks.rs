@@ -537,9 +537,17 @@ pub fn apply_event(
 
     match event {
         Event::SignaledDone { .. } | Event::ReworkPushed => {
-            if task.author.as_deref() != Some(agent) {
-                tx.commit()?;
-                return Err(QuorumError::NotHolder);
+            // Authorize by current assignee (fast path), then by active run
+            // capability (handles replacement workers whose author field was
+            // preserved for branch-naming provenance).
+            let is_assignee = task.assignee.as_deref() == Some(agent);
+            if !is_assignee {
+                let has_cap =
+                    crate::capabilities::active_for_agent_task(&tx, agent, id, "worker")?.is_some();
+                if !has_cap {
+                    tx.commit()?;
+                    return Err(QuorumError::NotHolder);
+                }
             }
         }
         Event::VerdictApprove | Event::VerdictChanges => {
@@ -666,6 +674,13 @@ pub fn apply_event(
                         "review-only task failed: reviewer requested changes"
                     ],
                 )?;
+            }
+            Effect::ResumeWorker => {
+                // Rework phase: restore assignee from reviewer back to the
+                // worker (author). If a replacement worker later pushes
+                // rework, the assignee check may still miss — the capability
+                // fallback in the authorization match covers that case.
+                assignee = author.clone();
             }
             _ => {}
         }
@@ -1656,6 +1671,105 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.task.status, "in-review");
+    }
+
+    #[test]
+    fn replacement_worker_signaled_done_with_preserved_author() {
+        // Regression: task #9 — replacement worker with preserved authorship
+        // (PR exists) must be able to signal done via assignee check.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+
+        // A claims → author=A, assignee=A
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+
+        // A signals done with PR
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "50".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Reviewer R claims and requests changes → rework
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
+
+        // A fails during rework → open (author=A preserved because PR exists)
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::AgentFailed {
+                reason: "crashed".to_string(),
+            },
+            1004,
+        )
+        .unwrap();
+
+        // B reclaims → assignee=B, author=A (preserved)
+        let t = claim(&mut c, "B", Some(id), &[], TTL, 1005)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.assignee.as_deref(), Some("B"));
+        assert_eq!(t.author.as_deref(), Some("A"), "author must be preserved");
+
+        // B signals done — authorized by assignee, not author
+        let r = apply_event(
+            &mut c,
+            "B",
+            id,
+            &Event::SignaledDone {
+                pr: "51".to_string(),
+            },
+            1006,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "in-review");
+        assert_eq!(
+            r.task.author.as_deref(),
+            Some("A"),
+            "original author preserved through submit"
+        );
+    }
+
+    #[test]
+    fn replacement_worker_rework_pushed_via_capability() {
+        // During Rework, assignee is restored to author by ResumeWorker.
+        // A replacement worker (not the author) needs a capability to push rework.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+
+        // A claims → author=A, assignee=A
+        claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "A",
+            id,
+            &Event::SignaledDone {
+                pr: "50".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+
+        // Reviewer R claims and gives changes → rework
+        claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
+
+        // ResumeWorker restored assignee to author=A.
+        // B (replacement worker) pushes rework — needs capability.
+        crate::capabilities::issue(&mut c, "run-b", id, "B", "worker", 1003).unwrap();
+        let r = apply_event(&mut c, "B", id, &Event::ReworkPushed, 1004).unwrap();
+        assert_eq!(r.task.status, "in-review");
+
+        // Stale agent without capability must be rejected
+        let err = apply_event(&mut c, "stale", id, &Event::ReworkPushed, 1005);
+        assert!(err.is_err());
     }
 
     // ── review-only task ────────────────────────────────────────────────────
