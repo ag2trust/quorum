@@ -58,7 +58,12 @@ pub(crate) async fn recover(
         .await?
     };
 
-    for appr in records {
+    // Deduplicate by PR: process each PR once (may have R1 + R2 records).
+    let mut seen_prs = std::collections::HashSet::new();
+    for appr in &records {
+        if !seen_prs.insert(appr.pr_number) {
+            continue;
+        }
         let pr = appr.pr_number;
         // SHA-bind against the PR's live head. If we can't determine it, leave
         // the record for a future startup rather than merging blind.
@@ -77,37 +82,72 @@ pub(crate) async fn recover(
             continue;
         };
 
-        match crate::verdict::dispose_approval(
-            &appr.verdict,
-            appr.blocking_count,
-            &appr.reviewer,
-            &appr.author,
-            &appr.approved_head_sha,
-            &current_head,
-        ) {
-            crate::verdict::ApprovalDisposition::Merge => {
-                if merge_approved(db_path, repo_dir, merge_executor, &appr).await? {
-                    outcome.merged += 1;
-                } else {
-                    outcome.deferred += 1;
+        // Validate each role's approval individually (stale SHA, self-review).
+        let mut any_invalid = false;
+        let mut any_rejected = false;
+        let pr_records: Vec<&approvals::Approval> =
+            records.iter().filter(|a| a.pr_number == pr).collect();
+        for role_appr in &pr_records {
+            match crate::verdict::dispose_approval(
+                &role_appr.verdict,
+                role_appr.blocking_count,
+                &role_appr.reviewer,
+                &role_appr.author,
+                &role_appr.approved_head_sha,
+                &current_head,
+            ) {
+                crate::verdict::ApprovalDisposition::Merge => {}
+                crate::verdict::ApprovalDisposition::Demote(reason) => {
+                    log(&format!(
+                        "approval-recovery: PR #{pr} {} demoted (task #{}) — {reason}",
+                        role_appr.review_role, appr.task_id
+                    ));
+                    any_invalid = true;
+                }
+                crate::verdict::ApprovalDisposition::Reject(reason) => {
+                    log(&format!(
+                        "approval-recovery: PR #{pr} {} rejected (task #{}) — {reason}",
+                        role_appr.review_role, appr.task_id
+                    ));
+                    any_invalid = true;
+                    any_rejected = true;
                 }
             }
-            crate::verdict::ApprovalDisposition::Demote(reason) => {
-                log(&format!(
-                    "approval-recovery: PR #{pr} demoted (task #{}) — {reason}",
-                    appr.task_id
-                ));
-                drop_approval(db_path, pr).await?;
+        }
+
+        if any_invalid {
+            drop_approval(db_path, pr).await?;
+            if any_rejected {
+                outcome.rejected += 1;
+            } else {
                 outcome.demoted += 1;
             }
-            crate::verdict::ApprovalDisposition::Reject(reason) => {
-                log(&format!(
-                    "approval-recovery: PR #{pr} approval rejected (task #{}) — {reason}",
-                    appr.task_id
-                ));
-                drop_approval(db_path, pr).await?;
-                outcome.rejected += 1;
-            }
+            continue;
+        }
+
+        // Dual-review gate: both R1 and R2 must be approved for the same head.
+        let dual_ok = {
+            let p = db_path.to_path_buf();
+            run_blocking(move || {
+                let conn = quorum_core::db::open(&p)?;
+                approvals::dual_approved(&conn, pr)
+            })
+            .await?
+        };
+        if dual_ok.is_none() {
+            log(&format!(
+                "approval-recovery: PR #{pr} (task #{}) — dual approval incomplete, \
+                 deferring to normal review",
+                appr.task_id
+            ));
+            outcome.deferred += 1;
+            continue;
+        }
+
+        if merge_approved(db_path, repo_dir, merge_executor, appr).await? {
+            outcome.merged += 1;
+        } else {
+            outcome.deferred += 1;
         }
     }
 
@@ -185,8 +225,21 @@ async fn adopt_stranded_verdicts(
             continue; // head unknown — leave the row for a later startup
         };
 
+        // Determine role: if an R1 approval already exists for this PR,
+        // adopt as R2; otherwise as R1.
+        let adopt_role = {
+            let p2 = db_path.to_path_buf();
+            let pr2 = pr;
+            run_blocking(move || {
+                let conn = quorum_core::db::open(&p2)?;
+                let existing = approvals::get(&conn, pr2, "r1")?;
+                Ok(if existing.is_some() { "r2" } else { "r1" })
+            })
+            .await?
+        };
         let record = approvals::Approval {
             pr_number: pr,
+            review_role: adopt_role.to_string(),
             task_id,
             author,
             reviewer: row.agent.clone(),
@@ -410,9 +463,24 @@ mod tests {
             &mut conn,
             &approvals::Approval {
                 pr_number: 208,
+                review_role: "r1".into(),
                 task_id: tid,
                 author: "Bellows-d11".into(),
                 reviewer: "Grommet-d14".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "2c0c833".into(),
+            },
+        )
+        .unwrap();
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r2".into(),
+                task_id: tid,
+                author: "Bellows-d11".into(),
+                reviewer: "Anvil-d22".into(),
                 verdict: "approved".into(),
                 blocking_count: 0,
                 approved_head_sha: "2c0c833".into(),
@@ -430,7 +498,7 @@ mod tests {
         // Task closed, approval consumed, journal cleaned.
         let conn = db::open(&db_path).unwrap();
         assert_eq!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
-        assert!(approvals::get(&conn, 208).unwrap().is_none());
+        assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
         assert!(journal::list_in_flight(&conn).unwrap().is_empty());
     }
 
@@ -446,6 +514,7 @@ mod tests {
             &mut conn,
             &approvals::Approval {
                 pr_number: 208,
+                review_role: "r1".into(),
                 task_id: tid,
                 author: "Bellows-d11".into(),
                 reviewer: "Grommet-d14".into(),
@@ -468,7 +537,7 @@ mod tests {
         let conn = db::open(&db_path).unwrap();
         // Task NOT closed — it stays claimed for normal re-review.
         assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
-        assert!(approvals::get(&conn, 208).unwrap().is_none());
+        assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
     }
 
     /// Acceptance #228: a self-review approval (reviewer == author) is refused,
@@ -483,6 +552,7 @@ mod tests {
             &mut conn,
             &approvals::Approval {
                 pr_number: 208,
+                review_role: "r1".into(),
                 task_id: tid,
                 author: "Bellows-d11".into(),
                 reviewer: "Bellows-d11".into(), // == author
@@ -503,7 +573,7 @@ mod tests {
         assert_eq!(outcome.rejected, 1, "self-review must be rejected");
         let conn = db::open(&db_path).unwrap();
         assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
-        assert!(approvals::get(&conn, 208).unwrap().is_none());
+        assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
     }
 
     /// Acceptance #228 (the observed live bug): a stranded, attested `approved`
@@ -517,7 +587,22 @@ mod tests {
         let mut conn = db::open(&db_path).unwrap();
         let tid = seed_task(&mut conn, "impl", "Bellows-d11");
         seed_journal(&mut conn, "Bellows-d11", tid, 208);
-        // The prior reviewer's attested approval, still unconsumed in the mailbox.
+        // Pre-seed R2 approval (e.g. from a prior R2 run before restart).
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r2".into(),
+                task_id: tid,
+                author: "Bellows-d11".into(),
+                reviewer: "Anvil-d22".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "2c0c833".into(),
+            },
+        )
+        .unwrap();
+        // The prior R1 reviewer's attested approval, still unconsumed in the mailbox.
         let mid = mailbox::append(
             &mut conn,
             &mailbox::MailboxRow {
@@ -600,9 +685,24 @@ mod tests {
             &mut conn,
             &approvals::Approval {
                 pr_number: 208,
+                review_role: "r1".into(),
                 task_id: tid,
                 author: "Bellows-d11".into(),
                 reviewer: "Grommet-d14".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "abc".into(),
+            },
+        )
+        .unwrap();
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r2".into(),
+                task_id: tid,
+                author: "Bellows-d11".into(),
+                reviewer: "Anvil-d22".into(),
                 verdict: "approved".into(),
                 blocking_count: 0,
                 approved_head_sha: "abc".into(),
@@ -622,6 +722,6 @@ mod tests {
         assert_eq!(outcome.deferred, 1);
         let conn = db::open(&db_path).unwrap();
         assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
-        assert!(approvals::get(&conn, 208).unwrap().is_none());
+        assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
     }
 }

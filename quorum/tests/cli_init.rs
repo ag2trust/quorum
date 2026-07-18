@@ -159,16 +159,8 @@ fn init_creates_serve_config_scaffold() {
     assert!(toml_path.exists(), "serve config scaffold must be created");
     let content = std::fs::read_to_string(&toml_path).unwrap();
     assert!(
-        content.contains("r2_enabled"),
-        "scaffold must surface r2_enabled"
-    );
-    assert!(
-        content.contains("r2_target_per_stratum"),
-        "scaffold must surface r2_target_per_stratum"
-    );
-    assert!(
-        content.contains("r2_steady_state_p"),
-        "scaffold must surface r2_steady_state_p"
+        content.contains("R2 pre-merge review is mandatory"),
+        "scaffold must note R2 is mandatory"
     );
 }
 

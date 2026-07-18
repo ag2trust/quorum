@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 27;
+pub const SCHEMA_VERSION: i64 = 28;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -399,6 +399,47 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 [now],
             )?;
         }
+
+        // v28 = mandatory dual-review approvals (#159). Recreate the approvals
+        // table with a composite PK (pr_number, review_role) so R1 and R2
+        // verdicts are stored independently. Existing single-row approvals
+        // are migrated as role='r1'.
+        if current < 28 {
+            let has_old_approvals: bool = conn
+                .query_row(
+                    "SELECT count(*) > 0 FROM sqlite_master \
+                     WHERE type='table' AND name='approvals'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if has_old_approvals && !column_exists(conn, "approvals", "review_role")? {
+                conn.execute_batch(
+                    "CREATE TABLE approvals_v28 (
+                        pr_number         INTEGER NOT NULL,
+                        review_role       TEXT NOT NULL DEFAULT 'r1',
+                        task_id           INTEGER NOT NULL,
+                        author            TEXT NOT NULL,
+                        reviewer          TEXT NOT NULL,
+                        verdict           TEXT NOT NULL,
+                        blocking_count    INTEGER NOT NULL,
+                        approved_head_sha TEXT NOT NULL,
+                        created_at        INTEGER NOT NULL,
+                        PRIMARY KEY (pr_number, review_role)
+                    );
+                    INSERT OR IGNORE INTO approvals_v28
+                        (pr_number, review_role, task_id, author, reviewer, verdict,
+                         blocking_count, approved_head_sha, created_at)
+                        SELECT pr_number, 'r1', task_id, author, reviewer, verdict,
+                               blocking_count, approved_head_sha, created_at
+                        FROM approvals;
+                    DROP TABLE approvals;
+                    ALTER TABLE approvals_v28 RENAME TO approvals;
+                    CREATE INDEX IF NOT EXISTS approvals_task ON approvals(task_id);",
+                )?;
+            }
+        }
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };

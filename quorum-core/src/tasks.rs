@@ -867,6 +867,19 @@ pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -
     Ok(true)
 }
 
+/// Set the author field on a task (#159: remediation worker becomes the
+/// managed author so routing/disqualification works correctly).
+pub fn set_author(conn: &mut Connection, id: i64, author: &str) -> Result<()> {
+    let now = crate::clock::now();
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE tasks SET author=?2, updated_at=?3 WHERE id=?1",
+        params![id, author, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 // ── close_manual ─────────────────────────────────────────────────────────────
 
 pub fn close_manual(
@@ -1630,7 +1643,8 @@ mod tests {
     }
 
     #[test]
-    fn review_only_verdict_changes_fails() {
+    fn review_only_verdict_changes_reworks() {
+        // #159: review_only + changes → rework (remediation workers).
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
@@ -1647,7 +1661,7 @@ mod tests {
         .unwrap();
         claim(&mut c, "R", Some(id), &[], TTL, 1001).unwrap();
         let r = apply_event(&mut c, "R", id, &Event::VerdictChanges, 1002).unwrap();
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
     }
 
     // ── update backward compat ──────────────────────────────────────────────
@@ -2306,7 +2320,8 @@ mod tests {
     }
 
     #[test]
-    fn review_only_verdict_changes_posts_findings_note() {
+    fn review_only_verdict_changes_enters_rework() {
+        // #159: review_only + changes → rework (remediation workers spawn).
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
@@ -2324,16 +2339,9 @@ mod tests {
         claim(&mut c, "R", Some(id), &[], TTL, 1001).unwrap();
 
         let r = apply_event(&mut c, "R", id, &Event::VerdictChanges, 1002).unwrap();
-        assert_eq!(r.task.status, "failed");
-        assert!(r.effects.contains(&Effect::PostFindingsNote));
-
-        let detail = get_with_notes(&c, id).unwrap().unwrap();
-        let note = detail
-            .notes
-            .iter()
-            .find(|n| n.body.contains("review-only"))
-            .expect("findings note missing");
-        assert!(note.body.contains("requested changes"));
+        assert_eq!(r.task.status, "rework");
+        assert!(r.effects.contains(&Effect::IncrementReworkRound));
+        assert!(r.effects.contains(&Effect::ResumeWorker));
     }
 
     #[test]

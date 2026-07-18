@@ -190,6 +190,38 @@ fn seed_task(home: &std::path::Path, title: &str) {
     );
 }
 
+fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) {
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &r2_name,
+            "--pr",
+            pr,
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let mut cmd_args = vec!["done"];
     cmd_args.extend_from_slice(args);
@@ -274,6 +306,7 @@ fn policy_blocked_merge_parks_task_no_rework() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("MERGE BLOCKED", 15),
@@ -372,6 +405,7 @@ fn conflicting_pr_skips_merge_sends_rework() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("CONFLICTING", 15),
@@ -464,6 +498,7 @@ fn retryable_merge_sends_rework_turn() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("retryable", 15),

@@ -193,6 +193,39 @@ fn seed_task(home: &std::path::Path, title: &str) {
     );
 }
 
+/// #159: after R1 approves, wait for mandatory R2 and post R2's approval.
+fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) {
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &r2_name,
+            "--pr",
+            pr,
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let mut cmd_args = vec!["done"];
     cmd_args.extend_from_slice(args);
@@ -284,6 +317,7 @@ fn checks_pass_then_merge_succeeds() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("checks passed", 15),
@@ -374,6 +408,7 @@ fn checks_fail_sends_rework() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("checks failed", 15),
@@ -471,6 +506,7 @@ fn checks_timeout_parks_task() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("MERGE BLOCKED", 15),
@@ -590,6 +626,7 @@ fn checks_pending_then_ready_merges_after_wait() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     assert!(
         handle.wait_for("waiting for checks", 10),
@@ -706,6 +743,7 @@ fn empty_checks_treated_as_pending() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     // Wait long enough that the old (buggy) code would have merged immediately.
     assert!(
@@ -841,6 +879,7 @@ fn policy_pending_retries_then_merges() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     // First merge attempt hits policy-pending.
     assert!(
@@ -1075,6 +1114,7 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
             "0",
         ],
     );
+    complete_r2_review(home.path(), &mut handle, "1");
 
     // Should see the conflict detected after timeout, NOT a cancel.
     assert!(

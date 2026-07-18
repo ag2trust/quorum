@@ -229,22 +229,24 @@ CREATE TABLE IF NOT EXISTS journal (
     updated_at      INTEGER NOT NULL
 );
 
--- #228 durable approval record: an attested `approved` review verdict persisted
--- against the PR/task. A `--self-update-drain` restart that lands between approval
--- and merge must be able to reconstruct "merge this PR" from durable state alone.
--- Recovery merges iff the record is a well-formed attested approval, reviewer !=
--- author, and `approved_head_sha` still matches the PR's live head (see
--- verdict::dispose_approval). Keyed by pr_number: at most one live approval per PR.
+-- #228 durable approval record: an attested review verdict persisted against the
+-- PR/task. A `--self-update-drain` restart that lands between approval and merge
+-- must be able to reconstruct "merge this PR" from durable state alone. Recovery
+-- merges iff both r1 and r2 records are well-formed attested approvals for the
+-- same head SHA, reviewer != author, and the SHA still matches the PR's live head.
+-- Keyed by (pr_number, review_role): one verdict per reviewer role per PR.
 -- Deleted on merge / demote / reject.
 CREATE TABLE IF NOT EXISTS approvals (
-    pr_number         INTEGER PRIMARY KEY,
+    pr_number         INTEGER NOT NULL,
+    review_role       TEXT NOT NULL DEFAULT 'r1',
     task_id           INTEGER NOT NULL,
     author            TEXT NOT NULL,
     reviewer          TEXT NOT NULL,
     verdict           TEXT NOT NULL,
     blocking_count    INTEGER NOT NULL,
     approved_head_sha TEXT NOT NULL,
-    created_at        INTEGER NOT NULL
+    created_at        INTEGER NOT NULL,
+    PRIMARY KEY (pr_number, review_role)
 );
 CREATE INDEX IF NOT EXISTS approvals_task ON approvals(task_id);
 

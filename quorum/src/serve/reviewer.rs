@@ -56,6 +56,15 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          review is your durable GitHub record when the verdict is `changes`).\n\
          - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
          `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
+         cite evidence disproving the failure):\n\
+         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
+         - Unbounded prompt or context growth\n\
+         - Network or model API calls while holding a database transaction\n\
+         - Data loss, corruption, or security boundary violations\n\
+         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
+         A reviewer may not describe one of these concrete failures and then submit it \
+         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
@@ -166,6 +175,15 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          review is your durable GitHub record when the verdict is `changes`).\n\
          - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
          `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
+         cite evidence disproving the failure):\n\
+         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
+         - Unbounded prompt or context growth\n\
+         - Network or model API calls while holding a database transaction\n\
+         - Data loss, corruption, or security boundary violations\n\
+         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
+         A reviewer may not describe one of these concrete failures and then submit it \
+         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
@@ -325,6 +343,46 @@ pub fn build_rework_turn(
         task_id = task_id,
         budget = budget_line(spent_usd, max_task_cost_usd),
     ))
+}
+
+/// Prompt for a remediation worker spawned to fix blocking findings on a PR
+/// that has no live managed worker (#159).
+pub fn build_remediation_turn(
+    agent_name: &str,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+    task_body: &str,
+    max_task_cost_usd: Option<f64>,
+) -> String {
+    format!(
+        "You are remediation worker {agent}. A reviewer found blocking issues on PR #{pr} \
+         and no managed worker exists to address them.\n\n\
+         ## Task context\n{body}\n\n\
+         ## Blocking findings from the reviewer\n{feedback}\n\n\
+         ## Instructions\n\
+         You are fixing an EXISTING PR — do NOT open a new one. The PR branch is already \
+         checked out in your worktree.\n\n\
+         The PR is the source of truth for this review — address findings there:\n\
+         - For each blocking finding, either fix it and push, or, if you disagree, reply \
+         to the finding on the PR with concrete evidence (a citation, a test result, a \
+         rationale). Do NOT silently ignore a finding — an unanswered blocker will still \
+         block the next review.\n\
+         - The final PR history must let a later reader determine, for each finding, whether \
+         it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
+         Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
+         After fixing and pushing:\n\
+         1. Run preflight: ./preflight.sh\n\
+         2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\
+         3. Post progress: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+        agent = agent_name,
+        pr = pr,
+        body = if task_body.is_empty() { "(no task body)" } else { task_body },
+        feedback = feedback,
+        task_id = task_id,
+        budget = budget_line(0.0, max_task_cost_usd),
+    )
 }
 
 #[cfg(test)]

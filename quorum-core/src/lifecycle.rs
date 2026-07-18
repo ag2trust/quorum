@@ -244,18 +244,6 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             }],
         )),
         (Status::InReview, Event::VerdictChanges) => {
-            if t.review_only {
-                return Ok((
-                    Status::Failed,
-                    vec![
-                        Effect::PostFindingsNote,
-                        Effect::ReleaseLease,
-                        Effect::NotifyOwner {
-                            reason: "review-only task: reviewer requested changes".into(),
-                        },
-                    ],
-                ));
-            }
             if t.rework_round >= REWORK_CAP {
                 return Ok((
                     Status::Failed,
@@ -712,20 +700,15 @@ mod tests {
     }
 
     #[test]
-    fn in_review_verdict_changes_review_only_fails() {
+    fn in_review_verdict_changes_review_only_reworks() {
+        // #159: review_only tasks now go through rework (remediation workers).
         let mut t = view_with_author(Status::InReview, "W1");
         t.review_only = true;
         assert_ok(
             &t,
             &Event::VerdictChanges,
-            Status::Failed,
-            &[
-                Effect::PostFindingsNote,
-                Effect::ReleaseLease,
-                Effect::NotifyOwner {
-                    reason: "review-only task: reviewer requested changes".into(),
-                },
-            ],
+            Status::Rework,
+            &[Effect::IncrementReworkRound, Effect::ResumeWorker],
         );
     }
 
@@ -1155,20 +1138,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn review_only_changes_at_zero_rounds_still_fails() {
+    fn review_only_changes_at_zero_rounds_reworks() {
+        // #159: review_only + changes → rework (remediation workers).
         let mut t = view_with_author(Status::InReview, "W1");
         t.review_only = true;
         t.rework_round = 0;
         let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
-        assert_eq!(next, Status::Failed);
-        assert!(effects.contains(&Effect::PostFindingsNote));
-        assert!(effects.contains(&Effect::ReleaseLease));
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::NotifyOwner { .. })),
-            "review-only Failed must carry NotifyOwner"
-        );
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        assert!(effects.contains(&Effect::ResumeWorker));
     }
 
     // -----------------------------------------------------------------------

@@ -43,9 +43,12 @@ pub struct ServeFileConfig {
     pub master_ci_gate: Option<bool>,
     pub master_ci_timeout_secs: Option<u64>,
     pub doctor_enabled: Option<bool>,
-    // ponytail: R2 pre-merge review knobs — defaults in ServeConfig resolution
+    // R2 is mandatory (#159) — sampling config removed. Fields kept for TOML compat.
+    #[allow(dead_code)]
     pub r2_enabled: Option<bool>,
+    #[allow(dead_code)]
     pub r2_target_per_stratum: Option<i64>,
+    #[allow(dead_code)]
     pub r2_steady_state_p: Option<f64>,
     /// Per-complexity suggested model/effort (keys "1".."5", values "tier/effort").
     pub suggested_models: Option<std::collections::HashMap<String, String>>,
