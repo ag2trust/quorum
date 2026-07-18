@@ -52,13 +52,14 @@ COMPLEXITY RUBRIC (used by classifier and for task-creation guidance)
   Mismatch alerts are advisory — the daemon posts a note when actual < suggested.
 
 SUBMIT (canonical hand-off — aliased as `done`, which is deprecated)
-  quorum submit --agent <id> --pr <N> [--run-id <uuid>]                # worker: signal task completion (PR posted)
-                                                                       # --run-id: daemon-issued capability (managed agents)
+  quorum submit --agent <id> --pr <N>                                  # worker: signal task completion (PR posted)
   quorum submit --agent <id> --pr <N> --verdict approved --blocking 0  # reviewer: approve
   quorum submit --agent <id> --pr <N> --verdict changes --blocking <N> --feedback "..."
                                                                        # reviewer: request changes
-  # Writes a mailbox row for the daemon. Verdict contract (#206): approved requires
-  # --blocking 0; changes requires --feedback. `quorum done` is accepted but deprecated.
+  # Requires daemon run identity: reads QUORUM_RUN_ID env var (set by daemon at spawn)
+  # or explicit --run-id flag. Validates capability — agent and role must match.
+  # Verdict contract (#206): approved requires --blocking 0; changes requires --feedback.
+  # `quorum done` is accepted but deprecated.
 
 ROLES
   External callers create/inspect tasks and messages; they do not sync, claim, release, or submit work.
@@ -96,6 +97,7 @@ DAEMON IPC (M5 — agent-to-agent messaging + state reactions)
                                                       # daemon delivers as a turn when the target is idle
   quorum react   --agent <id> --task-id <n> --state <s>
                                                       # signal non-terminal state: blocked, failed, needs-info, note
+                                                      # requires daemon run identity (QUORUM_RUN_ID or --run-id)
                                                       # daemon tracks per-slot and surfaces via `quorum status`
   quorum kill    --agent <id> --by <id> [--reason-stdin]
                                                       # hard-terminate a daemon-managed agent (SIGTERM->SIGKILL);

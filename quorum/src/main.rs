@@ -161,6 +161,16 @@ fn check_nonneg(flag: &str, v: Option<i64>) -> Result<()> {
     }
 }
 
+/// Resolve run identity: explicit `--run-id` flag, then `QUORUM_RUN_ID` env var.
+fn resolve_run_id(flag: Option<String>, command: &str) -> Result<String> {
+    flag.or_else(|| std::env::var("QUORUM_RUN_ID").ok())
+        .ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "{command} requires daemon run identity: pass --run-id or set QUORUM_RUN_ID"
+            ))
+        })
+}
+
 /// Resolve an optional free-text body from `--body-stdin` / `--body-file` (at most one).
 fn read_optional_body(stdin: bool, file: Option<std::path::PathBuf>) -> Result<Option<String>> {
     read_optional_text(stdin, file, "--body-stdin", "--body-file")
@@ -829,6 +839,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent,
             task_id,
             state,
+            run_id,
         } => {
             match state.as_str() {
                 "blocked" | "failed" | "needs-info" | "note" => {}
@@ -838,8 +849,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     )));
                 }
             }
+            let rid = resolve_run_id(run_id, "react")?;
             let db = paths::db_path()?;
-            let mut conn = quorum_core::db::open(&db)?;
+            let conn = quorum_core::db::open(&db)?;
+            quorum_core::capabilities::validate(&conn, &rid, &agent, "worker", Some(task_id))
+                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
+            let mut conn = conn;
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
                 kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
@@ -876,20 +891,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             }
             verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
                 .map_err(QuorumError::Usage)?;
+            let rid = resolve_run_id(run_id, "submit")?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
-            // Validate run capability if provided. Role is derived from the submit
-            // shape — `--verdict` present → reviewer, absent → worker — so a
-            // worker-role capability cannot sign a reviewer submit and vice-versa.
-            if let Some(ref rid) = run_id {
-                let expected_role = if verdict.is_some() {
-                    "reviewer"
-                } else {
-                    "worker"
-                };
-                quorum_core::capabilities::validate(&conn, rid, &agent, expected_role, None)
-                    .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
-            }
+            let expected_role = if verdict.is_some() {
+                "reviewer"
+            } else {
+                "worker"
+            };
+            quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
+                .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
             let kind = quorum_core::mailbox::MailboxKind::Done;
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
