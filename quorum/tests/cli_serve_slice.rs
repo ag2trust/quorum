@@ -184,9 +184,22 @@ fn serve_spawns_agent_and_tears_down_on_done() {
 
     // Now write a Done mailbox row for that agent
     if !agent_name.is_empty() {
+        let run_id = {
+            let db = home
+                .path()
+                .join("repos")
+                .join("test__repo")
+                .join("quorum.db");
+            let conn = quorum_core::db::open(&db).unwrap();
+            quorum_core::capabilities::active_for_agent(&conn, &agent_name)
+                .unwrap()
+                .expect("no active capability for spawned agent")
+                .run_id
+        };
         let done_out = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
+            .env("QUORUM_RUN_ID", &run_id)
             .args(["done", "--agent", &agent_name, "--pr", "1"])
             .output()
             .unwrap();

@@ -226,12 +226,38 @@ fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str
     );
 }
 
+fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    match quorum_core::capabilities::active_for_agent(&conn, agent).unwrap() {
+        Some(cap) => cap.run_id,
+        None => {
+            let rid = format!("test-{agent}-{}", std::process::id());
+            quorum_core::capabilities::issue(&mut conn, &rid, 0, agent, role, 1000).unwrap();
+            rid
+        }
+    }
+}
+
 fn quorum_done(home: &std::path::Path, args: &[&str]) {
+    let agent = args
+        .iter()
+        .zip(args.iter().skip(1))
+        .find(|(k, _)| **k == "--agent")
+        .map(|(_, v)| *v)
+        .expect("quorum_done requires --agent");
+    let role = if args.contains(&"--verdict") {
+        "reviewer"
+    } else {
+        "worker"
+    };
+    let run_id = resolve_run_id(home, agent, role);
     let mut cmd_args = vec!["done"];
     cmd_args.extend_from_slice(args);
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
         .unwrap();

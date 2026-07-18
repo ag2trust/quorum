@@ -1,4 +1,4 @@
-//! Tests for `quorum submit` (mailbox write) and its deprecated `done` alias.
+//! Tests for `quorum submit` and `quorum react` — daemon run identity is required.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -16,16 +16,36 @@ fn init(home: &std::path::Path) {
         .success();
 }
 
-// --- `quorum submit` (canonical verb) ---
+fn db_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("repos").join("test__repo").join("quorum.db")
+}
+
+fn issue_cap(home: &std::path::Path, run_id: &str, task_id: i64, agent: &str, role: &str) {
+    let db = db_path(home);
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::capabilities::issue(&mut conn, run_id, task_id, agent, role, 1000).unwrap();
+}
+
+fn revoke_cap(home: &std::path::Path, run_id: &str) {
+    let db = db_path(home);
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::capabilities::revoke(&mut conn, run_id, 2000).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// submit — happy paths
+// ---------------------------------------------------------------------------
 
 #[test]
 fn submit_writes_mailbox_row() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-w1", 1, "TestAgent", "worker");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-w1")
         .args(["submit", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .success()
@@ -37,10 +57,12 @@ fn submit_writes_mailbox_row() {
 fn submit_with_verdict() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-r1", 1, "Reviewer-1", "reviewer");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-r1")
         .args([
             "submit",
             "--agent",
@@ -61,10 +83,12 @@ fn submit_with_verdict() {
 fn submit_with_changes_and_feedback() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-r2", 1, "Reviewer-2", "reviewer");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-r2")
         .args([
             "submit",
             "--agent",
@@ -81,16 +105,44 @@ fn submit_with_changes_and_feedback() {
         .stdout(predicate::str::contains("\"ok\":true"));
 }
 
-// --- #206 verdict discipline ---
+#[test]
+fn submit_explicit_run_id_flag_overrides_env() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-flag", 1, "TestAgent", "worker");
+    issue_cap(home.path(), "run-env", 2, "TestAgent", "worker");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-env")
+        .args([
+            "submit",
+            "--agent",
+            "TestAgent",
+            "--pr",
+            "42",
+            "--run-id",
+            "run-flag",
+        ])
+        .assert()
+        .success();
+}
+
+// ---------------------------------------------------------------------------
+// submit — #206 verdict discipline (still checked before capability)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn submit_approved_with_blocking_findings_is_refused() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-vd1", 1, "Reviewer-1", "reviewer");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-vd1")
         .args([
             "submit",
             "--agent",
@@ -111,10 +163,12 @@ fn submit_approved_with_blocking_findings_is_refused() {
 fn submit_approved_without_blocking_attestation_is_refused() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-vd2", 1, "Reviewer-1", "reviewer");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-vd2")
         .args([
             "submit",
             "--agent",
@@ -133,10 +187,12 @@ fn submit_approved_without_blocking_attestation_is_refused() {
 fn submit_changes_without_feedback_is_refused() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-vd3", 1, "Reviewer-1", "reviewer");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-vd3")
         .args([
             "submit",
             "--agent",
@@ -151,7 +207,24 @@ fn submit_changes_without_feedback_is_refused() {
         .stderr(predicate::str::contains("--feedback"));
 }
 
-// --- #130 capability validation ---
+// ---------------------------------------------------------------------------
+// submit — identity failures (exit 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn submit_without_run_identity_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_RUN_ID")
+        .args(["submit", "--agent", "TestAgent", "--pr", "42"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires daemon run identity"));
+}
 
 #[test]
 fn submit_with_unknown_run_id_fails() {
@@ -161,15 +234,8 @@ fn submit_with_unknown_run_id_fails() {
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
-        .args([
-            "submit",
-            "--agent",
-            "TestAgent",
-            "--pr",
-            "42",
-            "--run-id",
-            "nonexistent-run-id",
-        ])
+        .env("QUORUM_RUN_ID", "nonexistent-run-id")
+        .args(["submit", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown run_id"));
@@ -179,31 +245,14 @@ fn submit_with_unknown_run_id_fails() {
 fn submit_with_revoked_run_id_fails() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
-
-    let db_path = home
-        .path()
-        .join("repos")
-        .join("test__repo")
-        .join("quorum.db");
-    {
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
-        quorum_core::capabilities::issue(&mut conn, "run-revoked", 1, "TestAgent", "worker", 1000)
-            .unwrap();
-        quorum_core::capabilities::revoke(&mut conn, "run-revoked", 2000).unwrap();
-    }
+    issue_cap(home.path(), "run-revoked", 1, "TestAgent", "worker");
+    revoke_cap(home.path(), "run-revoked");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
-        .args([
-            "submit",
-            "--agent",
-            "TestAgent",
-            "--pr",
-            "42",
-            "--run-id",
-            "run-revoked",
-        ])
+        .env("QUORUM_RUN_ID", "run-revoked")
+        .args(["submit", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("revoked"));
@@ -213,37 +262,13 @@ fn submit_with_revoked_run_id_fails() {
 fn submit_with_mismatched_agent_fails() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
-
-    let db_path = home
-        .path()
-        .join("repos")
-        .join("test__repo")
-        .join("quorum.db");
-    {
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
-        quorum_core::capabilities::issue(
-            &mut conn,
-            "run-mismatch",
-            1,
-            "OtherAgent",
-            "worker",
-            1000,
-        )
-        .unwrap();
-    }
+    issue_cap(home.path(), "run-mismatch", 1, "OtherAgent", "worker");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
-        .args([
-            "submit",
-            "--agent",
-            "TestAgent",
-            "--pr",
-            "42",
-            "--run-id",
-            "run-mismatch",
-        ])
+        .env("QUORUM_RUN_ID", "run-mismatch")
+        .args(["submit", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("agent mismatch"));
@@ -251,42 +276,15 @@ fn submit_with_mismatched_agent_fails() {
 
 #[test]
 fn submit_with_mismatched_role_fails() {
-    // A reviewer-role capability must not sign a worker submit (and vice-versa):
-    // capability derives identity from agent + role + task, not agent alone.
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-wrong-role", 1, "TestAgent", "reviewer");
 
-    let db_path = home
-        .path()
-        .join("repos")
-        .join("test__repo")
-        .join("quorum.db");
-    {
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
-        quorum_core::capabilities::issue(
-            &mut conn,
-            "run-wrong-role",
-            1,
-            "TestAgent",
-            "reviewer",
-            1000,
-        )
-        .unwrap();
-    }
-
-    // Worker-shaped submit (no --verdict) → expected_role=worker, cap.role=reviewer.
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
-        .args([
-            "submit",
-            "--agent",
-            "TestAgent",
-            "--pr",
-            "42",
-            "--run-id",
-            "run-wrong-role",
-        ])
+        .env("QUORUM_RUN_ID", "run-wrong-role")
+        .args(["submit", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("role mismatch"));
@@ -296,17 +294,7 @@ fn submit_with_mismatched_role_fails() {
 fn submit_with_valid_run_id_succeeds() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
-
-    let db_path = home
-        .path()
-        .join("repos")
-        .join("test__repo")
-        .join("quorum.db");
-    {
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
-        quorum_core::capabilities::issue(&mut conn, "run-valid", 1, "TestAgent", "worker", 1000)
-            .unwrap();
-    }
+    issue_cap(home.path(), "run-valid", 1, "TestAgent", "worker");
 
     quorum()
         .env("QUORUM_HOME", home.path())
@@ -325,16 +313,20 @@ fn submit_with_valid_run_id_succeeds() {
         .stdout(predicate::str::contains("\"ok\":true"));
 }
 
-// --- `quorum done` (deprecated alias, must still work) ---
+// ---------------------------------------------------------------------------
+// `quorum done` (deprecated alias, must still work)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn done_alias_writes_mailbox_row() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-done1", 1, "TestAgent", "worker");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-done1")
         .args(["done", "--agent", "TestAgent", "--pr", "42"])
         .assert()
         .success()
@@ -346,10 +338,12 @@ fn done_alias_writes_mailbox_row() {
 fn done_alias_with_verdict() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
+    issue_cap(home.path(), "run-done2", 1, "Reviewer-1", "reviewer");
 
     quorum()
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-done2")
         .args([
             "done",
             "--agent",
@@ -364,4 +358,228 @@ fn done_alias_with_verdict() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\":true"));
+}
+
+// ---------------------------------------------------------------------------
+// react — happy path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn react_with_valid_capability_succeeds() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react1", 42, "Worker-1", "worker");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-react1")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "42",
+            "--state",
+            "blocked",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\":true"));
+}
+
+#[test]
+fn react_explicit_run_id_flag() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react-flag", 10, "Worker-1", "worker");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_RUN_ID")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "10",
+            "--state",
+            "note",
+            "--run-id",
+            "run-react-flag",
+        ])
+        .assert()
+        .success();
+}
+
+// ---------------------------------------------------------------------------
+// react — identity failures (exit 2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn react_without_run_identity_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env_remove("QUORUM_RUN_ID")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "42",
+            "--state",
+            "blocked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires daemon run identity"));
+}
+
+#[test]
+fn react_with_unknown_run_id_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "ghost-run")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "42",
+            "--state",
+            "blocked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown run_id"));
+}
+
+#[test]
+fn react_with_revoked_run_id_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react-rev", 42, "Worker-1", "worker");
+    revoke_cap(home.path(), "run-react-rev");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-react-rev")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "42",
+            "--state",
+            "failed",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("revoked"));
+}
+
+#[test]
+fn react_with_wrong_agent_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react-ag", 42, "RealWorker", "worker");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-react-ag")
+        .args([
+            "react",
+            "--agent",
+            "Impostor",
+            "--task-id",
+            "42",
+            "--state",
+            "blocked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("agent mismatch"));
+}
+
+#[test]
+fn react_with_wrong_task_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react-tid", 42, "Worker-1", "worker");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-react-tid")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "99",
+            "--state",
+            "blocked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("task mismatch"));
+}
+
+#[test]
+fn react_with_reviewer_role_fails() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react-role", 42, "Rev-1", "reviewer");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-react-role")
+        .args([
+            "react",
+            "--agent",
+            "Rev-1",
+            "--task-id",
+            "42",
+            "--state",
+            "blocked",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("role mismatch"));
+}
+
+#[test]
+fn react_invalid_state_still_rejected() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-react-st", 42, "Worker-1", "worker");
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-react-st")
+        .args([
+            "react",
+            "--agent",
+            "Worker-1",
+            "--task-id",
+            "42",
+            "--state",
+            "invalid",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--state must be"));
 }

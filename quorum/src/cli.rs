@@ -327,14 +327,15 @@ pub enum Command {
         /// One of: blocked, failed, needs-info, note.
         #[arg(long)]
         state: String,
+        /// Daemon-issued run capability token. Falls back to QUORUM_RUN_ID env var.
+        #[arg(long = "run-id")]
+        run_id: Option<String>,
     },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// Writes a mailbox row for the daemon to consume.
     ///
-    /// `--run-id` is the daemon-issued capability token binding this operation
-    /// to a specific (task, agent, role) tuple. When present, identity is derived
-    /// from the capability — `--agent` is still required for backwards compat but
-    /// must match. When absent, falls back to agent-name-only auth (compat path).
+    /// Requires daemon run identity: `--run-id` flag or `QUORUM_RUN_ID` env var.
+    /// Identity is validated against the capability — `--agent` must match.
     ///
     /// `quorum done` is a deprecated alias — use `quorum submit`.
     #[command(alias = "done")]
@@ -357,7 +358,7 @@ pub enum Command {
         /// `--verdict changes`.
         #[arg(long)]
         blocking: Option<u32>,
-        /// Daemon-issued run capability token. Validates identity, task, and role.
+        /// Daemon-issued run capability token. Falls back to QUORUM_RUN_ID env var.
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
