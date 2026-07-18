@@ -1216,3 +1216,59 @@ fn recovery_journal_phase_irrelevant_db_status_drives_reset() {
 
     handle.sigkill();
 }
+
+/// Recovery with surviving branch: worktree GC'd but branch persists.
+/// Phase 6 must reuse the existing branch (not fail on `-b`).
+#[test]
+fn recovery_surviving_branch_reused_on_respawn() {
+    let env = TestEnv::new();
+    let id = env.seed_claimed_task("Surviving branch task", "Agent0");
+
+    // Create a real git branch in the repo (simulates what the prior worker created).
+    let d = env.repo_dir.path().to_string_lossy().to_string();
+    let branch = format!("daemon/agent0-t{id}");
+    Command::new("git")
+        .args(["-C", &d, "checkout", "-b", &branch])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "commit", "--allow-empty", "-m", "worker WIP"])
+        .status()
+        .unwrap();
+    // Switch back to main
+    Command::new("git")
+        .args(["-C", &d, "checkout", "main"])
+        .status()
+        .unwrap();
+
+    // Create orphan worktree dir (will be GC'd) and journal entry
+    let wt = env.wt_base.path().join(format!("Agent0-t{id}"));
+    std::fs::create_dir_all(&wt).unwrap();
+
+    env.seed_journal(&make_journal_entry(
+        "Agent0",
+        "worker",
+        "working",
+        Some(id),
+        Some(&wt.to_string_lossy()),
+        None,
+    ));
+
+    let mut handle = env.start_serve();
+
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+
+    // The branch survives recovery (only worktrees are GC'd).
+    // Phase 6 re-spawns: provision() must reuse the branch, not fail.
+    assert!(
+        handle.wait_for("worktree provisioned", 20),
+        "worker worktree should be provisioned despite surviving branch. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.sigkill();
+}

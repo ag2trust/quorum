@@ -57,6 +57,45 @@ impl WorktreeManager {
         cmd
     }
 
+    /// Check if a local branch exists. Caller MUST hold `self.lock`.
+    async fn branch_exists_unlocked(&self, repo_dir: &Path, branch: &str) -> bool {
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+        match run_git(cmd, self.local_timeout, "git rev-parse --verify").await {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+
+    /// Find the worktree path that has `branch` checked out, if any.
+    /// Returns `None` when the branch is free or on any git error.
+    /// Caller MUST hold `self.lock`.
+    async fn find_worktree_for_branch_unlocked(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+    ) -> Option<String> {
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["worktree", "list", "--porcelain"]);
+        let out = match run_git(cmd, self.local_timeout, "git worktree list").await {
+            Ok(out) if out.status.success() => out,
+            _ => return None,
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let target_ref = format!("branch refs/heads/{branch}");
+        let mut current_wt: Option<String> = None;
+        for line in stdout.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                current_wt = Some(path.to_string());
+            } else if line == target_ref {
+                return current_wt;
+            } else if line.is_empty() {
+                current_wt = None;
+            }
+        }
+        None
+    }
+
     pub async fn provision(
         &self,
         repo_dir: &Path,
@@ -67,16 +106,38 @@ impl WorktreeManager {
         let _guard = self.lock.lock().await;
 
         let wt_path = worktree_dir.to_path_buf();
-        let mut cmd = self.git_cmd(repo_dir);
-        cmd.args(["worktree", "add", "-b", branch]);
-        cmd.arg(&wt_path).arg(base_ref);
-        let add = run_git(cmd, self.local_timeout, "git worktree add").await?;
 
-        if !add.status.success() {
-            return Err(format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
-            ));
+        if self.branch_exists_unlocked(repo_dir, branch).await {
+            if let Some(existing_wt) = self
+                .find_worktree_for_branch_unlocked(repo_dir, branch)
+                .await
+            {
+                return Err(format!(
+                    "branch collision: '{branch}' already checked out in worktree '{existing_wt}'"
+                ));
+            }
+            // Reuse existing branch — preserves commits from a prior incarnation
+            let mut cmd = self.git_cmd(repo_dir);
+            cmd.args(["worktree", "add"]);
+            cmd.arg(&wt_path).arg(branch);
+            let add = run_git(cmd, self.local_timeout, "git worktree add (reuse branch)").await?;
+            if !add.status.success() {
+                return Err(format!(
+                    "git worktree add (reuse branch) failed: {}",
+                    String::from_utf8_lossy(&add.stderr)
+                ));
+            }
+        } else {
+            let mut cmd = self.git_cmd(repo_dir);
+            cmd.args(["worktree", "add", "-b", branch]);
+            cmd.arg(&wt_path).arg(base_ref);
+            let add = run_git(cmd, self.local_timeout, "git worktree add").await?;
+            if !add.status.success() {
+                return Err(format!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&add.stderr)
+                ));
+            }
         }
 
         Ok(wt_path)
@@ -104,6 +165,22 @@ impl WorktreeManager {
 
         let base_ref = format!("origin/{remote_branch}");
         let wt_path = worktree_dir.to_path_buf();
+
+        if self.branch_exists_unlocked(repo_dir, branch).await {
+            if let Some(existing_wt) = self
+                .find_worktree_for_branch_unlocked(repo_dir, branch)
+                .await
+            {
+                return Err(format!(
+                    "branch collision: '{branch}' already checked out in worktree '{existing_wt}'"
+                ));
+            }
+            // Delete stale review branch so it can be recreated at the remote head
+            let mut del_cmd = self.git_cmd(repo_dir);
+            del_cmd.args(["branch", "-D", branch]);
+            let _ = run_git(del_cmd, self.local_timeout, "git branch -D (stale)").await;
+        }
+
         let mut add_cmd = self.git_cmd(repo_dir);
         add_cmd.args(["worktree", "add", "-b", branch]);
         add_cmd.arg(&wt_path).arg(&base_ref);
@@ -378,6 +455,161 @@ mod tests {
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
         mgr.delete_branch(repo_dir.path(), branch).await;
+    }
+
+    /// Recovery scenario: worktree removed but branch survives. provision()
+    /// must reuse the existing branch and preserve its commits.
+    #[tokio::test]
+    async fn provision_reuses_existing_branch_preserving_commits() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("worker-wt");
+        let branch = "daemon/alloy-t9";
+
+        let mgr = WorktreeManager::new();
+
+        // First cycle: provision, make a commit in the worktree, then remove
+        // worktree WITHOUT deleting branch (simulates recovery GC).
+        mgr.provision(repo_dir.path(), branch, &wt_path, "main")
+            .await
+            .expect("first provision");
+        let d = wt_path.to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "worker commit"])
+            .status()
+            .unwrap();
+        let worker_head = git_rev_parse(&wt_path, "HEAD");
+
+        mgr.remove(repo_dir.path(), &wt_path).await.unwrap();
+        // Branch still exists (recovery doesn't delete branches)
+        let branch_check = StdCommand::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{branch}"),
+            ])
+            .output()
+            .unwrap();
+        assert!(branch_check.status.success(), "branch must survive removal");
+
+        // Second cycle: provision should reuse the existing branch
+        let wt_path2 = wt_dir.path().join("worker-wt-2");
+        let result = mgr
+            .provision(repo_dir.path(), branch, &wt_path2, "main")
+            .await;
+        assert!(
+            result.is_ok(),
+            "provision with existing branch should succeed: {:?}",
+            result.err()
+        );
+
+        // Worker commit must be preserved
+        let head_after = git_rev_parse(&wt_path2, "HEAD");
+        assert_eq!(
+            head_after, worker_head,
+            "reused branch must preserve the worker's commits"
+        );
+
+        mgr.remove(repo_dir.path(), &wt_path2).await.ok();
+        mgr.delete_branch(repo_dir.path(), branch).await;
+    }
+
+    /// Collision: provision must fail when the branch is checked out in
+    /// another worktree.
+    #[tokio::test]
+    async fn provision_detects_worktree_collision() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt1 = wt_dir.path().join("wt-1");
+        let wt2 = wt_dir.path().join("wt-2");
+        let branch = "daemon/collide-t1";
+
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo_dir.path(), branch, &wt1, "main")
+            .await
+            .unwrap();
+
+        let result = mgr.provision(repo_dir.path(), branch, &wt2, "main").await;
+        assert!(result.is_err(), "should detect collision");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("branch collision"),
+            "error should mention collision, got: {err}"
+        );
+
+        mgr.remove(repo_dir.path(), &wt1).await.ok();
+        mgr.delete_branch(repo_dir.path(), branch).await;
+    }
+
+    /// fetch_and_provision must handle a stale local branch left from a
+    /// prior reviewer incarnation (delete + recreate at remote head).
+    #[tokio::test]
+    async fn fetch_and_provision_cleans_stale_branch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let d = repo_dir.path().to_string_lossy().to_string();
+
+        StdCommand::new("git")
+            .args(["-C", &d, "remote", "add", "origin", &d])
+            .status()
+            .unwrap();
+
+        // Create a feature branch
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "feature/pr-branch"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "pr work"])
+            .status()
+            .unwrap();
+        let feature_head = git_rev_parse(repo_dir.path(), "feature/pr-branch");
+
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+
+        // Create a stale local review branch (simulates surviving branch)
+        StdCommand::new("git")
+            .args(["-C", &d, "branch", "review/pr-1-Rev0", "main"])
+            .status()
+            .unwrap();
+        let stale_head = git_rev_parse(repo_dir.path(), "review/pr-1-Rev0");
+        assert_ne!(stale_head, feature_head, "stale branch should differ");
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("reviewer-wt");
+
+        let mgr = WorktreeManager::new();
+        let result = mgr
+            .fetch_and_provision(
+                repo_dir.path(),
+                "review/pr-1-Rev0",
+                &wt_path,
+                "feature/pr-branch",
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "fetch_and_provision with stale branch should succeed: {:?}",
+            result.err()
+        );
+
+        // Must point at the remote head, not the stale branch
+        let wt_head = git_rev_parse(&wt_path, "HEAD");
+        assert_eq!(
+            wt_head, feature_head,
+            "reviewer worktree must be at remote head, not stale branch"
+        );
+
+        mgr.remove(repo_dir.path(), &wt_path).await.ok();
     }
 
     #[tokio::test]
