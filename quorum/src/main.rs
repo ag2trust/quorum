@@ -67,10 +67,9 @@ const DEFAULT_SERVE_TOML: &str = "\
 # log_dir = \"/path/to/logs\"
 # doctor_enabled = false
 
-## R2 pre-merge review (adversarial second reviewer, sampled at R1 approval)
-# r2_enabled = false
-# r2_target_per_stratum = 5
-# r2_steady_state_p = 0.10
+## R2 pre-merge review is mandatory (#159) — no sampling config needed.
+## Legacy keys (r2_enabled, r2_target_per_stratum, r2_steady_state_p) are
+## accepted but ignored.
 ";
 
 fn run() -> Result<i32> {
@@ -1148,9 +1147,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
             let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
-            let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(false);
-            let r_r2_target_per_stratum = file_cfg.r2_target_per_stratum.unwrap_or(5);
-            let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(0.10);
+            // R2 sampling config ignored — R2 is mandatory (#159).
 
             let r_suggested_models = file_cfg.suggested_models.unwrap_or_default();
             for (k, v) in &r_suggested_models {
@@ -1267,9 +1264,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_timeout_secs: r_master_ci_timeout.value,
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
                 doctor_enabled: r_doctor_enabled.value,
-                r2_enabled: r_r2_enabled,
-                r2_target_per_stratum: r_r2_target_per_stratum,
-                r2_steady_state_p: r_r2_steady_state_p,
                 suggested_models: r_suggested_models,
             };
             Ok(serve::run_serve(config)?)

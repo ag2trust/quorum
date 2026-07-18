@@ -1,16 +1,19 @@
-//! Durable, instance-independent approval records (#228).
+//! Durable, instance-independent approval records (#228, #159).
 //!
-//! When a reviewer posts an attested `approved` verdict, the daemon records it
-//! here — keyed by PR, with the `approved_head_sha` the reviewer signed off on.
+//! When a reviewer posts a verdict, the daemon records it here — keyed by
+//! (PR, review_role), with the `approved_head_sha` the reviewer signed off on.
 //! Unlike an instance-scoped mailbox row (which a `--self-update-drain` restart
 //! discards because the prior reviewer is not in the new instance's roster),
 //! this record survives any restart and carries no instance identity. On
 //! startup the daemon replays these records and — purely from persisted state —
-//! merges the PR (head still matches), returns it to review (head moved), or
-//! refuses it (self-review / not attested). See `serve::approvals::recover`.
+//! merges the PR (both R1+R2 approved for same head), returns it to review
+//! (head moved or missing verdict), or refuses it (self-review / not attested).
+//!
+//! Merge is authorized only when R1=approved AND R2=approved, both attest
+//! blocking=0, and both reviewed the current head SHA.
 //!
 //! Deleted on the terminal transition (merge / demote / reject) so the table
-//! only ever holds live "approved, awaiting merge" records.
+//! only ever holds live verdict records.
 
 use crate::clock;
 use crate::db::begin_immediate;
@@ -20,19 +23,19 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Approval {
-    /// The approved PR number — primary key (one live approval per PR).
     pub pr_number: i64,
-    /// The implementation task the PR closes — recovery closes this on merge.
+    /// Review role: "r1" or "r2".
+    pub review_role: String,
     pub task_id: i64,
-    /// Agent that authored the PR (the worker). Recovery refuses `reviewer == author`.
+    /// Agent that authored the PR (the worker).
     pub author: String,
-    /// Agent that produced the approved verdict (the reviewer).
+    /// Agent that produced the verdict (the reviewer).
     pub reviewer: String,
-    /// Canonical attested verdict — always `"approved"` for a stored record.
+    /// Attested verdict — "approved" or "changes".
     pub verdict: String,
-    /// Attested blocking-finding count (#226 contract; `0` for a real approval).
+    /// Attested blocking-finding count (#226 contract; 0 for a real approval).
     pub blocking_count: i64,
-    /// The PR head commit the reviewer approved — bound at record time so a
+    /// The PR head commit the reviewer reviewed — bound at record time so a
     /// later force-push auto-invalidates the approval.
     pub approved_head_sha: String,
 }
@@ -40,25 +43,29 @@ pub struct Approval {
 fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<Approval> {
     Ok(Approval {
         pr_number: r.get(0)?,
-        task_id: r.get(1)?,
-        author: r.get(2)?,
-        reviewer: r.get(3)?,
-        verdict: r.get(4)?,
-        blocking_count: r.get(5)?,
-        approved_head_sha: r.get(6)?,
+        review_role: r.get(1)?,
+        task_id: r.get(2)?,
+        author: r.get(3)?,
+        reviewer: r.get(4)?,
+        verdict: r.get(5)?,
+        blocking_count: r.get(6)?,
+        approved_head_sha: r.get(7)?,
     })
 }
 
-/// Upsert the durable approval for a PR. Last writer wins (a re-review after
-/// rework overwrites the prior head SHA).
+const SELECT_COLS: &str =
+    "pr_number, review_role, task_id, author, reviewer, verdict, blocking_count, approved_head_sha";
+
+/// Upsert the durable verdict for a (PR, role). Last writer wins (a re-review
+/// after rework overwrites the prior head SHA).
 pub fn record(conn: &mut Connection, a: &Approval) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
     tx.execute(
         "INSERT INTO approvals
-            (pr_number, task_id, author, reviewer, verdict, blocking_count, approved_head_sha, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(pr_number) DO UPDATE SET
+            (pr_number, review_role, task_id, author, reviewer, verdict, blocking_count, approved_head_sha, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(pr_number, review_role) DO UPDATE SET
              task_id = excluded.task_id,
              author = excluded.author,
              reviewer = excluded.reviewer,
@@ -68,6 +75,7 @@ pub fn record(conn: &mut Connection, a: &Approval) -> Result<()> {
              created_at = excluded.created_at",
         params![
             a.pr_number,
+            a.review_role,
             a.task_id,
             a.author,
             a.reviewer,
@@ -81,25 +89,59 @@ pub fn record(conn: &mut Connection, a: &Approval) -> Result<()> {
     Ok(())
 }
 
-/// Fetch the durable approval for a PR, if any.
-pub fn get(conn: &Connection, pr_number: i64) -> Result<Option<Approval>> {
+/// Fetch the durable verdict for a (PR, role), if any.
+pub fn get(conn: &Connection, pr_number: i64, review_role: &str) -> Result<Option<Approval>> {
     let row = conn
         .query_row(
-            "SELECT pr_number, task_id, author, reviewer, verdict, blocking_count, approved_head_sha
-             FROM approvals WHERE pr_number = ?1",
-            params![pr_number],
+            &format!(
+                "SELECT {SELECT_COLS} FROM approvals WHERE pr_number = ?1 AND review_role = ?2"
+            ),
+            params![pr_number, review_role],
             row_from_sql,
         )
         .optional()?;
     Ok(row)
 }
 
-/// List all durable approvals (recovery replays every one on startup).
+/// Fetch both R1 and R2 verdicts for a PR (empty vec if none).
+pub fn get_for_pr(conn: &Connection, pr_number: i64) -> Result<Vec<Approval>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM approvals WHERE pr_number = ?1 ORDER BY review_role"
+    ))?;
+    let rows = stmt.query_map(params![pr_number], row_from_sql)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Check whether dual approval is complete: both R1 and R2 approved for the
+/// same head SHA. Returns the common head SHA on success.
+pub fn dual_approved(conn: &Connection, pr_number: i64) -> Result<Option<String>> {
+    let verdicts = get_for_pr(conn, pr_number)?;
+    let r1 = verdicts.iter().find(|a| a.review_role == "r1");
+    let r2 = verdicts.iter().find(|a| a.review_role == "r2");
+    match (r1, r2) {
+        (Some(a1), Some(a2))
+            if a1.verdict == "approved"
+                && a2.verdict == "approved"
+                && a1.blocking_count == 0
+                && a2.blocking_count == 0
+                && !a1.approved_head_sha.is_empty()
+                && a1.approved_head_sha == a2.approved_head_sha =>
+        {
+            Ok(Some(a1.approved_head_sha.clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// List all durable verdicts (recovery replays every one on startup).
 pub fn list(conn: &Connection) -> Result<Vec<Approval>> {
-    let mut stmt = conn.prepare(
-        "SELECT pr_number, task_id, author, reviewer, verdict, blocking_count, approved_head_sha
-         FROM approvals ORDER BY pr_number",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SELECT_COLS} FROM approvals ORDER BY pr_number, review_role"
+    ))?;
     let rows = stmt.query_map([], row_from_sql)?;
     let mut out = Vec::new();
     for r in rows {
@@ -108,13 +150,25 @@ pub fn list(conn: &Connection) -> Result<Vec<Approval>> {
     Ok(out)
 }
 
-/// Delete the durable approval for a PR (terminal transition). Returns whether
-/// a row was removed.
+/// Delete all durable verdicts for a PR (terminal transition). Returns the
+/// number of rows removed.
 pub fn delete(conn: &mut Connection, pr_number: i64) -> Result<bool> {
     let tx = begin_immediate(conn)?;
     let n = tx.execute(
         "DELETE FROM approvals WHERE pr_number = ?1",
         params![pr_number],
+    )?;
+    tx.commit()?;
+    Ok(n > 0)
+}
+
+/// Delete a specific (PR, role) verdict. Used when invalidating a stale
+/// approval after head changes.
+pub fn delete_role(conn: &mut Connection, pr_number: i64, review_role: &str) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let n = tx.execute(
+        "DELETE FROM approvals WHERE pr_number = ?1 AND review_role = ?2",
+        params![pr_number, review_role],
     )?;
     tx.commit()?;
     Ok(n > 0)
@@ -134,6 +188,7 @@ mod tests {
     fn sample(pr: i64) -> Approval {
         Approval {
             pr_number: pr,
+            review_role: "r1".into(),
             task_id: 80,
             author: "Bellows-d11".into(),
             reviewer: "Grommet-d14".into(),
@@ -143,17 +198,30 @@ mod tests {
         }
     }
 
+    fn sample_r2(pr: i64) -> Approval {
+        Approval {
+            pr_number: pr,
+            review_role: "r2".into(),
+            task_id: 80,
+            author: "Bellows-d11".into(),
+            reviewer: "Anvil-d22".into(),
+            verdict: "approved".into(),
+            blocking_count: 0,
+            approved_head_sha: "2c0c8336f863".into(),
+        }
+    }
+
     #[test]
     fn record_get_delete_roundtrip() {
         let (mut conn, _dir) = test_conn();
-        assert!(get(&conn, 208).unwrap().is_none());
+        assert!(get(&conn, 208, "r1").unwrap().is_none());
 
         record(&mut conn, &sample(208)).unwrap();
-        let got = get(&conn, 208).unwrap().unwrap();
+        let got = get(&conn, 208, "r1").unwrap().unwrap();
         assert_eq!(got, sample(208));
 
         assert!(delete(&mut conn, 208).unwrap());
-        assert!(get(&conn, 208).unwrap().is_none());
+        assert!(get(&conn, 208, "r1").unwrap().is_none());
         assert!(!delete(&mut conn, 208).unwrap());
     }
 
@@ -167,11 +235,65 @@ mod tests {
         updated.reviewer = "Anvil-d22".into();
         record(&mut conn, &updated).unwrap();
 
-        let got = get(&conn, 208).unwrap().unwrap();
+        let got = get(&conn, 208, "r1").unwrap().unwrap();
         assert_eq!(got.approved_head_sha, "deadbeef");
         assert_eq!(got.reviewer, "Anvil-d22");
-        // Still exactly one row for the PR.
-        assert_eq!(list(&conn).unwrap().len(), 1);
+        assert_eq!(get_for_pr(&conn, 208).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dual_review_both_roles() {
+        let (mut conn, _dir) = test_conn();
+        record(&mut conn, &sample(208)).unwrap();
+        record(&mut conn, &sample_r2(208)).unwrap();
+
+        let all = get_for_pr(&conn, 208).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].review_role, "r1");
+        assert_eq!(all[1].review_role, "r2");
+
+        let sha = dual_approved(&conn, 208).unwrap();
+        assert_eq!(sha, Some("2c0c8336f863".into()));
+    }
+
+    #[test]
+    fn dual_approved_fails_when_heads_differ() {
+        let (mut conn, _dir) = test_conn();
+        record(&mut conn, &sample(208)).unwrap();
+        let mut r2 = sample_r2(208);
+        r2.approved_head_sha = "different".into();
+        record(&mut conn, &r2).unwrap();
+
+        assert_eq!(dual_approved(&conn, 208).unwrap(), None);
+    }
+
+    #[test]
+    fn dual_approved_fails_when_one_is_changes() {
+        let (mut conn, _dir) = test_conn();
+        record(&mut conn, &sample(208)).unwrap();
+        let mut r2 = sample_r2(208);
+        r2.verdict = "changes".into();
+        r2.blocking_count = 2;
+        record(&mut conn, &r2).unwrap();
+
+        assert_eq!(dual_approved(&conn, 208).unwrap(), None);
+    }
+
+    #[test]
+    fn dual_approved_fails_when_r2_missing() {
+        let (mut conn, _dir) = test_conn();
+        record(&mut conn, &sample(208)).unwrap();
+        assert_eq!(dual_approved(&conn, 208).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_role_removes_single() {
+        let (mut conn, _dir) = test_conn();
+        record(&mut conn, &sample(208)).unwrap();
+        record(&mut conn, &sample_r2(208)).unwrap();
+        assert!(delete_role(&mut conn, 208, "r1").unwrap());
+        assert!(get(&conn, 208, "r1").unwrap().is_none());
+        assert!(get(&conn, 208, "r2").unwrap().is_some());
     }
 
     #[test]
@@ -179,10 +301,14 @@ mod tests {
         let (mut conn, _dir) = test_conn();
         record(&mut conn, &sample(208)).unwrap();
         record(&mut conn, &sample(84)).unwrap();
+        record(&mut conn, &sample_r2(208)).unwrap();
         let all = list(&conn).unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert_eq!(all[0].pr_number, 84);
         assert_eq!(all[1].pr_number, 208);
+        assert_eq!(all[1].review_role, "r1");
+        assert_eq!(all[2].pr_number, 208);
+        assert_eq!(all[2].review_role, "r2");
     }
 
     #[test]
@@ -190,6 +316,7 @@ mod tests {
         let (mut conn, _dir) = test_conn();
         let a = Approval {
             pr_number: 300,
+            review_role: "r1".into(),
             task_id: 90,
             author: "Worker-w1".into(),
             reviewer: "Reviewer-r1".into(),
@@ -198,22 +325,18 @@ mod tests {
             approved_head_sha: String::new(),
         };
         record(&mut conn, &a).unwrap();
-        let got = get(&conn, 300).unwrap().unwrap();
+        let got = get(&conn, 300, "r1").unwrap().unwrap();
         assert_eq!(got.verdict, "changes");
         assert_eq!(got.blocking_count, 3);
     }
 
     #[test]
     fn approval_record_is_instance_independent() {
-        // The whole point of #228: the record survives with no instance
-        // identity, so a restarted instance (new/empty roster) reads it back
-        // unchanged. There is no instance_id column to gate on.
         let (mut conn, _dir) = test_conn();
         record(&mut conn, &sample(208)).unwrap();
-        // Re-open the DB (simulates a fresh daemon process/instance).
         drop(conn);
         let dir2 = _dir;
         let conn2 = db::open(&dir2.path().join("q.db")).unwrap();
-        assert_eq!(get(&conn2, 208).unwrap().unwrap(), sample(208));
+        assert_eq!(get(&conn2, 208, "r1").unwrap().unwrap(), sample(208));
     }
 }

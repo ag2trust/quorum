@@ -141,10 +141,12 @@ pub trait MergeExecutor: Send + Sync {
         DefaultBranchStatus::Green
     }
 
-    // Task #124: the daemon no longer posts REQUEST_CHANGES reviews. Reviewer
-    // agents own their own GitHub review interactions on the PR (inline
-    // comments, review summaries, `gh pr review --request-changes`). The
-    // daemon retains only the final formal APPROVE + merge.
+    /// #159: verify the PR has an active REQUEST_CHANGES review with the blocking
+    /// findings. Reviewer agents are encouraged to post one, but the daemon
+    /// verifies and backstops — never merge around unresolved blockers.
+    fn ensure_changes_requested(&self, _pr: i64, _repo_dir: &Path, _body: &str) {
+        // Default no-op; real executor posts via `gh pr review --request-changes`.
+    }
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
@@ -727,6 +729,36 @@ impl MergeExecutor for GhMergeExecutor {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_default_branch_ci(&stdout)
+    }
+
+    fn ensure_changes_requested(&self, pr: i64, repo_dir: &Path, body: &str) {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr_str, "--json", "reviewDecision"],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                // Can't check — post defensively.
+                let _ = self
+                    .build_gh_cmd(
+                        &["pr", "review", &pr_str, "--request-changes", "--body", body],
+                        repo_dir,
+                    )
+                    .output();
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.contains("CHANGES_REQUESTED") {
+            let _ = self
+                .build_gh_cmd(
+                    &["pr", "review", &pr_str, "--request-changes", "--body", body],
+                    repo_dir,
+                )
+                .output();
+        }
     }
 }
 

@@ -532,35 +532,45 @@ This preserves #206 verdict attestation, reviewer separation, the rework cap, st
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
 agents, directly.
 
-### R2 pre-merge review gate
+### R2 pre-merge review gate (#159 — mandatory dual review)
 
-When R1 (first reviewer) approves and the task is selected for R2 by the existing
-stratified sampler (`review_audits::should_sample`), the daemon intercepts **before**
-firing `VerdictApprove` and replaces R1 with an R2 reviewer:
+Every PR requires both R1 and R2 approval for the same head SHA before merge.
+R2 is mandatory, not sampled — there is no `r2_enabled` / `r2_steady_state_p`
+config (legacy keys accepted but ignored). When R1 approves:
 
-1. **Sampling** — same stratum-based logic as before: under target → always sample;
-   at/over target → sample with `r2_steady_state_p` probability. R2 is NOT mandatory
-   for every PR.
+1. **Durable R1 approval** — the daemon records R1's approval in the `approvals`
+   table keyed by `(pr_number, review_role='r1')` with `head_sha` and `blocking=0`.
 2. **R1 teardown** — R1 is torn down (end reason `r2-superseded`). Task stays InReview.
-3. **R2 spawn** — R2 is spawned as a normal pre-merge reviewer with the same escalation
-   policy as R1 (one tier above worker model, capped at top tier, respecting config
-   floor). R2's prompt frames it as an adversarial second reviewer that attempts
-   to falsify the merge-safety claim, reviews independently before comparing
-   against R1, and requires evidence-bound findings (concrete code paths with
-   demonstrated failures).
+3. **R2 spawn** — R2 is spawned with a `ReviewCounterpart` built from the worker
+   slot if available, or resolved from the PR head ref via GitHub (allowing R2 to
+   proceed even without a live worker). R2's prompt frames it as an adversarial
+   second reviewer that attempts to falsify the merge-safety claim, reviews
+   independently before comparing against R1, and requires evidence-bound findings.
 4. **Verdict flow** — R2's verdict drives lifecycle:
-   - Approved → fire VerdictApprove → proceed to merge (with stale-SHA check).
-   - Changes → fire VerdictChanges → rework → author pushes → ReworkPushed resumes
-     R2 (not R1). The `r2_origin` flag on the slot ensures rework routes back to R2.
+   - Approved → record R2 durable approval `(pr, 'r2')`. Merge proceeds only when
+     `dual_approved(pr)` returns a common head SHA (both R1 and R2 approved with
+     matching non-empty head SHAs and zero blocking findings).
+   - Changes → fire VerdictChanges → invalidate both R1 and R2 approvals →
+     rework → author pushes → ReworkPushed resumes R2 (not R1).
 5. **Stale-SHA gate** — head SHA is recorded at R2 spawn and refreshed on re-review.
-   Before merge, the daemon compares the reviewed SHA to the current head. A mismatch
-   fires MergeFailed so the PR goes through another review cycle.
+   Before merge, the daemon requires matching head SHAs from both approvals.
 6. **Rework routing** — after R2-requested rework, `ReworkPushed` yields
-   `ResumeReviewer` (not `SpawnReviewer`). The daemon feeds this to R2, not R1.
-7. **Audit recording** — on both approved and changes verdicts, the daemon records an
-   R2 audit row via `review_audits::insert` for stratum coverage tracking.
+   `ResumeReviewer` (not `SpawnReviewer`). The `r2_origin` flag on the slot
+   ensures rework routes back to R2.
+7. **REQUEST_CHANGES verification** — when any reviewer verdict is `changes` with
+   blocking findings, the daemon verifies a GitHub REQUEST_CHANGES review exists
+   on the PR. If not present, it posts one via `gh pr review --request-changes`.
+8. **Remediation workers** — when a `changes` verdict arrives and no worker exists
+   (review-only tasks, adopted PRs, dead workers), the daemon spawns a managed
+   remediation worker with the existing PR, blocking findings, and task context.
+   The lifecycle's review-only early-fail path is removed; all tasks go through
+   normal rework (rework cap still enforced).
 
 No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
+
+**Severity contract** — both R1 and R2 prompts enforce that concrete failure classes
+(resource exhaustion, unbounded growth, network calls in DB txns, data loss, stuck paths)
+are BLOCKING unless evidence disproves the failure.
 
 ### Daemon merge flow
 

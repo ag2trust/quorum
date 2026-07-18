@@ -301,12 +301,45 @@ fn self_repo_merge_drains_and_exits_75() {
         handle.lines
     );
 
-    // Reviewer done with approved verdict
+    // R1 reviewer done with approved verdict — triggers mandatory R2.
     quorum_done(
         home.path(),
         &[
             "--agent",
             &reviewer_name,
+            "--pr",
+            "42",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    // #159: mandatory dual review — wait for R2 reviewer.
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    // R2 name has trailing " spawned..." — take first word.
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+
+    // R2 reviewer approves — completes dual review.
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2_name,
             "--pr",
             "42",
             "--verdict",
@@ -606,12 +639,44 @@ fn drain_timeout_honored_during_merge_checks() {
         handle.lines
     );
 
-    // Reviewer approves → daemon enters wait_for_checks (blocks up to 30s).
+    // R1 approves → triggers mandatory R2 (#159).
     quorum_done(
         home.path(),
         &[
             "--agent",
             &reviewer_name,
+            "--pr",
+            "42",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    // Wait for R2 reviewer.
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+
+    // R2 approves → daemon enters wait_for_checks (blocks up to 30s).
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2_name,
             "--pr",
             "42",
             "--verdict",
@@ -738,12 +803,44 @@ fn pending_checks_timeout_without_drain_triggers_rework() {
         handle.lines
     );
 
-    // Reviewer approves → daemon enters wait_for_checks (times out after 3s).
+    // R1 approves → triggers mandatory R2 (#159).
     quorum_done(
         home.path(),
         &[
             "--agent",
             &reviewer_name,
+            "--pr",
+            "42",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    // Wait for R2 reviewer.
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    let r2_name = r2_name.split_whitespace().next().unwrap().to_string();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce result: {:?}",
+        handle.lines
+    );
+
+    // R2 approves → daemon enters wait_for_checks (times out after 3s).
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2_name,
             "--pr",
             "42",
             "--verdict",
