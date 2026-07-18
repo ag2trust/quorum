@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 27). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 29). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -77,7 +77,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     author       TEXT,
     reviewer     TEXT,
     rework_round INTEGER NOT NULL DEFAULT 0,
-    review_only  INTEGER NOT NULL DEFAULT 0
+    review_only  INTEGER NOT NULL DEFAULT 0,
+    -- v29: durable crash-recovery budget. Incremented each time a managed worker
+    -- dies and the task reopens; reset when the task reaches a meaningful lifecycle
+    -- handoff (in-review via submit/rework-push). Cancels the task when exhausted.
+    recovery_attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 

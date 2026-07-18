@@ -28,6 +28,8 @@ pub const STATUSES: &[&str] = &[
 
 pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 
+pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
+
 /// Body prefix for all daemon-parked tasks. Any cancelled task whose body starts with this
 /// prefix is reopenable by creator or (former) assignee (#182).
 pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
@@ -71,6 +73,7 @@ pub struct Task {
     pub reviewer: Option<String>,
     pub rework_round: i64,
     pub review_only: bool,
+    pub recovery_attempts: i64,
     pub ready: bool,
 }
 
@@ -87,6 +90,7 @@ pub struct TaskBrief {
     pub author: Option<String>,
     pub reviewer: Option<String>,
     pub rework_round: i64,
+    pub recovery_attempts: i64,
 }
 
 impl From<&Task> for TaskBrief {
@@ -103,6 +107,7 @@ impl From<&Task> for TaskBrief {
             author: t.author.clone(),
             reviewer: t.reviewer.clone(),
             rework_round: t.rework_round,
+            recovery_attempts: t.recovery_attempts,
         }
     }
 }
@@ -195,7 +200,7 @@ pub fn effect_name(e: &Effect) -> String {
 
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
-                    rework_round, review_only";
+                    rework_round, review_only, recovery_attempts";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -215,6 +220,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         reviewer: r.get(13)?,
         rework_round: r.get(14)?,
         review_only: r.get::<_, i64>(15)? != 0,
+        recovery_attempts: r.get(16)?,
         ready: false,
     })
 }
@@ -563,8 +569,42 @@ pub fn apply_event(
         review_only: task.review_only,
     };
 
-    let (new_status, effects) = crate::lifecycle::transition(&view, event)
+    let (mut new_status, mut effects) = crate::lifecycle::transition(&view, event)
         .map_err(|e| QuorumError::Usage(e.to_string()))?;
+
+    // Recovery budget: crash-recovery transitions (Working/Rework → Open via
+    // AgentFailed/LeaseExpired) are bounded. Override to Cancelled when exhausted.
+    let is_crash_recovery = new_status == Status::Open
+        && matches!(status, Status::Working | Status::Rework)
+        && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
+
+    if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+        new_status = Status::Cancelled;
+        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. }));
+        effects.push(Effect::NotifyOwner {
+            reason: format!(
+                "recovery budget exhausted ({}/{MAX_RECOVERY_ATTEMPTS} attempts)",
+                task.recovery_attempts,
+            ),
+        });
+    }
+
+    // Reset recovery counter on meaningful lifecycle handoff.
+    let reset_recovery = matches!(
+        (&status, &new_status, event),
+        (
+            Status::Working,
+            Status::InReview,
+            Event::SignaledDone { .. }
+        ) | (Status::Rework, Status::InReview, Event::ReworkPushed)
+    );
+    let recovery_attempts = if reset_recovery {
+        0
+    } else if is_crash_recovery && new_status == Status::Open {
+        task.recovery_attempts + 1
+    } else {
+        task.recovery_attempts
+    };
 
     let new_status_str = new_status.to_string();
     let mut author = task.author.clone();
@@ -637,7 +677,7 @@ pub fn apply_event(
 
     tx.execute(
         "UPDATE tasks SET status=?1, assignee=?2, author=?3, reviewer=?4, \
-         rework_round=?5, refs=?6, updated_at=?7 WHERE id=?8",
+         rework_round=?5, refs=?6, updated_at=?7, recovery_attempts=?9 WHERE id=?8",
         params![
             new_status_str,
             assignee,
@@ -646,7 +686,8 @@ pub fn apply_event(
             rework_round,
             refs,
             now,
-            id
+            id,
+            recovery_attempts,
         ],
     )?;
 
@@ -3106,5 +3147,372 @@ mod tests {
         assert_eq!(r2.agent, "Carol");
         assert_eq!(r2.role, "reviewer");
         assert_eq!(r2.sub_role.as_deref(), Some("r2"));
+    }
+
+    // ── Recovery budget tests ────────────────────────────────────────────
+
+    #[test]
+    fn recovery_budget_increments_on_agent_failed() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "crash-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Claim → working
+        let t = claim(&mut c, "w1", None, &[], TTL, 200).unwrap().unwrap();
+        assert_eq!(t.id, tid);
+        assert_eq!(t.status, "working");
+
+        // Worker dies → AgentFailed → open, recovery_attempts = 1
+        let tr = apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "crashed".into(),
+            },
+            300,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "open");
+        assert_eq!(tr.task.recovery_attempts, 1);
+    }
+
+    #[test]
+    fn recovery_budget_increments_on_lease_expired() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "expire-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        claim(&mut c, "w1", None, &[], TTL, 200).unwrap();
+
+        let tr = apply_event(&mut c, "daemon", tid, &Event::LeaseExpired, 300).unwrap();
+        assert_eq!(tr.task.status, "open");
+        assert_eq!(tr.task.recovery_attempts, 1);
+    }
+
+    #[test]
+    fn recovery_budget_cancels_on_exhaustion() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "exhaust-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Exhaust the budget: 3 crash cycles
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            claim(&mut c, "w1", None, &[], TTL, attempt * 100).unwrap();
+            let tr = apply_event(
+                &mut c,
+                "daemon",
+                tid,
+                &Event::AgentFailed {
+                    reason: "crashed".into(),
+                },
+                attempt * 100 + 50,
+            )
+            .unwrap();
+            assert_eq!(tr.task.status, "open", "attempt {attempt} should reopen");
+            assert_eq!(tr.task.recovery_attempts, attempt);
+        }
+
+        // Attempt 4: claim again, crash → should cancel, not reopen
+        claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
+        let tr = apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "crashed again".into(),
+            },
+            550,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "cancelled");
+        assert!(
+            tr.effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyOwner { reason } if reason.contains("recovery budget exhausted"))),
+            "must notify owner of budget exhaustion"
+        );
+    }
+
+    #[test]
+    fn recovery_budget_resets_on_signaled_done() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "reset-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Crash once → recovery_attempts = 1
+        claim(&mut c, "w1", None, &[], TTL, 200).unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "crash".into(),
+            },
+            300,
+        )
+        .unwrap();
+
+        // Re-claim and succeed → SignaledDone → in-review, counter resets
+        claim(&mut c, "w2", None, &[], TTL, 400).unwrap();
+        let tr = apply_event(
+            &mut c,
+            "w2",
+            tid,
+            &Event::SignaledDone { pr: "42".into() },
+            500,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "in-review");
+        assert_eq!(tr.task.recovery_attempts, 0);
+    }
+
+    #[test]
+    fn recovery_budget_resets_on_rework_pushed() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "rework-reset",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // claim → submit → review → rework
+        claim(&mut c, "w1", Some(tid), &[], TTL, 200).unwrap();
+        apply_event(
+            &mut c,
+            "w1",
+            tid,
+            &Event::SignaledDone { pr: "10".into() },
+            300,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::ReviewerAttached { agent: "r1".into() },
+            400,
+        )
+        .unwrap();
+        apply_event(&mut c, "r1", tid, &Event::VerdictChanges, 500).unwrap();
+
+        // Rework crash → open, recovery_attempts = 1
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "rework crash".into(),
+            },
+            600,
+        )
+        .unwrap();
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.recovery_attempts, 1);
+
+        // Re-claim (w1 is still author since PR exists) → working → submit → in-review
+        claim(&mut c, "w1", Some(tid), &[], TTL, 700).unwrap();
+        apply_event(
+            &mut c,
+            "w1",
+            tid,
+            &Event::SignaledDone { pr: "10".into() },
+            800,
+        )
+        .unwrap();
+        // SignaledDone resets recovery_attempts
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.recovery_attempts, 0, "SignaledDone resets counter");
+
+        // New rework cycle to test ReworkPushed specifically:
+        // Bump recovery_attempts via raw SQL to simulate prior crashes
+        c.execute(
+            "UPDATE tasks SET recovery_attempts = 2 WHERE id = ?1",
+            params![tid],
+        )
+        .unwrap();
+
+        // VerdictChanges → rework (does NOT touch recovery_attempts)
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::ReviewerAttached { agent: "r2".into() },
+            900,
+        )
+        .unwrap();
+        apply_event(&mut c, "r2", tid, &Event::VerdictChanges, 1000).unwrap();
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(
+            t.recovery_attempts, 2,
+            "VerdictChanges must not touch counter"
+        );
+
+        // ReworkPushed → in-review (resets counter)
+        let tr = apply_event(&mut c, "w1", tid, &Event::ReworkPushed, 1100).unwrap();
+        assert_eq!(tr.task.status, "in-review");
+        assert_eq!(
+            tr.task.recovery_attempts, 0,
+            "ReworkPushed should reset recovery_attempts"
+        );
+    }
+
+    #[test]
+    fn rework_via_verdict_does_not_increment_recovery() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "rework-no-inc",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        claim(&mut c, "w1", None, &[], TTL, 200).unwrap();
+        apply_event(
+            &mut c,
+            "w1",
+            tid,
+            &Event::SignaledDone { pr: "99".into() },
+            300,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::ReviewerAttached { agent: "r1".into() },
+            400,
+        )
+        .unwrap();
+
+        // VerdictChanges → rework: must NOT touch recovery_attempts
+        let tr = apply_event(&mut c, "r1", tid, &Event::VerdictChanges, 500).unwrap();
+        assert_eq!(tr.task.status, "rework");
+        assert_eq!(tr.task.recovery_attempts, 0);
+    }
+
+    #[test]
+    fn recovery_budget_survives_daemon_restart_pattern() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "restart-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Crash twice via "daemon restart recovery" pattern (same as recovery.rs)
+        for attempt in 1..=2 {
+            claim(&mut c, "w1", None, &[], TTL, attempt * 100).unwrap();
+            apply_event(
+                &mut c,
+                "daemon",
+                tid,
+                &Event::AgentFailed {
+                    reason: "daemon restart recovery (working task)".to_string(),
+                },
+                attempt * 100 + 50,
+            )
+            .unwrap();
+        }
+
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.recovery_attempts, 2);
+
+        // Third crash
+        claim(&mut c, "w1", None, &[], TTL, 400).unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "daemon restart recovery (working task)".into(),
+            },
+            450,
+        )
+        .unwrap();
+
+        let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.recovery_attempts, 3);
+
+        // Fourth crash → cancel
+        claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
+        let tr = apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "daemon restart recovery (working task)".into(),
+            },
+            550,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "cancelled");
     }
 }
