@@ -5781,6 +5781,7 @@ async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strik
 }
 
 /// Fire a lifecycle event, returning the result or an error description.
+/// On failure, persists a structured diagnostic to errors/notes/alerts.
 async fn fire_event_result(
     db_path: &std::path::Path,
     agent: &str,
@@ -5790,6 +5791,7 @@ async fn fire_event_result(
     let p = db_path.to_path_buf();
     let a = agent.to_string();
     let ev = event.clone();
+    let ev_debug = format!("{:?}", event);
     let result = tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
@@ -5812,6 +5814,7 @@ async fn fire_event_result(
             log(&format!(
                 "lifecycle: fire_event failed for task #{task_id}: {msg}"
             ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, &ev_debug, &msg).await;
             Err(msg)
         }
         Err(e) => {
@@ -5819,6 +5822,7 @@ async fn fire_event_result(
             log(&format!(
                 "lifecycle: fire_event join error for task #{task_id}: {msg}"
             ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, &ev_debug, &msg).await;
             Err(msg)
         }
     }
@@ -5834,6 +5838,31 @@ async fn fire_event(
     event: &Event,
 ) -> Option<tasks::TransitionResult> {
     fire_event_result(db_path, agent, task_id, event).await.ok()
+}
+
+/// Gather task context from the DB and persist a structured lifecycle diagnostic.
+async fn persist_lifecycle_diagnostic(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    event_desc: &str,
+    error_msg: &str,
+) {
+    let p = db_path.to_path_buf();
+    let actor = agent.to_string();
+    let ev = event_desc.to_string();
+    let err = error_msg.to_string();
+    tokio::task::spawn_blocking(move || {
+        let Ok(mut conn) = quorum_core::db::open(&p) else {
+            return;
+        };
+        let now = now_unix();
+        quorum_core::errlog::persist_lifecycle_diagnostic(
+            &mut conn, now, &actor, task_id, &ev, &err,
+        );
+    })
+    .await
+    .ok();
 }
 
 async fn emit_kill_event(db_path: &std::path::Path, target: &str, by: &str, reason: &str) {
