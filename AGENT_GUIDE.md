@@ -289,11 +289,19 @@ Implementation in the current interactive session is authorized only when the ow
 an explicit, unambiguous directive to implement (e.g. "do it", "make that change",
 "implement it here").
 
+**When an interactive/external session implements work that a Quorum task covers:** cancel
+the Quorum implementation task first (`task-update --status cancelled`), then create a
+review-only task (`task-create --review-pr N`) when the PR is ready. See the "Transferring
+implementation responsibility outside Quorum" section in the Quorum skill for the full
+protocol. Failing to cancel leaves the daemon believing it owns implementation and it will
+provision a redundant worker.
+
 Read-only operations (status checks, diagnosis, code inspection, `quorum status`) remain
 always allowed.
 
 **Origin:** PR #365 was implemented directly after an interactive session read "can we
-make it" as an implementation directive.
+make it" as an implementation directive. PR #9 / BoostMyAgents demonstrated the duplicate-
+worker hazard when external implementation proceeds without cancelling the Quorum task.
 
 ## Provider-specific guidance
 

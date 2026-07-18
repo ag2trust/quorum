@@ -73,6 +73,55 @@ worker. The outside PR author remains responsible for pushes requested by review
 changes verdict fails the review-only task because Quorum has no managed worker to perform
 rework; a merge conflict may leave it waiting for the outside author to update the PR.
 
+## Task meanings — what each state implies
+
+| Task kind | What it means |
+|-----------|---------------|
+| **Implementation task** (no `--review-pr`) | The daemon owns code production: it provisions a worker, assigns a worktree and branch, and drives the submit/review/merge cycle. |
+| **Review-only task** (`--review-pr N`) | Code already exists in PR #N. The daemon provisions only a reviewer; no worker is spawned. |
+| **Cancelled task** (`task-update --status cancelled`) | Quorum is no longer responsible for this outcome. No worker or reviewer will be provisioned. |
+
+These are mutually exclusive states of responsibility. A task does not change kind — if
+implementation moves elsewhere, cancel and replace (see below).
+
+## Transferring implementation responsibility outside Quorum
+
+When an interactive session, external tool, or non-Quorum agent implements work that a
+Quorum implementation task already covers, Quorum must be told — otherwise the daemon
+provisions a redundant worker that duplicates or conflicts with the external work.
+
+**Protocol (HARD RULE):**
+
+1. **Cancel the existing implementation task before external work proceeds.**
+   ```sh
+   quorum task-update --task-id <N> --agent <You> --status cancelled \
+     --note-file <(echo "Implementation transferred to <external-session/tool>; see PR #M")
+   ```
+2. **When the external PR is ready for review, create a review-only task:**
+   ```sh
+   quorum task-create \
+     --created-by <You> \
+     --title "Review and merge PR #M" \
+     --review-pr <M> \
+     --labels '["complexity:1","type:review"]' \
+     --body-stdin <<'EOF'
+   Implementation produced externally by <session/tool>. Review only.
+   EOF
+   ```
+3. **Never claim, execute, submit, or close a Quorum task from an interactive or external
+   session.** The daemon owns lifecycle transitions. Interactive callers create and cancel
+   tasks; they do not execute them.
+
+**Why this matters:** PR #9 / BoostMyAgents — an interactive Codex session completed
+implementation and opened a PR while the Quorum task remained `working`. The daemon later
+provisioned a worker for the same task, producing a duplicate implementation. The cancel-
+then-review-only protocol prevents this class of conflict.
+
+**Forbidden from interactive/external sessions:**
+- `quorum submit` (worker-only verb; requires a daemon-provisioned agent)
+- `quorum task-update --status done` (lifecycle-only; set by the system after merge)
+- Claiming a task and performing its implementation outside the daemon's worktree
+
 For either path, include a clear body, `complexity:1-5`, and `--depends-on '[...]'` when
 work must wait. Use the shared rubric:
 
