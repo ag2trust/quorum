@@ -27,11 +27,21 @@ release, or select tasks yourself.
 and check health. Do not use the legacy passive-agent workflow (`sync`, `task-claim`, manual
 release, or external `submit`). The daemon selects and provisions managed agents.
 
+Own ambiguity before dispatch. Interactive callers handle production access, open-ended
+troubleshooting, incident diagnosis, feature design, architectural planning, and task
+scoping. Use narrowly bounded discovery tasks for support when useful, but do not ask a
+managed worker to own those activities.
+
 **Operator.** Start the manager with `scripts/serve-supervisor.sh` (recommended for
 self-updating repos) or `quorum serve`. Use `quorum status` for health and `quorum kill`
 only for emergency termination.
 
 ## Create the right kind of task
+
+Dispatch only execution-ready work. Do not create a fix task from a reported symptom
+alone. First confirm the issue or gather enough evidence to state the observed and
+expected behavior, affected path, proposed remediation, constraints, and verification
+criteria.
 
 Implementation is still needed:
 
