@@ -93,7 +93,7 @@ pub fn allocate_for_task(
     let base_branch = format!("{prefix}/{topic}-{suffix}");
     let tx = crate::db::begin_immediate(conn)?;
     // Recheck inside the txn — another writer may have allocated between our lookup and
-    // BEGIN IMMEDIATE. (Common pattern in quorum; same shape as task-claim's recheck.)
+    // BEGIN IMMEDIATE. (Common pattern in quorum; same shape as tasks::claim's recheck.)
     if let Some(existing) = tx
         .query_row(
             "SELECT branch, worktree FROM task_branches WHERE task_id=?1",

@@ -98,7 +98,7 @@ established it.
 
 ```bash
 cargo build --release            # produces target/release/quorum
-cargo test                       # includes the N-process claim race canary
+cargo test                       # includes the N-thread claim race canary
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ./preflight.sh                   # all four PR gates (branch base + fmt + clippy + test)
@@ -123,7 +123,7 @@ because a stale binary at `~/.local/bin` lacked `sync`; this script prevents tha
 
 For toolchain-free installation from GitHub Releases (no cargo required), use `install.sh`.
 
-Verified end-to-end (release binary): `init` → `claim` → `task-create`/`task-claim` →
+Verified end-to-end (release binary): `init` → `task-create` →
 `post`/`read` → `status` all return clean JSON / the status table, exit 0. See `README.md`
 for the captured session.
 
@@ -389,14 +389,14 @@ rediscovered:
   merge. Distinct-name discipline lives in the *caller's* convention, not the tool. (v2
   consideration: optionally enforce uniqueness / hand out names.)
 - **Presence = "participated recently", not "succeeded recently".** Any *write-taking* command
-  bumps `last_seen` **before** its outcome — so a lost `task-claim` or a not-holder `release`
+  bumps `last_seen` **before** its outcome — so a lost `tasks::claim` or a not-holder `release`
   (both exit 1) still mark the agent online, because they took the write lock and ran `touch`.
   A *pre-write* usage error (e.g. invalid `--kind`, exit 2) does NOT register the agent. So:
   write-taking-any-outcome → online; usage/bad-input-rejected-pre-write → no trace.
 - **Test gaps:** no property/fuzz tests; the name-collision merge is untested; `status --watch`
   (infinite loop) is only structurally verified, not run; renew-vs-claim concurrency is covered
-  deterministically but not as a multi-process stress (claims has the 20-process canary,
-  task-claim a 12-process one).
+  deterministically but not as a multi-thread stress (claims has the 20-thread canary,
+  tasks::claim a 12-thread one).
 
 ## Where to read next
 

@@ -65,7 +65,7 @@ fn stop_requires_reason_via_stdin_or_file() {
 
 #[test]
 fn resume_with_no_active_stop_exits_1_clean() {
-    // Clean "didn't get it" exit 1, not an error. Mirrors how `task-claim` reports nothing
+    // Clean "didn't get it" exit 1, not an error. Mirrors how `tasks::claim` reports nothing
     // claimable.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path()).arg("init").assert().success();

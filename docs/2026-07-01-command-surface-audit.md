@@ -45,15 +45,10 @@ agent must create tasks. Also auto-called internally by `task-update --status do
 task spawning). Essential for the orchestration layer (it will create tasks with
 orchestration params).
 
-### 3. `task-claim` — **ESSENTIAL**
+### 3. `task-claim` — **RETIRED (PR #161)**
 
-| Repo | Hits | Callers |
-|------|------|---------|
-| ag2trust | 13 | hub-onboard, work-loop, cto, review-and-merge, git-workflow, feature-owner |
-| quorum | 7 | docs (design, review-as-task-plan, implementation-plan) |
-
-**Rationale:** Core work-queue primitive. Atomic claim is load-bearing invariant #1. Every
-agent claims via this. Highest cross-skill usage after `sync`.
+**Rationale:** Atomic claim primitive (`tasks::claim`) is preserved as daemon-internal
+function. CLI entry point hard-removed — daemon claims internally, agents never invoke.
 
 ### 4. `task-update` — **ESSENTIAL**
 
@@ -256,7 +251,7 @@ commands. Essential for discoverability, especially post-trim.
 |---------|------|
 | `sync` | Tick compass — tasks, messages, events, presence |
 | `task-create` | Create work items |
-| `task-claim` | Atomic claim (or auto-pick highest priority) |
+| ~~`task-claim`~~ | Retired (PR #161) — daemon-internal only |
 | `task-update` | Lifecycle transitions, notes, refs, verdicts |
 | `task-list` | Queue visibility (CTO, debugging) |
 | `task-get` | Full task body + notes |
@@ -304,7 +299,7 @@ Commands that, if removed or renamed, would break a shipping skill:
 | Command | Skills that invoke it |
 |---------|-----------------------|
 | `sync` | hub-onboard, work-loop, cto, review-and-merge, git-workflow, code-maintenance |
-| `task-claim` | hub-onboard, work-loop, cto, review-and-merge, git-workflow, feature-owner |
+| ~~`task-claim`~~ | *(retired PR #161 — daemon-internal)* |
 | `task-update` | work-loop, hub-onboard, git-workflow, review-and-merge |
 | `task-get` | work-loop, hub-onboard, review-and-merge, git-workflow |
 | `post` | work-loop, hub-onboard, cto, review-and-merge, code-maintenance, feature-owner |
@@ -326,7 +321,7 @@ job (Claude Code's `Agent` tool). The orchestrator needs:
   coordination halt, not a process kill)
 
 ### 2. Git branch/worktree lifecycle
-`task-claim` returns `suggested_branch` and `suggested_worktree` but doesn't create them.
+The daemon's internal `tasks::claim` returns `suggested_branch` and `suggested_worktree` but doesn't create them.
 Skills contain the `git worktree add` / `git worktree remove` boilerplate. The orchestrator
 needs:
 - `quorum worktree-create --task-id <n>` — create branch + worktree from the task's

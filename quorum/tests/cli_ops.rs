@@ -2,6 +2,8 @@
 //! config handling, migration refusal, and the WAL-health property (short-lived connections
 //! self-checkpoint).
 
+mod common;
+
 use assert_cmd::Command;
 
 fn quorum(home: &std::path::Path) -> Command {
@@ -27,10 +29,7 @@ fn status_json_and_table() {
         .args(["task-create", "--created-by", "A", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
 
     quorum(home.path())
         .args(["status", "--json"])
@@ -70,18 +69,7 @@ fn status_dashboard_emits_all_sections() {
         .args(["task-create", "--created-by", "boss", "--title", "locked"])
         .assert()
         .success();
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "Alice",
-            "--task-id",
-            "2",
-            "--ttl",
-            "1h",
-        ])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "Alice", Some(2), 3600);
     quorum(home.path())
         .args(["post", "--agent", "Alice", "--kind", "info", "--body-stdin"])
         .write_stdin("hello world\n")
@@ -122,18 +110,7 @@ fn status_json_includes_dashboard_fields() {
         .args(["task-create", "--created-by", "boss", "--title", "locked"])
         .assert()
         .success();
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "Alice",
-            "--task-id",
-            "2",
-            "--ttl",
-            "1h",
-        ])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "Alice", Some(2), 3600);
     quorum(home.path())
         .args(["post", "--agent", "Alice", "--kind", "info", "--body-stdin"])
         .write_stdin("recent\n")
@@ -325,10 +302,7 @@ fn status_watch_emits_output_before_kill() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
 
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())

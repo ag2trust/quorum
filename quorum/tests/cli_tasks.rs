@@ -1,15 +1,44 @@
 //! Integration tests for the task commands, including the concurrent-claim single-winner
 //! property and the body-via-stdin text path.
+//!
+//! `task-claim` was removed from the public CLI (#161); tests now claim via the internal
+//! `quorum_core::tasks::claim` function through a shared helper.
+
+mod common;
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
-use std::process::{Command as Proc, Stdio};
 
 fn quorum(home: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("quorum").unwrap();
     c.env("QUORUM_HOME", home).env("QUORUM_REPO", "test/repo");
     c
 }
+
+// -- removed CLI entry points (#161) -------------------------------------------------
+
+#[test]
+fn task_claim_cli_rejected_at_parse() {
+    // task-claim was removed from the public CLI surface (#161). The binary must reject it
+    // at arg parsing (exit 2), not silently accept or route it.
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-claim", "--agent", "A"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn legacy_claim_commands_all_rejected() {
+    // All legacy claim entry points (claim, release, renew, claims, task-claim) removed by
+    // PR #85 and #161 — verify they all fail at parse (exit 2).
+    let home = tempfile::tempdir().unwrap();
+    for cmd in ["claim", "release", "renew", "claims", "task-claim"] {
+        quorum(home.path()).arg(cmd).assert().code(2);
+    }
+}
+
+// -- task lifecycle -------------------------------------------------------------------
 
 #[test]
 fn create_claim_update_flow() {
@@ -24,12 +53,8 @@ fn create_claim_update_flow() {
         .success()
         .stdout(predicates::str::contains("\"id\":1"));
 
-    // claim highest-priority open
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"assignee\":\"A\""));
+    // claim highest-priority open (via internal lib — task-claim CLI removed #161)
+    common::claim_task(home.path(), "A", None, 3600);
 
     // `done` is lifecycle-only — task-update rejects it with exit 2
     quorum(home.path())
@@ -73,20 +98,14 @@ fn create_claim_update_flow() {
 #[test]
 fn normal_misses_do_not_log_errors() {
     let home = tempfile::tempdir().unwrap();
-    // claim with nothing open → exit 1
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A"])
-        .assert()
-        .code(1);
+    // claim with nothing open → None (no claimable task)
+    assert!(common::try_claim_task(home.path(), "A", None, 3600).is_none());
     // create + claim, then a non-assignee cancel → exit 1 (not holder/creator)
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -115,10 +134,7 @@ fn release_then_reclaim_hands_off_task() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     // A gives it up → back to open, assignee cleared.
     quorum(home.path())
         .args([
@@ -148,11 +164,7 @@ fn release_then_reclaim_hands_off_task() {
         .assert()
         .code(1);
     // B claims the now-open task and cancels it; A (not assignee/creator) cannot.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "B", "--task-id", "1"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"assignee\":\"B\""));
+    common::claim_task(home.path(), "B", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -177,18 +189,7 @@ fn cancel_lifecycle() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--ttl",
-            "1h",
-        ])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     // A stranger (neither creator nor assignee) cannot cancel...
     quorum(home.path())
         .args([
@@ -239,19 +240,7 @@ fn reaper_reclaims_lapsed_lease_via_cli() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--ttl",
-            "1s",
-        ])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"status\":\"working\""));
+    common::claim_task(home.path(), "A", Some(1), 1);
     // Let the 1s lease lapse, then make any write to trigger sweep-on-write.
     std::thread::sleep(std::time::Duration::from_millis(2100));
     quorum(home.path())
@@ -295,10 +284,7 @@ fn notes_round_trip_byte_exact_and_any_agent_can_add() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
 
     // A leaves a note via stdin — heredoc-style content with $vars + backticks + newlines
     quorum(home.path())
@@ -354,10 +340,7 @@ fn note_combinable_with_cancel() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -388,10 +371,7 @@ fn note_with_status_done_rejected_before_note() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -471,48 +451,37 @@ fn body_stdin_and_note_stdin_conflict_at_parse() {
 
 #[test]
 fn concurrent_task_claim_one_winner() {
+    // Multi-threaded variant: each thread opens its own connection and races
+    // quorum_core::tasks::claim. SQLite file locking guarantees exactly-one-winner
+    // the same way the former multi-process CLI test did.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
         .args(["task-create", "--created-by", "boss", "--title", "single"])
         .assert()
         .success();
 
-    let bin = assert_cmd::cargo::cargo_bin("quorum");
-    let children: Vec<_> = (0..12)
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let handles: Vec<_> = (0..12)
         .map(|i| {
-            Proc::new(&bin)
-                .env("QUORUM_HOME", home.path())
-                .env("QUORUM_REPO", "test/repo")
-                .args(["task-claim", "--agent", &format!("a{i}"), "--task-id", "1"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
+            let db = db_path.clone();
+            std::thread::spawn(move || {
+                let mut conn = quorum_core::db::open(&db).unwrap();
+                quorum_core::tasks::claim(&mut conn, &format!("a{i}"), Some(1), &[], 300, now)
+                    .unwrap()
+            })
         })
         .collect();
-    let outputs: Vec<_> = children
-        .into_iter()
-        .map(|c| c.wait_with_output().unwrap())
-        .collect();
-    let wins = outputs.iter().filter(|o| o.status.success()).count();
-    assert_eq!(wins, 1, "exactly one process may claim the task");
 
-    // Mirror the claims canary (race.rs): the *quality* of the race matters too, not just
-    // the count of winners. Losers must exit 1 (clean lost-race), never 3 (abnormal). A
-    // post-#9 lease-insert boundary-corpse regression would surface as exit 3 here — the
-    // win-count check alone would miss it because the status-UPDATE still gates correctly.
-    for o in &outputs {
-        let code = o.status.code().unwrap_or(-1);
-        assert!(
-            code == 0 || code == 1,
-            "loser must exit 1 (clean lost-race), got {code} — exit 3 means tasks::claim hit an abnormal DB error"
-        );
-    }
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let wins = results.iter().filter(|r| r.is_some()).count();
+    assert_eq!(wins, 1, "exactly one thread may claim the task");
 
-    // Storage agrees: exactly one active lease row for task#1, the same property the claims
-    // canary asserts for an arbitrary target. Catches a half-applied claim (status UPDATE
-    // wins, lease INSERT fails) that the win-count check can't see.
-    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&db_path).unwrap();
     let active: i64 = conn
         .query_row(
             "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
@@ -522,7 +491,6 @@ fn concurrent_task_claim_one_winner() {
         .unwrap();
     assert_eq!(active, 1, "exactly one active lease row for task#1");
 
-    // And no errors logged — a normal race is not a failure mode.
     let errs: i64 = conn
         .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
         .unwrap();
@@ -563,63 +531,22 @@ fn match_label_end_to_end() {
         .success();
 
     // --match-label restricts to the labeled task even though the other is higher-priority.
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "A",
-            "--match-label",
-            "tier:opus-47",
-        ])
-        .assert()
-        .success()
-        // #64 compact write response: title is no longer in the success JSON. Verify
-        // the right task was claimed via `task-get` (full record) instead.
-        .stdout(predicates::str::contains("\"status\":\"working\""));
+    let claimed = common::claim_task_with_labels(home.path(), "A", &["tier:opus-47"], 3600);
+    assert!(claimed.is_some(), "label-matched claim should succeed");
     quorum(home.path())
         .args(["task-get", "--task-id", "2"])
         .assert()
         .success()
         .stdout(predicates::str::contains("with-label"));
 
-    // No more labeled tasks open → exit 1, clean reason.
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "B",
-            "--match-label",
-            "tier:opus-47",
-        ])
-        .assert()
-        .code(1)
-        .stdout(predicates::str::contains("no claimable task"));
-}
-
-#[test]
-fn match_label_and_task_id_are_mutually_exclusive() {
-    // clap rejects --task-id + --match-label at parse time (exit 2 = usage error). An explicit
-    // --task-id is already a more specific selector than any label filter.
-    let home = tempfile::tempdir().unwrap();
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--match-label",
-            "k",
-        ])
-        .assert()
-        .code(2);
+    // No more labeled tasks open → None.
+    let miss = common::claim_task_with_labels(home.path(), "B", &["tier:opus-47"], 3600);
+    assert!(miss.is_none(), "no more labeled tasks open");
 }
 
 #[test]
 fn concurrent_match_label_claim_one_winner() {
-    // Project bar (CLAUDE.md): stress concurrency. Spawn 12 processes all racing for the same
-    // label-filtered task; the partial unique index + BEGIN IMMEDIATE must still give exactly
-    // one winner — the WHERE label-filter doesn't change the atomicity gate.
+    // Multi-threaded variant: 12 threads race label-filtered claim on one task.
     let home = tempfile::tempdir().unwrap();
     quorum(home.path())
         .args([
@@ -634,45 +561,31 @@ fn concurrent_match_label_claim_one_winner() {
         .assert()
         .success();
 
-    let bin = assert_cmd::cargo::cargo_bin("quorum");
-    let children: Vec<_> = (0..12)
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let handles: Vec<_> = (0..12)
         .map(|i| {
-            Proc::new(&bin)
-                .env("QUORUM_HOME", home.path())
-                .env("QUORUM_REPO", "test/repo")
-                .args([
-                    "task-claim",
-                    "--agent",
-                    &format!("a{i}"),
-                    "--match-label",
-                    "k",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
+            let db = db_path.clone();
+            std::thread::spawn(move || {
+                let mut conn = quorum_core::db::open(&db).unwrap();
+                quorum_core::tasks::claim(&mut conn, &format!("a{i}"), None, &["k"], 300, now)
+                    .unwrap()
+            })
         })
         .collect();
-    let outputs: Vec<_> = children
-        .into_iter()
-        .map(|c| c.wait_with_output().unwrap())
-        .collect();
-    let wins = outputs.iter().filter(|o| o.status.success()).count();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let wins = results.iter().filter(|r| r.is_some()).count();
     assert_eq!(
         wins, 1,
-        "label-filtered claim must still grant to exactly one process"
+        "label-filtered claim must still grant to exactly one thread"
     );
 
-    // Same canary-grade guards as the task-id variant — the label filter is just an extra
-    // AND on the selector and must not change exit-code or lease-row semantics.
-    for o in &outputs {
-        let code = o.status.code().unwrap_or(-1);
-        assert!(
-            code == 0 || code == 1,
-            "loser must exit 1 (clean lost-race), got {code}"
-        );
-    }
-    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&db_path).unwrap();
     let active: i64 = conn
         .query_row(
             "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
@@ -738,24 +651,14 @@ fn depends_on_gates_claim_end_to_end() {
         .success();
 
     // Auto-pick claims the dep (id 1); dependent stays gated.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"id\":1"));
+    let picked = common::try_claim_task(home.path(), "A", None, 3600);
+    assert_eq!(picked.as_ref().unwrap().id, 1);
 
     // No more claimable tasks: dependent is gated, dep is claimed.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "B"])
-        .assert()
-        .code(1)
-        .stdout(predicates::str::contains("no claimable task"));
+    assert!(common::try_claim_task(home.path(), "B", None, 3600).is_none());
 
-    // Even an explicit --task-id can't pull the gated dependent.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "B", "--task-id", "2"])
-        .assert()
-        .code(1);
+    // Even an explicit task-id can't pull the gated dependent.
+    assert!(common::try_claim_task(home.path(), "B", Some(2), 3600).is_none());
 
     // Mark dep as done via task-close — `done` ungates dependents.
     quorum(home.path())
@@ -771,11 +674,8 @@ fn depends_on_gates_claim_end_to_end() {
         .assert()
         .success();
     // Now the dependent (task 2) is unblocked — B can claim it.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "B"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("\"id\":2"));
+    let unblocked = common::try_claim_task(home.path(), "B", None, 3600);
+    assert_eq!(unblocked.as_ref().unwrap().id, 2);
 }
 
 #[test]

@@ -1,17 +1,16 @@
-//! The load-bearing invariant: N separate OS processes racing `task-claim` on one task produce
+//! The load-bearing invariant: N concurrent callers racing `tasks::claim` on one task produce
 //! exactly one winner. The task lease reuses the same atomic claims primitive
 //! (`UNIQUE(target) WHERE active=1`) the queue is built on. This is the canary — if it ever
 //! flakes, stop and investigate before anything else.
-
-use std::process::{Command, Stdio};
+//!
+//! Converted from multi-process CLI to multi-threaded library calls (#161: task-claim CLI
+//! removed). SQLite file locking is process-agnostic — threads with separate connections
+//! contend on the same WAL/lock, so the atomicity guarantee is identical.
 
 #[test]
-fn n_processes_exactly_one_winner() {
+fn n_threads_exactly_one_winner() {
     let home = tempfile::tempdir().unwrap();
 
-    // Initialize, then create the single task every racer will contend for. This isolates the
-    // *claim* race from the create/migrate race (the latter is covered by
-    // cli_init::concurrent_init_is_safe) and from the task-create itself.
     assert_cmd::Command::cargo_bin("quorum")
         .unwrap()
         .env("QUORUM_HOME", home.path())
@@ -27,42 +26,30 @@ fn n_processes_exactly_one_winner() {
         .assert()
         .success();
 
-    let bin = assert_cmd::cargo::cargo_bin("quorum");
+    let db_path = home.path().join("repos/test__repo/quorum.db");
     let n = 20;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
 
-    // Spawn all children first (maximize overlap), then wait. Every child races to claim the
-    // same task#1 — exactly one may win the lease.
-    let children: Vec<_> = (0..n)
+    let handles: Vec<_> = (0..n)
         .map(|i| {
-            Command::new(&bin)
-                .env("QUORUM_HOME", home.path())
-                .env("QUORUM_REPO", "test/repo")
-                .args([
-                    "task-claim",
-                    "--agent",
-                    &format!("a{i}"),
-                    "--task-id",
-                    "1",
-                    "--ttl",
-                    "5m",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn quorum task-claim")
+            let db = db_path.clone();
+            std::thread::spawn(move || {
+                let mut conn = quorum_core::db::open(&db).unwrap();
+                quorum_core::tasks::claim(&mut conn, &format!("a{i}"), Some(1), &[], 300, now)
+                    .unwrap()
+            })
         })
         .collect();
 
-    let wins = children
-        .into_iter()
-        .map(|c| c.wait_with_output().unwrap())
-        .filter(|out| out.status.success()) // exit 0 == won
-        .count();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let wins = results.iter().filter(|r| r.is_some()).count();
 
-    assert_eq!(wins, 1, "exactly one process must win the claim");
+    assert_eq!(wins, 1, "exactly one thread must win the claim");
 
-    // And the store agrees: exactly one active lease row for the task.
-    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+    let conn = quorum_core::db::open(&db_path).unwrap();
     let active: i64 = conn
         .query_row(
             "SELECT count(*) FROM claims WHERE target='task#1' AND active=1",
@@ -72,7 +59,6 @@ fn n_processes_exactly_one_winner() {
         .unwrap();
     assert_eq!(active, 1, "exactly one active claim row");
 
-    // A normal race must never log an error (guards the boundary-corpse → exit-3 regression).
     let errs: i64 = conn
         .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
         .unwrap();

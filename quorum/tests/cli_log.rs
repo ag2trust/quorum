@@ -2,6 +2,8 @@
 //! `events` stream (not the message feed), `quorum log` reads them, `--refs` filters by
 //! subject, `--since <seq>` is a strict delta, and `post`/`read` are NOT affected.
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 
@@ -20,10 +22,7 @@ fn state_changes_auto_emit_events_on_log() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -81,10 +80,7 @@ fn since_seq_is_strict_delta() {
         .success()
         .stdout(predicates::str::contains("\"seq\":1").not());
     // Adding another state change appears for --since 1.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args(["log", "--since", "1"])
         .assert()
@@ -101,10 +97,7 @@ fn message_feed_carries_no_auto_events() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -163,10 +156,7 @@ fn task_update_status_done_rejected() {
         .args(["task-create", "--created-by", "boss", "--title", "x"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",

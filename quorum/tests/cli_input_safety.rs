@@ -4,6 +4,8 @@
 //! is unit-tested, but never integration-tested through the CLI stdin path. These tests pipe
 //! bad bytes via `--body-stdin` to `post`, `task-create`, and `task-update`, asserting exit 2.
 
+mod common;
+
 use assert_cmd::Command;
 
 fn quorum(home: &std::path::Path) -> Command {
@@ -74,10 +76,7 @@ fn task_update_rejects_nul_via_body_stdin() {
         .args(["task-create", "--created-by", "boss", "--title", "t"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",
@@ -99,10 +98,7 @@ fn task_update_rejects_invalid_utf8_via_body_stdin() {
         .args(["task-create", "--created-by", "boss", "--title", "t"])
         .assert()
         .success();
-    quorum(home.path())
-        .args(["task-claim", "--agent", "A", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     quorum(home.path())
         .args([
             "task-update",

@@ -91,7 +91,6 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Init => "init",
         cli::Command::Reset { .. } => "reset",
         cli::Command::TaskCreate { .. } => "task-create",
-        cli::Command::TaskClaim { .. } => "task-claim",
         cli::Command::TaskUpdate { .. } => "task-update",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
@@ -442,57 +441,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             )?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
-        }
-        cli::Command::TaskClaim {
-            agent,
-            task_id,
-            match_label,
-            ttl,
-            repo,
-        } => {
-            let ttl = match ttl {
-                Some(s) => parse_ttl(&s)?,
-                None => load_cfg()?.task_lease_ttl_secs,
-            };
-            let resolved_repo = resolve_repo_override(repo.as_deref())?;
-            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let labels: Vec<&str> = match_label.iter().map(String::as_str).collect();
-            match quorum_core::tasks::claim(&mut conn, &agent, task_id, &labels, ttl, now)? {
-                Some(t) => {
-                    // Issue #64: compact success response — omit `body` (caller knows it)
-                    // and include `lease_expires_at` since the lease just landed.
-                    let mut compact = quorum_core::tasks::TaskCompact::from(&t);
-                    compact.lease_expires_at = Some(now + ttl);
-                    // Issue #98: allocate (or reuse) a branch + worktree for this
-                    // task — centralized anti-collision naming. Idempotent by
-                    // construction (UNIQUE(task_id)), so a reopened-task re-claim
-                    // returns the same branch as the original allocation.
-                    let branch_hint =
-                        quorum_core::branches::branch_hint_from_refs(t.refs.as_deref());
-                    let alloc = quorum_core::branches::allocate_for_task(
-                        &mut conn,
-                        t.id,
-                        ".worktrees",
-                        &agent,
-                        &t.title,
-                        t.labels.as_deref(),
-                        branch_hint.as_deref(),
-                        now,
-                    )?;
-                    compact.suggested_branch = Some(alloc.branch);
-                    compact.suggested_worktree = Some(alloc.worktree);
-                    compact.branch_exists = Some(alloc.existed);
-                    compact.repo = Some(resolved_repo.clone());
-                    output::emit(&compact);
-                    Ok(0)
-                }
-                None => {
-                    output::emit(
-                        &serde_json::json!({ "ok": false, "reason": "no claimable task", "repo": resolved_repo }),
-                    );
-                    Ok(1)
-                }
-            }
         }
         cli::Command::TaskUpdate {
             agent,

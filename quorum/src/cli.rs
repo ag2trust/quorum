@@ -73,21 +73,6 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
-    /// [INTERNAL] Atomically claim a task. Daemon-only — not part of the public CLI surface.
-    /// Retained for internal daemon use and concurrency canary tests.
-    #[command(hide = true)]
-    TaskClaim {
-        #[arg(long)]
-        agent: String,
-        #[arg(long = "task-id", conflicts_with = "match_label")]
-        task_id: Option<i64>,
-        #[arg(long = "match-label")]
-        match_label: Vec<String>,
-        #[arg(long)]
-        ttl: Option<String>,
-        #[arg(long)]
-        repo: Option<String>,
-    },
     /// Update a task: transition status, set refs/body, or append a note. The single
     /// task-transition command — replaces the former `task-release` and `task-cancel`.
     ///
