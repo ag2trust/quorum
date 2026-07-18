@@ -284,6 +284,30 @@ fn suggested_for(
         .unwrap_or_else(|| ("claude-opus-4-6".into(), "medium".into()))
 }
 
+/// #172: clamp a resolved (model, effort) up to the configured floor for worker
+/// spawn. `min_model` is a full model id (e.g. "claude-opus-4-7"); `min_effort`
+/// is "medium"|"high". A `None` field imposes no floor on that dimension — the
+/// resolved value stands in as the missing companion, so the combined
+/// `is_model_effort_below` comparison only fires on the configured dimension.
+/// Never lowers a pair already at/above the floor.
+fn apply_model_effort_floor(
+    resolved_model: &str,
+    resolved_effort: &str,
+    min_model: Option<&str>,
+    min_effort: Option<&str>,
+) -> (String, String) {
+    if min_model.is_none() && min_effort.is_none() {
+        return (resolved_model.to_string(), resolved_effort.to_string());
+    }
+    let floor_model = min_model.unwrap_or(resolved_model);
+    let floor_effort = min_effort.unwrap_or(resolved_effort);
+    if is_model_effort_below(resolved_model, resolved_effort, floor_model, floor_effort) {
+        (floor_model.to_string(), floor_effort.to_string())
+    } else {
+        (resolved_model.to_string(), resolved_effort.to_string())
+    }
+}
+
 fn is_model_effort_below(
     resolved_model: &str,
     resolved_effort: &str,
@@ -493,6 +517,11 @@ pub struct ServeConfig {
     // R2 is mandatory (#159) — no sampling config needed.
     /// Per-complexity suggested model/effort overrides (keys "1".."5", values "tier/effort").
     pub suggested_models: std::collections::HashMap<String, String>,
+    /// #172: minimum worker model floor as a full model id (e.g. "claude-opus-4-7"),
+    /// or None for no floor. Validated + tier→id converted at config load.
+    pub min_model: Option<String>,
+    /// #172: minimum worker effort floor ("medium"|"high"), or None for no floor.
+    pub min_effort: Option<String>,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -5581,6 +5610,26 @@ async fn spawn_worker(
         }
     }
 
+    // #172: enforce the min model/effort floor for worker spawn. Applied AFTER the
+    // mismatch alert (so the alert reflects the label-resolved values) but BEFORE the
+    // AgentSpec build (so the spawn uses the floored values). Reviewers float above
+    // implicitly via escalated_reviewer_model. Separate clamp — not part of flag>file
+    // >default resolution.
+    let (floored_model, floored_effort) = apply_model_effort_floor(
+        &resolved_model,
+        &resolved_effort,
+        config.min_model.as_deref(),
+        config.min_effort.as_deref(),
+    );
+    if floored_model != resolved_model || floored_effort != resolved_effort {
+        log(&format!(
+            "model/effort floor: task #{} bumped {resolved_model}/{resolved_effort} -> {floored_model}/{floored_effort}",
+            task.id
+        ));
+    }
+    let resolved_model = floored_model;
+    let resolved_effort = floored_effort;
+
     // #130: issue run capability for this worker (before spawn so env var is available).
     // A silent issue failure would leave the worker holding a QUORUM_RUN_ID pointing at
     // no row — every capability-validated submit would then exit 2 and only the compat
@@ -7074,6 +7123,76 @@ mod tests {
     fn effort_rank_ordering() {
         assert!(effort_rank("medium") < effort_rank("high"));
         assert_eq!(effort_rank("unknown"), 0);
+    }
+
+    #[test]
+    fn floor_bumps_below_to_floor() {
+        // #172: resolved below floor → clamped up to floor (both dims).
+        let (m, e) = apply_model_effort_floor(
+            "claude-sonnet-5",
+            "medium",
+            Some("claude-opus-4-7"),
+            Some("high"),
+        );
+        assert_eq!(m, "claude-opus-4-7");
+        assert_eq!(e, "high");
+    }
+
+    #[test]
+    fn floor_leaves_at_floor_unchanged() {
+        let (m, e) = apply_model_effort_floor(
+            "claude-opus-4-7",
+            "high",
+            Some("claude-opus-4-7"),
+            Some("high"),
+        );
+        assert_eq!(m, "claude-opus-4-7");
+        assert_eq!(e, "high");
+    }
+
+    #[test]
+    fn floor_never_lowers_above_floor() {
+        // Higher tier at lower effort is still above floor — must NOT be touched.
+        let (m, e) = apply_model_effort_floor(
+            "claude-opus-4-8",
+            "medium",
+            Some("claude-opus-4-7"),
+            Some("high"),
+        );
+        assert_eq!(m, "claude-opus-4-8");
+        assert_eq!(e, "medium");
+    }
+
+    #[test]
+    fn floor_effort_tiebreak_same_model() {
+        // #172: same model, effort below floor → effort bumped, model unchanged.
+        let (m, e) = apply_model_effort_floor("claude-opus-4-7", "medium", None, Some("high"));
+        assert_eq!(m, "claude-opus-4-7");
+        assert_eq!(e, "high");
+    }
+
+    #[test]
+    fn floor_none_is_identity() {
+        // Regression guard: no floor → spawn values identical to today.
+        let (m, e) = apply_model_effort_floor("claude-sonnet-5", "medium", None, None);
+        assert_eq!(m, "claude-sonnet-5");
+        assert_eq!(e, "medium");
+    }
+
+    #[test]
+    fn floor_reviewer_floats_above_floored_worker() {
+        // #172: a task asking for sonnet-5 with a floor of opus-47 spawns the worker
+        // at opus-47, and the reviewer escalates strictly above it (opus-48).
+        let (worker_model, _) = apply_model_effort_floor(
+            "claude-sonnet-5",
+            "high",
+            Some("claude-opus-4-7"),
+            Some("high"),
+        );
+        assert_eq!(worker_model, "claude-opus-4-7");
+        let reviewer = escalated_reviewer_model(&worker_model, "claude-sonnet-5");
+        assert_eq!(reviewer, "claude-opus-4-8");
+        assert!(model_rank(&reviewer) > model_rank(&worker_model));
     }
 
     fn test_db() -> (rusqlite::Connection, tempfile::TempDir) {

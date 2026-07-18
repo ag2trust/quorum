@@ -39,6 +39,8 @@ const DEFAULT_SERVE_TOML: &str = "\
 # no_bare_agent = false
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\"
+# min_model = \"opus-47\"   # floor: bump workers below this tier up to it
+# min_effort = \"high\"     # floor: medium|high
 
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000
@@ -1122,6 +1124,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
             }
 
+            // #172: worker model/effort floor. Validate + convert tier→model id at load;
+            // bad tier or effort → exit 2 (Usage), consistent with serve_config style.
+            let (r_min_model, r_min_effort) = serve_config::resolve_floor(
+                file_cfg.min_model.as_deref(),
+                file_cfg.min_effort.as_deref(),
+            )?;
+
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
                 config_path: config_path_used.as_deref(),
@@ -1148,6 +1157,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_gate: &r_master_ci_gate,
                 master_ci_timeout_secs: &r_master_ci_timeout,
                 doctor_enabled: &r_doctor_enabled,
+                min_model: r_min_model.as_deref(),
+                min_effort: r_min_effort.as_deref(),
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1224,6 +1235,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
                 doctor_enabled: r_doctor_enabled.value,
                 suggested_models: r_suggested_models,
+                min_model: r_min_model,
+                min_effort: r_min_effort,
             };
             Ok(serve::run_serve(config)?)
         }

@@ -52,6 +52,11 @@ pub struct ServeFileConfig {
     pub r2_steady_state_p: Option<f64>,
     /// Per-complexity suggested model/effort (keys "1".."5", values "tier/effort").
     pub suggested_models: Option<std::collections::HashMap<String, String>>,
+    /// #172: minimum worker model tier floor ("sonnet-5"|"opus-46"|"opus-47"|"opus-48").
+    /// A worker resolving below this is bumped up to it at spawn. None = no floor.
+    pub min_model: Option<String>,
+    /// #172: minimum worker effort floor ("medium"|"high"). None = no floor.
+    pub min_effort: Option<String>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
@@ -236,6 +241,9 @@ pub struct BannerData<'a> {
     pub master_ci_gate: &'a Sourced<bool>,
     pub master_ci_timeout_secs: &'a Sourced<u64>,
     pub doctor_enabled: &'a Sourced<bool>,
+    /// #172: worker model/effort floor (full model id + effort), or None = off.
+    pub min_model: Option<&'a str>,
+    pub min_effort: Option<&'a str>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -340,8 +348,44 @@ pub fn banner(d: &BannerData<'_>) -> String {
         d.master_ci_timeout_secs
     ));
     lines.push(format!("  doctor_enabled:            {}", d.doctor_enabled));
+    lines.push(format!(
+        "  min_model:                 {}",
+        d.min_model.unwrap_or("(none)")
+    ));
+    lines.push(format!(
+        "  min_effort:                {}",
+        d.min_effort.unwrap_or("(none)")
+    ));
     lines.push("─────────────────────────────".to_string());
     lines.join("\n")
+}
+
+/// #172: validate + convert the worker model/effort floor from config strings.
+/// `min_model` tier → full model id; `min_effort` must be "medium"|"high".
+/// Bad values → Usage error (exit 2), consistent with the rest of serve config.
+/// Returns (model_id, effort); either is None when its input is None (no floor).
+pub fn resolve_floor(
+    min_model: Option<&str>,
+    min_effort: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let model = match min_model {
+        Some(tier) => Some(crate::serve::tier_to_model_id_pub(tier).ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "bad min_model: \"{tier}\" (expected sonnet-5|opus-46|opus-47|opus-48)"
+            ))
+        })?),
+        None => None,
+    };
+    let effort = match min_effort {
+        Some(e) if e == "medium" || e == "high" => Some(e.to_string()),
+        Some(e) => {
+            return Err(QuorumError::Usage(format!(
+                "bad min_effort: \"{e}\" (expected medium|high)"
+            )))
+        }
+        None => None,
+    };
+    Ok((model, effort))
 }
 
 /// Default config file path for a given repo: `~/.quorum/serve/<owner>__<repo>.toml`
@@ -448,6 +492,33 @@ worktree_base = "/tmp/wt"
         let sm = cfg.suggested_models.unwrap();
         assert_eq!(sm.get("3").unwrap(), "opus-48/high");
         assert_eq!(sm.get("5").unwrap(), "opus-47/medium");
+    }
+
+    #[test]
+    fn resolve_floor_valid_converts_tier() {
+        let (m, e) = resolve_floor(Some("opus-47"), Some("high")).unwrap();
+        assert_eq!(m.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(e.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn resolve_floor_none_is_no_floor() {
+        let (m, e) = resolve_floor(None, None).unwrap();
+        assert!(m.is_none() && e.is_none());
+    }
+
+    #[test]
+    fn resolve_floor_bad_model_exits_2() {
+        let err = resolve_floor(Some("opus-99"), None).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("min_model"), "{err}");
+    }
+
+    #[test]
+    fn resolve_floor_bad_effort_exits_2() {
+        let err = resolve_floor(Some("opus-47"), Some("low")).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("min_effort"), "{err}");
     }
 
     #[test]
@@ -574,6 +645,8 @@ worktree_base = "/tmp/wt"
                 value: false,
                 source: Source::Default,
             },
+            min_model: None,
+            min_effort: None,
         });
         assert!(
             b.contains("config file:               /path/to/config.toml"),
