@@ -578,12 +578,19 @@ pub fn apply_event(
         && matches!(status, Status::Working | Status::Rework)
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
 
+    let failure_cause = match event {
+        Event::AgentFailed { reason } => reason.as_str(),
+        Event::LeaseExpired => "lease expired",
+        _ => "unknown",
+    };
+
     if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
         new_status = Status::Cancelled;
         effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. }));
         effects.push(Effect::NotifyOwner {
             reason: format!(
-                "recovery budget exhausted ({}/{MAX_RECOVERY_ATTEMPTS} attempts)",
+                "recovery budget exhausted ({}/{MAX_RECOVERY_ATTEMPTS} attempts); \
+                 last failure: {failure_cause}",
                 task.recovery_attempts,
             ),
         });
@@ -3514,5 +3521,198 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tr.task.status, "cancelled");
+    }
+
+    #[test]
+    fn lifecycle_rejection_consumes_recovery_budget() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "reject-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Simulate the daemon's C3 path: worker submits, lifecycle rejects,
+        // daemon fires AgentFailed with the rejection reason.
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            claim(&mut c, "w1", None, &[], TTL, attempt * 100).unwrap();
+            let tr = apply_event(
+                &mut c,
+                "daemon",
+                tid,
+                &Event::AgentFailed {
+                    reason: "lifecycle transition rejected at done signal: not-holder".into(),
+                },
+                attempt * 100 + 50,
+            )
+            .unwrap();
+            assert_eq!(tr.task.status, "open", "attempt {attempt} should reopen");
+            assert_eq!(tr.task.recovery_attempts, attempt);
+        }
+
+        // Attempt 4: budget exhausted → cancelled, not reopened
+        claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
+        let tr = apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "lifecycle transition rejected at done signal: not-holder".into(),
+            },
+            550,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "cancelled");
+
+        // Verify the cancellation includes the failure cause
+        let has_cause = tr.effects.iter().any(|e| {
+            matches!(e, Effect::NotifyOwner { reason }
+                if reason.contains("recovery budget exhausted")
+                    && reason.contains("not-holder"))
+        });
+        assert!(has_cause, "cancellation must include the rejection cause");
+    }
+
+    #[test]
+    fn no_fourth_spawn_after_budget_exhaustion() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "no-respawn",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Exhaust the budget with deterministic lifecycle rejections
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            claim(&mut c, "w1", None, &[], TTL, attempt * 100).unwrap();
+            apply_event(
+                &mut c,
+                "daemon",
+                tid,
+                &Event::AgentFailed {
+                    reason: "lifecycle transition rejected at done signal: task is cancelled"
+                        .into(),
+                },
+                attempt * 100 + 50,
+            )
+            .unwrap();
+        }
+
+        // Fourth crash → cancelled
+        claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
+        let tr = apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "lifecycle transition rejected at done signal: task is cancelled".into(),
+            },
+            550,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "cancelled");
+
+        // Task is now terminal — claim must fail (no 4th spawn possible)
+        let claimed = claim(&mut c, "w2", None, &[], TTL, 600).unwrap();
+        assert!(claimed.is_none(), "must not claim a cancelled task");
+    }
+
+    #[test]
+    fn exhaustion_message_carries_last_failure_reason() {
+        let (_d, mut c) = open_tmp();
+        let tid = create(
+            &mut c,
+            "boss",
+            "cause-test",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        // Burn the budget with mixed reasons — the last one is what matters
+        claim(&mut c, "w1", None, &[], TTL, 200).unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "worker process died".into(),
+            },
+            250,
+        )
+        .unwrap();
+
+        claim(&mut c, "w1", None, &[], TTL, 300).unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "worker process died".into(),
+            },
+            350,
+        )
+        .unwrap();
+
+        claim(&mut c, "w1", None, &[], TTL, 400).unwrap();
+        apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "worker process died".into(),
+            },
+            450,
+        )
+        .unwrap();
+
+        // Fourth attempt — the reason in this event is the one that shows up
+        claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
+        let tr = apply_event(
+            &mut c,
+            "daemon",
+            tid,
+            &Event::AgentFailed {
+                reason: "lifecycle transition rejected at done signal: not-holder".into(),
+            },
+            550,
+        )
+        .unwrap();
+        assert_eq!(tr.task.status, "cancelled");
+
+        let reason = tr
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::NotifyOwner { reason } => Some(reason.as_str()),
+                _ => None,
+            })
+            .expect("must have NotifyOwner effect");
+        assert!(
+            reason
+                .contains("last failure: lifecycle transition rejected at done signal: not-holder"),
+            "exhaustion message must carry the triggering failure reason, got: {reason}"
+        );
     }
 }
