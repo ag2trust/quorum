@@ -429,14 +429,41 @@ async fn gh_checks_summary(repo: &Option<String>, cwd: &Path, pr: i64) -> Result
         args.push("-R".into());
         args.push(r.clone());
     }
-    run_gh(&args, cwd, &gh_env(repo)).await
+    match run_gh_raw(&args, cwd, &gh_env(repo)).await {
+        Ok(stdout) => Ok(stdout),
+        Err(GhError::NoChecks) => Ok("no checks reported".to_string()),
+        Err(GhError::Failed(e)) => Err(e),
+    }
+}
+
+/// Distinguishes "no checks reported" (valid empty state for repos without CI)
+/// from genuine gh failures (auth, network, rate-limit, malformed response).
+enum GhError {
+    /// `gh pr checks` exited nonzero with stderr containing "no checks reported".
+    NoChecks,
+    /// Any other failure — propagate as a retryable error.
+    Failed(QuorumError),
 }
 
 async fn run_gh(args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<String> {
+    match run_gh_raw(args, cwd, env).await {
+        Ok(s) => Ok(s),
+        Err(GhError::NoChecks) => Err(QuorumError::Io(
+            "gh: no checks reported (unexpected in run_gh)".into(),
+        )),
+        Err(GhError::Failed(e)) => Err(e),
+    }
+}
+
+async fn run_gh_raw(
+    args: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+) -> std::result::Result<String, GhError> {
     let cwd = cwd.to_path_buf();
     let args = args.to_vec();
     let env = env.to_vec();
-    let handle = tokio::task::spawn_blocking(move || -> Result<String> {
+    let handle = tokio::task::spawn_blocking(move || -> std::result::Result<String, GhError> {
         let mut cmd = std::process::Command::new("gh");
         cmd.args(&args).current_dir(&cwd);
         for (k, v) in &env {
@@ -444,17 +471,25 @@ async fn run_gh(args: &[String], cwd: &Path, env: &[(String, String)]) -> Result
         }
         let out = cmd
             .output()
-            .map_err(|e| QuorumError::Io(format!("gh: {e}")))?;
+            .map_err(|e| GhError::Failed(QuorumError::Io(format!("gh: {e}"))))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(QuorumError::Io(format!("gh {args:?} failed: {stderr}")));
+            if stderr.contains("no checks reported") {
+                return Err(GhError::NoChecks);
+            }
+            return Err(GhError::Failed(QuorumError::Io(format!(
+                "gh {args:?} failed: {stderr}"
+            ))));
         }
-        String::from_utf8(out.stdout).map_err(|e| QuorumError::Io(format!("invalid utf8: {e}")))
+        String::from_utf8(out.stdout)
+            .map_err(|e| GhError::Failed(QuorumError::Io(format!("invalid utf8: {e}"))))
     });
     match timeout(GH_FETCH_TIMEOUT, handle).await {
         Ok(Ok(res)) => res,
-        Ok(Err(join_err)) => Err(QuorumError::Io(format!("gh join failed: {join_err}"))),
-        Err(_) => Err(QuorumError::Io("gh timed out".into())),
+        Ok(Err(join_err)) => Err(GhError::Failed(QuorumError::Io(format!(
+            "gh join failed: {join_err}"
+        )))),
+        Err(_) => Err(GhError::Failed(QuorumError::Io("gh timed out".into()))),
     }
 }
 
@@ -1130,5 +1165,150 @@ esac
                 assert!(!line.contains(" -R "), "gh api must not carry -R: {line}");
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Fake-gh contract tests: no-checks vs genuine failure (#168).
+    //
+    // Repos without CI (e.g. BoostMyAgents) make `gh pr checks` exit 1
+    // with "no checks reported" on stderr. This must normalize to a valid
+    // collector input, NOT trigger retry/dead-letter. Genuine failures
+    // (auth, network, rate-limit) must still propagate as errors.
+    // ------------------------------------------------------------------
+
+    /// Build a fake-gh shim script. `checks_behavior` is spliced into the
+    /// `pr checks` case — it controls exit code and output.
+    fn write_gh_shim(dir: &Path, checks_behavior: &str) -> PathBuf {
+        let shim_path = dir.join("gh");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"pr checks"*)
+    {checks}
+    ;;
+  *"pr view"*)
+    echo '{{"changedFiles":1,"additions":5,"deletions":2,"title":"test"}}'
+    ;;
+  *"pulls/"*"/reviews"*|*"pulls/"*"/comments"*|*"issues/"*"/comments"*|*"pulls/"*"/commits"*)
+    echo '[]'
+    ;;
+  *"pulls/"*)
+    echo '{{}}'
+    ;;
+  *)
+    echo '{{}}'
+    ;;
+esac
+"#,
+            checks = checks_behavior
+        );
+        std::fs::write(&shim_path, script).unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&shim_path)
+            .output()
+            .unwrap();
+        shim_path
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gh_checks_no_checks_reported_normalizes_to_valid_input() {
+        // Repos without CI: `gh pr checks` exits 1, stderr = "no checks reported\n"
+        let shim_dir = tempfile::tempdir().unwrap();
+        write_gh_shim(shim_dir.path(), r#"echo "no checks reported" >&2; exit 1"#);
+
+        let home = tempfile::tempdir().unwrap();
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            orig_path.to_string_lossy()
+        );
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            assert_cmd::Command::cargo_bin("quorum")
+                .unwrap()
+                .env("PATH", &new_path)
+                .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "no-ci-owner/no-ci-repo")
+                .args([
+                    "review-interpret",
+                    "--pr",
+                    "1",
+                    "--agent-bin",
+                    fake_agent_path().to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.status.success(),
+            "no-checks must not fail the collector; exit {}: stderr={}",
+            outcome.status,
+            String::from_utf8_lossy(&outcome.stderr),
+        );
+
+        // Verify the classifier ran and produced findings (proves the pipeline
+        // continued past the checks fetch rather than erroring out).
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        assert!(
+            stdout.contains("\"status\":\"success\"") || stdout.contains("findings"),
+            "collector should succeed with no-checks input; stdout={stdout}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gh_checks_genuine_failure_still_errors() {
+        // Genuine failure: `gh pr checks` exits 1 with auth/network error
+        let shim_dir = tempfile::tempdir().unwrap();
+        write_gh_shim(
+            shim_dir.path(),
+            r#"echo "HTTP 401: Bad credentials" >&2; exit 1"#,
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let orig_path = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            orig_path.to_string_lossy()
+        );
+
+        let outcome = tokio::task::spawn_blocking(move || {
+            assert_cmd::Command::cargo_bin("quorum")
+                .unwrap()
+                .env("PATH", &new_path)
+                .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "no-ci-owner/no-ci-repo")
+                .args([
+                    "review-interpret",
+                    "--pr",
+                    "1",
+                    "--agent-bin",
+                    fake_agent_path().to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        // Genuine auth failure must propagate — exit nonzero or JSON with failed status
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        let failed = !outcome.status.success()
+            || stdout.contains("\"status\":\"failed\"")
+            || stderr.contains("Bad credentials");
+        assert!(
+            failed,
+            "genuine gh failure must propagate as error; exit={} stdout={stdout} stderr={stderr}",
+            outcome.status,
+        );
     }
 }
