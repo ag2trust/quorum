@@ -132,6 +132,37 @@ pub fn revoke_all_for_agent(conn: &mut Connection, agent: &str, now: i64) -> Res
     Ok(changed)
 }
 
+/// Look up an active (non-revoked) capability for a given agent+task+role triple.
+/// Used by `apply_event` to authorize worker/reviewer actions when the name-based
+/// check (assignee/reviewer) doesn't match — e.g. a replacement worker whose
+/// author field was preserved for branch-naming provenance.
+pub fn active_for_agent_task(
+    conn: &Connection,
+    agent: &str,
+    task_id: i64,
+    role: &str,
+) -> Result<Option<RunCapability>> {
+    conn.query_row(
+        "SELECT run_id, task_id, agent, role, created_at, revoked_at
+         FROM run_capabilities
+         WHERE agent = ?1 AND task_id = ?2 AND role = ?3 AND revoked_at IS NULL
+         ORDER BY created_at DESC LIMIT 1",
+        params![agent, task_id, role],
+        |r| {
+            Ok(RunCapability {
+                run_id: r.get(0)?,
+                task_id: r.get(1)?,
+                agent: r.get(2)?,
+                role: r.get(3)?,
+                created_at: r.get(4)?,
+                revoked_at: r.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Look up the active (non-revoked) capability for a given agent name.
 /// Returns None if no active capability exists.
 pub fn active_for_agent(conn: &Connection, agent: &str) -> Result<Option<RunCapability>> {
@@ -269,5 +300,48 @@ mod tests {
         issue(&mut c, "run-x", 1, "Y", "worker", 1000).unwrap();
         revoke(&mut c, "run-x", 2000).unwrap();
         assert!(active_for_agent(&c, "Y").unwrap().is_none());
+    }
+
+    #[test]
+    fn active_for_agent_task_filters_correctly() {
+        let (_d, mut c) = open_tmp();
+        issue(&mut c, "run-t1", 10, "W", "worker", 1000).unwrap();
+        issue(&mut c, "run-t2", 20, "W", "worker", 1100).unwrap();
+        issue(&mut c, "run-rv", 10, "W", "reviewer", 1200).unwrap();
+
+        // Exact match
+        let cap = active_for_agent_task(&c, "W", 10, "worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cap.run_id, "run-t1");
+
+        // Different task
+        let cap = active_for_agent_task(&c, "W", 20, "worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cap.run_id, "run-t2");
+
+        // Wrong role
+        assert!(
+            active_for_agent_task(&c, "W", 10, "reviewer")
+                .unwrap()
+                .unwrap()
+                .run_id
+                == "run-rv"
+        );
+
+        // No match
+        assert!(active_for_agent_task(&c, "W", 99, "worker")
+            .unwrap()
+            .is_none());
+        assert!(active_for_agent_task(&c, "Z", 10, "worker")
+            .unwrap()
+            .is_none());
+
+        // Revoked capability not returned
+        revoke(&mut c, "run-t1", 2000).unwrap();
+        assert!(active_for_agent_task(&c, "W", 10, "worker")
+            .unwrap()
+            .is_none());
     }
 }
