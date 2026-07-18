@@ -258,6 +258,10 @@ fn upgrade_replaces_stale_skill() {
         after.contains("quorum"),
         "embedded skill must mention quorum"
     );
+    assert!(
+        after.contains("Transferring implementation responsibility outside Quorum"),
+        "embedded skill must document external transfer protocol"
+    );
 }
 
 #[test]
