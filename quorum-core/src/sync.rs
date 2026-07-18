@@ -31,7 +31,7 @@ pub const DEFAULT_LOG_LIMIT: i64 = 20;
 pub const DEFAULT_MSG_LIMIT: i64 = 20;
 
 /// The task the agent currently holds (`status='claimed' AND assignee=agent`). Body is
-/// intentionally omitted — the agent fetches it once at `task-claim` time and again via
+/// intentionally omitted — the agent receives it at claim time and again via
 /// `task-get` if needed. `sync` is the compass, not the cargo manifest.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct CurrentTaskView {

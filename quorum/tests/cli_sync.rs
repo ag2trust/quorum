@@ -5,6 +5,8 @@
 //! shape, and the at-most-once cursor advance via the public `quorum read` path so a
 //! second `sync` invocation doesn't re-show the same direct messages.
 
+mod common;
+
 use assert_cmd::Command;
 
 fn quorum(home: &std::path::Path) -> Command {
@@ -77,18 +79,7 @@ fn sync_returns_current_task_when_agent_holds_one() {
         ])
         .assert()
         .success();
-    quorum(home.path())
-        .args([
-            "task-claim",
-            "--agent",
-            "A",
-            "--task-id",
-            "1",
-            "--ttl",
-            "1h",
-        ])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "A", Some(1), 3600);
     let out = quorum(home.path())
         .args(["sync", "--agent", "A"])
         .output()

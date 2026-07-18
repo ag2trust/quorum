@@ -254,15 +254,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-create --created-by <id> --title <s> [--priority N] [--labels <json>] [--depends-on <json>] (--body-stdin | --body-file <p> | --json-stdin)` → `{id}` (status: `open`)
 - `quorum task-create ... --review-pr <N>` → review-only task (status: `in-review`,
   `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
-- `quorum task-claim --agent <id> [--task-id <n>]` → specific task, or highest-priority
-  ready `open` task; atomic via `UPDATE … WHERE status='open' RETURNING`. Fires
-  `Claimed { agent }` → `working`. Response includes `suggested_branch`,
-  `suggested_worktree`, and `branch_exists` — centralized per-(task, project) branch
-  allocation in `task_branches`, idempotent on `(task_id, repo)`, so rework re-claims
-  return the SAME branch (issue #98). **Dependency gating:** `depends_on` tasks must all
-  be `done` before a task is claimable.
-- `quorum task-claim --agent <id> --task-id <n>` (on an `in-review` task) → fires
-  `ReviewerAttached { agent }`, sets reviewer. **Guard:** agent must differ from author.
+- ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
+  `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
+  dependency gating, and reviewer attachment are all preserved as internal functions.
 - `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
@@ -1006,10 +1000,12 @@ incrementally:
    injection to `serve`. Add `expires_at` column to `pinned` (default 24h).
    Add `inspect` command. Add `roster` as standalone. All v1 commands continue
    to work — no breakage.
-2. **Phase 2 (soft removal):** `sync`, `task-claim`, generic claims
-   (`claim`/`release`/`renew`/`claims`), `stop`/`resume`/`stops`, and
+2. **Phase 2 (soft removal):** `sync`,
+   `stop`/`resume`/`stops`, and
    `message` emit a deprecation warning (stderr). `submit` and `react` accept
    both the old unscoped path and the new `QUORUM_RUN_ID` path.
+   *Note:* `task-claim` and generic claims (`claim`/`release`/`renew`/`claims`)
+   were hard-removed in PR #85 and PR #161 (skipped soft-removal).
 3. **Phase 3 (hard removal):** Deprecated commands exit 2. `submit` and
    `react` require `QUORUM_RUN_ID`. `done` alias removed. `task-update
    --status` restricted to `cancelled` only.
@@ -1032,8 +1028,8 @@ remains disposable.
 | `done` alias on `submit` | `quorum/src/cli.rs:362` | `#[command(alias = "done")]` removed. |
 | `status --agents` | `quorum/src/cli.rs:308`, `quorum/src/main.rs` | Flag removed; `roster` becomes standalone. |
 | `sync` CLI command | `quorum/src/cli.rs`, `quorum/src/main.rs`, `quorum-core/src/sync.rs` | CLI entry point removed. `sync.rs` module retained in `quorum-core` for any internal daemon use. |
-| `task-claim` CLI command | `quorum/src/cli.rs`, `quorum/src/main.rs` | CLI entry point removed. `tasks::claim` retained as internal function. |
-| Generic claims CLI (`claim`/`release`/`renew`/`claims`) | `quorum/src/cli.rs`, `quorum/src/main.rs` | CLI entry points removed. `quorum-core/src/claims.rs` module retained. |
+| `task-claim` CLI command | `quorum/src/cli.rs`, `quorum/src/main.rs` | **Hard-removed (PR #161).** `tasks::claim` retained as internal function. |
+| Generic claims CLI (`claim`/`release`/`renew`/`claims`) | `quorum/src/cli.rs`, `quorum/src/main.rs` | **Hard-removed (PR #85).** `quorum-core/src/claims.rs` module retained. |
 | `stop`/`resume`/`stops` CLI | `quorum/src/cli.rs`, `quorum/src/main.rs`, `quorum-core/src/control.rs` | CLI entry points removed. Stop requests become messages. |
 | `message` CLI | `quorum/src/cli.rs`, `quorum/src/main.rs` | CLI entry point removed. Feed `post` + daemon stdin delivery replace it. |
 | Passive-submit detection | `quorum/src/serve/mod.rs` (Phase 2) | Removed entirely (no passive execution). |

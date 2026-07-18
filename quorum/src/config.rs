@@ -12,7 +12,7 @@ pub struct Config {
     pub online_window_secs: i64,
     /// Default message TTL when `--ttl` is omitted.
     pub message_ttl_secs: i64,
-    /// Default task-claim lease TTL when `--ttl` is omitted. The assignee renews on long work;
+    /// Default task lease TTL. The assignee renews on long work;
     /// a lapsed lease lets the reaper return the task to `open`.
     pub task_lease_ttl_secs: i64,
     /// Default page size for read/peek.
@@ -54,7 +54,7 @@ pub const DEFAULT_TOML: &str = "\
 # Quorum config. Delete any line to use its built-in default.
 online_window_secs       = 900        # agent considered online if active within 15 min
 message_ttl_secs         = 172800     # 48h
-task_lease_ttl_secs      = 3600       # 1h task-claim lease; assignee renews on long work
+task_lease_ttl_secs      = 3600       # 1h task lease; assignee renews on long work
 read_limit               = 100        # default page size for read/peek
 retire_after_active_secs = 5400       # 90 min cumulative active time → retiring (issue #97)
 retire_after_tasks       = 8          # OR 8 completed tasks → retiring (issue #97)

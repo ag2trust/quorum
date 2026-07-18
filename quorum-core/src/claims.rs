@@ -235,11 +235,10 @@ pub fn renew(
 
 /// List active, unexpired claims, optionally filtered to one target. Read-only.
 ///
-/// **Task leases are excluded** (`target NOT LIKE 'task#%'`, #58): a `task-claim` takes its
+/// **Task leases are excluded** (`target NOT LIKE 'task#%'`, #58): `tasks::claim` takes its
 /// renewable lease in this same `claims` table under the reserved `task#<id>` target, but
 /// those are internal to the task queue — they belong to `task-list`/`task-get`, not the
-/// arbitrary-lock surface. So `claims` lists only the locks an agent took with `quorum claim`
-/// (`pr#…`, free-form targets). The `task#` prefix is reserved for the queue; don't claim it
+/// arbitrary-lock surface. The `task#` prefix is reserved for the queue; don't claim it
 /// directly. This is a behavior-contract clarification, not a removal — no command goes away.
 pub fn list(conn: &Connection, target: Option<&str>, now: i64) -> Result<Vec<Claim>> {
     let map = |r: &rusqlite::Row| {
@@ -409,7 +408,7 @@ mod tests {
 
     #[test]
     fn list_excludes_task_leases() {
-        // A task-claim takes its lease in this same table under the reserved `task#<id>`
+        // tasks::claim takes its lease in this same table under the reserved `task#<id>`
         // target (#58). Those are internal to the queue and must not surface via `claims`;
         // an arbitrary `pr#` lock still does.
         let (_d, mut c) = open_tmp();

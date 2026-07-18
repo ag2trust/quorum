@@ -5,6 +5,8 @@
 //! (1) a lost race still bumps presence, (2) a pre-write usage error leaves no trace,
 //! (3) pure-read commands never create/bump an agent row.
 
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 
@@ -62,16 +64,10 @@ fn lost_claim_still_marks_agent_online() {
         .success();
 
     // Winner takes the task lease.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "Winner", "--task-id", "1"])
-        .assert()
-        .success();
+    common::claim_task(home.path(), "Winner", Some(1), 3600);
 
-    // Loser loses (exit 1, task already claimed) — but touch ran inside the txn first.
-    quorum(home.path())
-        .args(["task-claim", "--agent", "Loser", "--task-id", "1"])
-        .assert()
-        .code(1);
+    // Loser loses — but touch ran inside the txn first.
+    assert!(common::try_claim_task(home.path(), "Loser", Some(1), 3600).is_none());
 
     // Both agents must appear in the agent list.
     quorum(home.path())
