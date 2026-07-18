@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 28;
+pub const SCHEMA_VERSION: i64 = 29;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -438,6 +438,15 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                     CREATE INDEX IF NOT EXISTS approvals_task ON approvals(task_id);",
                 )?;
             }
+        }
+
+        // v29 = durable crash-recovery budget (#163). Additive column on
+        // `tasks`; pre-existing rows default to 0 (no prior recovery attempts).
+        if current < 29 && !column_exists(conn, "tasks", "recovery_attempts")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -1852,5 +1861,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(wm1, wm2, "watermark must not change on reopen");
+    }
+
+    #[test]
+    fn migrates_v28_to_v29_adds_recovery_attempts_column() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                 created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                 sticky_until INTEGER, orig TEXT,
+                 author TEXT, reviewer TEXT,
+                 rework_round INTEGER NOT NULL DEFAULT 0,
+                 review_only INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('pre-v29', 'open', 'boss', 100, 100);
+             PRAGMA user_version = 28;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert!(
+            column_exists(&c, "tasks", "recovery_attempts").unwrap(),
+            "recovery_attempts column missing — v28→v29 migration silently skipped"
+        );
+
+        let ra: i64 = c
+            .query_row("SELECT recovery_attempts FROM tasks WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(ra, 0, "pre-existing row must default to 0");
+
+        let title: String = c
+            .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "pre-v29");
     }
 }
