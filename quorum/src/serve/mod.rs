@@ -1407,7 +1407,10 @@ async fn tick(
                     // approves, always spawn R2. Store R1's durable approval
                     // before tearing down so the verdict survives restart.
                     if !reviewers[ri].r2_origin && !drain_state.draining {
-                        // Record R1's durable approval.
+                        // Record R1's durable approval with live head SHA.
+                        // R1 SlotState has reviewed_head_sha: None (only R2
+                        // populates it), so fetch from executor — mirrors the
+                        // pre-merge capture at the R2 approval site.
                         {
                             let r1_reviewer = reviewers[ri].agent_name.clone();
                             let author = workers
@@ -1415,8 +1418,17 @@ async fn tick(
                                 .find(|w| w.task_id == reviewer_task_id)
                                 .map(|w| w.agent_name.clone())
                                 .unwrap_or_default();
-                            let head_sha =
-                                reviewers[ri].reviewed_head_sha.clone().unwrap_or_default();
+                            let head_sha = {
+                                let repo = config.repo_dir.clone();
+                                let executor = Arc::clone(&config.merge_executor);
+                                tokio::task::spawn_blocking(move || {
+                                    executor.head_sha(pr_num, &repo)
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default()
+                            };
                             let p = db_path.clone();
                             let tid = reviewer_task_id;
                             let blocking = gated.blocking_count.unwrap_or(0) as i64;
