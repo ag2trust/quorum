@@ -6514,7 +6514,8 @@ async fn spawn_remediation_worker(
     ));
 
     let session_id = agent::new_session_id();
-    let branch = format!("daemon/{}-t{}", agent_name.to_lowercase(), task_id);
+    // Use the PR's branch as local branch so pushes update the existing PR.
+    let branch = pr_branch.clone();
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", agent_name, task_id));
