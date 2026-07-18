@@ -3238,7 +3238,7 @@ async fn tick(
                 } else {
                     Event::SignaledDone { pr: pr.to_string() }
                 };
-                let tr = fire_event(
+                let tr = fire_event_result(
                     &db_path,
                     &workers[wi].agent_name,
                     workers[wi].task_id,
@@ -3247,7 +3247,7 @@ async fn tick(
                 .await;
 
                 match tr {
-                    Some(tr) => {
+                    Ok(tr) => {
                         workers[wi].pr = Some(pr);
 
                         // Dispatch lifecycle effects.
@@ -3337,12 +3337,14 @@ async fn tick(
                             workers[wi].agent_name, pr
                         ));
                     }
-                    None => {
+                    Err(rejection_cause) => {
                         // C3: transition rejected (e.g. task externally
-                        // cancelled). Do NOT set worker.pr — clean up instead.
+                        // cancelled, authority mismatch). Routes through the
+                        // recovery budget as a deterministic failure — branch
+                        // preserved for diagnosis.
                         log(&format!(
                             "lifecycle rejected at done signal for worker {} \
-                             — cleaning up slot",
+                             — deterministic failure, branch preserved: {rejection_cause}",
                             workers[wi].agent_name
                         ));
                         let w = workers.remove(wi);
@@ -3351,11 +3353,14 @@ async fn tick(
                             &w.agent_name,
                             w.task_id,
                             &Event::AgentFailed {
-                                reason: "lifecycle transition rejected at done signal".into(),
+                                reason: format!(
+                                    "lifecycle transition rejected at done signal: \
+                                     {rejection_cause}"
+                                ),
                             },
                         )
                         .await;
-                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                        cleanup_slot_inner(config, wt_mgr, name_pool, w, None, false).await;
                     }
                 }
             } else {
@@ -5775,15 +5780,13 @@ async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strik
     .ok();
 }
 
-/// Fire a lifecycle event through `tasks::apply_event`.
-/// Returns the transition result (updated task + process-side effects), or None
-/// if the transition was invalid (logs the error).
-async fn fire_event(
+/// Fire a lifecycle event, returning the result or an error description.
+async fn fire_event_result(
     db_path: &std::path::Path,
     agent: &str,
     task_id: i64,
     event: &Event,
-) -> Option<tasks::TransitionResult> {
+) -> std::result::Result<tasks::TransitionResult, String> {
     let p = db_path.to_path_buf();
     let a = agent.to_string();
     let ev = event.clone();
@@ -5802,21 +5805,35 @@ async fn fire_event(
                 tr.task.status,
                 names.join(", ")
             ));
-            Some(tr)
+            Ok(tr)
         }
         Ok(Err(e)) => {
+            let msg = e.to_string();
             log(&format!(
-                "lifecycle: fire_event failed for task #{task_id}: {e}"
+                "lifecycle: fire_event failed for task #{task_id}: {msg}"
             ));
-            None
+            Err(msg)
         }
         Err(e) => {
+            let msg = format!("join error: {e}");
             log(&format!(
-                "lifecycle: fire_event join error for task #{task_id}: {e}"
+                "lifecycle: fire_event join error for task #{task_id}: {msg}"
             ));
-            None
+            Err(msg)
         }
     }
+}
+
+/// Fire a lifecycle event through `tasks::apply_event`.
+/// Returns the transition result (updated task + process-side effects), or None
+/// if the transition was invalid (logs the error).
+async fn fire_event(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    event: &Event,
+) -> Option<tasks::TransitionResult> {
+    fire_event_result(db_path, agent, task_id, event).await.ok()
 }
 
 async fn emit_kill_event(db_path: &std::path::Path, target: &str, by: &str, reason: &str) {
@@ -5937,12 +5954,29 @@ async fn cleanup_slot(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
-    mut state: SlotState,
+    state: SlotState,
     finalize_verdict: Option<&str>,
 ) {
+    cleanup_slot_inner(config, wt_mgr, name_pool, state, finalize_verdict, true).await;
+}
+
+async fn cleanup_slot_inner(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    mut state: SlotState,
+    finalize_verdict: Option<&str>,
+    delete_branch: bool,
+) {
     log(&format!(
-        "tearing down worker {} (task #{})",
-        state.agent_name, state.task_id
+        "tearing down worker {} (task #{}{})",
+        state.agent_name,
+        state.task_id,
+        if delete_branch {
+            ""
+        } else {
+            ", branch preserved"
+        },
     ));
 
     if let Some(ref mut sl) = state.session_log {
@@ -5964,7 +5998,9 @@ async fn cleanup_slot(
 
     let repo_dir = &config.repo_dir;
     wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
-    wt_mgr.delete_branch(repo_dir, &state.branch).await;
+    if delete_branch {
+        wt_mgr.delete_branch(repo_dir, &state.branch).await;
+    }
 
     name_pool.release(&state.agent_name);
 }
