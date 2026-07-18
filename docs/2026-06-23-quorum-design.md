@@ -660,6 +660,16 @@ via the `MergeSucceeded` enqueue path. Already-enqueued rows from prior merges
 are drained normally by the tick loop; historical tasks without a queue row are
 left untouched.
 
+**Prospective-only performance boundary (#158):** `quorum perf` only reports on
+tasks that reached terminal status after the analytics rollout. The boundary is a
+unix timestamp stored durably in the `perf_watermark` table (single row, id=1),
+seeded once during the v27 schema migration and never updated. Tasks with
+`updated_at < watermark` are excluded from the default report. `quorum perf --all`
+bypasses the watermark for historical analysis. The boundary survives daemon
+restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
+Historical collector artifacts (collection runs, findings, errors) created by a
+prior backfill are retained as audit data but do not affect the default report.
+
 ## Daemon-only execution and lean interface (v2 boundary)
 
 **Date:** 2026-07-16
@@ -793,7 +803,7 @@ emit verdicts.
 | `inspect` | Deep read-only troubleshooting (see Inspect below). | — (new) |
 | `status` | Compact health snapshot. Unchanged. | — |
 | `tail` | Stream agent session log. Unchanged. | — |
-| `perf` | Performance report. Unchanged. | — |
+| `perf` | Performance report. Prospective-only by default (`--all` for historical). | v1 `perf` (included all terminal tasks) |
 | `roster` | Agent presence (migrated from `status --agents`). | `status --agents` |
 | `help` | Cheat-sheet. Unchanged. | — |
 | `init` | Create DB + config. Unchanged. | — |

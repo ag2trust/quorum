@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -384,6 +384,21 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // SCHEMA_VERSION` early-return above short-circuits SCHEMA_SQL — a live
         // DB stopped at user_version=25 would otherwise never see the new table.
         // v26 forces the migration path to run once.
+
+        // v27 = prospective-only perf watermark (#158). Net-new
+        // `perf_watermark` table via SCHEMA_SQL. On first migration past v26
+        // we seed the single watermark row with the current unix timestamp —
+        // every task that reached terminal status before this instant is
+        // excluded from the default `quorum perf` report. INSERT OR IGNORE
+        // is idempotent: re-running the migration (e.g. after a crash
+        // between SCHEMA_SQL and the version stamp) never moves the boundary.
+        if current < 27 {
+            let now = crate::clock::now();
+            conn.execute(
+                "INSERT OR IGNORE INTO perf_watermark (id, watermark) VALUES (1, ?1)",
+                [now],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1705,5 +1720,96 @@ mod tests {
         let cap = crate::capabilities::validate(&c, "run-v26", "Agent-Upgrade", "worker", Some(1))
             .unwrap();
         assert_eq!(cap.agent, "Agent-Upgrade");
+    }
+
+    #[test]
+    fn migrates_v26_to_v27_adds_perf_watermark_table() {
+        use rusqlite::Connection;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE run_capabilities (
+                 run_id TEXT PRIMARY KEY, task_id INTEGER NOT NULL,
+                 agent TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('worker','reviewer')),
+                 created_at INTEGER NOT NULL, revoked_at INTEGER
+             );
+             PRAGMA user_version = 26;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        // Verify table absent before migration.
+        let raw = Connection::open(&path).unwrap();
+        let pre: i64 = raw
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='perf_watermark'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0, "seed must not include perf_watermark");
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name='perf_watermark'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "perf_watermark must exist after v26→v27 migration");
+
+        // Watermark row seeded with a real timestamp.
+        let wm: i64 = c
+            .query_row(
+                "SELECT watermark FROM perf_watermark WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            wm > 1_700_000_000,
+            "watermark should be a recent unix timestamp, got {wm}"
+        );
+    }
+
+    #[test]
+    fn perf_watermark_idempotent_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let wm1: i64;
+        {
+            let c = open(&path).unwrap();
+            wm1 = c
+                .query_row(
+                    "SELECT watermark FROM perf_watermark WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        }
+        // Reopen — INSERT OR IGNORE must not overwrite.
+        let c = open(&path).unwrap();
+        let wm2: i64 = c
+            .query_row(
+                "SELECT watermark FROM perf_watermark WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wm1, wm2, "watermark must not change on reopen");
     }
 }

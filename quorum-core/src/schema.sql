@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 25). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 27). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -438,3 +438,15 @@ CREATE TABLE IF NOT EXISTS run_capabilities (
     revoked_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS run_capabilities_agent ON run_capabilities(agent) WHERE revoked_at IS NULL;
+
+-- v27: prospective-only boundary for PR-interaction performance analytics
+-- (#158). Single row (id=1) recording the unix timestamp at which
+-- `quorum perf` results become eligible. Tasks with `updated_at` before
+-- this watermark are excluded from the default performance report.
+-- Set once during the v27 migration and never updated — it marks the
+-- point of feature rollout and survives daemon restarts / binary upgrades.
+-- `quorum perf --all` bypasses the watermark for historical analysis.
+CREATE TABLE IF NOT EXISTS perf_watermark (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    watermark INTEGER NOT NULL
+);

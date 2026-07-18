@@ -1335,7 +1335,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
             Ok(0)
         }
-        cli::Command::Perf { by, json } => {
+        cli::Command::Perf { by, all, json } => {
             let cut = match by.as_deref() {
                 None => quorum_core::perf::PerfCut::Default,
                 Some("complexity") => quorum_core::perf::PerfCut::Complexity,
@@ -1352,7 +1352,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let default_model = file_cfg.model.as_deref().unwrap_or("sonnet");
             let default_effort = file_cfg.effort.as_deref().unwrap_or("high");
             let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let report = quorum_core::perf::perf(&conn, cut, default_model, default_effort)?;
+            let report =
+                quorum_core::perf::perf_with(&conn, cut, default_model, default_effort, all)?;
             if json {
                 output::emit(&report);
             } else {

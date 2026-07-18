@@ -7,6 +7,7 @@
 
 use crate::error::Result;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 
@@ -40,6 +41,19 @@ pub struct PerfRow {
     pub approve_rate_pct: f64,
     pub avg_blocking: f64,
     pub total_cost_usd: f64,
+}
+
+/// Read the prospective-only boundary from the `perf_watermark` table.
+/// Returns `None` on pre-v27 databases (table absent or empty).
+pub fn read_watermark(conn: &Connection) -> Result<Option<i64>> {
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT watermark FROM perf_watermark WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(val)
 }
 
 fn extract_label_value(labels_json: Option<&str>, prefix: &str) -> Option<String> {
@@ -78,7 +92,9 @@ fn load_terminal_tasks(
     conn: &Connection,
     default_model: &str,
     default_effort: &str,
+    since: Option<i64>,
 ) -> Result<Vec<TaskRow>> {
+    let since_val = since.unwrap_or(0);
     let mut stmt = conn.prepare(
         "SELECT t.id, t.status, t.labels, t.rework_round, t.created_at, t.updated_at, t.reviewer, \
                 COALESCE(ar.model, ?1), COALESCE(ar.effort, ?2) \
@@ -88,22 +104,26 @@ fn load_terminal_tasks(
                     ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY spawned_at ASC) AS rn \
              FROM agent_runs WHERE role = 'worker' \
          ) ar ON ar.task_id = t.id AND ar.rn = 1 \
-         WHERE t.status IN ('done', 'failed', 'cancelled')",
+         WHERE t.status IN ('done', 'failed', 'cancelled') \
+           AND t.updated_at >= ?3",
     )?;
     let rows = stmt
-        .query_map(rusqlite::params![default_model, default_effort], |r| {
-            Ok(TaskRow {
-                id: r.get(0)?,
-                status: r.get(1)?,
-                labels: r.get(2)?,
-                rework_round: r.get(3)?,
-                created_at: r.get(4)?,
-                updated_at: r.get(5)?,
-                reviewer: r.get(6)?,
-                model: r.get(7)?,
-                effort: r.get(8)?,
-            })
-        })?
+        .query_map(
+            rusqlite::params![default_model, default_effort, since_val],
+            |r| {
+                Ok(TaskRow {
+                    id: r.get(0)?,
+                    status: r.get(1)?,
+                    labels: r.get(2)?,
+                    rework_round: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                    reviewer: r.get(6)?,
+                    model: r.get(7)?,
+                    effort: r.get(8)?,
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -298,7 +318,22 @@ pub fn perf(
     default_model: &str,
     default_effort: &str,
 ) -> Result<PerfReport> {
-    let tasks = load_terminal_tasks(conn, default_model, default_effort)?;
+    perf_with(conn, cut, default_model, default_effort, false)
+}
+
+pub fn perf_with(
+    conn: &Connection,
+    cut: PerfCut,
+    default_model: &str,
+    default_effort: &str,
+    include_all: bool,
+) -> Result<PerfReport> {
+    let since = if include_all {
+        None
+    } else {
+        read_watermark(conn)?
+    };
+    let tasks = load_terminal_tasks(conn, default_model, default_effort, since)?;
     if tasks.is_empty() {
         return Ok(PerfReport { rows: vec![] });
     }
@@ -403,6 +438,10 @@ mod tests {
     fn open_tmp() -> (tempfile::TempDir, rusqlite::Connection) {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
+        // Reset watermark to 0 so aggregation tests see all seeded tasks
+        // (their hardcoded timestamps predate the live migration watermark).
+        c.execute("UPDATE perf_watermark SET watermark = 0 WHERE id = 1", [])
+            .unwrap();
         (dir, c)
     }
 
@@ -843,5 +882,109 @@ mod tests {
             .unwrap();
         assert!((bob.avg_reviewer_secs - 31.0).abs() < 0.01);
         assert_eq!(bob.rubber_stamp_count, 1);
+    }
+
+    // ── watermark boundary tests (#158) ─────────────────────────────────
+
+    #[test]
+    fn watermark_excludes_historical_tasks() {
+        let (_d, mut c) = open_tmp();
+        // Set watermark to 5000: only tasks with updated_at >= 5000 are eligible.
+        c.execute(
+            "UPDATE perf_watermark SET watermark = 5000 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // Historical task (updated_at=1600 < 5000) — must be excluded.
+        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+        // Post-rollout task (updated_at=6000 >= 5000) — must be included.
+        let t2 = seed_task(&mut c, "done", None, 0, None, 5000, 6000);
+        seed_run(&c, t2, "opus-46", "high", 5001);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].n_tasks, 1, "only post-watermark task counted");
+    }
+
+    #[test]
+    fn watermark_all_flag_includes_historical() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "UPDATE perf_watermark SET watermark = 5000 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+        let t2 = seed_task(&mut c, "done", None, 0, None, 5000, 6000);
+        seed_run(&c, t2, "opus-46", "high", 5001);
+
+        let r = perf_with(&c, PerfCut::Default, DM, DE, true).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].n_tasks, 2, "--all must include both tasks");
+    }
+
+    /// Negative-path: if the watermark boundary filter were removed, this
+    /// test would fail — historical tasks would reappear in the default report.
+    #[test]
+    fn watermark_negative_path_regression_guard() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "UPDATE perf_watermark SET watermark = 9000 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // All tasks are historical (updated_at < 9000).
+        seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_task(&mut c, "failed", None, 0, None, 2000, 3000);
+        seed_task(&mut c, "cancelled", None, 0, None, 4000, 5000);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert!(
+            r.rows.is_empty(),
+            "default perf must return no rows when all tasks predate the watermark"
+        );
+    }
+
+    #[test]
+    fn watermark_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        {
+            let c = crate::db::open(&path).unwrap();
+            let wm = read_watermark(&c).unwrap();
+            assert!(wm.is_some(), "watermark must exist after migration");
+            assert!(wm.unwrap() > 0, "watermark must be a real timestamp");
+        }
+        // Reopen — watermark persists.
+        let c = crate::db::open(&path).unwrap();
+        let wm = read_watermark(&c).unwrap();
+        assert!(wm.is_some(), "watermark must survive reopen");
+        assert!(wm.unwrap() > 0);
+    }
+
+    #[test]
+    fn watermark_boundary_is_inclusive() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "UPDATE perf_watermark SET watermark = 1600 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // Task exactly at the boundary (updated_at == watermark).
+        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        seed_run(&c, t1, "opus-46", "high", 1001);
+
+        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(
+            r.rows[0].n_tasks, 1,
+            "task at exact boundary must be included"
+        );
     }
 }
