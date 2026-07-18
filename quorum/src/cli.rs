@@ -503,6 +503,9 @@ pub enum Command {
         /// Cut dimension: `complexity` or `reviewer`.
         #[arg(long)]
         by: Option<String>,
+        /// Include historical tasks from before the analytics rollout boundary.
+        #[arg(long)]
+        all: bool,
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,

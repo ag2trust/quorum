@@ -119,12 +119,12 @@ INSPECT (read-only diagnostics — includes expired rows, retention caveats)
 
 OPS
   quorum status [--watch] [--json] [--agents]    # health snapshot; --agents = agent presence (online/offline)
-  quorum perf [--json] [--by complexity|reviewer]
+  quorum perf [--json] [--all] [--by complexity|reviewer]
                                               # model × effort performance aggregates over terminal tasks.
-                                              # Default: n_tasks, 1st-pass %, avg rework, fail %, median wall mins.
+                                              # Default: prospective-only (tasks completed after analytics rollout).
+                                              # --all: include historical tasks from before the rollout boundary.
                                               # --by complexity: adds complexity:* label as a cut dimension.
                                               # --by reviewer: splits by reviewer identity.
-                                              # Pre-capture tasks with no tier/effort labels show as unknown.
   quorum sweep                                # reclaim expired rows + checkpoint WAL (control state is NOT swept)
   quorum init                                 # create ~/.quorum + db (idempotent)
   quorum reset --yes                          # wipe ALL state -> clean db (needs --yes; refuses without)
