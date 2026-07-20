@@ -137,6 +137,16 @@ pub fn dual_approved(conn: &Connection, pr_number: i64) -> Result<Option<String>
     }
 }
 
+/// True if any durable approval exists for the given task (any role).
+pub fn has_for_task(conn: &Connection, task_id: i64) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM approvals WHERE task_id = ?1",
+        params![task_id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 /// List all durable verdicts (recovery replays every one on startup).
 pub fn list(conn: &Connection) -> Result<Vec<Approval>> {
     let mut stmt = conn.prepare(&format!(

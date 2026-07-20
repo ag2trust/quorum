@@ -69,6 +69,8 @@ pub enum ChecksOutcome {
     Ready,
     /// One or more checks failed — names of failing checks included.
     Failed { failing_checks: Vec<String> },
+    /// Checks still running — retry later without entering rework.
+    Pending { reason: String },
     /// Timed out waiting for checks to complete.
     TimedOut,
 }
@@ -856,6 +858,19 @@ impl MergeExecutor for CommandMergeExecutor {
                 return ChecksOutcome::TimedOut;
             }
             std::thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
+
+    fn head_sha(&self, _pr: i64, repo_dir: &Path) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_dir)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
         }
     }
 

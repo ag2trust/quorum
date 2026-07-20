@@ -757,7 +757,7 @@ fn drain_timeout_honored_during_merge_checks() {
 /// follow the normal rework path (MergeFailed + VerdictChanges) — the merge
 /// must not be lost or silently swallowed.
 #[test]
-fn pending_checks_timeout_without_drain_triggers_rework() {
+fn pending_checks_timeout_without_drain_enters_merge_wait() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -883,15 +883,18 @@ fn pending_checks_timeout_without_drain_triggers_rework() {
     );
 
     // No drain signal — let the timeout expire naturally.
-    // #153: checks timeout → rework (recoverable, not terminal cancel).
+    // #174: checks timeout → durable merge-wait (not rework).
     assert!(
-        handle.wait_for("firing rework", 20),
-        "checks did not time out and trigger rework as expected: {:?}",
+        handle.wait_for("merge wait", 20),
+        "checks did not time out and enter merge-wait as expected: {:?}",
         handle.lines
     );
+
+    // No rework should be triggered.
+    let saw_rework = handle.lines.iter().any(|l| l.contains("rework"));
     assert!(
-        handle.wait_for("rework", 20),
-        "rework not seen after checks timeout: {:?}",
+        !saw_rework,
+        "rework should NOT fire for pending checks timeout (#174): {:?}",
         handle.lines
     );
 
