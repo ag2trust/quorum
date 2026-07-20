@@ -961,8 +961,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     // self-update-drain restart merges the approved PR instead of re-working it.
     // Runs first so approved tasks are closed (and their journal rows dropped)
     // before recovery::recover resets them to open.
-    if let Err(e) =
-        approvals::recover(&config.db_path, &config.repo_dir, &config.merge_executor).await
+    if let Err(e) = approvals::recover(
+        &config.db_path,
+        &config.repo_dir,
+        &config.merge_executor,
+        config.merge_checks_timeout_secs,
+        config.merge_checks_poll_secs,
+    )
+    .await
     {
         log(&format!("approval recovery failed: {e} — continuing"));
     }
@@ -1639,6 +1645,48 @@ async fn tick(
                                 break;
                             }
                             continue;
+                        }
+                        // #174: persist R2 approval NOW (before merge gate)
+                        // so it survives a restart during merge-wait. Uses
+                        // the current head SHA which is the diff R2 reviewed.
+                        // Only runs once — merge-wait retries take the
+                        // already_merging branch above and skip this.
+                        {
+                            let reviewer_name = reviewers[ri].agent_name.clone();
+                            let author = workers
+                                .iter()
+                                .find(|w| w.task_id == reviewer_task_id)
+                                .map(|w| w.agent_name.clone());
+                            if let Some(author) = author {
+                                let repo = config.repo_dir.clone();
+                                let executor = Arc::clone(&config.merge_executor);
+                                let head = tokio::task::spawn_blocking(move || {
+                                    executor.head_sha(pr_num, &repo)
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                if let Some(head) = head {
+                                    let p = db_path.clone();
+                                    let role = if reviewers[ri].r2_origin { "r2" } else { "r1" };
+                                    let record = quorum_core::approvals::Approval {
+                                        pr_number: pr_num,
+                                        review_role: role.to_string(),
+                                        task_id: reviewer_task_id,
+                                        author,
+                                        reviewer: reviewer_name,
+                                        verdict: "approved".to_string(),
+                                        blocking_count: gated.blocking_count.unwrap_or(0) as i64,
+                                        approved_head_sha: head,
+                                    };
+                                    tokio::task::spawn_blocking(move || -> Result<()> {
+                                        let mut conn = quorum_core::db::open(&p)?;
+                                        quorum_core::approvals::record(&mut conn, &record)
+                                    })
+                                    .await
+                                    .ok();
+                                }
+                            }
                         }
                     }
 
@@ -2450,53 +2498,13 @@ async fn tick(
                             }
 
                             // #174: Durable merge-wait. Checks are still
-                            // running — persist the approval and leave the
-                            // mailbox row unconsumed so the next tick retries.
-                            // No lifecycle events, no rework, no counter bumps.
+                            // running — leave the mailbox row unconsumed so
+                            // the next tick retries. No approval write here:
+                            // R1/R2 approvals from normal flow are already
+                            // SHA-bound to the reviewed diff; writing here
+                            // would re-bind to current head (force-push drift)
+                            // and let approval-recovery merge without CI.
                             log(&format!("merge wait: {reason} — retrying next tick"));
-                            {
-                                let reviewer_name = reviewers[ri].agent_name.clone();
-                                let author = workers
-                                    .iter()
-                                    .find(|w| w.task_id == reviewer_task_id)
-                                    .map(|w| w.agent_name.clone());
-                                if let Some(author) = author {
-                                    let repo = config.repo_dir.clone();
-                                    let executor = Arc::clone(&config.merge_executor);
-                                    let head = tokio::task::spawn_blocking(move || {
-                                        executor.head_sha(pr_num, &repo)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten();
-                                    if let Some(head) = head {
-                                        let p = db_path.clone();
-                                        let role =
-                                            if reviewers[ri].r2_origin { "r2" } else { "r1" };
-                                        let record = quorum_core::approvals::Approval {
-                                            pr_number: pr_num,
-                                            review_role: role.to_string(),
-                                            task_id: reviewer_task_id,
-                                            author,
-                                            reviewer: reviewer_name,
-                                            verdict: "approved".to_string(),
-                                            blocking_count: gated.blocking_count.unwrap_or(0)
-                                                as i64,
-                                            approved_head_sha: head,
-                                        };
-                                        tokio::task::spawn_blocking(move || -> Result<()> {
-                                            let mut conn = quorum_core::db::open(&p)?;
-                                            quorum_core::approvals::record(&mut conn, &record)
-                                        })
-                                        .await
-                                        .map_err(|e| {
-                                            QuorumError::Io(format!("spawn_blocking join: {e}"))
-                                        })?
-                                        .ok();
-                                    }
-                                }
-                            }
-                            // Don't consume the mailbox row — next tick retries.
                             break;
                         }
                         merge::ChecksOutcome::Ready => {

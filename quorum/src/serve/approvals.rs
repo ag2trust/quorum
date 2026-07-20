@@ -41,6 +41,8 @@ pub(crate) async fn recover(
     db_path: &Path,
     repo_dir: &Path,
     merge_executor: &Arc<dyn merge::MergeExecutor>,
+    checks_timeout_secs: u64,
+    checks_poll_secs: u64,
 ) -> Result<RecoveryOutcome> {
     // ── Phase 1: adopt stranded attested-approved mailbox rows ─────────────
     let mut outcome = RecoveryOutcome {
@@ -144,7 +146,16 @@ pub(crate) async fn recover(
             continue;
         }
 
-        if merge_approved(db_path, repo_dir, merge_executor, appr).await? {
+        if merge_approved(
+            db_path,
+            repo_dir,
+            merge_executor,
+            appr,
+            checks_timeout_secs,
+            checks_poll_secs,
+        )
+        .await?
+        {
             outcome.merged += 1;
         } else {
             outcome.deferred += 1;
@@ -273,6 +284,8 @@ async fn merge_approved(
     repo_dir: &Path,
     merge_executor: &Arc<dyn merge::MergeExecutor>,
     appr: &approvals::Approval,
+    checks_timeout_secs: u64,
+    checks_poll_secs: u64,
 ) -> Result<bool> {
     let pr = appr.pr_number;
 
@@ -290,6 +303,42 @@ async fn merge_approved(
         ));
         drop_approval(db_path, pr).await?;
         return Ok(false);
+    }
+
+    // #174: verify CI checks before merging — a durable approval may
+    // survive a crash during merge-wait when checks were still pending.
+    {
+        let repo = repo_dir.to_path_buf();
+        let exec = Arc::clone(merge_executor);
+        let timeout = checks_timeout_secs;
+        let poll = checks_poll_secs;
+        let checks =
+            tokio::task::spawn_blocking(move || exec.wait_for_checks(pr, &repo, timeout, poll))
+                .await
+                .map_err(|e| {
+                    QuorumError::Io(format!("wait_for_checks spawn_blocking join: {e}"))
+                })?;
+        match checks {
+            merge::ChecksOutcome::Ready => {}
+            merge::ChecksOutcome::Failed { failing_checks } => {
+                let names = failing_checks.join(", ");
+                log(&format!(
+                    "approval-recovery: PR #{pr} CI checks failed ({names}) — \
+                     dropping approval (task #{})",
+                    appr.task_id
+                ));
+                drop_approval(db_path, pr).await?;
+                return Ok(false);
+            }
+            merge::ChecksOutcome::TimedOut | merge::ChecksOutcome::Pending { .. } => {
+                log(&format!(
+                    "approval-recovery: PR #{pr} CI checks not ready — \
+                     deferring to tick loop (task #{})",
+                    appr.task_id
+                ));
+                return Ok(false);
+            }
+        }
     }
 
     let repo = repo_dir.to_path_buf();
@@ -490,7 +539,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
             .await
             .unwrap();
 
@@ -528,7 +577,7 @@ mod tests {
 
         // Current head differs from approved head → stale.
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "NEW_sha".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
             .await
             .unwrap();
 
@@ -565,7 +614,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "abc".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
             .await
             .unwrap();
 
@@ -621,7 +670,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
             .await
             .unwrap();
 
@@ -663,7 +712,7 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
             .await
             .unwrap();
 
@@ -714,7 +763,7 @@ mod tests {
         let mut m = MockExec::new(HashMap::from([(208, "abc".to_string())]));
         m.conflicting = true;
         let exec = exec_arc(m);
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec)
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
             .await
             .unwrap();
 

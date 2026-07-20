@@ -911,8 +911,12 @@ fn checks_pending_survives_restart() {
     // via AgentFailed, but durable approvals survive.
     handle.stop();
 
-    // Phase 3: restart daemon. Approval recovery detects dual approval
-    // and merges directly from durable state.
+    // Phase 3: flip checks to ready before restart so approval-recovery
+    // can verify CI and merge.
+    std::fs::write(&checks_state, "ready").unwrap();
+
+    // Phase 4: restart daemon. Approval recovery detects dual approval,
+    // verifies CI (now ready), and merges from durable state.
     let mut handle2 = ServeHandle::start(
         home.path(),
         repo_dir.path(),
@@ -930,8 +934,8 @@ fn checks_pending_survives_restart() {
     );
 
     assert!(
-        handle2.wait_for("merged", 30),
-        "merge not seen after restart. Lines: {:?}",
+        handle2.wait_for("merged from durable approval", 30),
+        "approval-recovery merge not seen after restart. Lines: {:?}",
         handle2.lines
     );
 
