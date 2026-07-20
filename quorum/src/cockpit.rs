@@ -597,8 +597,8 @@ fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Wri
     let _ = writeln!(w, "{}", sty.section_rule("MERGE WAIT", width));
     let _ = writeln!(
         w,
-        "  {:<6} {:<24} {:<10} {:>6} {:>4}  PR",
-        "TASK", "WHAT", "BLOCKER", "WAIT", "RTR"
+        "  {:<6} {:<24} {:3} {:<10} {:>4} {:>4}  PR",
+        "TASK", "WHAT", "", "BLOCKER", "WAIT", "RTR"
     );
     for b in blockers {
         let wait = fmt_age(b.waiting_secs);
@@ -623,7 +623,7 @@ fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Wri
         };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<24} {} {:<10} {:>4} {:>4}  {}",
+            "  #{:<5} {:<24} {:3} {:<10} {:>4} {:>4}  {}",
             b.task_id,
             truncate(&b.title, 24),
             icon,
@@ -1242,6 +1242,44 @@ mod tests {
         assert!(
             line.contains("[!]"),
             "conflict should show warning icon in plain mode: {line}"
+        );
+    }
+
+    #[test]
+    fn merge_wait_columns_align() {
+        let mut s = default_stats();
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 7,
+            title: "short".into(),
+            pr: Some(99),
+            blocker_kind: "conflict".into(),
+            status: "in-review".into(),
+            waiting_secs: 60,
+            retry_count: 3,
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let header = output.lines().find(|l| l.contains("BLOCKER")).unwrap();
+        let data = output.lines().find(|l| l.contains("#7")).unwrap();
+        let hdr_blocker = header.find("BLOCKER").unwrap();
+        let data_blocker = data.find("conflict").unwrap();
+        assert_eq!(
+            hdr_blocker, data_blocker,
+            "BLOCKER header must align with data column.\nheader: {header}\ndata:   {data}"
+        );
+        let hdr_wait = header.find("WAIT").unwrap();
+        let hdr_rtr = header.find("RTR").unwrap();
+        let hdr_pr = header.find("PR").unwrap();
+        let data_pr = data.find("#99").unwrap();
+        assert!(
+            data_pr >= hdr_pr,
+            "PR data must align with or follow PR header.\nheader: {header}\ndata:   {data}"
+        );
+        assert!(
+            hdr_rtr > hdr_wait,
+            "RTR column must be after WAIT column in header"
         );
     }
 
