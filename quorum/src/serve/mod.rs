@@ -1496,25 +1496,43 @@ async fn tick(
                         let r1_run_id = reviewers[ri].agent_run_id;
 
                         // Build counterpart from worker if available, otherwise
-                        // resolve from task author + PR head ref (covers review-only
-                        // and dead-worker cases).
+                        // resolve from task author (daemon branch convention)
+                        // or PR head ref via gh (covers review-only and dead-worker cases).
                         let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
                             workers.iter().find(|w| w.task_id == reviewer_task_id)
                         {
                             Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
                         } else {
-                            // No live worker — resolve branch from PR head ref.
-                            let pr_val = pr_num;
-                            let repo_dir = config.repo_dir.clone();
-                            let gh_repo = config.repo.clone();
-                            let resolved = tokio::task::spawn_blocking(move || {
-                                query_pr_head_ref(pr_val, &repo_dir, Some(&gh_repo))
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                            resolved
-                                .map(|branch| ("external".to_string(), reviewer_task_id, branch))
+                            // #175: try daemon branch convention first, then gh.
+                            let db_branch = {
+                                let p = db_path.clone();
+                                let tid = reviewer_task_id;
+                                tokio::task::spawn_blocking(move || -> Option<String> {
+                                    let conn = quorum_core::db::open(&p).ok()?;
+                                    let t = tasks::get(&conn, tid).ok()??;
+                                    let author = t.author.unwrap_or_default();
+                                    orphan_worker_branch(&author, tid, t.review_only)
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            };
+                            if let Some(branch) = db_branch {
+                                Some(("external".to_string(), reviewer_task_id, branch))
+                            } else {
+                                let pr_val = pr_num;
+                                let repo_dir = config.repo_dir.clone();
+                                let gh_repo = config.repo.clone();
+                                let resolved = tokio::task::spawn_blocking(move || {
+                                    query_pr_head_ref(pr_val, &repo_dir, Some(&gh_repo))
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                resolved.map(|branch| {
+                                    ("external".to_string(), reviewer_task_id, branch)
+                                })
+                            }
                         };
 
                         if let Some((cp_agent, cp_tid, cp_branch)) = worker_cp_owned {
@@ -1754,62 +1772,113 @@ async fn tick(
                                      and push again.",
                                         config.base_branch, config.base_branch
                                     );
-                                    let wi = workers
-                                        .iter()
-                                        .position(|w| w.task_id == reviewer_task_id)
-                                        .unwrap();
-                                    let rework_turn = reviewer::build_rework_turn(
-                                        &workers[wi].agent_name,
-                                        workers[wi].task_id,
-                                        pr_num,
-                                        &rework_msg,
-                                        workers[wi].cost_usd,
-                                        config.limits.max_task_cost_usd,
-                                    );
-                                    if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
-                                        log(&format!(
-                                            "conflict rework feed failed: {e} — cleaning up"
-                                        ));
-                                        let w = workers.remove(wi);
-                                        fire_event(
-                                            &db_path,
-                                            &w.agent_name,
-                                            w.task_id,
-                                            &Event::AgentFailed {
-                                                reason: format!("rework feed failed: {e}"),
-                                            },
-                                        )
-                                        .await;
-                                        cleanup_slot(
-                                            config,
-                                            wt_mgr,
-                                            name_pool,
-                                            w,
-                                            None,
-                                            "agent_failed",
-                                        )
-                                        .await;
-                                    } else {
-                                        let w = &mut workers[wi];
-                                        w.draining = true;
-                                        w.pr = None;
-                                        w.rework_count += 1;
-                                        w.turn_started_at = std::time::Instant::now();
-                                        if let Some(ref mut sl) = w.session_log {
-                                            sl.log_rework(w.rework_count);
+                                    if let Some(wi) =
+                                        workers.iter().position(|w| w.task_id == reviewer_task_id)
+                                    {
+                                        let rework_turn = reviewer::build_rework_turn(
+                                            &workers[wi].agent_name,
+                                            workers[wi].task_id,
+                                            pr_num,
+                                            &rework_msg,
+                                            workers[wi].cost_usd,
+                                            config.limits.max_task_cost_usd,
+                                        );
+                                        if let Err(e) =
+                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        {
+                                            log(&format!(
+                                                "conflict rework feed failed: {e} — cleaning up"
+                                            ));
+                                            let w = workers.remove(wi);
+                                            fire_event(
+                                                &db_path,
+                                                &w.agent_name,
+                                                w.task_id,
+                                                &Event::AgentFailed {
+                                                    reason: format!("rework feed failed: {e}"),
+                                                },
+                                            )
+                                            .await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "agent_failed",
+                                            )
+                                            .await;
+                                        } else {
+                                            let w = &mut workers[wi];
+                                            w.draining = true;
+                                            w.pr = None;
+                                            w.rework_count += 1;
+                                            w.turn_started_at = std::time::Instant::now();
+                                            if let Some(ref mut sl) = w.session_log {
+                                                sl.log_rework(w.rework_count);
+                                            }
+                                            let p = db_path.clone();
+                                            let entry = slot_journal_entry(w, "worker", "working");
+                                            tokio::task::spawn_blocking(move || -> Result<()> {
+                                                let mut conn = quorum_core::db::open(&p)?;
+                                                journal::upsert(&mut conn, &entry)
+                                            })
+                                            .await
+                                            .ok();
+                                            log(&format!(
+                                                "worker {} rework #{} (pre-merge conflict)",
+                                                w.agent_name, w.rework_count
+                                            ));
                                         }
-                                        let p = db_path.clone();
-                                        let entry = slot_journal_entry(w, "worker", "working");
-                                        tokio::task::spawn_blocking(move || -> Result<()> {
-                                            let mut conn = quorum_core::db::open(&p)?;
-                                            journal::upsert(&mut conn, &entry)
-                                        })
-                                        .await
-                                        .ok();
+                                    } else {
+                                        // #175: no live worker — spawn remediation
                                         log(&format!(
-                                            "worker {} rework #{} (pre-merge conflict)",
-                                            w.agent_name, w.rework_count
+                                            "no worker for rework on task #{reviewer_task_id} \
+                                             (pre-merge conflict) — spawning remediation worker"
                                         ));
+                                        if pr_num > 0 && !drain_state.draining {
+                                            let spawn_ok = spawn_remediation_worker(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                workers,
+                                                lifetime_roster,
+                                                reviewer_task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                            )
+                                            .await;
+                                            if !spawn_ok {
+                                                log(&format!(
+                                                    "remediation worker spawn failed for task \
+                                                     #{reviewer_task_id} — firing AgentFailed"
+                                                ));
+                                                fire_event(
+                                                    &db_path,
+                                                    "daemon",
+                                                    reviewer_task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: "remediation worker spawn failed"
+                                                            .into(),
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                        } else {
+                                            log(&format!(
+                                                "no PR or draining — cannot spawn remediation \
+                                                 for task #{reviewer_task_id}"
+                                            ));
+                                            fire_event(
+                                                &db_path,
+                                                "daemon",
+                                                reviewer_task_id,
+                                                &Event::AgentFailed {
+                                                    reason: "no worker and no PR for rework".into(),
+                                                },
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                                 Some(_) => {
@@ -2036,15 +2105,54 @@ async fn tick(
                                             ));
                                         }
                                     } else {
-                                        fire_event(
-                                            &db_path,
-                                            "daemon",
-                                            reviewer_task_id,
-                                            &Event::AgentFailed {
-                                                reason: "no worker for rework".into(),
-                                            },
-                                        )
-                                        .await;
+                                        // #175: no live worker — spawn remediation
+                                        log(&format!(
+                                            "no worker for rework on task #{reviewer_task_id} \
+                                             (checks failure) — spawning remediation worker"
+                                        ));
+                                        if pr_num > 0 && !drain_state.draining {
+                                            let spawn_ok = spawn_remediation_worker(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                workers,
+                                                lifetime_roster,
+                                                reviewer_task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                            )
+                                            .await;
+                                            if !spawn_ok {
+                                                log(&format!(
+                                                    "remediation worker spawn failed for task \
+                                                     #{reviewer_task_id} — firing AgentFailed"
+                                                ));
+                                                fire_event(
+                                                    &db_path,
+                                                    "daemon",
+                                                    reviewer_task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: "remediation worker spawn failed"
+                                                            .into(),
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                        } else {
+                                            log(&format!(
+                                                "no PR or draining — cannot spawn remediation \
+                                                 for task #{reviewer_task_id}"
+                                            ));
+                                            fire_event(
+                                                &db_path,
+                                                "daemon",
+                                                reviewer_task_id,
+                                                &Event::AgentFailed {
+                                                    reason: "no worker and no PR for rework".into(),
+                                                },
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                                 Some(_) => {
@@ -2208,15 +2316,56 @@ async fn tick(
                                                 ));
                                             }
                                         } else {
-                                            fire_event(
-                                                &db_path,
-                                                "daemon",
-                                                reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker for rework".into(),
-                                                },
-                                            )
-                                            .await;
+                                            // #175: no live worker — spawn remediation
+                                            log(&format!(
+                                                "no worker for rework on task #{reviewer_task_id} \
+                                                 (timeout + conflict) — spawning remediation worker"
+                                            ));
+                                            if pr_num > 0 && !drain_state.draining {
+                                                let spawn_ok = spawn_remediation_worker(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    lifetime_roster,
+                                                    reviewer_task_id,
+                                                    pr_num,
+                                                    &rework_msg,
+                                                )
+                                                .await;
+                                                if !spawn_ok {
+                                                    log(&format!(
+                                                        "remediation worker spawn failed for task \
+                                                         #{reviewer_task_id} — firing AgentFailed"
+                                                    ));
+                                                    fire_event(
+                                                        &db_path,
+                                                        "daemon",
+                                                        reviewer_task_id,
+                                                        &Event::AgentFailed {
+                                                            reason:
+                                                                "remediation worker spawn failed"
+                                                                    .into(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                }
+                                            } else {
+                                                log(&format!(
+                                                    "no PR or draining — cannot spawn remediation \
+                                                     for task #{reviewer_task_id}"
+                                                ));
+                                                fire_event(
+                                                    &db_path,
+                                                    "daemon",
+                                                    reviewer_task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: "no worker and no PR for rework"
+                                                            .into(),
+                                                    },
+                                                )
+                                                .await;
+                                            }
                                         }
                                     }
                                     Some(_) => {
@@ -2355,12 +2504,16 @@ async fn tick(
                                                 ));
                                             }
                                         } else {
+                                            // #175: timed-out CI is out of scope for
+                                            // remediation — fire AgentFailed so the
+                                            // recovery path retries after restart.
                                             fire_event(
                                                 &db_path,
                                                 "daemon",
                                                 reviewer_task_id,
                                                 &Event::AgentFailed {
-                                                    reason: "no worker for rework".into(),
+                                                    reason: "no worker for rework (checks timeout)"
+                                                        .into(),
                                                 },
                                             )
                                             .await;
@@ -2640,15 +2793,54 @@ async fn tick(
                                             ));
                                         }
                                     } else {
-                                        fire_event(
-                                            &db_path,
-                                            "daemon",
-                                            reviewer_task_id,
-                                            &Event::AgentFailed {
-                                                reason: "no worker for rework".into(),
-                                            },
-                                        )
-                                        .await;
+                                        // #175: no live worker — spawn remediation
+                                        log(&format!(
+                                            "no worker for rework on task #{reviewer_task_id} \
+                                             (pre-merge conflict) — spawning remediation worker"
+                                        ));
+                                        if pr_num > 0 && !drain_state.draining {
+                                            let spawn_ok = spawn_remediation_worker(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                workers,
+                                                lifetime_roster,
+                                                reviewer_task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                            )
+                                            .await;
+                                            if !spawn_ok {
+                                                log(&format!(
+                                                    "remediation worker spawn failed for task \
+                                                     #{reviewer_task_id} — firing AgentFailed"
+                                                ));
+                                                fire_event(
+                                                    &db_path,
+                                                    "daemon",
+                                                    reviewer_task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: "remediation worker spawn failed"
+                                                            .into(),
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                        } else {
+                                            log(&format!(
+                                                "no PR or draining — cannot spawn remediation \
+                                                 for task #{reviewer_task_id}"
+                                            ));
+                                            fire_event(
+                                                &db_path,
+                                                "daemon",
+                                                reviewer_task_id,
+                                                &Event::AgentFailed {
+                                                    reason: "no worker and no PR for rework".into(),
+                                                },
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                                 Some(_) => {
@@ -2973,15 +3165,55 @@ async fn tick(
                                                     ));
                                                 }
                                             } else {
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
-                                                    reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "no worker for rework".into(),
-                                                    },
-                                                )
-                                                .await;
+                                                // #175: no live worker — spawn remediation
+                                                log(&format!(
+                                                    "no worker for rework on task #{reviewer_task_id} \
+                                                     (merge failure) — spawning remediation worker"
+                                                ));
+                                                if pr_num > 0 && !drain_state.draining {
+                                                    let spawn_ok = spawn_remediation_worker(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        workers,
+                                                        lifetime_roster,
+                                                        reviewer_task_id,
+                                                        pr_num,
+                                                        &rework_msg,
+                                                    )
+                                                    .await;
+                                                    if !spawn_ok {
+                                                        log(&format!(
+                                                            "remediation worker spawn failed for task \
+                                                             #{reviewer_task_id} — firing AgentFailed"
+                                                        ));
+                                                        fire_event(
+                                                            &db_path,
+                                                            "daemon",
+                                                            reviewer_task_id,
+                                                            &Event::AgentFailed {
+                                                                reason: "remediation worker spawn failed".into(),
+                                                            },
+                                                        )
+                                                        .await;
+                                                    }
+                                                } else {
+                                                    log(&format!(
+                                                        "no PR or draining — cannot spawn remediation \
+                                                         for task #{reviewer_task_id}"
+                                                    ));
+                                                    fire_event(
+                                                        &db_path,
+                                                        "daemon",
+                                                        reviewer_task_id,
+                                                        &Event::AgentFailed {
+                                                            reason:
+                                                                "no worker and no PR for rework"
+                                                                    .into(),
+                                                        },
+                                                    )
+                                                    .await;
+                                                }
                                             }
                                         }
                                         Some(_) => {
@@ -6732,23 +6964,38 @@ async fn spawn_remediation_worker(
 ) -> bool {
     let db_path = &config.db_path;
 
-    // Fetch task body for context.
-    let task_body = {
+    // Fetch task body + author for context and branch resolution.
+    let (task_body, task_author, task_review_only) = {
         let p = db_path.clone();
         let tid = task_id;
-        tokio::task::spawn_blocking(move || -> Option<String> {
-            let conn = quorum_core::db::open(&p).ok()?;
-            let t = tasks::get(&conn, tid).ok()??;
-            t.body
+        tokio::task::spawn_blocking(move || -> (String, String, bool) {
+            let conn = quorum_core::db::open(&p).ok();
+            let t = conn
+                .as_ref()
+                .and_then(|c| tasks::get(c, tid).ok().flatten());
+            match t {
+                Some(task) => (
+                    task.body.unwrap_or_default(),
+                    task.author.unwrap_or_default(),
+                    task.review_only,
+                ),
+                None => (String::new(), String::new(), false),
+            }
         })
         .await
-        .ok()
-        .flatten()
-        .unwrap_or_default()
+        .unwrap_or((String::new(), String::new(), false))
     };
 
-    // Resolve PR branch from GitHub.
-    let pr_branch = {
+    // Resolve PR branch: try daemon convention first, fall back to GitHub.
+    let pr_branch = orphan_worker_branch(&task_author, task_id, task_review_only).or_else(|| {
+        log(&format!(
+            "remediation: no daemon-convention branch for task #{task_id} — trying gh"
+        ));
+        None
+    });
+    let pr_branch = if pr_branch.is_some() {
+        pr_branch
+    } else {
         let pr_val = pr;
         let repo_dir = config.repo_dir.clone();
         let gh_repo = config.repo.clone();
