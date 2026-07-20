@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -572,12 +572,8 @@ After VerdictApprove (InReview → Merging):
 1. Check stale SHA — if reviewer recorded a head SHA and it differs from current, fire
    MergeFailed → rework cycle (prevents stale approval from authorizing a changed diff).
 2. Check mergeability — if conflicting, MergeConflict → rework cycle (worker rebases).
-3. Wait for CI checks — failed → rework; timed out → see step 3a.
-   - **3a. Post-timeout mergeability recheck (#153):** if the PR became conflicting during
-     the checks wait (base branch advanced), fire MergeConflict → rework (worker rebases
-     and resolves conflicts). If the PR is still mergeable, fire MergeFailed + VerdictChanges
-     → rework (worker fixes stuck CI). Neither outcome is terminal — the rework cap governs
-     eventual failure. Drain-interrupted timeout preserves state for restart recovery.
+3. Wait for CI checks — outcome classified into Ready / Failed / TimedOut. See
+   § Merge-wait vs. actionable-rework contract (#173) below for the full disposition.
 4. Persist approval record (instance-independent, survives restart).
 5. **Pre-merge mergeability recheck (#153):** recheck PR mergeability immediately before
    the merge attempt — the window from step 2 through the master-CI gate can span minutes.
@@ -594,6 +590,229 @@ After VerdictApprove (InReview → Merging):
 the task transitions ReworkPushed → InReview, requiring a fresh review of the new head.
 The stale-SHA check (step 1) ensures a prior approval for a different head cannot
 authorize the merge — no approval is reused across conflict resolution.
+
+### Merge-wait vs. actionable-rework contract (#173)
+
+**Origin:** ag2trust task #156 / PR #3734 — both reviews approved, but GitHub Actions
+jobs remained QUEUED with zero steps. `ChecksOutcome::TimedOut` was converted to
+`MergeFailed` + `VerdictChanges` + rework. The absent worker recovery stranded the task
+because infrastructure-pending CI consumed rework budget without giving the worker anything
+actionable to fix.
+
+**Principle:** a merge-wait outcome is either *actionable* (a worker can fix something)
+or *infrastructure-pending* (nothing is broken in the PR; the platform hasn't finished).
+Only actionable outcomes consume rework budget, emit VerdictChanges/AgentFailed, or
+allocate an agent. Infrastructure-pending outcomes stay in `merging` with metadata and
+retry autonomously.
+
+#### ChecksOutcome disposition table
+
+| ChecksOutcome | Mergeability post-wait | Classification | Action |
+|---|---|---|---|
+| `Ready` | any | actionable (proceed) | Continue to step 4 (persist approval) and merge |
+| `Failed { checks }` | any | actionable (code broken) | `MergeFailed` → InReview, then `VerdictChanges` → Rework (rework cap applies). Worker gets failing check names. |
+| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Worker rebases. |
+| `TimedOut` | `Mergeable` | **infrastructure-pending** | **Durable merge-wait** — no VerdictChanges, no AgentFailed, no rework budget consumed. See retry/backoff below. |
+| `TimedOut` | `AlreadyMerged` | resolved externally | `PrFoundMerged` → Done |
+| `TimedOut` | `Closed` | resolved externally | `PrFoundClosed` → Failed |
+
+The drain-interrupted timeout is a special case: the daemon preserves state (mailbox row
+unconsumed, task stays `merging`) and returns `Ok(())` so restart recovery re-enters the
+merge flow. This is unchanged.
+
+#### No new lifecycle state
+
+The task remains in `merging` throughout infrastructure-pending waits. No new status is
+added. The daemon holds blocker metadata in memory (or in the journal row's `agent_state`
+field for restart recovery):
+
+- `merge_wait_reason`: string — last observed blocker (e.g. "CI checks pending: 0 of 3
+  completed after 300s")
+- `merge_wait_started_at`: unix timestamp — when the first wait began
+- `merge_wait_retries`: count — how many retry cycles have been attempted
+- `merge_wait_next_poll_at`: unix timestamp — next scheduled retry
+
+`quorum status` exposes these for observability: a `merging` task with
+`merge_wait_reason` set displays the blocker inline. No additional CLI surface.
+
+#### Bounded retry with exponential backoff
+
+When a `TimedOut` + `Mergeable` outcome enters merge-wait:
+
+1. **Increment `merge_wait_retries`** and compute the next poll delay:
+   `delay = min(merge_checks_timeout_secs * 2^retries, merge_wait_max_interval_secs)`.
+   Default `merge_wait_max_interval_secs = 1800` (30 min). The first retry re-polls after
+   the configured `merge_checks_timeout_secs` (same as the initial wait).
+2. **Owner alert** — post a `NotifyOwner` event on the first wait entry and again at
+   each power-of-two retry (1, 2, 4, 8, ...) to avoid alert fatigue. The notification
+   includes the PR number, retry count, and elapsed wall-clock time.
+3. **Hard ceiling** — `merge_wait_max_retries` (default 48, ~24h at 30-min cap). When
+   exceeded, fire `MergeFailed { reason: "merge-wait retry limit exceeded" }` and
+   `VerdictChanges` → rework (or Failed if rework cap exceeded). This is the only path
+   where infrastructure-pending eventually consumes rework budget.
+4. **Early resolution** — on each retry poll:
+   a. Re-query `check_mergeability`. If `AlreadyMerged` → `PrFoundMerged` → Done.
+      If `Closed` → `PrFoundClosed` → Failed. If `Conflicting` → `MergeConflict` →
+      Rework (actionable).
+   b. Re-query `head_sha`. If head has moved since the reviewed SHA, the approval is
+      stale — fire `MergeFailed` → InReview (reviewer re-reviews the new head). This
+      is actionable: someone pushed to the branch.
+   c. Re-query `wait_for_checks`:
+      - `Ready` → exit wait, continue to step 4 (persist approval) and merge.
+      - `Failed { checks }` → actionable rework (as above).
+      - `TimedOut` again → stay in merge-wait, loop to step 1.
+
+#### What merge-wait must NOT do
+
+These are negative invariants — violation of any one is a regression:
+
+1. **Must NOT emit `VerdictChanges`** — infrastructure-pending is not a reviewer verdict.
+2. **Must NOT emit `AgentFailed`** — no agent has failed; the CI platform hasn't responded.
+3. **Must NOT increment `rework_round`** — no rework is happening.
+4. **Must NOT allocate or spawn a worker/reviewer** — nothing for them to do.
+5. **Must NOT consume the mailbox row** until the wait resolves (merged, reworked, or
+   ceiling-exceeded). The unconsumed row is the durable record that a merge is pending.
+6. **Must NOT delete the approval record** until the merge attempt completes (success or
+   failure). Premature deletion causes restart recovery to re-work instead of re-merge.
+
+#### Preserved state during merge-wait
+
+The following must remain intact throughout the wait and across restarts:
+
+| State | Location | Why |
+|---|---|---|
+| PR number | `tasks.pr` column | Identifies the merge target |
+| Both durable approvals (R1 + R2) | `approvals` table | Restart recovery reconstructs "merge this PR" |
+| Reviewed head SHA | `approvals.approved_head_sha` | Head-change detection (step 4b above) |
+| Branch provenance | `tasks.branch`, journal row | Worker/remediation needs the branch |
+| Dependency blocking | `tasks.depends_on` | Already-done deps stay done; blocked deps stay blocked |
+| Task status = `merging` | `tasks.status` column | Restart recovery recognizes this as merge-pending |
+| Mailbox row (unconsumed) | `mailbox` table | Restart re-enters merge flow from unconsumed approval |
+
+#### Restart reconciliation
+
+On daemon startup, before stateless recovery:
+
+1. **#228 approval recovery** (existing) runs first: scans `approvals` table for tasks in
+   `merging` status. For each, re-enters the merge flow (step 1: stale-SHA check, step 2:
+   mergeability, step 3: checks wait...). If the task was in merge-wait before shutdown,
+   this transparently resumes the wait with `merge_wait_retries` reset to 0 (the restart
+   is itself a retry).
+2. **Journal recovery** (existing) handles workers/reviewers whose processes died. Tasks
+   in `merging` with no approval record fall through to stateless recovery → Open.
+
+Head-SHA invalidation on restart: the approval record stores `approved_head_sha`. On
+re-entry, `head_sha()` is queried and compared. If different, the approval is stale —
+`MergeFailed` fires and the task enters rework with a fresh review requirement. This
+prevents a restart from merging code the reviewer never saw.
+
+#### Actionable rework with no live worker
+
+When an actionable outcome (Failed checks, MergeConflict, retryable merge failure) fires
+VerdictChanges and the resulting status is `rework`, but no live worker exists for the
+task, the daemon spawns a **remediation worker** (`spawn_remediation_worker` in
+`serve/mod.rs`). The remediation worker:
+
+- Gets the existing PR branch (resolved from GitHub via `query_pr_head_ref`)
+- Gets the blocking findings / merge error as its rework prompt
+- Is bounded by the same recovery policy as other workers (idle timeout, cost cap)
+- Counts toward the rework cap (`rework_round` was already incremented by lifecycle)
+
+If remediation worker provisioning fails (branch not found, worktree failure), the daemon
+fires `AgentFailed { reason: "no worker for rework" }` which transitions the task back
+to InReview (sticky) and re-spawns a reviewer on the next tick — not a silent strand.
+
+#### Code paths (current implementation references)
+
+| Concept | Location |
+|---|---|
+| `ChecksOutcome` enum (Ready/Failed/TimedOut) | `quorum/src/serve/merge.rs:67-74` |
+| `MergeFailureKind` enum (Retryable/PolicyPending/PolicyBlocked) | `quorum/src/serve/merge.rs:16-24` |
+| Checks-wait timeout handling (current: fires rework) | `quorum/src/serve/mod.rs:2073` |
+| Failed-checks rework path | `quorum/src/serve/mod.rs:1932` |
+| PolicyPending retry loop | `quorum/src/serve/mod.rs:2638` |
+| Lifecycle transition table | `quorum-core/src/lifecycle.rs:147` |
+| Durable approval persist (#228) | `quorum/src/serve/mod.rs:2358` |
+| Approval recovery on restart | `quorum/src/serve/mod.rs:959` |
+| Remediation worker spawn | `quorum/src/serve/mod.rs:6567` |
+| Drain-interrupted merge-wait | `quorum/src/serve/mod.rs:2061` |
+
+#### Acceptance tests
+
+Each invariant below requires both a positive and a negative test. Tests marked
+**(restart-spanning)** must exercise daemon stop/restart across the boundary.
+
+**Infrastructure-pending (merge-wait):**
+
+1. `pending_checks_stay_in_merging` — checks return `TimedOut`, PR is `Mergeable`.
+   Assert: task stays `merging`, no `VerdictChanges` event, no `AgentFailed` event,
+   `rework_round` unchanged, no worker/reviewer spawned. Mailbox row unconsumed.
+   Approval record preserved.
+
+2. `pending_checks_resolve_on_retry` — checks return `TimedOut` then `Ready` on
+   retry. Assert: task transitions to `done` via normal merge path. Approval record
+   deleted after merge.
+
+3. `pending_checks_retry_ceiling_triggers_rework` — checks return `TimedOut`
+   `merge_wait_max_retries + 1` times. Assert: `MergeFailed` + `VerdictChanges`
+   fired, `rework_round` incremented, worker gets rework turn.
+
+4. `pending_checks_head_moved_during_wait` — checks return `TimedOut`, retry
+   detects head SHA change. Assert: `MergeFailed` fired (stale approval),
+   task enters InReview for fresh review. No rework budget consumed for the wait
+   itself.
+
+5. `pending_checks_conflict_during_wait` — checks return `TimedOut`, retry
+   detects `Conflicting`. Assert: `MergeConflict` → Rework. This IS actionable
+   and DOES consume rework budget.
+
+6. `pending_checks_pr_merged_during_wait` — checks return `TimedOut`, retry
+   detects `AlreadyMerged`. Assert: `PrFoundMerged` → Done.
+
+7. `pending_checks_pr_closed_during_wait` — checks return `TimedOut`, retry
+   detects `Closed`. Assert: `PrFoundClosed` → Failed.
+
+**Restart-spanning:**
+
+8. `restart_resumes_merge_wait` **(restart-spanning)** — daemon stops while in
+   merge-wait. Restart finds approval record + task in `merging`. Assert: merge
+   flow re-entered, checks re-polled, eventually merges when checks pass.
+
+9. `restart_detects_stale_head` **(restart-spanning)** — daemon stops while in
+   merge-wait. Before restart, head SHA changes (external push). Assert: restart
+   detects stale approval, fires `MergeFailed`, does NOT merge.
+
+**Actionable rework (existing behavior, preserved):**
+
+10. `failed_checks_trigger_rework` — checks return `Failed { checks }`. Assert:
+    `MergeFailed` + `VerdictChanges` fired, worker gets rework turn with check names,
+    `rework_round` incremented.
+
+11. `conflict_during_checks_triggers_rework` — checks return `TimedOut`, mergeability
+    is `Conflicting`. Assert: `MergeConflict` → Rework, worker rebases.
+
+12. `retryable_merge_failure_triggers_rework` — merge attempt fails with
+    `MergeFailureKind::Retryable`. Assert: `MergeFailed` + `VerdictChanges` → Rework.
+
+13. `rework_no_worker_spawns_remediation` — actionable rework fires but no live worker.
+    Assert: remediation worker spawned on existing PR branch. If spawn fails,
+    `AgentFailed` fires (task stays InReview, not stranded).
+
+**Negative paths (must NOT happen):**
+
+14. `merge_wait_does_not_consume_rework_budget` — `TimedOut` + `Mergeable` repeated
+    N times (N < ceiling). Assert: `rework_round` == 0 throughout.
+
+15. `merge_wait_does_not_allocate_agent` — same scenario. Assert: no worker or
+    reviewer spawn events in daemon log.
+
+16. `merge_wait_does_not_delete_approval` — same scenario. Assert: approval record
+    present in DB after each retry cycle.
+
+17. `drain_interrupted_merge_wait_preserves_state` — drain signal during checks wait.
+    Assert: mailbox row unconsumed, task stays `merging`, approval record intact.
+    (Existing test `drain_timeout_honored_during_merge_checks` covers the timing;
+    this test covers state preservation.)
 
 ### Post-merge review-analytics collector (#125)
 
