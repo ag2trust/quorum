@@ -1,7 +1,7 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
     AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DedupedError, HealthVerdict,
-    PipelineTask, QueueTask, Stats,
+    MergeBlockerView, PipelineTask, QueueTask, Stats,
 };
 use std::io::Write;
 
@@ -134,6 +134,7 @@ pub fn render_with_style(s: &Stats, sty: &Style, w: &mut dyn Write) {
     render_queue(&s.queue_tasks, sty, w, width);
     render_blocked(&s.blocked, sty, w, width);
     render_pipeline(&s.pipeline, &s.daemon_agents, sty, w, width);
+    render_merge_wait(&s.merge_blockers, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
@@ -584,6 +585,52 @@ fn render_unbacked_prs(
             warn,
             t.task_id,
             prs.join(", "),
+        );
+    }
+}
+
+fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Write, width: usize) {
+    if blockers.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("MERGE WAIT", width));
+    let _ = writeln!(
+        w,
+        "  {:<6} {:<24} {:3} {:<10} {:>4} {:>4}  PR",
+        "TASK", "WHAT", "", "BLOCKER", "WAIT", "RTR"
+    );
+    for b in blockers {
+        let wait = fmt_age(b.waiting_secs);
+        let pr_str =
+            b.pr.map(|p| format!("#{p}"))
+                .unwrap_or_else(|| "—".to_string());
+        let icon = match b.blocker_kind.as_str() {
+            "conflict" => {
+                if sty.color {
+                    sty.yellow("⚠")
+                } else {
+                    "[!]".to_string()
+                }
+            }
+            _ => {
+                if sty.color {
+                    "⏳".to_string()
+                } else {
+                    "[~]".to_string()
+                }
+            }
+        };
+        let _ = writeln!(
+            w,
+            "  #{:<5} {:<24} {:3} {:<10} {:>4} {:>4}  {}",
+            b.task_id,
+            truncate(&b.title, 24),
+            icon,
+            b.blocker_kind,
+            wait,
+            b.retry_count,
+            pr_str,
         );
     }
 }
@@ -1116,6 +1163,123 @@ mod tests {
         assert!(
             output.contains("r2 audit"),
             "R2 reviewer subrow must show 'r2 audit' label: {output}"
+        );
+    }
+
+    // ── #177: MERGE WAIT section ────────────────────────────────────
+
+    #[test]
+    fn merge_wait_section_renders_when_present() {
+        let mut s = default_stats();
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 42,
+            title: "review PR #367".into(),
+            pr: Some(367),
+            blocker_kind: "conflict".into(),
+            status: "in-review".into(),
+            waiting_secs: 1800,
+            retry_count: 1,
+        });
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 50,
+            title: "merge approved PR".into(),
+            pr: Some(400),
+            blocker_kind: "ci_pending".into(),
+            status: "merging".into(),
+            waiting_secs: 120,
+            retry_count: 0,
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("MERGE WAIT"),
+            "section header must appear: {output}"
+        );
+        assert!(
+            output.contains("#42") && output.contains("conflict"),
+            "conflict blocker visible: {output}"
+        );
+        assert!(
+            output.contains("#50") && output.contains("ci_pending"),
+            "ci_pending blocker visible: {output}"
+        );
+        assert!(output.contains("#367"), "PR number visible: {output}");
+        assert!(output.contains("#400"), "PR number visible: {output}");
+    }
+
+    #[test]
+    fn merge_wait_section_hidden_when_empty() {
+        let s = default_stats();
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("MERGE WAIT"),
+            "section hidden when no merge blockers: {output}"
+        );
+    }
+
+    #[test]
+    fn merge_wait_conflict_shows_warning_icon_plain() {
+        let mut s = default_stats();
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 10,
+            title: "conflict task".into(),
+            pr: Some(100),
+            blocker_kind: "conflict".into(),
+            status: "in-review".into(),
+            waiting_secs: 600,
+            retry_count: 2,
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("#10")).unwrap();
+        assert!(
+            line.contains("[!]"),
+            "conflict should show warning icon in plain mode: {line}"
+        );
+    }
+
+    #[test]
+    fn merge_wait_columns_align() {
+        let mut s = default_stats();
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 7,
+            title: "short".into(),
+            pr: Some(99),
+            blocker_kind: "conflict".into(),
+            status: "in-review".into(),
+            waiting_secs: 60,
+            retry_count: 3,
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let header = output.lines().find(|l| l.contains("BLOCKER")).unwrap();
+        let data = output.lines().find(|l| l.contains("#7")).unwrap();
+        let hdr_blocker = header.find("BLOCKER").unwrap();
+        let data_blocker = data.find("conflict").unwrap();
+        assert_eq!(
+            hdr_blocker, data_blocker,
+            "BLOCKER header must align with data column.\nheader: {header}\ndata:   {data}"
+        );
+        let hdr_wait = header.find("WAIT").unwrap();
+        let hdr_rtr = header.find("RTR").unwrap();
+        let hdr_pr = header.find("PR").unwrap();
+        let data_pr = data.find("#99").unwrap();
+        assert!(
+            data_pr >= hdr_pr,
+            "PR data must align with or follow PR header.\nheader: {header}\ndata:   {data}"
+        );
+        assert!(
+            hdr_rtr > hdr_wait,
+            "RTR column must be after WAIT column in header"
         );
     }
 
