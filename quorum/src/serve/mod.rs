@@ -1691,7 +1691,7 @@ async fn tick(
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
-                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                            cleanup_slot(config, wt_mgr, name_pool, w, None, "merged").await;
                         }
                         let r = reviewers.remove(ri);
                         teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
@@ -1780,7 +1780,15 @@ async fn tick(
                                             },
                                         )
                                         .await;
-                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                        cleanup_slot(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            w,
+                                            None,
+                                            "agent_failed",
+                                        )
+                                        .await;
                                     } else {
                                         let w = &mut workers[wi];
                                         w.draining = true;
@@ -1819,7 +1827,15 @@ async fn tick(
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
                                         let w = workers.remove(wi);
-                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                        cleanup_slot(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            w,
+                                            None,
+                                            "rework_cap",
+                                        )
+                                        .await;
                                     }
                                 }
                                 None => {
@@ -1988,7 +2004,15 @@ async fn tick(
                                                 },
                                             )
                                             .await;
-                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "agent_failed",
+                                            )
+                                            .await;
                                         } else {
                                             let w = &mut workers[wi];
                                             w.draining = true;
@@ -2038,7 +2062,15 @@ async fn tick(
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
                                         let w = workers.remove(wi);
-                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                        cleanup_slot(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            w,
+                                            None,
+                                            "rework_cap",
+                                        )
+                                        .await;
                                     }
                                 }
                                 None => {
@@ -2140,8 +2172,15 @@ async fn tick(
                                                     },
                                                 )
                                                 .await;
-                                                cleanup_slot(config, wt_mgr, name_pool, w, None)
-                                                    .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
                                             } else {
                                                 let w = &mut workers[wi];
                                                 w.draining = true;
@@ -2195,7 +2234,15 @@ async fn tick(
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
                                             let w = workers.remove(wi);
-                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "rework_cap",
+                                            )
+                                            .await;
                                         }
                                     }
                                     None => {
@@ -2272,8 +2319,15 @@ async fn tick(
                                                     },
                                                 )
                                                 .await;
-                                                cleanup_slot(config, wt_mgr, name_pool, w, None)
-                                                    .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
                                             } else {
                                                 let w = &mut workers[wi];
                                                 w.draining = true;
@@ -2327,7 +2381,15 @@ async fn tick(
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
                                             let w = workers.remove(wi);
-                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "rework_cap",
+                                            )
+                                            .await;
                                         }
                                     }
                                     None => {
@@ -2545,7 +2607,15 @@ async fn tick(
                                                 },
                                             )
                                             .await;
-                                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                            cleanup_slot(
+                                                config,
+                                                wt_mgr,
+                                                name_pool,
+                                                w,
+                                                None,
+                                                "agent_failed",
+                                            )
+                                            .await;
                                         } else {
                                             let w = &mut workers[wi];
                                             w.draining = true;
@@ -2595,7 +2665,15 @@ async fn tick(
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
                                         let w = workers.remove(wi);
-                                        cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                        cleanup_slot(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            w,
+                                            None,
+                                            "rework_cap",
+                                        )
+                                        .await;
                                     }
                                 }
                                 None => {
@@ -2731,7 +2809,7 @@ async fn tick(
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
                         {
                             let w = workers.remove(wi);
-                            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                            cleanup_slot(config, wt_mgr, name_pool, w, None, "merged").await;
                         }
                         reviewer_provision_tracker.clear(reviewer_task_id, pr_num);
                     } else {
@@ -2763,7 +2841,8 @@ async fn tick(
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
                                     let w = workers.remove(wi);
-                                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                    cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled")
+                                        .await;
                                 }
                             }
                             merge::MergeFailureKind::Retryable => {
@@ -2859,7 +2938,12 @@ async fn tick(
                                                     )
                                                     .await;
                                                     cleanup_slot(
-                                                        config, wt_mgr, name_pool, w, None,
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
                                                     )
                                                     .await;
                                                 } else {
@@ -2916,8 +3000,15 @@ async fn tick(
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
                                                 let w = workers.remove(wi);
-                                                cleanup_slot(config, wt_mgr, name_pool, w, None)
-                                                    .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "rework_cap",
+                                                )
+                                                .await;
                                             }
                                         }
                                         None => {
@@ -3073,7 +3164,15 @@ async fn tick(
                                         },
                                     )
                                     .await;
-                                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                    cleanup_slot(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        w,
+                                        None,
+                                        "agent_failed",
+                                    )
+                                    .await;
                                 } else {
                                     let w = &mut workers[wi];
                                     w.draining = true;
@@ -3158,7 +3257,8 @@ async fn tick(
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
                                 let w = workers.remove(wi);
-                                cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                                cleanup_slot(config, wt_mgr, name_pool, w, None, "rework_cap")
+                                    .await;
                             }
                         }
                         None => {
@@ -3389,7 +3489,16 @@ async fn tick(
                             },
                         )
                         .await;
-                        cleanup_slot_inner(config, wt_mgr, name_pool, w, None, false).await;
+                        cleanup_slot_inner(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            w,
+                            None,
+                            false,
+                            "agent_failed",
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -3405,7 +3514,7 @@ async fn tick(
                 })
                 .await
                 .ok();
-                cleanup_slot(config, wt_mgr, name_pool, w, Some("done")).await;
+                cleanup_slot(config, wt_mgr, name_pool, w, Some("done"), "done").await;
             }
 
             if !consume_mailbox_row(&db_path, *id).await {
@@ -3533,46 +3642,82 @@ async fn tick(
             },
         )
         .await;
-        cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
     }
 
     // ── Phase 4-idle: Kill workers idle too long between turns ─────────
     // A worker that completed a turn (draining=false) but never gets a new
     // turn is a zombie — e.g. it asked a question in dontAsk mode (#74).
-    let mut idle_zombies: Vec<usize> = Vec::new();
+    // Phase-aware: workers whose task is already in-review or merging are
+    // legitimately idle (awaiting review/merge) — release gracefully without
+    // firing AgentFailed (#176).
+    let mut idle_workers: Vec<usize> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
         if w.draining || w.error_turn_count > 0 {
             continue;
         }
         if let Some(ended) = w.turn_ended_at {
             if ended.elapsed().as_secs() > idle_timeout {
-                log(&format!(
-                    "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
-                    w.agent_name,
-                    ended.elapsed().as_secs(),
-                    w.task_id,
-                    idle_timeout
-                ));
-                idle_zombies.push(i);
+                idle_workers.push(i);
             }
         }
     }
-    for &i in idle_zombies.iter().rev() {
+    for &i in idle_workers.iter().rev() {
+        let task_id = workers[i].task_id;
+        let idle_secs = workers[i].turn_ended_at.unwrap().elapsed().as_secs();
+
+        // Look up current task status to distinguish legitimate waits from zombies.
+        let p = db_path.clone();
+        let task_status: Option<String> = tokio::task::spawn_blocking(move || -> Option<String> {
+            let conn = quorum_core::db::open(&p).ok()?;
+            let task = tasks::get(&conn, task_id).ok()??;
+            Some(task.status.clone())
+        })
+        .await
+        .ok()
+        .flatten();
+
         let dead = workers.remove(i);
-        fire_event(
-            &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: format!(
-                    "worker idle {}s between turns (limit {}s) — zombie reaped",
-                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
-                    idle_timeout
-                ),
-            },
-        )
-        .await;
-        cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+
+        match task_status.as_deref() {
+            Some("in-review") | Some("merging") => {
+                // Worker submitted its work and is awaiting review/merge.
+                // Release gracefully — no AgentFailed, no task state change.
+                let end_reason = match task_status.as_deref() {
+                    Some("in-review") => "submitted",
+                    Some("merging") => "awaiting_merge",
+                    _ => unreachable!(),
+                };
+                log(&format!(
+                    "worker {} idle {}s on task #{} (status: {}) — releasing submitted slot",
+                    dead.agent_name,
+                    idle_secs,
+                    dead.task_id,
+                    task_status.as_deref().unwrap_or("unknown"),
+                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, end_reason).await;
+            }
+            _ => {
+                // Genuine zombie — fire AgentFailed.
+                log(&format!(
+                    "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
+                    dead.agent_name, idle_secs, dead.task_id, idle_timeout
+                ));
+                fire_event(
+                    &db_path,
+                    &dead.agent_name,
+                    dead.task_id,
+                    &Event::AgentFailed {
+                        reason: format!(
+                            "worker idle {}s between turns (limit {}s) — zombie reaped",
+                            idle_secs, idle_timeout
+                        ),
+                    },
+                )
+                .await;
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
+            }
+        }
     }
 
     // ── Phase 4-refeed: Auto-refeed workers whose last turn ended with an error ──
@@ -3629,7 +3774,7 @@ async fn tick(
             },
         )
         .await;
-        cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "error_retries").await;
     }
 
     // ── Phase 4a-drain: Tear down idle agents during drain ──────────────
@@ -3657,7 +3802,7 @@ async fn tick(
                 },
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
         }
 
         let mut drain_reviewers: Vec<usize> = Vec::new();
@@ -3725,7 +3870,7 @@ async fn tick(
                     },
                 )
                 .await;
-                cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "cancelled").await;
                 log(&format!(
                     "POISON: task #{task_id} cancelled after {strikes} strikes"
                 ));
@@ -3743,7 +3888,7 @@ async fn tick(
                     },
                 )
                 .await;
-                cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
             }
         } else {
             poison_tracker.clear(dead.task_id);
@@ -3756,7 +3901,7 @@ async fn tick(
                 },
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, dead, None).await;
+            cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
         }
     }
 
@@ -3829,7 +3974,7 @@ async fn tick(
                         workers[wi].agent_name,
                     ));
                     let w = workers.remove(wi);
-                    cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+                    cleanup_slot(config, wt_mgr, name_pool, w, None, "external").await;
                 }
                 if let Some(ri) = reviewers.iter().position(|r| r.task_id == tid) {
                     log(&format!(
@@ -4004,7 +4149,7 @@ async fn tick(
         }
         for &wi in pr_closed_workers.iter().rev() {
             let w = workers.remove(wi);
-            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "pr_closed").await;
         }
         // #75: park repo-mismatch workers without burning strikes
         // Process in reverse index order to avoid index invalidation.
@@ -4037,7 +4182,7 @@ async fn tick(
                 &pr_label,
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled").await;
         }
         for &wi in parked_workers.iter().rev() {
             let w = workers.remove(wi);
@@ -4070,7 +4215,7 @@ async fn tick(
                 &pr_label,
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None).await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled").await;
         }
 
         // ── Phase 5b: Spawn reviewers for orphan in-review tasks ──────
@@ -6034,8 +6179,18 @@ async fn cleanup_slot(
     name_pool: &mut Pool,
     state: SlotState,
     finalize_verdict: Option<&str>,
+    end_reason: &str,
 ) {
-    cleanup_slot_inner(config, wt_mgr, name_pool, state, finalize_verdict, true).await;
+    cleanup_slot_inner(
+        config,
+        wt_mgr,
+        name_pool,
+        state,
+        finalize_verdict,
+        true,
+        end_reason,
+    )
+    .await;
 }
 
 async fn cleanup_slot_inner(
@@ -6045,6 +6200,7 @@ async fn cleanup_slot_inner(
     mut state: SlotState,
     finalize_verdict: Option<&str>,
     delete_branch: bool,
+    end_reason: &str,
 ) {
     log(&format!(
         "tearing down worker {} (task #{}{})",
@@ -6062,7 +6218,7 @@ async fn cleanup_slot_inner(
     }
 
     state.proc.kill_and_reap().await;
-    close_agent_run(&config.db_path, state.agent_run_id, "done").await;
+    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
