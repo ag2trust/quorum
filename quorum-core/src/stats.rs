@@ -234,6 +234,30 @@ pub struct AlertMessage {
     pub kind: String,
 }
 
+/// A task stuck in the merge pipeline waiting on external conditions (CI, conflicts,
+/// policy). Surfaced in the MERGE WAIT status section (#177). The underlying task
+/// stays nonterminal — dependents remain blocked by the normal dependency rule.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct MergeBlockerView {
+    pub task_id: i64,
+    pub title: String,
+    pub pr: Option<i64>,
+    /// "conflict", "ci_pending", "policy"
+    pub blocker_kind: String,
+    /// Current task status (e.g. "in-review", "merging").
+    pub status: String,
+    /// Seconds since the block began (derived from task.updated_at).
+    pub waiting_secs: i64,
+    /// Rework rounds accumulated on this task.
+    pub retry_count: i32,
+}
+
+/// True when `count` is 0 or a power of two — controls merge-wait alert dedup.
+/// Alerts fire at retries 0, 1, 2, 4, 8, 16, … to avoid per-poll spam.
+pub fn alert_due_at_retry(count: i64) -> bool {
+    count == 0 || (count > 0 && (count & (count - 1)) == 0)
+}
+
 /// Daemon liveness snapshot read from `daemon_lock`.
 /// Populated by the binary crate (which owns the pid-alive syscall).
 #[derive(Debug, Serialize, PartialEq, Eq, Clone, Default)]
@@ -310,6 +334,8 @@ pub struct Stats {
     pub twin_prs: Vec<crate::drift::TwinPr>,
     /// #88: owner-alert feed messages (kind = alert/critical), visible in ALERTS cockpit section.
     pub alerts: Vec<AlertMessage>,
+    /// #177: tasks stuck in the merge pipeline waiting on external conditions.
+    pub merge_blockers: Vec<MergeBlockerView>,
     /// #115: daemon liveness from daemon_lock (populated by binary crate).
     pub daemon: DaemonLiveness,
 }
@@ -383,6 +409,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let pipeline = pipeline_tasks(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
+    let merge_blockers = merge_blockers(conn, now)?;
     let health = compute_health(
         &daemon_agents,
         !recent_errors.is_empty(),
@@ -428,6 +455,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         unbacked_prs,
         twin_prs,
         alerts,
+        merge_blockers,
         daemon: DaemonLiveness::default(),
     })
 }
@@ -1138,6 +1166,84 @@ fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Tasks stuck waiting on external merge conditions (#177).
+///
+/// Two sources:
+/// 1. Tasks with `body = MERGE_BLOCKED_BODY` — merge-blocked by conflict (review-only
+///    tasks whose PR has conflicts; daemon parks them until mergeable again).
+/// 2. Tasks in `merging` status — approved, waiting for CI/merge to complete.
+///
+/// Neither is terminal; dependents stay blocked by the normal dep rule.
+fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> {
+    let mut result = Vec::new();
+
+    // 1. Conflict-blocked tasks (body = MERGE_BLOCKED_BODY, any non-terminal status).
+    let mut stmt = conn.prepare(
+        "SELECT id, title, refs, status, updated_at, rework_round
+         FROM tasks
+         WHERE body = ?1 AND status NOT IN ('done', 'failed', 'cancelled')
+         ORDER BY updated_at ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![crate::tasks::MERGE_BLOCKED_BODY], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i32>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, title, refs, status, updated_at, rework_round) in rows {
+        result.push(MergeBlockerView {
+            task_id: id,
+            title,
+            pr: extract_pr_from_refs(refs.as_deref()),
+            blocker_kind: "conflict".into(),
+            status,
+            waiting_secs: (now - updated_at).max(0),
+            retry_count: rework_round,
+        });
+    }
+
+    // 2. Tasks in 'merging' status (approved, pending CI / merge attempt).
+    let mut stmt2 = conn.prepare(
+        "SELECT id, title, refs, updated_at, rework_round
+         FROM tasks
+         WHERE status = 'merging'
+         ORDER BY updated_at ASC",
+    )?;
+    let rows2 = stmt2
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i32>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, title, refs, updated_at, rework_round) in rows2 {
+        if result.iter().any(|b| b.task_id == id) {
+            continue;
+        }
+        result.push(MergeBlockerView {
+            task_id: id,
+            title,
+            pr: extract_pr_from_refs(refs.as_deref()),
+            blocker_kind: "ci_pending".into(),
+            status: "merging".into(),
+            waiting_secs: (now - updated_at).max(0),
+            retry_count: rework_round,
+        });
+    }
+
+    Ok(result)
 }
 
 /// Compute the health verdict (#204).
@@ -2429,5 +2535,216 @@ mod tests {
             uptime_secs: None,
         };
         assert!(!is_stall_eligible(&view));
+    }
+
+    // ── #177: merge blocker visibility ────────────────────────────────
+
+    #[test]
+    fn merge_blocker_conflict_surfaces_in_stats() {
+        let (_d, mut c) = open_tmp();
+        let t = crate::tasks::create(
+            &mut c,
+            "boss",
+            "review PR #42",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(42),
+            100,
+        )
+        .unwrap();
+        // Simulate merge-blocked: set body to MERGE_BLOCKED_BODY and status to in-review.
+        c.execute(
+            "UPDATE tasks SET body = ?1, status = 'in-review', updated_at = 500 WHERE id = ?2",
+            rusqlite::params![crate::tasks::MERGE_BLOCKED_BODY, t],
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.merge_blockers.len(), 1);
+        let b = &s.merge_blockers[0];
+        assert_eq!(b.task_id, t);
+        assert_eq!(b.blocker_kind, "conflict");
+        assert_eq!(b.status, "in-review");
+        assert_eq!(b.waiting_secs, 500);
+        assert_eq!(b.pr, Some(42));
+    }
+
+    #[test]
+    fn merge_blocker_ci_pending_surfaces_merging_tasks() {
+        let (_d, mut c) = open_tmp();
+        let t = crate::tasks::create(
+            &mut c,
+            "boss",
+            "merge me",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(99),
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status = 'merging', updated_at = 800 WHERE id = ?1",
+            rusqlite::params![t],
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.merge_blockers.len(), 1);
+        let b = &s.merge_blockers[0];
+        assert_eq!(b.task_id, t);
+        assert_eq!(b.blocker_kind, "ci_pending");
+        assert_eq!(b.status, "merging");
+        assert_eq!(b.waiting_secs, 200);
+        assert_eq!(b.pr, Some(99));
+    }
+
+    #[test]
+    fn merge_blocker_not_counted_as_terminal_or_active_agent_work() {
+        let (_d, mut c) = open_tmp();
+        let t = crate::tasks::create(
+            &mut c,
+            "boss",
+            "blocked",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(10),
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET body = ?1, status = 'in-review', updated_at = 200 WHERE id = ?2",
+            rusqlite::params![crate::tasks::MERGE_BLOCKED_BODY, t],
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        // Must NOT be counted as done, failed, cancelled.
+        let terminal_count: i64 = s
+            .tasks
+            .iter()
+            .filter(|sc| sc.status == "done" || sc.status == "failed" || sc.status == "cancelled")
+            .map(|sc| sc.count)
+            .sum();
+        assert_eq!(terminal_count, 0, "merge-blocked must not be terminal");
+        // Must NOT appear as active daemon agent work.
+        assert!(
+            s.daemon_agents.is_empty(),
+            "merge-blocked must not show as daemon agent"
+        );
+        // Must NOT count as stalled.
+        assert_eq!(s.stalled_count, 0, "merge-blocked must not be stalled");
+        // But IS in merge_blockers.
+        assert_eq!(s.merge_blockers.len(), 1);
+    }
+
+    #[test]
+    fn merge_blocker_done_task_excluded() {
+        let (_d, mut c) = open_tmp();
+        let t = crate::tasks::create(
+            &mut c,
+            "boss",
+            "was blocked",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        // A done task that still has MERGE_BLOCKED_BODY (cleanup missed) should not surface.
+        c.execute(
+            "UPDATE tasks SET body = ?1, status = 'done', updated_at = 200 WHERE id = ?2",
+            rusqlite::params![crate::tasks::MERGE_BLOCKED_BODY, t],
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(s.merge_blockers.is_empty());
+    }
+
+    #[test]
+    fn merge_blocker_no_duplicate_when_merging_and_body_set() {
+        let (_d, mut c) = open_tmp();
+        let t = crate::tasks::create(
+            &mut c,
+            "boss",
+            "both flags",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        // Edge case: task in merging AND has MERGE_BLOCKED_BODY. Should appear once.
+        c.execute(
+            "UPDATE tasks SET body = ?1, status = 'merging', updated_at = 200 WHERE id = ?2",
+            rusqlite::params![crate::tasks::MERGE_BLOCKED_BODY, t],
+        )
+        .unwrap();
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.merge_blockers.len(), 1, "should dedup");
+        assert_eq!(s.merge_blockers[0].blocker_kind, "conflict");
+    }
+
+    #[test]
+    fn existing_blocked_dependency_rendering_unaffected() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.blocked.len(), 1, "dep-blocked task should still render");
+        assert!(s.merge_blockers.is_empty(), "dep-blocked != merge-blocked");
+    }
+
+    // ── #177: alert dedup/backoff ─────────────────────────────────────
+
+    #[test]
+    fn alert_due_at_retry_fires_at_power_of_two() {
+        assert!(alert_due_at_retry(0), "first alert must fire");
+        assert!(alert_due_at_retry(1));
+        assert!(alert_due_at_retry(2));
+        assert!(!alert_due_at_retry(3));
+        assert!(alert_due_at_retry(4));
+        assert!(!alert_due_at_retry(5));
+        assert!(!alert_due_at_retry(6));
+        assert!(!alert_due_at_retry(7));
+        assert!(alert_due_at_retry(8));
+        assert!(alert_due_at_retry(16));
+        assert!(!alert_due_at_retry(15));
+    }
+
+    #[test]
+    fn alert_due_at_retry_negative_never_fires() {
+        assert!(!alert_due_at_retry(-1));
+        assert!(!alert_due_at_retry(-100));
     }
 }
