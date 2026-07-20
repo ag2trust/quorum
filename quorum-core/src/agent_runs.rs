@@ -183,4 +183,61 @@ mod tests {
             Some("claude-opus-4-6")
         );
     }
+
+    #[test]
+    fn end_reason_distinguishes_cleanup_causes() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c,
+            "boss",
+            "test-task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        let reasons = [
+            "submitted",
+            "awaiting_merge",
+            "idle_reaped",
+            "crashed",
+            "agent_failed",
+            "merged",
+            "done",
+        ];
+        let mut run_ids = Vec::new();
+        for (i, &reason) in reasons.iter().enumerate() {
+            let rid = insert(
+                &c,
+                tid,
+                &format!("Agent-{i}"),
+                "worker",
+                "model",
+                "high",
+                100 + i as i64,
+            )
+            .unwrap();
+            close(&c, rid, 200 + i as i64, reason).unwrap();
+            run_ids.push(rid);
+        }
+
+        for (rid, &expected) in run_ids.iter().zip(reasons.iter()) {
+            let actual: String = c
+                .query_row(
+                    "SELECT end_reason FROM agent_runs WHERE id = ?1",
+                    params![rid],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                actual, expected,
+                "run {rid} should have end_reason={expected}"
+            );
+        }
+    }
 }

@@ -1677,6 +1677,76 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Effect::NotifyOwner { .. })));
     }
+
+    // ── Phase-aware idle reaping contract (#176) ─────────────────────────
+    // These tests document the lifecycle invariants that the daemon's
+    // phase-aware idle reaper relies on.
+
+    #[test]
+    fn idle_zombie_working_agent_failed_resets_to_open() {
+        // A genuinely idle worker (task still in Working, no PR yet) fires
+        // AgentFailed, which resets the task to Open for re-claim.
+        let t = view(Status::Working);
+        assert_ok(
+            &t,
+            &Event::AgentFailed {
+                reason: "worker idle 300s — zombie reaped".into(),
+            },
+            Status::Open,
+            &[
+                Effect::ReleaseLease,
+                Effect::ClearAuthor,
+                Effect::NotifyOwner {
+                    reason: "worker idle 300s — zombie reaped".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn legitimate_idle_in_review_agent_failed_would_spawn_reviewer() {
+        // If AgentFailed WERE fired for an in-review task (which the
+        // phase-aware reaper avoids), it would stay in-review but
+        // unnecessarily spawn a replacement reviewer. This test documents
+        // why the daemon skips AgentFailed for in-review workers: the
+        // side effects (SpawnReviewer, NotifyOwner) are unwanted for a
+        // worker that legitimately submitted and is awaiting review.
+        let t = view_with_author(Status::InReview, "W1");
+        let (next, effects) = transition(
+            &t,
+            &Event::AgentFailed {
+                reason: "should not fire for legitimate idle".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(
+            effects.contains(&Effect::SpawnReviewer),
+            "AgentFailed in in-review spawns a reviewer — this is why the daemon skips it"
+        );
+    }
+
+    #[test]
+    fn legitimate_idle_merging_agent_failed_would_regress_to_in_review() {
+        // If AgentFailed WERE fired during merging, the task regresses to
+        // in-review. The phase-aware reaper avoids this by not firing
+        // AgentFailed for merging workers.
+        let t = view_with_author(Status::Merging, "W1");
+        let (next, effects) = transition(
+            &t,
+            &Event::AgentFailed {
+                reason: "should not fire for legitimate idle".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyOwner { .. })),
+            "AgentFailed in merging notifies owner — this is why the daemon skips it"
+        );
+    }
 }
 
 // ===========================================================================
