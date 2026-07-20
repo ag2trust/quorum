@@ -181,7 +181,8 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
         }
     }
 
-    // merging → AgentFailed → in-review
+    // merging → AgentFailed → in-review (skip tasks with durable approvals
+    // — those are in merge-wait and should stay in merging for retry)
     {
         let p = db_path.clone();
         let merging_tasks = tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
@@ -195,6 +196,29 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
         for task in merging_tasks {
             let p = db_path.clone();
             let tid = task.id;
+
+            // #174: skip merging tasks with a durable approval — they are
+            // in merge-wait and the tick loop will retry checks via the
+            // unconsumed mailbox row or approval-recovery replay.
+            let has_approval = {
+                let p2 = db_path.clone();
+                tokio::task::spawn_blocking(move || -> bool {
+                    quorum_core::db::open(&p2)
+                        .ok()
+                        .and_then(|conn| quorum_core::approvals::has_for_task(&conn, tid).ok())
+                        .unwrap_or(false)
+                })
+                .await
+                .unwrap_or(false)
+            };
+            if has_approval {
+                log(&format!(
+                    "recovery: merging task #{tid} has durable approval \
+                     — preserving merge-wait state"
+                ));
+                continue;
+            }
+
             tokio::task::spawn_blocking(move || {
                 if let Ok(mut conn) = quorum_core::db::open(&p) {
                     let now = crate::serve::now_unix();

@@ -457,9 +457,10 @@ fn checks_fail_sends_rework() {
     handle.stop();
 }
 
-/// Checks timeout → PolicyBlocked park (no merge attempt).
+/// #174: Checks timeout → durable merge-wait (no rework, no merge, no
+/// agent spawn, no counter changes). Task stays in merging.
 #[test]
-fn checks_timeout_parks_task() {
+fn checks_timeout_enters_merge_wait() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -474,7 +475,7 @@ fn checks_timeout_parks_task() {
         .status()
         .unwrap();
 
-    seed_task(home.path(), "Task for checks-timeout test");
+    seed_task(home.path(), "Task for checks-timeout merge-wait test");
 
     let mut handle = ServeHandle::start(
         home.path(),
@@ -534,41 +535,429 @@ fn checks_timeout_parks_task() {
     );
     complete_r2_review(home.path(), &mut handle, "1");
 
+    // Should see merge-wait log, NOT rework/MERGE BLOCKED.
     assert!(
-        handle.wait_for("MERGE BLOCKED", 15),
-        "MERGE BLOCKED log not seen. Lines: {:?}",
+        handle.wait_for("merge wait", 15),
+        "merge-wait log not seen. Lines: {:?}",
         handle.lines
     );
     assert!(
         handle.lines.iter().any(|l| l.contains("timed out")),
-        "timeout reason not in log. Lines: {:?}",
-        handle.lines
-    );
-    assert!(
-        handle.wait_for("rework", 15),
-        "rework not triggered after checks timeout. Lines: {:?}",
+        "timeout reason not in merge-wait log. Lines: {:?}",
         handle.lines
     );
 
+    // Negative: no rework, no merge, no cancel, no new agent spawn.
+    let saw_rework = handle.lines.iter().any(|l| l.contains("rework"));
+    assert!(
+        !saw_rework,
+        "rework should NOT fire during merge-wait. Lines: {:?}",
+        handle.lines
+    );
     let saw_merged = handle
         .lines
         .iter()
         .any(|l| l.contains("merged") && !l.contains("BLOCKED"));
     assert!(
         !saw_merged,
-        "merge should NOT happen when checks timeout. Lines: {:?}",
+        "merge should NOT happen during merge-wait. Lines: {:?}",
         handle.lines
     );
-
-    // #153: checks timeout fires rework, not terminal cancel.
     let saw_cancelled = handle.lines.iter().any(|l| l.contains("cancelling"));
     assert!(
         !saw_cancelled,
-        "task should NOT be cancelled after checks timeout. Lines: {:?}",
+        "task should NOT be cancelled during merge-wait. Lines: {:?}",
+        handle.lines
+    );
+
+    // Task should still be in merging status.
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"merging\"") || stdout.contains("\"status\": \"merging\""),
+        "task should stay in merging during merge-wait, got: {stdout}"
+    );
+
+    // Counters should not have changed.
+    assert!(
+        stdout.contains("\"rework_round\":0") || stdout.contains("\"rework_round\": 0"),
+        "rework_round should not increment during merge-wait, got: {stdout}"
+    );
+
+    handle.stop();
+}
+
+/// #174: Pending → Ready → merge proceeds (merge-wait retries and succeeds).
+#[test]
+fn checks_pending_then_ready_merges_via_merge_wait() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    let state_file = home.path().join("checks_state");
+    std::fs::write(&state_file, "pending").unwrap();
+    let checks_cmd = format!("cat {}", state_file.to_string_lossy());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for pending-then-ready merge-wait test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, "1");
+
+    // First timeout enters merge-wait.
+    assert!(
+        handle.wait_for("merge wait", 15),
+        "merge-wait log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Flip checks to ready — next tick should merge.
+    std::fs::write(&state_file, "ready").unwrap();
+
+    assert!(
+        handle.wait_for("checks passed", 20),
+        "checks-passed log not seen after state change. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("merged", 20),
+        "merge-success log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // No rework was triggered.
+    let saw_rework = handle.lines.iter().any(|l| l.contains("rework"));
+    assert!(
+        !saw_rework,
+        "rework should NOT fire for pending→ready path. Lines: {:?}",
         handle.lines
     );
 
     handle.stop();
+}
+
+/// #174: Pending → Failed → enters rework (merge-wait retries, checks fail).
+#[test]
+fn checks_pending_then_failed_enters_rework() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    let state_file = home.path().join("checks_state");
+    std::fs::write(&state_file, "pending").unwrap();
+    let checks_cmd = format!("cat {}", state_file.to_string_lossy());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for pending-then-failed test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, "1");
+
+    // First timeout enters merge-wait.
+    assert!(
+        handle.wait_for("merge wait", 15),
+        "merge-wait log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Flip checks to failed — next tick should enter rework.
+    std::fs::write(&state_file, "failed\nclipper\ntest").unwrap();
+
+    assert!(
+        handle.wait_for("checks failed", 20),
+        "checks-failed log not seen after state change. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework #1 (checks failure)", 15),
+        "rework not triggered after checks failure. Lines: {:?}",
+        handle.lines
+    );
+
+    let saw_merged = handle.lines.iter().any(|l| l.contains("merged"));
+    assert!(
+        !saw_merged,
+        "merge should NOT happen when checks fail. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}
+
+/// #174: Restart test — pending before restart remains pending after restart,
+/// and later Ready merges exactly once.
+#[test]
+fn checks_pending_survives_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    let checks_state = home.path().join("checks_state");
+    std::fs::write(&checks_state, "pending").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for restart merge-wait test");
+
+    // Phase 1: start daemon, enter merge-wait.
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, "1");
+
+    assert!(
+        handle.wait_for("merge wait", 15),
+        "merge-wait log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Phase 2: stop daemon. Shutdown teardown resets merging → in-review
+    // via AgentFailed, but durable approvals survive.
+    handle.stop();
+
+    // Phase 3: restart daemon. Approval recovery detects dual approval
+    // and merges directly from durable state.
+    let mut handle2 = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "10",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle2.wait_for("merged", 30),
+        "merge not seen after restart. Lines: {:?}",
+        handle2.lines
+    );
+
+    // Verify task is done.
+    let get_out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", "1"])
+        .output()
+        .unwrap();
+    assert!(get_out.status.success());
+    let stdout = String::from_utf8_lossy(&get_out.stdout);
+    assert!(
+        stdout.contains("\"status\":\"done\"") || stdout.contains("\"status\": \"done\""),
+        "task should be done after restart merge, got: {stdout}"
+    );
+
+    // No rework should have been triggered.
+    let saw_rework = handle2.lines.iter().any(|l| l.contains("rework"));
+    assert!(
+        !saw_rework,
+        "rework should NOT fire after restart merge. Lines: {:?}",
+        handle2.lines
+    );
+
+    handle2.stop();
 }
 
 /// Negative path: checks pending → transition to ready → merge proceeds.

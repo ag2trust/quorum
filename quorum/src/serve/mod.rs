@@ -1607,19 +1607,39 @@ async fn tick(
                     .await
                     .is_none()
                     {
-                        log("VerdictApprove transition failed — skipping merge");
-                        let r = reviewers.remove(ri);
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved").await;
-                        // C3 belt-and-suspenders: clear worker.pr so Phase 5
-                        // doesn't spawn another reviewer for a rejected task.
-                        if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
-                        {
-                            workers[wi].pr = None;
+                        // #174: if task is already merging, this is a merge-wait
+                        // retry — the unconsumed mailbox row replayed the verdict.
+                        // Proceed to the merge gate instead of skipping.
+                        let already_merging = {
+                            let p = db_path.clone();
+                            tokio::task::spawn_blocking(move || -> bool {
+                                quorum_core::db::open(&p)
+                                    .ok()
+                                    .and_then(|conn| {
+                                        tasks::get(&conn, reviewer_task_id).ok().flatten()
+                                    })
+                                    .map(|t| t.status == "merging")
+                                    .unwrap_or(false)
+                            })
+                            .await
+                            .unwrap_or(false)
+                        };
+                        if !already_merging {
+                            log("VerdictApprove transition failed — skipping merge");
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
+                                .await;
+                            if let Some(wi) =
+                                workers.iter().position(|w| w.task_id == reviewer_task_id)
+                            {
+                                workers[wi].pr = None;
+                            }
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            continue;
                         }
-                        if !consume_mailbox_row(&db_path, *id).await {
-                            break;
-                        }
-                        continue;
+                        log("merge-wait retry: task already merging — proceeding to merge gate");
                     }
 
                     // R2 audit: record completed R2 review for the stratum.
@@ -2002,16 +2022,33 @@ async fn tick(
                                 }
                             }
                             merge::RequiredJobsOutcome::Pending { pending_jobs } => {
+                                let pending_list = pending_jobs.join(", ");
                                 log(&format!(
                                     "REQUIRED JOBS GATE: PR #{pr_num} required jobs \
-                                     still pending: {}",
-                                    pending_jobs.join(", ")
+                                     still pending: {pending_list}",
                                 ));
-                                merge::ChecksOutcome::TimedOut
+                                merge::ChecksOutcome::Pending {
+                                    reason: format!("required jobs still pending: {pending_list}"),
+                                }
                             }
                         }
                     } else {
                         checks_outcome
+                    };
+
+                    // Convert non-drain TimedOut to Pending: a timeout
+                    // means checks haven't finished yet, not that they
+                    // failed. Merge-wait retries instead of reworking.
+                    let checks_outcome = match checks_outcome {
+                        merge::ChecksOutcome::TimedOut if !drain_interrupted => {
+                            merge::ChecksOutcome::Pending {
+                                reason: format!(
+                                    "CI checks timed out after {}s for PR #{pr_num}",
+                                    config.merge_checks_timeout_secs
+                                ),
+                            }
+                        }
+                        other => other,
                     };
 
                     match checks_outcome {
@@ -2198,8 +2235,9 @@ async fn tick(
                             }
                             continue;
                         }
-                        merge::ChecksOutcome::TimedOut if drain_interrupted => {
-                            // Drain interrupted the merge-checks wait. Leave
+                        merge::ChecksOutcome::TimedOut => {
+                            // Only drain-interrupted TimedOut reaches here
+                            // (non-drain converted to Pending above). Leave
                             // the mailbox row unconsumed and the task in
                             // "merging" state — the outer loop will handle
                             // drain shutdown, and adoption recovery on
@@ -2210,10 +2248,9 @@ async fn tick(
                             ));
                             return Ok(());
                         }
-                        merge::ChecksOutcome::TimedOut => {
-                            // #153: recheck mergeability before deciding the
-                            // outcome — PR may have become conflicting during
-                            // the checks wait.
+                        merge::ChecksOutcome::Pending { reason } => {
+                            // Recheck mergeability — PR may have become
+                            // conflicting during the checks wait.
                             let post_timeout_mergeability = {
                                 let repo = config.repo_dir.clone();
                                 let executor = Arc::clone(&config.merge_executor);
@@ -2406,162 +2443,61 @@ async fn tick(
                                         .await;
                                     }
                                 }
-                            } else {
-                                // Genuine timeout, PR still mergeable — fire
-                                // MergeFailed + VerdictChanges for rework
-                                // (recoverable, not terminal cancel).
-                                let reason = format!(
-                                    "CI checks timed out after {}s for PR #{pr_num}",
-                                    config.merge_checks_timeout_secs
-                                );
-                                log(&format!("MERGE BLOCKED: {reason} — firing rework"));
-                                fire_event(
-                                    &db_path,
-                                    "system",
-                                    reviewer_task_id,
-                                    &Event::MergeFailed {
-                                        reason: reason.clone(),
-                                    },
-                                )
-                                .await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                continue;
+                            }
+
+                            // #174: Durable merge-wait. Checks are still
+                            // running — persist the approval and leave the
+                            // mailbox row unconsumed so the next tick retries.
+                            // No lifecycle events, no rework, no counter bumps.
+                            log(&format!("merge wait: {reason} — retrying next tick"));
+                            {
                                 let reviewer_name = reviewers[ri].agent_name.clone();
-                                let vc = fire_event(
-                                    &db_path,
-                                    &reviewer_name,
-                                    reviewer_task_id,
-                                    &Event::VerdictChanges,
-                                )
-                                .await;
-                                match vc {
-                                    Some(ref tr) if tr.task.status == "rework" => {
-                                        let rework_msg = format!(
-                                            "{reason}\n\n\
-                                             Fix the failing or stuck checks \
-                                             and push again.",
-                                        );
-                                        if let Some(wi) = workers
-                                            .iter()
-                                            .position(|w| w.task_id == reviewer_task_id)
-                                        {
-                                            let rework_turn = reviewer::build_rework_turn(
-                                                &workers[wi].agent_name,
-                                                workers[wi].task_id,
-                                                pr_num,
-                                                &rework_msg,
-                                                workers[wi].cost_usd,
-                                                config.limits.max_task_cost_usd,
-                                            );
-                                            if let Err(e) =
-                                                workers[wi].proc.feed_turn(&rework_turn).await
-                                            {
-                                                log(&format!(
-                                                    "timeout rework feed failed: \
-                                                     {e} — cleaning up"
-                                                ));
-                                                let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
-                                                )
-                                                .await;
-                                                cleanup_slot(
-                                                    config,
-                                                    wt_mgr,
-                                                    name_pool,
-                                                    w,
-                                                    None,
-                                                    "agent_failed",
-                                                )
-                                                .await;
-                                            } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
-                                                )
-                                                .await
-                                                .ok();
-                                                log(&format!(
-                                                    "worker {} rework #{} \
-                                                     (checks timeout)",
-                                                    w.agent_name, w.rework_count
-                                                ));
-                                            }
-                                        } else {
-                                            // #175: timed-out CI is out of scope for
-                                            // remediation — fire AgentFailed so the
-                                            // recovery path retries after restart.
-                                            fire_event(
-                                                &db_path,
-                                                "daemon",
-                                                reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker for rework (checks timeout)"
-                                                        .into(),
-                                                },
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    Some(_) => {
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(
-                                            config,
-                                            wt_mgr,
-                                            name_pool,
-                                            r,
-                                            "verdict:approved",
-                                        )
-                                        .await;
-                                        if let Some(wi) = workers
-                                            .iter()
-                                            .position(|w| w.task_id == reviewer_task_id)
-                                        {
-                                            let w = workers.remove(wi);
-                                            cleanup_slot(
-                                                config,
-                                                wt_mgr,
-                                                name_pool,
-                                                w,
-                                                None,
-                                                "rework_cap",
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    None => {
-                                        let r = reviewers.remove(ri);
-                                        teardown_reviewer(
-                                            config,
-                                            wt_mgr,
-                                            name_pool,
-                                            r,
-                                            "verdict:approved",
-                                        )
-                                        .await;
+                                let author = workers
+                                    .iter()
+                                    .find(|w| w.task_id == reviewer_task_id)
+                                    .map(|w| w.agent_name.clone());
+                                if let Some(author) = author {
+                                    let repo = config.repo_dir.clone();
+                                    let executor = Arc::clone(&config.merge_executor);
+                                    let head = tokio::task::spawn_blocking(move || {
+                                        executor.head_sha(pr_num, &repo)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                    if let Some(head) = head {
+                                        let p = db_path.clone();
+                                        let role =
+                                            if reviewers[ri].r2_origin { "r2" } else { "r1" };
+                                        let record = quorum_core::approvals::Approval {
+                                            pr_number: pr_num,
+                                            review_role: role.to_string(),
+                                            task_id: reviewer_task_id,
+                                            author,
+                                            reviewer: reviewer_name,
+                                            verdict: "approved".to_string(),
+                                            blocking_count: gated.blocking_count.unwrap_or(0)
+                                                as i64,
+                                            approved_head_sha: head,
+                                        };
+                                        tokio::task::spawn_blocking(move || -> Result<()> {
+                                            let mut conn = quorum_core::db::open(&p)?;
+                                            quorum_core::approvals::record(&mut conn, &record)
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            QuorumError::Io(format!("spawn_blocking join: {e}"))
+                                        })?
+                                        .ok();
                                     }
                                 }
                             }
-                            if !consume_mailbox_row(&db_path, *id).await {
-                                break;
-                            }
-                            continue;
+                            // Don't consume the mailbox row — next tick retries.
+                            break;
                         }
                         merge::ChecksOutcome::Ready => {
                             log(&format!(
@@ -2954,7 +2890,8 @@ async fn tick(
                                     continue 'merge_gate;
                                 }
                                 merge::ChecksOutcome::Failed { .. }
-                                | merge::ChecksOutcome::TimedOut => {
+                                | merge::ChecksOutcome::TimedOut
+                                | merge::ChecksOutcome::Pending { .. } => {
                                     break 'merge_gate attempt;
                                 }
                             }
