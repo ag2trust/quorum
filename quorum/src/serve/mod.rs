@@ -1597,34 +1597,35 @@ async fn tick(
                         }
                     }
 
-                    // Lifecycle: in-review → merging
-                    if fire_event(
-                        &db_path,
-                        &reviewers[ri].agent_name,
-                        reviewer_task_id,
-                        &Event::VerdictApprove,
-                    )
-                    .await
-                    .is_none()
-                    {
-                        // #174: if task is already merging, this is a merge-wait
-                        // retry — the unconsumed mailbox row replayed the verdict.
-                        // Proceed to the merge gate instead of skipping.
-                        let already_merging = {
-                            let p = db_path.clone();
-                            tokio::task::spawn_blocking(move || -> bool {
-                                quorum_core::db::open(&p)
-                                    .ok()
-                                    .and_then(|conn| {
-                                        tasks::get(&conn, reviewer_task_id).ok().flatten()
-                                    })
-                                    .map(|t| t.status == "merging")
-                                    .unwrap_or(false)
-                            })
-                            .await
-                            .unwrap_or(false)
-                        };
-                        if !already_merging {
+                    // #174: check if task is already merging (merge-wait
+                    // retry via unconsumed mailbox row). Skip VerdictApprove
+                    // entirely to avoid rejected transitions and unbounded
+                    // diagnostic writes.
+                    let already_merging = {
+                        let p = db_path.clone();
+                        tokio::task::spawn_blocking(move || -> bool {
+                            quorum_core::db::open(&p)
+                                .ok()
+                                .and_then(|conn| tasks::get(&conn, reviewer_task_id).ok().flatten())
+                                .map(|t| t.status == "merging")
+                                .unwrap_or(false)
+                        })
+                        .await
+                        .unwrap_or(false)
+                    };
+                    if already_merging {
+                        log("merge-wait retry: task already merging — proceeding to merge gate");
+                    } else {
+                        // Lifecycle: in-review → merging
+                        if fire_event(
+                            &db_path,
+                            &reviewers[ri].agent_name,
+                            reviewer_task_id,
+                            &Event::VerdictApprove,
+                        )
+                        .await
+                        .is_none()
+                        {
                             log("VerdictApprove transition failed — skipping merge");
                             let r = reviewers.remove(ri);
                             teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
@@ -1639,7 +1640,6 @@ async fn tick(
                             }
                             continue;
                         }
-                        log("merge-wait retry: task already merging — proceeding to merge gate");
                     }
 
                     // R2 audit: record completed R2 review for the stratum.
