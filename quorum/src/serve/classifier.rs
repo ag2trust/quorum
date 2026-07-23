@@ -75,9 +75,13 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                 result, is_error, ..
             } => {
                 if is_error.unwrap_or(false) {
-                    return Some(ClassifierResult::Error(
-                        "classifier agent returned an error".into(),
-                    ));
+                    let text = stream::result_text(result);
+                    let detail = if text.is_empty() {
+                        "classifier agent returned an error".into()
+                    } else {
+                        format!("classifier agent error: {}", truncate_error(&text, 300))
+                    };
+                    return Some(ClassifierResult::Error(detail));
                 }
                 let text = stream::result_text(result);
                 if !text.is_empty() {
@@ -103,6 +107,20 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
 pub enum ClassifierResult {
     Done(String),
     Error(String),
+}
+
+fn truncate_error(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max])
+    }
+}
+
+/// True when the error text looks like a Claude CLI authentication failure.
+pub fn is_auth_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("not logged in") || lower.contains("please run /login")
 }
 
 /// Parse the classifier response text into structured results.
@@ -181,5 +199,22 @@ mod tests {
     #[test]
     fn parse_response_invalid() {
         assert!(parse_response("not json at all").is_none());
+    }
+
+    #[test]
+    fn is_auth_error_detects_login_message() {
+        assert!(is_auth_error("Not logged in · Please run /login"));
+        assert!(is_auth_error("error: not logged in"));
+        assert!(!is_auth_error("rate limit exceeded"));
+    }
+
+    #[test]
+    fn truncate_error_respects_limit() {
+        assert_eq!(truncate_error("short", 10), "short");
+        let long = "a".repeat(400);
+        let t = truncate_error(&long, 300);
+        assert!(t.starts_with("aaa"));
+        assert!(t.ends_with('…'));
+        assert_eq!(&t[..300], &long[..300]);
     }
 }

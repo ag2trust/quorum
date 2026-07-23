@@ -43,7 +43,13 @@ drain_timeout_secs = 900
 
 # ── misc ──────────────────────────────────────────────────────────────
 base_branch = "main"
-# no_bare_agent = false
+
+# Claude authentication mode:
+#   no_bare_agent = true  (default) — inherit operator's Claude login; no --bare
+#   no_bare_agent = false            — pass --bare; requires non-interactive
+#                                      credentials (e.g. ANTHROPIC_API_KEY) in
+#                                      the daemon environment
+# no_bare_agent = true
 
 # ── doctor agent ──────────────────────────────────────────────────────
 # One-shot troubleshooter for tasks stalled with no active worker/reviewer.

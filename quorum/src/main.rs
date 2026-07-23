@@ -37,7 +37,7 @@ const DEFAULT_SERVE_TOML: &str = "\
 # effort = \"high\"
 # names_file = \"/path/to/names.txt\"
 # agent_bin = \"claude\"
-# no_bare_agent = false
+# no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\"
 # min_model = \"opus-47\"   # floor: bump workers below this tier up to it
@@ -1095,7 +1095,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 merge_token_file.as_deref(),
                 file_cfg.merge_token_file.as_deref(),
             );
-            let r_no_bare = resolve_bool(no_bare_agent, file_cfg.no_bare_agent, false);
+            let r_no_bare = resolve_bool(no_bare_agent, file_cfg.no_bare_agent, true);
             let r_max_turn_tokens = resolve_opt(max_turn_tokens, file_cfg.max_turn_tokens);
             let r_max_task_tokens = resolve_opt(max_task_tokens, file_cfg.max_task_tokens);
             let r_max_turn_cost = resolve_opt(max_turn_cost_usd, file_cfg.max_turn_cost_usd);
