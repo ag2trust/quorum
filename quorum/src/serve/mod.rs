@@ -4833,7 +4833,8 @@ async fn tick(
                         log(&format!("classifier: {e}"));
                     }
                     *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
-                    let delay = std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1)), 300);
+                    let delay =
+                        std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
                     *classifier_backoff_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
                     log(&format!(
@@ -4869,14 +4870,16 @@ async fn tick(
                 } else {
                     log("classifier: process exited without parseable response");
                     *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
-                    let delay = std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1)), 300);
+                    let delay =
+                        std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
                     *classifier_backoff_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
                 }
             } else {
                 log("classifier: process exited without response");
                 *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
-                let delay = std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1)), 300);
+                let delay =
+                    std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
                 *classifier_backoff_until =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
                 log(&format!(

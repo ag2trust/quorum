@@ -109,11 +109,13 @@ pub enum ClassifierResult {
     Error(String),
 }
 
-fn truncate_error(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
+fn truncate_error(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
     } else {
-        format!("{}…", &s[..max])
+        truncated
     }
 }
 
@@ -213,8 +215,16 @@ mod tests {
         assert_eq!(truncate_error("short", 10), "short");
         let long = "a".repeat(400);
         let t = truncate_error(&long, 300);
-        assert!(t.starts_with("aaa"));
         assert!(t.ends_with('…'));
-        assert_eq!(&t[..300], &long[..300]);
+        assert_eq!(t.chars().count(), 301); // 300 + '…'
+    }
+
+    #[test]
+    fn truncate_error_safe_on_multibyte() {
+        // "·" is 2 bytes in UTF-8; must not panic on boundary
+        let s = "Not logged in · Please run /login".repeat(20);
+        let t = truncate_error(&s, 30);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.chars().count(), 31);
     }
 }

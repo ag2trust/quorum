@@ -384,3 +384,52 @@ fn classifier_spawn_respects_no_bare_agent() {
         "classifier agent must NOT get --bare under --no-bare-agent; task refs: {refs}"
     );
 }
+
+/// #180: explicit `no_bare_agent = false` in a config file must still produce
+/// `--bare` agents — the default flip must not break existing configs.
+#[test]
+fn config_file_bare_false_enables_bare_mode() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    // Write a config file with explicit bare mode
+    let config_path = home.path().join("bare-test.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "repo = \"test/repo\"\nrepo_dir = \"{}\"\nworktree_base = \"{}\"\nno_bare_agent = false\n",
+            repo_dir.path().display(),
+            wt_base.path().display(),
+        ),
+    )
+    .unwrap();
+
+    seed_task(home.path(), "Test bare via config");
+
+    let config_str = config_path.to_string_lossy().to_string();
+    let handle = BareServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--config", &config_str],
+    );
+
+    assert!(
+        wait_session_log(home.path(), "[bare]", 15),
+        "agent should get --bare when config has no_bare_agent = false"
+    );
+
+    handle.stop();
+}
