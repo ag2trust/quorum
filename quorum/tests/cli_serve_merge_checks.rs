@@ -1556,3 +1556,104 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
 
     handle.stop();
 }
+
+/// #181: No CI configured (no checks_cmd) → merge proceeds immediately
+/// without entering merge-wait or timeout.
+#[test]
+fn no_ci_checks_merges_immediately() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Task for no-CI-checks test");
+
+    // No --merge-checks-cmd: CommandMergeExecutor returns Ready immediately.
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+    );
+
+    assert!(
+        handle.wait_for("spawning agent", 15),
+        "worker not spawned. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "reviewer not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, "1");
+
+    assert!(
+        handle.wait_for("merged", 15),
+        "merge-success log not seen. Lines: {:?}",
+        handle.lines
+    );
+
+    // Negative: no merge-wait, no timeout, no rework.
+    let saw_merge_wait = handle.lines.iter().any(|l| l.contains("merge wait"));
+    assert!(
+        !saw_merge_wait,
+        "merge-wait should NOT occur with no CI checks. Lines: {:?}",
+        handle.lines
+    );
+    let saw_timeout = handle.lines.iter().any(|l| l.contains("timed out"));
+    assert!(
+        !saw_timeout,
+        "timeout should NOT occur with no CI checks. Lines: {:?}",
+        handle.lines
+    );
+    let saw_rework = handle.lines.iter().any(|l| l.contains("rework"));
+    assert!(
+        !saw_rework,
+        "rework should NOT occur with no CI checks. Lines: {:?}",
+        handle.lines
+    );
+
+    handle.stop();
+}

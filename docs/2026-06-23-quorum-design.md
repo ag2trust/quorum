@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, coding-runner boundary 2026-07-24)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -672,6 +672,22 @@ The drain-interrupted timeout is a special case: the daemon preserves state (mai
 unconsumed, task stays `merging`) and returns `Ok(())` so restart recovery re-enters the
 merge flow. This is unchanged.
 
+#### No-CI contract (#181)
+
+When GitHub returns a valid PR payload whose `statusCheckRollup` is a structurally valid
+empty JSON array (`[]`), the repository has no configured CI checks. The daemon treats
+this as `ChecksOutcome::Ready` immediately — no timeout, no merge-wait, no rework.
+
+**Distinguishing valid-empty from unknown:** `parse_checks_json` returns
+`Option<Vec<...>>` for checks — `Some(vec![])` for a valid empty array, `None` for a
+missing field, non-array value, or malformed JSON. `checks_query_from_parsed` maps
+`Some(vec![])` → `AllPassed` and `None` → `Pending`. This prevents conflation of
+"no CI configured" with "unknown/error state".
+
+**Required jobs override:** if `required_jobs` is configured, `validate_required_jobs`
+still gates on each named job — absent jobs from an empty rollup produce `NotReady`,
+not `AllSucceeded`. The no-CI shortcut only applies to the general checks gate.
+
 #### No new lifecycle state
 
 The task remains in `merging` throughout infrastructure-pending waits. No new status is
@@ -865,6 +881,20 @@ Each invariant below requires both a positive and a negative test. Tests marked
     Assert: mailbox row unconsumed, task stays `merging`, approval record intact.
     (Existing test `drain_timeout_honored_during_merge_checks` covers the timing;
     this test covers state preservation.)
+
+**No-CI paths (#181):**
+
+18. `no_ci_checks_merges_immediately` — no checks configured, R1+R2 approve.
+    Assert: merge proceeds immediately, no merge-wait, no timeout, no rework.
+
+19. `required_jobs_absent_from_empty_rollup` — `required_jobs` configured but
+    `statusCheckRollup` is `[]`. Assert: `NotReady`, not `AllSucceeded`.
+
+20. `valid_empty_rollup_is_ready` — `statusCheckRollup: []` with any
+    `mergeStateStatus`. Assert: `ChecksQueryResult::AllPassed`.
+
+21. `missing_rollup_field_is_pending` — `statusCheckRollup` absent from JSON.
+    Assert: `ChecksQueryResult::Pending`.
 
 ### Post-merge review-analytics collector (#125)
 

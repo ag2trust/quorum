@@ -169,10 +169,13 @@ enum SingleCheckStatus {
     Pending,
 }
 
-fn parse_checks_json(json_str: &str) -> (Option<String>, Vec<(String, SingleCheckStatus)>) {
+/// Returns `(mergeStateStatus, checks)` where `checks` is:
+/// - `Some(vec![...])` when `statusCheckRollup` is a valid JSON array (possibly empty),
+/// - `None` when the field is missing, not an array, or JSON is malformed.
+fn parse_checks_json(json_str: &str) -> (Option<String>, Option<Vec<(String, SingleCheckStatus)>>) {
     let val: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
-        Err(_) => return (None, Vec::new()),
+        Err(_) => return (None, None),
     };
 
     let merge_state = val
@@ -209,22 +212,27 @@ fn parse_checks_json(json_str: &str) -> (Option<String>, Vec<(String, SingleChec
                     (name, check_status)
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        });
 
     (merge_state, checks)
 }
 
 fn checks_query_from_parsed(
     merge_state: &Option<String>,
-    checks: &[(String, SingleCheckStatus)],
+    checks: &Option<Vec<(String, SingleCheckStatus)>>,
 ) -> ChecksQueryResult {
     if merge_state.as_deref() == Some("CLEAN") {
         return ChecksQueryResult::AllPassed;
     }
 
-    if checks.is_empty() {
+    let Some(checks) = checks else {
+        // Field absent or not an array — unknown state, wait.
         return ChecksQueryResult::Pending;
+    };
+
+    if checks.is_empty() {
+        // Valid empty array — no CI configured, nothing to wait for.
+        return ChecksQueryResult::AllPassed;
     }
 
     let mut failing = Vec::new();
@@ -1257,20 +1265,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_checks_empty_rollup_is_pending() {
+    fn parse_checks_empty_rollup_is_ready() {
         let json = r#"{
             "mergeStateStatus": "BLOCKED",
             "statusCheckRollup": []
         }"#;
         let (state, checks) = parse_checks_json(json);
+        assert!(checks.as_ref().unwrap().is_empty());
         let result = checks_query_from_parsed(&state, &checks);
-        assert_eq!(result, ChecksQueryResult::Pending);
+        assert_eq!(result, ChecksQueryResult::AllPassed);
     }
 
     #[test]
     fn parse_checks_no_rollup_field_is_pending() {
         let json = r#"{"mergeStateStatus": "BLOCKED"}"#;
         let (state, checks) = parse_checks_json(json);
+        assert!(checks.is_none());
         let result = checks_query_from_parsed(&state, &checks);
         assert_eq!(result, ChecksQueryResult::Pending);
     }
@@ -1279,7 +1289,31 @@ mod tests {
     fn parse_checks_invalid_json() {
         let (state, checks) = parse_checks_json("not json");
         assert!(state.is_none());
-        assert!(checks.is_empty());
+        assert!(checks.is_none());
+    }
+
+    #[test]
+    fn parse_checks_non_array_rollup_is_pending() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": "not an array"
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        assert!(checks.is_none());
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::Pending);
+    }
+
+    #[test]
+    fn parse_checks_null_rollup_is_pending() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": null
+        }"#;
+        let (state, checks) = parse_checks_json(json);
+        assert!(checks.is_none());
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::Pending);
     }
 
     #[test]
@@ -1636,6 +1670,19 @@ mod tests {
     fn required_jobs_invalid_json() {
         let result = validate_required_jobs("not json", &["test".into()]);
         assert!(matches!(result, RequiredJobsOutcome::NotReady { .. }));
+    }
+
+    #[test]
+    fn required_jobs_absent_from_empty_rollup() {
+        let json = r#"{"statusCheckRollup": []}"#;
+        let result = validate_required_jobs(json, &["ci-gate".into()]);
+        match result {
+            RequiredJobsOutcome::NotReady { issues } => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0], ("ci-gate".into(), "absent".into()));
+            }
+            other => panic!("expected NotReady, got {other:?}"),
+        }
     }
 
     // ── Default branch CI gate tests ──────────────────────────────────
