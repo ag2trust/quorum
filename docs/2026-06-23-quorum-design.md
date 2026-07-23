@@ -675,14 +675,18 @@ merge flow. This is unchanged.
 #### No-CI contract (#181)
 
 When GitHub returns a valid PR payload whose `statusCheckRollup` is a structurally valid
-empty JSON array (`[]`), the repository has no configured CI checks. The daemon treats
-this as `ChecksOutcome::Ready` immediately — no timeout, no merge-wait, no rework.
+empty JSON array (`[]`), the repository may have no configured CI checks — or checks may
+not have registered yet after a recent push (the ag2trust #3583 transient-empty race).
 
-**Distinguishing valid-empty from unknown:** `parse_checks_json` returns
-`Option<Vec<...>>` for checks — `Some(vec![])` for a valid empty array, `None` for a
-missing field, non-array value, or malformed JSON. `checks_query_from_parsed` maps
-`Some(vec![])` → `AllPassed` and `None` → `Pending`. This prevents conflation of
-"no CI configured" with "unknown/error state".
+**Disambiguation via consecutive polls:** `parse_checks_json` returns `Option<Vec<...>>`
+for checks — `Some(vec![])` for a valid empty array, `None` for a missing field,
+non-array value, or malformed JSON. `checks_query_from_parsed` maps `Some(vec![])` →
+`NoChecksConfigured` (distinct from `AllPassed`) and `None` → `Pending`.
+`GhMergeExecutor::wait_for_checks` requires **2+ consecutive `NoChecksConfigured` polls**
+before returning `Ready`. This protects against the transient-empty-after-push race: the
+first empty poll sleeps `poll_interval_secs`, then re-queries. If checks have registered
+by the second poll, the counter resets and normal waiting continues. If still empty, the
+repo genuinely has no CI and the daemon proceeds to merge.
 
 **Required jobs override:** if `required_jobs` is configured, `validate_required_jobs`
 still gates on each named job — absent jobs from an empty rollup produce `NotReady`,
@@ -884,17 +888,23 @@ Each invariant below requires both a positive and a negative test. Tests marked
 
 **No-CI paths (#181):**
 
-18. `no_ci_checks_merges_immediately` — no checks configured, R1+R2 approve.
-    Assert: merge proceeds immediately, no merge-wait, no timeout, no rework.
+18. `parse_checks_empty_rollup_is_no_checks_configured` — `statusCheckRollup: []`
+    with `mergeStateStatus: BLOCKED`. Assert: `ChecksQueryResult::NoChecksConfigured`
+    (not `AllPassed` or `Pending`). Unit test.
 
 19. `required_jobs_absent_from_empty_rollup` — `required_jobs` configured but
-    `statusCheckRollup` is `[]`. Assert: `NotReady`, not `AllSucceeded`.
+    `statusCheckRollup` is `[]`. Assert: `NotReady`, not `AllSucceeded`. Unit test.
 
-20. `valid_empty_rollup_is_ready` — `statusCheckRollup: []` with any
-    `mergeStateStatus`. Assert: `ChecksQueryResult::AllPassed`.
+20. `parse_checks_no_rollup_field_is_pending` — `statusCheckRollup` absent from JSON.
+    Assert: `ChecksQueryResult::Pending`. Unit test.
 
-21. `missing_rollup_field_is_pending` — `statusCheckRollup` absent from JSON.
-    Assert: `ChecksQueryResult::Pending`.
+21. `parse_checks_non_array_rollup_is_pending` — `statusCheckRollup` is a string/null.
+    Assert: `ChecksQueryResult::Pending`. Unit test.
+
+22. Consecutive-polls guard — `GhMergeExecutor::wait_for_checks` requires 2+
+    consecutive `NoChecksConfigured` before returning `Ready`. Protects against
+    transient-empty-after-push (#3583). Verified by unit test structure; E2E
+    coverage deferred (requires gh-shim, see #181 PR review discussion).
 
 ### Post-merge review-analytics collector (#125)
 

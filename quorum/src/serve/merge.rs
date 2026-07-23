@@ -160,6 +160,10 @@ enum ChecksQueryResult {
     AllPassed,
     SomeFailed(Vec<String>),
     Pending,
+    /// Valid empty statusCheckRollup — repo may have no CI, or checks
+    /// may not have registered yet after a push. Caller must require
+    /// consecutive polls before trusting this as Ready.
+    NoChecksConfigured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,8 +235,9 @@ fn checks_query_from_parsed(
     };
 
     if checks.is_empty() {
-        // Valid empty array — no CI configured, nothing to wait for.
-        return ChecksQueryResult::AllPassed;
+        // Valid empty array — might be no CI, or checks haven't registered
+        // yet after a push. Caller must poll again to disambiguate.
+        return ChecksQueryResult::NoChecksConfigured;
     }
 
     let mut failing = Vec::new();
@@ -634,6 +639,10 @@ impl MergeExecutor for GhMergeExecutor {
         poll_interval_secs: u64,
     ) -> ChecksOutcome {
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        // #181: after a push, GitHub transiently returns statusCheckRollup: []
+        // before CI registers. Require 2 consecutive empty polls to distinguish
+        // "no CI configured" from "checks haven't registered yet."
+        let mut consecutive_no_checks = 0u32;
         loop {
             match self.query_checks(pr, repo_dir) {
                 ChecksQueryResult::AllPassed => return ChecksOutcome::Ready,
@@ -642,7 +651,15 @@ impl MergeExecutor for GhMergeExecutor {
                         failing_checks: names,
                     }
                 }
-                ChecksQueryResult::Pending => {}
+                ChecksQueryResult::NoChecksConfigured => {
+                    consecutive_no_checks += 1;
+                    if consecutive_no_checks >= 2 {
+                        return ChecksOutcome::Ready;
+                    }
+                }
+                ChecksQueryResult::Pending => {
+                    consecutive_no_checks = 0;
+                }
             }
             if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
                 return ChecksOutcome::TimedOut;
@@ -1265,13 +1282,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_checks_empty_rollup_is_ready() {
+    fn parse_checks_empty_rollup_is_no_checks_configured() {
         let json = r#"{
             "mergeStateStatus": "BLOCKED",
             "statusCheckRollup": []
         }"#;
         let (state, checks) = parse_checks_json(json);
         assert!(checks.as_ref().unwrap().is_empty());
+        let result = checks_query_from_parsed(&state, &checks);
+        assert_eq!(result, ChecksQueryResult::NoChecksConfigured);
+    }
+
+    #[test]
+    fn parse_checks_clean_with_empty_rollup_is_all_passed() {
+        let json = r#"{
+            "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": []
+        }"#;
+        let (state, checks) = parse_checks_json(json);
         let result = checks_query_from_parsed(&state, &checks);
         assert_eq!(result, ChecksQueryResult::AllPassed);
     }
