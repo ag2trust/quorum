@@ -6,6 +6,10 @@
 pub mod agent;
 pub mod approvals;
 pub mod classifier;
+#[allow(dead_code)]
+pub mod codex_agent;
+#[allow(dead_code)]
+pub mod codex_stream;
 pub mod collector;
 pub mod doctor;
 pub mod merge;
