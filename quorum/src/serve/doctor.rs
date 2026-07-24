@@ -98,6 +98,7 @@ pub fn spawn_doctor(
     repo: &str,
 ) -> std::io::Result<DoctorSlot> {
     let spec = AgentSpec {
+        kind: super::runner::AgentKind::Claude,
         model: DOCTOR_MODEL.to_string(),
         effort: DOCTOR_EFFORT.to_string(),
         session_id: agent::new_session_id(),

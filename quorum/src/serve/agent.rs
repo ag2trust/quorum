@@ -1,5 +1,6 @@
 //! AgentProc: spawn, feed, read, and kill one claude child process.
 
+use super::runner::AgentKind;
 use super::stream::{self, Event};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -7,6 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
 pub struct AgentSpec {
+    #[allow(dead_code)] // consumed when runner dispatch is added
+    pub kind: AgentKind,
     pub model: String,
     pub effort: String,
     pub session_id: String,
@@ -116,6 +119,15 @@ impl AgentProc {
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+
+    /// Return the next raw stdout line, or `None` on EOF/error.
+    /// Used by the daemon to preserve verbatim JSONL in session logs.
+    pub async fn next_raw_line(&mut self) -> Option<String> {
+        match self.reader.next_line().await {
+            Ok(Some(line)) => Some(line),
+            _ => None,
+        }
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -278,6 +290,7 @@ mod tests {
     #[test]
     fn agent_spec_carries_allowed_tools() {
         let spec = AgentSpec {
+            kind: AgentKind::Claude,
             model: "opus".into(),
             effort: "high".into(),
             session_id: "sid".into(),

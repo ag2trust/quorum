@@ -23,6 +23,7 @@ pub struct ClassifierSlot {
 /// respawn-loops (observed live 2026-07-10, right after the session-id fix).
 pub fn classifier_spec(repo_dir: &Path, bare: bool) -> AgentSpec {
     AgentSpec {
+        kind: super::runner::AgentKind::Claude,
         model: CLASSIFIER_MODEL.to_string(),
         effort: CLASSIFIER_EFFORT.to_string(),
         session_id: super::agent::new_session_id(),

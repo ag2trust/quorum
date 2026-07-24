@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use super::render;
-use super::stream::Event;
+use super::runner::AgentEvent;
 
 pub struct SessionLog {
     dir: PathBuf,
@@ -91,7 +91,8 @@ impl SessionLog {
         &self.dir
     }
 
-    pub fn log_event(&mut self, event: &Event) {
+    #[cfg(test)]
+    pub fn log_event(&mut self, event: &super::stream::Event) {
         if let Ok(json) = serde_json::to_string(event) {
             let _ = writeln!(self.stream_file, "{json}");
         }
@@ -102,6 +103,20 @@ impl SessionLog {
 
         let _ = self.transcript_file.flush();
         let _ = self.stream_file.flush();
+    }
+
+    /// Write a raw provider line verbatim to stream.jsonl, then render
+    /// normalized events to transcript.md.
+    pub fn log_raw_and_normalized(&mut self, raw_line: &str, events: &[AgentEvent]) {
+        let _ = writeln!(self.stream_file, "{raw_line}");
+        let _ = self.stream_file.flush();
+
+        for event in events {
+            if let Some(rendered) = render::render_agent_event(event) {
+                let _ = writeln!(self.transcript_file, "{rendered}");
+            }
+        }
+        let _ = self.transcript_file.flush();
     }
 
     pub fn set_phase(&mut self, phase: &str) {
@@ -176,6 +191,7 @@ fn age_from_mtime(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::stream::Event;
     use tempfile::TempDir;
 
     #[test]
@@ -357,6 +373,69 @@ mod tests {
         assert!(
             stream.contains("tool_use"),
             "stream.jsonl must be visible immediately after log_event"
+        );
+    }
+
+    #[test]
+    fn raw_line_preserved_verbatim() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+
+        let raw = r#"{"type":"result","result":"done","extra_provider_field":true,"usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let events = crate::serve::runner::normalize_claude_line(raw);
+        log.log_raw_and_normalized(raw, &events);
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert_eq!(
+            stream.trim(),
+            raw,
+            "stream.jsonl must contain the raw line verbatim, not re-serialized"
+        );
+        assert!(
+            stream.contains("extra_provider_field"),
+            "extra fields must survive in stream.jsonl"
+        );
+    }
+
+    #[test]
+    fn normalized_event_renders_to_transcript() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+
+        let raw = r#"{"type":"assistant","message":{"content":"hello normalized"}}"#;
+        let events = crate::serve::runner::normalize_claude_line(raw);
+        log.log_raw_and_normalized(raw, &events);
+
+        let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
+        assert!(
+            transcript.contains("hello normalized"),
+            "normalized text must render to transcript"
+        );
+    }
+
+    #[test]
+    fn unknown_event_logged_raw_no_transcript() {
+        let dir = TempDir::new().unwrap();
+        let mut log =
+            SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
+
+        let raw = r#"{"type":"system","message":"init","custom":42}"#;
+        let events = crate::serve::runner::normalize_claude_line(raw);
+        assert!(events.is_empty());
+        log.log_raw_and_normalized(raw, &events);
+
+        let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
+        assert!(
+            stream.contains("custom"),
+            "unknown events must still appear in stream.jsonl"
+        );
+
+        let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
+        assert!(
+            !transcript.contains("custom"),
+            "unknown events must not render to transcript"
         );
     }
 }

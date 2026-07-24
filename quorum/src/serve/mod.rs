@@ -17,6 +17,7 @@ pub mod names;
 pub mod recovery;
 pub mod render;
 pub mod reviewer;
+pub mod runner;
 pub mod session_log;
 pub mod stream;
 pub mod worktree;
@@ -5110,148 +5111,164 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
 
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
 /// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
+///
+/// Raw provider lines are preserved verbatim in stream.jsonl; the daemon
+/// consumes only normalized `AgentEvent`s via the runner boundary.
 async fn drain_events(
     slot: &mut SlotState,
     db_path: &std::path::Path,
     role: &str,
     limits: &CostLimits,
 ) -> Result<Option<LimitBreached>> {
-    while let Ok(Some(event)) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_event()).await
+    while let Ok(Some(raw_line)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_raw_line()).await
     {
-        match &event {
-            stream::Event::Result {
-                usage,
-                total_cost_usd,
-                is_error,
-                result,
-                ..
-            } => {
-                let error_terminated = is_error.unwrap_or(false);
-                let turn_tokens = usage
-                    .as_ref()
-                    .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
-                slot.cost_tokens += turn_tokens;
-                // total_cost_usd is session-cumulative (running total), not per-turn.
-                // Derive per-turn cost as the delta before overwriting the high-water mark.
-                let prev_cost = slot.cost_usd;
-                if let Some(cost) = total_cost_usd {
-                    slot.cost_usd = *cost;
-                }
-                let turn_cost_usd = total_cost_usd.map(|c| (c - prev_cost).max(0.0));
-                log(&format!(
-                    "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}{})",
-                    slot.agent_name,
-                    turn_tokens,
-                    slot.cost_tokens,
-                    slot.cost_usd,
-                    if error_terminated { ", ERROR" } else { "" }
-                ));
-
-                let phase = if error_terminated {
-                    "working"
-                } else if role == "worker" {
-                    "awaiting-review"
-                } else {
-                    "reviewing"
-                };
-
-                if let Some(ref mut sl) = slot.session_log {
-                    sl.update_cost(slot.cost_tokens, slot.cost_usd);
-                    sl.set_phase(phase);
-                }
-
-                let p = db_path.to_path_buf();
-                let entry = slot_journal_entry(slot, role, phase);
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    journal::upsert(&mut conn, &entry)
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
-
-                slot.draining = false;
-                slot.turn_ended_at = Some(std::time::Instant::now());
-                slot.live_stats.mid_turn_tokens = 0;
-                slot.live_stats.record_event();
-
-                if error_terminated {
-                    slot.error_turn_count += 1;
-                    let raw = stream::result_text(result);
-                    let bounded: String = raw.chars().take(120).collect();
-                    slot.last_error_text = Some(bounded);
-                } else {
-                    slot.error_turn_count = 0;
-                    slot.last_error_text = None;
-                }
-
-                write_live_sidecar(slot);
-
-                if let Some(ref mut sl) = slot.session_log {
-                    sl.log_event(&event);
-                }
-
-                let breach = check_post_result_limits(
-                    limits,
-                    turn_tokens,
-                    slot.cost_tokens,
-                    turn_cost_usd,
-                    slot.cost_usd,
-                    slot,
-                );
-                return Ok(breach);
-            }
-            stream::Event::Assistant { message } => {
-                let content = message.get("content");
-                if let Some(blocks) = content.and_then(|c| c.as_array()) {
-                    // Agent text blocks are captured in the per-session log
-                    // (stream.jsonl + transcript.md); do NOT echo them to daemon
-                    // stderr — they drown real serve decisions/errors. Only
-                    // tool_use blocks update live stats here.
-                    for block in blocks {
-                        if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
-                            if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                                let input = block
-                                    .get("input")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                                slot.live_stats.tool_count += 1;
-                                slot.live_stats.now_label = now_label(name, &input);
-                            }
-                        }
-                    }
-                }
-                if let Some(usage) = message.get("usage") {
-                    let input = usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    if input + output > 0 {
-                        slot.live_stats.mid_turn_tokens = input + output;
-                    }
-                }
-                slot.live_stats.record_event();
-                write_live_sidecar(slot);
-            }
-            stream::Event::ToolUse { name, input } => {
-                slot.live_stats.tool_count += 1;
-                slot.live_stats.now_label = now_label(name, input);
-                slot.live_stats.record_event();
-                write_live_sidecar(slot);
-            }
-            _ => {}
-        }
+        let events = runner::normalize_claude_line(&raw_line);
 
         if let Some(ref mut sl) = slot.session_log {
-            sl.log_event(&event);
+            sl.log_raw_and_normalized(&raw_line, &events);
+        }
+
+        for agent_event in &events {
+            match agent_event {
+                runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
+                    let turn_tokens =
+                        usage.map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
+                    slot.cost_tokens += turn_tokens;
+                    // cost_usd is session-cumulative (running total), not per-turn.
+                    let prev_cost = slot.cost_usd;
+                    if let Some(cost) = cost_usd {
+                        slot.cost_usd = *cost;
+                    }
+                    let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
+                    log(&format!(
+                        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4})",
+                        slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd,
+                    ));
+
+                    let phase = if role == "worker" {
+                        "awaiting-review"
+                    } else {
+                        "reviewing"
+                    };
+
+                    if let Some(ref mut sl) = slot.session_log {
+                        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                        sl.set_phase(phase);
+                    }
+
+                    let p = db_path.to_path_buf();
+                    let entry = slot_journal_entry(slot, role, phase);
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        journal::upsert(&mut conn, &entry)
+                    })
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                    .ok();
+
+                    slot.draining = false;
+                    slot.turn_ended_at = Some(std::time::Instant::now());
+                    slot.live_stats.mid_turn_tokens = 0;
+                    slot.live_stats.record_event();
+                    write_live_sidecar(slot);
+                    slot.error_turn_count = 0;
+                    slot.last_error_text = None;
+
+                    let breach = check_post_result_limits(
+                        limits,
+                        turn_tokens,
+                        slot.cost_tokens,
+                        turn_cost_usd,
+                        slot.cost_usd,
+                        slot,
+                    );
+                    return Ok(breach);
+                }
+
+                runner::AgentEvent::TurnFailed {
+                    message,
+                    usage,
+                    cost_usd,
+                } => {
+                    let turn_tokens =
+                        usage.map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
+                    slot.cost_tokens += turn_tokens;
+                    let prev_cost = slot.cost_usd;
+                    if let Some(cost) = cost_usd {
+                        slot.cost_usd = *cost;
+                    }
+                    let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
+                    log(&format!(
+                        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}, ERROR)",
+                        slot.agent_name, turn_tokens, slot.cost_tokens, slot.cost_usd,
+                    ));
+
+                    if let Some(ref mut sl) = slot.session_log {
+                        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+                        sl.set_phase("working");
+                    }
+
+                    let p = db_path.to_path_buf();
+                    let entry = slot_journal_entry(slot, role, "working");
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        journal::upsert(&mut conn, &entry)
+                    })
+                    .await
+                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+                    .ok();
+
+                    slot.draining = false;
+                    slot.turn_ended_at = Some(std::time::Instant::now());
+                    slot.live_stats.mid_turn_tokens = 0;
+                    slot.live_stats.record_event();
+                    slot.error_turn_count += 1;
+                    let bounded: String = message.chars().take(120).collect();
+                    slot.last_error_text = Some(bounded);
+                    write_live_sidecar(slot);
+
+                    let breach = check_post_result_limits(
+                        limits,
+                        turn_tokens,
+                        slot.cost_tokens,
+                        turn_cost_usd,
+                        slot.cost_usd,
+                        slot,
+                    );
+                    return Ok(breach);
+                }
+
+                runner::AgentEvent::AssistantText { .. } => {
+                    slot.live_stats.record_event();
+                    write_live_sidecar(slot);
+                }
+
+                runner::AgentEvent::Activity { summary, .. } => {
+                    slot.live_stats.tool_count += 1;
+                    slot.live_stats.now_label = truncate_now_label(summary);
+                    slot.live_stats.record_event();
+                    write_live_sidecar(slot);
+                }
+
+                runner::AgentEvent::MidTurnUsage { tokens } => {
+                    slot.live_stats.mid_turn_tokens = *tokens;
+                    slot.live_stats.record_event();
+                    write_live_sidecar(slot);
+                }
+            }
         }
     }
     Ok(None)
+}
+
+fn truncate_now_label(s: &str) -> String {
+    if s.chars().count() <= 24 {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(23).collect();
+        format!("{t}…")
+    }
 }
 
 fn write_live_sidecar(slot: &SlotState) {
@@ -5270,42 +5287,6 @@ fn write_live_sidecar(slot: &SlotState) {
         if let Ok(json) = serde_json::to_string(&stats) {
             let _ = std::fs::write(&path, json);
         }
-    }
-}
-
-fn now_label(name: &str, input: &serde_json::Value) -> String {
-    let snippet = match name {
-        "Bash" => input
-            .get("command")
-            .and_then(|c| c.as_str())
-            .map(|c| c.split_whitespace().take(3).collect::<Vec<_>>().join(" ")),
-        "Read" | "Write" | "Edit" => input
-            .get("file_path")
-            .and_then(|p| p.as_str())
-            .map(|p| p.rsplit('/').next().unwrap_or(p).to_string()),
-        "Grep" => input
-            .get("pattern")
-            .and_then(|p| p.as_str())
-            .map(|s| s.to_string()),
-        "Glob" => input
-            .get("pattern")
-            .and_then(|p| p.as_str())
-            .map(|s| s.to_string()),
-        "Agent" => input
-            .get("description")
-            .and_then(|d| d.as_str())
-            .map(|s| s.to_string()),
-        _ => None,
-    };
-    let full = match snippet {
-        Some(s) => format!("{name}: {s}"),
-        None => name.to_string(),
-    };
-    if full.chars().count() <= 24 {
-        full
-    } else {
-        let t: String = full.chars().take(23).collect();
-        format!("{t}…")
     }
 }
 
@@ -5991,6 +5972,7 @@ async fn spawn_worker(
     }
 
     let spec = AgentSpec {
+        kind: runner::AgentKind::Claude,
         model: resolved_model.clone(),
         effort: resolved_effort.clone(),
         session_id: session_id.clone(),
@@ -7090,6 +7072,7 @@ async fn spawn_remediation_worker(
 
     match agent::AgentProc::spawn(
         &agent::AgentSpec {
+            kind: runner::AgentKind::Claude,
             model: config.model.clone(),
             effort: config.effort.clone(),
             session_id: session_id.clone(),
@@ -8162,58 +8145,47 @@ mod tests {
     }
 
     #[test]
-    fn now_label_bash_command() {
-        let input = serde_json::json!({"command": "cargo test"});
-        assert_eq!(now_label("Bash", &input), "Bash: cargo test");
-    }
-
-    #[test]
-    fn now_label_read_file() {
-        let input = serde_json::json!({"file_path": "/foo/bar/stats.rs"});
-        assert_eq!(now_label("Read", &input), "Read: stats.rs");
-    }
-
-    #[test]
-    fn now_label_truncation() {
-        let input = serde_json::json!({"command": "cargo build --all-targets --features bundled"});
-        let label = now_label("Bash", &input);
-        assert!(label.chars().count() <= 24, "label too long: {label}");
-        assert!(label.ends_with('…'));
-    }
-
-    #[test]
-    fn now_label_unknown_tool() {
-        let input = serde_json::json!({});
-        assert_eq!(now_label("UnknownTool", &input), "UnknownTool");
-    }
-
-    #[test]
-    fn assistant_content_array_extracts_tool_use() {
-        let message = serde_json::json!({
-            "content": [
-                {"type": "text", "text": "Let me check that."},
-                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}},
-                {"type": "tool_use", "name": "Read", "input": {"file_path": "/foo/bar.rs"}}
-            ]
-        });
-        let mut tool_count: u32 = 0;
-        let mut last_now = String::new();
-        if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
-            for block in blocks {
-                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                        let input = block
-                            .get("input")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        tool_count += 1;
-                        last_now = now_label(name, &input);
-                    }
-                }
+    fn runner_tool_summary_via_normalize() {
+        let line = r#"{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}}"#;
+        let events = runner::normalize_claude_line(line);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            runner::AgentEvent::Activity { summary, .. } => {
+                assert!(summary.contains("Bash"), "summary={summary}");
+                assert!(summary.contains("cargo test"), "summary={summary}");
             }
+            other => panic!("expected Activity, got {other:?}"),
         }
-        assert_eq!(tool_count, 2);
-        assert_eq!(last_now, "Read: bar.rs");
+    }
+
+    #[test]
+    fn runner_tool_summary_truncation() {
+        let line = r#"{"type":"tool_use","name":"Bash","input":{"command":"cargo build --all-targets --features bundled"}}"#;
+        let events = runner::normalize_claude_line(line);
+        match &events[0] {
+            runner::AgentEvent::Activity { summary, .. } => {
+                assert!(summary.chars().count() <= 24, "summary too long: {summary}");
+            }
+            other => panic!("expected Activity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_content_array_extracts_tool_use_via_runner() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me check that."},{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","name":"Read","input":{"file_path":"/foo/bar.rs"}}]}}"#;
+        let events = runner::normalize_claude_line(line);
+        let tool_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, runner::AgentEvent::Activity { .. }))
+            .collect();
+        assert_eq!(tool_events.len(), 2);
+        match &tool_events[1] {
+            runner::AgentEvent::Activity { summary, .. } => {
+                assert!(summary.contains("Read"), "summary={summary}");
+                assert!(summary.contains("bar.rs"), "summary={summary}");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]

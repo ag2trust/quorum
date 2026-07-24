@@ -504,6 +504,7 @@ async fn spawn_and_run_classifier(
     let turn = agent::user_turn(&prompt);
 
     let spec = AgentSpec {
+        kind: super::runner::AgentKind::Claude,
         model: CLASSIFIER_MODEL.to_string(),
         effort: CLASSIFIER_EFFORT.to_string(),
         session_id: agent::new_session_id(),
