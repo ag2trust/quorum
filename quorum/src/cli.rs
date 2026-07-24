@@ -367,7 +367,10 @@ pub enum Command {
         /// When absent, names are auto-generated.
         #[arg(long)]
         names_file: Option<String>,
-        /// Override the agent binary (default: "claude").
+        /// Runner type: "claude" (default) or "codex".
+        #[arg(long)]
+        agent: Option<String>,
+        /// Override the agent binary (default: "claude" or "codex" per runner).
         #[arg(long)]
         agent_bin: Option<String>,
         /// Model to pass to spawned agents (default: sonnet).

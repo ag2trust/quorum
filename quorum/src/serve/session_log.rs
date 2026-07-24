@@ -91,6 +91,7 @@ impl SessionLog {
         &self.dir
     }
 
+    #[allow(dead_code)]
     pub fn log_event(&mut self, event: &Event) {
         if let Ok(json) = serde_json::to_string(event) {
             let _ = writeln!(self.stream_file, "{json}");
@@ -101,6 +102,13 @@ impl SessionLog {
         }
 
         let _ = self.transcript_file.flush();
+        let _ = self.stream_file.flush();
+    }
+
+    /// Write a pre-serialized JSON line to the stream log. Used by unified
+    /// drain_events for runner-agnostic session logging.
+    pub fn log_json_line(&mut self, json: &str) {
+        let _ = writeln!(self.stream_file, "{json}");
         let _ = self.stream_file.flush();
     }
 

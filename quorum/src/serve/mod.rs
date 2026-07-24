@@ -17,6 +17,7 @@ pub mod names;
 pub mod recovery;
 pub mod render;
 pub mod reviewer;
+pub mod runner;
 pub mod session_log;
 pub mod stream;
 pub mod worktree;
@@ -469,6 +470,7 @@ pub struct CostLimits {
 pub struct ServeConfig {
     pub db_path: PathBuf,
     pub cap: usize,
+    pub runner_kind: crate::serve_config::RunnerKind,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
     pub names_file: Option<PathBuf>,
@@ -526,6 +528,8 @@ pub struct ServeConfig {
     pub min_model: Option<String>,
     /// #172: minimum worker effort floor ("medium"|"high"), or None for no floor.
     pub min_effort: Option<String>,
+    /// Codex sandbox mode (default: "danger-full-access").
+    pub codex_sandbox: String,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -648,7 +652,7 @@ impl LiveStats {
 
 pub(crate) struct SlotState {
     agent_name: String,
-    proc: AgentProc,
+    proc: runner::RunnerProc,
     task_id: i64,
     session_id: String,
     worktree_path: PathBuf,
@@ -677,6 +681,9 @@ pub(crate) struct SlotState {
     /// PR head SHA at reviewer spawn time. Used to detect stale approvals
     /// when the author pushes new commits between review and merge.
     reviewed_head_sha: Option<String>,
+    /// Codex thread identity for continuation. Set from the first
+    /// `thread.started` event, persisted to task refs before use.
+    codex_thread_id: Option<String>,
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -1848,7 +1855,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_turn = reviewer::build_rework_turn(
+                                        let rework_prompt = reviewer::build_rework_prompt(
                                             &workers[wi].agent_name,
                                             workers[wi].task_id,
                                             pr_num,
@@ -1856,8 +1863,12 @@ async fn tick(
                                             workers[wi].cost_usd,
                                             config.limits.max_task_cost_usd,
                                         );
-                                        if let Err(e) =
-                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        if let Err(e) = feed_worker_turn(
+                                            &mut workers[wi],
+                                            &rework_prompt,
+                                            config,
+                                        )
+                                        .await
                                         {
                                             log(&format!(
                                                 "conflict rework feed failed: {e} — cleaning up"
@@ -2139,7 +2150,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_turn = reviewer::build_rework_turn(
+                                        let rework_prompt = reviewer::build_rework_prompt(
                                             &workers[wi].agent_name,
                                             workers[wi].task_id,
                                             pr_num,
@@ -2147,8 +2158,12 @@ async fn tick(
                                             workers[wi].cost_usd,
                                             config.limits.max_task_cost_usd,
                                         );
-                                        if let Err(e) =
-                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        if let Err(e) = feed_worker_turn(
+                                            &mut workers[wi],
+                                            &rework_prompt,
+                                            config,
+                                        )
+                                        .await
                                         {
                                             log(&format!(
                                                 "checks-failure rework feed failed: {e} — cleaning up"
@@ -2345,7 +2360,7 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            let rework_turn = reviewer::build_rework_turn(
+                                            let rework_prompt = reviewer::build_rework_prompt(
                                                 &workers[wi].agent_name,
                                                 workers[wi].task_id,
                                                 pr_num,
@@ -2353,8 +2368,12 @@ async fn tick(
                                                 workers[wi].cost_usd,
                                                 config.limits.max_task_cost_usd,
                                             );
-                                            if let Err(e) =
-                                                workers[wi].proc.feed_turn(&rework_turn).await
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
+                                            .await
                                             {
                                                 log(&format!(
                                                     "timeout-conflict rework feed failed: \
@@ -2684,7 +2703,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_turn = reviewer::build_rework_turn(
+                                        let rework_prompt = reviewer::build_rework_prompt(
                                             &workers[wi].agent_name,
                                             workers[wi].task_id,
                                             pr_num,
@@ -2692,8 +2711,12 @@ async fn tick(
                                             workers[wi].cost_usd,
                                             config.limits.max_task_cost_usd,
                                         );
-                                        if let Err(e) =
-                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        if let Err(e) = feed_worker_turn(
+                                            &mut workers[wi],
+                                            &rework_prompt,
+                                            config,
+                                        )
+                                        .await
                                         {
                                             log(&format!(
                                                 "pre-merge conflict rework feed failed: \
@@ -3053,7 +3076,7 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                let rework_turn = reviewer::build_rework_turn(
+                                                let rework_prompt = reviewer::build_rework_prompt(
                                                     &workers[wi].agent_name,
                                                     workers[wi].task_id,
                                                     pr_num,
@@ -3061,8 +3084,12 @@ async fn tick(
                                                     workers[wi].cost_usd,
                                                     config.limits.max_task_cost_usd,
                                                 );
-                                                if let Err(e) =
-                                                    workers[wi].proc.feed_turn(&rework_turn).await
+                                                if let Err(e) = feed_worker_turn(
+                                                    &mut workers[wi],
+                                                    &rework_prompt,
+                                                    config,
+                                                )
+                                                .await
                                                 {
                                                     log(&format!(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
@@ -3326,7 +3353,7 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                let rework_turn = reviewer::build_rework_turn(
+                                let rework_prompt = reviewer::build_rework_prompt(
                                     &workers[wi].agent_name,
                                     workers[wi].task_id,
                                     rework_pr,
@@ -3334,7 +3361,9 @@ async fn tick(
                                     workers[wi].cost_usd,
                                     config.limits.max_task_cost_usd,
                                 );
-                                if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
+                                if let Err(e) =
+                                    feed_worker_turn(&mut workers[wi], &rework_prompt, config).await
+                                {
                                     log(&format!("rework feed_turn failed: {e} — cleaning up"));
                                     let w = workers.remove(wi);
                                     fire_event(
@@ -3919,12 +3948,12 @@ async fn tick(
             error_failed.push(i);
             continue;
         }
-        let turn = agent::user_turn(&format!(
+        let raw_prompt = format!(
             "Your previous turn was interrupted by a transport/API error (attempt {}/{}). \
              Verify any partial state from your last turn, then continue your task.",
             w.error_turn_count, MAX_ERROR_RETRIES
-        ));
-        match w.proc.feed_turn(&turn).await {
+        );
+        match feed_worker_turn(w, &raw_prompt, config).await {
             Ok(()) => {
                 w.draining = true;
                 w.turn_started_at = std::time::Instant::now();
@@ -4194,8 +4223,8 @@ async fn tick(
             }
             Some(wi) => {
                 let payload = msg_row.payload.as_deref().unwrap_or("");
-                let turn = agent::user_turn(&format!("MESSAGE from {}: {payload}", msg_row.agent));
-                match workers[wi].proc.feed_turn(&turn).await {
+                let raw_prompt = format!("MESSAGE from {}: {payload}", msg_row.agent);
+                match feed_worker_turn(&mut workers[wi], &raw_prompt, config).await {
                     Ok(()) => {
                         workers[wi].draining = true;
                         workers[wi].turn_started_at = std::time::Instant::now();
@@ -5108,6 +5137,159 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
     None
 }
 
+/// Common post-turn-end processing: update slot state, journal, sidecar, check limits.
+async fn handle_turn_end(
+    slot: &mut SlotState,
+    result: runner::TurnEndResult,
+    db_path: &std::path::Path,
+    role: &str,
+    limits: &CostLimits,
+) -> Result<Option<LimitBreached>> {
+    slot.cost_tokens += result.turn_tokens;
+    let prev_cost = slot.cost_usd;
+    if let Some(cost) = result.session_cost_usd {
+        slot.cost_usd = cost;
+    }
+    let turn_cost_usd = result.session_cost_usd.map(|c| (c - prev_cost).max(0.0));
+    log(&format!(
+        "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}{})",
+        slot.agent_name,
+        result.turn_tokens,
+        slot.cost_tokens,
+        slot.cost_usd,
+        if result.is_error { ", ERROR" } else { "" }
+    ));
+
+    let phase = if result.is_error {
+        "working"
+    } else if role == "worker" {
+        "awaiting-review"
+    } else {
+        "reviewing"
+    };
+
+    if let Some(ref mut sl) = slot.session_log {
+        sl.update_cost(slot.cost_tokens, slot.cost_usd);
+        sl.set_phase(phase);
+    }
+
+    let p = db_path.to_path_buf();
+    let entry = slot_journal_entry(slot, role, phase);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+    .ok();
+
+    slot.draining = false;
+    slot.turn_ended_at = Some(std::time::Instant::now());
+    slot.live_stats.mid_turn_tokens = 0;
+    slot.live_stats.record_event();
+
+    if result.is_error {
+        slot.error_turn_count += 1;
+        slot.last_error_text = result.error_text;
+    } else {
+        slot.error_turn_count = 0;
+        slot.last_error_text = None;
+    }
+
+    write_live_sidecar(slot);
+
+    check_post_result_limits(
+        limits,
+        result.turn_tokens,
+        slot.cost_tokens,
+        turn_cost_usd,
+        slot.cost_usd,
+        slot,
+    )
+    .map_or(Ok(None), |b| Ok(Some(b)))
+}
+
+/// Persist a Codex thread_id to task refs for continuation across restart/rework.
+/// Feed a worker turn (rework, error-retry, or message). Claude uses stdin
+/// feed_turn; Codex kills the exited process and spawns a new one with
+/// thread-based continuation.
+async fn feed_worker_turn(
+    slot: &mut SlotState,
+    raw_prompt: &str,
+    config: &ServeConfig,
+) -> std::io::Result<()> {
+    if slot.proc.is_codex() {
+        let mut env_vars: Vec<(String, String)> = vec![
+            ("QUORUM_REPO".into(), config.repo.clone()),
+            ("QUORUM_AGENT".into(), slot.agent_name.clone()),
+        ];
+        if let Some(ref rid) = slot.cap_run_id {
+            env_vars.push(("QUORUM_RUN_ID".into(), rid.clone()));
+        }
+
+        let new_proc = if let Some(ref tid) = slot.codex_thread_id {
+            codex_agent::CodexProc::spawn_resume(
+                tid,
+                &config.model,
+                &config.effort,
+                &config.codex_sandbox,
+                &slot.worktree_path,
+                raw_prompt,
+                &env_vars,
+                config.agent_bin.as_deref(),
+            )?
+        } else {
+            codex_agent::CodexProc::spawn(
+                &codex_agent::CodexSpec {
+                    model: config.model.clone(),
+                    effort: config.effort.clone(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: slot.worktree_path.clone(),
+                    prompt: raw_prompt.to_string(),
+                    env_vars,
+                },
+                config.agent_bin.as_deref(),
+            )?
+        };
+
+        let old = std::mem::replace(&mut slot.proc, runner::RunnerProc::Codex(new_proc));
+        tokio::spawn(async move { old.kill_and_reap().await });
+        Ok(())
+    } else {
+        let turn = agent::user_turn(raw_prompt);
+        slot.proc.feed_turn(&turn).await
+    }
+}
+
+async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread_id: &str) {
+    let p = db_path.to_path_buf();
+    let tid = thread_id.to_string();
+    let task_id_val = task_id;
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let task = tasks::get(&conn, task_id_val)?;
+        if let Some(task) = task {
+            let mut refs: serde_json::Value = task
+                .refs
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::json!({}));
+            refs["codex_thread_id"] = serde_json::Value::String(tid);
+            let refs_str = refs.to_string();
+            let fields = tasks::TaskUpdate {
+                status: None,
+                body: None,
+                refs: Some(&refs_str),
+                verdict: None,
+                depends_on: None,
+            };
+            tasks::update(&mut conn, "daemon", task_id_val, &fields, now_unix())?;
+        }
+        Ok(())
+    })
+    .await;
+}
+
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
 /// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
 async fn drain_events(
@@ -5116,101 +5298,52 @@ async fn drain_events(
     role: &str,
     limits: &CostLimits,
 ) -> Result<Option<LimitBreached>> {
-    while let Ok(Some(event)) =
+    while let Ok(Some(raw_event)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_event()).await
     {
-        match &event {
-            stream::Event::Result {
+        // Session log: write raw JSON for observability.
+        if let Some(ref mut sl) = slot.session_log {
+            if let Some(json) = raw_event.to_json_line() {
+                sl.log_json_line(&json);
+            }
+        }
+
+        match &raw_event {
+            // ── Claude events ────────────────────────────────────────
+            runner::RawEvent::Claude(stream::Event::Result {
                 usage,
                 total_cost_usd,
                 is_error,
                 result,
                 ..
-            } => {
-                let error_terminated = is_error.unwrap_or(false);
+            }) => {
                 let turn_tokens = usage
                     .as_ref()
                     .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
-                slot.cost_tokens += turn_tokens;
-                // total_cost_usd is session-cumulative (running total), not per-turn.
-                // Derive per-turn cost as the delta before overwriting the high-water mark.
-                let prev_cost = slot.cost_usd;
-                if let Some(cost) = total_cost_usd {
-                    slot.cost_usd = *cost;
-                }
-                let turn_cost_usd = total_cost_usd.map(|c| (c - prev_cost).max(0.0));
-                log(&format!(
-                    "{role} {} result (turn_tokens={}, cumulative={}, cost_usd={:.4}{})",
-                    slot.agent_name,
-                    turn_tokens,
-                    slot.cost_tokens,
-                    slot.cost_usd,
-                    if error_terminated { ", ERROR" } else { "" }
-                ));
-
-                let phase = if error_terminated {
-                    "working"
-                } else if role == "worker" {
-                    "awaiting-review"
+                let error_terminated = is_error.unwrap_or(false);
+                let error_text = if error_terminated {
+                    Some(stream::result_text(result).chars().take(120).collect())
                 } else {
-                    "reviewing"
+                    None
                 };
-
-                if let Some(ref mut sl) = slot.session_log {
-                    sl.update_cost(slot.cost_tokens, slot.cost_usd);
-                    sl.set_phase(phase);
-                }
-
-                let p = db_path.to_path_buf();
-                let entry = slot_journal_entry(slot, role, phase);
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    journal::upsert(&mut conn, &entry)
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
-
-                slot.draining = false;
-                slot.turn_ended_at = Some(std::time::Instant::now());
-                slot.live_stats.mid_turn_tokens = 0;
-                slot.live_stats.record_event();
-
-                if error_terminated {
-                    slot.error_turn_count += 1;
-                    let raw = stream::result_text(result);
-                    let bounded: String = raw.chars().take(120).collect();
-                    slot.last_error_text = Some(bounded);
-                } else {
-                    slot.error_turn_count = 0;
-                    slot.last_error_text = None;
-                }
-
-                write_live_sidecar(slot);
-
-                if let Some(ref mut sl) = slot.session_log {
-                    sl.log_event(&event);
-                }
-
-                let breach = check_post_result_limits(
-                    limits,
-                    turn_tokens,
-                    slot.cost_tokens,
-                    turn_cost_usd,
-                    slot.cost_usd,
+                return handle_turn_end(
                     slot,
-                );
-                return Ok(breach);
+                    runner::TurnEndResult {
+                        turn_tokens,
+                        session_cost_usd: *total_cost_usd,
+                        is_error: error_terminated,
+                        error_text,
+                    },
+                    db_path,
+                    role,
+                    limits,
+                )
+                .await;
             }
-            stream::Event::Assistant { message } => {
-                let content = message.get("content");
-                if let Some(blocks) = content.and_then(|c| c.as_array()) {
-                    // Agent text blocks are captured in the per-session log
-                    // (stream.jsonl + transcript.md); do NOT echo them to daemon
-                    // stderr — they drown real serve decisions/errors. Only
-                    // tool_use blocks update live stats here.
+            runner::RawEvent::Claude(stream::Event::Assistant { message }) => {
+                if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
                     for block in blocks {
-                        if let Some("tool_use") = block.get("type").and_then(|t| t.as_str()) {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                 let input = block
                                     .get("input")
@@ -5238,17 +5371,92 @@ async fn drain_events(
                 slot.live_stats.record_event();
                 write_live_sidecar(slot);
             }
-            stream::Event::ToolUse { name, input } => {
+            runner::RawEvent::Claude(stream::Event::ToolUse { name, input }) => {
                 slot.live_stats.tool_count += 1;
                 slot.live_stats.now_label = now_label(name, input);
                 slot.live_stats.record_event();
                 write_live_sidecar(slot);
             }
+            // ── Codex events ─────────────────────────────────────────
+            runner::RawEvent::Codex(codex_stream::Event::ThreadStarted { thread_id }) => {
+                log(&format!(
+                    "{role} {} thread_id: {thread_id}",
+                    slot.agent_name
+                ));
+                slot.codex_thread_id = Some(thread_id.clone());
+                persist_codex_thread_id(db_path, slot.task_id, thread_id).await;
+            }
+            runner::RawEvent::Codex(codex_stream::Event::TurnCompleted { usage }) => {
+                let turn_tokens = usage
+                    .as_ref()
+                    .map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
+                return handle_turn_end(
+                    slot,
+                    runner::TurnEndResult {
+                        turn_tokens,
+                        session_cost_usd: None,
+                        is_error: false,
+                        error_text: None,
+                    },
+                    db_path,
+                    role,
+                    limits,
+                )
+                .await;
+            }
+            runner::RawEvent::Codex(codex_stream::Event::TurnFailed { error }) => {
+                let text = error
+                    .as_ref()
+                    .map(|e| e.message.chars().take(120).collect::<String>());
+                return handle_turn_end(
+                    slot,
+                    runner::TurnEndResult {
+                        turn_tokens: 0,
+                        session_cost_usd: None,
+                        is_error: true,
+                        error_text: text,
+                    },
+                    db_path,
+                    role,
+                    limits,
+                )
+                .await;
+            }
+            runner::RawEvent::Codex(codex_stream::Event::Error { message }) => {
+                return handle_turn_end(
+                    slot,
+                    runner::TurnEndResult {
+                        turn_tokens: 0,
+                        session_cost_usd: None,
+                        is_error: true,
+                        error_text: Some(message.chars().take(120).collect()),
+                    },
+                    db_path,
+                    role,
+                    limits,
+                )
+                .await;
+            }
+            runner::RawEvent::Codex(codex_stream::Event::ItemStarted { item })
+            | runner::RawEvent::Codex(codex_stream::Event::ItemCompleted { item }) => {
+                match item {
+                    codex_stream::Item::CommandExecution { command, .. } => {
+                        slot.live_stats.tool_count += 1;
+                        slot.live_stats.now_label =
+                            now_label("command", &serde_json::json!({ "command": command }));
+                    }
+                    codex_stream::Item::FileChange { changes, .. } => {
+                        slot.live_stats.tool_count += 1;
+                        let path = changes.first().map(|c| c.path.as_str()).unwrap_or("file");
+                        slot.live_stats.now_label =
+                            now_label("file_change", &serde_json::json!({ "file_path": path }));
+                    }
+                    _ => {}
+                }
+                slot.live_stats.record_event();
+                write_live_sidecar(slot);
+            }
             _ => {}
-        }
-
-        if let Some(ref mut sl) = slot.session_log {
-            sl.log_event(&event);
         }
     }
     Ok(None)
@@ -5566,7 +5774,8 @@ async fn spawn_reviewer_for_worker(
     )
     .await
     {
-        Ok(mut proc) => {
+        Ok(agent_proc) => {
+            let mut proc = runner::RunnerProc::Claude(agent_proc);
             let prompt = reviewer::build_review_prompt(&spec, &config.effort);
             let turn1 = agent::user_turn(&prompt);
             if let Err(e) = proc.feed_turn(&turn1).await {
@@ -5676,6 +5885,7 @@ async fn spawn_reviewer_for_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
+                codex_thread_id: None,
             });
         }
         Err(e) => {
@@ -5990,45 +6200,70 @@ async fn spawn_worker(
         }
     }
 
-    let spec = AgentSpec {
-        model: resolved_model.clone(),
-        effort: resolved_effort.clone(),
-        session_id: session_id.clone(),
-        worktree: wt_path.clone(),
-        bare: config.bare_agent,
-        allowed_tools: config
-            .allowed_tools
-            .clone()
-            .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
-        env_vars: vec![
-            ("QUORUM_REPO".into(), config.repo.clone()),
-            ("QUORUM_AGENT".into(), agent_name.clone()),
-            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-        ],
+    let worker_env_vars = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), agent_name.clone()),
+        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
+    ];
+
+    let body = task.body.as_deref().unwrap_or(&task.title);
+    let prompt_text = reviewer::build_worker_prompt(
+        &agent_name,
+        task.id,
+        &task.title,
+        body,
+        config.limits.max_task_cost_usd,
+    );
+
+    let spawn_result: std::io::Result<runner::RunnerProc> = match config.runner_kind {
+        crate::serve_config::RunnerKind::Claude => {
+            let spec = AgentSpec {
+                model: resolved_model.clone(),
+                effort: resolved_effort.clone(),
+                session_id: session_id.clone(),
+                worktree: wt_path.clone(),
+                bare: config.bare_agent,
+                allowed_tools: config
+                    .allowed_tools
+                    .clone()
+                    .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
+                env_vars: worker_env_vars,
+            };
+            AgentProc::spawn(&spec, config.agent_bin.as_deref()).map(runner::RunnerProc::Claude)
+        }
+        crate::serve_config::RunnerKind::Codex => {
+            let spec = codex_agent::CodexSpec {
+                model: resolved_model.clone(),
+                effort: resolved_effort.clone(),
+                sandbox: config.codex_sandbox.clone(),
+                worktree: wt_path.clone(),
+                prompt: prompt_text.clone(),
+                env_vars: worker_env_vars,
+            };
+            codex_agent::CodexProc::spawn(&spec, config.agent_bin.as_deref())
+                .map(runner::RunnerProc::Codex)
+        }
     };
-    match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
+
+    match spawn_result {
         Ok(mut proc) => {
-            let body = task.body.as_deref().unwrap_or(&task.title);
-            let turn1 = reviewer::build_worker_turn(
-                &agent_name,
-                task.id,
-                &task.title,
-                body,
-                config.limits.max_task_cost_usd,
-            );
-            if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!("feed_turn failed: {e}"));
-                proc.kill_and_reap().await;
-                let strikes = poison_tracker.record_strike(task.id);
-                if strikes >= MAX_POISON_STRIKES {
-                    poison_task(&db_path, &agent_name, task.id, strikes).await;
-                } else {
-                    release_task(&db_path, &agent_name, task.id).await;
+            // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
+            if !proc.is_codex() {
+                let turn1 = agent::user_turn(&prompt_text);
+                if let Err(e) = proc.feed_turn(&turn1).await {
+                    log(&format!("feed_turn failed: {e}"));
+                    proc.kill_and_reap().await;
+                    let strikes = poison_tracker.record_strike(task.id);
+                    if strikes >= MAX_POISON_STRIKES {
+                        poison_task(&db_path, &agent_name, task.id, strikes).await;
+                    } else {
+                        release_task(&db_path, &agent_name, task.id).await;
+                    }
+                    name_pool.release(&agent_name);
+                    wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+                    return Ok(false);
                 }
-                name_pool.release(&agent_name);
-                wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(worker_repo_dir, &branch).await;
-                return Ok(false);
             }
 
             // M7: persist PID immediately so crash recovery can clean up
@@ -6102,6 +6337,7 @@ async fn spawn_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
+                codex_thread_id: None,
             });
         }
         Err(e) => {
@@ -6740,7 +6976,8 @@ async fn spawn_r2_reviewer(
     )
     .await
     {
-        Ok(mut proc) => {
+        Ok(agent_proc) => {
+            let mut proc = runner::RunnerProc::Claude(agent_proc);
             let prompt = reviewer::build_r2_review_prompt(&spec, &config.effort);
             let turn1 = agent::user_turn(&prompt);
             if let Err(e) = proc.feed_turn(&turn1).await {
@@ -6840,6 +7077,7 @@ async fn spawn_r2_reviewer(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: true,
                 reviewed_head_sha: spawn_head_sha,
+                codex_thread_id: None,
             });
 
             log(&format!(
@@ -7088,35 +7326,90 @@ async fn spawn_remediation_worker(
         config.limits.max_task_cost_usd,
     );
 
-    match agent::AgentProc::spawn(
-        &agent::AgentSpec {
-            model: config.model.clone(),
-            effort: config.effort.clone(),
-            session_id: session_id.clone(),
-            worktree: wt_path.clone(),
-            bare: config.bare_agent,
-            allowed_tools: config
-                .allowed_tools
+    let remediation_env = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), agent_name.clone()),
+        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
+    ];
+
+    // For Codex rework: look up persisted thread_id for continuation.
+    let codex_thread_id = if config.runner_kind == crate::serve_config::RunnerKind::Codex {
+        let p = db_path.clone();
+        let tid = task_id;
+        tokio::task::spawn_blocking(move || -> Option<String> {
+            let conn = quorum_core::db::open(&p).ok()?;
+            let task = tasks::get(&conn, tid).ok()??;
+            let refs: serde_json::Value = task
+                .refs
                 .as_deref()
-                .unwrap_or(agent::ALLOWED_TOOLS)
-                .to_string(),
-            env_vars: vec![
-                ("QUORUM_REPO".into(), config.repo.clone()),
-                ("QUORUM_AGENT".into(), agent_name.clone()),
-                ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-            ],
-        },
-        config.agent_bin.as_deref(),
-    ) {
+                .and_then(|s| serde_json::from_str(s).ok())?;
+            refs.get("codex_thread_id")?.as_str().map(|s| s.to_string())
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+
+    let spawn_result: std::io::Result<runner::RunnerProc> = match config.runner_kind {
+        crate::serve_config::RunnerKind::Claude => agent::AgentProc::spawn(
+            &agent::AgentSpec {
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+                session_id: session_id.clone(),
+                worktree: wt_path.clone(),
+                bare: config.bare_agent,
+                allowed_tools: config
+                    .allowed_tools
+                    .as_deref()
+                    .unwrap_or(agent::ALLOWED_TOOLS)
+                    .to_string(),
+                env_vars: remediation_env,
+            },
+            config.agent_bin.as_deref(),
+        )
+        .map(runner::RunnerProc::Claude),
+        crate::serve_config::RunnerKind::Codex => if let Some(ref tid) = codex_thread_id {
+            codex_agent::CodexProc::spawn_resume(
+                tid,
+                &config.model,
+                &config.effort,
+                &config.codex_sandbox,
+                &wt_path,
+                &prompt,
+                &remediation_env,
+                config.agent_bin.as_deref(),
+            )
+        } else {
+            log("remediation: no persisted thread_id — starting fresh Codex exec");
+            codex_agent::CodexProc::spawn(
+                &codex_agent::CodexSpec {
+                    model: config.model.clone(),
+                    effort: config.effort.clone(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: wt_path.clone(),
+                    prompt: prompt.clone(),
+                    env_vars: remediation_env,
+                },
+                config.agent_bin.as_deref(),
+            )
+        }
+        .map(runner::RunnerProc::Codex),
+    };
+
+    match spawn_result {
         Ok(mut proc) => {
-            let turn1 = agent::user_turn(&prompt);
-            if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!("remediation feed_turn failed: {e}"));
-                proc.kill_and_reap().await;
-                name_pool.release(&agent_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return false;
+            if !proc.is_codex() {
+                let turn1 = agent::user_turn(&prompt);
+                if let Err(e) = proc.feed_turn(&turn1).await {
+                    log(&format!("remediation feed_turn failed: {e}"));
+                    proc.kill_and_reap().await;
+                    name_pool.release(&agent_name);
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    return false;
+                }
             }
 
             let worker_run_id = {
@@ -7159,6 +7452,7 @@ async fn spawn_remediation_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
+                codex_thread_id,
             });
 
             log(&format!(
@@ -7689,7 +7983,7 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let reader = BufReader::new(stdout).lines();
-        let proc = AgentProc::from_parts(child, stdin, reader);
+        let proc = runner::RunnerProc::Claude(AgentProc::from_parts(child, stdin, reader));
         let now = Instant::now();
         SlotState {
             agent_name: "Test-1".into(),
@@ -7715,6 +8009,7 @@ mod tests {
             cap_run_id: None,
             r2_origin: false,
             reviewed_head_sha: None,
+            codex_thread_id: None,
         }
     }
 

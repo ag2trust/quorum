@@ -31,6 +31,7 @@ const DEFAULT_SERVE_TOML: &str = "\
 # worktree_base = \"/path/to/worktrees\"
 
 ## Worker / model
+# agent = \"claude\"        # runner: \"claude\" or \"codex\"
 # cap = 4
 # model = \"sonnet\"
 # effort = \"high\"
@@ -976,6 +977,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo_dir,
             worktree_base,
             names_file,
+            agent,
             agent_bin,
             model,
             effort,
@@ -1131,9 +1133,20 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.min_effort.as_deref(),
             )?;
 
+            // Resolve runner kind (flag > file > default=claude).
+            let runner_kind =
+                RunnerKind::from_str_opt(agent.as_deref().or(file_cfg.agent.as_deref()))?;
+            validate_codex_limits(runner_kind, r_max_turn_cost.value, r_max_task_cost.value)?;
+            let codex_sandbox = file_cfg
+                .codex
+                .as_ref()
+                .and_then(|c| c.sandbox.clone())
+                .unwrap_or_else(|| "danger-full-access".to_string());
+
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
                 config_path: config_path_used.as_deref(),
+                agent: runner_kind,
                 repo: &r_repo,
                 repo_dir: &r_repo_dir,
                 worktree_base: &r_wt,
@@ -1205,7 +1218,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir: std::path::PathBuf::from(r_repo_dir.value),
                 worktree_base: std::path::PathBuf::from(r_wt.value),
                 names_file: r_names.value.map(std::path::PathBuf::from),
+                runner_kind,
                 agent_bin: r_agent_bin.value,
+                codex_sandbox,
                 model: r_model.value,
                 effort: r_effort.value,
                 merge_executor,
