@@ -8,11 +8,40 @@ use quorum_core::error::{QuorumError, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+/// Which CLI runner the daemon uses for all spawned agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerKind {
+    Claude,
+    Codex,
+}
+
+impl std::fmt::Display for RunnerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Claude => write!(f, "claude"),
+            Self::Codex => write!(f, "codex"),
+        }
+    }
+}
+
+impl RunnerKind {
+    pub fn from_str_opt(s: Option<&str>) -> Result<Self> {
+        match s {
+            None | Some("claude") => Ok(Self::Claude),
+            Some("codex") => Ok(Self::Codex),
+            Some(other) => Err(QuorumError::Usage(format!(
+                "bad agent value: \"{other}\" (expected \"claude\" or \"codex\")"
+            ))),
+        }
+    }
+}
+
 /// Deserializable TOML config for `quorum serve`. Every field is optional —
 /// missing fields fall back to built-in defaults; CLI flags override everything.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeFileConfig {
+    pub agent: Option<String>,
     pub cap: Option<usize>,
     pub repo_dir: Option<String>,
     pub worktree_base: Option<String>,
@@ -57,6 +86,16 @@ pub struct ServeFileConfig {
     pub min_model: Option<String>,
     /// #172: minimum worker effort floor ("medium"|"high"). None = no floor.
     pub min_effort: Option<String>,
+    /// Runner-specific Codex configuration.
+    pub codex: Option<CodexFileConfig>,
+}
+
+/// `[codex]` section in serve config.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexFileConfig {
+    /// Sandbox mode for Codex workers (default: "danger-full-access").
+    pub sandbox: Option<String>,
 }
 
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
@@ -218,6 +257,7 @@ pub fn resolve_bool(flag: bool, file: Option<bool>, default: bool) -> Sourced<bo
 #[allow(clippy::struct_field_names)]
 pub struct BannerData<'a> {
     pub config_path: Option<&'a str>,
+    pub agent: RunnerKind,
     pub repo: &'a Sourced<String>,
     pub repo_dir: &'a Sourced<String>,
     pub worktree_base: &'a Sourced<String>,
@@ -255,6 +295,7 @@ pub fn banner(d: &BannerData<'_>) -> String {
     } else {
         lines.push("  config file:               (none)".to_string());
     }
+    lines.push(format!("  agent:                     {}", d.agent));
     lines.push(format!("  repo:                      {}", d.repo));
     lines.push(format!("  repo_dir:                  {}", d.repo_dir));
     lines.push(format!("  worktree_base:             {}", d.worktree_base));
@@ -386,6 +427,30 @@ pub fn resolve_floor(
         None => None,
     };
     Ok((model, effort))
+}
+
+/// Validate that Codex runner is not combined with USD safety limits.
+/// Codex does not expose reliable per-turn USD cost; fabricating it would be unsafe.
+pub fn validate_codex_limits(
+    kind: RunnerKind,
+    max_turn_cost_usd: Option<f64>,
+    max_task_cost_usd: Option<f64>,
+) -> Result<()> {
+    if kind == RunnerKind::Codex {
+        if let Some(v) = max_turn_cost_usd {
+            return Err(QuorumError::Usage(format!(
+                "agent=codex cannot use max_turn_cost_usd ({v}) — \
+                 Codex does not expose per-turn USD cost; use token or wall-clock limits"
+            )));
+        }
+        if let Some(v) = max_task_cost_usd {
+            return Err(QuorumError::Usage(format!(
+                "agent=codex cannot use max_task_cost_usd ({v}) — \
+                 Codex does not expose per-turn USD cost; use token or wall-clock limits"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Default config file path for a given repo: `~/.quorum/serve/<owner>__<repo>.toml`
@@ -556,6 +621,7 @@ worktree_base = "/tmp/wt"
     fn banner_shows_config_path() {
         let b = banner(&BannerData {
             config_path: Some("/path/to/config.toml"),
+            agent: RunnerKind::Claude,
             repo: &Sourced {
                 value: "test/repo".into(),
                 source: Source::Flag,

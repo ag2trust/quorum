@@ -511,6 +511,58 @@ pub fn claim(
     Ok(task)
 }
 
+/// Reattach a worker to a provider-blocked rework task without erasing its
+/// lifecycle phase. This is deliberately separate from [`claim`]: a rework
+/// retry remains `rework`, but still needs a worker lease rather than reviewer
+/// attachment semantics.
+pub fn claim_provider_retry_rework(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    ttl: i64,
+    now: i64,
+) -> Result<Option<Task>> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+
+    let updated = tx.execute(
+        "UPDATE tasks SET assignee=?1, updated_at=?2
+         WHERE id=?3 AND status='rework' AND assignee IS NULL
+           AND json_valid(refs)
+           AND json_type(refs, '$.codex_retry_requested')='true'",
+        params![agent, now, id],
+    )?;
+    let mut task = if updated == 1 {
+        Some(tx.query_row(
+            &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+            params![id],
+            row_to_task,
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(task) = &mut task {
+        task.ready = true;
+        let target = lease_target(task.id);
+        tx.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at <= ?2",
+            params![target, now],
+        )?;
+        tx.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+            params![target, agent, now, now + ttl],
+        )?;
+        crate::events::emit(&tx, "task_claimed", &target, &format!("by {agent}"), now)?;
+    }
+
+    // Sweep only after the replacement lease exists. Sweeping first would
+    // classify this deliberately unleased retry as lapsed and erase `rework`.
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    tx.commit()?;
+    Ok(task)
+}
+
 // ── apply_event ───────────────────────────────────────────────────────────────
 
 pub fn apply_event(
@@ -696,6 +748,11 @@ pub fn apply_event(
     if let Event::SignaledDone { pr } = event {
         refs = Some(merge_pr_into_refs(&task.refs, pr));
     }
+    if matches!(event, Event::SignaledDone { .. } | Event::ReworkPushed)
+        && new_status == Status::InReview
+    {
+        refs = clear_codex_retry_refs(refs.as_deref())?;
+    }
 
     tx.execute(
         "UPDATE tasks SET status=?1, assignee=?2, author=?3, reviewer=?4, \
@@ -734,6 +791,27 @@ pub fn apply_event(
         task: result_task,
         effects,
     })
+}
+
+fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
+    let Some(refs) = refs else {
+        return Ok(None);
+    };
+    let mut value: serde_json::Value = serde_json::from_str(refs)
+        .map_err(|error| QuorumError::Usage(format!("invalid refs JSON: {error}")))?;
+    if let Some(object) = value.as_object_mut() {
+        for key in [
+            "codex_retry_requested",
+            "codex_retry_model",
+            "codex_retry_effort",
+            "codex_retry_prompt",
+            "codex_retry_turn_kind",
+            "codex_retry_thread_id",
+        ] {
+            object.remove(key);
+        }
+    }
+    Ok(Some(value.to_string()))
 }
 
 // ── set_body (daemon post-event body annotation) ─────────────────────────────
@@ -899,6 +977,73 @@ pub fn update(
     task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
     Ok(task)
+}
+
+/// Daemon-authoritative refs update — bypasses the assignee guard.
+/// Used for internal bookkeeping (e.g. persisting Codex thread IDs)
+/// where the daemon needs to write task metadata it doesn't "own" via
+/// the normal agent-scoped update path.
+pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) -> Result<()> {
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Atomically retry a task parked after a bounded provider failure.
+///
+/// A `working` task returns to `open`. A true `rework` task remains unassigned
+/// in `rework` until [`claim_provider_retry_rework`] atomically installs its
+/// replacement worker lease. Reviewer retries are deliberately rejected until
+/// provider-neutral R1/R2 support exists.
+pub fn retry_provider_blocked(
+    conn: &mut Connection,
+    id: i64,
+    by: &str,
+    now: i64,
+) -> Result<Option<Task>> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, by, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+
+    let n = tx.execute(
+        "UPDATE tasks SET
+             refs=json_set(
+                 json_remove(refs, '$.codex_provider_blocked', '$.codex_provider_error'),
+                 '$.codex_retry_requested', json('true')
+             ),
+             status=CASE WHEN status='working' THEN 'open' ELSE status END,
+             assignee=NULL,
+             updated_at=?2
+         WHERE id=?1
+           AND status IN ('working','rework')
+           AND json_valid(refs)
+           AND json_extract(refs, '$.codex_provider_blocked')=1",
+        params![id, now],
+    )?;
+    if n == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    deactivate_lease(&tx, id, now)?;
+    crate::events::emit(
+        &tx,
+        "task_provider_retry",
+        &format!("task#{id}"),
+        &format!("provider retry requested by {by}"),
+        now,
+    )?;
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
+    tx.commit()?;
+    Ok(Some(task))
 }
 
 // ── close_after_merge ─────────────────────────────────────────────────────────
@@ -3828,5 +3973,154 @@ mod tests {
                 .contains("last failure: lifecycle transition rejected at done signal: not-holder"),
             "exhaustion message must carry the triggering failure reason, got: {reason}"
         );
+    }
+
+    #[test]
+    fn update_refs_daemon_bypasses_assignee_guard() {
+        let (_dir, mut conn) = open_tmp();
+        let now = 1000;
+        let id = create(
+            &mut conn,
+            "creator",
+            "Test task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        // Claim as "worker-1" so assignee is set.
+        claim(&mut conn, "worker-1", Some(id), &[], TTL, now).unwrap();
+        // Normal update as "daemon" fails — not the assignee.
+        let res = update(
+            &mut conn,
+            "daemon",
+            id,
+            &TaskUpdate {
+                refs: Some(r#"{"thread":"abc"}"#),
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(res.is_err(), "regular update by non-assignee must fail");
+        // Daemon-authoritative refs update succeeds.
+        update_refs_daemon(&mut conn, id, r#"{"thread":"abc"}"#, now).unwrap();
+        let t = get(&conn, id).unwrap().unwrap();
+        assert_eq!(t.refs.as_deref(), Some(r#"{"thread":"abc"}"#));
+    }
+
+    #[test]
+    fn provider_retry_worker_is_atomic_and_requeues_implementation() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        update_refs_daemon(
+            &mut conn,
+            id,
+            r#"{"pr":419,"codex_thread_id":"thread-old","codex_provider_blocked":true,"codex_provider_error":"quota","codex_retry_model":"gpt","codex_retry_effort":"high","codex_retry_prompt":"fix blocker","codex_retry_turn_kind":"rework","codex_retry_thread_id":"thread-old","keep":"yes"}"#,
+            12,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET rework_round=2, author='original-author' WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        let retried = retry_provider_blocked(&mut conn, id, "operator", 13)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "open");
+        assert!(retried.assignee.is_none());
+        let refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["keep"], "yes");
+        assert_eq!(refs["pr"], 419);
+        assert_eq!(refs["codex_thread_id"], "thread-old");
+        assert_eq!(refs["codex_retry_requested"], true);
+        assert_eq!(retried.rework_round, 2);
+        assert_eq!(retried.author.as_deref(), Some("original-author"));
+        let active_lease: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_lease, 0);
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='task_provider_retry' AND subject=?1",
+                params![format!("task#{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1);
+        assert!(refs.get("codex_provider_blocked").is_none());
+        assert!(refs.get("codex_provider_error").is_none());
+        assert!(retry_provider_blocked(&mut conn, id, "operator", 14)
+            .unwrap()
+            .is_none());
+
+        claim(&mut conn, "retry-worker", Some(id), &[], TTL, 15).unwrap();
+        let submitted = apply_event(
+            &mut conn,
+            "retry-worker",
+            id,
+            &Event::SignaledDone { pr: "419".into() },
+            16,
+        )
+        .unwrap()
+        .task;
+        assert_eq!(submitted.status, "in-review");
+        let submitted_refs: serde_json::Value =
+            serde_json::from_str(submitted.refs.as_deref().unwrap()).unwrap();
+        assert!(submitted_refs.get("codex_retry_requested").is_none());
+        assert!(submitted_refs.get("codex_retry_prompt").is_none());
+        assert_eq!(submitted_refs["codex_thread_id"], "thread-old");
+    }
+
+    #[test]
+    fn provider_retry_rejects_review_phase() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn,
+            "owner",
+            "review",
+            None,
+            0,
+            None,
+            Some(r#"{"codex_provider_blocked":true,"codex_provider_error":"auth"}"#),
+            None,
+            Some(42),
+            10,
+        )
+        .unwrap();
+        assert!(retry_provider_blocked(&mut conn, id, "operator", 11)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn provider_retry_rejects_unblocked_and_terminal_tasks() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        assert!(retry_provider_blocked(&mut conn, id, "operator", 11)
+            .unwrap()
+            .is_none());
+        update_refs_daemon(&mut conn, id, r#"{"codex_provider_blocked":true}"#, 12).unwrap();
+        close_manual(&mut conn, "owner", id, "obsolete", 13).unwrap();
+        assert!(retry_provider_blocked(&mut conn, id, "operator", 14)
+            .unwrap()
+            .is_none());
     }
 }

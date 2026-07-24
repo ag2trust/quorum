@@ -367,7 +367,10 @@ pub enum Command {
         /// When absent, names are auto-generated.
         #[arg(long)]
         names_file: Option<String>,
-        /// Override the agent binary (default: "claude").
+        /// Runner type: "claude" (default) or "codex".
+        #[arg(long)]
+        agent: Option<String>,
+        /// Override the agent binary (default: "claude" or "codex" per runner).
         #[arg(long)]
         agent_bin: Option<String>,
         /// Model to pass to spawned agents (default: sonnet).
@@ -550,6 +553,14 @@ pub enum Command {
         reason_stdin: bool,
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
+    },
+    /// Retry a Codex worker task parked by a daemon provider failure.
+    TaskRetry {
+        #[arg(long = "task-id")]
+        task_id: i64,
+        /// Operator identity recorded in the audit event.
+        #[arg(long)]
+        by: String,
     },
     /// Hard-terminate a daemon-managed agent. Writes a kill request to the
     /// mailbox; the daemon consumes it and SIGTERM→SIGKILL the child process,

@@ -470,6 +470,7 @@ pub struct CostLimits {
 pub struct ServeConfig {
     pub db_path: PathBuf,
     pub cap: usize,
+    pub runner_kind: crate::serve_config::RunnerKind,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
     pub names_file: Option<PathBuf>,
@@ -527,6 +528,8 @@ pub struct ServeConfig {
     pub min_model: Option<String>,
     /// #172: minimum worker effort floor ("medium"|"high"), or None for no floor.
     pub min_effort: Option<String>,
+    /// Codex sandbox mode (default: "danger-full-access").
+    pub codex_sandbox: String,
 }
 
 pub const EXIT_SELF_UPDATE: i32 = 75;
@@ -649,9 +652,13 @@ impl LiveStats {
 
 pub(crate) struct SlotState {
     agent_name: String,
-    proc: AgentProc,
+    proc: runner::RunnerProc,
     task_id: i64,
     session_id: String,
+    /// Exact provider selection for this run. Continuations must never
+    /// silently drift to daemon-global defaults.
+    model: String,
+    effort: String,
     worktree_path: PathBuf,
     branch: String,
     draining: bool,
@@ -678,6 +685,52 @@ pub(crate) struct SlotState {
     /// PR head SHA at reviewer spawn time. Used to detect stale approvals
     /// when the author pushes new commits between review and merge.
     reviewed_head_sha: Option<String>,
+    /// Codex thread identity for continuation. Set from the first
+    /// `thread.started` event, persisted to task refs before use.
+    codex_thread_id: Option<String>,
+    pending_prompt: String,
+    pending_turn_kind: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexRetryTurn {
+    model: String,
+    effort: String,
+    prompt: String,
+    turn_kind: String,
+    thread_id: Option<String>,
+}
+
+fn codex_retry_turn(refs: Option<&str>) -> Option<CodexRetryTurn> {
+    let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
+    if !refs.get("codex_retry_requested")?.as_bool()? {
+        return None;
+    }
+    Some(CodexRetryTurn {
+        model: refs.get("codex_retry_model")?.as_str()?.to_string(),
+        effort: refs.get("codex_retry_effort")?.as_str()?.to_string(),
+        prompt: refs.get("codex_retry_prompt")?.as_str()?.to_string(),
+        turn_kind: refs.get("codex_retry_turn_kind")?.as_str()?.to_string(),
+        thread_id: refs
+            .get("codex_retry_thread_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+}
+
+fn worker_done_event(rework_count: u32, pr: i64) -> Event {
+    if rework_count > 0 {
+        Event::ReworkPushed
+    } else {
+        Event::SignaledDone { pr: pr.to_string() }
+    }
+}
+
+fn retry_slot_rework_count(rework_round: i64, retry: Option<&CodexRetryTurn>) -> u32 {
+    retry
+        .filter(|retry| retry.turn_kind == "rework")
+        .map(|_| u32::try_from(rework_round.max(1)).unwrap_or(u32::MAX))
+        .unwrap_or(0)
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -1849,7 +1902,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_turn = reviewer::build_rework_turn(
+                                        let rework_prompt = reviewer::build_rework_prompt(
                                             &workers[wi].agent_name,
                                             workers[wi].task_id,
                                             pr_num,
@@ -1857,8 +1910,12 @@ async fn tick(
                                             workers[wi].cost_usd,
                                             config.limits.max_task_cost_usd,
                                         );
-                                        if let Err(e) =
-                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        if let Err(e) = feed_worker_turn(
+                                            &mut workers[wi],
+                                            &rework_prompt,
+                                            config,
+                                        )
+                                        .await
                                         {
                                             log(&format!(
                                                 "conflict rework feed failed: {e} — cleaning up"
@@ -2140,7 +2197,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_turn = reviewer::build_rework_turn(
+                                        let rework_prompt = reviewer::build_rework_prompt(
                                             &workers[wi].agent_name,
                                             workers[wi].task_id,
                                             pr_num,
@@ -2148,8 +2205,12 @@ async fn tick(
                                             workers[wi].cost_usd,
                                             config.limits.max_task_cost_usd,
                                         );
-                                        if let Err(e) =
-                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        if let Err(e) = feed_worker_turn(
+                                            &mut workers[wi],
+                                            &rework_prompt,
+                                            config,
+                                        )
+                                        .await
                                         {
                                             log(&format!(
                                                 "checks-failure rework feed failed: {e} — cleaning up"
@@ -2346,7 +2407,7 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            let rework_turn = reviewer::build_rework_turn(
+                                            let rework_prompt = reviewer::build_rework_prompt(
                                                 &workers[wi].agent_name,
                                                 workers[wi].task_id,
                                                 pr_num,
@@ -2354,8 +2415,12 @@ async fn tick(
                                                 workers[wi].cost_usd,
                                                 config.limits.max_task_cost_usd,
                                             );
-                                            if let Err(e) =
-                                                workers[wi].proc.feed_turn(&rework_turn).await
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
+                                            .await
                                             {
                                                 log(&format!(
                                                     "timeout-conflict rework feed failed: \
@@ -2685,7 +2750,7 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_turn = reviewer::build_rework_turn(
+                                        let rework_prompt = reviewer::build_rework_prompt(
                                             &workers[wi].agent_name,
                                             workers[wi].task_id,
                                             pr_num,
@@ -2693,8 +2758,12 @@ async fn tick(
                                             workers[wi].cost_usd,
                                             config.limits.max_task_cost_usd,
                                         );
-                                        if let Err(e) =
-                                            workers[wi].proc.feed_turn(&rework_turn).await
+                                        if let Err(e) = feed_worker_turn(
+                                            &mut workers[wi],
+                                            &rework_prompt,
+                                            config,
+                                        )
+                                        .await
                                         {
                                             log(&format!(
                                                 "pre-merge conflict rework feed failed: \
@@ -3054,7 +3123,7 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                let rework_turn = reviewer::build_rework_turn(
+                                                let rework_prompt = reviewer::build_rework_prompt(
                                                     &workers[wi].agent_name,
                                                     workers[wi].task_id,
                                                     pr_num,
@@ -3062,8 +3131,12 @@ async fn tick(
                                                     workers[wi].cost_usd,
                                                     config.limits.max_task_cost_usd,
                                                 );
-                                                if let Err(e) =
-                                                    workers[wi].proc.feed_turn(&rework_turn).await
+                                                if let Err(e) = feed_worker_turn(
+                                                    &mut workers[wi],
+                                                    &rework_prompt,
+                                                    config,
+                                                )
+                                                .await
                                                 {
                                                     log(&format!(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
@@ -3327,7 +3400,7 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                let rework_turn = reviewer::build_rework_turn(
+                                let rework_prompt = reviewer::build_rework_prompt(
                                     &workers[wi].agent_name,
                                     workers[wi].task_id,
                                     rework_pr,
@@ -3335,7 +3408,9 @@ async fn tick(
                                     workers[wi].cost_usd,
                                     config.limits.max_task_cost_usd,
                                 );
-                                if let Err(e) = workers[wi].proc.feed_turn(&rework_turn).await {
+                                if let Err(e) =
+                                    feed_worker_turn(&mut workers[wi], &rework_prompt, config).await
+                                {
                                     log(&format!("rework feed_turn failed: {e} — cleaning up"));
                                     let w = workers.remove(wi);
                                     fire_event(
@@ -3545,11 +3620,7 @@ async fn tick(
             if let Some(pr) = effective_pr {
                 // Fire the appropriate lifecycle event based on whether
                 // this is the first done signal or a rework-pushed.
-                let event = if workers[wi].rework_count > 0 {
-                    Event::ReworkPushed
-                } else {
-                    Event::SignaledDone { pr: pr.to_string() }
-                };
+                let event = worker_done_event(workers[wi].rework_count, pr);
                 let tr = fire_event_result(
                     &db_path,
                     &workers[wi].agent_name,
@@ -3920,12 +3991,12 @@ async fn tick(
             error_failed.push(i);
             continue;
         }
-        let turn = agent::user_turn(&format!(
+        let raw_prompt = format!(
             "Your previous turn was interrupted by a transport/API error (attempt {}/{}). \
              Verify any partial state from your last turn, then continue your task.",
             w.error_turn_count, MAX_ERROR_RETRIES
-        ));
-        match w.proc.feed_turn(&turn).await {
+        );
+        match feed_worker_turn(w, &raw_prompt, config).await {
             Ok(()) => {
                 w.draining = true;
                 w.turn_started_at = std::time::Instant::now();
@@ -3945,6 +4016,40 @@ async fn tick(
     }
     for &i in error_failed.iter().rev() {
         let dead = workers.remove(i);
+        if dead.proc.is_codex() {
+            let reason = dead
+                .last_error_text
+                .as_deref()
+                .unwrap_or("Codex provider/protocol failure")
+                .to_string();
+            log(&format!(
+                "parking task #{} after bounded Codex failure: {reason}",
+                dead.task_id
+            ));
+            if let Err(error) = persist_codex_provider_block(
+                &db_path,
+                dead.task_id,
+                &reason,
+                &CodexRetryTurn {
+                    model: dead.model.clone(),
+                    effort: dead.effort.clone(),
+                    prompt: dead.pending_prompt.clone(),
+                    turn_kind: dead.pending_turn_kind.clone(),
+                    thread_id: dead.codex_thread_id.clone(),
+                },
+            )
+            .await
+            {
+                log(&format!(
+                    "FATAL: cannot durably park task #{}; retaining slot: {error}",
+                    dead.task_id
+                ));
+                workers.insert(i, dead);
+                continue;
+            }
+            cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
+            continue;
+        }
         fire_event(
             &db_path,
             &dead.agent_name,
@@ -4037,6 +4142,48 @@ async fn tick(
     }
     for &i in dead_workers.iter().rev() {
         let dead = workers.remove(i);
+        if dead.proc.is_codex() {
+            let p = db_path.clone();
+            let task_id = dead.task_id;
+            let still_working = tokio::task::spawn_blocking(move || -> bool {
+                quorum_core::db::open(&p)
+                    .ok()
+                    .and_then(|conn| tasks::get(&conn, task_id).ok().flatten())
+                    .is_some_and(|task| task.status == "working")
+            })
+            .await
+            .unwrap_or(false);
+            if still_working {
+                let reason = dead
+                    .last_error_text
+                    .as_deref()
+                    .unwrap_or("Codex process exited before task submission")
+                    .to_string();
+                if let Err(error) = persist_codex_provider_block(
+                    &db_path,
+                    dead.task_id,
+                    &reason,
+                    &CodexRetryTurn {
+                        model: dead.model.clone(),
+                        effort: dead.effort.clone(),
+                        prompt: dead.pending_prompt.clone(),
+                        turn_kind: dead.pending_turn_kind.clone(),
+                        thread_id: dead.codex_thread_id.clone(),
+                    },
+                )
+                .await
+                {
+                    log(&format!(
+                        "FATAL: cannot durably park task #{}; retaining slot: {error}",
+                        dead.task_id
+                    ));
+                    workers.insert(i, dead);
+                    continue;
+                }
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
+                continue;
+            }
+        }
         let instant_death = dead.cost_tokens == 0;
         if instant_death {
             let strikes = poison_tracker.record_strike(dead.task_id);
@@ -4195,8 +4342,8 @@ async fn tick(
             }
             Some(wi) => {
                 let payload = msg_row.payload.as_deref().unwrap_or("");
-                let turn = agent::user_turn(&format!("MESSAGE from {}: {payload}", msg_row.agent));
-                match workers[wi].proc.feed_turn(&turn).await {
+                let raw_prompt = format!("MESSAGE from {}: {payload}", msg_row.agent);
+                match feed_worker_turn(&mut workers[wi], &raw_prompt, config).await {
                     Ok(()) => {
                         workers[wi].draining = true;
                         workers[wi].turn_started_at = std::time::Instant::now();
@@ -5109,6 +5256,154 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
     None
 }
 
+/// Persist a Codex thread_id to task refs for continuation across restart/rework.
+/// Feed a worker turn (rework, error-retry, or message). Claude uses stdin
+/// feed_turn; Codex kills the exited process and spawns a new one with
+/// thread-based continuation.
+async fn feed_worker_turn(
+    slot: &mut SlotState,
+    raw_prompt: &str,
+    config: &ServeConfig,
+) -> std::io::Result<()> {
+    if slot.proc.is_codex() {
+        if should_replace_pending_prompt(raw_prompt) {
+            slot.pending_prompt = raw_prompt.to_string();
+            slot.pending_turn_kind = if slot.pr.is_some() {
+                "rework".into()
+            } else {
+                "continuation".into()
+            };
+        }
+        let (model, effort) = codex_continuation_identity(slot)?;
+        let mut env_vars: Vec<(String, String)> = vec![
+            ("QUORUM_REPO".into(), config.repo.clone()),
+            ("QUORUM_AGENT".into(), slot.agent_name.clone()),
+        ];
+        if let Some(ref rid) = slot.cap_run_id {
+            env_vars.push(("QUORUM_RUN_ID".into(), rid.clone()));
+        }
+
+        let new_proc = if let Some(ref tid) = slot.codex_thread_id {
+            codex_agent::CodexProc::spawn_resume(
+                tid,
+                model,
+                effort,
+                &config.codex_sandbox,
+                &slot.worktree_path,
+                raw_prompt,
+                &env_vars,
+                config.agent_bin.as_deref(),
+            )?
+        } else {
+            codex_agent::CodexProc::spawn(
+                &codex_agent::CodexSpec {
+                    model: model.to_string(),
+                    effort: effort.to_string(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: slot.worktree_path.clone(),
+                    prompt: raw_prompt.to_string(),
+                    env_vars,
+                },
+                config.agent_bin.as_deref(),
+            )?
+        };
+
+        let old = std::mem::replace(&mut slot.proc, runner::RunnerProc::Codex(new_proc));
+        tokio::spawn(async move { old.kill_and_reap().await });
+        Ok(())
+    } else {
+        let turn = agent::user_turn(raw_prompt);
+        slot.proc.feed_turn(&turn).await
+    }
+}
+
+fn should_replace_pending_prompt(prompt: &str) -> bool {
+    !prompt.starts_with("Your previous turn was interrupted by a transport/API error")
+}
+
+fn codex_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str)> {
+    if slot.model.is_empty() || slot.effort.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Codex continuation missing its resolved model/effort identity",
+        ))
+    } else {
+        Ok((&slot.model, &slot.effort))
+    }
+}
+
+async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread_id: &str) {
+    let p = db_path.to_path_buf();
+    let tid = thread_id.to_string();
+    let task_id_val = task_id;
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let task = tasks::get(&conn, task_id_val)?;
+        if let Some(task) = task {
+            let mut refs: serde_json::Value = task
+                .refs
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::json!({}));
+            refs["codex_thread_id"] = serde_json::Value::String(tid);
+            let refs_str = refs.to_string();
+            tasks::update_refs_daemon(&mut conn, task_id_val, &refs_str, now_unix())?;
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log(&format!(
+            "persist_codex_thread_id failed for task #{task_id}: {e}"
+        )),
+        Err(e) => log(&format!(
+            "persist_codex_thread_id join error for task #{task_id}: {e}"
+        )),
+    }
+}
+
+async fn persist_codex_provider_block(
+    db_path: &std::path::Path,
+    task_id: i64,
+    reason: &str,
+    retry: &CodexRetryTurn,
+) -> Result<()> {
+    let p = db_path.to_path_buf();
+    let reason = reason.to_string();
+    let retry = retry.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        if let Some(task) = tasks::get(&conn, task_id)? {
+            let mut refs: serde_json::Value = task
+                .refs
+                .as_deref()
+                .and_then(|refs| serde_json::from_str(refs).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            refs["codex_provider_blocked"] = serde_json::Value::Bool(true);
+            refs["codex_provider_error"] = serde_json::Value::String(reason);
+            refs["codex_retry_model"] = serde_json::Value::String(retry.model);
+            refs["codex_retry_effort"] = serde_json::Value::String(retry.effort);
+            refs["codex_retry_prompt"] = serde_json::Value::String(retry.prompt);
+            refs["codex_retry_turn_kind"] = serde_json::Value::String(retry.turn_kind);
+            match retry.thread_id {
+                Some(thread_id) => {
+                    refs["codex_retry_thread_id"] = serde_json::Value::String(thread_id);
+                }
+                None => {
+                    if let Some(object) = refs.as_object_mut() {
+                        object.remove("codex_retry_thread_id");
+                    }
+                }
+            }
+            tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())?;
+        }
+        Ok(())
+    })
+    .await;
+    result.map_err(|error| QuorumError::Io(format!("provider-block join failed: {error}")))?
+}
+
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
 /// Returns `Some(LimitBreached)` if a cost/time ceiling was hit.
 ///
@@ -5123,7 +5418,7 @@ async fn drain_events(
     while let Ok(Some(raw_line)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_raw_line()).await
     {
-        let events = runner::normalize_claude_line(&raw_line);
+        let events = runner::normalize_line(slot.proc.kind(), &raw_line);
 
         if let Some(ref mut sl) = slot.session_log {
             sl.log_raw_and_normalized(&raw_line, &events);
@@ -5131,6 +5426,10 @@ async fn drain_events(
 
         for agent_event in &events {
             match agent_event {
+                runner::AgentEvent::ThreadStarted { thread_id } => {
+                    slot.codex_thread_id = Some(thread_id.clone());
+                    persist_codex_thread_id(db_path, slot.task_id, thread_id).await;
+                }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
                         usage.map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
@@ -5547,7 +5846,8 @@ async fn spawn_reviewer_for_worker(
     )
     .await
     {
-        Ok(mut proc) => {
+        Ok(agent_proc) => {
+            let mut proc = runner::RunnerProc::Claude(agent_proc);
             let prompt = reviewer::build_review_prompt(&spec, &config.effort);
             let turn1 = agent::user_turn(&prompt);
             if let Err(e) = proc.feed_turn(&turn1).await {
@@ -5638,6 +5938,8 @@ async fn spawn_reviewer_for_worker(
                 proc,
                 task_id: worker.task_id,
                 session_id,
+                model: reviewer_model,
+                effort: config.effort.clone(),
                 worktree_path: wt_path,
                 branch,
                 draining: true,
@@ -5657,6 +5959,9 @@ async fn spawn_reviewer_for_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
+                codex_thread_id: None,
+                pending_prompt: String::new(),
+                pending_turn_kind: "review".into(),
             });
         }
         Err(e) => {
@@ -5703,8 +6008,13 @@ async fn spawn_worker(
 
     let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        let open = tasks::list(&conn, Some("open"), None, None)?;
-        let found = open.into_iter().find(|t| {
+        let mut available = tasks::list(&conn, Some("open"), None, None)?;
+        available.extend(
+            tasks::list(&conn, Some("rework"), None, None)?
+                .into_iter()
+                .filter(|task| codex_retry_turn(task.refs.as_deref()).is_some()),
+        );
+        let found = available.into_iter().find(|t| {
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
@@ -5762,17 +6072,28 @@ async fn spawn_worker(
     let p = db_path.clone();
     let claim_agent = agent_name.clone();
     let claim_task_id = task.id;
+    let retrying_rework = task.status == "rework";
     let claimed = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
-        tasks::claim(
-            &mut conn,
-            &claim_agent,
-            Some(claim_task_id),
-            &[],
-            tasks::DEFAULT_LEASE_TTL_SECS,
-            now,
-        )
+        if retrying_rework {
+            tasks::claim_provider_retry_rework(
+                &mut conn,
+                &claim_agent,
+                claim_task_id,
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now,
+            )
+        } else {
+            tasks::claim(
+                &mut conn,
+                &claim_agent,
+                Some(claim_task_id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now,
+            )
+        }
     })
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -5944,8 +6265,11 @@ async fn spawn_worker(
             task.id
         ));
     }
-    let resolved_model = floored_model;
-    let resolved_effort = floored_effort;
+    let retry_turn = codex_retry_turn(task.refs.as_deref());
+    let (resolved_model, resolved_effort) = retry_turn
+        .as_ref()
+        .map(|retry| (retry.model.clone(), retry.effort.clone()))
+        .unwrap_or((floored_model, floored_effort));
 
     // #130: issue run capability for this worker (before spawn so env var is available).
     // A silent issue failure would leave the worker holding a QUORUM_RUN_ID pointing at
@@ -5971,46 +6295,93 @@ async fn spawn_worker(
         }
     }
 
-    let spec = AgentSpec {
-        kind: runner::AgentKind::Claude,
-        model: resolved_model.clone(),
-        effort: resolved_effort.clone(),
-        session_id: session_id.clone(),
-        worktree: wt_path.clone(),
-        bare: config.bare_agent,
-        allowed_tools: config
-            .allowed_tools
-            .clone()
-            .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
-        env_vars: vec![
-            ("QUORUM_REPO".into(), config.repo.clone()),
-            ("QUORUM_AGENT".into(), agent_name.clone()),
-            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-        ],
-    };
-    match AgentProc::spawn(&spec, config.agent_bin.as_deref()) {
-        Ok(mut proc) => {
-            let body = task.body.as_deref().unwrap_or(&task.title);
-            let turn1 = reviewer::build_worker_turn(
+    let worker_env_vars = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), agent_name.clone()),
+        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
+    ];
+
+    let body = task.body.as_deref().unwrap_or(&task.title);
+    let prompt_text = retry_turn.as_ref().map_or_else(
+        || {
+            reviewer::build_worker_prompt(
                 &agent_name,
                 task.id,
                 &task.title,
                 body,
                 config.limits.max_task_cost_usd,
-            );
-            if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!("feed_turn failed: {e}"));
-                proc.kill_and_reap().await;
-                let strikes = poison_tracker.record_strike(task.id);
-                if strikes >= MAX_POISON_STRIKES {
-                    poison_task(&db_path, &agent_name, task.id, strikes).await;
-                } else {
-                    release_task(&db_path, &agent_name, task.id).await;
+            )
+        },
+        |retry| retry.prompt.clone(),
+    );
+
+    let spawn_result: std::io::Result<runner::RunnerProc> = match config.runner_kind {
+        crate::serve_config::RunnerKind::Claude => {
+            let spec = AgentSpec {
+                kind: runner::AgentKind::Claude,
+                model: resolved_model.clone(),
+                effort: resolved_effort.clone(),
+                session_id: session_id.clone(),
+                worktree: wt_path.clone(),
+                bare: config.bare_agent,
+                allowed_tools: config
+                    .allowed_tools
+                    .clone()
+                    .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
+                env_vars: worker_env_vars,
+            };
+            AgentProc::spawn(&spec, config.agent_bin.as_deref()).map(runner::RunnerProc::Claude)
+        }
+        crate::serve_config::RunnerKind::Codex => {
+            if let Some(thread_id) = retry_turn
+                .as_ref()
+                .and_then(|retry| retry.thread_id.as_deref())
+            {
+                codex_agent::CodexProc::spawn_resume(
+                    thread_id,
+                    &resolved_model,
+                    &resolved_effort,
+                    &config.codex_sandbox,
+                    &wt_path,
+                    &prompt_text,
+                    &worker_env_vars,
+                    config.agent_bin.as_deref(),
+                )
+                .map(runner::RunnerProc::Codex)
+            } else {
+                let spec = codex_agent::CodexSpec {
+                    model: resolved_model.clone(),
+                    effort: resolved_effort.clone(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: wt_path.clone(),
+                    prompt: prompt_text.clone(),
+                    env_vars: worker_env_vars,
+                };
+                codex_agent::CodexProc::spawn(&spec, config.agent_bin.as_deref())
+                    .map(runner::RunnerProc::Codex)
+            }
+        }
+    };
+
+    match spawn_result {
+        Ok(mut proc) => {
+            // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
+            if !proc.is_codex() {
+                let turn1 = agent::user_turn(&prompt_text);
+                if let Err(e) = proc.feed_turn(&turn1).await {
+                    log(&format!("feed_turn failed: {e}"));
+                    proc.kill_and_reap().await;
+                    let strikes = poison_tracker.record_strike(task.id);
+                    if strikes >= MAX_POISON_STRIKES {
+                        poison_task(&db_path, &agent_name, task.id, strikes).await;
+                    } else {
+                        release_task(&db_path, &agent_name, task.id).await;
+                    }
+                    name_pool.release(&agent_name);
+                    wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+                    return Ok(false);
                 }
-                name_pool.release(&agent_name);
-                wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(worker_repo_dir, &branch).await;
-                return Ok(false);
             }
 
             // M7: persist PID immediately so crash recovery can clean up
@@ -6065,11 +6436,17 @@ async fn spawn_worker(
                 proc,
                 task_id: task.id,
                 session_id,
+                model: resolved_model,
+                effort: resolved_effort,
                 worktree_path: wt_path,
                 branch,
                 draining: true,
-                pr: None,
-                rework_count: 0,
+                pr: task
+                    .refs
+                    .as_deref()
+                    .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                    .and_then(|refs| refs.get("pr").and_then(|pr| pr.as_i64())),
+                rework_count: retry_slot_rework_count(task.rework_round, retry_turn.as_ref()),
                 cost_tokens: 0,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -6084,6 +6461,12 @@ async fn spawn_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
+                codex_thread_id: None,
+                pending_prompt: prompt_text,
+                pending_turn_kind: retry_turn
+                    .as_ref()
+                    .map(|retry| retry.turn_kind.clone())
+                    .unwrap_or_else(|| "initial".into()),
             });
         }
         Err(e) => {
@@ -6722,7 +7105,8 @@ async fn spawn_r2_reviewer(
     )
     .await
     {
-        Ok(mut proc) => {
+        Ok(agent_proc) => {
+            let mut proc = runner::RunnerProc::Claude(agent_proc);
             let prompt = reviewer::build_r2_review_prompt(&spec, &config.effort);
             let turn1 = agent::user_turn(&prompt);
             if let Err(e) = proc.feed_turn(&turn1).await {
@@ -6803,6 +7187,8 @@ async fn spawn_r2_reviewer(
                 proc,
                 task_id: worker.task_id,
                 session_id,
+                model: reviewer_model,
+                effort: config.effort.clone(),
                 worktree_path: wt_path,
                 branch,
                 draining: true,
@@ -6822,6 +7208,9 @@ async fn spawn_r2_reviewer(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: true,
                 reviewed_head_sha: spawn_head_sha,
+                codex_thread_id: None,
+                pending_prompt: String::new(),
+                pending_turn_kind: "r2-review".into(),
             });
 
             log(&format!(
@@ -7070,36 +7459,91 @@ async fn spawn_remediation_worker(
         config.limits.max_task_cost_usd,
     );
 
-    match agent::AgentProc::spawn(
-        &agent::AgentSpec {
-            kind: runner::AgentKind::Claude,
-            model: config.model.clone(),
-            effort: config.effort.clone(),
-            session_id: session_id.clone(),
-            worktree: wt_path.clone(),
-            bare: config.bare_agent,
-            allowed_tools: config
-                .allowed_tools
+    let remediation_env = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), agent_name.clone()),
+        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
+    ];
+
+    // For Codex rework: look up persisted thread_id for continuation.
+    let codex_thread_id = if config.runner_kind == crate::serve_config::RunnerKind::Codex {
+        let p = db_path.clone();
+        let tid = task_id;
+        tokio::task::spawn_blocking(move || -> Option<String> {
+            let conn = quorum_core::db::open(&p).ok()?;
+            let task = tasks::get(&conn, tid).ok()??;
+            let refs: serde_json::Value = task
+                .refs
                 .as_deref()
-                .unwrap_or(agent::ALLOWED_TOOLS)
-                .to_string(),
-            env_vars: vec![
-                ("QUORUM_REPO".into(), config.repo.clone()),
-                ("QUORUM_AGENT".into(), agent_name.clone()),
-                ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-            ],
-        },
-        config.agent_bin.as_deref(),
-    ) {
+                .and_then(|s| serde_json::from_str(s).ok())?;
+            refs.get("codex_thread_id")?.as_str().map(|s| s.to_string())
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+
+    let spawn_result: std::io::Result<runner::RunnerProc> = match config.runner_kind {
+        crate::serve_config::RunnerKind::Claude => agent::AgentProc::spawn(
+            &agent::AgentSpec {
+                kind: runner::AgentKind::Claude,
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+                session_id: session_id.clone(),
+                worktree: wt_path.clone(),
+                bare: config.bare_agent,
+                allowed_tools: config
+                    .allowed_tools
+                    .as_deref()
+                    .unwrap_or(agent::ALLOWED_TOOLS)
+                    .to_string(),
+                env_vars: remediation_env,
+            },
+            config.agent_bin.as_deref(),
+        )
+        .map(runner::RunnerProc::Claude),
+        crate::serve_config::RunnerKind::Codex => if let Some(ref tid) = codex_thread_id {
+            codex_agent::CodexProc::spawn_resume(
+                tid,
+                &config.model,
+                &config.effort,
+                &config.codex_sandbox,
+                &wt_path,
+                &prompt,
+                &remediation_env,
+                config.agent_bin.as_deref(),
+            )
+        } else {
+            log("remediation: no persisted thread_id — starting fresh Codex exec");
+            codex_agent::CodexProc::spawn(
+                &codex_agent::CodexSpec {
+                    model: config.model.clone(),
+                    effort: config.effort.clone(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: wt_path.clone(),
+                    prompt: prompt.clone(),
+                    env_vars: remediation_env,
+                },
+                config.agent_bin.as_deref(),
+            )
+        }
+        .map(runner::RunnerProc::Codex),
+    };
+
+    match spawn_result {
         Ok(mut proc) => {
-            let turn1 = agent::user_turn(&prompt);
-            if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!("remediation feed_turn failed: {e}"));
-                proc.kill_and_reap().await;
-                name_pool.release(&agent_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return false;
+            if !proc.is_codex() {
+                let turn1 = agent::user_turn(&prompt);
+                if let Err(e) = proc.feed_turn(&turn1).await {
+                    log(&format!("remediation feed_turn failed: {e}"));
+                    proc.kill_and_reap().await;
+                    name_pool.release(&agent_name);
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    return false;
+                }
             }
 
             let worker_run_id = {
@@ -7123,6 +7567,8 @@ async fn spawn_remediation_worker(
                 proc,
                 task_id,
                 session_id,
+                model: config.model.clone(),
+                effort: config.effort.clone(),
                 worktree_path: wt_path,
                 branch,
                 draining: true,
@@ -7142,6 +7588,9 @@ async fn spawn_remediation_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
+                codex_thread_id,
+                pending_prompt: prompt,
+                pending_turn_kind: "rework".into(),
             });
 
             log(&format!(
@@ -7672,13 +8121,15 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let reader = BufReader::new(stdout).lines();
-        let proc = AgentProc::from_parts(child, stdin, reader);
+        let proc = runner::RunnerProc::Claude(AgentProc::from_parts(child, stdin, reader));
         let now = Instant::now();
         SlotState {
             agent_name: "Test-1".into(),
             proc,
             task_id: 1,
             session_id: "sess".into(),
+            model: "test-model".into(),
+            effort: "high".into(),
             worktree_path: PathBuf::from("/tmp/test"),
             branch: "test-branch".into(),
             draining: false,
@@ -7698,7 +8149,224 @@ mod tests {
             cap_run_id: None,
             r2_origin: false,
             reviewed_head_sha: None,
+            codex_thread_id: None,
+            pending_prompt: "test prompt".into(),
+            pending_turn_kind: "initial".into(),
         }
+    }
+
+    #[test]
+    fn codex_continuation_requires_exact_run_identity() {
+        let mut slot = make_dummy_slot();
+        assert_eq!(
+            codex_continuation_identity(&slot).unwrap(),
+            ("test-model", "high")
+        );
+        slot.model.clear();
+        assert_eq!(
+            codex_continuation_identity(&slot).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        slot.model = "test-model".into();
+        slot.effort.clear();
+        assert_eq!(
+            codex_continuation_identity(&slot).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn provider_retry_restores_exact_rework_turn_and_thread() {
+        let feedback = "Fix stale-SHA handling; preserve this exact feedback.";
+        let refs = serde_json::json!({
+            "pr": 419,
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-5.6-codex",
+            "codex_retry_effort": "high",
+            "codex_retry_prompt": feedback,
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-exact"
+        })
+        .to_string();
+        let retry = codex_retry_turn(Some(&refs)).unwrap();
+        assert_eq!(retry.prompt, feedback);
+        assert_eq!(retry.turn_kind, "rework");
+        assert_eq!(retry.thread_id.as_deref(), Some("thread-exact"));
+        let args = codex_agent::resume_args(
+            retry.thread_id.as_deref().unwrap(),
+            &retry.model,
+            &retry.effort,
+            &retry.prompt,
+        );
+        assert_eq!(args[0..3], ["exec", "resume", "thread-exact"]);
+        assert_eq!(args.last().unwrap(), feedback);
+        assert!(!args.iter().any(|arg| arg.contains("You are agent")));
+    }
+
+    #[test]
+    fn provider_retry_rejects_incomplete_durable_turn() {
+        let refs = r#"{"codex_retry_requested":true,"codex_retry_model":"gpt"}"#;
+        assert!(codex_retry_turn(Some(refs)).is_none());
+    }
+
+    #[test]
+    fn transport_refeed_does_not_erase_rework_feedback() {
+        let feedback = "REVIEW FAILED — fix the stale approval bug";
+        assert!(should_replace_pending_prompt(feedback));
+        assert!(!should_replace_pending_prompt(
+            "Your previous turn was interrupted by a transport/API error (attempt 1/3)."
+        ));
+    }
+
+    #[test]
+    fn retry_metadata_survives_provider_event_and_db_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("retry.db");
+        let refs = serde_json::json!({
+            "pr": 419,
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-exact",
+            "codex_retry_effort": "high",
+            "codex_retry_prompt": "exact rework feedback",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-exact"
+        })
+        .to_string();
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "retry",
+                None,
+                0,
+                None,
+                Some(&refs),
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        }
+
+        let events = runner::normalize_codex_line(
+            r#"{"type":"thread.started","thread_id":"replacement-thread"}"#,
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [runner::AgentEvent::ThreadStarted { .. }]
+        ));
+
+        // Simulated daemon crash/restart: reopen the DB after provider output.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        let restored = codex_retry_turn(task.refs.as_deref()).unwrap();
+        assert_eq!(restored.prompt, "exact rework feedback");
+        assert_eq!(restored.thread_id.as_deref(), Some("thread-exact"));
+        assert_eq!(restored.model, "gpt-exact");
+        assert_eq!(restored.effort, "high");
+    }
+
+    #[test]
+    fn rework_retry_reconstructs_rework_pushed_and_sticky_reviewer_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rework-retry.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn, "owner", "retry", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, "worker", Some(task_id), &[], 3600, 11).unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "worker",
+            task_id,
+            &Event::SignaledDone { pr: "419".into() },
+            12,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "reviewer",
+            task_id,
+            &Event::ReviewerAttached {
+                agent: "reviewer".into(),
+            },
+            13,
+        )
+        .unwrap();
+        let rework = tasks::apply_event(&mut conn, "reviewer", task_id, &Event::VerdictChanges, 14)
+            .unwrap()
+            .task;
+        assert_eq!(rework.status, "rework");
+
+        let refs = serde_json::json!({
+            "pr": 419,
+            "codex_provider_blocked": true,
+            "codex_provider_error": "quota",
+            "codex_retry_model": "gpt-exact",
+            "codex_retry_effort": "high",
+            "codex_retry_prompt": "fix reviewer blocker",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-r2"
+        })
+        .to_string();
+        tasks::update_refs_daemon(&mut conn, task_id, &refs, 15).unwrap();
+        let queued = tasks::retry_provider_blocked(&mut conn, task_id, "operator", 16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, "rework");
+        assert!(queued.assignee.is_none());
+        let retry = codex_retry_turn(queued.refs.as_deref()).unwrap();
+        let reconstructed_count = retry_slot_rework_count(queued.rework_round, Some(&retry));
+        let event = worker_done_event(reconstructed_count, 419);
+        assert!(matches!(event, Event::ReworkPushed));
+
+        let reclaimed =
+            tasks::claim_provider_retry_rework(&mut conn, "retry-worker", task_id, 3600, 17)
+                .unwrap()
+                .unwrap();
+        assert_eq!(reclaimed.status, "rework");
+        let transitioned =
+            tasks::apply_event(&mut conn, "retry-worker", task_id, &event, 18).unwrap();
+        assert_eq!(transitioned.task.status, "in-review");
+        assert!(
+            transitioned.effects.contains(&Effect::ResumeReviewer),
+            "R2/sticky reviewer must be resumed after retried rework"
+        );
+    }
+
+    #[test]
+    fn initial_worker_retry_still_signals_done() {
+        assert!(matches!(
+            worker_done_event(0, 419),
+            Event::SignaledDone { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_block_persistence_fails_loud_before_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let impossible = dir.path().join("missing-parent").join("quorum.db");
+        let error = persist_codex_provider_block(
+            &impossible,
+            1,
+            "quota",
+            &CodexRetryTurn {
+                model: "gpt-test".into(),
+                effort: "high".into(),
+                prompt: "continue exact work".into(),
+                turn_kind: "rework".into(),
+                thread_id: Some("thread-1".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("provider-block")
+                || error.to_string().contains("unable to open"),
+            "unexpected durable-write error: {error}"
+        );
     }
 
     #[test]

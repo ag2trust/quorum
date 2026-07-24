@@ -152,6 +152,22 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
         .unwrap_or_default();
 
         for task in tasks_in_state {
+            let provider_blocked = task
+                .refs
+                .as_deref()
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                .and_then(|refs| {
+                    refs.get("codex_provider_blocked")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .unwrap_or(false);
+            if provider_blocked {
+                log(&format!(
+                    "recovery: leaving provider-blocked task #{} in {} for operator retry",
+                    task.id, task.status
+                ));
+                continue;
+            }
             let p = db_path.clone();
             let tid = task.id;
             let st = *status;

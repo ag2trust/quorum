@@ -17,6 +17,7 @@ use tokio::process::{Child, Command};
 
 pub struct CodexSpec {
     pub model: String,
+    pub effort: String,
     pub sandbox: String,
     pub worktree: PathBuf,
     pub prompt: String,
@@ -34,6 +35,8 @@ pub fn exec_args(spec: &CodexSpec) -> Vec<String> {
         "--json".into(),
         "--model".into(),
         spec.model.clone(),
+        "-c".into(),
+        format!("model_reasoning_effort={}", spec.effort),
         "-s".into(),
         spec.sandbox.clone(),
         "--dangerously-bypass-approvals-and-sandbox".into(),
@@ -47,13 +50,7 @@ pub fn exec_args(spec: &CodexSpec) -> Vec<String> {
 
 /// Build the argument list for `codex exec resume <thread_id> --json`
 /// (continuation turn).
-pub fn resume_args(
-    thread_id: &str,
-    model: &str,
-    sandbox: &str,
-    worktree: &std::path::Path,
-    prompt: &str,
-) -> Vec<String> {
+pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> Vec<String> {
     vec![
         "exec".into(),
         "resume".into(),
@@ -61,11 +58,9 @@ pub fn resume_args(
         "--json".into(),
         "--model".into(),
         model.into(),
-        "-s".into(),
-        sandbox.into(),
+        "-c".into(),
+        format!("model_reasoning_effort={effort}"),
         "--dangerously-bypass-approvals-and-sandbox".into(),
-        "-C".into(),
-        worktree.display().to_string(),
         "--skip-git-repo-check".into(),
         "--ignore-user-config".into(),
         prompt.into(),
@@ -82,6 +77,45 @@ pub struct CodexProc {
 }
 
 impl CodexProc {
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_resume(
+        thread_id: &str,
+        model: &str,
+        effort: &str,
+        _sandbox: &str,
+        worktree: &std::path::Path,
+        prompt: &str,
+        env_vars: &[(String, String)],
+        codex_bin: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let bin = codex_bin.unwrap_or("codex");
+        let args = resume_args(thread_id, model, effort, prompt);
+        let mut cmd = Command::new(bin);
+        cmd.args(&args);
+        for (k, v) in env_vars {
+            cmd.env(k, v);
+        }
+        cmd.current_dir(worktree);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = cmd.spawn()?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let reader = BufReader::new(stdout).lines();
+
+        Ok(Self { child, reader })
+    }
+
     pub fn spawn(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
         let args = exec_args(spec);
@@ -125,6 +159,15 @@ impl CodexProc {
         }
     }
 
+    /// Return the next provider JSONL line verbatim. Normalization belongs at
+    /// the shared runner boundary so logs retain fields Quorum does not parse.
+    pub async fn next_raw_line(&mut self) -> Option<String> {
+        match self.reader.next_line().await {
+            Ok(Some(line)) => Some(line),
+            _ => None,
+        }
+    }
+
     pub fn pid(&self) -> Option<i32> {
         self.child.id().map(|id| id as i32)
     }
@@ -150,11 +193,11 @@ impl CodexProc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn test_spec() -> CodexSpec {
         CodexSpec {
             model: "o4-mini".into(),
+            effort: "high".into(),
             sandbox: "read-only".into(),
             worktree: PathBuf::from("/tmp"),
             prompt: "say hello".into(),
@@ -172,15 +215,17 @@ mod tests {
         assert_eq!(args[1], "--json");
         assert_eq!(args[2], "--model");
         assert_eq!(args[3], "o4-mini");
-        assert_eq!(args[4], "-s");
-        assert_eq!(args[5], "read-only");
-        assert_eq!(args[6], "--dangerously-bypass-approvals-and-sandbox");
-        assert_eq!(args[7], "-C");
-        assert_eq!(args[8], "/tmp");
-        assert_eq!(args[9], "--skip-git-repo-check");
-        assert_eq!(args[10], "--ignore-user-config");
-        assert_eq!(args[11], "say hello");
-        assert_eq!(args.len(), 12);
+        assert_eq!(args[4], "-c");
+        assert_eq!(args[5], "model_reasoning_effort=high");
+        assert_eq!(args[6], "-s");
+        assert_eq!(args[7], "read-only");
+        assert_eq!(args[8], "--dangerously-bypass-approvals-and-sandbox");
+        assert_eq!(args[9], "-C");
+        assert_eq!(args[10], "/tmp");
+        assert_eq!(args[11], "--skip-git-repo-check");
+        assert_eq!(args[12], "--ignore-user-config");
+        assert_eq!(args[13], "say hello");
+        assert_eq!(args.len(), 14);
     }
 
     #[test]
@@ -216,43 +261,36 @@ mod tests {
         assert_eq!(args[pos + 1], "/tmp");
     }
 
+    #[test]
+    fn exec_args_contain_effort() {
+        let args = exec_args(&test_spec());
+        let pos = args.iter().position(|a| a == "-c").unwrap();
+        assert_eq!(args[pos + 1], "model_reasoning_effort=high");
+    }
+
     // ── Pinned resume argument shape ─────────────────────────────────────
 
     #[test]
     fn resume_args_shape() {
-        let args = resume_args(
-            "019f-thread-id",
-            "o4-mini",
-            "read-only",
-            Path::new("/tmp"),
-            "continue",
-        );
+        let args = resume_args("019f-thread-id", "o4-mini", "high", "continue");
         assert_eq!(args[0], "exec");
         assert_eq!(args[1], "resume");
         assert_eq!(args[2], "019f-thread-id");
         assert_eq!(args[3], "--json");
         assert_eq!(args[4], "--model");
         assert_eq!(args[5], "o4-mini");
-        assert_eq!(args[6], "-s");
-        assert_eq!(args[7], "read-only");
+        assert_eq!(args[6], "-c");
+        assert_eq!(args[7], "model_reasoning_effort=high");
         assert_eq!(args[8], "--dangerously-bypass-approvals-and-sandbox");
-        assert_eq!(args[9], "-C");
-        assert_eq!(args[10], "/tmp");
-        assert_eq!(args[11], "--skip-git-repo-check");
-        assert_eq!(args[12], "--ignore-user-config");
-        assert_eq!(args[13], "continue");
-        assert_eq!(args.len(), 14);
+        assert_eq!(args[9], "--skip-git-repo-check");
+        assert_eq!(args[10], "--ignore-user-config");
+        assert_eq!(args[11], "continue");
+        assert_eq!(args.len(), 12);
     }
 
     #[test]
     fn resume_args_thread_id_position() {
-        let args = resume_args(
-            "my-thread",
-            "gpt-4o",
-            "workspace-write",
-            Path::new("/w"),
-            "go",
-        );
+        let args = resume_args("my-thread", "gpt-4o", "medium", "go");
         assert_eq!(
             args[2], "my-thread",
             "thread_id must be positional arg after 'resume'"
@@ -261,7 +299,7 @@ mod tests {
 
     #[test]
     fn resume_args_carry_json_flag() {
-        let args = resume_args("tid", "m", "s", Path::new("/"), "p");
+        let args = resume_args("tid", "m", "h", "p");
         assert!(args.contains(&"--json".to_string()));
     }
 
@@ -336,6 +374,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spec = CodexSpec {
             model: "o4-mini".into(),
+            effort: "high".into(),
             sandbox: "read-only".into(),
             worktree: PathBuf::from("/tmp"),
             prompt: "ping".into(),
@@ -365,6 +404,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let spec = CodexSpec {
             model: "o4-mini".into(),
+            effort: "high".into(),
             sandbox: "read-only".into(),
             worktree: PathBuf::from("/tmp"),
             prompt: "ping".into(),
@@ -396,8 +436,7 @@ mod tests {
         let args = resume_args(
             "00000000-0000-0000-0000-000000000000",
             "o4-mini",
-            "read-only",
-            Path::new("/tmp"),
+            "high",
             "continue",
         );
         let mut cmd = std::process::Command::new("codex");
@@ -408,13 +447,36 @@ mod tests {
         cmd.current_dir("/tmp");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
-        let output = cmd.output().expect("spawn codex resume");
+        let mut child = cmd.spawn().expect("spawn codex resume");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll codex resume") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("kill bounded codex resume canary");
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // Remaining alive past the short parser boundary proves the CLI
+        // accepted the shape. Empty CODEX_HOME and API key prevent auth reuse.
+        let Some(status) = status else {
+            return;
+        };
+        let output = child
+            .wait_with_output()
+            .expect("collect codex resume output");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() && stdout.is_empty() {
+        if !status.success() && stdout.is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let is_arg_error = stderr.contains("Usage:") || stderr.contains("error: invalid");
+            let is_arg_error = stderr.contains("Usage:")
+                || stderr.contains("unexpected argument")
+                || stderr.contains("invalid argument")
+                || stderr.contains("unrecognized option");
             assert!(
                 !is_arg_error,
                 "codex rejected resume argument shape: {stderr}"

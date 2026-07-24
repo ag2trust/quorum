@@ -8,15 +8,73 @@
 //! Quorum-generated UUID before spawn; Codex will persist the thread ID from
 //! `thread.started`. The column name is retained for schema compatibility.
 
-use super::stream;
+use super::agent::AgentProc;
+use super::codex_agent::CodexProc;
+use super::{codex_stream, stream};
 
 /// Closed runner enum — supporting another runner requires an explicit code
 /// change, not configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
-    #[allow(dead_code)] // phase 1: Codex not yet production-selectable
     Codex,
+}
+
+/// Provider-specific process transport behind the normalized runner boundary.
+pub enum RunnerProc {
+    Claude(AgentProc),
+    Codex(CodexProc),
+}
+
+impl RunnerProc {
+    pub fn kind(&self) -> AgentKind {
+        match self {
+            Self::Claude(_) => AgentKind::Claude,
+            Self::Codex(_) => AgentKind::Codex,
+        }
+    }
+
+    pub async fn kill_and_reap(self) {
+        match self {
+            Self::Claude(proc) => proc.kill_and_reap().await,
+            Self::Codex(proc) => proc.kill_and_reap().await,
+        }
+    }
+
+    pub fn pid(&self) -> Option<i32> {
+        match self {
+            Self::Claude(proc) => proc.pid(),
+            Self::Codex(proc) => proc.pid(),
+        }
+    }
+
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Claude(proc) => proc.try_wait(),
+            Self::Codex(proc) => proc.try_wait(),
+        }
+    }
+
+    pub async fn next_raw_line(&mut self) -> Option<String> {
+        match self {
+            Self::Claude(proc) => proc.next_raw_line().await,
+            Self::Codex(proc) => proc.next_raw_line().await,
+        }
+    }
+
+    pub async fn feed_turn(&mut self, turn: &str) -> std::io::Result<()> {
+        match self {
+            Self::Claude(proc) => proc.feed_turn(turn).await,
+            Self::Codex(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Codex is turn-oriented — respawn with its thread ID",
+            )),
+        }
+    }
+
+    pub fn is_codex(&self) -> bool {
+        matches!(self, Self::Codex(_))
+    }
 }
 
 impl std::fmt::Display for AgentKind {
@@ -31,6 +89,9 @@ impl std::fmt::Display for AgentKind {
 /// Normalized event consumed by the daemon lifecycle.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    ThreadStarted {
+        thread_id: String,
+    },
     /// Runner session identity established. For Claude this fires on the
     /// first assistant event (identity is pre-spawn); for Codex it will fire
     /// on `thread.started`.
@@ -168,6 +229,72 @@ pub fn normalize_claude_line(raw: &str) -> Vec<AgentEvent> {
         }
 
         stream::Event::Other => vec![],
+    }
+}
+
+pub fn normalize_codex_line(raw: &str) -> Vec<AgentEvent> {
+    let event = match codex_stream::parse_line(raw) {
+        Some(event) => event,
+        None => return vec![],
+    };
+    match event {
+        codex_stream::Event::ThreadStarted { thread_id } => {
+            vec![AgentEvent::ThreadStarted { thread_id }]
+        }
+        codex_stream::Event::ItemStarted { item } | codex_stream::Event::ItemCompleted { item } => {
+            match item {
+                codex_stream::Item::AgentMessage { text, .. } if !text.is_empty() => {
+                    vec![AgentEvent::AssistantText { text }]
+                }
+                codex_stream::Item::CommandExecution { command, .. } => {
+                    vec![AgentEvent::Activity {
+                        kind: ActivityKind::ToolUse,
+                        summary: tool_summary("command", &serde_json::json!({"command": command})),
+                    }]
+                }
+                codex_stream::Item::FileChange { changes, .. } => {
+                    let path = changes
+                        .first()
+                        .map(|change| change.path.as_str())
+                        .unwrap_or("file");
+                    vec![AgentEvent::Activity {
+                        kind: ActivityKind::ToolUse,
+                        summary: tool_summary(
+                            "file_change",
+                            &serde_json::json!({"file_path": path}),
+                        ),
+                    }]
+                }
+                _ => vec![],
+            }
+        }
+        codex_stream::Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
+            usage: usage.map(|usage| TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            cost_usd: None,
+        }],
+        codex_stream::Event::TurnFailed { error } => vec![AgentEvent::TurnFailed {
+            message: error
+                .map(|error| error.message)
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| "Codex turn failed".into()),
+            usage: None,
+            cost_usd: None,
+        }],
+        // Codex emits top-level Error events for retryable transport/reconnect
+        // warnings before a later terminal turn event. Lifecycle state changes
+        // only on turn.completed/turn.failed or authoritative process exit.
+        codex_stream::Event::Error { .. } => vec![],
+        _ => vec![],
+    }
+}
+
+pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
+    match kind {
+        AgentKind::Claude => normalize_claude_line(raw),
+        AgentKind::Codex => normalize_codex_line(raw),
     }
 }
 

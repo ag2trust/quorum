@@ -298,6 +298,23 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   non-terminal state; reason REQUIRED. Sets `done` but emits `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum done`.
+- `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
+  durably parked after bounded provider/auth/quota/protocol failure. The command
+  atomically requires and clears the provider-block marker. A parked
+  `working` task returns to `open`; a true `rework` task remains unassigned in
+  `rework` and is atomically reattached through a dedicated replacement-worker
+  claim. Both paths carry the exact persisted failed turn. `in-review` is
+  rejected; Codex R1/R2 belongs to the later reviewer-provider phase.
+  Before teardown, Quorum stores the pending raw prompt, turn kind, exact
+  model/effort, and provider thread ID (when issued) in task refs. Provisioning
+  reuses the task branch and PR, resumes that thread when present (fresh
+  `exec` only before a thread exists), and never substitutes the generic
+  initial task prompt. Provider events do not consume retry metadata. It is
+  removed atomically with the successful worker submit transition into
+  `in-review`, so any crash while implementation remains active restarts from
+  the same durable turn.
+  It never changes PR identity, approvals, dependencies, rework count, or author.
+  Unblocked and terminal tasks return the clean-negative exit 1.
 - `quorum task-list [--status <s>] [--label <l>] [--assignee <id>]` (read-filtered)
 - `quorum task-get --task-id <n>`
 
