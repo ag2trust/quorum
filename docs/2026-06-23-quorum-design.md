@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, coding-runner boundary 2026-07-24)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -22,6 +22,41 @@ properties, in order:
 
 The one concession to humans: a read-only **`quorum status`** command (optionally
 long-lived with `--watch`) for at-a-glance health. It mutates nothing.
+
+### Product boundary: opinionated Git delivery
+
+Quorum is an opinionated local **agentic Git/GitHub coding pipeline**. It provisions
+supported coding CLI runners as managed workers and reviewers inside this lifecycle:
+
+```text
+accepted task
+  → isolated worktree and branch
+  → coding worker
+  → pushed pull request
+  → independent R1 review
+  → adversarial R2 review
+  → rework when required
+  → required checks
+  → daemon-controlled approval and merge
+```
+
+This boundary is intentional. Quorum is **not** a general-purpose agent orchestrator,
+model gateway, arbitrary workflow engine, or agent-provider plugin host. The task,
+worktree, PR, review, rework, CI, and merge lifecycle is the product. A coding CLI is
+an execution mechanism inside that fixed lifecycle; it does not define or extend the
+lifecycle.
+
+Quorum supports a small closed set of built-in coding runners. Adding one is a
+deliberate product change implemented and tested in this repository, not dynamic
+provider registration. Runner-specific capabilities must never weaken lifecycle
+authority: workers and reviewers signal outcomes, while the daemon alone owns task
+transitions, formal approval, and merge.
+
+The approved product contract lives in the separate `quorum-pml` definition. PML
+states observable delivery outcomes using the terms **Managed Task**, **Coding Run**,
+**Proposed Change**, **Delivery Contract**, and **Supported Coding Runner**. Provider
+names, model IDs, CLI flags, stream protocols, and telemetry shapes are implementation
+and verification evidence, not normative product language.
 
 ## What Quorum *is*
 
@@ -892,6 +927,276 @@ bypasses the watermark for historical analysis. The boundary survives daemon
 restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
 Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
+
+## Built-in coding runners: Claude and Codex
+
+**Date:** 2026-07-24
+**Status:** Approved design; implementation pending.
+
+### Decision and boundary
+
+Quorum supports exactly two built-in coding runners in this design:
+
+- `claude` preserves the existing persistent Claude Code stream-json behavior.
+- `codex` uses the stable non-interactive Codex CLI JSONL interface.
+
+This is a closed Rust enum, not a public provider trait or plugin API:
+
+```rust
+enum AgentKind {
+    Claude,
+    Codex,
+}
+```
+
+The runner boundary exists only to keep coding-CLI process details out of the Git/PR
+lifecycle. Supporting another runner requires an explicit code, test, configuration,
+and design change.
+
+The daemon gives each managed run exactly one task and role, an isolated worktree and
+branch, a run-scoped `QUORUM_RUN_ID`, model and effort selection, role instructions,
+and the environment required to invoke `git`, `gh`, and `quorum`.
+
+A runner may start or continue one coding turn, deliver a prompt, expose observable
+assistant text and tool activity, report authoritative terminal success or failure,
+return available usage, and be killed and reaped as a process group. A runner may not
+select work, change lifecycle state directly, formally approve or merge, mark a task
+done, or redefine review policy.
+
+### Internal run contract
+
+Use the smallest normalized model consumed by the daemon:
+
+```rust
+struct AgentSpec {
+    kind: AgentKind,
+    executable: PathBuf,
+    model: String,
+    effort: String,
+    worktree: PathBuf,
+    environment: Vec<(String, String)>,
+    session_id: Option<String>,
+}
+
+enum AgentEvent {
+    SessionStarted { id: String },
+    AssistantText { text: String },
+    Activity { kind: ActivityKind, summary: String },
+    TurnCompleted { usage: Option<TokenUsage> },
+    TurnFailed { message: String },
+}
+```
+
+Do not mirror either CLI's complete schema. Preserve each raw JSON line in
+`stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
+transcript, and ignore unknown events without advancing lifecycle state.
+
+`journal.session_id` becomes an opaque **runner continuation ID** while retaining its
+column name for schema compatibility:
+
+- Claude receives a Quorum-generated UUID before spawn.
+- Codex issues a thread ID in `thread.started`; Quorum persists it before relying on
+  continuation.
+
+Missing required continuation identity is an abnormal startup failure. Assistant
+prose is never task completion.
+
+### Claude behavior remains stable
+
+The Claude runner preserves the production contract: one persistent child,
+bidirectional stream-json, Quorum-generated session UUID, stdin-fed later turns,
+`dontAsk`, Claude-only `allowedTools`, optional Claude-only `bare`, and terminal
+`result` events with tokens and optional cumulative USD cost.
+
+Existing Claude command construction, event semantics, defaults, prompts, real-CLI
+contract tests, and recovery behavior must remain unchanged during extraction.
+Claude-only capabilities stay isolated and receive no Codex emulation:
+
+- `--allowedTools`;
+- `--bare`;
+- PostToolUse activity hooks;
+- Claude-native Skill invocation;
+- stream-provided cumulative USD cost.
+
+### Reliable Codex surface
+
+Use only `codex exec`. Do not use the experimental app server, experimental exec
+server, TypeScript SDK, internal rollout files, or ephemeral mode.
+
+First turn, conceptually:
+
+```text
+codex exec --json --ask-for-approval never --sandbox <mode>
+  --cd <worktree> --model <model>
+  -c model_reasoning_effort=<effort> -
+```
+
+Continuation, conceptually:
+
+```text
+codex exec resume <thread-id> --json --ask-for-approval never
+  --sandbox <mode> --model <model>
+  -c model_reasoning_effort=<effort> -
+```
+
+Exact flag placement is an executable contract pinned by tests against the installed
+real CLI without spending model tokens.
+
+Codex is turn-oriented: one process runs one turn and exits; a later process resumes
+the returned thread ID. Quorum must not force Codex into Claude's persistent-stdin
+model.
+
+Consumed events:
+
+| Codex event | Normalized meaning |
+|---|---|
+| `thread.started` | `SessionStarted` with opaque thread ID |
+| completed `agent_message` item | `AssistantText` |
+| command, file-change, or MCP item activity | `Activity` |
+| `turn.completed` | terminal success plus available usage |
+| `turn.failed` | terminal failure |
+| top-level fatal `error` | terminal failure unless a later success is permitted by the pinned CLI contract |
+
+An item-level error is observable activity, not independently authoritative failure:
+Codex has emitted non-fatal item errors followed by `turn.completed` and exit 0.
+
+Codex success requires both `turn.completed` and successful process exit. Failure
+includes `turn.failed`, fatal top-level error, non-zero exit without authoritative
+completion, EOF before a terminal event, missing thread identity, or idle/wall-clock
+timeout.
+
+### Capabilities and safety limits
+
+Capabilities are fixed internal facts, not a negotiation framework:
+
+| Capability | Claude | Codex |
+|---|---:|---:|
+| resumable continuation | yes | yes |
+| JSON event stream | yes | yes |
+| token usage | yes | yes |
+| stream-provided USD cost | yes | no |
+| CLI tool allowlist | yes | no |
+| provider-native review skill | optional | not required |
+
+Never fabricate missing telemetry. Token, wall-clock, task-wall, and idle limits
+continue when their data is observable. Codex does not expose reliable ChatGPT
+subscription USD cost per turn. If a Codex daemon is configured with a USD safety
+limit, startup fails loudly rather than ignoring it or failing every completed turn.
+
+Use the minimum Codex sandbox proven by the full lifecycle canary. Begin validation
+with `danger-full-access` because runs use git, GitHub CLI, Quorum, repository hooks,
+builds, and managed worktree paths. Use `workspace-write` plus explicit writable paths
+only if worker, review, rework, and merge-signaling canaries pass without exceptions.
+Approval policy is always `never`; no human exists inside a managed run.
+
+### Prompt composition
+
+Prompts are the common Git delivery contract plus a worker/R1/R2 role contract plus a
+small runner note. Complete task and verdict contracts remain inline; provider skills
+are supplemental methodology, never lifecycle dependencies.
+
+Workers must work only on the assigned task, branch, and worktree; implement and
+verify the outcome; push and open or update the PR; signal through `quorum submit`;
+and never merge or mark the task done.
+
+Reviewers must inspect the full diff and relevant surrounding behavior, follow
+repository instructions, classify BLOCKING and advisory findings, put authoritative
+findings on the PR, submit a matching verdict, and never formally approve, merge, or
+review their own delivery.
+
+Claude may invoke its built-in review skill. Codex follows `AGENTS.md` and available
+Codex skills, but Quorum does not require a particular built-in skill. Shared prompts
+say "repository instructions" instead of `CLAUDE.md`.
+
+### Configuration and model routing
+
+Runner selection is explicit and defaults to Claude for compatibility:
+
+```toml
+agent = "claude"
+agent_bin = "claude"
+model = "claude-opus-4-7"
+effort = "high"
+```
+
+Codex:
+
+```toml
+agent = "codex"
+agent_bin = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[codex]
+sandbox = "danger-full-access"
+ignore_user_config = false
+```
+
+Never infer runner kind from the executable filename. Existing top-level
+`no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
+Runner-specific configuration is scoped under `[claude]` or `[codex]`.
+
+The initial release uses one runner kind per daemon. Per-task runners, mixed providers
+within one daemon, and switching an in-flight task between runners are out of scope.
+
+Claude's Sonnet/Opus order is not a cross-runner abstraction. Replace shared rank
+inference with explicit per-role selections while preserving Claude defaults:
+
+```toml
+[models]
+worker = "claude-opus-4-6"
+reviewer = "claude-opus-4-7"
+r2 = "claude-opus-4-8"
+classifier = "claude-haiku-4-5-20251001"
+doctor = "claude-sonnet-4-20250514"
+```
+
+Complexity overrides map directly to `model/effort`. R1 and R2 models are explicit;
+there is no universal "next stronger model" across families.
+
+### Delivery sequence
+
+1. **Extract the runner boundary.** Move current Claude spawn/parsing behind it,
+   normalize consumed events, preserve raw JSONL, and prove Claude behavior unchanged.
+2. **Add Codex parsing and commands.** Fixture-test consumed events, negative terminal
+   paths, unknown events, command shapes, and zero-token real-CLI argument validation.
+3. **Enable Codex workers.** Prove initial work, submit, rework continuation, restart,
+   watchdogs, auth/quota failure, and unsupported-USD-limit rejection.
+4. **Enable Codex R1 and R2.** Prove changes/rework/re-review, stale-head rejection,
+   self-review prevention, preflight evidence, CI wait, daemon approval, and merge.
+5. **Simplify configuration.** Preserve old Claude configuration, add explicit
+   per-role mappings, and install runner-appropriate Quorum guidance.
+
+Classifier, doctor, review interpreter, and analytics collector are not initial Codex
+parity requirements. They remain Claude-backed or disabled until the primary
+worker → R1 → R2 → merge lifecycle is proven. Mixed-runner behavior is never inferred.
+
+### Verification gates
+
+Before Codex is production-selectable:
+
+- all Claude tests and real-CLI contracts pass unchanged;
+- Codex fixtures cover every consumed event and negative terminal path;
+- a disposable repository completes worker → PR → R1 → R2 → checks → merge;
+- a changes verdict resumes the same task and Proposed Change;
+- restart preserves or safely reconstructs the run;
+- shutdown and signals never mark work done;
+- auth, quota, protocol, and timeout failures are loud and do not respawn-loop;
+- concurrent workers remain isolated;
+- the same approved PML Delivery Contract is verified with Claude and Codex, with
+  provider/model recorded in evidence instead of the definition.
+
+### Out of scope
+
+- arbitrary runner plugins;
+- direct OpenAI API integration independent of Codex CLI;
+- Anthropic-compatible gateways or ChatGPT credential proxies;
+- emulating Claude `bare`, tool allowlists, or activity hooks for Codex;
+- exact subscription-dollar accounting;
+- Codex cloud tasks or experimental servers;
+- cross-runner session migration;
+- per-task or mixed-provider selection initially;
+- general agent orchestration.
 
 ## Daemon-only execution and lean interface (v2 boundary)
 
