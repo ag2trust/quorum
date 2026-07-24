@@ -901,6 +901,20 @@ pub fn update(
     Ok(task)
 }
 
+/// Daemon-authoritative refs update — bypasses the assignee guard.
+/// Used for internal bookkeeping (e.g. persisting Codex thread IDs)
+/// where the daemon needs to write task metadata it doesn't "own" via
+/// the normal agent-scoped update path.
+pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) -> Result<()> {
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 // ── close_after_merge ─────────────────────────────────────────────────────────
 
 pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -> Result<bool> {
@@ -3828,5 +3842,42 @@ mod tests {
                 .contains("last failure: lifecycle transition rejected at done signal: not-holder"),
             "exhaustion message must carry the triggering failure reason, got: {reason}"
         );
+    }
+
+    #[test]
+    fn update_refs_daemon_bypasses_assignee_guard() {
+        let (_dir, mut conn) = open_tmp();
+        let now = 1000;
+        let id = create(
+            &mut conn,
+            "creator",
+            "Test task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        // Claim as "worker-1" so assignee is set.
+        claim(&mut conn, "worker-1", Some(id), &[], TTL, now).unwrap();
+        // Normal update as "daemon" fails — not the assignee.
+        let res = update(
+            &mut conn,
+            "daemon",
+            id,
+            &TaskUpdate {
+                refs: Some(r#"{"thread":"abc"}"#),
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(res.is_err(), "regular update by non-assignee must fail");
+        // Daemon-authoritative refs update succeeds.
+        update_refs_daemon(&mut conn, id, r#"{"thread":"abc"}"#, now).unwrap();
+        let t = get(&conn, id).unwrap().unwrap();
+        assert_eq!(t.refs.as_deref(), Some(r#"{"thread":"abc"}"#));
     }
 }

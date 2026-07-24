@@ -5265,7 +5265,7 @@ async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread
     let p = db_path.to_path_buf();
     let tid = thread_id.to_string();
     let task_id_val = task_id;
-    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
         let task = tasks::get(&conn, task_id_val)?;
         if let Some(task) = task {
@@ -5276,18 +5276,20 @@ async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread
                 .unwrap_or(serde_json::json!({}));
             refs["codex_thread_id"] = serde_json::Value::String(tid);
             let refs_str = refs.to_string();
-            let fields = tasks::TaskUpdate {
-                status: None,
-                body: None,
-                refs: Some(&refs_str),
-                verdict: None,
-                depends_on: None,
-            };
-            tasks::update(&mut conn, "daemon", task_id_val, &fields, now_unix())?;
+            tasks::update_refs_daemon(&mut conn, task_id_val, &refs_str, now_unix())?;
         }
         Ok(())
     })
     .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log(&format!(
+            "persist_codex_thread_id failed for task #{task_id}: {e}"
+        )),
+        Err(e) => log(&format!(
+            "persist_codex_thread_id join error for task #{task_id}: {e}"
+        )),
+    }
 }
 
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
