@@ -115,6 +115,7 @@ pub async fn spawn_reviewer(
     allowed_tools_override: Option<&str>,
 ) -> std::io::Result<AgentProc> {
     let agent_spec = AgentSpec {
+        kind: super::runner::AgentKind::Claude,
         model: model.to_string(),
         effort: effort.to_string(),
         session_id: session_id.to_string(),

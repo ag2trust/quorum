@@ -2,6 +2,7 @@
 //!
 //! Used by both transcript.md appends and `quorum tail`.
 
+use super::runner::AgentEvent;
 use super::stream::Event;
 
 /// Render a stream event into human-readable markdown text.
@@ -117,6 +118,27 @@ fn tool_snippet(name: &str, input: &serde_json::Value) -> Option<String> {
             }
             None
         }
+    }
+}
+
+/// Render a normalized AgentEvent for transcript.md.
+pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::AssistantText { text } => {
+            if text.is_empty() {
+                None
+            } else {
+                Some(format!("## Assistant\n\n{text}\n"))
+            }
+        }
+        AgentEvent::Activity { summary, .. } => Some(format!("> {summary}")),
+        AgentEvent::TurnCompleted { usage, cost_usd } => {
+            let tokens = usage.map_or(0, |u| u.input_tokens + u.output_tokens);
+            let cost_str = cost_usd.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
+            Some(format!("---\n*Turn complete: {tokens} tokens{cost_str}*\n"))
+        }
+        AgentEvent::TurnFailed { message, .. } => Some(format!("---\n*Turn failed: {message}*\n")),
+        AgentEvent::MidTurnUsage { .. } => None,
     }
 }
 
@@ -273,5 +295,56 @@ mod tests {
             rendered.contains("I'll review PR #168"),
             "real stream assistant event must render: {rendered}"
         );
+    }
+
+    #[test]
+    fn render_agent_event_assistant_text() {
+        let event = AgentEvent::AssistantText {
+            text: "hello".into(),
+        };
+        let rendered = render_agent_event(&event).unwrap();
+        assert!(rendered.contains("hello"));
+        assert!(rendered.contains("## Assistant"));
+    }
+
+    #[test]
+    fn render_agent_event_activity() {
+        let event = AgentEvent::Activity {
+            kind: super::super::runner::ActivityKind::ToolUse,
+            summary: "Bash: cargo test".into(),
+        };
+        let rendered = render_agent_event(&event).unwrap();
+        assert!(rendered.contains("> Bash: cargo test"));
+    }
+
+    #[test]
+    fn render_agent_event_turn_completed() {
+        let event = AgentEvent::TurnCompleted {
+            usage: Some(super::super::runner::TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+            }),
+            cost_usd: Some(0.05),
+        };
+        let rendered = render_agent_event(&event).unwrap();
+        assert!(rendered.contains("300 tokens"));
+        assert!(rendered.contains("$0.0500"));
+    }
+
+    #[test]
+    fn render_agent_event_turn_failed() {
+        let event = AgentEvent::TurnFailed {
+            message: "boom".into(),
+            usage: None,
+            cost_usd: None,
+        };
+        let rendered = render_agent_event(&event).unwrap();
+        assert!(rendered.contains("Turn failed: boom"));
+    }
+
+    #[test]
+    fn render_agent_event_mid_turn_usage_invisible() {
+        let event = AgentEvent::MidTurnUsage { tokens: 500 };
+        assert!(render_agent_event(&event).is_none());
     }
 }
