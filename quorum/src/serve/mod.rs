@@ -663,6 +663,7 @@ pub(crate) struct SlotState {
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
     error_turn_count: u32,
+    last_error_text: Option<String>,
     agent_run_id: Option<i64>,
     /// Daemon-issued run capability id (#130). Used for revocation on teardown.
     cap_run_id: Option<String>,
@@ -5119,6 +5120,7 @@ async fn drain_events(
                 usage,
                 total_cost_usd,
                 is_error,
+                result,
                 ..
             } => {
                 let error_terminated = is_error.unwrap_or(false);
@@ -5169,13 +5171,18 @@ async fn drain_events(
                 slot.turn_ended_at = Some(std::time::Instant::now());
                 slot.live_stats.mid_turn_tokens = 0;
                 slot.live_stats.record_event();
-                write_live_sidecar(slot);
 
                 if error_terminated {
                     slot.error_turn_count += 1;
+                    let raw = stream::result_text(result);
+                    let bounded: String = raw.chars().take(120).collect();
+                    slot.last_error_text = Some(bounded);
                 } else {
                     slot.error_turn_count = 0;
+                    slot.last_error_text = None;
                 }
+
+                write_live_sidecar(slot);
 
                 if let Some(ref mut sl) = slot.session_log {
                     sl.log_event(&event);
@@ -5253,6 +5260,8 @@ fn write_live_sidecar(slot: &SlotState) {
             up_secs: slot.live_stats.uptime_secs(),
             mid_turn_tok: slot.live_stats.mid_turn_tokens,
             spawn_epoch: slot.live_stats.spawn_epoch,
+            error_count: slot.error_turn_count,
+            error_text: slot.last_error_text.clone(),
         };
         if let Ok(json) = serde_json::to_string(&stats) {
             let _ = std::fs::write(&path, json);
@@ -5658,6 +5667,7 @@ async fn spawn_reviewer_for_worker(
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                last_error_text: None,
                 agent_run_id: reviewer_run_id,
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
@@ -6083,6 +6093,7 @@ async fn spawn_worker(
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                last_error_text: None,
                 agent_run_id: worker_run_id,
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
@@ -6820,6 +6831,7 @@ async fn spawn_r2_reviewer(
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                last_error_text: None,
                 agent_run_id: reviewer_run_id,
                 cap_run_id: Some(cap_run_id),
                 r2_origin: true,
@@ -7138,6 +7150,7 @@ async fn spawn_remediation_worker(
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                last_error_text: None,
                 agent_run_id: worker_run_id,
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
@@ -7693,6 +7706,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
             r2_origin: false,
