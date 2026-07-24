@@ -330,6 +330,7 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
     } else {
         String::new()
     };
+    let error_suffix = format_live_error(d, sty);
     let agent_label = if d.sub_role.as_deref() == Some("r2") {
         format!("{}(r2)", d.agent)
     } else {
@@ -338,7 +339,7 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
 
     let _ = writeln!(
         w,
-        "{} {:<12}  {:<8} {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}",
+        "{} {:<12}  {:<8} {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}{}",
         dot,
         agent_label,
         model,
@@ -351,8 +352,29 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
         evm,
         now_display,
         rework_suffix,
+        error_suffix,
     );
 }
+
+fn format_live_error(d: &DaemonAgentView, sty: &Style) -> String {
+    if d.live_error_count == 0 {
+        return String::new();
+    }
+    let label = format!(" ERR {}/{MAX_ERROR_RETRIES}", d.live_error_count);
+    let text_part = d
+        .live_error_text
+        .as_deref()
+        .map(|t| format!(" · {}", truncate(t, 40)))
+        .unwrap_or_default();
+    let raw = format!("{label}{text_part}");
+    if sty.color {
+        format!(" {}", sty.red(&raw))
+    } else {
+        format!(" [{raw}]")
+    }
+}
+
+const MAX_ERROR_RETRIES: u32 = 3;
 
 fn split_tier_eff(tier_eff: Option<&str>) -> (&str, &str) {
     let value = tier_eff.unwrap_or("—");
@@ -371,19 +393,21 @@ fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write)
     } else {
         "reviewer"
     };
+    let error_suffix = format_live_error(rev, sty);
     let sub = if sty.color {
         format!(
-            "    {} {}  {} · {} · {} tok",
+            "    {} {}  {} · {} · {} tok{}",
             sty.dim("└"),
             role_label,
             rev.agent,
             rev_up,
             rev_tok,
+            error_suffix,
         )
     } else {
         format!(
-            "    +- {}  {} · {} · {} tok",
-            role_label, rev.agent, rev_up, rev_tok,
+            "    +- {}  {} · {} · {} tok{}",
+            role_label, rev.agent, rev_up, rev_tok, error_suffix,
         )
     };
     let _ = writeln!(w, "{sub}");
@@ -766,6 +790,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: Some(1),
+            live_error_count: 0,
+            live_error_text: None,
         });
         s.queue_tasks.push(QueueTask {
             id: 2,
@@ -848,6 +874,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
         });
         s.health = HealthVerdict::Stalled;
         s.stalled_count = 1;
@@ -939,6 +967,8 @@ mod tests {
             now_label: Some("Bash: cargo test".into()),
             events_per_min: Some(14.0),
             uptime_secs: Some(240),
+            live_error_count: 0,
+            live_error_text: None,
         });
         s.daemon_agents.push(DaemonAgentView {
             agent: "R1".into(),
@@ -959,6 +989,8 @@ mod tests {
             now_label: None,
             events_per_min: Some(2.0),
             uptime_secs: Some(120),
+            live_error_count: 0,
+            live_error_text: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1052,6 +1084,8 @@ mod tests {
             now_label: Some("Read: src/main.rs".into()),
             events_per_min: Some(6.0),
             uptime_secs: Some(180),
+            live_error_count: 0,
+            live_error_text: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1098,6 +1132,8 @@ mod tests {
             now_label: None,
             events_per_min: Some(4.0),
             uptime_secs: Some(60),
+            live_error_count: 0,
+            live_error_text: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1135,6 +1171,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
         });
         s.daemon_agents.push(DaemonAgentView {
             agent: "R2-aud".into(),
@@ -1155,6 +1193,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: Some(30),
+            live_error_count: 0,
+            live_error_text: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1452,6 +1492,143 @@ mod tests {
                 && output.contains("12m ago")
                 && output.contains("pid 99999 dead"),
             "expected stale line: {output}"
+        );
+    }
+
+    // ── #182: live provider error rendering ─────────────────────────
+
+    fn make_worker_with_error(error_count: u32, error_text: Option<&str>) -> DaemonAgentView {
+        DaemonAgentView {
+            agent: "W-err".into(),
+            role: "worker".into(),
+            sub_role: None,
+            task_id: Some(42),
+            phase: "working".into(),
+            cost_tokens: 500,
+            agent_state: None,
+            cost_usd: 0.01,
+            log_dir: None,
+            last_activity_age_secs: Some(2),
+            task_title: Some("erroring task".into()),
+            tier_eff: Some("opus46·hi".into()),
+            pr: None,
+            rework_count: 0,
+            tool_count: 3,
+            now_label: None,
+            events_per_min: Some(5.0),
+            uptime_secs: Some(60),
+            live_error_count: error_count,
+            live_error_text: error_text.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn worker_error_visible_in_plain() {
+        let mut s = default_stats();
+        s.daemon_agents
+            .push(make_worker_with_error(1, Some("session limit")));
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("W-err")).unwrap();
+        assert!(line.contains("ERR 1/3"), "error count must appear: {line}");
+        assert!(
+            line.contains("session limit"),
+            "error text must appear: {line}"
+        );
+    }
+
+    #[test]
+    fn worker_no_error_no_marker() {
+        let mut s = default_stats();
+        s.daemon_agents.push(make_worker_with_error(0, None));
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("W-err")).unwrap();
+        assert!(
+            !line.contains("ERR"),
+            "no error marker when error_count=0: {line}"
+        );
+    }
+
+    #[test]
+    fn reviewer_subrow_error_visible() {
+        let mut s = default_stats();
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "W1".into(),
+            role: "worker".into(),
+            sub_role: None,
+            task_id: Some(10),
+            phase: "working".into(),
+            cost_tokens: 1000,
+            agent_state: None,
+            cost_usd: 0.01,
+            log_dir: None,
+            last_activity_age_secs: Some(5),
+            task_title: Some("task".into()),
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
+        });
+        s.daemon_agents.push(DaemonAgentView {
+            agent: "R-err".into(),
+            role: "reviewer".into(),
+            sub_role: None,
+            task_id: Some(10),
+            phase: "reviewing".into(),
+            cost_tokens: 200,
+            agent_state: None,
+            cost_usd: 0.005,
+            log_dir: None,
+            last_activity_age_secs: Some(3),
+            task_title: None,
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 1,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: Some(30),
+            live_error_count: 2,
+            live_error_text: Some("rate limited".into()),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let rev_line = output.lines().find(|l| l.contains("R-err")).unwrap();
+        assert!(
+            rev_line.contains("ERR 2/3"),
+            "reviewer subrow error count must appear: {rev_line}"
+        );
+        assert!(
+            rev_line.contains("rate limited"),
+            "reviewer subrow error text must appear: {rev_line}"
+        );
+    }
+
+    #[test]
+    fn live_error_triggers_attention_health() {
+        let mut s = default_stats();
+        s.daemon_agents
+            .push(make_worker_with_error(1, Some("provider error")));
+        s.health = HealthVerdict::Attention;
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("attention"),
+            "health must show attention with live error: {output}"
         );
     }
 }

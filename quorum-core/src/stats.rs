@@ -32,6 +32,10 @@ pub struct DaemonLiveStats {
     pub up_secs: u64,
     pub mid_turn_tok: i64,
     pub spawn_epoch: i64,
+    #[serde(default)]
+    pub error_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_text: Option<String>,
 }
 
 /// Per-status task count.
@@ -194,6 +198,8 @@ pub struct DaemonAgentView {
     pub now_label: Option<String>,
     pub events_per_min: Option<f64>,
     pub uptime_secs: Option<i64>,
+    pub live_error_count: u32,
+    pub live_error_text: Option<String>,
 }
 
 /// Individual claimable task for the QUEUE section (#204 cockpit).
@@ -929,27 +935,36 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         } else {
             (None, None)
         };
-        let (tool_count, now_label, events_per_min, uptime_secs, mid_turn_tok) =
-            if let Some(ref ls) = live {
-                let up = if ls.spawn_epoch > 0 {
-                    Some(now - ls.spawn_epoch)
-                } else {
-                    None
-                };
-                (
-                    ls.tools,
-                    if ls.now.is_empty() {
-                        None
-                    } else {
-                        Some(ls.now.clone())
-                    },
-                    Some(ls.evm),
-                    up,
-                    ls.mid_turn_tok,
-                )
+        let (
+            tool_count,
+            now_label,
+            events_per_min,
+            uptime_secs,
+            mid_turn_tok,
+            error_count,
+            error_text,
+        ) = if let Some(ref ls) = live {
+            let up = if ls.spawn_epoch > 0 {
+                Some(now - ls.spawn_epoch)
             } else {
-                (0, None, None, None, 0)
+                None
             };
+            (
+                ls.tools,
+                if ls.now.is_empty() {
+                    None
+                } else {
+                    Some(ls.now.clone())
+                },
+                Some(ls.evm),
+                up,
+                ls.mid_turn_tok,
+                ls.error_count,
+                ls.error_text.clone(),
+            )
+        } else {
+            (0, None, None, None, 0, 0, None)
+        };
         let display_tokens = e.cost_tokens + mid_turn_tok;
         let sub_role = if e.phase == "auditing" {
             Some("r2".to_string())
@@ -975,6 +990,8 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
             now_label,
             events_per_min,
             uptime_secs,
+            live_error_count: error_count,
+            live_error_text: error_text,
         });
     }
     Ok(views)
@@ -1274,7 +1291,8 @@ fn compute_health(
             Some(age) => age > 60,
             None => false,
         });
-    if has_stalling || errors_recent || alerts_present {
+    let has_live_error = daemon_agents.iter().any(|d| d.live_error_count > 0);
+    if has_stalling || errors_recent || alerts_present || has_live_error {
         return HealthVerdict::Attention;
     }
     HealthVerdict::OnTrack
@@ -2223,6 +2241,8 @@ mod tests {
             up_secs: 240,
             mid_turn_tok: 18000,
             spawn_epoch: 1720300000,
+            error_count: 0,
+            error_text: None,
         };
         let json = serde_json::to_string(&stats).unwrap();
         let back: DaemonLiveStats = serde_json::from_str(&json).unwrap();
@@ -2244,6 +2264,8 @@ mod tests {
             up_secs: 60,
             mid_turn_tok: 500,
             spawn_epoch: 1720300000,
+            error_count: 0,
+            error_text: None,
         };
         let json = serde_json::to_string(&stats).unwrap();
         std::fs::write(dir.path().join("_daemon_live.json"), json).unwrap();
@@ -2279,6 +2301,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
         };
         assert_eq!(
             compute_health(&[worker(Some(50))], false, false),
@@ -2317,6 +2341,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
         }
     }
 
@@ -2506,6 +2532,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
         };
         assert!(is_stall_eligible(&view));
         let health = compute_health(&[view], false, false);
@@ -2533,6 +2561,8 @@ mod tests {
             now_label: None,
             events_per_min: None,
             uptime_secs: None,
+            live_error_count: 0,
+            live_error_text: None,
         };
         assert!(!is_stall_eligible(&view));
     }
@@ -2746,5 +2776,93 @@ mod tests {
     fn alert_due_at_retry_negative_never_fires() {
         assert!(!alert_due_at_retry(-1));
         assert!(!alert_due_at_retry(-100));
+    }
+
+    // ── #182: live provider error fields ──────────────────────────────
+
+    #[test]
+    fn daemon_live_stats_round_trips_error_fields() {
+        let stats = DaemonLiveStats {
+            tools: 5,
+            now: "Bash: ls".into(),
+            evm: 3.0,
+            up_secs: 120,
+            mid_turn_tok: 0,
+            spawn_epoch: 1000,
+            error_count: 2,
+            error_text: Some("session limit; resets 10:30am".into()),
+        };
+        let json = serde_json::to_string(&stats).unwrap();
+        let parsed: DaemonLiveStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.error_count, 2);
+        assert_eq!(
+            parsed.error_text.as_deref(),
+            Some("session limit; resets 10:30am")
+        );
+    }
+
+    #[test]
+    fn daemon_live_stats_defaults_error_fields_when_absent() {
+        let json =
+            r#"{"tools":1,"now":"","evm":0.0,"up_secs":10,"mid_turn_tok":0,"spawn_epoch":0}"#;
+        let parsed: DaemonLiveStats = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.error_count, 0);
+        assert!(parsed.error_text.is_none());
+    }
+
+    #[test]
+    fn health_attention_when_live_error() {
+        let agents = vec![DaemonAgentView {
+            agent: "W1".into(),
+            role: "worker".into(),
+            sub_role: None,
+            task_id: Some(1),
+            phase: "working".into(),
+            cost_tokens: 100,
+            agent_state: None,
+            cost_usd: 0.01,
+            log_dir: None,
+            last_activity_age_secs: Some(5),
+            task_title: Some("task".into()),
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: Some(60),
+            live_error_count: 1,
+            live_error_text: Some("session limit".into()),
+        }];
+        let health = compute_health(&agents, false, false);
+        assert_eq!(health, HealthVerdict::Attention);
+    }
+
+    #[test]
+    fn health_on_track_when_no_live_error() {
+        let agents = vec![DaemonAgentView {
+            agent: "W1".into(),
+            role: "worker".into(),
+            sub_role: None,
+            task_id: Some(1),
+            phase: "working".into(),
+            cost_tokens: 100,
+            agent_state: None,
+            cost_usd: 0.01,
+            log_dir: None,
+            last_activity_age_secs: Some(5),
+            task_title: Some("task".into()),
+            tier_eff: None,
+            pr: None,
+            rework_count: 0,
+            tool_count: 0,
+            now_label: None,
+            events_per_min: None,
+            uptime_secs: Some(60),
+            live_error_count: 0,
+            live_error_text: None,
+        }];
+        let health = compute_health(&agents, false, false);
+        assert_eq!(health, HealthVerdict::OnTrack);
     }
 }
