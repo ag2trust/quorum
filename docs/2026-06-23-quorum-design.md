@@ -765,13 +765,16 @@ The following must remain intact throughout the wait and across restarts:
 
 On daemon startup, before stateless recovery:
 
-1. **#228 approval recovery** (existing) runs first: scans `approvals` table for tasks in
-   `merging` status. For each, re-enters the merge flow (step 1: stale-SHA check, step 2:
-   mergeability, step 3: checks wait...). If the task was in merge-wait before shutdown,
-   this transparently resumes the wait with `merge_wait_retries` reset to 0 (the restart
-   is itself a retry).
-2. **Journal recovery** (existing) handles workers/reviewers whose processes died. Tasks
-   in `merging` with no approval record fall through to stateless recovery → Open.
+1. **#228 approval recovery** runs first: scans `approvals` table, validates each role's
+   verdict against the current PR head SHA via `next_missing_review_role(conn, pr, sha)`.
+   If all roles approved for the current SHA → merge. If any role is missing or stale →
+   defer to generic recovery (the approval is preserved or dropped per disposition).
+2. **Generic recovery** handles `merging` tasks: stays in `merging` only when
+   `dual_approved()` confirms all required roles are approved for the same head SHA.
+   Incomplete approval (e.g. R1 approved, R2 missing) resets the task to `in-review` via
+   `AgentFailed`, so the tick loop provisions the first missing role (#191).
+3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
+   approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
 
 Head-SHA invalidation on restart: the approval record stores `approved_head_sha`. On
 re-entry, `head_sha()` is queried and compared. If different, the approval is stale —

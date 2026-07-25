@@ -16,7 +16,7 @@ use super::worktree::WorktreeManager;
 use super::{log, ServeConfig};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::Event;
-use quorum_core::{error::QuorumError, error::Result, tasks};
+use quorum_core::{approvals, error::QuorumError, error::Result, tasks};
 
 fn kill_stale_process_group(pid: Option<i32>) {
     if let Some(pid) = pid {
@@ -213,23 +213,28 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
             let p = db_path.clone();
             let tid = task.id;
 
-            // #174: skip merging tasks with a durable approval — they are
-            // in merge-wait and the tick loop will retry checks via the
-            // unconsumed mailbox row or approval-recovery replay.
-            let has_approval = {
+            // #191: stay in merging only when ALL required review roles are
+            // approved for the same SHA (genuine merge-wait). Incomplete
+            // approval (e.g. R1 only, R2 missing) resets to in-review so
+            // the tick loop provisions the first missing role.
+            let pr_number = tasks::extract_pr_number(&task.refs);
+            let fully_approved = if let Some(pr) = pr_number {
                 let p2 = db_path.clone();
                 tokio::task::spawn_blocking(move || -> bool {
                     quorum_core::db::open(&p2)
                         .ok()
-                        .and_then(|conn| quorum_core::approvals::has_for_task(&conn, tid).ok())
-                        .unwrap_or(false)
+                        .and_then(|conn| approvals::dual_approved(&conn, pr).ok())
+                        .flatten()
+                        .is_some()
                 })
                 .await
                 .unwrap_or(false)
+            } else {
+                false
             };
-            if has_approval {
+            if fully_approved {
                 log(&format!(
-                    "recovery: merging task #{tid} has durable approval \
+                    "recovery: merging task #{tid} fully approved \
                      — preserving merge-wait state"
                 ));
                 continue;
