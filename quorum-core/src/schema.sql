@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 29). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 30). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -253,6 +253,19 @@ CREATE TABLE IF NOT EXISTS approvals (
     PRIMARY KEY (pr_number, review_role)
 );
 CREATE INDEX IF NOT EXISTS approvals_task ON approvals(task_id);
+
+-- Durable reviewer-provision attempt tracking (#190). Bounded retry budget
+-- per (task, PR, role). A new head_sha resets the counter (different diff =
+-- fresh budget). Survives daemon restarts unlike the in-memory tracker.
+CREATE TABLE IF NOT EXISTS reviewer_provision_attempts (
+    task_id         INTEGER NOT NULL,
+    pr_number       INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    head_sha        TEXT NOT NULL DEFAULT '',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (task_id, pr_number, role)
+);
 
 -- Single-daemon-per-DB guard. At most one row (id=1). The daemon acquires this
 -- on startup, refreshes heartbeat_at on every tick, and deletes on clean shutdown.

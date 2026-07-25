@@ -39,6 +39,31 @@ use worktree::WorktreeManager;
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
+const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+
+const REQUIRED_REVIEW_ROLES: &[&str] = &["r1", "r2"];
+
+#[derive(Debug, Clone)]
+enum ReviewRole {
+    R1,
+    R2 {
+        r1_reviewer: String,
+        r1_run_id: Option<i64>,
+    },
+}
+
+impl ReviewRole {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ReviewRole::R1 => "r1",
+            ReviewRole::R2 { .. } => "r2",
+        }
+    }
+
+    fn is_r2(&self) -> bool {
+        matches!(self, ReviewRole::R2 { .. })
+    }
+}
 
 struct PoisonTracker {
     strikes: HashMap<i64, u32>,
@@ -72,35 +97,46 @@ impl PoisonTracker {
     }
 }
 
-struct ReviewerProvisionTracker {
-    strikes: HashMap<(i64, i64), u32>,
-}
-
-impl ReviewerProvisionTracker {
-    fn new() -> Self {
-        Self {
-            strikes: HashMap::new(),
+/// Determine the next review role needed for a PR, checking durable approvals.
+/// Returns `None` if all required roles are approved for the given `head_sha`.
+fn next_needed_role(
+    conn: &quorum_core::Connection,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<Option<&'static str>> {
+    for &role in REQUIRED_REVIEW_ROLES {
+        match quorum_core::approvals::get(conn, pr_number, role)? {
+            Some(a)
+                if a.verdict == "approved"
+                    && a.blocking_count == 0
+                    && !a.approved_head_sha.is_empty()
+                    && a.approved_head_sha == head_sha =>
+            {
+                continue;
+            }
+            _ => return Ok(Some(role)),
         }
     }
+    Ok(None)
+}
 
-    fn record_strike(&mut self, task_id: i64, pr: i64) -> u32 {
-        let count = self.strikes.entry((task_id, pr)).or_insert(0);
-        *count += 1;
-        *count
-    }
+/// Check whether provision attempts for a (task, PR, role) are exhausted.
+fn is_provision_exhausted(
+    conn: &quorum_core::Connection,
+    task_id: i64,
+    pr: i64,
+    role: &str,
+    head_sha: &str,
+) -> Result<bool> {
+    let attempts =
+        quorum_core::provision_attempts::get_attempts(conn, task_id, pr, role, head_sha)?;
+    Ok(attempts >= MAX_REVIEWER_PROVISION_STRIKES as i64)
+}
 
-    fn clear(&mut self, task_id: i64, pr: i64) {
-        self.strikes.remove(&(task_id, pr));
-    }
-
-    fn is_exhausted(&self, task_id: i64, pr: i64) -> bool {
-        self.strikes.get(&(task_id, pr)).copied().unwrap_or(0) >= MAX_REVIEWER_PROVISION_STRIKES
-    }
-
-    #[cfg(test)]
-    fn strikes(&self, task_id: i64, pr: i64) -> u32 {
-        self.strikes.get(&(task_id, pr)).copied().unwrap_or(0)
-    }
+/// Check whether total reviewer runs for a task exceed the safety cap.
+fn is_reviewer_cap_exceeded(conn: &quorum_core::Connection, task_id: i64) -> Result<bool> {
+    let total = quorum_core::provision_attempts::total_reviewer_runs(conn, task_id)?;
+    Ok(total >= MAX_TOTAL_REVIEWER_RUNS)
 }
 
 /// Lifetime roster of agent names this daemon has ever owned.
@@ -1013,7 +1049,6 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
     let mut poison_tracker = PoisonTracker::new();
-    let mut reviewer_provision_tracker = ReviewerProvisionTracker::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -1285,7 +1320,6 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut workers,
             &mut reviewers,
             &mut poison_tracker,
-            &mut reviewer_provision_tracker,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -1340,7 +1374,6 @@ async fn tick(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     poison_tracker: &mut PoisonTracker,
-    reviewer_provision_tracker: &mut ReviewerProvisionTracker,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -1520,35 +1553,36 @@ async fn tick(
                         continue;
                     };
 
-                    // #159: mandatory dual-review gate. When R1 (non-R2)
-                    // approves, always spawn R2. Store R1's durable approval
-                    // before tearing down so the verdict survives restart.
+                    // #159/#190: mandatory dual-review gate. When R1 (non-R2)
+                    // approves, store durable approval and provision R2 via the
+                    // unified path. If R2 spawn fails, the durable approval
+                    // persists and Phase 5 retries on next tick with bounded
+                    // attempt tracking.
                     if !reviewers[ri].r2_origin && !drain_state.draining {
-                        // Record R1's durable approval with live head SHA.
-                        // R1 SlotState has reviewed_head_sha: None (only R2
-                        // populates it), so fetch from executor — mirrors the
-                        // pre-merge capture at the R2 approval site.
-                        {
-                            let r1_reviewer = reviewers[ri].agent_name.clone();
-                            let author = workers
-                                .iter()
-                                .find(|w| w.task_id == reviewer_task_id)
-                                .map(|w| w.agent_name.clone())
-                                .unwrap_or_default();
-                            let head_sha = {
-                                let repo = config.repo_dir.clone();
-                                let executor = Arc::clone(&config.merge_executor);
-                                tokio::task::spawn_blocking(move || {
-                                    executor.head_sha(pr_num, &repo)
-                                })
+                        let r1_reviewer = reviewers[ri].agent_name.clone();
+                        let r1_run_id = reviewers[ri].agent_run_id;
+                        let author = workers
+                            .iter()
+                            .find(|w| w.task_id == reviewer_task_id)
+                            .map(|w| w.agent_name.clone())
+                            .unwrap_or_default();
+                        let head_sha = {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
                                 .await
                                 .ok()
                                 .flatten()
                                 .unwrap_or_default()
-                            };
+                        };
+                        // Record R1's durable approval.
+                        {
                             let p = db_path.clone();
                             let tid = reviewer_task_id;
                             let blocking = gated.blocking_count.unwrap_or(0) as i64;
+                            let sha = head_sha.clone();
+                            let r1_rev = r1_reviewer.clone();
+                            let auth = author.clone();
                             tokio::task::spawn_blocking(move || -> Result<()> {
                                 let mut conn = quorum_core::db::open(&p)?;
                                 quorum_core::approvals::record(
@@ -1557,11 +1591,11 @@ async fn tick(
                                         pr_number: pr_num,
                                         review_role: "r1".to_string(),
                                         task_id: tid,
-                                        author,
-                                        reviewer: r1_reviewer,
+                                        author: auth,
+                                        reviewer: r1_rev,
                                         verdict: "approved".to_string(),
                                         blocking_count: blocking,
-                                        approved_head_sha: head_sha,
+                                        approved_head_sha: sha,
                                     },
                                 )
                             })
@@ -1580,90 +1614,107 @@ async fn tick(
                         )
                         .await;
 
-                        let r1_name = reviewers[ri].agent_name.clone();
-                        let r1_run_id = reviewers[ri].agent_run_id;
-
-                        // #189: branch is a hint only — spawn_r2_reviewer resolves
-                        // the authoritative PR target from GitHub internally.
-                        let (cp_agent, cp_tid, cp_branch) = if let Some(w) =
+                        // Build counterpart from worker if available, otherwise
+                        // resolve from task author or PR head ref.
+                        let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
                             workers.iter().find(|w| w.task_id == reviewer_task_id)
                         {
-                            (w.agent_name.clone(), w.task_id, w.branch.clone())
+                            Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
                         } else {
-                            let hint = {
+                            let db_branch = {
                                 let p = db_path.clone();
                                 let tid = reviewer_task_id;
-                                tokio::task::spawn_blocking(move || -> (String, String) {
-                                    let conn = quorum_core::db::open(&p).ok();
-                                    let t = conn
-                                        .as_ref()
-                                        .and_then(|c| tasks::get(c, tid).ok().flatten());
-                                    match t {
-                                        Some(task) => {
-                                            let author = task.author.unwrap_or_default();
-                                            let branch = orphan_worker_branch(
-                                                &author,
-                                                tid,
-                                                task.review_only,
-                                            )
-                                            .unwrap_or_default();
-                                            let name = if author.is_empty() {
-                                                "external".to_string()
-                                            } else {
-                                                author
-                                            };
-                                            (name, branch)
-                                        }
-                                        None => ("external".to_string(), String::new()),
-                                    }
+                                tokio::task::spawn_blocking(move || -> Option<String> {
+                                    let conn = quorum_core::db::open(&p).ok()?;
+                                    let t = tasks::get(&conn, tid).ok()??;
+                                    let a = t.author.unwrap_or_default();
+                                    orphan_worker_branch(&a, tid, t.review_only)
                                 })
                                 .await
-                                .unwrap_or(("external".to_string(), String::new()))
+                                .ok()
+                                .flatten()
                             };
-                            (hint.0, reviewer_task_id, hint.1)
-                        };
-                        let worker_cp = ReviewCounterpart {
-                            agent_name: &cp_agent,
-                            task_id: cp_tid,
-                            branch: &cp_branch,
+                            if let Some(branch) = db_branch {
+                                Some(("external".to_string(), reviewer_task_id, branch))
+                            } else {
+                                let pr_val = pr_num;
+                                let repo_dir = config.repo_dir.clone();
+                                let gh_repo = config.repo.clone();
+                                let resolved = tokio::task::spawn_blocking(move || {
+                                    resolve_pr_target(pr_val, &repo_dir, Some(&gh_repo))
+                                })
+                                .await
+                                .ok()
+                                .flatten();
+                                resolved.map(|target| {
+                                    ("external".to_string(), reviewer_task_id, target.head_ref)
+                                })
+                            }
                         };
 
-                        let pre_count = reviewers.len();
-                        spawn_r2_reviewer(
-                            config,
-                            wt_mgr,
-                            name_pool,
-                            reviewers,
-                            lifetime_roster,
-                            pr_num,
-                            worker_cp,
-                            &r1_name,
-                            r1_run_id,
-                        )
-                        .await
-                        .ok();
-                        let r2_added = reviewers.len() > pre_count;
+                        if let Some((cp_agent, cp_tid, cp_branch)) = worker_cp_owned {
+                            let worker_cp = ReviewCounterpart {
+                                agent_name: &cp_agent,
+                                task_id: cp_tid,
+                                branch: &cp_branch,
+                            };
+                            let role = ReviewRole::R2 {
+                                r1_reviewer: r1_reviewer.clone(),
+                                r1_run_id,
+                            };
 
-                        if r2_added {
-                            log(&format!(
-                                "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
-                                 tearing down R1 reviewer {}",
-                                r1_name
-                            ));
+                            let pre_count = reviewers.len();
+                            provision_reviewer(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                reviewers,
+                                lifetime_roster,
+                                pr_num,
+                                worker_cp,
+                                &role,
+                                &head_sha,
+                            )
+                            .await
+                            .ok();
+                            let r2_added = reviewers.len() > pre_count;
+
+                            if r2_added {
+                                log(&format!(
+                                    "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
+                                     tearing down R1 reviewer {}",
+                                    r1_reviewer
+                                ));
+                            } else {
+                                log(&format!(
+                                    "R2 GATE: R2 spawn failed for PR #{pr_num} \
+                                     — R1 approval stored, Phase 5 will retry"
+                                ));
+                            }
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-pending").await;
+                            teardown_reviewer(
+                                config,
+                                wt_mgr,
+                                name_pool,
+                                r,
+                                if r2_added {
+                                    "r2-pending"
+                                } else {
+                                    "r2-spawn-failed"
+                                },
+                            )
+                            .await;
                             if !consume_mailbox_row(&db_path, *id).await {
                                 break;
                             }
                             continue;
                         } else {
                             log(&format!(
-                                "R2 GATE: R2 spawn failed for PR #{pr_num} \
-                                 — R1 approval stored, will retry on next tick"
+                                "R2 GATE: PR #{pr_num} — could not resolve branch for R2 \
+                                 counterpart, R1 approval stored, Phase 5 will retry"
                             ));
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-spawn-failed")
-                                .await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-no-branch").await;
                             if !consume_mailbox_row(&db_path, *id).await {
                                 break;
                             }
@@ -3032,7 +3083,19 @@ async fn tick(
                             let w = workers.remove(wi);
                             cleanup_slot(config, wt_mgr, name_pool, w, None, "merged").await;
                         }
-                        reviewer_provision_tracker.clear(reviewer_task_id, pr_num);
+                        {
+                            let p = db_path.clone();
+                            let tid = reviewer_task_id;
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                    let _ = quorum_core::provision_attempts::clear_for_task(
+                                        &mut conn, tid,
+                                    );
+                                }
+                            })
+                            .await
+                            .ok();
+                        }
                     } else {
                         let failure_kind = merge_result
                             .failure_kind
@@ -4465,26 +4528,90 @@ async fn tick(
                 repo_mismatch_workers.push((*wi, task_repo));
                 continue;
             }
-            if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
-                log(&format!(
-                    "reviewer provision exhausted for task #{task_id} PR #{pr} \
-                     — parking worker"
-                ));
-                parked_workers.push(*wi);
-                continue;
+            // #190: determine which role is needed and check durable exhaustion.
+            let head_sha = {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let pr_num = *pr;
+                tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            };
+            let provision_decision = {
+                let p = db_path.clone();
+                let tid = *task_id;
+                let pr_num = *pr;
+                let sha = head_sha.clone();
+                tokio::task::spawn_blocking(move || -> Result<Option<&'static str>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    if is_reviewer_cap_exceeded(&conn, tid)? {
+                        return Ok(None);
+                    }
+                    let role = next_needed_role(&conn, pr_num, &sha)?;
+                    if let Some(r) = role {
+                        if is_provision_exhausted(&conn, tid, pr_num, r, &sha)? {
+                            return Ok(None);
+                        }
+                    }
+                    Ok(role)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            };
+            match provision_decision {
+                Ok(None) => {
+                    log(&format!(
+                        "reviewer provision exhausted for task #{task_id} PR #{pr} \
+                         — parking worker"
+                    ));
+                    parked_workers.push(*wi);
+                    continue;
+                }
+                Ok(Some(role_str)) => {
+                    let role = if role_str == "r2" {
+                        // Look up R1 reviewer info from durable approval
+                        let r1_info = {
+                            let p = db_path.clone();
+                            let pr_num = *pr;
+                            tokio::task::spawn_blocking(move || -> Option<(String, Option<i64>)> {
+                                let conn = quorum_core::db::open(&p).ok()?;
+                                let a = quorum_core::approvals::get(&conn, pr_num, "r1").ok()??;
+                                Some((a.reviewer, None))
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(("unknown".into(), None))
+                        };
+                        ReviewRole::R2 {
+                            r1_reviewer: r1_info.0,
+                            r1_run_id: r1_info.1,
+                        }
+                    } else {
+                        ReviewRole::R1
+                    };
+                    let counterpart: ReviewCounterpart = (&workers[*wi]).into();
+                    provision_reviewer(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        reviewers,
+                        lifetime_roster,
+                        *pr,
+                        counterpart,
+                        &role,
+                        &head_sha,
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    log(&format!(
+                        "provision decision error for task #{task_id} PR #{pr}: {e}"
+                    ));
+                }
             }
-            let counterpart: ReviewCounterpart = (&workers[*wi]).into();
-            spawn_reviewer_for_worker(
-                config,
-                wt_mgr,
-                name_pool,
-                reviewers,
-                reviewer_provision_tracker,
-                lifetime_roster,
-                *pr,
-                counterpart,
-            )
-            .await?;
         }
         for &wi in pr_closed_workers.iter().rev() {
             let w = workers.remove(wi);
@@ -4690,63 +4817,146 @@ async fn tick(
                 .await;
                 continue;
             }
-            if reviewer_provision_tracker.is_exhausted(*task_id, *pr) {
-                log(&format!(
-                    "orphan in-review task #{task_id} PR #{pr}: \
-                     provision exhausted — parking"
-                ));
-                fire_event(
-                    &db_path,
-                    "daemon",
-                    *task_id,
-                    &Event::Cancelled {
-                        by: "daemon:parked:provision-exhausted".into(),
-                    },
-                )
-                .await;
-                set_task_body(
-                    &db_path,
-                    *task_id,
-                    &format!(
-                        "{}provision-exhausted | PR #{pr} | \
-                         reviewer provision failed (orphan in-review)",
-                        tasks::PARKED_BODY_PREFIX
-                    ),
-                )
-                .await;
-                notify_provision_failure(
-                    &db_path,
-                    *task_id,
-                    "reviewer provision exhausted (orphan in-review)",
-                    &format!("#{pr}"),
-                )
-                .await;
-                continue;
-            }
-            // #189: branch is a hint only — spawn_reviewer_for_worker resolves
-            // the authoritative PR target from GitHub.
-            let hint_branch =
-                orphan_worker_branch(author, *task_id, *review_only).unwrap_or_default();
-            let counterpart = ReviewCounterpart {
-                agent_name: if author.is_empty() {
-                    "external"
-                } else {
-                    author
-                },
-                task_id: *task_id,
-                branch: &hint_branch,
+            // #190: determine which role is needed and check durable exhaustion.
+            let head_sha = {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let pr_num = *pr;
+                tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
             };
-            spawn_reviewer_for_worker(
-                config,
-                wt_mgr,
-                name_pool,
-                reviewers,
-                reviewer_provision_tracker,
-                lifetime_roster,
-                *pr,
-                counterpart,
-            )
-            .await?;
+            let provision_decision = {
+                let p = db_path.clone();
+                let tid = *task_id;
+                let pr_num = *pr;
+                let sha = head_sha.clone();
+                tokio::task::spawn_blocking(move || -> Result<Option<&'static str>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    if is_reviewer_cap_exceeded(&conn, tid)? {
+                        return Ok(None);
+                    }
+                    let role = next_needed_role(&conn, pr_num, &sha)?;
+                    if let Some(r) = role {
+                        if is_provision_exhausted(&conn, tid, pr_num, r, &sha)? {
+                            return Ok(None);
+                        }
+                    }
+                    Ok(role)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            };
+            match provision_decision {
+                Ok(None) => {
+                    log(&format!(
+                        "orphan in-review task #{task_id} PR #{pr}: \
+                         provision exhausted — parking"
+                    ));
+                    fire_event(
+                        &db_path,
+                        "daemon",
+                        *task_id,
+                        &Event::Cancelled {
+                            by: "daemon:parked:provision-exhausted".into(),
+                        },
+                    )
+                    .await;
+                    set_task_body(
+                        &db_path,
+                        *task_id,
+                        &format!(
+                            "{}provision-exhausted | PR #{pr} | \
+                             reviewer provision failed (orphan in-review)",
+                            tasks::PARKED_BODY_PREFIX
+                        ),
+                    )
+                    .await;
+                    notify_provision_failure(
+                        &db_path,
+                        *task_id,
+                        "reviewer provision exhausted (orphan in-review)",
+                        &format!("#{pr}"),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(Some(role_str)) => {
+                    let role = if role_str == "r2" {
+                        let r1_info = {
+                            let p = db_path.clone();
+                            let pr_num = *pr;
+                            tokio::task::spawn_blocking(move || -> Option<(String, Option<i64>)> {
+                                let conn = quorum_core::db::open(&p).ok()?;
+                                let a = quorum_core::approvals::get(&conn, pr_num, "r1").ok()??;
+                                Some((a.reviewer, None))
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or(("unknown".into(), None))
+                        };
+                        ReviewRole::R2 {
+                            r1_reviewer: r1_info.0,
+                            r1_run_id: r1_info.1,
+                        }
+                    } else {
+                        ReviewRole::R1
+                    };
+                    let branch =
+                        if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
+                            b
+                        } else {
+                            let pr_num = *pr;
+                            let repo_dir = config.repo_dir.clone();
+                            let gh_repo = config.repo.clone();
+                            let resolved = tokio::task::spawn_blocking(move || {
+                                resolve_pr_target(pr_num, &repo_dir, Some(&gh_repo))
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            match resolved {
+                                Some(target) => target.head_ref,
+                                None => {
+                                    log(&format!(
+                                        "orphan in-review task #{task_id} PR #{pr}: \
+                                         could not resolve PR head ref — skipping"
+                                    ));
+                                    continue;
+                                }
+                            }
+                        };
+                    let counterpart = ReviewCounterpart {
+                        agent_name: if author.is_empty() {
+                            "external"
+                        } else {
+                            author
+                        },
+                        task_id: *task_id,
+                        branch: &branch,
+                    };
+                    provision_reviewer(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        reviewers,
+                        lifetime_roster,
+                        *pr,
+                        counterpart,
+                        &role,
+                        &head_sha,
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    log(&format!(
+                        "orphan provision decision error for task #{task_id} PR #{pr}: {e}"
+                    ));
+                }
+            }
         }
     }
 
@@ -5638,16 +5848,22 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
     }
 }
 
+/// Unified reviewer provisioning (#190). Replaces the separate
+/// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
+/// Role, prompt, model policy, and audit recording are parameterized;
+/// worktree provisioning, capability issuance, process lifecycle, and
+/// durable attempt tracking are shared.
 #[allow(clippy::too_many_arguments)]
-async fn spawn_reviewer_for_worker(
+async fn provision_reviewer(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     reviewers: &mut Vec<SlotState>,
-    provision_tracker: &mut ReviewerProvisionTracker,
     lifetime_roster: &mut LifetimeRoster,
     pr: i64,
     worker: ReviewCounterpart<'_>,
+    role: &ReviewRole,
+    head_sha: &str,
 ) -> Result<()> {
     let acquire_result = name_pool.acquire();
     if acquire_result.is_generated() && name_pool.has_file() {
@@ -5749,21 +5965,50 @@ async fn spawn_reviewer_for_worker(
     };
     if !provision_ok {
         let task_id = worker.task_id;
-        let strikes = provision_tracker.record_strike(task_id, pr);
+        let role_str = role.as_str().to_string();
+        let sha = head_sha.to_string();
+        let strikes = {
+            let p = config.db_path.clone();
+            tokio::task::spawn_blocking(move || -> i64 {
+                quorum_core::db::open(&p)
+                    .ok()
+                    .and_then(|mut conn| {
+                        quorum_core::provision_attempts::record_attempt(
+                            &mut conn, task_id, pr, &role_str, &sha,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0)
+        };
         log(&format!(
-            "reviewer provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-             for task #{task_id} PR #{pr}"
+            "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
+             for task #{task_id} PR #{pr}",
+            role_label = role.as_str().to_uppercase()
         ));
-        if strikes >= MAX_REVIEWER_PROVISION_STRIKES {
+        if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
             log(&format!(
                 "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
-                 {strikes} consecutive provision failures for PR #{pr}"
+                 {strikes} consecutive {} provision failures for PR #{pr}",
+                role.as_str().to_uppercase()
             ));
         }
         name_pool.release(&reviewer_name);
         return Ok(());
     } else {
-        provision_tracker.clear(worker.task_id, pr);
+        // Clear provision attempts for this role on success.
+        let p = config.db_path.clone();
+        let tid = worker.task_id;
+        let role_str = role.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
+            }
+        })
+        .await
+        .ok();
     }
     log(&format!(
         "reviewer worktree provisioned at {}",
@@ -5834,16 +6079,8 @@ async fn spawn_reviewer_for_worker(
         worker.task_id
     ));
 
-    let spec = reviewer::ReviewerSpec {
-        pr,
-        worker_agent: worker.agent_name.to_string(),
-        reviewer_name: reviewer_name.clone(),
-    };
-
     // #130: issue the run capability BEFORE spawning so the reviewer inherits
-    // QUORUM_RUN_ID in its environment. Reviewer `submit --verdict` uses this
-    // to authenticate against the daemon-owned run instead of falling back to
-    // agent-name compat auth. Any issue failure is loud (see below).
+    // QUORUM_RUN_ID in its environment.
     let cap_run_id = uuid::Uuid::new_v4().to_string();
     {
         let p = config.db_path.clone();
@@ -5882,10 +6119,34 @@ async fn spawn_reviewer_for_worker(
     {
         Ok(agent_proc) => {
             let mut proc = runner::RunnerProc::Claude(agent_proc);
-            let prompt = reviewer::build_review_prompt(&spec, &config.effort);
+
+            // Build the role-appropriate prompt.
+            let prompt = match role {
+                ReviewRole::R1 => {
+                    let spec = reviewer::ReviewerSpec {
+                        pr,
+                        worker_agent: worker.agent_name.to_string(),
+                        reviewer_name: reviewer_name.clone(),
+                    };
+                    reviewer::build_review_prompt(&spec, &config.effort)
+                }
+                ReviewRole::R2 { r1_reviewer, .. } => {
+                    let spec = reviewer::R2ReviewSpec {
+                        pr,
+                        worker_agent: worker.agent_name.to_string(),
+                        r1_reviewer: r1_reviewer.clone(),
+                        r2_name: reviewer_name.clone(),
+                    };
+                    reviewer::build_r2_review_prompt(&spec, &config.effort)
+                }
+            };
+
             let turn1 = agent::user_turn(&prompt);
             if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!("reviewer feed_turn failed: {e}"));
+                log(&format!(
+                    "{}: reviewer feed_turn failed: {e}",
+                    role.as_str().to_uppercase()
+                ));
                 proc.kill_and_reap().await;
                 name_pool.release(&reviewer_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
@@ -5943,32 +6204,78 @@ async fn spawn_reviewer_for_worker(
             )
             .await;
 
+            // Record agent run — R2 uses insert_r2 (sub_role='r2').
             let reviewer_run_id = {
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
                 let m = reviewer_model.clone();
                 let e = config.effort.clone();
                 let tid = worker.task_id;
+                let is_r2 = role.is_r2();
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert(
-                        &conn,
-                        tid,
-                        &name,
-                        "reviewer",
-                        &m,
-                        &e,
-                        now_unix(),
-                    )
+                    if is_r2 {
+                        quorum_core::agent_runs::insert_r2(&conn, tid, &name, &m, &e, now_unix())
+                    } else {
+                        quorum_core::agent_runs::insert(
+                            &conn,
+                            tid,
+                            &name,
+                            "reviewer",
+                            &m,
+                            &e,
+                            now_unix(),
+                        )
+                    }
                 })
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
                 .ok()
             };
 
+            // R2: stash metadata for audit recording when the reviewer finishes.
+            if let ReviewRole::R2 {
+                r1_reviewer,
+                r1_run_id,
+            } = role
+            {
+                let p = config.db_path.clone();
+                let tid = worker.task_id;
+                let dm = config.model.clone();
+                let de = config.effort.clone();
+                let r1_rev = r1_reviewer.clone();
+                let r2n = reviewer_name.clone();
+                let r1_rid = *r1_run_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = quorum_core::db::open(&p) {
+                        let stratum =
+                            quorum_core::review_audits::task_stratum(&conn, tid, &dm, &de)
+                                .unwrap_or_else(|_| (dm, de, "untagged".into()));
+                        R2_META.lock().unwrap().insert(
+                            r2n,
+                            R2Meta {
+                                r1_reviewer: r1_rev,
+                                r1_run_id: r1_rid,
+                                worker_model: stratum.0,
+                                worker_effort: stratum.1,
+                                cx_bucket: stratum.2,
+                            },
+                        );
+                    }
+                })
+                .await;
+            }
+
+            // Capture head SHA at spawn time for stale-approval detection.
+            let spawn_head_sha = if role.is_r2() {
+                Some(head_sha.to_string()).filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
-                agent_name: reviewer_name,
+                agent_name: reviewer_name.clone(),
                 proc,
                 task_id: worker.task_id,
                 session_id,
@@ -5991,15 +6298,32 @@ async fn spawn_reviewer_for_worker(
                 last_error_text: None,
                 agent_run_id: reviewer_run_id,
                 cap_run_id: Some(cap_run_id),
-                r2_origin: false,
-                reviewed_head_sha: None,
+                r2_origin: role.is_r2(),
+                reviewed_head_sha: spawn_head_sha,
                 codex_thread_id: None,
                 pending_prompt: String::new(),
-                pending_turn_kind: "review".into(),
+                pending_turn_kind: if role.is_r2() {
+                    "r2-review".into()
+                } else {
+                    "review".into()
+                },
             });
+
+            if role.is_r2() {
+                log(&format!(
+                    "R2: pre-merge reviewer {reviewer_name} spawned for PR #{pr}"
+                ));
+            } else {
+                log(&format!(
+                    "R1: reviewer {reviewer_name} spawned for PR #{pr}"
+                ));
+            }
         }
         Err(e) => {
-            log(&format!("reviewer spawn failed: {e}"));
+            log(&format!(
+                "{}: failed to spawn reviewer: {e}",
+                role.as_str().to_uppercase()
+            ));
             name_pool.release(&reviewer_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -6979,337 +7303,6 @@ async fn teardown_reviewer(
 
     name_pool.release(&state.agent_name);
     log(&format!("reviewer {} torn down", state.agent_name));
-}
-
-// ── R2 pre-merge reviewer ────────────────────────────────────────────────
-
-/// Spawn an R2 pre-merge reviewer that replaces R1. Uses the same
-/// escalation policy as R1 (one tier above worker, capped at top).
-/// The reviewer slot is marked `r2_origin = true` so rework routes back
-/// to R2, not R1.
-#[allow(clippy::too_many_arguments)]
-async fn spawn_r2_reviewer(
-    config: &ServeConfig,
-    wt_mgr: &WorktreeManager,
-    name_pool: &mut Pool,
-    reviewers: &mut Vec<SlotState>,
-    lifetime_roster: &mut LifetimeRoster,
-    pr: i64,
-    worker: ReviewCounterpart<'_>,
-    r1_reviewer: &str,
-    r1_run_id: Option<i64>,
-) -> Result<()> {
-    let r2_name = name_pool.acquire().into_name();
-    lifetime_roster.register(&r2_name);
-
-    // Drain stale mailbox rows.
-    {
-        let p = config.db_path.clone();
-        let name = r2_name.clone();
-        let _ = tokio::task::spawn_blocking(move || -> Result<usize> {
-            let mut conn = quorum_core::db::open(&p)?;
-            mailbox::consume_all_for_agent(&mut conn, &name)
-        })
-        .await;
-    }
-
-    let session_id = agent::new_session_id();
-    let branch = reviewer::reviewer_branch(pr, &r2_name);
-    let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &r2_name);
-
-    // #189: resolve PR target from GitHub for R2 provisioning.
-    // Falls back to worker branch when GitHub is unavailable.
-    let task_repo_dir = &config.repo_dir;
-    let pr_num = pr;
-    let repo_dir_for_gh = task_repo_dir.to_path_buf();
-    let gh_repo_r2 = config.repo.clone();
-    let pr_target = tokio::task::spawn_blocking(move || {
-        resolve_pr_target(pr_num, &repo_dir_for_gh, Some(&gh_repo_r2))
-    })
-    .await
-    .ok()
-    .flatten();
-    let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
-        let result = if target.is_fork {
-            wt_mgr
-                .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
-                .await
-        } else {
-            wt_mgr
-                .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
-                .await
-        };
-        (result, Some(target.head_sha.as_str()))
-    } else {
-        log(&format!(
-            "R2: PR #{pr} target not resolved — falling back to worker branch '{}'",
-            worker.branch
-        ));
-        let result = wt_mgr
-            .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
-            .await;
-        (result, None)
-    };
-    let provision_ok = match provision_result {
-        Ok(_) => {
-            if let Some(expected_sha) = sha_to_verify {
-                match wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log(&format!("R2: worktree HEAD SHA mismatch for PR #{pr}: {e}"));
-                        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                        wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                        false
-                    }
-                }
-            } else {
-                true
-            }
-        }
-        Err(e) => {
-            log(&format!(
-                "R2: reviewer worktree provision failed for PR #{pr}: {e}"
-            ));
-            false
-        }
-    };
-    if !provision_ok {
-        log(&format!(
-            "R2: reviewer worktree provision failed for PR #{pr} — skipping R2"
-        ));
-        name_pool.release(&r2_name);
-        return Ok(());
-    }
-
-    let reviewer_model = {
-        let p = config.db_path.clone();
-        let tid = worker.task_id;
-        let cfg_model = config.model.clone();
-        tokio::task::spawn_blocking(move || -> String {
-            let worker_model = quorum_core::db::open(&p)
-                .ok()
-                .and_then(|conn| {
-                    quorum_core::agent_runs::worker_model(&conn, tid)
-                        .ok()
-                        .flatten()
-                })
-                .unwrap_or_else(|| cfg_model.clone());
-            escalated_reviewer_model(&worker_model, &cfg_model)
-        })
-        .await
-        .unwrap_or_else(|_| config.model.clone())
-    };
-    log(&format!(
-        "R2: reviewer model escalated to {reviewer_model} for task {}",
-        worker.task_id
-    ));
-
-    let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
-        session_log::SessionLog::create(
-            ld,
-            &r2_name,
-            "reviewer",
-            Some(worker.task_id),
-            &session_id,
-            &branch,
-            now_unix(),
-        )
-        .ok()
-    });
-
-    // Journal entry.
-    {
-        let p = config.db_path.clone();
-        let entry = JournalEntry {
-            agent: r2_name.clone(),
-            role: "reviewer".into(),
-            task_id: Some(worker.task_id),
-            session_id: session_id.clone(),
-            worktree: Some(wt_path.to_string_lossy().into()),
-            branch: Some(branch.clone()),
-            phase: "reviewing".into(),
-            cost_tokens: 0,
-            agent_state: None,
-            cost_usd: 0.0,
-            log_dir: reviewer_session_log
-                .as_ref()
-                .map(|l| l.dir().to_string_lossy().into()),
-            pid: None,
-            pr: Some(pr),
-            rework_count: 0,
-        };
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            journal::upsert(&mut conn, &entry)
-        })
-        .await
-        .ok();
-    }
-
-    let spec = reviewer::R2ReviewSpec {
-        pr,
-        worker_agent: worker.agent_name.to_string(),
-        r1_reviewer: r1_reviewer.to_string(),
-        r2_name: r2_name.clone(),
-    };
-
-    // #130: issue R2 run capability BEFORE spawn so QUORUM_RUN_ID is inherited.
-    let cap_run_id = uuid::Uuid::new_v4().to_string();
-    {
-        let p = config.db_path.clone();
-        let rid = cap_run_id.clone();
-        let name = r2_name.clone();
-        let tid = worker.task_id;
-        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
-        })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-        if let Err(e) = issue_res {
-            log(&format!(
-                "R2 capability issue failed for task {} agent {r2_name}: {e} — R2 will fall back to compat auth",
-                worker.task_id
-            ));
-        }
-    }
-
-    match reviewer::spawn_reviewer(
-        &reviewer_model,
-        &config.effort,
-        &session_id,
-        &wt_path,
-        config.agent_bin.as_deref(),
-        config.bare_agent,
-        vec![
-            ("QUORUM_REPO".into(), config.repo.clone()),
-            ("QUORUM_AGENT".into(), r2_name.clone()),
-            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-        ],
-        config.allowed_tools.as_deref(),
-    )
-    .await
-    {
-        Ok(agent_proc) => {
-            let mut proc = runner::RunnerProc::Claude(agent_proc);
-            let prompt = reviewer::build_r2_review_prompt(&spec, &config.effort);
-            let turn1 = agent::user_turn(&prompt);
-            if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!("R2: reviewer feed_turn failed: {e}"));
-                proc.kill_and_reap().await;
-                name_pool.release(&r2_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return Ok(());
-            }
-
-            fire_event(
-                &config.db_path,
-                &r2_name,
-                worker.task_id,
-                &Event::ReviewerAttached {
-                    agent: r2_name.clone(),
-                },
-            )
-            .await;
-
-            let reviewer_run_id = {
-                let p = config.db_path.clone();
-                let name = r2_name.clone();
-                let m = reviewer_model.clone();
-                let e = config.effort.clone();
-                let tid = worker.task_id;
-                tokio::task::spawn_blocking(move || -> Result<i64> {
-                    let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_r2(&conn, tid, &name, &m, &e, now_unix())
-                })
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-            };
-
-            // Stash R2 metadata for audit recording when done.
-            {
-                let p = config.db_path.clone();
-                let tid = worker.task_id;
-                let dm = config.model.clone();
-                let de = config.effort.clone();
-                let r1_rev = r1_reviewer.to_string();
-                let r2n = r2_name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Ok(conn) = quorum_core::db::open(&p) {
-                        let stratum =
-                            quorum_core::review_audits::task_stratum(&conn, tid, &dm, &de)
-                                .unwrap_or_else(|_| (dm, de, "untagged".into()));
-                        R2_META.lock().unwrap().insert(
-                            r2n,
-                            R2Meta {
-                                r1_reviewer: r1_rev,
-                                r1_run_id,
-                                worker_model: stratum.0,
-                                worker_effort: stratum.1,
-                                cx_bucket: stratum.2,
-                            },
-                        );
-                    }
-                })
-                .await;
-            }
-
-            // Record PR head SHA at R2 spawn time for stale-approval detection.
-            let spawn_head_sha = {
-                let repo = config.repo_dir.clone();
-                let executor = Arc::clone(&config.merge_executor);
-                tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
-                    .await
-                    .ok()
-                    .flatten()
-            };
-
-            let now_instant = std::time::Instant::now();
-            reviewers.push(SlotState {
-                agent_name: r2_name.clone(),
-                proc,
-                task_id: worker.task_id,
-                session_id,
-                model: reviewer_model,
-                effort: config.effort.clone(),
-                worktree_path: wt_path,
-                branch,
-                draining: true,
-                pr: Some(pr),
-                rework_count: 0,
-                cost_tokens: 0,
-                cost_usd: 0.0,
-                task_started_at: now_instant,
-                turn_started_at: now_instant,
-                turn_ended_at: None,
-                agent_state: None,
-                session_log: reviewer_session_log,
-                live_stats: LiveStats::new(),
-                error_turn_count: 0,
-                last_error_text: None,
-                agent_run_id: reviewer_run_id,
-                cap_run_id: Some(cap_run_id),
-                r2_origin: true,
-                reviewed_head_sha: spawn_head_sha,
-                codex_thread_id: None,
-                pending_prompt: String::new(),
-                pending_turn_kind: "r2-review".into(),
-            });
-
-            log(&format!(
-                "R2: pre-merge reviewer {r2_name} spawned for PR #{pr}"
-            ));
-        }
-        Err(e) => {
-            log(&format!("R2: failed to spawn reviewer: {e}"));
-            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-            name_pool.release(&r2_name);
-        }
-    }
-
-    Ok(())
 }
 
 /// Record an R2 audit row from stashed metadata (best-effort).
@@ -8824,68 +8817,113 @@ mod tests {
         );
     }
 
-    // ── ReviewerProvisionTracker tests (#162) ────────────────────────────
+    // ── next_needed_role / provision exhaustion tests (#190) ────────────
 
     #[test]
-    fn reviewer_provision_tracker_new_is_clean() {
-        let tracker = ReviewerProvisionTracker::new();
-        assert_eq!(tracker.strikes(1, 42), 0);
-        assert!(!tracker.is_exhausted(1, 42));
+    fn next_needed_role_returns_r1_when_no_approvals() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let role = next_needed_role(&conn, 42, "abc123").unwrap();
+        assert_eq!(role, Some("r1"));
     }
 
     #[test]
-    fn reviewer_provision_tracker_records_strikes() {
-        let mut tracker = ReviewerProvisionTracker::new();
-        assert_eq!(tracker.record_strike(1, 42), 1);
-        assert_eq!(tracker.record_strike(1, 42), 2);
-        assert_eq!(tracker.record_strike(1, 42), 3);
-        assert_eq!(tracker.strikes(1, 42), 3);
+    fn next_needed_role_returns_r2_when_r1_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id: 10,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "abc123".into(),
+            },
+        )
+        .unwrap();
+        let role = next_needed_role(&conn, 42, "abc123").unwrap();
+        assert_eq!(role, Some("r2"));
     }
 
     #[test]
-    fn reviewer_provision_tracker_exhausted_at_threshold() {
-        let mut tracker = ReviewerProvisionTracker::new();
-        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES - 1 {
-            tracker.record_strike(1, 42);
+    fn next_needed_role_returns_none_when_both_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        for role in &["r1", "r2"] {
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: 42,
+                    review_role: role.to_string(),
+                    task_id: 10,
+                    author: "worker".into(),
+                    reviewer: format!("rev-{role}"),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "abc123".into(),
+                },
+            )
+            .unwrap();
         }
-        assert!(!tracker.is_exhausted(1, 42));
-        tracker.record_strike(1, 42);
-        assert!(tracker.is_exhausted(1, 42));
+        let role = next_needed_role(&conn, 42, "abc123").unwrap();
+        assert_eq!(role, None);
     }
 
     #[test]
-    fn reviewer_provision_tracker_clear_resets() {
-        let mut tracker = ReviewerProvisionTracker::new();
-        tracker.record_strike(1, 42);
-        tracker.record_strike(1, 42);
-        tracker.clear(1, 42);
-        assert_eq!(tracker.strikes(1, 42), 0);
-        assert!(!tracker.is_exhausted(1, 42));
+    fn next_needed_role_returns_r1_when_sha_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id: 10,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "old_sha".into(),
+            },
+        )
+        .unwrap();
+        let role = next_needed_role(&conn, 42, "new_sha").unwrap();
+        assert_eq!(role, Some("r1"), "stale SHA must invalidate approval");
     }
 
     #[test]
-    fn reviewer_provision_tracker_independent_keys() {
-        let mut tracker = ReviewerProvisionTracker::new();
-        tracker.record_strike(1, 42);
-        tracker.record_strike(1, 42);
-        tracker.record_strike(2, 43);
-        assert_eq!(tracker.strikes(1, 42), 2);
-        assert_eq!(tracker.strikes(2, 43), 1);
-        assert!(!tracker.is_exhausted(1, 42));
-        assert!(!tracker.is_exhausted(2, 43));
-    }
-
-    #[test]
-    fn reviewer_provision_tracker_same_task_different_pr() {
-        let mut tracker = ReviewerProvisionTracker::new();
-        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
-            tracker.record_strike(1, 42);
+    fn reviewer_cap_exceeded_at_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        for i in 0..MAX_TOTAL_REVIEWER_RUNS {
+            quorum_core::agent_runs::insert(
+                &conn,
+                1,
+                &format!("rev-{i}"),
+                "reviewer",
+                "model",
+                "high",
+                100 + i,
+            )
+            .unwrap();
         }
-        assert!(tracker.is_exhausted(1, 42));
         assert!(
-            !tracker.is_exhausted(1, 43),
-            "different PR on same task must not be exhausted"
+            is_reviewer_cap_exceeded(&conn, 1).unwrap(),
+            "should be exceeded at {MAX_TOTAL_REVIEWER_RUNS} runs"
         );
+    }
+
+    #[test]
+    fn reviewer_cap_not_exceeded_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        quorum_core::agent_runs::insert(&conn, 1, "rev-0", "reviewer", "model", "high", 100)
+            .unwrap();
+        assert!(!is_reviewer_cap_exceeded(&conn, 1).unwrap());
     }
 
     #[test]
