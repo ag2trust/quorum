@@ -332,12 +332,14 @@ No additional Codex-only project instructions currently.
   operator credentials, so on subscription-auth machines a bare agent's every turn returns
   "Not logged in". Fix pattern: session ids come only from `agent::new_session_id()`; every
   spawn path (worker, reviewer, classifier, backfill) must thread the `bare_agent` config —
-  never hardcode `bare`. Prevention pattern: the real-CLI contract tests in `agent.rs`
-  (spawn the installed binary with `CLAUDE_CONFIG_DIR` → empty tempdir + blanked cred env
-  vars: it reaches arg-parse and auth but can never reach the API — any stream event back
-  means args parsed; event-less exit is the crash-loop signature). Debug pattern: the
-  classifier's real error text isn't in daemon logs — read the newest session jsonl under
-  `~/.claude/projects/<repo-slug>/`.
+  never hardcode `bare`. **Default changed (#180):** `no_bare_agent` now defaults to `true`
+  (inherit operator's Claude login). Bare mode is opt-in via `no_bare_agent = false` for
+  operators providing non-interactive credentials (e.g. `ANTHROPIC_API_KEY`). Auth errors
+  now propagate the provider result text through daemon logs and trigger exponential backoff
+  (30s..300s) to prevent per-tick respawn loops. Prevention pattern: the real-CLI contract
+  tests in `agent.rs` (spawn the installed binary with `CLAUDE_CONFIG_DIR` → empty tempdir
+  + blanked cred env vars: it reaches arg-parse and auth but can never reach the API — any
+  stream event back means args parsed; event-less exit is the crash-loop signature).
 - `read --ack-through` is a **write** (it advances the cursor), so it takes the write lock
   like everything else — it is not a "pure read." Plain `read`/`peek` without ack are reads.
 - **Presence is implicit and display-only.** There is no `heartbeat` or `register` command in

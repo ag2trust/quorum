@@ -1,5 +1,6 @@
-//! Test: `quorum serve` passes `--bare` to spawned agents by default, and
-//! respects `--no-bare-agent` to disable it.
+//! Test: `quorum serve` does NOT pass `--bare` to spawned agents by default
+//! (inherits operator's Claude login), and a config with `no_bare_agent = false`
+//! re-enables bare mode.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -205,7 +206,7 @@ fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> 
 }
 
 #[test]
-fn serve_passes_bare_to_agent_by_default() {
+fn serve_uses_system_login_by_default() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -220,7 +221,7 @@ fn serve_passes_bare_to_agent_by_default() {
         .status()
         .unwrap();
 
-    seed_task(home.path(), "Test bare flag");
+    seed_task(home.path(), "Test no-bare default");
 
     let handle = BareServeHandle::start(
         home.path(),
@@ -231,8 +232,13 @@ fn serve_passes_bare_to_agent_by_default() {
     );
 
     assert!(
-        wait_session_log(home.path(), "[bare]", 15),
-        "agent turn-1 session log should contain [bare] when bare_agent is enabled (default)"
+        wait_session_log(home.path(), "Working on task", 15),
+        "agent turn-1 should have landed in the session log"
+    );
+
+    assert!(
+        !session_log_contains(home.path(), "[bare]"),
+        "agent should NOT get --bare by default (system login mode)"
     );
 
     handle.stop();
@@ -297,8 +303,10 @@ fn task_get_json(home: &std::path::Path, task_id: u32) -> String {
 /// classifier prompt with an `area:fake-bare` / `area:fake-nobare` cx tag
 /// depending on whether it was spawned with --bare, and we assert the tag
 /// that lands in the task's refs.
+///
+/// #180: default changed from bare to system-login (no_bare_agent=true).
 #[test]
-fn classifier_spawn_is_bare_by_default() {
+fn classifier_spawn_uses_system_login_by_default() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -313,7 +321,7 @@ fn classifier_spawn_is_bare_by_default() {
         .status()
         .unwrap();
 
-    seed_task(home.path(), "Classify me (bare default)");
+    seed_task(home.path(), "Classify me (system login default)");
 
     let mut handle = BareServeHandle::start(
         home.path(),
@@ -332,8 +340,8 @@ fn classifier_spawn_is_bare_by_default() {
 
     let refs = task_get_json(home.path(), 1);
     assert!(
-        refs.contains("area:fake-bare"),
-        "classifier agent should be spawned with --bare by default; task refs: {refs}"
+        refs.contains("area:fake-nobare"),
+        "classifier should NOT get --bare by default (system login); task refs: {refs}"
     );
 }
 
@@ -375,4 +383,53 @@ fn classifier_spawn_respects_no_bare_agent() {
         refs.contains("area:fake-nobare"),
         "classifier agent must NOT get --bare under --no-bare-agent; task refs: {refs}"
     );
+}
+
+/// #180: explicit `no_bare_agent = false` in a config file must still produce
+/// `--bare` agents — the default flip must not break existing configs.
+#[test]
+fn config_file_bare_false_enables_bare_mode() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    // Write a config file with explicit bare mode
+    let config_path = home.path().join("bare-test.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "repo = \"test/repo\"\nrepo_dir = \"{}\"\nworktree_base = \"{}\"\nno_bare_agent = false\n",
+            repo_dir.path().display(),
+            wt_base.path().display(),
+        ),
+    )
+    .unwrap();
+
+    seed_task(home.path(), "Test bare via config");
+
+    let config_str = config_path.to_string_lossy().to_string();
+    let handle = BareServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &["--config", &config_str],
+    );
+
+    assert!(
+        wait_session_log(home.path(), "[bare]", 15),
+        "agent should get --bare when config has no_bare_agent = false"
+    );
+
+    handle.stop();
 }

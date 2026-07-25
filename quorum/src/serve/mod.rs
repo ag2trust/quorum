@@ -496,7 +496,7 @@ pub struct ServeConfig {
     pub effort: String,
     pub merge_executor: Arc<dyn merge::MergeExecutor>,
     /// Pass `--bare` to spawned agents, stripping operator-local hooks,
-    /// plugins, memory, and MCP config. Default: true.
+    /// plugins, memory, and MCP config. Default: false (inherit operator login).
     pub bare_agent: bool,
     pub limits: CostLimits,
     /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
@@ -1018,6 +1018,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
+    let mut classifier_consec_errors: u32 = 0;
+    let mut classifier_backoff_until: Option<std::time::Instant> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
     let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
     // Snapshot initial main sha for Trigger B baseline
@@ -1287,6 +1289,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
+            &mut classifier_consec_errors,
+            &mut classifier_backoff_until,
             &mut doctor_slot,
             &mut doctored_tasks,
             &signal_count,
@@ -1340,6 +1344,8 @@ async fn tick(
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
+    classifier_consec_errors: &mut u32,
+    classifier_backoff_until: &mut Option<std::time::Instant>,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
     doctored_tasks: &mut std::collections::HashSet<i64>,
     signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -4794,10 +4800,28 @@ async fn tick(
                     } else {
                         log("classifier: failed to parse response");
                     }
+                    *classifier_consec_errors = 0;
+                    *classifier_backoff_until = None;
                     *classifier_slot = None;
                 }
                 classifier::ClassifierResult::Error(e) => {
-                    log(&format!("classifier: {e}"));
+                    if classifier::is_auth_error(&e) {
+                        log(&format!(
+                            "classifier: {e} — if using subscription auth, \
+                             ensure no_bare_agent = true (the default)"
+                        ));
+                    } else {
+                        log(&format!("classifier: {e}"));
+                    }
+                    *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
+                    let delay =
+                        std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
+                    *classifier_backoff_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
+                    log(&format!(
+                        "classifier: backoff {delay}s after {} consecutive error(s)",
+                        *classifier_consec_errors
+                    ));
                     *classifier_slot = None;
                 }
             }
@@ -4822,18 +4846,42 @@ async fn tick(
                     if stored > 0 {
                         log(&format!("classifier: stored {stored} classification(s)"));
                     }
+                    *classifier_consec_errors = 0;
+                    *classifier_backoff_until = None;
                 } else {
                     log("classifier: process exited without parseable response");
+                    *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
+                    let delay =
+                        std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
+                    *classifier_backoff_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
                 }
             } else {
                 log("classifier: process exited without response");
+                *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
+                let delay =
+                    std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
+                *classifier_backoff_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
+                log(&format!(
+                    "classifier: backoff {delay}s after {} consecutive error(s)",
+                    *classifier_consec_errors
+                ));
             }
             *classifier_slot = None;
         }
     }
 
     // 7b: Spawn classifier if idle and there are unclassified tasks.
-    if classifier_slot.is_none() && !drain_state.draining {
+    // Skip if in backoff from consecutive errors.
+    if let Some(until) = *classifier_backoff_until {
+        if std::time::Instant::now() < until {
+            // Still in backoff — skip spawn this tick.
+        } else {
+            *classifier_backoff_until = None;
+        }
+    }
+    if classifier_slot.is_none() && !drain_state.draining && classifier_backoff_until.is_none() {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;

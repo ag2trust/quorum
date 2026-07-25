@@ -402,10 +402,11 @@ pub enum Command {
         /// Poll interval for status checks in seconds (default: 30).
         #[arg(long, hide = true)]
         merge_checks_poll_secs: Option<u64>,
-        /// Disable --bare mode for spawned agents. By default, agents are
-        /// spawned with --bare so they do not inherit operator-local hooks,
-        /// plugins, memory, or MCP config. Pass this flag to let agents use
-        /// the operator's full Claude config.
+        /// Use the operator's installed Claude login for spawned agents
+        /// (default: true — no --bare). Set `no_bare_agent = false` in the
+        /// config file to pass --bare, which strips operator-local hooks,
+        /// plugins, memory, and MCP config but requires separate non-interactive
+        /// credentials (e.g. ANTHROPIC_API_KEY) in the daemon environment.
         #[arg(long)]
         no_bare_agent: bool,
         /// Max tokens (input+output) per single turn. Exceeding kills the agent.
@@ -509,9 +510,9 @@ pub enum Command {
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
-        /// Disable --bare for the classifier agent so it inherits operator
-        /// credentials — required on subscription-auth (logged-in) machines,
-        /// same as `serve --no-bare-agent`.
+        /// Use the operator's installed Claude login (default: true).
+        /// Set to false to pass --bare, requiring non-interactive credentials
+        /// in the environment.
         #[arg(long)]
         no_bare_agent: bool,
     },
@@ -532,7 +533,9 @@ pub enum Command {
         /// Override the agent binary (default: "claude").
         #[arg(long)]
         agent_bin: Option<String>,
-        /// Disable --bare for the agent (subscription-auth machines).
+        /// Use the operator's installed Claude login (default: true).
+        /// Set to false to pass --bare, requiring non-interactive credentials
+        /// in the environment.
         #[arg(long)]
         no_bare_agent: bool,
         /// Emit JSON output instead of a summary.

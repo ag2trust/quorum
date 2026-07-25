@@ -75,9 +75,13 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                 result, is_error, ..
             } => {
                 if is_error.unwrap_or(false) {
-                    return Some(ClassifierResult::Error(
-                        "classifier agent returned an error".into(),
-                    ));
+                    let text = stream::result_text(result);
+                    let detail = if text.is_empty() {
+                        "classifier agent returned an error".into()
+                    } else {
+                        format!("classifier agent error: {}", truncate_error(&text, 300))
+                    };
+                    return Some(ClassifierResult::Error(detail));
                 }
                 let text = stream::result_text(result);
                 if !text.is_empty() {
@@ -103,6 +107,22 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
 pub enum ClassifierResult {
     Done(String),
     Error(String),
+}
+
+fn truncate_error(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// True when the error text looks like a Claude CLI authentication failure.
+pub fn is_auth_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("not logged in") || lower.contains("please run /login")
 }
 
 /// Parse the classifier response text into structured results.
@@ -181,5 +201,30 @@ mod tests {
     #[test]
     fn parse_response_invalid() {
         assert!(parse_response("not json at all").is_none());
+    }
+
+    #[test]
+    fn is_auth_error_detects_login_message() {
+        assert!(is_auth_error("Not logged in · Please run /login"));
+        assert!(is_auth_error("error: not logged in"));
+        assert!(!is_auth_error("rate limit exceeded"));
+    }
+
+    #[test]
+    fn truncate_error_respects_limit() {
+        assert_eq!(truncate_error("short", 10), "short");
+        let long = "a".repeat(400);
+        let t = truncate_error(&long, 300);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.chars().count(), 301); // 300 + '…'
+    }
+
+    #[test]
+    fn truncate_error_safe_on_multibyte() {
+        // "·" is 2 bytes in UTF-8; must not panic on boundary
+        let s = "Not logged in · Please run /login".repeat(20);
+        let t = truncate_error(&s, 30);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.chars().count(), 31);
     }
 }

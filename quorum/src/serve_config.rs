@@ -655,7 +655,7 @@ worktree_base = "/tmp/wt"
                 source: Source::Default,
             },
             no_bare_agent: &Sourced {
-                value: false,
+                value: true,
                 source: Source::Default,
             },
             self_update_drain: &Sourced {
