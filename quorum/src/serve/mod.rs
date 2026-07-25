@@ -132,15 +132,22 @@ impl LifetimeRoster {
     }
 }
 
-fn query_pr_head_ref(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<String> {
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+struct PrTarget {
+    pr: i64,
+    head_ref: String,
+    head_sha: String,
+    is_fork: bool,
+}
+
+fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
     let mut args = vec![
         "pr".to_string(),
         "view".to_string(),
         pr.to_string(),
         "--json".to_string(),
-        "headRefName".to_string(),
-        "--jq".to_string(),
-        ".headRefName".to_string(),
+        "headRefName,headRefOid,isCrossRepository".to_string(),
     ];
     if let Some(repo) = gh_repo {
         args.push("--repo".to_string());
@@ -154,12 +161,22 @@ fn query_pr_head_ref(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<
     if !output.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let head_ref = json.get("headRefName")?.as_str()?.to_string();
+    let head_sha = json.get("headRefOid")?.as_str()?.to_string();
+    let is_fork = json
+        .get("isCrossRepository")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if head_ref.is_empty() || head_sha.is_empty() {
+        return None;
     }
+    Some(PrTarget {
+        pr,
+        head_ref,
+        head_sha,
+        is_fork,
+    })
 }
 
 fn log(msg: &str) {
@@ -1560,101 +1577,87 @@ async fn tick(
                         let r1_name = reviewers[ri].agent_name.clone();
                         let r1_run_id = reviewers[ri].agent_run_id;
 
-                        // Build counterpart from worker if available, otherwise
-                        // resolve from task author (daemon branch convention)
-                        // or PR head ref via gh (covers review-only and dead-worker cases).
-                        let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
+                        // #189: branch is a hint only — spawn_r2_reviewer resolves
+                        // the authoritative PR target from GitHub internally.
+                        let (cp_agent, cp_tid, cp_branch) = if let Some(w) =
                             workers.iter().find(|w| w.task_id == reviewer_task_id)
                         {
-                            Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
+                            (w.agent_name.clone(), w.task_id, w.branch.clone())
                         } else {
-                            // #175: try daemon branch convention first, then gh.
-                            let db_branch = {
+                            let hint = {
                                 let p = db_path.clone();
                                 let tid = reviewer_task_id;
-                                tokio::task::spawn_blocking(move || -> Option<String> {
-                                    let conn = quorum_core::db::open(&p).ok()?;
-                                    let t = tasks::get(&conn, tid).ok()??;
-                                    let author = t.author.unwrap_or_default();
-                                    orphan_worker_branch(&author, tid, t.review_only)
+                                tokio::task::spawn_blocking(move || -> (String, String) {
+                                    let conn = quorum_core::db::open(&p).ok();
+                                    let t = conn
+                                        .as_ref()
+                                        .and_then(|c| tasks::get(c, tid).ok().flatten());
+                                    match t {
+                                        Some(task) => {
+                                            let author = task.author.unwrap_or_default();
+                                            let branch = orphan_worker_branch(
+                                                &author,
+                                                tid,
+                                                task.review_only,
+                                            )
+                                            .unwrap_or_default();
+                                            let name = if author.is_empty() {
+                                                "external".to_string()
+                                            } else {
+                                                author
+                                            };
+                                            (name, branch)
+                                        }
+                                        None => ("external".to_string(), String::new()),
+                                    }
                                 })
                                 .await
-                                .ok()
-                                .flatten()
+                                .unwrap_or(("external".to_string(), String::new()))
                             };
-                            if let Some(branch) = db_branch {
-                                Some(("external".to_string(), reviewer_task_id, branch))
-                            } else {
-                                let pr_val = pr_num;
-                                let repo_dir = config.repo_dir.clone();
-                                let gh_repo = config.repo.clone();
-                                let resolved = tokio::task::spawn_blocking(move || {
-                                    query_pr_head_ref(pr_val, &repo_dir, Some(&gh_repo))
-                                })
-                                .await
-                                .ok()
-                                .flatten();
-                                resolved.map(|branch| {
-                                    ("external".to_string(), reviewer_task_id, branch)
-                                })
-                            }
+                            (hint.0, reviewer_task_id, hint.1)
+                        };
+                        let worker_cp = ReviewCounterpart {
+                            agent_name: &cp_agent,
+                            task_id: cp_tid,
+                            branch: &cp_branch,
                         };
 
-                        if let Some((cp_agent, cp_tid, cp_branch)) = worker_cp_owned {
-                            let worker_cp = ReviewCounterpart {
-                                agent_name: &cp_agent,
-                                task_id: cp_tid,
-                                branch: &cp_branch,
-                            };
+                        let pre_count = reviewers.len();
+                        spawn_r2_reviewer(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            reviewers,
+                            lifetime_roster,
+                            pr_num,
+                            worker_cp,
+                            &r1_name,
+                            r1_run_id,
+                        )
+                        .await
+                        .ok();
+                        let r2_added = reviewers.len() > pre_count;
 
-                            let pre_count = reviewers.len();
-                            spawn_r2_reviewer(
-                                config,
-                                wt_mgr,
-                                name_pool,
-                                reviewers,
-                                lifetime_roster,
-                                pr_num,
-                                worker_cp,
-                                &r1_name,
-                                r1_run_id,
-                            )
-                            .await
-                            .ok();
-                            let r2_added = reviewers.len() > pre_count;
-
-                            if r2_added {
-                                log(&format!(
-                                    "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
-                                     tearing down R1 reviewer {}",
-                                    r1_name
-                                ));
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-pending").await;
-                                if !consume_mailbox_row(&db_path, *id).await {
-                                    break;
-                                }
-                                continue;
-                            } else {
-                                log(&format!(
-                                    "R2 GATE: R2 spawn failed for PR #{pr_num} \
-                                     — R1 approval stored, will retry on next tick"
-                                ));
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-spawn-failed")
-                                    .await;
-                                if !consume_mailbox_row(&db_path, *id).await {
-                                    break;
-                                }
-                                continue;
-                            }
-                        } else {
+                        if r2_added {
                             log(&format!(
-                                "R2 GATE: PR #{pr_num} — could not resolve branch for R2 \
-                                 counterpart, R1 approval stored, will retry on next tick"
+                                "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
+                                 tearing down R1 reviewer {}",
+                                r1_name
                             ));
                             let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-no-branch").await;
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-pending").await;
+                            if !consume_mailbox_row(&db_path, *id).await {
+                                break;
+                            }
+                            continue;
+                        } else {
+                            log(&format!(
+                                "R2 GATE: R2 spawn failed for PR #{pr_num} \
+                                 — R1 approval stored, will retry on next tick"
+                            ));
+                            let r = reviewers.remove(ri);
+                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-spawn-failed")
+                                .await;
                             if !consume_mailbox_row(&db_path, *id).await {
                                 break;
                             }
@@ -4714,32 +4717,10 @@ async fn tick(
                 .await;
                 continue;
             }
-            let branch = if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
-                b
-            } else {
-                // Review-only tasks (or tasks with no author) have no daemon-authored
-                // branch — resolve the PR's head ref from GitHub instead of guessing
-                // a malformed daemon/-t<id> branch name.
-                let pr_num = *pr;
-                let repo_dir = config.repo_dir.clone();
-                let gh_repo = config.repo.clone();
-                let resolved = tokio::task::spawn_blocking(move || {
-                    query_pr_head_ref(pr_num, &repo_dir, Some(&gh_repo))
-                })
-                .await
-                .ok()
-                .flatten();
-                match resolved {
-                    Some(head_ref) => head_ref,
-                    None => {
-                        log(&format!(
-                            "orphan in-review task #{task_id} PR #{pr}: \
-                             review-only but could not resolve PR head ref — skipping"
-                        ));
-                        continue;
-                    }
-                }
-            };
+            // #189: branch is a hint only — spawn_reviewer_for_worker resolves
+            // the authoritative PR target from GitHub.
+            let hint_branch =
+                orphan_worker_branch(author, *task_id, *review_only).unwrap_or_default();
             let counterpart = ReviewCounterpart {
                 agent_name: if author.is_empty() {
                     "external"
@@ -4747,7 +4728,7 @@ async fn tick(
                     author
                 },
                 task_id: *task_id,
-                branch: &branch,
+                branch: &hint_branch,
             };
             spawn_reviewer_for_worker(
                 config,
@@ -5590,7 +5571,9 @@ fn write_live_sidecar(slot: &SlotState) {
 }
 
 /// A minimal view of the reviewer's counterpart — the agent whose PR is
-/// under review.
+/// under review. `branch` is a hint for logging; provisioning resolves the
+/// authoritative ref from GitHub (#189).
+#[allow(dead_code)]
 struct ReviewCounterpart<'a> {
     agent_name: &'a str,
     task_id: i64,
@@ -5657,60 +5640,63 @@ async fn spawn_reviewer_for_worker(
     let branch = reviewer::reviewer_branch(pr, &reviewer_name);
     let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &reviewer_name);
 
-    // F4: provision reviewer worktree from the PR head branch (the worker's
-    // branch), not origin/main, so the reviewer has the code under review
-    // checked out locally.
-    // #180: resolve the correct clone directory from refs.repo — the worker's
-    // branch lives on the task's repo remote, not necessarily config.repo_dir.
-    // #162: if the worker's branch fails, fall back to the PR's actual head
-    // ref from GitHub (covers review tasks where the worker never pushed).
+    // #189: resolve PR target from GitHub (authoritative head ref, SHA, fork
+    // status). Falls back to worker branch convention when GitHub is
+    // unavailable (e.g. integration tests with fake repos).
     let task_repo_dir = &config.repo_dir;
-    let provision_result = wt_mgr
-        .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
-        .await;
+    let pr_num = pr;
+    let repo_dir_for_gh = task_repo_dir.to_path_buf();
+    let gh_repo = config.repo.clone();
+    let pr_target = tokio::task::spawn_blocking(move || {
+        resolve_pr_target(pr_num, &repo_dir_for_gh, Some(&gh_repo))
+    })
+    .await
+    .ok()
+    .flatten();
+    let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
+        let result = if target.is_fork {
+            wt_mgr
+                .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
+                .await
+        } else {
+            wt_mgr
+                .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
+                .await
+        };
+        (result, Some(target.head_sha.as_str()))
+    } else {
+        log(&format!(
+            "PR #{pr} target not resolved from GitHub — falling back to worker branch '{}'",
+            worker.branch
+        ));
+        let result = wt_mgr
+            .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
+            .await;
+        (result, None)
+    };
     let provision_ok = match provision_result {
-        Ok(_) => true,
-        Err(ref e) => {
-            log(&format!(
-                "reviewer worktree provision failed for branch '{}' in {}: {e} — \
-                 trying gh pr view fallback",
-                worker.branch,
-                task_repo_dir.display()
-            ));
-            let pr_num = pr;
-            let repo_dir_for_gh = task_repo_dir.to_path_buf();
-            let gh_repo = config.repo.clone();
-            let fallback_ref = tokio::task::spawn_blocking(move || {
-                query_pr_head_ref(pr_num, &repo_dir_for_gh, Some(&gh_repo))
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(ref head_ref) = fallback_ref {
-                if head_ref != worker.branch {
-                    log(&format!(
-                        "PR #{pr} head ref from GitHub: '{head_ref}' (worker branch: '{}')",
-                        worker.branch
-                    ));
-                    match wt_mgr
-                        .fetch_and_provision(task_repo_dir, &branch, &wt_path, head_ref)
-                        .await
-                    {
-                        Ok(_) => true,
-                        Err(e2) => {
-                            log(&format!(
-                                "reviewer worktree provision failed with fallback ref too: {e2}"
-                            ));
-                            false
-                        }
+        Ok(_) => {
+            if let Some(expected_sha) = sha_to_verify {
+                match wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log(&format!(
+                            "reviewer worktree HEAD SHA mismatch for PR #{pr}: {e}"
+                        ));
+                        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                        wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        false
                     }
-                } else {
-                    false
                 }
             } else {
-                log("gh pr view fallback returned no head ref");
-                false
+                true
             }
+        }
+        Err(e) => {
+            log(&format!(
+                "reviewer worktree provision failed for PR #{pr}: {e}"
+            ));
+            false
         }
     };
     if !provision_ok {
@@ -6983,11 +6969,62 @@ async fn spawn_r2_reviewer(
     let branch = reviewer::reviewer_branch(pr, &r2_name);
     let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &r2_name);
 
+    // #189: resolve PR target from GitHub for R2 provisioning.
+    // Falls back to worker branch when GitHub is unavailable.
     let task_repo_dir = &config.repo_dir;
-    let provision_ok = wt_mgr
-        .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
-        .await
-        .is_ok();
+    let pr_num = pr;
+    let repo_dir_for_gh = task_repo_dir.to_path_buf();
+    let gh_repo_r2 = config.repo.clone();
+    let pr_target = tokio::task::spawn_blocking(move || {
+        resolve_pr_target(pr_num, &repo_dir_for_gh, Some(&gh_repo_r2))
+    })
+    .await
+    .ok()
+    .flatten();
+    let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
+        let result = if target.is_fork {
+            wt_mgr
+                .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
+                .await
+        } else {
+            wt_mgr
+                .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
+                .await
+        };
+        (result, Some(target.head_sha.as_str()))
+    } else {
+        log(&format!(
+            "R2: PR #{pr} target not resolved — falling back to worker branch '{}'",
+            worker.branch
+        ));
+        let result = wt_mgr
+            .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
+            .await;
+        (result, None)
+    };
+    let provision_ok = match provision_result {
+        Ok(_) => {
+            if let Some(expected_sha) = sha_to_verify {
+                match wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log(&format!("R2: worktree HEAD SHA mismatch for PR #{pr}: {e}"));
+                        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                        wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        }
+        Err(e) => {
+            log(&format!(
+                "R2: reviewer worktree provision failed for PR #{pr}: {e}"
+            ));
+            false
+        }
+    };
     if !provision_ok {
         log(&format!(
             "R2: reviewer worktree provision failed for PR #{pr} — skipping R2"
@@ -7318,29 +7355,28 @@ async fn spawn_remediation_worker(
         .unwrap_or((String::new(), String::new(), false))
     };
 
-    // Resolve PR branch: try daemon convention first, fall back to GitHub.
-    let pr_branch = orphan_worker_branch(&task_author, task_id, task_review_only).or_else(|| {
-        log(&format!(
-            "remediation: no daemon-convention branch for task #{task_id} — trying gh"
-        ));
-        None
-    });
-    let pr_branch = if pr_branch.is_some() {
-        pr_branch
-    } else {
+    // #189: resolve PR target from GitHub. Falls back to daemon branch
+    // convention when GitHub is unavailable.
+    let pr_target = {
         let pr_val = pr;
         let repo_dir = config.repo_dir.clone();
         let gh_repo = config.repo.clone();
-        tokio::task::spawn_blocking(move || query_pr_head_ref(pr_val, &repo_dir, Some(&gh_repo)))
+        tokio::task::spawn_blocking(move || resolve_pr_target(pr_val, &repo_dir, Some(&gh_repo)))
             .await
             .ok()
             .flatten()
     };
-    let Some(pr_branch) = pr_branch else {
-        log(&format!(
-            "remediation: cannot resolve PR #{pr} head ref — cannot spawn worker"
-        ));
-        return false;
+    let fallback_branch = if pr_target.is_none() {
+        let fb = orphan_worker_branch(&task_author, task_id, task_review_only);
+        if fb.is_none() {
+            log(&format!(
+                "remediation: cannot resolve PR #{pr} target — cannot spawn worker"
+            ));
+            return false;
+        }
+        fb
+    } else {
+        None
     };
 
     let agent_name = name_pool.acquire().into_name();
@@ -7363,18 +7399,43 @@ async fn spawn_remediation_worker(
     ));
 
     let session_id = agent::new_session_id();
-    // Use the PR's branch as local branch so pushes update the existing PR.
-    let branch = pr_branch.clone();
+    let branch = pr_target
+        .as_ref()
+        .map(|t| t.head_ref.clone())
+        .or_else(|| fallback_branch.clone())
+        .unwrap();
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", agent_name, task_id));
 
-    // Provision worktree from the PR's branch (the code that needs fixing).
     let task_repo_dir = &config.repo_dir;
-    let provision_ok = wt_mgr
-        .fetch_and_provision(task_repo_dir, &branch, &wt_path, &pr_branch)
-        .await
-        .is_ok();
+    let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
+        let result = if target.is_fork {
+            wt_mgr
+                .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
+                .await
+        } else {
+            wt_mgr
+                .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
+                .await
+        };
+        (result, Some(target.head_sha.as_str()))
+    } else {
+        let result = wt_mgr
+            .fetch_and_provision(task_repo_dir, &branch, &wt_path, &branch)
+            .await;
+        (result, None)
+    };
+    let provision_ok = match provision_result {
+        Ok(_) => {
+            if let Some(expected_sha) = sha_to_verify {
+                wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok()
+            } else {
+                true
+            }
+        }
+        Err(_) => false,
+    };
     if !provision_ok {
         log(&format!(
             "remediation: worktree provision failed for PR #{pr} — giving up"
@@ -8892,5 +8953,72 @@ mod tests {
     #[test]
     fn orphan_worker_branch_review_only_with_author_returns_none() {
         assert_eq!(orphan_worker_branch("Anvil", 15, true), None);
+    }
+
+    // ── PrTarget / resolve_pr_target ─────────────────────────────────────
+
+    fn parse_pr_target_json(pr: i64, json: &str) -> Option<PrTarget> {
+        let v: serde_json::Value = serde_json::from_str(json).ok()?;
+        let head_ref = v.get("headRefName")?.as_str()?.to_string();
+        let head_sha = v.get("headRefOid")?.as_str()?.to_string();
+        let is_fork = v
+            .get("isCrossRepository")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if head_ref.is_empty() || head_sha.is_empty() {
+            return None;
+        }
+        Some(PrTarget {
+            pr,
+            head_ref,
+            head_sha,
+            is_fork,
+        })
+    }
+
+    #[test]
+    fn pr_target_same_repo() {
+        let json = r#"{"headRefName":"daemon/lever-t189","headRefOid":"abc123","isCrossRepository":false}"#;
+        let t = parse_pr_target_json(42, json).unwrap();
+        assert_eq!(t.pr, 42);
+        assert_eq!(t.head_ref, "daemon/lever-t189");
+        assert_eq!(t.head_sha, "abc123");
+        assert!(!t.is_fork);
+    }
+
+    #[test]
+    fn pr_target_fork() {
+        let json = r#"{"headRefName":"fix-bug","headRefOid":"def456","isCrossRepository":true}"#;
+        let t = parse_pr_target_json(99, json).unwrap();
+        assert!(t.is_fork);
+        assert_eq!(t.head_ref, "fix-bug");
+    }
+
+    #[test]
+    fn pr_target_missing_sha_returns_none() {
+        let json = r#"{"headRefName":"branch","headRefOid":"","isCrossRepository":false}"#;
+        assert!(parse_pr_target_json(1, json).is_none());
+    }
+
+    #[test]
+    fn pr_target_missing_ref_returns_none() {
+        let json = r#"{"headRefName":"","headRefOid":"abc123","isCrossRepository":false}"#;
+        assert!(parse_pr_target_json(1, json).is_none());
+    }
+
+    #[test]
+    fn pr_target_missing_fork_field_defaults_false() {
+        let json = r#"{"headRefName":"branch","headRefOid":"abc123"}"#;
+        let t = parse_pr_target_json(1, json).unwrap();
+        assert!(!t.is_fork);
+    }
+
+    #[test]
+    fn pr_target_revived_pr_uses_github_ref() {
+        // Simulates task #202 reviving PR #3779 whose real head is t200, not t202
+        let json = r#"{"headRefName":"daemon/alloy-hvjv-t200","headRefOid":"deadbeef","isCrossRepository":false}"#;
+        let t = parse_pr_target_json(3779, json).unwrap();
+        assert_eq!(t.head_ref, "daemon/alloy-hvjv-t200");
+        assert_eq!(t.head_sha, "deadbeef");
     }
 }
