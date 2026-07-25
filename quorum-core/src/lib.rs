@@ -2,6 +2,8 @@
 //!
 //! See `docs/2026-06-23-quorum-design.md` for the design of record.
 
+pub use rusqlite::Connection;
+
 pub mod activity;
 pub mod agent_runs;
 pub mod agents;
@@ -26,6 +28,7 @@ pub mod lifecycle;
 pub mod mailbox;
 pub mod perf;
 pub mod pinned;
+pub mod provision_attempts;
 pub mod review_audits;
 pub mod review_findings;
 pub mod review_interpret_jobs;
