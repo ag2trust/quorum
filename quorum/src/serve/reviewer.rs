@@ -242,14 +242,15 @@ const WORKING_STYLE: &str =
      reads that would bloat your context) behind a short returned conclusion, and rarely \
      more than one or two per task.";
 
-pub fn build_worker_turn(
+/// Build the raw worker prompt (no runner-specific wrapping).
+pub fn build_worker_prompt(
     agent_name: &str,
     task_id: i64,
     title: &str,
     body: &str,
     max_task_cost_usd: Option<f64>,
 ) -> String {
-    super::agent::user_turn(&format!(
+    format!(
         "You are agent {agent}. Task #{task_id}: {title}\n\n\
          {body}\n\n\
          {working_style}{budget}\n\n\
@@ -264,6 +265,23 @@ pub fn build_worker_turn(
         body = body,
         working_style = WORKING_STYLE,
         budget = budget_line(0.0, max_task_cost_usd),
+    )
+}
+
+#[cfg(test)]
+pub fn build_worker_turn(
+    agent_name: &str,
+    task_id: i64,
+    title: &str,
+    body: &str,
+    max_task_cost_usd: Option<f64>,
+) -> String {
+    super::agent::user_turn(&build_worker_prompt(
+        agent_name,
+        task_id,
+        title,
+        body,
+        max_task_cost_usd,
     ))
 }
 
@@ -311,7 +329,7 @@ pub fn build_rereview_turn(
     ))
 }
 
-pub fn build_rework_turn(
+pub fn build_rework_prompt(
     agent_name: &str,
     task_id: i64,
     pr: i64,
@@ -319,7 +337,7 @@ pub fn build_rework_turn(
     spent_usd: f64,
     max_task_cost_usd: Option<f64>,
 ) -> String {
-    super::agent::user_turn(&format!(
+    format!(
         "REVIEW FAILED — the reviewer requested changes. The reviewer's blocking findings \
          (summary below) also live on PR #{pr} as review comments — read the PR to see the \
          full context, inline anchors, and any advisory notes.\n\n\
@@ -343,6 +361,25 @@ pub fn build_rework_turn(
         pr = pr,
         task_id = task_id,
         budget = budget_line(spent_usd, max_task_cost_usd),
+    )
+}
+
+#[cfg(test)]
+pub fn build_rework_turn(
+    agent_name: &str,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+    spent_usd: f64,
+    max_task_cost_usd: Option<f64>,
+) -> String {
+    super::agent::user_turn(&build_rework_prompt(
+        agent_name,
+        task_id,
+        pr,
+        feedback,
+        spent_usd,
+        max_task_cost_usd,
     ))
 }
 

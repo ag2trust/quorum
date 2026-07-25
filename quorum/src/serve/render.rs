@@ -124,6 +124,7 @@ fn tool_snippet(name: &str, input: &serde_json::Value) -> Option<String> {
 /// Render a normalized AgentEvent for transcript.md.
 pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
     match event {
+        AgentEvent::ThreadStarted { .. } => None,
         AgentEvent::AssistantText { text } => {
             if text.is_empty() {
                 None
