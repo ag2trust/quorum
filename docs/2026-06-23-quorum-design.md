@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, coding-runner boundary 2026-07-24)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -672,6 +672,26 @@ The drain-interrupted timeout is a special case: the daemon preserves state (mai
 unconsumed, task stays `merging`) and returns `Ok(())` so restart recovery re-enters the
 merge flow. This is unchanged.
 
+#### No-CI contract (#181)
+
+When GitHub returns a valid PR payload whose `statusCheckRollup` is a structurally valid
+empty JSON array (`[]`), the repository may have no configured CI checks — or checks may
+not have registered yet after a recent push (the ag2trust #3583 transient-empty race).
+
+**Disambiguation via consecutive polls:** `parse_checks_json` returns `Option<Vec<...>>`
+for checks — `Some(vec![])` for a valid empty array, `None` for a missing field,
+non-array value, or malformed JSON. `checks_query_from_parsed` maps `Some(vec![])` →
+`NoChecksConfigured` (distinct from `AllPassed`) and `None` → `Pending`.
+`GhMergeExecutor::wait_for_checks` requires **2+ consecutive `NoChecksConfigured` polls**
+before returning `Ready`. This protects against the transient-empty-after-push race: the
+first empty poll sleeps `poll_interval_secs`, then re-queries. If checks have registered
+by the second poll, the counter resets and normal waiting continues. If still empty, the
+repo genuinely has no CI and the daemon proceeds to merge.
+
+**Required jobs override:** if `required_jobs` is configured, `validate_required_jobs`
+still gates on each named job — absent jobs from an empty rollup produce `NotReady`,
+not `AllSucceeded`. The no-CI shortcut only applies to the general checks gate.
+
 #### No new lifecycle state
 
 The task remains in `merging` throughout infrastructure-pending waits. No new status is
@@ -878,6 +898,26 @@ Each invariant below requires both a positive and a negative test. Tests marked
     Assert: mailbox row unconsumed, task stays `merging`, approval record intact.
     (Existing test `drain_timeout_honored_during_merge_checks` covers the timing;
     this test covers state preservation.)
+
+**No-CI paths (#181):**
+
+18. `parse_checks_empty_rollup_is_no_checks_configured` — `statusCheckRollup: []`
+    with `mergeStateStatus: BLOCKED`. Assert: `ChecksQueryResult::NoChecksConfigured`
+    (not `AllPassed` or `Pending`). Unit test.
+
+19. `required_jobs_absent_from_empty_rollup` — `required_jobs` configured but
+    `statusCheckRollup` is `[]`. Assert: `NotReady`, not `AllSucceeded`. Unit test.
+
+20. `parse_checks_no_rollup_field_is_pending` — `statusCheckRollup` absent from JSON.
+    Assert: `ChecksQueryResult::Pending`. Unit test.
+
+21. `parse_checks_non_array_rollup_is_pending` — `statusCheckRollup` is a string/null.
+    Assert: `ChecksQueryResult::Pending`. Unit test.
+
+22. Consecutive-polls guard — `GhMergeExecutor::wait_for_checks` requires 2+
+    consecutive `NoChecksConfigured` before returning `Ready`. Protects against
+    transient-empty-after-push (#3583). Verified by unit test structure; E2E
+    coverage deferred (requires gh-shim, see #181 PR review discussion).
 
 ### Post-merge review-analytics collector (#125)
 

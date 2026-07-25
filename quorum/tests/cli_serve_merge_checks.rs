@@ -1556,3 +1556,9 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
 
     handle.stop();
 }
+
+// NOTE: no-CI path coverage for parse_checks_json / checks_query_from_parsed
+// is in unit tests (parse_checks_empty_rollup_is_no_checks_configured,
+// parse_checks_no_rollup_field_is_pending, etc.). E2E tests use
+// CommandMergeExecutor which bypasses GhMergeExecutor::query_checks.
+// See #181 review discussion.
