@@ -765,7 +765,9 @@ VerdictChanges and the resulting status is `rework`, but no live worker exists f
 task, the daemon spawns a **remediation worker** (`spawn_remediation_worker` in
 `serve/mod.rs`). The remediation worker:
 
-- Gets the existing PR branch (resolved from GitHub via `query_pr_head_ref`)
+- Gets the existing PR branch (resolved from GitHub via `resolve_pr_target`, which returns
+  the authoritative head ref, SHA, and fork status; falls back to daemon branch convention
+  when GitHub is unavailable)
 - Gets the blocking findings / merge error as its rework prompt
 - Is bounded by the same recovery policy as other workers (idle timeout, cost cap)
 - Counts toward the rework cap (`rework_round` was already incremented by lifecycle)
@@ -788,6 +790,17 @@ to InReview (sticky) and re-spawns a reviewer on the next tick — not a silent 
 | Approval recovery on restart | `quorum/src/serve/mod.rs:959` |
 | Remediation worker spawn | `quorum/src/serve/mod.rs:6567` |
 | Drain-interrupted merge-wait | `quorum/src/serve/mod.rs:2061` |
+
+#### Review target resolution (#189)
+
+All reviewer and remediation provisioning resolves the PR's authoritative head ref, SHA,
+and fork status from GitHub via `resolve_pr_target` (`PrTarget` struct in `serve/mod.rs`).
+Worker branch conventions (`daemon/{agent}-t{task_id}`) are fetch hints only — when GitHub
+is available, the resolved ref is used instead. After worktree provisioning, HEAD is
+verified against the resolved SHA; a mismatch aborts the reviewer launch. Fork PRs are
+fetched via `refs/pull/<pr>/head` (`WorktreeManager::fetch_pr_and_provision`). When GitHub
+is unavailable, provisioning falls back to the worker branch convention without SHA
+verification.
 
 #### Acceptance tests
 

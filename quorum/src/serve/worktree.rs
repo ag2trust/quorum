@@ -196,6 +196,86 @@ impl WorktreeManager {
         Ok(wt_path)
     }
 
+    /// Fetch a PR head via `refs/pull/<pr>/head` and provision a worktree.
+    /// Works for both same-repo and fork PRs (GitHub exposes this ref
+    /// regardless of head repository).
+    pub async fn fetch_pr_and_provision(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        worktree_dir: &Path,
+        pr: i64,
+    ) -> Result<PathBuf, String> {
+        let _guard = self.lock.lock().await;
+
+        let refspec = format!("+refs/pull/{pr}/head:refs/quorum-pr/{pr}");
+        let mut fetch_cmd = self.git_cmd(repo_dir);
+        fetch_cmd.args(["fetch", "origin", &refspec]);
+        let fetch = run_git(fetch_cmd, self.fetch_timeout, "git fetch pr ref").await?;
+        if !fetch.status.success() {
+            return Err(format!(
+                "git fetch origin {refspec} failed: {}",
+                String::from_utf8_lossy(&fetch.stderr)
+            ));
+        }
+
+        let base_ref = format!("refs/quorum-pr/{pr}");
+        let wt_path = worktree_dir.to_path_buf();
+
+        if self.branch_exists_unlocked(repo_dir, branch).await {
+            if let Some(existing_wt) = self
+                .find_worktree_for_branch_unlocked(repo_dir, branch)
+                .await
+            {
+                return Err(format!(
+                    "branch collision: '{branch}' already checked out in worktree '{existing_wt}'"
+                ));
+            }
+            let mut del_cmd = self.git_cmd(repo_dir);
+            del_cmd.args(["branch", "-D", branch]);
+            let _ = run_git(del_cmd, self.local_timeout, "git branch -D (stale)").await;
+        }
+
+        let mut add_cmd = self.git_cmd(repo_dir);
+        add_cmd.args(["worktree", "add", "-b", branch]);
+        add_cmd.arg(&wt_path).arg(&base_ref);
+        let add = run_git(add_cmd, self.local_timeout, "git worktree add").await?;
+        if !add.status.success() {
+            return Err(format!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&add.stderr)
+            ));
+        }
+
+        Ok(wt_path)
+    }
+
+    /// Verify that a worktree HEAD matches an expected SHA. Does not take the
+    /// serialization lock — this is a read-only check on the worktree dir.
+    pub async fn verify_head_sha(
+        &self,
+        worktree_dir: &Path,
+        expected_sha: &str,
+    ) -> Result<(), String> {
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.arg("-C").arg(worktree_dir).args(["rev-parse", "HEAD"]);
+        let out = run_git(cmd, self.local_timeout, "git rev-parse HEAD").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git rev-parse HEAD failed in {}: {}",
+                worktree_dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if actual != expected_sha {
+            return Err(format!(
+                "worktree HEAD SHA mismatch: expected {expected_sha}, got {actual}"
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn gc_orphaned(
         &self,
         repo_dir: &Path,
@@ -806,5 +886,101 @@ mod tests {
             "orphan should be cleaned up via fs fallback"
         );
         assert!(!orphan.exists());
+    }
+
+    #[tokio::test]
+    async fn verify_head_sha_matches() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("verify-wt");
+
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo_dir.path(), "verify-branch", &wt_path, "main")
+            .await
+            .unwrap();
+
+        let expected_sha = git_rev_parse(&wt_path, "HEAD");
+        assert!(mgr.verify_head_sha(&wt_path, &expected_sha).await.is_ok());
+
+        mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn verify_head_sha_mismatch_fails() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("mismatch-wt");
+
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo_dir.path(), "mismatch-branch", &wt_path, "main")
+            .await
+            .unwrap();
+
+        let result = mgr
+            .verify_head_sha(&wt_path, "0000000000000000000000000000000000000000")
+            .await;
+        assert!(result.is_err(), "must fail on SHA mismatch");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mismatch"),
+            "error should mention mismatch: {err}"
+        );
+
+        mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_and_provision_same_repo() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let d = repo_dir.path().to_string_lossy().to_string();
+
+        StdCommand::new("git")
+            .args(["-C", &d, "remote", "add", "origin", &d])
+            .status()
+            .unwrap();
+
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "feature/pr-42"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "pr commit"])
+            .status()
+            .unwrap();
+        let feature_head = git_rev_parse(repo_dir.path(), "feature/pr-42");
+
+        // Simulate GitHub's refs/pull/<pr>/head by creating the ref manually
+        StdCommand::new("git")
+            .args(["-C", &d, "update-ref", "refs/pull/42/head", &feature_head])
+            .status()
+            .unwrap();
+
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt_path = wt_dir.path().join("pr-review-wt");
+
+        let mgr = WorktreeManager::new();
+        let result = mgr
+            .fetch_pr_and_provision(repo_dir.path(), "review/pr-42-test", &wt_path, 42)
+            .await;
+        assert!(
+            result.is_ok(),
+            "fetch_pr_and_provision failed: {:?}",
+            result.err()
+        );
+
+        let wt_head = git_rev_parse(&wt_path, "HEAD");
+        assert_eq!(wt_head, feature_head, "worktree must be at PR head");
+
+        mgr.remove(repo_dir.path(), &wt_path).await.ok();
     }
 }
