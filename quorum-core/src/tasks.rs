@@ -798,7 +798,7 @@ fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
         return Ok(None);
     };
     let mut value: serde_json::Value = serde_json::from_str(refs)
-        .map_err(|error| QuorumError::Usage(format!("invalid refs JSON: {error}")))?;
+        .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
     if let Some(object) = value.as_object_mut() {
         for key in [
             "codex_retry_requested",
@@ -4122,5 +4122,12 @@ mod tests {
         assert!(retry_provider_blocked(&mut conn, id, "operator", 14)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn malformed_persisted_retry_refs_are_internal_error() {
+        let error = clear_codex_retry_refs(Some("{")).unwrap_err();
+        assert_eq!(error.exit_code(), 3);
+        assert!(error.to_string().contains("invalid persisted refs JSON"));
     }
 }
