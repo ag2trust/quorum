@@ -127,19 +127,23 @@ pub(crate) async fn recover(
             continue;
         }
 
-        // Dual-review gate: both R1 and R2 must be approved for the same head.
-        let dual_ok = {
+        // #191: use the shared next_needed_role predicate (#190) instead of
+        // hard-coded dual_approved(). Any role not approved for the current SHA
+        // defers to normal review (generic recovery resets to in-review and the
+        // tick loop provisions the first missing role).
+        let next_role = {
             let p = db_path.to_path_buf();
+            let sha = current_head.clone();
             run_blocking(move || {
                 let conn = quorum_core::db::open(&p)?;
-                approvals::dual_approved(&conn, pr)
+                super::next_needed_role(&conn, pr, &sha)
             })
             .await?
         };
-        if dual_ok.is_none() {
+        if let Some(role) = next_role {
             log(&format!(
-                "approval-recovery: PR #{pr} (task #{}) — dual approval incomplete, \
-                 deferring to normal review",
+                "approval-recovery: PR #{pr} (task #{}) — {role} not approved \
+                 for current SHA, deferring to normal review",
                 appr.task_id
             ));
             outcome.deferred += 1;
@@ -772,5 +776,94 @@ mod tests {
         let conn = db::open(&db_path).unwrap();
         assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
         assert!(approvals::get_for_pr(&conn, 208).unwrap().is_empty());
+    }
+
+    /// #191 regression: R1-only approval with matching SHA is deferred (not
+    /// merged, not demoted) — R2 is still missing. The approval is preserved
+    /// so generic recovery can act on it.
+    #[tokio::test]
+    async fn r1_only_matching_sha_is_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "impl", "Bellows-d11");
+        seed_journal(&mut conn, "Bellows-d11", tid, 208);
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r1".into(),
+                task_id: tid,
+                author: "Bellows-d11".into(),
+                reviewer: "Grommet-d14".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "2c0c833".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.merged, 0, "R1-only must not merge");
+        assert_eq!(outcome.demoted, 0, "R1 matches SHA, not demoted");
+        assert_eq!(outcome.deferred, 1, "incomplete review deferred");
+        let conn = db::open(&db_path).unwrap();
+        assert_ne!(tasks::get(&conn, tid).unwrap().unwrap().status, "done");
+        // R1 approval preserved for tick-loop R2 provisioning.
+        assert!(approvals::get(&conn, 208, "r1").unwrap().is_some());
+    }
+
+    /// #191: mixed-SHA approvals (R1 for one SHA, R2 for another) cannot
+    /// authorize merge — both are demoted/deferred.
+    #[tokio::test]
+    async fn mixed_sha_approvals_cannot_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let tid = seed_task(&mut conn, "impl", "Bellows-d11");
+        seed_journal(&mut conn, "Bellows-d11", tid, 208);
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r1".into(),
+                task_id: tid,
+                author: "Bellows-d11".into(),
+                reviewer: "Grommet-d14".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "sha_old".into(),
+            },
+        )
+        .unwrap();
+        approvals::record(
+            &mut conn,
+            &approvals::Approval {
+                pr_number: 208,
+                review_role: "r2".into(),
+                task_id: tid,
+                author: "Bellows-d11".into(),
+                reviewer: "Anvil-d22".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "sha_new".into(),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        // Current head matches R2 but not R1 → R1 is stale → demoted.
+        let exec = exec_arc(MockExec::new(HashMap::from([(208, "sha_new".to_string())])));
+        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, 10, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.merged, 0, "mixed-SHA must not merge");
+        assert_eq!(outcome.demoted, 1, "stale R1 demoted");
     }
 }
