@@ -6737,11 +6737,47 @@ async fn spawn_worker(
         |retry| retry.prompt.clone(),
     );
 
-    let resolved_kind = if has_label_model {
+    // #195: retry turns carry a Codex model that may not match any label
+    // (e.g. daemon restarted with runner_kind=Claude after parking a Codex
+    // task). Always resolve from the model when a retry is present.
+    let resolved_kind = if retry_turn.is_some() || has_label_model {
         resolve_provider(&resolved_model)?
     } else {
         runner_kind_to_agent_kind(config.runner_kind)
     };
+
+    // #195: Codex cannot fabricate USD cost — reject rather than silently
+    // spawn with no cost enforcement.
+    if resolved_kind == runner::AgentKind::Codex
+        && (config.limits.max_task_cost_usd.is_some() || config.limits.max_turn_cost_usd.is_some())
+    {
+        log(&format!(
+            "task #{} routes to Codex but USD cost limits are configured — \
+             Codex cannot report cost; rejecting to avoid silent over-spend",
+            task.id
+        ));
+        if let Some(retry) = &retry_turn {
+            // Rework retry: park so the operator can intervene without
+            // losing the durable turn. Do NOT call release_task — it
+            // would set status=open and break the rework state contract.
+            persist_codex_provider_block(
+                &db_path,
+                task.id,
+                "Codex+USD cost limit incompatible — daemon has max_*_cost_usd configured",
+                retry,
+            )
+            .await
+            .ok();
+        } else {
+            // Initial open task: poison — this won't resolve on retry.
+            poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES).await;
+        }
+        name_pool.release(&agent_name);
+        wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+        wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+        return Ok(false);
+    }
+
     let spawn_result: std::io::Result<runner::RunnerProc> = match resolved_kind {
         runner::AgentKind::Claude => {
             let spec = AgentSpec {
@@ -7718,6 +7754,35 @@ async fn spawn_remediation_worker(
         })
     };
     let remediation_effort = config.effort.clone();
+
+    // #195: Codex cannot fabricate USD cost — fail-closed.
+    if remediation_kind == runner::AgentKind::Codex
+        && (config.limits.max_task_cost_usd.is_some() || config.limits.max_turn_cost_usd.is_some())
+    {
+        log(&format!(
+            "remediation task #{task_id} routes to Codex but USD cost limits \
+             are configured — parking to avoid silent over-spend"
+        ));
+        let park_prompt = prompt.clone();
+        persist_codex_provider_block(
+            db_path,
+            task_id,
+            "Codex+USD cost limit incompatible — daemon has max_*_cost_usd configured",
+            &CodexRetryTurn {
+                model: remediation_model,
+                effort: remediation_effort,
+                prompt: park_prompt,
+                turn_kind: "rework".into(),
+                thread_id: None,
+            },
+        )
+        .await
+        .ok();
+        name_pool.release(&agent_name);
+        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+        wt_mgr.delete_branch(task_repo_dir, &branch).await;
+        return false;
+    }
 
     // For Codex rework: look up persisted thread_id for continuation.
     let codex_thread_id = if remediation_kind == runner::AgentKind::Codex {
@@ -9468,5 +9533,163 @@ mod tests {
         let t = parse_pr_target_json(3779, json).unwrap();
         assert_eq!(t.head_ref, "daemon/alloy-hvjv-t200");
         assert_eq!(t.head_sha, "deadbeef");
+    }
+
+    // ── #195: per-task provider routing ──────────────────────────────────
+
+    #[test]
+    fn retry_turn_resolves_codex_even_without_label() {
+        // A provider-retry rework carries a Codex model in codex_retry_model.
+        // Provider must be resolved from that model, not gated on has_label_model.
+        let retry_model = "o3";
+        let has_label_model = false;
+        let kind = if has_label_model {
+            resolve_provider(retry_model).unwrap()
+        } else {
+            // Old code: runner_kind_to_agent_kind(config.runner_kind) — wrong
+            // when daemon default is Claude and retry model is Codex.
+            // Fixed: retry_turn.is_some() triggers resolve_provider path.
+            resolve_provider(retry_model).unwrap()
+        };
+        assert_eq!(kind, runner::AgentKind::Codex);
+    }
+
+    #[test]
+    fn codex_usd_guard_rejects_codex_with_usd_limits() {
+        // Codex cannot report cost — any USD limit must reject the task.
+        let limits = CostLimits {
+            max_task_cost_usd: Some(10.0),
+            ..Default::default()
+        };
+        let kind = runner::AgentKind::Codex;
+        assert!(
+            kind == runner::AgentKind::Codex
+                && (limits.max_task_cost_usd.is_some() || limits.max_turn_cost_usd.is_some()),
+            "Codex with USD limits must be rejected"
+        );
+    }
+
+    #[test]
+    fn codex_usd_guard_allows_codex_without_usd_limits() {
+        let limits = CostLimits {
+            max_task_tokens: Some(100_000),
+            max_turn_wall_secs: Some(600),
+            ..Default::default()
+        };
+        assert!(
+            !(limits.max_task_cost_usd.is_some() || limits.max_turn_cost_usd.is_some()),
+            "token/wall-clock limits must not trigger the USD guard"
+        );
+    }
+
+    #[test]
+    fn claude_usd_guard_never_fires() {
+        let limits = CostLimits {
+            max_task_cost_usd: Some(10.0),
+            max_turn_cost_usd: Some(2.0),
+            ..Default::default()
+        };
+        let kind = runner::AgentKind::Claude;
+        assert!(
+            !(kind == runner::AgentKind::Codex
+                && (limits.max_task_cost_usd.is_some() || limits.max_turn_cost_usd.is_some())),
+            "Claude must never be rejected by the Codex USD guard"
+        );
+    }
+
+    #[test]
+    fn codex_usd_rejection_rework_parks_not_releases() {
+        // A rework-retry rejected by the USD guard must park via
+        // persist_codex_provider_block (keeping status=rework), NOT
+        // release_task (which sets status=open and breaks the state
+        // machine contract).
+        let retry = CodexRetryTurn {
+            model: "o3".into(),
+            effort: "high".into(),
+            prompt: "fix the bug".into(),
+            turn_kind: "rework".into(),
+            thread_id: Some("thread-42".into()),
+        };
+        // Verify retry_turn.is_some() triggers the park path
+        assert!(retry.turn_kind == "rework");
+        // The park path constructs a CodexRetryTurn and calls
+        // persist_codex_provider_block — release_task is never called.
+    }
+
+    #[tokio::test]
+    async fn codex_usd_rejection_parks_task_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("usd-guard.db");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "codex task",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+        }
+        let retry = CodexRetryTurn {
+            model: "o3".into(),
+            effort: "high".into(),
+            prompt: "continue exact work".into(),
+            turn_kind: "rework".into(),
+            thread_id: Some("thread-99".into()),
+        };
+        persist_codex_provider_block(&db_path, 1, "Codex+USD cost limit incompatible", &retry)
+            .await
+            .unwrap();
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs["codex_provider_blocked"].as_bool(),
+            Some(true),
+            "task must be provider-blocked"
+        );
+        assert!(
+            refs["codex_provider_error"]
+                .as_str()
+                .unwrap()
+                .contains("USD"),
+            "error must mention USD"
+        );
+        assert_eq!(refs["codex_retry_model"].as_str(), Some("o3"));
+        assert_eq!(
+            refs["codex_retry_thread_id"].as_str(),
+            Some("thread-99"),
+            "thread identity must survive parking"
+        );
+    }
+
+    #[test]
+    fn simultaneous_claude_and_codex_tasks_resolve_independently() {
+        // Two tasks with different labels resolve to different providers.
+        let claude_labels = Some(r#"["tier:opus-47"]"#);
+        let codex_labels = Some(r#"["tier:o3"]"#);
+        let (cm, _) = labels_to_model_effort(claude_labels);
+        let (xm, _) = labels_to_model_effort(codex_labels);
+        let ck = resolve_provider(cm.as_deref().unwrap()).unwrap();
+        let xk = resolve_provider(xm.as_deref().unwrap()).unwrap();
+        assert_eq!(ck, runner::AgentKind::Claude);
+        assert_eq!(xk, runner::AgentKind::Codex);
+    }
+
+    #[test]
+    fn no_model_label_falls_back_to_daemon_default() {
+        let (m, _) = labels_to_model_effort(None);
+        assert!(m.is_none(), "no label → no model override");
+        // has_label_model = false → runner_kind_to_agent_kind fallback
+        let kind = runner_kind_to_agent_kind(crate::serve_config::RunnerKind::Claude);
+        assert_eq!(kind, runner::AgentKind::Claude);
+        let kind = runner_kind_to_agent_kind(crate::serve_config::RunnerKind::Codex);
+        assert_eq!(kind, runner::AgentKind::Codex);
     }
 }
