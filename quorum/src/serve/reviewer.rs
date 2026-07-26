@@ -110,6 +110,7 @@ pub fn reviewer_branch(pr: i64, reviewer_name: &str) -> String {
 /// for Codex it is passed as a CLI argument.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_reviewer(
+    kind: AgentKind,
     model: &str,
     effort: &str,
     session_id: &str,
@@ -121,7 +122,7 @@ pub fn spawn_reviewer(
     codex_sandbox: &str,
     prompt: &str,
 ) -> std::io::Result<RunnerProc> {
-    match AgentKind::for_model(model) {
+    match kind {
         AgentKind::Claude => {
             let agent_spec = AgentSpec {
                 kind: AgentKind::Claude,
