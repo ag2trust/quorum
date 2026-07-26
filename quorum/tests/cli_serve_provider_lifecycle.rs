@@ -129,6 +129,15 @@ struct Case {
 
 impl Case {
     fn start(default_provider: &str, model: &str, labels: Option<&str>) -> Self {
+        Self::start_with_role_config(default_provider, model, labels, None)
+    }
+
+    fn start_with_role_config(
+        default_provider: &str,
+        model: &str,
+        labels: Option<&str>,
+        role_config: Option<&str>,
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let worktrees = tempfile::tempdir().unwrap();
@@ -137,6 +146,11 @@ impl Case {
         let runner = write_dual_protocol_runner(home.path());
         let runner_log = home.path().join("runner.log");
         std::fs::write(&runner_log, "").unwrap();
+        let config_path = role_config.map(|contents| {
+            let path = home.path().join("serve.toml");
+            std::fs::write(&path, contents).unwrap();
+            path
+        });
 
         assert!(Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home.path())
@@ -164,7 +178,18 @@ impl Case {
         assert!(create.status().unwrap().success());
 
         let sentinel = tempfile::tempdir().unwrap();
-        let mut child = Command::new(cargo_bin("quorum"))
+        let cli_provider = if role_config.is_some() {
+            "codex"
+        } else {
+            default_provider
+        };
+        let cli_model = if role_config.is_some() {
+            "gpt-5.6-terra"
+        } else {
+            model
+        };
+        let mut serve = Command::new(cargo_bin("quorum"));
+        serve
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &runner_log)
@@ -181,9 +206,9 @@ impl Case {
                 "--names-file",
                 &names.to_string_lossy(),
                 "--agent",
-                default_provider,
+                cli_provider,
                 "--model",
-                model,
+                cli_model,
                 "--agent-bin",
                 &runner.to_string_lossy(),
                 "--merge-cmd",
@@ -196,7 +221,11 @@ impl Case {
                 "1",
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
-            ])
+            ]);
+        if let Some(path) = config_path {
+            serve.args(["--config", &path.to_string_lossy()]);
+        }
+        let mut child = serve
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
             .spawn()
@@ -371,6 +400,77 @@ fn run_routes(runs: &[quorum_core::agent_runs::AgentRun]) -> Vec<(&str, Option<&
             )
         })
         .collect()
+}
+
+fn run_routes_with_effort(
+    runs: &[quorum_core::agent_runs::AgentRun],
+) -> Vec<(&str, Option<&str>, &str, &str, &str)> {
+    runs.iter()
+        .filter(|run| run.role == "worker" || run.role == "reviewer")
+        .map(|run| {
+            (
+                run.role.as_str(),
+                run.sub_role.as_deref(),
+                run.model.as_str(),
+                run.effort.as_str(),
+                run.provider.as_deref().unwrap(),
+            )
+        })
+        .collect()
+}
+
+const CHATGPT_ONLY_ROLE_CONFIG: &str = r#"
+provider = "codex"
+worker_model = "gpt-5.6-terra"
+worker_effort = "medium"
+review_model = "gpt-5.6-terra"
+review_effort = "high"
+classifier_model = "gpt-5.6-terra"
+classifier_effort = "medium"
+"#;
+
+#[test]
+fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
+    let runs = Case::start_with_role_config(
+        "claude",
+        "claude-opus-4-6",
+        None,
+        Some(CHATGPT_ONLY_ROLE_CONFIG),
+    )
+    .finish();
+
+    assert_eq!(
+        run_routes_with_effort(&runs),
+        [
+            ("worker", None, "gpt-5.6-terra", "medium", "codex"),
+            ("reviewer", None, "gpt-5.6-terra", "high", "codex"),
+            ("reviewer", Some("r2"), "gpt-5.6-terra", "high", "codex"),
+        ],
+        "role-specific configuration must override legacy global Claude defaults"
+    );
+}
+
+#[test]
+fn configurable_chatgpt_only_rejects_claude_task_tier_without_spawning() {
+    let mut case = Case::start_with_role_config(
+        "claude",
+        "claude-opus-4-6",
+        Some(r#"["tier:opus-46"]"#),
+        Some(CHATGPT_ONLY_ROLE_CONFIG),
+    );
+
+    case.handle.wait_for("rejected in provider 'codex' mode");
+    let runs = quorum_core::agent_runs::runs_for_task(&case.db(), 1).unwrap();
+    assert!(
+        runs.is_empty(),
+        "a disallowed Claude tier must be rejected before any agent run is persisted: {runs:?}"
+    );
+    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
+    assert_ne!(
+        task.status, "working",
+        "a rejected task must not remain claimed without a worker"
+    );
+    case.handle.stop_mut();
 }
 
 #[test]

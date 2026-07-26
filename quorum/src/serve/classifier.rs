@@ -1,17 +1,23 @@
 //! Daemon classifier phase — spawns a headless agent to batch-classify tasks.
 
 use super::agent::{AgentProc, AgentSpec};
-use super::stream;
+use super::codex_agent::{CodexProc, CodexSpec};
+use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use quorum_core::classify::{self, ClassifierResponse, TaskClassification, TaskForClassification};
 use std::path::Path;
 
 pub const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const CLASSIFIER_EFFORT: &str = "low";
 
+pub fn classifier_kind(model: &str) -> std::io::Result<AgentKind> {
+    AgentKind::for_model(model)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
 /// In-flight classifier state, persisted across daemon ticks.
 #[allow(dead_code)]
 pub struct ClassifierSlot {
-    pub proc: AgentProc,
+    pub proc: RunnerProc,
     pub pending_task_ids: Vec<i64>,
     pub response_text: String,
 }
@@ -22,10 +28,14 @@ pub struct ClassifierSlot {
 /// classifier turn fails "Not logged in · Please run /login" and the daemon
 /// respawn-loops (observed live 2026-07-10, right after the session-id fix).
 pub fn classifier_spec(repo_dir: &Path, bare: bool) -> AgentSpec {
+    classifier_spec_for(repo_dir, bare, CLASSIFIER_MODEL, CLASSIFIER_EFFORT)
+}
+
+pub fn classifier_spec_for(repo_dir: &Path, bare: bool, model: &str, effort: &str) -> AgentSpec {
     AgentSpec {
-        kind: super::runner::AgentKind::Claude,
-        model: CLASSIFIER_MODEL.to_string(),
-        effort: CLASSIFIER_EFFORT.to_string(),
+        kind: AgentKind::Claude,
+        model: model.to_string(),
+        effort: effort.to_string(),
         session_id: super::agent::new_session_id(),
         worktree: repo_dir.to_path_buf(),
         bare,
@@ -34,20 +44,39 @@ pub fn classifier_spec(repo_dir: &Path, bare: bool) -> AgentSpec {
     }
 }
 
-/// Spawn a headless classifier agent for a batch of tasks.
-pub fn spawn_classifier(
+/// Spawn using the provider resolved from `model`. Provider resolution is
+/// authoritative: an unknown model is rejected and a failed spawn is returned
+/// directly; neither condition falls back to the other runner.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_classifier_configured(
     tasks: &[TaskForClassification],
-    _dup_context: &[TaskForClassification],
+    dup_context: &[TaskForClassification],
     repo_dir: &Path,
     agent_bin: Option<&str>,
     bare: bool,
+    model: &str,
+    effort: &str,
+    codex_sandbox: &str,
 ) -> std::io::Result<ClassifierSlot> {
-    let pending_task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
-
-    let spec = classifier_spec(repo_dir, bare);
-
-    let proc = AgentProc::spawn(&spec, agent_bin)?;
-
+    let kind = classifier_kind(model)?;
+    let pending_task_ids = tasks.iter().map(|t| t.id).collect();
+    let proc = match kind {
+        AgentKind::Claude => {
+            let spec = classifier_spec_for(repo_dir, bare, model, effort);
+            AgentProc::spawn(&spec, agent_bin).map(RunnerProc::Claude)?
+        }
+        AgentKind::Codex => {
+            let spec = CodexSpec {
+                model: model.to_string(),
+                effort: effort.to_string(),
+                sandbox: codex_sandbox.to_string(),
+                worktree: repo_dir.to_path_buf(),
+                prompt: classify::build_prompt(tasks, dup_context),
+                env_vars: vec![],
+            };
+            CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)?
+        }
+    };
     Ok(ClassifierSlot {
         proc,
         pending_task_ids,
@@ -67,15 +96,16 @@ pub fn classifier_turn(
 /// Drain events from the classifier agent (non-blocking, bounded).
 /// Returns `Some(response_text)` when the agent produces a Result event.
 pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<ClassifierResult> {
-    while let Ok(Some(event)) =
-        tokio::time::timeout(std::time::Duration::from_secs(2), slot.proc.next_event()).await
+    while let Ok(Some(raw)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), slot.proc.next_raw_line()).await
     {
-        match &event {
-            stream::Event::Result {
+        if slot.proc.kind() == AgentKind::Claude {
+            if let Some(super::stream::Event::Result {
                 result, is_error, ..
-            } => {
+            }) = super::stream::parse_line(&raw)
+            {
+                let text = super::stream::result_text(&result);
                 if is_error.unwrap_or(false) {
-                    let text = stream::result_text(result);
                     let detail = if text.is_empty() {
                         "classifier agent returned an error".into()
                     } else {
@@ -83,22 +113,34 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                     };
                     return Some(ClassifierResult::Error(detail));
                 }
-                let text = stream::result_text(result);
                 if !text.is_empty() {
                     slot.response_text = text;
                 }
                 return Some(ClassifierResult::Done(slot.response_text.clone()));
             }
-            stream::Event::Assistant { message } => {
-                // #127: real stream-json content is a typed block array — the
-                // prior `.as_str()`-only branch dropped every non-string
-                // content shape, leaving the classifier response empty and
-                // the daemon respawn-looping. Shared helper handles both.
-                if let Some(text) = stream::assistant_text(message) {
+        }
+        let events = match slot.proc.kind() {
+            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
+            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
+        };
+        for event in events {
+            match event {
+                AgentEvent::TurnFailed { message, .. } => {
+                    let detail = if message.is_empty() {
+                        "classifier agent returned an error".into()
+                    } else {
+                        format!("classifier agent error: {}", truncate_error(&message, 300))
+                    };
+                    return Some(ClassifierResult::Error(detail));
+                }
+                AgentEvent::TurnCompleted { .. } => {
+                    return Some(ClassifierResult::Done(slot.response_text.clone()));
+                }
+                AgentEvent::AssistantText { text } => {
                     slot.response_text.push_str(&text);
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     None
@@ -169,6 +211,72 @@ mod tests {
     fn classifier_spec_threads_bare_flag() {
         assert!(!classifier_spec(Path::new("."), false).bare);
         assert!(classifier_spec(Path::new("."), true).bare);
+    }
+
+    #[test]
+    fn configured_spec_preserves_model_and_effort() {
+        let spec = classifier_spec_for(Path::new("."), false, "claude-test", "medium");
+        assert_eq!(spec.kind, AgentKind::Claude);
+        assert_eq!(spec.model, "claude-test");
+        assert_eq!(spec.effort, "medium");
+    }
+
+    #[test]
+    fn configured_provider_is_resolved_from_model_without_fallback() {
+        assert_eq!(classifier_kind("gpt-5.6-terra").unwrap(), AgentKind::Codex);
+        assert_eq!(
+            classifier_kind("claude-haiku-4-5-20251001").unwrap(),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            classifier_kind("unknown").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_codex_classifier_invokes_exact_model_and_effort() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let args_log = temp.path().join("args.log");
+        let runner = temp.path().join("codex");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n\
+                 printf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"classifier-thread\"}}'\n\
+                 printf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+                args_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tasks = vec![TaskForClassification {
+            id: 7,
+            title: "classify me".into(),
+            body: None,
+        }];
+        let mut slot = spawn_classifier_configured(
+            &tasks,
+            &[],
+            temp.path(),
+            runner.to_str(),
+            false,
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        )
+        .unwrap();
+        while slot.proc.next_raw_line().await.is_some() {}
+        slot.proc.kill_and_reap().await;
+
+        let args = std::fs::read_to_string(args_log).unwrap();
+        assert!(args.contains("exec --json"), "{args}");
+        assert!(args.contains("--model gpt-5.6-terra"), "{args}");
+        assert!(args.contains("-c model_reasoning_effort=medium"), "{args}");
     }
 
     #[test]

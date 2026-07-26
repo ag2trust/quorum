@@ -31,6 +31,13 @@ const DEFAULT_SERVE_TOML: &str = "\
 # worktree_base = \"/path/to/worktrees\"
 
 ## Worker / model
+# provider = \"codex\"       # optional ChatGPT-only mode; legacy default remains Claude
+# worker_model = \"gpt-5.6-terra\"
+# worker_effort = \"medium\"
+# review_model = \"gpt-5.6-terra\"
+# review_effort = \"high\"
+# classifier_model = \"gpt-5.6-terra\"
+# classifier_effort = \"medium\"
 # agent = \"claude\"        # runner: \"claude\" or \"codex\"
 # cap = 4
 # model = \"sonnet\"
@@ -1133,7 +1140,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
             // R2 sampling config ignored — R2 is mandatory (#159).
 
-            let r_suggested_models = file_cfg.suggested_models.unwrap_or_default();
+            let r_suggested_models = file_cfg.suggested_models.clone().unwrap_or_default();
             for (k, v) in &r_suggested_models {
                 let valid_key = matches!(k.as_str(), "1" | "2" | "3" | "4" | "5");
                 let valid_val = v.split_once('/').is_some_and(|(tier, effort)| {
@@ -1154,9 +1161,25 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.min_effort.as_deref(),
             )?;
 
-            // Resolve runner kind (flag > file > default=claude).
-            let runner_kind =
-                RunnerKind::from_str_opt(agent.as_deref().or(file_cfg.agent.as_deref()))?;
+            let roles =
+                resolve_roles(&file_cfg, agent.as_deref(), &r_model.value, &r_effort.value)?;
+            let runner_kind = roles.provider;
+            let r_model = Sourced {
+                value: roles.worker_model.clone(),
+                source: if file_cfg.worker_model.is_some() {
+                    Source::File
+                } else {
+                    r_model.source
+                },
+            };
+            let r_effort = Sourced {
+                value: roles.worker_effort.clone(),
+                source: if file_cfg.worker_effort.is_some() {
+                    Source::File
+                } else {
+                    r_effort.source
+                },
+            };
             validate_codex_limits(runner_kind, r_max_turn_cost.value, r_max_task_cost.value)?;
             let codex_sandbox = file_cfg
                 .codex
@@ -1175,6 +1198,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 cap: &r_cap,
                 model: &r_model,
                 effort: &r_effort,
+                review_model: &roles.review_model,
+                review_effort: &roles.review_effort,
+                classifier_model: &roles.classifier_model,
+                classifier_effort: &roles.classifier_effort,
                 log_dir: &r_log_dir,
                 no_bare_agent: &r_no_bare,
                 self_update_drain: &r_self_update,
@@ -1244,6 +1271,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 codex_sandbox,
                 model: r_model.value,
                 effort: r_effort.value,
+                provider_explicit: roles.provider_explicit,
+                review_model: roles.review_model,
+                review_effort: roles.review_effort,
+                classifier_model: roles.classifier_model,
+                classifier_effort: roles.classifier_effort,
                 merge_executor,
                 bare_agent: !r_no_bare.value,
                 limits: serve::CostLimits {

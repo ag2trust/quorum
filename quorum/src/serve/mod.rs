@@ -243,6 +243,11 @@ fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
         config.repo_dir.clone(),
         config.agent_bin.clone(),
         config.bare_agent,
+    )
+    .with_classifier(
+        config.classifier_model.clone(),
+        config.classifier_effort.clone(),
+        config.codex_sandbox.clone(),
     );
     collector::spawn_detached(request);
 }
@@ -675,6 +680,11 @@ pub struct ServeConfig {
     pub agent_bin: Option<String>,
     pub model: String,
     pub effort: String,
+    pub provider_explicit: bool,
+    pub review_model: String,
+    pub review_effort: String,
+    pub classifier_model: String,
+    pub classifier_effort: String,
     pub merge_executor: Arc<dyn merge::MergeExecutor>,
     /// Pass `--bare` to spawned agents, stripping operator-local hooks,
     /// plugins, memory, and MCP config. Default: false (inherit operator login).
@@ -5277,15 +5287,21 @@ async fn tick(
         if let Ok((tasks, dup_context)) = unclassified {
             if !tasks.is_empty() {
                 let turn = classifier::classifier_turn(&tasks, &dup_context);
-                match classifier::spawn_classifier(
+                match classifier::spawn_classifier_configured(
                     &tasks,
                     &dup_context,
                     &config.repo_dir,
                     config.agent_bin.as_deref(),
                     config.bare_agent,
+                    &config.classifier_model,
+                    &config.classifier_effort,
+                    &config.codex_sandbox,
                 ) {
                     Ok(mut slot) => {
-                        if let Err(e) = slot.proc.feed_turn(&turn).await {
+                        if slot.proc.is_codex() {
+                            log(&format!("classifier: spawned for {} task(s)", tasks.len()));
+                            *classifier_slot = Some(slot);
+                        } else if let Err(e) = slot.proc.feed_turn(&turn).await {
                             log(&format!("classifier: feed_turn failed: {e}"));
                         } else {
                             log(&format!("classifier: spawned for {} task(s)", tasks.len()));
@@ -5404,6 +5420,11 @@ async fn tick(
                 config.repo_dir.clone(),
                 config.agent_bin.clone(),
                 config.bare_agent,
+            )
+            .with_classifier(
+                config.classifier_model.clone(),
+                config.classifier_effort.clone(),
+                config.codex_sandbox.clone(),
             );
             collector::spawn_detached(request);
         }
@@ -6313,7 +6334,9 @@ async fn provision_reviewer(
                 recovery.thread_id.clone(),
             )
         } else {
-            let reviewer_model = {
+            let reviewer_model = if config.provider_explicit {
+                config.review_model.clone()
+            } else {
                 let p = config.db_path.clone();
                 let tid = worker.task_id;
                 let cfg_model = config.model.clone();
@@ -6327,7 +6350,12 @@ async fn provision_reviewer(
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
             };
             let kind = resolve_provider(&reviewer_model)?;
-            (reviewer_model, config.effort.clone(), kind, None)
+            let effort = if config.provider_explicit {
+                config.review_effort.clone()
+            } else {
+                config.effort.clone()
+            };
+            (reviewer_model, effort, kind, None)
         };
     log(&format!(
         "reviewer model escalated to {reviewer_model} for task {}",
@@ -6994,6 +7022,39 @@ async fn spawn_worker(
         .as_ref()
         .map(|retry| (retry.model.clone(), retry.effort.clone()))
         .unwrap_or((floored_model, floored_effort));
+
+    if config.provider_explicit {
+        let expected = match config.runner_kind {
+            crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
+            crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+        };
+        let actual = resolve_worker_provider(&resolved_model)?;
+        if actual != expected {
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                    let _ = journal::delete(&mut conn, &name);
+                }
+            })
+            .await
+            .ok();
+            let strikes = poison_tracker.record_strike(task.id);
+            if strikes >= MAX_POISON_STRIKES {
+                poison_task(&db_path, &agent_name, task.id, strikes).await;
+            } else {
+                release_task(&db_path, &agent_name, task.id).await;
+            }
+            name_pool.release(&agent_name);
+            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+            log(&format!(
+                "task #{} model '{}' resolved to {actual} and was rejected in provider '{}' mode",
+                task.id, resolved_model, expected
+            ));
+            return Ok(false);
+        }
+    }
 
     // #130: issue run capability for this worker (before spawn so env var is available).
     // A silent issue failure would leave the worker holding a QUORUM_RUN_ID pointing at

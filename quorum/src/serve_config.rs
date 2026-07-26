@@ -41,6 +41,9 @@ impl RunnerKind {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServeFileConfig {
+    /// Optional provider-wide runner selection. Unlike the legacy `agent`
+    /// setting, this also constrains every role-specific model.
+    pub provider: Option<String>,
     pub agent: Option<String>,
     pub cap: Option<usize>,
     pub repo_dir: Option<String>,
@@ -49,6 +52,12 @@ pub struct ServeFileConfig {
     pub agent_bin: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub worker_model: Option<String>,
+    pub worker_effort: Option<String>,
+    pub review_model: Option<String>,
+    pub review_effort: Option<String>,
+    pub classifier_model: Option<String>,
+    pub classifier_effort: Option<String>,
     pub merge_token_file: Option<String>,
     pub no_bare_agent: Option<bool>,
     pub max_turn_tokens: Option<i64>,
@@ -88,6 +97,128 @@ pub struct ServeFileConfig {
     pub min_effort: Option<String>,
     /// Runner-specific Codex configuration.
     pub codex: Option<CodexFileConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleConfig {
+    pub provider: RunnerKind,
+    pub provider_explicit: bool,
+    pub worker_model: String,
+    pub worker_effort: String,
+    pub review_model: String,
+    pub review_effort: String,
+    pub classifier_model: String,
+    pub classifier_effort: String,
+}
+
+pub fn resolve_roles(
+    file: &ServeFileConfig,
+    cli_agent: Option<&str>,
+    legacy_model: &str,
+    legacy_effort: &str,
+) -> Result<RoleConfig> {
+    if let (Some(agent), Some(provider)) = (file.agent.as_deref(), file.provider.as_deref()) {
+        if agent != provider {
+            return Err(QuorumError::Usage(format!(
+                "conflicting agent=\"{agent}\" and provider=\"{provider}\""
+            )));
+        }
+    }
+    if let (Some(agent), Some(provider)) = (cli_agent, file.provider.as_deref()) {
+        if agent != provider {
+            return Err(QuorumError::Usage(format!(
+                "conflicting --agent \"{agent}\" and provider=\"{provider}\""
+            )));
+        }
+    }
+
+    let provider_name = file
+        .provider
+        .as_deref()
+        .or(cli_agent)
+        .or(file.agent.as_deref());
+    let provider = RunnerKind::from_str_opt(provider_name)?;
+    let provider_explicit = file.provider.is_some();
+
+    let (
+        worker_default_model,
+        worker_default_effort,
+        review_default_model,
+        review_default_effort,
+        classifier_default_model,
+        classifier_default_effort,
+    ) = if provider_explicit && provider == RunnerKind::Codex {
+        (
+            "gpt-5.6-terra",
+            "medium",
+            "gpt-5.6-terra",
+            "high",
+            "gpt-5.6-terra",
+            "medium",
+        )
+    } else {
+        (
+            legacy_model,
+            legacy_effort,
+            legacy_model,
+            legacy_effort,
+            "claude-haiku-4-5-20251001",
+            "low",
+        )
+    };
+
+    let roles = RoleConfig {
+        provider,
+        provider_explicit,
+        worker_model: file
+            .worker_model
+            .clone()
+            .unwrap_or_else(|| worker_default_model.into()),
+        worker_effort: file
+            .worker_effort
+            .clone()
+            .unwrap_or_else(|| worker_default_effort.into()),
+        review_model: file
+            .review_model
+            .clone()
+            .unwrap_or_else(|| review_default_model.into()),
+        review_effort: file
+            .review_effort
+            .clone()
+            .unwrap_or_else(|| review_default_effort.into()),
+        classifier_model: file
+            .classifier_model
+            .clone()
+            .unwrap_or_else(|| classifier_default_model.into()),
+        classifier_effort: file
+            .classifier_effort
+            .clone()
+            .unwrap_or_else(|| classifier_default_effort.into()),
+    };
+
+    let role_models_explicit = file.worker_model.is_some()
+        || file.review_model.is_some()
+        || file.classifier_model.is_some();
+    if provider_explicit || role_models_explicit {
+        for (role, model) in [
+            ("worker", roles.worker_model.as_str()),
+            ("review", roles.review_model.as_str()),
+            ("classifier", roles.classifier_model.as_str()),
+        ] {
+            let actual =
+                crate::serve::runner::AgentKind::for_model(model).map_err(QuorumError::Usage)?;
+            let expected = match provider {
+                RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
+                RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
+            };
+            if actual != expected {
+                return Err(QuorumError::Usage(format!(
+                    "{role}_model \"{model}\" does not match provider=\"{provider}\""
+                )));
+            }
+        }
+    }
+    Ok(roles)
 }
 
 /// `[codex]` section in serve config.
@@ -265,6 +396,10 @@ pub struct BannerData<'a> {
     pub cap: &'a Sourced<usize>,
     pub model: &'a Sourced<String>,
     pub effort: &'a Sourced<String>,
+    pub review_model: &'a str,
+    pub review_effort: &'a str,
+    pub classifier_model: &'a str,
+    pub classifier_effort: &'a str,
     pub log_dir: &'a Sourced<Option<String>>,
     pub no_bare_agent: &'a Sourced<bool>,
     pub self_update_drain: &'a Sourced<bool>,
@@ -303,6 +438,16 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!("  cap:                       {}", d.cap));
     lines.push(format!("  model:                     {}", d.model));
     lines.push(format!("  effort:                    {}", d.effort));
+    lines.push(format!("  review_model:              {}", d.review_model));
+    lines.push(format!("  review_effort:             {}", d.review_effort));
+    lines.push(format!(
+        "  classifier_model:          {}",
+        d.classifier_model
+    ));
+    lines.push(format!(
+        "  classifier_effort:         {}",
+        d.classifier_effort
+    ));
     match &d.log_dir.value {
         Some(v) => lines.push(format!(
             "  log_dir:                   {} ({})",
@@ -537,6 +682,70 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
     }
 
     #[test]
+    fn explicit_codex_provider_gets_role_defaults() {
+        let cfg: ServeFileConfig = toml::from_str("provider = \"codex\"\n").unwrap();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+        assert_eq!(roles.provider, RunnerKind::Codex);
+        assert!(roles.provider_explicit);
+        assert_eq!(
+            (
+                roles.worker_model.as_str(),
+                roles.worker_effort.as_str(),
+                roles.review_model.as_str(),
+                roles.review_effort.as_str(),
+                roles.classifier_model.as_str(),
+                roles.classifier_effort.as_str(),
+            ),
+            (
+                "gpt-5.6-terra",
+                "medium",
+                "gpt-5.6-terra",
+                "high",
+                "gpt-5.6-terra",
+                "medium",
+            )
+        );
+    }
+
+    #[test]
+    fn absent_provider_preserves_legacy_defaults() {
+        let cfg = ServeFileConfig::default();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+        assert_eq!(roles.provider, RunnerKind::Claude);
+        assert!(!roles.provider_explicit);
+        assert_eq!(roles.worker_model, "sonnet");
+        assert_eq!(roles.review_model, "sonnet");
+        assert_eq!(roles.classifier_model, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn explicit_provider_rejects_role_model_mismatch() {
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"codex\"\nreview_model = \"claude-opus-4-8\"\n").unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("review_model"), "{err}");
+    }
+
+    #[test]
+    fn explicit_provider_rejects_unknown_role_model() {
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"codex\"\nworker_model = \"mystery\"\n").unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("unknown model"), "{err}");
+    }
+
+    #[test]
+    fn conflicting_legacy_agent_and_provider_fail() {
+        let cfg: ServeFileConfig =
+            toml::from_str("agent = \"claude\"\nprovider = \"codex\"\n").unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("conflicting"), "{err}");
+    }
+
+    #[test]
     fn load_suggested_models_valid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.toml");
@@ -650,6 +859,10 @@ worktree_base = "/tmp/wt"
                 value: "high".into(),
                 source: Source::Default,
             },
+            review_model: "sonnet",
+            review_effort: "high",
+            classifier_model: "claude-haiku-4-5-20251001",
+            classifier_effort: "low",
             log_dir: &Sourced {
                 value: None,
                 source: Source::Default,

@@ -1298,6 +1298,43 @@ Classifier, doctor, review interpreter, and analytics collector are not initial 
 parity requirements. They remain Claude-backed or disabled until the primary
 worker → R1 → R2 → merge lifecycle is proven. Mixed-runner behavior is never inferred.
 
+### Optional single-provider operation
+
+After the mixed-runner lifecycle is proven, an operator may select one provider for every
+managed coding role:
+
+```toml
+provider = "codex"
+
+worker_model = "gpt-5.6-terra"
+worker_effort = "medium"
+
+review_model = "gpt-5.6-terra"
+review_effort = "high"
+
+classifier_model = "gpt-5.6-terra"
+classifier_effort = "medium"
+```
+
+`provider` is optional. When absent, the legacy `agent` / `model` / `effort` configuration
+and Claude-compatible defaults remain available. When present, it is a fail-safe operating
+constraint: worker, R1, R2, live task classification, and post-merge review classification
+must all resolve to that provider. An explicit task model or `tier:` label for another
+provider is rejected rather than overriding the constraint, and spawn, retry, persistence,
+or recovery must never fall back to another provider.
+
+The role model and effort fields are independently configurable. R1 and R2 use the explicit
+review selection instead of cross-provider strength inference. Every run persists the exact
+provider, model, effort, role, and provider continuation identity before lifecycle
+attachment; recovery reuses those durable values. Unknown models, provider/model mismatch,
+missing continuation metadata, and unavailable configured runners fail loudly and enter the
+existing bounded retry or parked-task path.
+
+The initial operational profile uses Codex `gpt-5.6-terra` at medium effort for workers and
+classifiers and high effort for R1/R2. This profile is deliberately smaller than a
+vendor-specific fleet: it adds no complexity ladder, model benchmarker, generalized provider
+plugin, or cross-vendor strength ordering.
+
 ### Verification gates
 
 Before Codex is production-selectable:
