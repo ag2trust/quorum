@@ -44,6 +44,10 @@ pub struct ReleaseOutcome {
     pub released: bool,
 }
 
+pub fn is_unique_violation_pub(e: &rusqlite::Error) -> bool {
+    is_unique_violation(e)
+}
+
 fn is_unique_violation(e: &rusqlite::Error) -> bool {
     // Match only the UNIQUE *extended* code. All NOT NULL columns are always supplied, so the
     // only constraint an INSERT can hit today is the partial unique index — but matching the
