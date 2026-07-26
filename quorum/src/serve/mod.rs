@@ -290,6 +290,16 @@ fn model_rank(model: &str) -> Option<usize> {
 }
 
 fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> String {
+    use crate::serve::runner::AgentKind;
+    let worker_is_claude = AgentKind::for_model(worker_model) == AgentKind::Claude;
+    let config_is_claude = AgentKind::for_model(config_model) == AgentKind::Claude;
+
+    // Both non-Claude (e.g. Codex): no tier escalation available, use
+    // config model as-is so the reviewer inherits the daemon's provider.
+    if !worker_is_claude && !config_is_claude {
+        return config_model.to_string();
+    }
+
     let worker_rank = model_rank(worker_model).unwrap_or(0);
     let config_rank = model_rank(config_model).unwrap_or(0);
     let escalated = (worker_rank + 1).min(MODEL_TIERS.len() - 1);
@@ -3724,16 +3734,19 @@ async fn tick(
                                         if let Err(e) =
                                             reviewers[ri].proc.feed_turn(&rereview_turn).await
                                         {
+                                            let reason = if reviewers[ri].proc.is_codex() {
+                                                "codex_rereview"
+                                            } else {
+                                                "failed"
+                                            };
                                             log(&format!(
                                                 "ResumeReviewer: feed_turn failed \
-                                                 for task #{}: {e} — tearing down",
+                                                 for task #{}: {e} — tearing down ({reason})",
                                                 workers[wi].task_id
                                             ));
                                             let r = reviewers.remove(ri);
-                                            teardown_reviewer(
-                                                config, wt_mgr, name_pool, r, "failed",
-                                            )
-                                            .await;
+                                            teardown_reviewer(config, wt_mgr, name_pool, r, reason)
+                                                .await;
                                         } else {
                                             log(&format!(
                                                 "ResumeReviewer: fed re-review turn \
@@ -6101,6 +6114,29 @@ async fn provision_reviewer(
         }
     }
 
+    // Build the role-appropriate prompt BEFORE spawn — Codex takes it as a
+    // CLI argument while Claude receives it via stdin after spawn.
+    let reviewer_kind = runner::AgentKind::for_model(&reviewer_model);
+    let prompt = match role {
+        ReviewRole::R1 => {
+            let spec = reviewer::ReviewerSpec {
+                pr,
+                worker_agent: worker.agent_name.to_string(),
+                reviewer_name: reviewer_name.clone(),
+            };
+            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &config.effort)
+        }
+        ReviewRole::R2 { r1_reviewer, .. } => {
+            let spec = reviewer::R2ReviewSpec {
+                pr,
+                worker_agent: worker.agent_name.to_string(),
+                r1_reviewer: r1_reviewer.clone(),
+                r2_name: reviewer_name.clone(),
+            };
+            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &config.effort)
+        }
+    };
+
     match reviewer::spawn_reviewer(
         &reviewer_model,
         &config.effort,
@@ -6114,53 +6150,33 @@ async fn provision_reviewer(
             ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
         ],
         config.allowed_tools.as_deref(),
-    )
-    .await
-    {
-        Ok(agent_proc) => {
-            let mut proc = runner::RunnerProc::Claude(agent_proc);
-
-            // Build the role-appropriate prompt.
-            let prompt = match role {
-                ReviewRole::R1 => {
-                    let spec = reviewer::ReviewerSpec {
-                        pr,
-                        worker_agent: worker.agent_name.to_string(),
-                        reviewer_name: reviewer_name.clone(),
-                    };
-                    reviewer::build_review_prompt(&spec, &config.effort)
+        &config.codex_sandbox,
+        &prompt,
+    ) {
+        Ok(mut proc) => {
+            // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
+            if !proc.is_codex() {
+                let turn1 = agent::user_turn(&prompt);
+                if let Err(e) = proc.feed_turn(&turn1).await {
+                    log(&format!(
+                        "{}: reviewer feed_turn failed: {e}",
+                        role.as_str().to_uppercase()
+                    ));
+                    proc.kill_and_reap().await;
+                    name_pool.release(&reviewer_name);
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    let p = config.db_path.clone();
+                    let rn = reviewer_name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut conn) = quorum_core::db::open(&p) {
+                            let _ = journal::delete(&mut conn, &rn);
+                        }
+                    })
+                    .await
+                    .ok();
+                    return Ok(());
                 }
-                ReviewRole::R2 { r1_reviewer, .. } => {
-                    let spec = reviewer::R2ReviewSpec {
-                        pr,
-                        worker_agent: worker.agent_name.to_string(),
-                        r1_reviewer: r1_reviewer.clone(),
-                        r2_name: reviewer_name.clone(),
-                    };
-                    reviewer::build_r2_review_prompt(&spec, &config.effort)
-                }
-            };
-
-            let turn1 = agent::user_turn(&prompt);
-            if let Err(e) = proc.feed_turn(&turn1).await {
-                log(&format!(
-                    "{}: reviewer feed_turn failed: {e}",
-                    role.as_str().to_uppercase()
-                ));
-                proc.kill_and_reap().await;
-                name_pool.release(&reviewer_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                let p = config.db_path.clone();
-                let rn = reviewer_name.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(mut conn) = quorum_core::db::open(&p) {
-                        let _ = journal::delete(&mut conn, &rn);
-                    }
-                })
-                .await
-                .ok();
-                return Ok(());
             }
 
             // M7: persist PID immediately so crash recovery can clean up
@@ -7899,6 +7915,77 @@ mod tests {
             escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7"),
             "claude-opus-4-7",
             "config floor must override natural escalation when higher"
+        );
+    }
+
+    // #196: Codex model escalation — both non-Claude returns config as-is
+    #[test]
+    fn escalated_reviewer_codex_both_returns_config() {
+        assert_eq!(
+            escalated_reviewer_model("o4-mini", "o4-mini"),
+            "o4-mini",
+            "both non-Claude: return config model as-is"
+        );
+        assert_eq!(
+            escalated_reviewer_model("gpt-4o", "gpt-5.6-codex"),
+            "gpt-5.6-codex",
+            "both non-Claude: return config model"
+        );
+    }
+
+    // #196: mixed Claude worker + Codex config still escalates within Claude tiers
+    #[test]
+    fn escalated_reviewer_claude_worker_codex_config() {
+        assert_eq!(
+            escalated_reviewer_model("claude-opus-4-6", "o4-mini"),
+            "claude-opus-4-7",
+            "Claude worker with non-Claude config: escalate within Claude tiers"
+        );
+    }
+
+    // #196: Codex worker + Claude config uses Claude tier escalation
+    #[test]
+    fn escalated_reviewer_codex_worker_claude_config() {
+        assert_eq!(
+            escalated_reviewer_model("o4-mini", "claude-opus-4-7"),
+            "claude-opus-4-7",
+            "non-Claude worker with Claude config: config floor wins"
+        );
+    }
+
+    // #196: recovery retains provider — deterministic model resolution
+    #[test]
+    fn escalated_reviewer_model_is_deterministic() {
+        let model_a = escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6");
+        let model_b = escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6");
+        assert_eq!(model_a, model_b, "same inputs must yield same output");
+        assert_eq!(
+            runner::AgentKind::for_model(&model_a),
+            runner::AgentKind::Claude
+        );
+
+        let codex_a = escalated_reviewer_model("o4-mini", "o4-mini");
+        let codex_b = escalated_reviewer_model("o4-mini", "o4-mini");
+        assert_eq!(
+            codex_a, codex_b,
+            "Codex: same inputs must yield same output"
+        );
+        assert_eq!(
+            runner::AgentKind::for_model(&codex_a),
+            runner::AgentKind::Codex
+        );
+    }
+
+    #[test]
+    fn escalated_reviewer_short_alias_sonnet() {
+        let result = escalated_reviewer_model("sonnet", "sonnet");
+        assert_eq!(
+            result, "claude-opus-4-6",
+            "short alias 'sonnet' must escalate within Claude tiers, not pass through as Codex"
+        );
+        assert_eq!(
+            runner::AgentKind::for_model(&result),
+            runner::AgentKind::Claude,
         );
     }
 
