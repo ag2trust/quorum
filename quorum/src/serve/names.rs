@@ -87,28 +87,32 @@ impl Pool {
     }
 
     pub fn acquire(&mut self) -> AcquireResult {
-        if let Some(name) = self.acquire_from_pool() {
-            return AcquireResult::FromPool(name);
-        }
-        AcquireResult::Generated(self.generate())
+        self.acquire_excluding(&HashSet::new())
     }
 
-    fn acquire_from_pool(&mut self) -> Option<String> {
+    pub fn acquire_excluding(&mut self, excluded: &HashSet<String>) -> AcquireResult {
+        if let Some(name) = self.acquire_from_pool(excluded) {
+            return AcquireResult::FromPool(name);
+        }
+        AcquireResult::Generated(self.generate(excluded))
+    }
+
+    fn acquire_from_pool(&mut self, excluded: &HashSet<String>) -> Option<String> {
         let idx = self
             .available
             .iter()
-            .position(|n| !self.in_use.contains(n))?;
+            .position(|n| !self.in_use.contains(n) && !excluded.contains(n))?;
         let name = self.available.remove(idx);
         self.in_use.insert(name.clone());
         Some(name)
     }
 
-    fn generate(&mut self) -> String {
+    fn generate(&mut self, excluded: &HashSet<String>) -> String {
         for _ in 0..100 {
             let word = WORD_LIST[self.simple_random() % WORD_LIST.len()];
             let suffix = self.random_suffix();
             let name = format!("{word}-{suffix}");
-            if !self.in_use.contains(&name) {
+            if !self.in_use.contains(&name) && !excluded.contains(&name) {
                 self.in_use.insert(name.clone());
                 return name;
             }
@@ -302,5 +306,33 @@ mod tests {
         assert!(!r2.is_generated());
         let r3 = pool.acquire();
         assert!(r3.is_generated());
+    }
+
+    #[test]
+    fn file_pool_does_not_reacquire_released_excluded_name() {
+        let (_f, path) = write_names_file(&["Worker", "Reviewer"]);
+        let mut pool = Pool::load(&path, 1).unwrap();
+        let worker = pool.acquire().into_name();
+        pool.release(&worker);
+
+        let excluded = HashSet::from([worker.clone()]);
+        let reviewer = pool.acquire_excluding(&excluded);
+
+        assert_eq!(worker, "Worker");
+        assert_eq!(reviewer.name(), "Reviewer");
+        assert_ne!(reviewer.name(), worker);
+    }
+
+    #[test]
+    fn generated_pool_does_not_reacquire_released_excluded_name() {
+        let mut pool = Pool::new_generated();
+        let worker = pool.acquire().into_name();
+        pool.release(&worker);
+
+        let excluded = HashSet::from([worker.clone()]);
+        let reviewer = pool.acquire_excluding(&excluded);
+
+        assert!(reviewer.is_generated());
+        assert_ne!(reviewer.name(), worker);
     }
 }

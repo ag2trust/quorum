@@ -5967,6 +5967,23 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
     }
 }
 
+fn reviewer_name_exclusions(
+    worker_name: &str,
+    role: &ReviewRole,
+    prior_runs: &[quorum_core::agent_runs::AgentRun],
+) -> std::collections::HashSet<String> {
+    let mut excluded = prior_runs
+        .iter()
+        .filter(|run| run.role == "worker" || run.role == "reviewer")
+        .map(|run| run.agent.clone())
+        .collect::<std::collections::HashSet<_>>();
+    excluded.insert(worker_name.to_string());
+    if let ReviewRole::R2 { r1_reviewer, .. } = role {
+        excluded.insert(r1_reviewer.clone());
+    }
+    excluded
+}
+
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -5984,7 +6001,21 @@ async fn provision_reviewer(
     role: &ReviewRole,
     head_sha: &str,
 ) -> Result<()> {
-    let acquire_result = name_pool.acquire();
+    // Reviewer identity is task-scoped, not slot-scoped. A completed worker or
+    // reviewer has already left `Pool::in_use`, so consult the durable run
+    // history before acquiring a name. This also protects stateless recovery.
+    let prior_runs = {
+        let p = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || -> Result<Vec<quorum_core::agent_runs::AgentRun>> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+    };
+    let excluded = reviewer_name_exclusions(worker.agent_name, role, &prior_runs);
+    let acquire_result = name_pool.acquire_excluding(&excluded);
     if acquire_result.is_generated() && name_pool.has_file() {
         log(&format!(
             "names pool exhausted, generated fallback reviewer name: {}",

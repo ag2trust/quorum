@@ -27,10 +27,17 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
 }
 
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
+    write_named_pool(
+        dir,
+        &(0..20).map(|i| format!("Agent{i}")).collect::<Vec<_>>(),
+    )
+}
+
+fn write_named_pool(dir: &std::path::Path, names: &[String]) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
-    for i in 0..20 {
-        writeln!(f, "Agent{i}").unwrap();
+    for name in names {
+        writeln!(f, "{name}").unwrap();
     }
     path
 }
@@ -338,6 +345,147 @@ fn create_author_branch(repo_dir: &std::path::Path, author: &str, task_id: i64) 
         .args(["-C", &d, "branch", &branch])
         .status()
         .unwrap();
+}
+
+fn record_closed_run(home: &std::path::Path, task_id: i64, agent: &str, role: &str) {
+    let conn = quorum_core::db::open(&db_path(home)).unwrap();
+    let run_id = quorum_core::agent_runs::insert(
+        &conn,
+        task_id,
+        agent,
+        role,
+        "claude-opus-4-6",
+        "high",
+        "claude",
+        100,
+    )
+    .unwrap();
+    quorum_core::agent_runs::close(&conn, run_id, 101, "test teardown").unwrap();
+}
+
+#[test]
+fn orphan_r1_does_not_reuse_torn_down_worker_name() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Worker".into(), "R1".into()]);
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "R1 reviewer not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert_eq!(reviewer, "R1");
+    assert_ne!(reviewer, author);
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("reviewer must differ from author")),
+        "lifecycle rejected a reused worker identity: {:?}",
+        handle.lines
+    );
+    drop(handle);
+}
+
+#[test]
+fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let r1 = "R1";
+    let pr = 42;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    record_closed_run(home.path(), task_id, r1, "reviewer");
+
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    {
+        let mut conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: pr,
+                review_role: "r1".into(),
+                task_id,
+                author: author.into(),
+                reviewer: r1.into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: head_sha,
+            },
+        )
+        .unwrap();
+    }
+    let names = write_named_pool(home.path(), &["Worker".into(), "R1".into(), "R2".into()]);
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 30),
+        "R2 reviewer not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .unwrap();
+    assert_eq!(reviewer, "R2");
+    assert_ne!(reviewer, author);
+    assert_ne!(reviewer, r1);
+    drop(handle);
 }
 
 /// PR #3806 regression: in-review task through R1 changes → remediation →
