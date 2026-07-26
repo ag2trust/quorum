@@ -348,6 +348,70 @@ fn resolve_remediation_provider(
     Ok((model, kind))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewerRecovery {
+    agent: String,
+    model: String,
+    effort: String,
+    kind: runner::AgentKind,
+    thread_id: Option<String>,
+}
+
+fn reviewer_thread_ref_key(is_r2: bool) -> &'static str {
+    if is_r2 {
+        "codex_reviewer_r2_thread_id"
+    } else {
+        "codex_reviewer_r1_thread_id"
+    }
+}
+
+fn resolve_reviewer_recovery(
+    db_path: &std::path::Path,
+    task_id: i64,
+    is_r2: bool,
+) -> Result<Option<ReviewerRecovery>> {
+    let conn = quorum_core::db::open(db_path)?;
+    let task = tasks::get(&conn, task_id)?;
+    let task_refs = task.as_ref().and_then(|task| task.refs.as_deref());
+    let Some(run) = quorum_core::agent_runs::interrupted_reviewer(&conn, task_id, is_r2)? else {
+        return Ok(None);
+    };
+    let provider = run.provider.as_deref().ok_or_else(|| {
+        QuorumError::Io(format!(
+            "interrupted reviewer run {} has no persisted provider",
+            run.id
+        ))
+    })?;
+    let kind = resolve_provider(&run.model)?;
+    if provider != kind.to_string() {
+        return Err(QuorumError::Io(format!(
+            "persisted provider '{provider}' does not match reviewer model '{}' resolved as '{kind}'",
+            run.model
+        )));
+    }
+    let thread_id = task_refs
+        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| {
+            refs.get(reviewer_thread_ref_key(is_r2))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    if kind == runner::AgentKind::Codex && thread_id.is_none() {
+        return Err(QuorumError::Io(format!(
+            "interrupted Codex reviewer run {} has no persisted {}",
+            run.id,
+            reviewer_thread_ref_key(is_r2)
+        )));
+    }
+    Ok(Some(ReviewerRecovery {
+        agent: run.agent,
+        model: run.model,
+        effort: run.effort,
+        kind,
+        thread_id,
+    }))
+}
+
 const MODEL_TIERS: &[&str] = &[
     "claude-sonnet-5",
     "claude-opus-4-6",
@@ -1781,6 +1845,7 @@ async fn tick(
                                 worker_cp,
                                 &role,
                                 &head_sha,
+                                false,
                             )
                             .await
                             .ok();
@@ -4707,6 +4772,7 @@ async fn tick(
                         counterpart,
                         &role,
                         &head_sha,
+                        false,
                     )
                     .await?;
                 }
@@ -5022,6 +5088,7 @@ async fn tick(
                         counterpart,
                         &role,
                         &head_sha,
+                        true,
                     )
                     .await?;
                 }
@@ -5645,7 +5712,12 @@ fn codex_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str)
     }
 }
 
-async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread_id: &str) {
+async fn persist_codex_thread_id(
+    db_path: &std::path::Path,
+    task_id: i64,
+    thread_id: &str,
+    ref_key: &'static str,
+) {
     let p = db_path.to_path_buf();
     let tid = thread_id.to_string();
     let task_id_val = task_id;
@@ -5658,7 +5730,7 @@ async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
-            refs["codex_thread_id"] = serde_json::Value::String(tid);
+            refs[ref_key] = serde_json::Value::String(tid);
             let refs_str = refs.to_string();
             tasks::update_refs_daemon(&mut conn, task_id_val, &refs_str, now_unix())?;
         }
@@ -5760,7 +5832,12 @@ async fn drain_events(
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
                     slot.codex_thread_id = Some(thread_id.clone());
-                    persist_codex_thread_id(db_path, slot.task_id, thread_id).await;
+                    let ref_key = if role == "worker" {
+                        "codex_thread_id"
+                    } else {
+                        reviewer_thread_ref_key(slot.r2_origin)
+                    };
+                    persist_codex_thread_id(db_path, slot.task_id, thread_id, ref_key).await;
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
@@ -5957,15 +6034,37 @@ async fn provision_reviewer(
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
     head_sha: &str,
+    recover_interrupted: bool,
 ) -> Result<()> {
-    let acquire_result = name_pool.acquire();
-    if acquire_result.is_generated() && name_pool.has_file() {
-        log(&format!(
-            "names pool exhausted, generated fallback reviewer name: {}",
-            acquire_result.name()
-        ));
-    }
-    let reviewer_name = acquire_result.into_name();
+    let recovery = if recover_interrupted {
+        let p = config.db_path.clone();
+        let task_id = worker.task_id;
+        let is_r2 = role.is_r2();
+        tokio::task::spawn_blocking(move || -> Result<Option<ReviewerRecovery>> {
+            resolve_reviewer_recovery(&p, task_id, is_r2)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+    } else {
+        None
+    };
+    let reviewer_name = if let Some(recovery) = &recovery {
+        name_pool.acquire_named(&recovery.agent).ok_or_else(|| {
+            QuorumError::Io(format!(
+                "persisted reviewer identity '{}' is already in use",
+                recovery.agent
+            ))
+        })?
+    } else {
+        let acquire_result = name_pool.acquire();
+        if acquire_result.is_generated() && name_pool.has_file() {
+            log(&format!(
+                "names pool exhausted, generated fallback reviewer name: {}",
+                acquire_result.name()
+            ));
+        }
+        acquire_result.into_name()
+    };
     // #181: register in the lifetime roster BEFORE any DB work so any concurrent
     // sibling daemon polling us now can see we own this name via future rows.
     lifetime_roster.register(&reviewer_name);
@@ -6151,19 +6250,38 @@ async fn provision_reviewer(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let reviewer_model = {
-        let p = config.db_path.clone();
-        let tid = worker.task_id;
-        let cfg_model = config.model.clone();
-        tokio::task::spawn_blocking(move || -> Result<String> {
-            let conn = quorum_core::db::open(&p)?;
-            let worker_model = quorum_core::agent_runs::worker_model(&conn, tid)?
-                .unwrap_or_else(|| cfg_model.clone());
-            escalated_reviewer_model(&worker_model, &cfg_model)
-        })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
-    };
+    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_thread_id) =
+        if let Some(recovery) = &recovery {
+            log(&format!(
+                "recovering {} reviewer {} with persisted provider {} model {}",
+                role.as_str().to_uppercase(),
+                reviewer_name,
+                recovery.kind,
+                recovery.model
+            ));
+            (
+                recovery.model.clone(),
+                recovery.effort.clone(),
+                recovery.kind,
+                recovery.thread_id.clone(),
+            )
+        } else {
+            let reviewer_model = {
+                let p = config.db_path.clone();
+                let tid = worker.task_id;
+                let cfg_model = config.model.clone();
+                tokio::task::spawn_blocking(move || -> Result<String> {
+                    let conn = quorum_core::db::open(&p)?;
+                    let worker_model = quorum_core::agent_runs::worker_model(&conn, tid)?
+                        .unwrap_or_else(|| cfg_model.clone());
+                    escalated_reviewer_model(&worker_model, &cfg_model)
+                })
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+            };
+            let kind = resolve_provider(&reviewer_model)?;
+            (reviewer_model, config.effort.clone(), kind, None)
+        };
     log(&format!(
         "reviewer model escalated to {reviewer_model} for task {}",
         worker.task_id
@@ -6193,7 +6311,6 @@ async fn provision_reviewer(
 
     // Build the role-appropriate prompt BEFORE spawn — Codex takes it as a
     // CLI argument while Claude receives it via stdin after spawn.
-    let reviewer_kind = resolve_provider(&reviewer_model)?;
     let prompt = match role {
         ReviewRole::R1 => {
             let spec = reviewer::ReviewerSpec {
@@ -6201,7 +6318,7 @@ async fn provision_reviewer(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &config.effort)
+            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
             let spec = reviewer::R2ReviewSpec {
@@ -6210,27 +6327,43 @@ async fn provision_reviewer(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &config.effort)
+            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
         }
     };
 
-    match reviewer::spawn_reviewer(
-        reviewer_kind,
-        &reviewer_model,
-        &config.effort,
-        &session_id,
-        &wt_path,
-        config.agent_bin.as_deref(),
-        config.bare_agent,
-        vec![
-            ("QUORUM_REPO".into(), config.repo.clone()),
-            ("QUORUM_AGENT".into(), reviewer_name.clone()),
-            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-        ],
-        config.allowed_tools.as_deref(),
-        &config.codex_sandbox,
-        &prompt,
-    ) {
+    let reviewer_env = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), reviewer_name.clone()),
+        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
+    ];
+    let spawn_result = if let Some(thread_id) = reviewer_thread_id.as_deref() {
+        codex_agent::CodexProc::spawn_resume(
+            thread_id,
+            &reviewer_model,
+            &reviewer_effort,
+            &config.codex_sandbox,
+            &wt_path,
+            &prompt,
+            &reviewer_env,
+            config.agent_bin.as_deref(),
+        )
+        .map(runner::RunnerProc::Codex)
+    } else {
+        reviewer::spawn_reviewer(
+            reviewer_kind,
+            &reviewer_model,
+            &reviewer_effort,
+            &session_id,
+            &wt_path,
+            config.agent_bin.as_deref(),
+            config.bare_agent,
+            reviewer_env,
+            config.allowed_tools.as_deref(),
+            &config.codex_sandbox,
+            &prompt,
+        )
+    };
+    match spawn_result {
         Ok(mut proc) => {
             // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
             if !proc.is_codex() {
@@ -6305,7 +6438,7 @@ async fn provision_reviewer(
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
                 let m = reviewer_model.clone();
-                let e = config.effort.clone();
+                let e = reviewer_effort.clone();
                 let prov = reviewer_provider;
                 let tid = worker.task_id;
                 let is_r2 = role.is_r2();
@@ -6386,7 +6519,7 @@ async fn provision_reviewer(
                 task_id: worker.task_id,
                 session_id,
                 model: reviewer_model,
-                effort: config.effort.clone(),
+                effort: reviewer_effort,
                 worktree_path: wt_path,
                 branch,
                 draining: true,
@@ -6406,7 +6539,7 @@ async fn provision_reviewer(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: role.is_r2(),
                 reviewed_head_sha: spawn_head_sha,
-                codex_thread_id: None,
+                codex_thread_id: reviewer_thread_id,
                 pending_prompt: String::new(),
                 pending_turn_kind: if role.is_r2() {
                     "r2-review".into()
@@ -9861,7 +9994,7 @@ mod tests {
             )
             .unwrap();
             let kind = resolve_provider("gpt-5.6-terra").unwrap();
-            quorum_core::agent_runs::insert(
+            let run_id = quorum_core::agent_runs::insert(
                 &conn,
                 task_id,
                 "r1-terra",
@@ -9872,41 +10005,31 @@ mod tests {
                 11,
             )
             .unwrap();
+            quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
             conn.execute(
                 "UPDATE tasks SET refs = ?1 WHERE id = ?2",
-                rusqlite::params![r#"{"codex_thread_id":"thread-terra-exact"}"#, task_id],
+                rusqlite::params![
+                    r#"{"codex_reviewer_r1_thread_id":"thread-terra-exact"}"#,
+                    task_id
+                ],
             )
             .unwrap();
         }
 
-        // Simulate daemon restart: durable run metadata and task refs are the
-        // only inputs available to choose the continuation runner.
-        let conn = quorum_core::db::open(&db_path).unwrap();
-        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
-        let reviewer_run = runs
-            .iter()
-            .find(|run| run.role == "reviewer")
-            .expect("persisted reviewer run");
-        let kind = resolve_remediation_provider(
-            reviewer_run.provider.as_deref(),
-            Some(reviewer_run.model.clone()),
-            "claude-opus-4-6",
-            crate::serve_config::RunnerKind::Claude,
-        )
-        .unwrap()
-        .1;
-        let task = tasks::get(&conn, task_id).unwrap().unwrap();
-        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        let thread_id = refs["codex_thread_id"].as_str().unwrap();
+        // This is the same resolver called by orphan in-review provisioning.
+        let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+            .unwrap()
+            .expect("interrupted reviewer recovery");
+        let thread_id = recovery.thread_id.as_deref().unwrap();
         let args = codex_agent::resume_args(
             thread_id,
-            &reviewer_run.model,
-            &reviewer_run.effort,
+            &recovery.model,
+            &recovery.effort,
             "continue review",
         );
 
-        assert_eq!(reviewer_run.provider.as_deref(), Some("codex"));
-        assert_eq!(kind, runner::AgentKind::Codex);
+        assert_eq!(recovery.agent, "r1-terra");
+        assert_eq!(recovery.kind, runner::AgentKind::Codex);
         assert_eq!(args[0..3], ["exec", "resume", "thread-terra-exact"]);
         assert_eq!(
             args.windows(2)

@@ -93,6 +93,22 @@ impl Pool {
         AcquireResult::Generated(self.generate())
     }
 
+    /// Reacquire a durable agent identity during daemon restart recovery.
+    pub fn acquire_named(&mut self, name: &str) -> Option<String> {
+        if self.in_use.contains(name) {
+            return None;
+        }
+        if let Some(index) = self
+            .available
+            .iter()
+            .position(|candidate| candidate == name)
+        {
+            self.available.remove(index);
+        }
+        self.in_use.insert(name.to_string());
+        Some(name.to_string())
+    }
+
     fn acquire_from_pool(&mut self) -> Option<String> {
         let idx = self
             .available
@@ -206,6 +222,21 @@ mod tests {
         let pool = Pool::load(&path, 4).unwrap();
         assert!(pool.has_file());
         assert_eq!(pool.available.len(), 3);
+    }
+
+    #[test]
+    fn acquire_named_restores_identity_once() {
+        let mut pool = Pool::new_generated();
+        assert_eq!(
+            pool.acquire_named("Reviewer-1").as_deref(),
+            Some("Reviewer-1")
+        );
+        assert_eq!(pool.acquire_named("Reviewer-1"), None);
+        pool.release("Reviewer-1");
+        assert_eq!(
+            pool.acquire_named("Reviewer-1").as_deref(),
+            Some("Reviewer-1")
+        );
     }
 
     #[test]

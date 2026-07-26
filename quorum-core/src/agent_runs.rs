@@ -85,6 +85,44 @@ pub fn worker_provider(conn: &Connection, task_id: i64) -> Result<Option<String>
     Ok(provider)
 }
 
+/// Latest interrupted reviewer run for a role, if any.
+///
+/// An open row represents a daemon crash. `drain` represents a clean daemon
+/// shutdown that intentionally left an in-review task for restart recovery.
+pub fn interrupted_reviewer(
+    conn: &Connection,
+    task_id: i64,
+    is_r2: bool,
+) -> Result<Option<AgentRun>> {
+    conn.query_row(
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason
+         FROM agent_runs
+         WHERE task_id = ?1
+           AND role = 'reviewer'
+           AND ((?2 = 1 AND sub_role = 'r2') OR (?2 = 0 AND sub_role IS NULL))
+           AND (ended_at IS NULL OR end_reason = 'drain')
+         ORDER BY id DESC
+         LIMIT 1",
+        params![task_id, is_r2],
+        |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                provider: r.get(6)?,
+                spawned_at: r.get(7)?,
+                ended_at: r.get(8)?,
+                end_reason: r.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// All runs for a task, ordered by id.
 pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
     let mut stmt = conn.prepare(

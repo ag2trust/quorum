@@ -94,7 +94,10 @@ impl AgentKind {
         } else if model.starts_with("claude-")
             || model == "sonnet"
             || model.starts_with("sonnet-")
+            || model == "opus"
             || model.starts_with("opus-")
+            || model == "fable"
+            || model.starts_with("fable-")
         {
             Ok(Self::Claude)
         } else {
@@ -582,9 +585,16 @@ mod tests {
     fn for_model_short_claude_aliases() {
         assert_eq!(AgentKind::for_model("sonnet").unwrap(), AgentKind::Claude);
         assert_eq!(AgentKind::for_model("sonnet-5").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus").unwrap(), AgentKind::Claude);
         assert_eq!(AgentKind::for_model("opus-46").unwrap(), AgentKind::Claude);
         assert_eq!(AgentKind::for_model("opus-47").unwrap(), AgentKind::Claude);
         assert_eq!(AgentKind::for_model("opus-48").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("fable").unwrap(), AgentKind::Claude);
+        assert_eq!(
+            AgentKind::for_model("fable-preview").unwrap(),
+            AgentKind::Claude
+        );
+        assert!(AgentKind::for_model("haiku").is_err());
     }
 
     #[test]
