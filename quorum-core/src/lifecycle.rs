@@ -257,7 +257,11 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             }
             Ok((
                 Status::Rework,
-                vec![Effect::IncrementReworkRound, Effect::ResumeWorker],
+                vec![
+                    Effect::ReleaseLease,
+                    Effect::IncrementReworkRound,
+                    Effect::ResumeWorker,
+                ],
             ))
         }
         (Status::InReview, Event::AgentFailed { reason }) => Ok((
@@ -359,7 +363,11 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             }
             Ok((
                 Status::Rework,
-                vec![Effect::IncrementReworkRound, Effect::ResumeWorker],
+                vec![
+                    Effect::ReleaseLease,
+                    Effect::IncrementReworkRound,
+                    Effect::ResumeWorker,
+                ],
             ))
         }
         (Status::Merging, Event::Cancelled { by }) => Ok((
@@ -695,7 +703,11 @@ mod tests {
             &t,
             &Event::VerdictChanges,
             Status::Rework,
-            &[Effect::IncrementReworkRound, Effect::ResumeWorker],
+            &[
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ],
         );
     }
 
@@ -708,7 +720,11 @@ mod tests {
             &t,
             &Event::VerdictChanges,
             Status::Rework,
-            &[Effect::IncrementReworkRound, Effect::ResumeWorker],
+            &[
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ],
         );
     }
 
@@ -972,7 +988,11 @@ mod tests {
             &t,
             &Event::MergeConflict,
             Status::Rework,
-            &[Effect::IncrementReworkRound, Effect::ResumeWorker],
+            &[
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ],
         );
     }
 
@@ -1077,7 +1097,11 @@ mod tests {
         assert_eq!(next, Status::Rework);
         assert_eq!(
             effects,
-            vec![Effect::IncrementReworkRound, Effect::ResumeWorker]
+            vec![
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ]
         );
         t.status = next;
         t.rework_round += 1;
@@ -1484,7 +1508,11 @@ mod tests {
         assert_eq!(next, Status::Rework);
         assert_eq!(
             effects,
-            vec![Effect::IncrementReworkRound, Effect::ResumeWorker]
+            vec![
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ]
         );
         assert!(!effects
             .iter()

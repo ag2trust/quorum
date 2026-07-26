@@ -7487,6 +7487,37 @@ async fn spawn_remediation_worker(
     let agent_name = name_pool.acquire().into_name();
     lifetime_roster.register(&agent_name);
 
+    // Acquire the remediation lease BEFORE any other write that could invoke
+    // sweep. Without this, an intervening sweep_on_write sees a rework task
+    // with no active claim and reaps it to open (#199).
+    {
+        let p = db_path.clone();
+        let name = agent_name.clone();
+        let tid = task_id;
+        let claimed = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&p)?;
+            Ok(tasks::claim_remediation_rework(
+                &mut conn,
+                &name,
+                tid,
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )?
+            .is_some())
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(false);
+        if !claimed {
+            log(&format!(
+                "remediation: claim failed for task #{task_id} — task no longer in rework"
+            ));
+            name_pool.release(&agent_name);
+            return false;
+        }
+    }
+
     // Drain stale mailbox rows.
     {
         let p = db_path.clone();
@@ -7545,21 +7576,22 @@ async fn spawn_remediation_worker(
         log(&format!(
             "remediation: worktree provision failed for PR #{pr} — giving up"
         ));
+        // Release the lease installed by claim_remediation_rework.
+        {
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            let tid = task_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::release_remediation_lease(&mut conn, &name, tid, now_unix())
+            })
+            .await;
+        }
         name_pool.release(&agent_name);
         return false;
     }
 
-    // Set author on the task so routing works correctly.
-    {
-        let p = db_path.clone();
-        let tid = task_id;
-        let name = agent_name.clone();
-        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::tasks::set_author(&mut conn, tid, &name)
-        })
-        .await;
-    }
+    // Author was already set by claim_remediation_rework.
 
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
@@ -7745,6 +7777,17 @@ async fn spawn_remediation_worker(
                 if let Err(e) = proc.feed_turn(&turn1).await {
                     log(&format!("remediation feed_turn failed: {e}"));
                     proc.kill_and_reap().await;
+                    // Release the lease installed by claim_remediation_rework.
+                    {
+                        let p = db_path.clone();
+                        let name = agent_name.clone();
+                        let tid = task_id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            tasks::release_remediation_lease(&mut conn, &name, tid, now_unix())
+                        })
+                        .await;
+                    }
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -7818,6 +7861,17 @@ async fn spawn_remediation_worker(
         }
         Err(e) => {
             log(&format!("remediation worker spawn failed: {e}"));
+            // Release the lease installed by claim_remediation_rework.
+            {
+                let p = db_path.clone();
+                let name = agent_name.clone();
+                let tid = task_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    tasks::release_remediation_lease(&mut conn, &name, tid, now_unix())
+                })
+                .await;
+            }
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;

@@ -563,6 +563,117 @@ pub fn claim_provider_retry_rework(
     Ok(task)
 }
 
+// ── claim_remediation_rework ──────────────────────────────────────────────────
+
+/// Daemon-private: atomically claim a rework task for a remediation worker.
+/// Verifies the task is still in `rework`, installs the remediation assignee
+/// and a live lease, then sweeps only after the lease exists. Returns `None`
+/// if the task left rework or another remediation agent already holds the
+/// claim (partial unique index is the race authority).
+pub fn claim_remediation_rework(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    ttl: i64,
+    now: i64,
+) -> Result<Option<Task>> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, agent, now)?;
+
+    let status: Option<String> = tx
+        .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+
+    if status.as_deref() != Some("rework") {
+        crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+        tx.commit()?;
+        return Ok(None);
+    }
+
+    let target = lease_target(id);
+
+    // Deactivate expired claims only — the stale worker claim was released by
+    // the ReleaseLease effect in the VerdictChanges/MergeConflict transition.
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND active=1 AND expires_at <= ?2",
+        params![target, now],
+    )?;
+
+    // Partial unique index is the atomicity authority (invariant #1). If
+    // another remediation agent already holds the active claim, this INSERT
+    // fails with SQLITE_CONSTRAINT_UNIQUE — a normal lost race, not an error.
+    let ins = tx.execute(
+        "INSERT INTO claims(target, holder, ts, expires_at, active) VALUES (?1,?2,?3,?4,1)",
+        params![target, agent, now, now + ttl],
+    );
+
+    match ins {
+        Ok(_) => {}
+        Err(ref e) if crate::claims::is_unique_violation_pub(e) => {
+            crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+            tx.commit()?;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    tx.execute(
+        "UPDATE tasks SET assignee=?1, author=?1, updated_at=?2 WHERE id=?3",
+        params![agent, now, id],
+    )?;
+    crate::events::emit(
+        &tx,
+        "task_claimed",
+        &target,
+        &format!("by {agent} (remediation)"),
+        now,
+    )?;
+
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
+
+    // Sweep only after the replacement lease exists.
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    tx.commit()?;
+    Ok(Some(task))
+}
+
+/// Release a remediation lease on provisioning failure. Deactivates the claim
+/// and clears the assignee, leaving the task in rework for the next provisioning
+/// attempt or reaper cycle.
+pub fn release_remediation_lease(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    now: i64,
+) -> Result<()> {
+    let tx = begin_immediate(conn)?;
+    let target = lease_target(id);
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND holder=?2 AND active=1",
+        params![target, agent],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET assignee=NULL, updated_at=?1 WHERE id=?2 AND assignee=?3 AND status='rework'",
+        params![now, id, agent],
+    )?;
+    crate::events::emit(
+        &tx,
+        "remediation_lease_released",
+        &target,
+        &format!("by {agent} (provision failed)"),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 // ── apply_event ───────────────────────────────────────────────────────────────
 
 pub fn apply_event(
@@ -3616,6 +3727,9 @@ mod tests {
         .unwrap();
         apply_event(&mut c, "r1", tid, &Event::VerdictChanges, 500).unwrap();
 
+        // Install remediation lease (as the daemon would).
+        claim_remediation_rework(&mut c, "w1", tid, TTL, 510).unwrap();
+
         // Rework crash → open, recovery_attempts = 1
         apply_event(
             &mut c,
@@ -3667,6 +3781,9 @@ mod tests {
             t.recovery_attempts, 2,
             "VerdictChanges must not touch counter"
         );
+
+        // Install remediation lease (as the daemon would after VerdictChanges).
+        claim_remediation_rework(&mut c, "w1", tid, TTL, 1010).unwrap();
 
         // ReworkPushed → in-review (resets counter)
         let tr = apply_event(&mut c, "w1", tid, &Event::ReworkPushed, 1100).unwrap();
@@ -4131,5 +4248,284 @@ mod tests {
         let error = clear_codex_retry_refs(Some("{")).unwrap_err();
         assert_eq!(error.exit_code(), 3);
         assert!(error.to_string().contains("invalid persisted refs JSON"));
+    }
+
+    // ── claim_remediation_rework (#199) ─────────────────────────────────────
+
+    #[test]
+    fn remediation_claim_installs_lease_and_sets_author() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        // Working → InReview
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        // InReview → Rework (VerdictChanges releases the stale lease)
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "rework");
+        // The stale worker lease was released by VerdictChanges.
+        assert!(!has_live_lease(&c, id, 1300));
+
+        // Remediation claim.
+        let claimed = claim_remediation_rework(&mut c, "REM1", id, TTL, 1400).unwrap();
+        assert!(claimed.is_some());
+        let t = claimed.unwrap();
+        assert_eq!(t.status, "rework");
+        assert_eq!(t.assignee.as_deref(), Some("REM1"));
+        assert_eq!(t.author.as_deref(), Some("REM1"));
+        assert!(has_live_lease(&c, id, 1400));
+
+        // Lease survives sweep.
+        crate::sweep::sweep_on_write(&c, 1500, 100).unwrap();
+        let t2 = get(&c, id).unwrap().unwrap();
+        assert_eq!(
+            t2.status, "rework",
+            "rework must survive sweep after lease installed"
+        );
+    }
+
+    #[test]
+    fn remediation_claim_verdict_then_sweep_regression() {
+        // Regression for #199: VerdictChanges followed by an intervening
+        // sweep_on_write must not erase rework when a remediation lease exists.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "99".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+
+        // Remediation claim installs lease.
+        claim_remediation_rework(&mut c, "REM1", id, TTL, 1400).unwrap();
+
+        // Simulate multiple intervening writes triggering sweep.
+        for t in 1500..1510 {
+            crate::sweep::sweep_on_write(&c, t, 100).unwrap();
+        }
+
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "rework", "rework must survive repeated sweeps");
+        assert_eq!(t.assignee.as_deref(), Some("REM1"));
+    }
+
+    #[test]
+    fn remediation_lease_renewed_by_phase_4d() {
+        // Active remediation worker's lease is renewed through renew_task_lease.
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+        claim_remediation_rework(&mut c, "REM1", id, TTL, 1400).unwrap();
+
+        // Original lease expires at 1400 + TTL = 5000. Renew at 4900.
+        crate::agents::renew_task_lease(&c, "REM1", id, 4900).unwrap();
+
+        // Check extended expiry.
+        let exp: i64 = c
+            .query_row(
+                "SELECT expires_at FROM claims WHERE target=?1 AND holder='REM1' AND active=1",
+                params![lease_target(id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exp, 4900 + DEFAULT_LEASE_TTL_SECS);
+
+        // Task survives sweep well past the original expiry.
+        crate::sweep::sweep_on_write(&c, 5100, 100).unwrap();
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(
+            t.status, "rework",
+            "renewed lease must protect rework from reaper"
+        );
+    }
+
+    #[test]
+    fn two_remediation_claimants_exactly_one_winner() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+
+        let first = claim_remediation_rework(&mut c, "REM1", id, TTL, 1400).unwrap();
+        assert!(first.is_some(), "first claimant must win");
+
+        let second = claim_remediation_rework(&mut c, "REM2", id, TTL, 1401).unwrap();
+        assert!(
+            second.is_none(),
+            "second claimant must lose to partial unique index"
+        );
+
+        // First claimant's lease is still active.
+        let holder: String = c
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1 AND expires_at > ?2",
+                params![lease_target(id), 1401],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder, "REM1");
+
+        // Zero errors for the normal lost race.
+        let err_count: i64 = c
+            .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(err_count, 0, "lost race must not produce error rows");
+    }
+
+    #[test]
+    fn remediation_claim_fails_if_task_not_in_rework() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        // Task is in open — claim must fail.
+        let result = claim_remediation_rework(&mut c, "REM1", id, TTL, 1100).unwrap();
+        assert!(result.is_none());
+
+        // Task in working — claim must fail.
+        claim(&mut c, "W1", Some(id), &[], TTL, 1200).unwrap();
+        let result = claim_remediation_rework(&mut c, "REM1", id, TTL, 1300).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn release_remediation_lease_cleans_up() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+        claim_remediation_rework(&mut c, "REM1", id, TTL, 1400).unwrap();
+
+        // Simulate provisioning failure.
+        release_remediation_lease(&mut c, "REM1", id, 1500).unwrap();
+
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "rework", "task stays in rework after release");
+        assert!(t.assignee.is_none(), "assignee cleared on release");
+        assert!(
+            !has_live_lease(&c, id, 1500),
+            "lease deactivated on release"
+        );
+
+        // Event emitted.
+        let evs = crate::events::list(&c, 0, Some(&lease_target(id)), 20, 1500).unwrap();
+        assert!(
+            evs.iter().any(|e| e.kind == "remediation_lease_released"),
+            "remediation_lease_released event must be emitted"
+        );
+    }
+
+    #[test]
+    fn remediation_exact_expiry_boundary() {
+        // At expires_at == now, the claim is DEAD (invariant: DEAD iff
+        // expires_at <= now).
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+
+        let short_ttl = 100;
+        claim_remediation_rework(&mut c, "REM1", id, short_ttl, 1400).unwrap();
+
+        // At exact expiry (1400 + 100 = 1500), claim is dead.
+        assert!(!has_live_lease(&c, id, 1500), "claim dead at exact expiry");
+
+        // Reaper fires (grace window has also passed: updated_at=1400,
+        // grace=60, so 1400+60=1460 < 1500).
+        crate::sweep::reap_lapsed_tasks(&c, 1500, 100).unwrap();
+        let t = get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "open", "expired remediation lease must be reaped");
     }
 }
