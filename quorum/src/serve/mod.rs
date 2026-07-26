@@ -7631,7 +7631,45 @@ async fn spawn_remediation_worker(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
 
-    let remediation_kind = resolve_provider(&config.model).unwrap_or(runner::AgentKind::Claude);
+    // Recover the original worker's provider and model from agent_runs so
+    // remediation cannot silently switch providers (e.g. tier:o3 task reworked
+    // as Claude because the daemon default is Claude).
+    let (remediation_model, remediation_kind) = {
+        let p = db_path.clone();
+        let tid = task_id;
+        let cfg_model = config.model.clone();
+        let cfg_kind = config.runner_kind;
+        tokio::task::spawn_blocking(move || -> (String, runner::AgentKind) {
+            let conn = match quorum_core::db::open(&p) {
+                Ok(c) => c,
+                Err(_) => return (cfg_model, runner_kind_to_agent_kind(cfg_kind)),
+            };
+            let provider = quorum_core::agent_runs::worker_provider(&conn, tid)
+                .ok()
+                .flatten();
+            let model = quorum_core::agent_runs::worker_model(&conn, tid)
+                .ok()
+                .flatten()
+                .unwrap_or(cfg_model);
+            let kind = provider
+                .and_then(|p| match p.as_str() {
+                    "claude" => Some(runner::AgentKind::Claude),
+                    "codex" => Some(runner::AgentKind::Codex),
+                    _ => None,
+                })
+                .or_else(|| resolve_provider(&model).ok())
+                .unwrap_or_else(|| runner_kind_to_agent_kind(cfg_kind));
+            (model, kind)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                config.model.clone(),
+                runner_kind_to_agent_kind(config.runner_kind),
+            )
+        })
+    };
+    let remediation_effort = config.effort.clone();
 
     // For Codex rework: look up persisted thread_id for continuation.
     let codex_thread_id = if remediation_kind == runner::AgentKind::Codex {
@@ -7657,8 +7695,8 @@ async fn spawn_remediation_worker(
         runner::AgentKind::Claude => agent::AgentProc::spawn(
             &agent::AgentSpec {
                 kind: runner::AgentKind::Claude,
-                model: config.model.clone(),
-                effort: config.effort.clone(),
+                model: remediation_model.clone(),
+                effort: remediation_effort.clone(),
                 session_id: session_id.clone(),
                 worktree: wt_path.clone(),
                 bare: config.bare_agent,
@@ -7675,8 +7713,8 @@ async fn spawn_remediation_worker(
         runner::AgentKind::Codex => if let Some(ref tid) = codex_thread_id {
             codex_agent::CodexProc::spawn_resume(
                 tid,
-                &config.model,
-                &config.effort,
+                &remediation_model,
+                &remediation_effort,
                 &config.codex_sandbox,
                 &wt_path,
                 &prompt,
@@ -7687,8 +7725,8 @@ async fn spawn_remediation_worker(
             log("remediation: no persisted thread_id — starting fresh Codex exec");
             codex_agent::CodexProc::spawn(
                 &codex_agent::CodexSpec {
-                    model: config.model.clone(),
-                    effort: config.effort.clone(),
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
                     sandbox: config.codex_sandbox.clone(),
                     worktree: wt_path.clone(),
                     prompt: prompt.clone(),
@@ -7718,8 +7756,8 @@ async fn spawn_remediation_worker(
             let worker_run_id = {
                 let p = db_path.clone();
                 let name = agent_name.clone();
-                let m = config.model.clone();
-                let e = config.effort.clone();
+                let m = remediation_model.clone();
+                let e = remediation_effort.clone();
                 let prov = remediation_provider_str;
                 let tid = task_id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
@@ -7746,8 +7784,8 @@ async fn spawn_remediation_worker(
                 proc,
                 task_id,
                 session_id,
-                model: config.model.clone(),
-                effort: config.effort.clone(),
+                model: remediation_model.clone(),
+                effort: remediation_effort.clone(),
                 worktree_path: wt_path,
                 branch,
                 draining: true,
