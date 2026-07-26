@@ -295,20 +295,41 @@ impl Case {
     }
 }
 
-fn providers(runs: &[quorum_core::agent_runs::AgentRun]) -> Vec<&str> {
+fn run_routes(runs: &[quorum_core::agent_runs::AgentRun]) -> Vec<(&str, Option<&str>, &str, &str)> {
     runs.iter()
         .filter(|run| run.role == "worker" || run.role == "reviewer")
-        .map(|run| run.provider.as_deref().unwrap())
+        .map(|run| {
+            (
+                run.role.as_str(),
+                run.sub_role.as_deref(),
+                run.model.as_str(),
+                run.provider.as_deref().unwrap(),
+            )
+        })
         .collect()
 }
 
 #[test]
 fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
     let claude = Case::start("claude", "claude-opus-4-6", None).finish();
-    assert_eq!(providers(&claude), ["claude", "claude", "claude"]);
+    assert_eq!(
+        run_routes(&claude),
+        [
+            ("worker", None, "claude-opus-4-6", "claude"),
+            ("reviewer", None, "claude-opus-4-7", "claude"),
+            ("reviewer", Some("r2"), "claude-opus-4-7", "claude"),
+        ]
+    );
 
     let codex = Case::start("codex", "o3", None).finish();
-    assert_eq!(providers(&codex), ["codex", "codex", "codex"]);
+    assert_eq!(
+        run_routes(&codex),
+        [
+            ("worker", None, "o3", "codex"),
+            ("reviewer", None, "o3", "codex"),
+            ("reviewer", Some("r2"), "o3", "codex"),
+        ]
+    );
 
     let mixed = Case::start(
         "claude",
@@ -316,7 +337,14 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
         Some(r#"["tier:o3","effort:high"]"#),
     )
     .finish();
-    assert_eq!(providers(&mixed), ["codex", "claude", "claude"]);
+    assert_eq!(
+        run_routes(&mixed),
+        [
+            ("worker", None, "o3", "codex"),
+            ("reviewer", None, "claude-opus-4-6", "claude"),
+            ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
+        ]
+    );
 }
 
 #[test]
@@ -349,10 +377,20 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
     );
     case.handle.wait_for("rework #1 started");
     case.handle.wait_for("turn");
+    let expected_thread = format!("thread-{worker}");
+    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        refs["codex_thread_id"].as_str(),
+        Some(expected_thread.as_str()),
+        "the original worker's provider thread must be durable before remediation"
+    );
     let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let expected_resume = format!("{worker}|exec resume {expected_thread} --json ");
     assert!(
-        log.contains("exec resume thread-"),
-        "Codex remediation must resume the provider thread: {log}"
+        log.lines().any(|line| line.starts_with(&expected_resume)),
+        "Codex remediation must resume the original worker's exact provider thread \
+         ({expected_resume:?}): {log}"
     );
     case.done(&worker, &["--pr", "1"]);
     case.handle.wait_for("ResumeReviewer: fed re-review turn");
@@ -373,6 +411,15 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(task.status, "done");
     let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        run_routes(&runs),
+        [
+            ("worker", None, "o3", "codex"),
+            ("reviewer", None, "claude-opus-4-6", "claude"),
+            ("reviewer", None, "claude-opus-4-6", "claude"),
+            ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
+        ]
+    );
     let workers: Vec<_> = runs.iter().filter(|run| run.role == "worker").collect();
     assert_eq!(
         workers.len(),
