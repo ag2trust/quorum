@@ -24,12 +24,15 @@ pub const REWORK_PROVISIONING_GRACE_SECS: i64 = 60;
 /// lease on `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed`
 /// event per task to the event log.
 pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    let lapsed: Vec<(i64, Option<String>)> = {
+    // (id, assignee, review_only, had_any_lease_ever)
+    let lapsed: Vec<(i64, Option<String>, bool, bool)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, assignee FROM tasks
-             WHERE status IN ('working', 'rework') AND NOT EXISTS (
+            "SELECT t.id, t.assignee, t.review_only,
+                    EXISTS(SELECT 1 FROM claims c WHERE c.target = 'task#' || t.id) AS had_lease
+             FROM tasks t
+             WHERE t.status IN ('working', 'rework') AND NOT EXISTS (
                  SELECT 1 FROM claims c
-                 WHERE c.target = 'task#' || tasks.id AND c.active=1 AND c.expires_at > ?1
+                 WHERE c.target = 'task#' || t.id AND c.active=1 AND c.expires_at > ?1
              )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
              LIMIT ?2",
@@ -37,28 +40,47 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
         let rows = stmt
             .query_map(
                 params![now, limit as i64, REWORK_PROVISIONING_GRACE_SECS],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get::<_, i64>(2)? != 0,
+                        r.get::<_, i64>(3)? != 0,
+                    ))
+                },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    for (id, prev) in &lapsed {
+    for (id, prev, review_only, had_lease) in &lapsed {
         let target = format!("task#{id}");
-        conn.execute(
-            "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1 WHERE id=?2",
-            params![now, id],
-        )?;
+        if *review_only {
+            // Review-only tasks recover to in-review so Phase 5b can reattach a reviewer.
+            // Clear reviewer so the orphan detector sees it as unattended.
+            conn.execute(
+                "UPDATE tasks SET status='in-review', assignee=NULL, reviewer=NULL, updated_at=?1 WHERE id=?2",
+                params![now, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1 WHERE id=?2",
+                params![now, id],
+            )?;
+        }
         // Clear any lingering (now-expired) lease row so the next claim starts clean.
         conn.execute(
             "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
             params![target],
         )?;
-        // Emit to the event log. Body carries the prev_assignee so consumers can identify
-        // whose work returned to the queue without parsing JSON; `subject = task#<id>` makes
-        // it filterable via `quorum log --refs task#<id>`.
+        let dest = if *review_only { "in-review" } else { "open" };
+        let reason = if *had_lease {
+            "lease lapsed"
+        } else {
+            "no lease installed"
+        };
         let body = match prev {
-            Some(a) => format!("reclaimed from {a} (lease lapsed) → open"),
-            None => "reclaimed (lease lapsed) → open".to_string(),
+            Some(a) => format!("reclaimed from {a} ({reason}) → {dest}"),
+            None => format!("reclaimed ({reason}) → {dest}"),
         };
         crate::events::emit(conn, "task_reclaimed", &target, &body, now)?;
     }
@@ -586,6 +608,215 @@ mod tests {
         assert_eq!(
             crate::tasks::get(&c, ch).unwrap().unwrap().status,
             "cancelled"
+        );
+    }
+
+    // ── Review-only reaper recovery (table-driven) ─────────────────
+
+    #[test]
+    fn reaper_review_only_and_impl_destinations() {
+        // Table-driven: review_only tasks recover to in-review,
+        // implementation tasks recover to open.
+        struct Case {
+            review_only: bool,
+            expected_status: &'static str,
+            label: &'static str,
+        }
+        let cases = [
+            Case {
+                review_only: false,
+                expected_status: "open",
+                label: "implementation→open",
+            },
+            Case {
+                review_only: true,
+                expected_status: "in-review",
+                label: "review_only→in-review",
+            },
+        ];
+        for case in &cases {
+            let (_d, mut c) = open_tmp();
+            let id = if case.review_only {
+                let id = crate::tasks::create(
+                    &mut c,
+                    "boss",
+                    "review task",
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(42),
+                    1000,
+                )
+                .unwrap();
+                // Move to rework to simulate VerdictChanges lifecycle path
+                c.execute(
+                    "UPDATE tasks SET status='rework', assignee='W1', reviewer='R1' WHERE id=?1",
+                    params![id],
+                )
+                .unwrap();
+                id
+            } else {
+                let id = crate::tasks::create(
+                    &mut c,
+                    "boss",
+                    "impl task",
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000,
+                )
+                .unwrap();
+                crate::tasks::claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+                id
+            };
+            // Ensure a claim exists that will lapse
+            if case.review_only {
+                c.execute(
+                    "INSERT INTO claims(target, holder, ts, expires_at, active) \
+                     VALUES (?1, 'W1', 1000, 1100, 1)",
+                    params![format!("task#{id}")],
+                )
+                .unwrap();
+            }
+
+            reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+            let t = crate::tasks::get(&c, id).unwrap().unwrap();
+            assert_eq!(t.status, case.expected_status, "{}", case.label);
+            assert!(
+                t.assignee.is_none(),
+                "{}: assignee must be cleared",
+                case.label
+            );
+
+            // Event body reports actual destination
+            let target = format!("task#{id}");
+            let evs = crate::events::list(&c, 0, Some(&target), 10, 1100).unwrap();
+            let body = &evs
+                .iter()
+                .find(|e| e.kind == "task_reclaimed")
+                .expect("task_reclaimed event missing")
+                .body;
+            assert!(
+                body.contains(case.expected_status),
+                "{}: event body must report '{}'",
+                case.label,
+                case.expected_status
+            );
+            assert!(
+                body.contains("lease lapsed"),
+                "{}: event body must say 'lease lapsed'",
+                case.label
+            );
+        }
+    }
+
+    #[test]
+    fn reaper_review_only_clears_reviewer_for_phase_5b() {
+        // Phase 5b reattaches reviewers to orphan in-review tasks with no live
+        // worker/reviewer. Clearing reviewer=NULL is required for that detection.
+        let (_d, mut c) = open_tmp();
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "review task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(42),
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework', assignee='W1', reviewer='R1' WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active) \
+             VALUES (?1, 'W1', 1000, 1050, 1)",
+            params![format!("task#{id}")],
+        )
+        .unwrap();
+
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        let t = crate::tasks::get(&c, id).unwrap().unwrap();
+        assert_eq!(t.status, "in-review");
+        assert!(
+            t.reviewer.is_none(),
+            "reviewer must be cleared so Phase 5b can reattach"
+        );
+        // PR, author provenance, and rework_round are preserved
+        assert!(t.review_only, "review_only flag must be preserved");
+        assert_eq!(t.rework_round, 0, "rework_round must be preserved");
+    }
+
+    #[test]
+    fn reaper_distinguishes_no_lease_from_expired_lease() {
+        let (_d, mut c) = open_tmp();
+        // Task in working with NO claim ever created (orphan scenario)
+        let id = crate::tasks::create(
+            &mut c, "boss", "orphan", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='working', assignee='W1' WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        let target = format!("task#{id}");
+        let evs = crate::events::list(&c, 0, Some(&target), 10, 1100).unwrap();
+        let body = &evs
+            .iter()
+            .find(|e| e.kind == "task_reclaimed")
+            .expect("task_reclaimed event missing")
+            .body;
+        assert!(
+            body.contains("no lease installed"),
+            "must say 'no lease installed' when no claim exists, got: {body}"
+        );
+        assert!(
+            !body.contains("lease lapsed"),
+            "must NOT say 'lease lapsed' when no claim existed"
+        );
+    }
+
+    #[test]
+    fn sweep_rollback_undoes_reaper_changes() {
+        // A rejected lifecycle transition (or any failure) in the same transaction
+        // as a sweep must roll back the reaper's changes.
+        let (_d, mut c) = open_tmp();
+        let id = crate::tasks::create(
+            &mut c, "boss", "impl", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, id).unwrap().unwrap().status,
+            "working"
+        );
+
+        // Begin explicit transaction, run sweep, then rollback
+        c.execute_batch("BEGIN IMMEDIATE").unwrap();
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, id).unwrap().unwrap().status,
+            "open",
+            "reaper must have transitioned within the txn"
+        );
+        c.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, id).unwrap().unwrap().status,
+            "working",
+            "rollback must undo the reaper's transition"
         );
     }
 
