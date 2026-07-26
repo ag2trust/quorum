@@ -574,6 +574,18 @@ pub fn resolve_floor(
     Ok((model, effort))
 }
 
+/// `min_model` is a Claude tier floor. Strict Codex mode cannot apply it
+/// without silently switching providers, so reject that configuration at
+/// startup instead of poisoning every worker task.
+pub fn validate_provider_floor(kind: RunnerKind, min_model: Option<&str>) -> Result<()> {
+    if kind == RunnerKind::Codex && min_model.is_some() {
+        return Err(QuorumError::Usage(
+            "provider=\"codex\" cannot use min_model — min_model accepts Claude tiers only".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that Codex runner is not combined with USD safety limits.
 /// Codex does not expose reliable per-turn USD cost; fabricating it would be unsafe.
 pub fn validate_codex_limits(
@@ -793,6 +805,19 @@ worktree_base = "/tmp/wt"
         let err = resolve_floor(Some("opus-47"), Some("low")).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("min_effort"), "{err}");
+    }
+
+    #[test]
+    fn strict_codex_rejects_claude_only_model_floor() {
+        let err = validate_provider_floor(RunnerKind::Codex, Some("opus-47")).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string()
+                .contains("provider=\"codex\" cannot use min_model"),
+            "{err}"
+        );
+        validate_provider_floor(RunnerKind::Claude, Some("opus-47")).unwrap();
+        validate_provider_floor(RunnerKind::Codex, None).unwrap();
     }
 
     #[test]

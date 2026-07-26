@@ -1180,6 +1180,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     r_effort.source
                 },
             };
+            serve_config::validate_provider_floor(runner_kind, file_cfg.min_model.as_deref())?;
             validate_codex_limits(runner_kind, r_max_turn_cost.value, r_max_task_cost.value)?;
             let codex_sandbox = file_cfg
                 .codex
