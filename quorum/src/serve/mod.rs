@@ -855,11 +855,29 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
     }
 }
 
-fn retry_slot_rework_count(rework_round: i64, retry: Option<&CodexRetryTurn>) -> u32 {
-    retry
-        .filter(|retry| retry.turn_kind == "rework")
-        .map(|_| u32::try_from(rework_round.max(1)).unwrap_or(u32::MAX))
-        .unwrap_or(0)
+fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
+    refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| {
+            refs.get(tasks::PARKED_REWORK_RETRY_REF)
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn retry_slot_rework_count(
+    rework_round: i64,
+    retry: Option<&CodexRetryTurn>,
+    daemon_retry: bool,
+) -> u32 {
+    if daemon_retry
+        || retry
+            .map(|retry| retry.turn_kind == "rework")
+            .unwrap_or(false)
+    {
+        u32::try_from(rework_round.max(1)).unwrap_or(u32::MAX)
+    } else {
+        0
+    }
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -3190,16 +3208,17 @@ async fn tick(
                             | merge::MergeFailureKind::PolicyPending => {
                                 log(&format!(
                                     "MERGE BLOCKED: PR #{pr_num} merge failed \
-                                     (not worker-fixable): {} — cancelling task",
+                                     (not worker-fixable): {} — parking task",
                                     merge_result.message
                                 ));
-                                fire_event(
+                                park_task(
                                     &db_path,
-                                    "system",
                                     reviewer_task_id,
-                                    &Event::Cancelled {
-                                        by: "daemon".into(),
-                                    },
+                                    &format!(
+                                        "merge policy blocked PR #{pr_num}: {}",
+                                        merge_result.message
+                                    ),
+                                    "merging",
                                 )
                                 .await;
                                 let r = reviewers.remove(ri);
@@ -3209,7 +3228,7 @@ async fn tick(
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
                                     let w = workers.remove(wi);
-                                    cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled")
+                                    cleanup_slot(config, wt_mgr, name_pool, w, None, "parked")
                                         .await;
                                 }
                             }
@@ -4348,21 +4367,14 @@ async fn tick(
             let strikes = poison_tracker.record_strike(dead.task_id);
             if strikes >= MAX_POISON_STRIKES {
                 let task_id = dead.task_id;
-                fire_event(
+                park_task(
                     &db_path,
-                    "daemon",
                     task_id,
-                    &Event::Cancelled {
-                        by: format!(
-                            "daemon: poisoned — worker died {strikes} time(s) without producing output"
-                        ),
-                    },
+                    &format!("worker died {strikes} time(s) without producing output"),
+                    "open",
                 )
                 .await;
-                cleanup_slot(config, wt_mgr, name_pool, dead, None, "cancelled").await;
-                log(&format!(
-                    "POISON: task #{task_id} cancelled after {strikes} strikes"
-                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
             } else {
                 log(&format!(
                     "POISON: task #{} strike {strikes}/{MAX_POISON_STRIKES}",
@@ -4712,22 +4724,16 @@ async fn tick(
             let pr_label =
                 w.pr.map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "unknown".to_string());
-            fire_event(
+            park_task(
                 &db_path,
-                &w.agent_name,
                 w.task_id,
-                &Event::Cancelled {
-                    by: "daemon:parked:repo-mismatch".into(),
-                },
+                &format!(
+                    "repo mismatch: PR {pr_label} belongs to {task_repo}, not {}",
+                    config.repo
+                ),
+                "in-review",
             )
             .await;
-            let body = format!(
-                "{}repo-mismatch | PR {pr_label} belongs to {task_repo}, \
-                 not {} — cannot provision reviewer from this daemon",
-                tasks::PARKED_BODY_PREFIX,
-                config.repo
-            );
-            set_task_body(&db_path, w.task_id, &body).await;
             notify_provision_failure(
                 &db_path,
                 w.task_id,
@@ -4735,30 +4741,21 @@ async fn tick(
                 &pr_label,
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled").await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
         for &wi in parked_workers.iter().rev() {
             let w = workers.remove(wi);
             let pr_label =
                 w.pr.map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "unknown".to_string());
-            fire_event(
-                &db_path,
-                &w.agent_name,
-                w.task_id,
-                &Event::Cancelled {
-                    by: "daemon:provision-exhausted".into(),
-                },
-            )
-            .await;
-            set_task_body(
+            park_task(
                 &db_path,
                 w.task_id,
                 &format!(
-                    "{}provision-exhausted | PR {pr_label} | \
-                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
-                    tasks::PARKED_BODY_PREFIX
+                    "reviewer provision exhausted for PR {pr_label} after \
+                     {MAX_REVIEWER_PROVISION_STRIKES} attempts"
                 ),
+                "in-review",
             )
             .await;
             notify_provision_failure(
@@ -4768,7 +4765,7 @@ async fn tick(
                 &pr_label,
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled").await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
 
         // ── Phase 5b: Spawn reviewers for orphan in-review tasks ──────
@@ -4879,22 +4876,16 @@ async fn tick(
                      belongs to {other_repo}, not {} — parking",
                     config.repo
                 ));
-                fire_event(
+                park_task(
                     &db_path,
-                    "daemon",
                     *task_id,
-                    &Event::Cancelled {
-                        by: "daemon:parked:repo-mismatch".into(),
-                    },
+                    &format!(
+                        "repo mismatch: PR #{pr} belongs to {other_repo}, not {}",
+                        config.repo
+                    ),
+                    "in-review",
                 )
                 .await;
-                let body = format!(
-                    "{}repo-mismatch | PR #{pr} belongs to {other_repo}, \
-                     not {} — cannot provision reviewer from this daemon",
-                    tasks::PARKED_BODY_PREFIX,
-                    config.repo
-                );
-                set_task_body(&db_path, *task_id, &body).await;
                 notify_provision_failure(
                     &db_path,
                     *task_id,
@@ -4942,23 +4933,11 @@ async fn tick(
                         "orphan in-review task #{task_id} PR #{pr}: \
                          provision exhausted — parking"
                     ));
-                    fire_event(
-                        &db_path,
-                        "daemon",
-                        *task_id,
-                        &Event::Cancelled {
-                            by: "daemon:parked:provision-exhausted".into(),
-                        },
-                    )
-                    .await;
-                    set_task_body(
+                    park_task(
                         &db_path,
                         *task_id,
-                        &format!(
-                            "{}provision-exhausted | PR #{pr} | \
-                             reviewer provision failed (orphan in-review)",
-                            tasks::PARKED_BODY_PREFIX
-                        ),
+                        &format!("reviewer provision exhausted for orphan PR #{pr}"),
+                        "in-review",
                     )
                     .await;
                     notify_provision_failure(
@@ -6498,7 +6477,10 @@ async fn spawn_worker(
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
-                .filter(|task| codex_retry_turn(task.refs.as_deref()).is_some()),
+                .filter(|task| {
+                    codex_retry_turn(task.refs.as_deref()).is_some()
+                        || daemon_rework_retry_requested(task.refs.as_deref())
+                }),
         );
         let found = available.into_iter().find(|t| {
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
@@ -6982,7 +6964,11 @@ async fn spawn_worker(
                     .as_deref()
                     .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
                     .and_then(|refs| refs.get("pr").and_then(|pr| pr.as_i64())),
-                rework_count: retry_slot_rework_count(task.rework_round, retry_turn.as_ref()),
+                rework_count: retry_slot_rework_count(
+                    task.rework_round,
+                    retry_turn.as_ref(),
+                    daemon_rework_retry_requested(task.refs.as_deref()),
+                ),
                 cost_tokens: 0,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -7044,27 +7030,28 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
 }
 
 async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strikes: u32) {
-    log(&format!(
-        "POISON: task #{task_id} cancelled after {strikes} consecutive instant-death failures"
-    ));
+    let reason = format!("worker {agent} died {strikes} time(s) without producing output");
+    park_task(db_path, task_id, &reason, "open").await;
+}
+
+async fn park_task(db_path: &std::path::Path, task_id: i64, reason: &str, resume_status: &str) {
+    log(&format!("PARKED: task #{task_id}: {reason}"));
     let p = db_path.to_path_buf();
-    let a = agent.to_string();
-    let body = format!("daemon: poisoned — worker died {strikes} time(s) without producing output");
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let reason = reason.to_string();
+    let resume_status = resume_status.to_string();
+    match tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
-        let now = now_unix();
-        let fields = tasks::TaskUpdate {
-            status: Some("cancelled"),
-            body: Some(&body),
-            refs: None,
-            verdict: None,
-            depends_on: None,
-        };
-        tasks::update(&mut conn, &a, task_id, &fields, now)?;
+        tasks::park(&mut conn, task_id, &reason, &resume_status, now_unix())?;
         Ok(())
     })
     .await
-    .ok();
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!("FATAL: failed to park task #{task_id}: {error}")),
+        Err(error) => log(&format!(
+            "FATAL: park task #{task_id} join failure: {error}"
+        )),
+    }
 }
 
 /// Fire a lifecycle event, returning the result or an error description.
@@ -8897,7 +8884,7 @@ mod tests {
         assert_eq!(queued.status, "rework");
         assert!(queued.assignee.is_none());
         let retry = codex_retry_turn(queued.refs.as_deref()).unwrap();
-        let reconstructed_count = retry_slot_rework_count(queued.rework_round, Some(&retry));
+        let reconstructed_count = retry_slot_rework_count(queued.rework_round, Some(&retry), false);
         let event = worker_done_event(reconstructed_count, 419);
         assert!(matches!(event, Event::ReworkPushed));
 

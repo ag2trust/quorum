@@ -349,6 +349,31 @@ fn policy_blocked_merge_parks_task_no_rework() {
 
     handle.stop();
 
+    let retry_branch = format!("daemon/{}-t1", worker_name.to_lowercase());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "branch",
+            "-f",
+            &retry_branch,
+            "main",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "push",
+            "origin",
+            &retry_branch,
+        ])
+        .status()
+        .unwrap()
+        .success());
+
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -358,9 +383,73 @@ fn policy_blocked_merge_parks_task_no_rework() {
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
-        stdout.contains("\"status\":\"cancelled\"") || stdout.contains("\"status\": \"cancelled\""),
-        "task should be cancelled after policy-blocked merge, got: {stdout}"
+        stdout.contains("\"status\":\"failed\"") || stdout.contains("\"status\": \"failed\""),
+        "task should be parked after policy-blocked merge, got: {stdout}"
     );
+    assert!(stdout.contains("daemon_resume_status"));
+    assert!(stdout.contains("merging"));
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-retry", "--task-id", "1", "--by", "operator"])
+        .output()
+        .unwrap();
+    assert!(retry.status.success());
+    let retry_stdout = String::from_utf8_lossy(&retry.stdout);
+    assert!(
+        retry_stdout.contains("\"status\":\"in-review\""),
+        "retry must restore the review stage that can safely re-drive merge: {retry_stdout}"
+    );
+
+    std::fs::write(
+        &names_file,
+        (0..20)
+            .map(|i| format!("RetryAgent{i}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let mut retry_handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "exit 0",
+        &[],
+    );
+    assert!(
+        retry_handle.wait_for("spawning reviewer", 15),
+        "retried merge did not provision a fresh reviewer: {:?}",
+        retry_handle.lines
+    );
+    let retry_reviewer = retry_handle
+        .extract_agent_name("spawning reviewer ")
+        .expect("could not extract retry reviewer");
+    assert!(
+        retry_handle.wait_for("result", 15),
+        "retry reviewer result not seen: {:?}",
+        retry_handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &retry_reviewer,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut retry_handle, "1");
+    assert!(
+        retry_handle.wait_for("PR #1 merged —", 15),
+        "retried task never reached a second merge attempt: {:?}",
+        retry_handle.lines
+    );
+    retry_handle.stop();
 }
 
 #[test]

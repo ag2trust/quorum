@@ -425,10 +425,10 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
 
     // Recovery incremented counter to 2, task is now open. Die-agent spawns
     // and dies: count→3, task reopens. Spawns again and dies: check 3>=3 →
-    // cancelled. The daemon logs the lifecycle transition.
+    // failed/parked. The daemon logs the lifecycle transition.
     assert!(
-        handle.wait_for("-> cancelled", 30),
-        "task not cancelled after restart + budget exhaustion. Lines: {:?}",
+        handle.wait_for("-> failed", 30),
+        "task not parked after restart + budget exhaustion. Lines: {:?}",
         handle.lines
     );
 
@@ -439,8 +439,8 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
 
     let task = env.task(task_id);
     assert_eq!(
-        task.status, "cancelled",
-        "task must be cancelled after budget exhaustion"
+        task.status, "failed",
+        "task must be parked after budget exhaustion"
     );
     assert_eq!(
         task.recovery_attempts,
@@ -449,9 +449,9 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
         quorum_core::tasks::MAX_RECOVERY_ATTEMPTS
     );
 
-    // No further worker spawns after cancellation
-    let cancel_idx = handle.lines.iter().position(|l| l.contains("-> cancelled"));
-    if let Some(idx) = cancel_idx {
+    // No further worker spawns after parking.
+    let park_idx = handle.lines.iter().position(|l| l.contains("-> failed"));
+    if let Some(idx) = park_idx {
         let spawns_after = handle.lines[idx..]
             .iter()
             .filter(|l| l.contains("spawning agent") && l.contains(&format!("task #{task_id}")))
@@ -462,18 +462,16 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
         );
     }
 
-    // Events table must contain task_cancelled event
+    // Events table records failure, never cancellation.
     let events = env.events_for_task(task_id);
-    let cancel_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.kind == "task_cancelled")
-        .collect();
+    let failed_events: Vec<_> = events.iter().filter(|e| e.kind == "task_failed").collect();
     assert_eq!(
-        cancel_events.len(),
+        failed_events.len(),
         1,
-        "exactly one task_cancelled event expected, got {}",
-        cancel_events.len()
+        "exactly one task_failed event expected, got {}",
+        failed_events.len()
     );
+    assert!(!events.iter().any(|e| e.kind == "task_cancelled"));
 
     // Messages table must contain the owner alert with failure cause
     let msgs = env.messages_for_task(task_id);
@@ -501,6 +499,101 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
         );
     }
 
+    handle.sigkill();
+}
+
+#[test]
+fn explicit_retry_of_parked_rework_spawns_replacement_worker() {
+    let env = TestEnv::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let task_id = {
+        let mut conn = quorum_core::db::open(&env.db_path).unwrap();
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "Parked rework retry",
+            Some("preserve original context"),
+            0,
+            None,
+            None,
+            None,
+            Some(1),
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='rework', assignee='dead-worker', author='Agent0',
+                 rework_round=1, review_only=0
+             WHERE id=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        quorum_core::tasks::park(
+            &mut conn,
+            id,
+            "recovery budget exhausted",
+            "rework",
+            now + 1,
+        )
+        .unwrap()
+        .unwrap();
+        id
+    };
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", env.home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-retry",
+            "--task-id",
+            &task_id.to_string(),
+            "--by",
+            "operator",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "task-retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+
+    let fake_agent = cargo_bin("fake-agent");
+    let mut handle = env.start_serve_with_bin(&fake_agent.to_string_lossy());
+    let spawned = handle.wait_for("spawning agent", 15);
+    let after_wait = env.task(task_id);
+    assert!(
+        spawned,
+        "retried rework never reached worker spawn; task={after_wait:?}; lines={:?}",
+        handle.lines,
+    );
+    assert!(
+        handle.lines.iter().any(|line| {
+            line.contains("spawning agent") && line.contains(&format!("task #{task_id}"))
+        }),
+        "retried rework must spawn a replacement worker: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("worktree provisioned", 15),
+        "replacement worker never completed claim/provision: {:?}",
+        handle.lines
+    );
+
+    let task = env.task(task_id);
+    assert!(
+        task.assignee.is_some() || task.status == "in-review",
+        "replacement must claim or complete the same task, got: {task:?}"
+    );
+    let events = env.events_for_task(task_id);
+    assert!(
+        events.iter().any(|event| event.kind == "task_claimed"),
+        "replacement claim must be durable: {events:?}"
+    );
     handle.sigkill();
 }
 
@@ -848,7 +941,7 @@ fn exhaustion_produces_durable_diagnostics() {
     };
 
     // Start daemon — the die-agent will exit, daemon detects death and fires
-    // the 4th AgentFailed → budget exhausted → cancelled
+    // the 4th AgentFailed → budget exhausted → failed/parked
     let mut handle = env.start_serve();
 
     // Recovery fires AgentFailed for the working task (it was working when
@@ -859,14 +952,14 @@ fn exhaustion_produces_durable_diagnostics() {
         handle.lines
     );
 
-    // The recovery AgentFailed should cancel it (attempts=3, check >=3 → cancel)
+    // The recovery AgentFailed should park it (attempts=3, check >=3).
     std::thread::sleep(Duration::from_millis(1000));
     handle.drain_pending_lines();
 
     let task = env.task(task_id);
     assert_eq!(
-        task.status, "cancelled",
-        "task must be cancelled after budget exhaustion. Lines: {:?}",
+        task.status, "failed",
+        "task must be parked after budget exhaustion. Lines: {:?}",
         handle.lines
     );
 
@@ -879,29 +972,25 @@ fn exhaustion_produces_durable_diagnostics() {
         msgs
     );
 
-    // Durable diagnostics: task_cancelled event in events table
+    // Durable diagnostics: failed event and no cancellation event.
     let events = env.events_for_task(task_id);
-    let cancel_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.kind == "task_cancelled")
-        .collect();
+    let failed_events: Vec<_> = events.iter().filter(|e| e.kind == "task_failed").collect();
     assert!(
-        !cancel_events.is_empty(),
-        "events table must contain task_cancelled event"
+        !failed_events.is_empty(),
+        "events table must contain task_failed event"
     );
+    assert!(!events.iter().any(|e| e.kind == "task_cancelled"));
 
-    // No worker must spawn for a cancelled task
+    // No worker must spawn for a parked task.
     let spawns_for_task: Vec<_> = handle
         .lines
         .iter()
         .filter(|l| l.contains("spawning agent") && l.contains(&format!("task #{task_id}")))
         .collect();
-    // After cancellation, there should be zero spawns (recovery cancelled it
-    // before Phase 6 could pick it up)
-    // The task was cancelled during recovery, so no spawn should happen at all
+    // The task was parked during recovery, so no spawn should happen at all.
     assert!(
         spawns_for_task.is_empty(),
-        "no worker should spawn for a task cancelled during recovery. Found: {:?}",
+        "no worker should spawn for a task parked during recovery. Found: {:?}",
         spawns_for_task
     );
 
