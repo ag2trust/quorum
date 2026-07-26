@@ -308,16 +308,40 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Rework, Event::ReworkPushed) => {
             Ok((Status::InReview, vec![Effect::ResumeReviewer]))
         }
-        (Status::Rework, Event::AgentFailed { reason }) => Ok((
-            Status::Open,
-            vec![
-                Effect::ReleaseLease,
-                Effect::NotifyOwner {
-                    reason: reason.clone(),
-                },
-            ],
-        )),
-        (Status::Rework, Event::LeaseExpired) => Ok((Status::Open, vec![Effect::ReleaseLease])),
+        (Status::Rework, Event::AgentFailed { reason }) => {
+            if t.review_only {
+                Ok((
+                    Status::InReview,
+                    vec![
+                        Effect::ReleaseLease,
+                        Effect::NotifyOwner {
+                            reason: reason.clone(),
+                        },
+                        Effect::SpawnReviewer,
+                    ],
+                ))
+            } else {
+                Ok((
+                    Status::Open,
+                    vec![
+                        Effect::ReleaseLease,
+                        Effect::NotifyOwner {
+                            reason: reason.clone(),
+                        },
+                    ],
+                ))
+            }
+        }
+        (Status::Rework, Event::LeaseExpired) => {
+            if t.review_only {
+                Ok((
+                    Status::InReview,
+                    vec![Effect::ReleaseLease, Effect::SpawnReviewer],
+                ))
+            } else {
+                Ok((Status::Open, vec![Effect::ReleaseLease]))
+            }
+        }
         (Status::Rework, Event::Cancelled { by }) => Ok((
             Status::Cancelled,
             vec![
@@ -875,6 +899,88 @@ mod tests {
             &Event::LeaseExpired,
             Status::Open,
             &[Effect::ReleaseLease],
+        );
+    }
+
+    // ── Review-only rework recovery (table-driven) ─────────────────
+    // review_only tasks must recover to InReview; implementation tasks to Open.
+
+    #[test]
+    fn rework_recovery_destinations_by_review_only() {
+        struct Case {
+            review_only: bool,
+            event: Event,
+            expected_status: Status,
+            label: &'static str,
+        }
+        let cases = [
+            Case {
+                review_only: false,
+                event: Event::AgentFailed { reason: "x".into() },
+                expected_status: Status::Open,
+                label: "impl+AgentFailed→Open",
+            },
+            Case {
+                review_only: true,
+                event: Event::AgentFailed { reason: "x".into() },
+                expected_status: Status::InReview,
+                label: "review_only+AgentFailed→InReview",
+            },
+            Case {
+                review_only: false,
+                event: Event::LeaseExpired,
+                expected_status: Status::Open,
+                label: "impl+LeaseExpired→Open",
+            },
+            Case {
+                review_only: true,
+                event: Event::LeaseExpired,
+                expected_status: Status::InReview,
+                label: "review_only+LeaseExpired→InReview",
+            },
+        ];
+        for case in &cases {
+            let mut t = view(Status::Rework);
+            t.review_only = case.review_only;
+            t.pr = Some("42".into());
+            let (next, _) =
+                transition(&t, &case.event).unwrap_or_else(|e| panic!("{}: {e}", case.label));
+            assert_eq!(next, case.expected_status, "{}", case.label);
+        }
+    }
+
+    #[test]
+    fn rework_agent_failed_review_only_spawns_reviewer() {
+        let mut t = view(Status::Rework);
+        t.review_only = true;
+        t.pr = Some("42".into());
+        t.author = Some("W1".into());
+        assert_ok(
+            &t,
+            &Event::AgentFailed {
+                reason: "crash".into(),
+            },
+            Status::InReview,
+            &[
+                Effect::ReleaseLease,
+                Effect::NotifyOwner {
+                    reason: "crash".into(),
+                },
+                Effect::SpawnReviewer,
+            ],
+        );
+    }
+
+    #[test]
+    fn rework_lease_expired_review_only_spawns_reviewer() {
+        let mut t = view(Status::Rework);
+        t.review_only = true;
+        t.pr = Some("42".into());
+        assert_ok(
+            &t,
+            &Event::LeaseExpired,
+            Status::InReview,
+            &[Effect::ReleaseLease, Effect::SpawnReviewer],
         );
     }
 
