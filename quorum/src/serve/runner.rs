@@ -77,6 +77,23 @@ impl RunnerProc {
     }
 }
 
+impl AgentKind {
+    /// Resolve provider from the model string chosen for a managed run.
+    /// Known Codex/OpenAI prefixes route to Codex; everything else
+    /// (including short Claude aliases like "sonnet") defaults to Claude.
+    pub fn for_model(model: &str) -> Self {
+        if model.starts_with("o1-")
+            || model.starts_with("o3-")
+            || model.starts_with("o4-")
+            || model.starts_with("gpt-")
+        {
+            Self::Codex
+        } else {
+            Self::Claude
+        }
+    }
+}
+
 impl std::fmt::Display for AgentKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -496,6 +513,35 @@ mod tests {
     fn agent_kind_display() {
         assert_eq!(AgentKind::Claude.to_string(), "claude");
         assert_eq!(AgentKind::Codex.to_string(), "codex");
+    }
+
+    #[test]
+    fn for_model_claude_prefix() {
+        assert_eq!(AgentKind::for_model("claude-sonnet-5"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("claude-opus-4-6"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("claude-opus-4-7"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("claude-opus-4-8"), AgentKind::Claude);
+    }
+
+    #[test]
+    fn for_model_codex_models() {
+        assert_eq!(AgentKind::for_model("o4-mini"), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("gpt-4o"), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("gpt-5.6-codex"), AgentKind::Codex);
+    }
+
+    #[test]
+    fn for_model_unknown_defaults_claude() {
+        assert_eq!(AgentKind::for_model("unknown-model"), AgentKind::Claude);
+    }
+
+    #[test]
+    fn for_model_short_claude_aliases() {
+        assert_eq!(AgentKind::for_model("sonnet"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("sonnet-5"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus-46"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus-47"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus-48"), AgentKind::Claude);
     }
 
     #[test]
