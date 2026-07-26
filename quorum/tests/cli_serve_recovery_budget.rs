@@ -502,6 +502,101 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
     handle.sigkill();
 }
 
+#[test]
+fn explicit_retry_of_parked_rework_spawns_replacement_worker() {
+    let env = TestEnv::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let task_id = {
+        let mut conn = quorum_core::db::open(&env.db_path).unwrap();
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "Parked rework retry",
+            Some("preserve original context"),
+            0,
+            None,
+            None,
+            None,
+            Some(1),
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='rework', assignee='dead-worker', author='Agent0',
+                 rework_round=1, review_only=0
+             WHERE id=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        quorum_core::tasks::park(
+            &mut conn,
+            id,
+            "recovery budget exhausted",
+            "rework",
+            now + 1,
+        )
+        .unwrap()
+        .unwrap();
+        id
+    };
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", env.home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-retry",
+            "--task-id",
+            &task_id.to_string(),
+            "--by",
+            "operator",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "task-retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+
+    let fake_agent = cargo_bin("fake-agent");
+    let mut handle = env.start_serve_with_bin(&fake_agent.to_string_lossy());
+    let spawned = handle.wait_for("spawning agent", 15);
+    let after_wait = env.task(task_id);
+    assert!(
+        spawned,
+        "retried rework never reached worker spawn; task={after_wait:?}; lines={:?}",
+        handle.lines,
+    );
+    assert!(
+        handle.lines.iter().any(|line| {
+            line.contains("spawning agent") && line.contains(&format!("task #{task_id}"))
+        }),
+        "retried rework must spawn a replacement worker: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("worktree provisioned", 15),
+        "replacement worker never completed claim/provision: {:?}",
+        handle.lines
+    );
+
+    let task = env.task(task_id);
+    assert!(
+        task.assignee.is_some() || task.status == "in-review",
+        "replacement must claim or complete the same task, got: {task:?}"
+    );
+    let events = env.events_for_task(task_id);
+    assert!(
+        events.iter().any(|event| event.kind == "task_claimed"),
+        "replacement claim must be durable: {events:?}"
+    );
+    handle.sigkill();
+}
+
 /// Success case: replacement worker resumes the existing branch, reaches
 /// in-review, and the recovery counter resets to 0.
 #[test]

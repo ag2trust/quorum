@@ -301,7 +301,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
   durably parked after an automatic bounded failure. General daemon parks restore
   their recorded lifecycle stage as specified in § Explicit cancellation and durable
-  parking. Provider/auth/quota/protocol parks atomically require and clear their
+  parking, except that a parked merge restores `in-review` so a fresh approval can
+  safely drive the next merge attempt. Provider/auth/quota/protocol parks atomically
+  require and clear their
   provider-block marker. A provider-parked
   `working` task returns to `open`; a true `rework` task remains unassigned in
   `rework` and is atomically reattached through a dedicated replacement-worker
@@ -575,8 +577,13 @@ not-done dependencies. The dependency cascade parks the dependent with resume st
 
 `quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
 daemon-parked task. It atomically validates the marker, clears it, resets only the crash
-recovery counter, restores the recorded stage (`open`, `rework`, `in-review`, or
-`merging`), and emits `task_retry`. It does not change PR identity, approvals,
+recovery counter, and emits `task_retry`. `open`, `rework`, and `in-review` restore
+directly. A `rework` retry also records `daemon_rework_retry_requested=true`; startup
+recovery preserves it and the next daemon tick atomically claims and spawns a replacement
+worker on the same task and branch. A parked `merging` task restores to `in-review`
+because the original approval mailbox row and agents were consumed during teardown;
+the orphan-review reconciler obtains fresh R1/R2 approval before the next merge attempt.
+Retry does not change PR identity, approvals,
 dependencies, author/reviewer provenance, or rework count. An unparked or terminal task
 is a clean negative (exit 1). This explicit gate prevents hot respawn/provision loops:
 daemon ticks cannot retry a parked task until the operator requests it.
@@ -667,7 +674,8 @@ After VerdictApprove (InReview → Merging):
    the merge attempt — the window from step 2 through the master-CI gate can span minutes.
    If conflicting, fire MergeConflict → rework cycle. If mergeable, proceed.
 6. Execute `gh pr merge` — success → Done; policy-blocked → Failed with a durable
-   `merging` resume marker; retryable failure → rework.
+   `merging` resume marker (explicit retry restores `in-review` and re-drives approval);
+   retryable failure → rework.
 7. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
 8. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs

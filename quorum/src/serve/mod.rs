@@ -855,11 +855,29 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
     }
 }
 
-fn retry_slot_rework_count(rework_round: i64, retry: Option<&CodexRetryTurn>) -> u32 {
-    retry
-        .filter(|retry| retry.turn_kind == "rework")
-        .map(|_| u32::try_from(rework_round.max(1)).unwrap_or(u32::MAX))
-        .unwrap_or(0)
+fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
+    refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| {
+            refs.get(tasks::PARKED_REWORK_RETRY_REF)
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn retry_slot_rework_count(
+    rework_round: i64,
+    retry: Option<&CodexRetryTurn>,
+    daemon_retry: bool,
+) -> u32 {
+    if daemon_retry
+        || retry
+            .map(|retry| retry.turn_kind == "rework")
+            .unwrap_or(false)
+    {
+        u32::try_from(rework_round.max(1)).unwrap_or(u32::MAX)
+    } else {
+        0
+    }
 }
 
 /// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
@@ -6459,7 +6477,10 @@ async fn spawn_worker(
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
-                .filter(|task| codex_retry_turn(task.refs.as_deref()).is_some()),
+                .filter(|task| {
+                    codex_retry_turn(task.refs.as_deref()).is_some()
+                        || daemon_rework_retry_requested(task.refs.as_deref())
+                }),
         );
         let found = available.into_iter().find(|t| {
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
@@ -6943,7 +6964,11 @@ async fn spawn_worker(
                     .as_deref()
                     .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
                     .and_then(|refs| refs.get("pr").and_then(|pr| pr.as_i64())),
-                rework_count: retry_slot_rework_count(task.rework_round, retry_turn.as_ref()),
+                rework_count: retry_slot_rework_count(
+                    task.rework_round,
+                    retry_turn.as_ref(),
+                    daemon_rework_retry_requested(task.refs.as_deref()),
+                ),
                 cost_tokens: 0,
                 cost_usd: 0.0,
                 task_started_at: now_instant,
@@ -8859,7 +8884,7 @@ mod tests {
         assert_eq!(queued.status, "rework");
         assert!(queued.assignee.is_none());
         let retry = codex_retry_turn(queued.refs.as_deref()).unwrap();
-        let reconstructed_count = retry_slot_rework_count(queued.rework_round, Some(&retry));
+        let reconstructed_count = retry_slot_rework_count(queued.rework_round, Some(&retry), false);
         let event = worker_done_event(reconstructed_count, 419);
         assert!(matches!(event, Event::ReworkPushed));
 

@@ -33,6 +33,7 @@ pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
+pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
 
 /// Body marker for review-only tasks whose approved PR failed to merge (e.g. conflicts).
 /// The daemon's orphan-in-review handler detects this and retries merge when the PR
@@ -529,7 +530,10 @@ pub fn claim_provider_retry_rework(
         "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
            AND json_valid(refs)
-           AND json_type(refs, '$.codex_retry_requested')='true'",
+           AND (
+               json_type(refs, '$.codex_retry_requested')='true'
+               OR json_type(refs, '$.daemon_rework_retry_requested')='true'
+           )",
         params![agent, now, id],
     )?;
     let mut task = if updated == 1 {
@@ -933,6 +937,7 @@ fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
             "codex_retry_prompt",
             "codex_retry_turn_kind",
             "codex_retry_thread_id",
+            PARKED_REWORK_RETRY_REF,
         ] {
             object.remove(key);
         }
@@ -1211,20 +1216,41 @@ pub fn retry_parked(conn: &mut Connection, id: i64, by: &str, now: i64) -> Resul
             "invalid persisted resume status for task #{id}: {resume_status}"
         )));
     }
+    let restored_status = if resume_status == "merging" {
+        // A parked merge has no live reviewer/mailbox row left to drive the
+        // merge gate. Restore the durable review phase so Phase 5b provisions
+        // a fresh reviewer and obtains a new approval before another attempt.
+        "in-review"
+    } else {
+        resume_status.as_str()
+    };
     tx.execute(
         "UPDATE tasks
          SET status=?2,
              assignee=NULL,
              recovery_attempts=0,
-             refs=json_remove(
-                 refs,
-                 '$.daemon_parked',
-                 '$.daemon_parked_reason',
-                 '$.daemon_resume_status'
-             ),
+             refs=CASE WHEN ?4='rework'
+                  THEN json_set(
+                      json_remove(
+                          refs,
+                          '$.daemon_parked',
+                          '$.daemon_parked_reason',
+                          '$.daemon_resume_status'
+                      ),
+                      '$.daemon_rework_retry_requested',
+                      json('true')
+                  )
+                  ELSE json_remove(
+                      refs,
+                      '$.daemon_parked',
+                      '$.daemon_parked_reason',
+                      '$.daemon_resume_status',
+                      '$.daemon_rework_retry_requested'
+                  )
+             END,
              updated_at=?3
          WHERE id=?1",
-        params![id, resume_status, now],
+        params![id, restored_status, now, resume_status],
     )?;
     deactivate_lease(&tx, id, now)?;
     crate::events::emit(
@@ -4289,6 +4315,102 @@ mod tests {
             serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 419);
         assert!(refs.get("daemon_parked").is_none());
+    }
+
+    #[test]
+    fn parked_rework_retry_becomes_claimable_by_replacement_worker() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            Some("original task context"),
+            0,
+            None,
+            None,
+            None,
+            Some(419),
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='rework', assignee='dead-worker', author='original-worker',
+                 rework_round=2
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        park(
+            &mut conn,
+            task_id,
+            "recovery budget exhausted",
+            "rework",
+            11,
+        )
+        .unwrap()
+        .unwrap();
+
+        let retried = retry_parked(&mut conn, task_id, "operator", 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "rework");
+        let refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
+
+        let claimed = claim_provider_retry_rework(&mut conn, "replacement", task_id, TTL, 13)
+            .unwrap()
+            .expect("explicitly retried rework must be claimable");
+        assert_eq!(claimed.status, "rework");
+        assert_eq!(claimed.assignee.as_deref(), Some("replacement"));
+        assert_eq!(claimed.author.as_deref(), Some("original-worker"));
+        assert_eq!(claimed.rework_round, 2);
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims
+                 WHERE target=?1 AND holder='replacement' AND active=1 AND expires_at>13",
+                params![lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 1);
+    }
+
+    #[test]
+    fn parked_merging_retry_restores_review_phase_with_pr_context() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(419),
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', author='worker', reviewer='reviewer'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        park(&mut conn, task_id, "merge policy blocked", "merging", 11)
+            .unwrap()
+            .unwrap();
+
+        let retried = retry_parked(&mut conn, task_id, "operator", 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "in-review");
+        assert_eq!(extract_pr_number(&retried.refs), Some(419));
+        assert_eq!(retried.author.as_deref(), Some("worker"));
+        assert_eq!(retried.reviewer.as_deref(), Some("reviewer"));
     }
 
     #[test]

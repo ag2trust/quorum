@@ -152,18 +152,23 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
         .unwrap_or_default();
 
         for task in tasks_in_state {
-            let provider_blocked = task
+            let retry_queued = task
                 .refs
                 .as_deref()
                 .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-                .and_then(|refs| {
+                .map(|refs| {
                     refs.get("codex_provider_blocked")
                         .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                        || refs
+                            .get(tasks::PARKED_REWORK_RETRY_REF)
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false);
-            if provider_blocked {
+            if retry_queued {
                 log(&format!(
-                    "recovery: leaving provider-blocked task #{} in {} for operator retry",
+                    "recovery: leaving explicitly retried task #{} in {} for worker claim",
                     task.id, task.status
                 ));
                 continue;
