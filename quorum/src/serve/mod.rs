@@ -2079,10 +2079,33 @@ async fn tick(
                     }
 
                     if mergeability == merge::MergeabilityState::Conflicting {
-                        let has_worker = workers.iter().any(|w| w.task_id == reviewer_task_id);
+                        // Responsibility is persisted on the task. Live slot presence
+                        // only decides whether to feed the original worker or provision
+                        // a remediation worker; an implementation task does not become
+                        // review-only merely because its worker exited after submit.
+                        let review_only = {
+                            let p = db_path.clone();
+                            let tid = reviewer_task_id;
+                            tokio::task::spawn_blocking(move || -> Result<bool> {
+                                let conn = quorum_core::db::open(&p)?;
+                                tasks::get(&conn, tid)?
+                                    .map(|task| task.review_only)
+                                    .ok_or_else(|| {
+                                        QuorumError::Io(format!(
+                                            "task #{tid} disappeared during merge conflict"
+                                        ))
+                                    })
+                            })
+                            .await
+                            .map_err(|e| {
+                                QuorumError::Io(format!(
+                                    "merge-conflict task lookup spawn_blocking join: {e}"
+                                ))
+                            })??
+                        };
 
-                        if !has_worker {
-                            // Review-only: no worker to rebase. Fire MergeFailed
+                        if review_only {
+                            // Review-only: the external author owns rebasing. Fire MergeFailed
                             // (merging → in-review) and park as merge-blocked;
                             // orphan handler retries when PR becomes MERGEABLE.
                             log(&format!(
@@ -6018,6 +6041,23 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
     }
 }
 
+fn reviewer_name_exclusions(
+    worker_name: &str,
+    role: &ReviewRole,
+    prior_runs: &[quorum_core::agent_runs::AgentRun],
+) -> std::collections::HashSet<String> {
+    let mut excluded = prior_runs
+        .iter()
+        .filter(|run| run.role == "worker" || run.role == "reviewer")
+        .map(|run| run.agent.clone())
+        .collect::<std::collections::HashSet<_>>();
+    excluded.insert(worker_name.to_string());
+    if let ReviewRole::R2 { r1_reviewer, .. } = role {
+        excluded.insert(r1_reviewer.clone());
+    }
+    excluded
+}
+
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -6049,6 +6089,9 @@ async fn provision_reviewer(
         None
     };
     let reviewer_name = if let Some(recovery) = &recovery {
+        // Restart recovery deliberately reuses the interrupted reviewer's
+        // durable identity. Normal provisioning below excludes every prior
+        // task participant, including this name.
         name_pool.acquire_named(&recovery.agent).ok_or_else(|| {
             QuorumError::Io(format!(
                 "persisted reviewer identity '{}' is already in use",
@@ -6056,7 +6099,23 @@ async fn provision_reviewer(
             ))
         })?
     } else {
-        let acquire_result = name_pool.acquire();
+        // Reviewer identity is task-scoped, not slot-scoped. A completed
+        // participant has left `Pool::in_use`, so consult durable run history
+        // before acquiring a fresh name.
+        let prior_runs = {
+            let p = config.db_path.clone();
+            let task_id = worker.task_id;
+            tokio::task::spawn_blocking(
+                move || -> Result<Vec<quorum_core::agent_runs::AgentRun>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                },
+            )
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+        };
+        let excluded = reviewer_name_exclusions(worker.agent_name, role, &prior_runs);
+        let acquire_result = name_pool.acquire_excluding(&excluded);
         if acquire_result.is_generated() && name_pool.has_file() {
             log(&format!(
                 "names pool exhausted, generated fallback reviewer name: {}",
@@ -6191,18 +6250,6 @@ async fn provision_reviewer(
         }
         name_pool.release(&reviewer_name);
         return Ok(());
-    } else {
-        // Clear provision attempts for this role on success.
-        let p = config.db_path.clone();
-        let tid = worker.task_id;
-        let role_str = role.as_str().to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = quorum_core::db::open(&p) {
-                let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
-            }
-        })
-        .await
-        .ok();
     }
     log(&format!(
         "reviewer worktree provisioned at {}",
@@ -6421,20 +6468,14 @@ async fn provision_reviewer(
                 .ok();
             }
 
-            fire_event(
-                &config.db_path,
-                &reviewer_name,
-                worker.task_id,
-                &Event::ReviewerAttached {
-                    agent: reviewer_name.clone(),
-                },
-            )
-            .await;
-
-            // Record the exact provider used to spawn this run. R2 uses
-            // insert_r2 (sub_role='r2').
+            // Persist the run before attaching the reviewer. The run history is
+            // the durable identity-exclusion source, so attachment must never
+            // become visible without it. A crash after this insert is safe:
+            // recovery excludes the name even if ReviewerAttached never fired.
+            // Persist the exact provider that was authoritatively resolved and
+            // used to spawn the process; never silently fall back here.
             let reviewer_provider = reviewer_kind.to_string();
-            let reviewer_run_id = {
+            let reviewer_run_result = {
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
                 let m = reviewer_model.clone();
@@ -6468,9 +6509,92 @@ async fn provision_reviewer(
                     }
                 })
                 .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok()
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
             };
+            let reviewer_run_id = match reviewer_run_result {
+                Ok(Ok(run_id)) => run_id,
+                Ok(Err(e)) | Err(e) => {
+                    log(&format!(
+                        "{}: reviewer run persistence failed before attachment: {e}",
+                        role.as_str().to_uppercase()
+                    ));
+                    proc.kill_and_reap().await;
+                    name_pool.release(&reviewer_name);
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    let p = config.db_path.clone();
+                    let rn = reviewer_name.clone();
+                    let failed_cap_run_id = cap_run_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut conn) = quorum_core::db::open(&p) {
+                            let _ = journal::delete(&mut conn, &rn);
+                            let _ = quorum_core::capabilities::revoke(
+                                &mut conn,
+                                &failed_cap_run_id,
+                                now_unix(),
+                            );
+                        }
+                    })
+                    .await
+                    .ok();
+                    let task_id = worker.task_id;
+                    let role_str = role.as_str().to_string();
+                    let sha = head_sha.to_string();
+                    let strikes = {
+                        let p = config.db_path.clone();
+                        tokio::task::spawn_blocking(move || -> i64 {
+                            quorum_core::db::open(&p)
+                                .ok()
+                                .and_then(|mut conn| {
+                                    quorum_core::provision_attempts::record_attempt(
+                                        &mut conn, task_id, pr, &role_str, &sha,
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0)
+                    };
+                    log(&format!(
+                        "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
+                         for task #{task_id} PR #{pr}",
+                        role_label = role.as_str().to_uppercase()
+                    ));
+                    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+                        log(&format!(
+                            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
+                             {strikes} consecutive {} provision failures for PR #{pr}",
+                            role.as_str().to_uppercase()
+                        ));
+                    }
+                    return Err(e);
+                }
+            };
+
+            // Provisioning is successful only after the reviewer run is
+            // durable. Clearing after worktree creation would reset strikes
+            // for a persistent run-insert failure on every daemon tick.
+            let p = config.db_path.clone();
+            let tid = worker.task_id;
+            let role_str = role.as_str().to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                    let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
+                }
+            })
+            .await
+            .ok();
+
+            fire_event(
+                &config.db_path,
+                &reviewer_name,
+                worker.task_id,
+                &Event::ReviewerAttached {
+                    agent: reviewer_name.clone(),
+                },
+            )
+            .await;
 
             // R2: stash metadata for audit recording when the reviewer finishes.
             if let ReviewRole::R2 {
@@ -6535,7 +6659,7 @@ async fn provision_reviewer(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 last_error_text: None,
-                agent_run_id: reviewer_run_id,
+                agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id),
                 r2_origin: role.is_r2(),
                 reviewed_head_sha: spawn_head_sha,

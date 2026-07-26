@@ -229,6 +229,16 @@ fn main() {
             continue;
         }
 
+        if let Ok(path) = std::env::var("FAKE_AGENT_PROMPT_LOG") {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        }
+
         turn += 1;
 
         // Classifier turn: respond with valid classification JSON for every

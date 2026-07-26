@@ -513,6 +513,10 @@ fn restart_resumes_codex_reviewer_with_persisted_identity_model_and_thread() {
     case.done(&worker, &["--pr", "1"]);
     case.handle.wait_for("spawning reviewer ");
     let reviewer = case.handle.agent_after("spawning reviewer ");
+    assert_ne!(
+        reviewer, worker,
+        "fresh reviewer provisioning must exclude the durable worker identity"
+    );
     case.handle.wait_for(&format!("reviewer {reviewer} result"));
 
     let expected_thread = format!("thread-{reviewer}");
@@ -560,6 +564,10 @@ fn restart_resumes_codex_reviewer_with_persisted_identity_model_and_thread() {
     let runs = quorum_core::agent_runs::runs_for_task(&case.db(), 1).unwrap();
     let recovered = runs.last().unwrap();
     assert_eq!(recovered.agent, reviewer);
+    assert_ne!(
+        recovered.agent, worker,
+        "restart recovery must preserve the reviewer identity without weakening task exclusions"
+    );
     assert_eq!(recovered.model, "gpt-5.6-terra");
     assert_eq!(recovered.provider.as_deref(), Some("codex"));
     case.handle.stop();
