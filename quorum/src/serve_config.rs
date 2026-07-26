@@ -577,8 +577,12 @@ pub fn resolve_floor(
 /// `min_model` is a Claude tier floor. Strict Codex mode cannot apply it
 /// without silently switching providers, so reject that configuration at
 /// startup instead of poisoning every worker task.
-pub fn validate_provider_floor(kind: RunnerKind, min_model: Option<&str>) -> Result<()> {
-    if kind == RunnerKind::Codex && min_model.is_some() {
+pub fn validate_provider_floor(
+    kind: RunnerKind,
+    provider_explicit: bool,
+    min_model: Option<&str>,
+) -> Result<()> {
+    if provider_explicit && kind == RunnerKind::Codex && min_model.is_some() {
         return Err(QuorumError::Usage(
             "provider=\"codex\" cannot use min_model — min_model accepts Claude tiers only".into(),
         ));
@@ -809,15 +813,16 @@ worktree_base = "/tmp/wt"
 
     #[test]
     fn strict_codex_rejects_claude_only_model_floor() {
-        let err = validate_provider_floor(RunnerKind::Codex, Some("opus-47")).unwrap_err();
+        let err = validate_provider_floor(RunnerKind::Codex, true, Some("opus-47")).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(
             err.to_string()
                 .contains("provider=\"codex\" cannot use min_model"),
             "{err}"
         );
-        validate_provider_floor(RunnerKind::Claude, Some("opus-47")).unwrap();
-        validate_provider_floor(RunnerKind::Codex, None).unwrap();
+        validate_provider_floor(RunnerKind::Claude, true, Some("opus-47")).unwrap();
+        validate_provider_floor(RunnerKind::Codex, true, None).unwrap();
+        validate_provider_floor(RunnerKind::Codex, false, Some("opus-47")).unwrap();
     }
 
     #[test]
