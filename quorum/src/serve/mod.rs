@@ -269,6 +269,8 @@ fn tier_to_model_id(tier: &str) -> Option<String> {
         "opus-47" => Some("claude-opus-4-7".into()),
         "opus-48" => Some("claude-opus-4-8".into()),
         "sonnet-5" => Some("claude-sonnet-5".into()),
+        "o3" => Some("o3".into()),
+        "o4-mini" => Some("o4-mini".into()),
         unknown => {
             log(&format!(
                 "unknown tier label '{unknown}', falling back to global model"
@@ -276,6 +278,36 @@ fn tier_to_model_id(tier: &str) -> Option<String> {
             None
         }
     }
+}
+
+fn runner_kind_to_agent_kind(kind: crate::serve_config::RunnerKind) -> runner::AgentKind {
+    match kind {
+        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
+        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+    }
+}
+
+/// Known OpenAI/Codex model prefixes. A model matches if it equals a prefix
+/// or starts with `<prefix>-`.
+const CODEX_MODEL_PREFIXES: &[&str] = &["o3", "o4-mini", "gpt-4.1", "gpt-5"];
+
+/// Resolve the provider (AgentKind) from a fully-qualified model ID.
+///
+/// Claude models start with `claude-`. OpenAI/Codex models match
+/// `CODEX_MODEL_PREFIXES`. Unknown models are rejected before spawning.
+pub fn resolve_provider(model: &str) -> Result<runner::AgentKind> {
+    if model.starts_with("claude-") {
+        return Ok(runner::AgentKind::Claude);
+    }
+    for &prefix in CODEX_MODEL_PREFIXES {
+        if model == prefix || model.starts_with(&format!("{prefix}-")) {
+            return Ok(runner::AgentKind::Codex);
+        }
+    }
+    Err(QuorumError::Usage(format!(
+        "unknown model '{model}': cannot resolve provider \
+         (expected claude-* or known OpenAI model)"
+    )))
 }
 
 const MODEL_TIERS: &[&str] = &[
@@ -523,6 +555,7 @@ pub struct CostLimits {
 pub struct ServeConfig {
     pub db_path: PathBuf,
     pub cap: usize,
+    #[allow(dead_code)]
     pub runner_kind: crate::serve_config::RunnerKind,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
@@ -6205,17 +6238,30 @@ async fn provision_reviewer(
             .await;
 
             // Record agent run — R2 uses insert_r2 (sub_role='r2').
+            // Reviewers always use Claude; provider is recorded for consistency.
+            let reviewer_provider = resolve_provider(&reviewer_model)
+                .map(|k| k.to_string())
+                .unwrap_or_else(|_| "claude".to_string());
             let reviewer_run_id = {
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
                 let m = reviewer_model.clone();
                 let e = config.effort.clone();
+                let prov = reviewer_provider;
                 let tid = worker.task_id;
                 let is_r2 = role.is_r2();
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
                     if is_r2 {
-                        quorum_core::agent_runs::insert_r2(&conn, tid, &name, &m, &e, now_unix())
+                        quorum_core::agent_runs::insert_r2(
+                            &conn,
+                            tid,
+                            &name,
+                            &m,
+                            &e,
+                            &prov,
+                            now_unix(),
+                        )
                     } else {
                         quorum_core::agent_runs::insert(
                             &conn,
@@ -6224,6 +6270,7 @@ async fn provision_reviewer(
                             "reviewer",
                             &m,
                             &e,
+                            &prov,
                             now_unix(),
                         )
                     }
@@ -6552,6 +6599,7 @@ async fn spawn_worker(
     .ok();
 
     let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
+    let has_label_model = label_model.is_some();
     let resolved_model = label_model.unwrap_or_else(|| config.model.clone());
     let resolved_effort = label_effort.unwrap_or_else(|| config.effort.clone());
 
@@ -6673,8 +6721,13 @@ async fn spawn_worker(
         |retry| retry.prompt.clone(),
     );
 
-    let spawn_result: std::io::Result<runner::RunnerProc> = match config.runner_kind {
-        crate::serve_config::RunnerKind::Claude => {
+    let resolved_kind = if has_label_model {
+        resolve_provider(&resolved_model)?
+    } else {
+        runner_kind_to_agent_kind(config.runner_kind)
+    };
+    let spawn_result: std::io::Result<runner::RunnerProc> = match resolved_kind {
+        runner::AgentKind::Claude => {
             let spec = AgentSpec {
                 kind: runner::AgentKind::Claude,
                 model: resolved_model.clone(),
@@ -6690,7 +6743,7 @@ async fn spawn_worker(
             };
             AgentProc::spawn(&spec, config.agent_bin.as_deref()).map(runner::RunnerProc::Claude)
         }
-        crate::serve_config::RunnerKind::Codex => {
+        runner::AgentKind::Codex => {
             if let Some(thread_id) = retry_turn
                 .as_ref()
                 .and_then(|retry| retry.thread_id.as_deref())
@@ -6773,15 +6826,26 @@ async fn spawn_worker(
                 .ok();
             }
 
+            let provider_str = resolved_kind.to_string();
             let worker_run_id = {
                 let p = db_path.clone();
                 let name = agent_name.clone();
                 let m = resolved_model.clone();
                 let e = resolved_effort.clone();
+                let prov = provider_str.clone();
                 let tid = task.id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert(&conn, tid, &name, "worker", &m, &e, now_unix())
+                    quorum_core::agent_runs::insert(
+                        &conn,
+                        tid,
+                        &name,
+                        "worker",
+                        &m,
+                        &e,
+                        &prov,
+                        now_unix(),
+                    )
                 })
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
@@ -7567,8 +7631,48 @@ async fn spawn_remediation_worker(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
 
+    // Recover the original worker's provider and model from agent_runs so
+    // remediation cannot silently switch providers (e.g. tier:o3 task reworked
+    // as Claude because the daemon default is Claude).
+    let (remediation_model, remediation_kind) = {
+        let p = db_path.clone();
+        let tid = task_id;
+        let cfg_model = config.model.clone();
+        let cfg_kind = config.runner_kind;
+        tokio::task::spawn_blocking(move || -> (String, runner::AgentKind) {
+            let conn = match quorum_core::db::open(&p) {
+                Ok(c) => c,
+                Err(_) => return (cfg_model, runner_kind_to_agent_kind(cfg_kind)),
+            };
+            let provider = quorum_core::agent_runs::worker_provider(&conn, tid)
+                .ok()
+                .flatten();
+            let model = quorum_core::agent_runs::worker_model(&conn, tid)
+                .ok()
+                .flatten()
+                .unwrap_or(cfg_model);
+            let kind = provider
+                .and_then(|p| match p.as_str() {
+                    "claude" => Some(runner::AgentKind::Claude),
+                    "codex" => Some(runner::AgentKind::Codex),
+                    _ => None,
+                })
+                .or_else(|| resolve_provider(&model).ok())
+                .unwrap_or_else(|| runner_kind_to_agent_kind(cfg_kind));
+            (model, kind)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                config.model.clone(),
+                runner_kind_to_agent_kind(config.runner_kind),
+            )
+        })
+    };
+    let remediation_effort = config.effort.clone();
+
     // For Codex rework: look up persisted thread_id for continuation.
-    let codex_thread_id = if config.runner_kind == crate::serve_config::RunnerKind::Codex {
+    let codex_thread_id = if remediation_kind == runner::AgentKind::Codex {
         let p = db_path.clone();
         let tid = task_id;
         tokio::task::spawn_blocking(move || -> Option<String> {
@@ -7587,12 +7691,12 @@ async fn spawn_remediation_worker(
         None
     };
 
-    let spawn_result: std::io::Result<runner::RunnerProc> = match config.runner_kind {
-        crate::serve_config::RunnerKind::Claude => agent::AgentProc::spawn(
+    let spawn_result: std::io::Result<runner::RunnerProc> = match remediation_kind {
+        runner::AgentKind::Claude => agent::AgentProc::spawn(
             &agent::AgentSpec {
                 kind: runner::AgentKind::Claude,
-                model: config.model.clone(),
-                effort: config.effort.clone(),
+                model: remediation_model.clone(),
+                effort: remediation_effort.clone(),
                 session_id: session_id.clone(),
                 worktree: wt_path.clone(),
                 bare: config.bare_agent,
@@ -7606,11 +7710,11 @@ async fn spawn_remediation_worker(
             config.agent_bin.as_deref(),
         )
         .map(runner::RunnerProc::Claude),
-        crate::serve_config::RunnerKind::Codex => if let Some(ref tid) = codex_thread_id {
+        runner::AgentKind::Codex => if let Some(ref tid) = codex_thread_id {
             codex_agent::CodexProc::spawn_resume(
                 tid,
-                &config.model,
-                &config.effort,
+                &remediation_model,
+                &remediation_effort,
                 &config.codex_sandbox,
                 &wt_path,
                 &prompt,
@@ -7621,8 +7725,8 @@ async fn spawn_remediation_worker(
             log("remediation: no persisted thread_id — starting fresh Codex exec");
             codex_agent::CodexProc::spawn(
                 &codex_agent::CodexSpec {
-                    model: config.model.clone(),
-                    effort: config.effort.clone(),
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
                     sandbox: config.codex_sandbox.clone(),
                     worktree: wt_path.clone(),
                     prompt: prompt.clone(),
@@ -7648,15 +7752,26 @@ async fn spawn_remediation_worker(
                 }
             }
 
+            let remediation_provider_str = remediation_kind.to_string();
             let worker_run_id = {
                 let p = db_path.clone();
                 let name = agent_name.clone();
-                let m = config.model.clone();
-                let e = config.effort.clone();
+                let m = remediation_model.clone();
+                let e = remediation_effort.clone();
+                let prov = remediation_provider_str;
                 let tid = task_id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert(&conn, tid, &name, "worker", &m, &e, now_unix())
+                    quorum_core::agent_runs::insert(
+                        &conn,
+                        tid,
+                        &name,
+                        "worker",
+                        &m,
+                        &e,
+                        &prov,
+                        now_unix(),
+                    )
                 })
                 .await
                 .ok()
@@ -7669,8 +7784,8 @@ async fn spawn_remediation_worker(
                 proc,
                 task_id,
                 session_id,
-                model: config.model.clone(),
-                effort: config.effort.clone(),
+                model: remediation_model.clone(),
+                effort: remediation_effort.clone(),
                 worktree_path: wt_path,
                 branch,
                 draining: true,
@@ -7750,6 +7865,109 @@ mod tests {
     #[test]
     fn tier_to_model_id_unknown_returns_none() {
         assert_eq!(tier_to_model_id("gpt-5"), None);
+    }
+
+    #[test]
+    fn tier_to_model_id_o3() {
+        assert_eq!(tier_to_model_id("o3").as_deref(), Some("o3"));
+    }
+
+    #[test]
+    fn tier_to_model_id_o4_mini() {
+        assert_eq!(tier_to_model_id("o4-mini").as_deref(), Some("o4-mini"));
+    }
+
+    #[test]
+    fn resolve_provider_claude_models() {
+        assert_eq!(
+            resolve_provider("claude-opus-4-6").unwrap(),
+            runner::AgentKind::Claude
+        );
+        assert_eq!(
+            resolve_provider("claude-opus-4-7").unwrap(),
+            runner::AgentKind::Claude
+        );
+        assert_eq!(
+            resolve_provider("claude-opus-4-8").unwrap(),
+            runner::AgentKind::Claude
+        );
+        assert_eq!(
+            resolve_provider("claude-sonnet-5").unwrap(),
+            runner::AgentKind::Claude
+        );
+    }
+
+    #[test]
+    fn resolve_provider_codex_models() {
+        assert_eq!(resolve_provider("o3").unwrap(), runner::AgentKind::Codex);
+        assert_eq!(
+            resolve_provider("o4-mini").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert_eq!(
+            resolve_provider("gpt-4.1").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert_eq!(resolve_provider("gpt-5").unwrap(), runner::AgentKind::Codex);
+        assert_eq!(
+            resolve_provider("gpt-5-turbo").unwrap(),
+            runner::AgentKind::Codex
+        );
+    }
+
+    #[test]
+    fn resolve_provider_default_claude_model() {
+        assert_eq!(
+            resolve_provider("claude-opus-4-6").unwrap(),
+            runner::AgentKind::Claude
+        );
+    }
+
+    #[test]
+    fn resolve_provider_unknown_model_rejected() {
+        let err = resolve_provider("llama-3").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown model"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_provider_persists_via_agent_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+
+        let kind = resolve_provider("claude-opus-4-7").unwrap();
+        quorum_core::agent_runs::insert(
+            &conn,
+            1,
+            "w1",
+            "worker",
+            "claude-opus-4-7",
+            "high",
+            &kind.to_string(),
+            100,
+        )
+        .unwrap();
+
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].provider.as_deref(), Some("claude"));
+
+        let codex_kind = resolve_provider("o3").unwrap();
+        quorum_core::agent_runs::insert(
+            &conn,
+            1,
+            "w2",
+            "worker",
+            "o3",
+            "high",
+            &codex_kind.to_string(),
+            200,
+        )
+        .unwrap();
+
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].provider.as_deref(), Some("codex"));
     }
 
     #[test]
@@ -8907,6 +9125,7 @@ mod tests {
                 "reviewer",
                 "model",
                 "high",
+                "claude",
                 100 + i,
             )
             .unwrap();
@@ -8921,8 +9140,10 @@ mod tests {
     fn reviewer_cap_not_exceeded_below_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
-        quorum_core::agent_runs::insert(&conn, 1, "rev-0", "reviewer", "model", "high", 100)
-            .unwrap();
+        quorum_core::agent_runs::insert(
+            &conn, 1, "rev-0", "reviewer", "model", "high", "claude", 100,
+        )
+        .unwrap();
         assert!(!is_reviewer_cap_exceeded(&conn, 1).unwrap());
     }
 

@@ -3387,12 +3387,14 @@ mod tests {
         assert!(detail.agent_runs.is_empty());
 
         // Insert worker + reviewer + R2
-        crate::agent_runs::insert(&c, tid, "Alice", "worker", "opus-4", "high", 100).unwrap();
-        let rev_id =
-            crate::agent_runs::insert(&c, tid, "Bob", "reviewer", "sonnet-5", "medium", 200)
-                .unwrap();
+        crate::agent_runs::insert(&c, tid, "Alice", "worker", "opus-4", "high", "claude", 100)
+            .unwrap();
+        let rev_id = crate::agent_runs::insert(
+            &c, tid, "Bob", "reviewer", "sonnet-5", "medium", "claude", 200,
+        )
+        .unwrap();
         crate::agent_runs::close(&c, rev_id, 300, "approved").unwrap();
-        crate::agent_runs::insert_r2(&c, tid, "Carol", "opus-4", "high", 250).unwrap();
+        crate::agent_runs::insert_r2(&c, tid, "Carol", "opus-4", "high", "claude", 250).unwrap();
 
         let detail = get_with_notes(&c, tid).unwrap().unwrap();
         assert_eq!(detail.agent_runs.len(), 3);
