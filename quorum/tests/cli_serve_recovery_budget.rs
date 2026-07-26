@@ -425,10 +425,10 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
 
     // Recovery incremented counter to 2, task is now open. Die-agent spawns
     // and dies: count→3, task reopens. Spawns again and dies: check 3>=3 →
-    // cancelled. The daemon logs the lifecycle transition.
+    // failed/parked. The daemon logs the lifecycle transition.
     assert!(
-        handle.wait_for("-> cancelled", 30),
-        "task not cancelled after restart + budget exhaustion. Lines: {:?}",
+        handle.wait_for("-> failed", 30),
+        "task not parked after restart + budget exhaustion. Lines: {:?}",
         handle.lines
     );
 
@@ -439,8 +439,8 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
 
     let task = env.task(task_id);
     assert_eq!(
-        task.status, "cancelled",
-        "task must be cancelled after budget exhaustion"
+        task.status, "failed",
+        "task must be parked after budget exhaustion"
     );
     assert_eq!(
         task.recovery_attempts,
@@ -449,9 +449,9 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
         quorum_core::tasks::MAX_RECOVERY_ATTEMPTS
     );
 
-    // No further worker spawns after cancellation
-    let cancel_idx = handle.lines.iter().position(|l| l.contains("-> cancelled"));
-    if let Some(idx) = cancel_idx {
+    // No further worker spawns after parking.
+    let park_idx = handle.lines.iter().position(|l| l.contains("-> failed"));
+    if let Some(idx) = park_idx {
         let spawns_after = handle.lines[idx..]
             .iter()
             .filter(|l| l.contains("spawning agent") && l.contains(&format!("task #{task_id}")))
@@ -462,18 +462,16 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
         );
     }
 
-    // Events table must contain task_cancelled event
+    // Events table records failure, never cancellation.
     let events = env.events_for_task(task_id);
-    let cancel_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.kind == "task_cancelled")
-        .collect();
+    let failed_events: Vec<_> = events.iter().filter(|e| e.kind == "task_failed").collect();
     assert_eq!(
-        cancel_events.len(),
+        failed_events.len(),
         1,
-        "exactly one task_cancelled event expected, got {}",
-        cancel_events.len()
+        "exactly one task_failed event expected, got {}",
+        failed_events.len()
     );
+    assert!(!events.iter().any(|e| e.kind == "task_cancelled"));
 
     // Messages table must contain the owner alert with failure cause
     let msgs = env.messages_for_task(task_id);
@@ -848,7 +846,7 @@ fn exhaustion_produces_durable_diagnostics() {
     };
 
     // Start daemon — the die-agent will exit, daemon detects death and fires
-    // the 4th AgentFailed → budget exhausted → cancelled
+    // the 4th AgentFailed → budget exhausted → failed/parked
     let mut handle = env.start_serve();
 
     // Recovery fires AgentFailed for the working task (it was working when
@@ -859,14 +857,14 @@ fn exhaustion_produces_durable_diagnostics() {
         handle.lines
     );
 
-    // The recovery AgentFailed should cancel it (attempts=3, check >=3 → cancel)
+    // The recovery AgentFailed should park it (attempts=3, check >=3).
     std::thread::sleep(Duration::from_millis(1000));
     handle.drain_pending_lines();
 
     let task = env.task(task_id);
     assert_eq!(
-        task.status, "cancelled",
-        "task must be cancelled after budget exhaustion. Lines: {:?}",
+        task.status, "failed",
+        "task must be parked after budget exhaustion. Lines: {:?}",
         handle.lines
     );
 
@@ -879,29 +877,25 @@ fn exhaustion_produces_durable_diagnostics() {
         msgs
     );
 
-    // Durable diagnostics: task_cancelled event in events table
+    // Durable diagnostics: failed event and no cancellation event.
     let events = env.events_for_task(task_id);
-    let cancel_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.kind == "task_cancelled")
-        .collect();
+    let failed_events: Vec<_> = events.iter().filter(|e| e.kind == "task_failed").collect();
     assert!(
-        !cancel_events.is_empty(),
-        "events table must contain task_cancelled event"
+        !failed_events.is_empty(),
+        "events table must contain task_failed event"
     );
+    assert!(!events.iter().any(|e| e.kind == "task_cancelled"));
 
-    // No worker must spawn for a cancelled task
+    // No worker must spawn for a parked task.
     let spawns_for_task: Vec<_> = handle
         .lines
         .iter()
         .filter(|l| l.contains("spawning agent") && l.contains(&format!("task #{task_id}")))
         .collect();
-    // After cancellation, there should be zero spawns (recovery cancelled it
-    // before Phase 6 could pick it up)
-    // The task was cancelled during recovery, so no spawn should happen at all
+    // The task was parked during recovery, so no spawn should happen at all.
     assert!(
         spawns_for_task.is_empty(),
-        "no worker should spawn for a task cancelled during recovery. Found: {:?}",
+        "no worker should spawn for a task parked during recovery. Found: {:?}",
         spawns_for_task
     );
 

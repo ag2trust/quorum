@@ -1,6 +1,6 @@
 # Quorum — Design Spec
 
-**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24)
+**Date:** 2026-06-23 (lifecycle refactor 2026-07-06, v2 boundary 2026-07-16, v2 correction 2026-07-17, merge-wait contract 2026-07-20, no-CI contract 2026-07-23, coding-runner boundary 2026-07-24, explicit-cancellation contract 2026-07-26)
 **Status:** Implemented (v1) · CLI + daemon · lifecycle state machine (`lifecycle.rs`)
 · v2 boundary specified (§ Daemon-only execution; corrected — supersedes PR #375)
 **Repo:** `~/dev/quorum`
@@ -299,8 +299,10 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum done`.
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
-  durably parked after bounded provider/auth/quota/protocol failure. The command
-  atomically requires and clears the provider-block marker. A parked
+  durably parked after an automatic bounded failure. General daemon parks restore
+  their recorded lifecycle stage as specified in § Explicit cancellation and durable
+  parking. Provider/auth/quota/protocol parks atomically require and clear their
+  provider-block marker. A provider-parked
   `working` task returns to `open`; a true `rework` task remains unassigned in
   `rework` and is atomically reattached through a dedicated replacement-worker
   claim. Both paths carry the exact persisted failed turn. `in-review` is
@@ -440,7 +442,8 @@ open → working → in-review → merging → done
                      ↓
                    failed (rework cap exceeded)
 
-Terminals: done, failed, cancelled (reachable from any non-terminal)
+Terminals: done, failed, cancelled (cancelled is reachable from any non-terminal
+only through an explicit outside request)
 ```
 
 | Status | Wire format | Terminal | Meaning |
@@ -451,8 +454,8 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 | Rework | `rework` | no | Reviewer requested changes; worker must fix and re-push |
 | Merging | `merging` | no | Approved; merge in progress |
 | Done | `done` | yes | Successfully merged |
-| Failed | `failed` | yes | Rework cap exceeded, or review-only task got changes verdict |
-| Cancelled | `cancelled` | yes | Explicitly cancelled |
+| Failed | `failed` | yes | Work stopped fail-safe: rework cap exceeded or daemon parked after a bounded/unresolvable failure |
+| Cancelled | `cancelled` | yes | Explicitly cancelled by the task creator or current assignee |
 
 ### Events
 
@@ -469,7 +472,7 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
 | `MergeConflict` | — | Daemon: PR has conflicts with base branch |
 | `LeaseExpired` | — | Lease reaper |
 | `AgentFailed { reason }` | description | Worker/reviewer process died |
-| `Cancelled { by }` | who | `task-update --status cancelled` or daemon policy |
+| `Cancelled { by }` | who | Explicit `task-update --status cancelled` caller request only |
 
 ### Effects
 
@@ -544,6 +547,39 @@ Terminals: done, failed, cancelled (reachable from any non-terminal)
   agent not in the daemon's spawn roster) is removed in v2 (see § Daemon-only execution).
   External agents that need work reviewed file `task-create --review-pr N` and the daemon
   handles it through the normal lifecycle.
+
+### Explicit cancellation and durable parking
+
+`cancelled` is reserved for an explicit outside request through
+`task-update --status cancelled`. Only the task creator or current assignee may make
+that request, only from a nonterminal state. The operation is terminal, releases the
+lease, emits `task_cancelled`, and the daemon tears down any active worker or reviewer.
+No daemon, lifecycle-recovery, watchdog, merge, provisioning, dependency, or sweep path
+may emit `Event::Cancelled` or write `status='cancelled'`.
+
+Automatic conditions that cannot safely continue use the existing `failed` status as
+a durable parked state. Parking atomically:
+
+- writes the complete cause to a task note and `task_parked` event;
+- stores `daemon_parked=true`, `daemon_parked_reason`, and the authoritative
+  `daemon_resume_status` in task refs;
+- releases the lease and clears the assignee so no process remains authoritative;
+- preserves task ID, PR and branch refs, dependencies, approvals, author/reviewer
+  provenance, and rework count;
+- excludes the task from automatic worker/reviewer provisioning.
+
+This applies to exhausted crash recovery, repeated instant worker death, merge-policy
+blocks, reviewer repository mismatch, reviewer provision exhaustion, and terminal
+not-done dependencies. The dependency cascade parks the dependent with resume status
+`open`; readiness remains false until all dependencies are `done`.
+
+`quorum task-retry --task-id N --by <operator>` is the sole resume operation for a
+daemon-parked task. It atomically validates the marker, clears it, resets only the crash
+recovery counter, restores the recorded stage (`open`, `rework`, `in-review`, or
+`merging`), and emits `task_retry`. It does not change PR identity, approvals,
+dependencies, author/reviewer provenance, or rework count. An unparked or terminal task
+is a clean negative (exit 1). This explicit gate prevents hot respawn/provision loops:
+daemon ticks cannot retry a parked task until the operator requests it.
 
 ### Review responsibility boundary (agents own PR collaboration)
 
@@ -630,8 +666,8 @@ After VerdictApprove (InReview → Merging):
 5. **Pre-merge mergeability recheck (#153):** recheck PR mergeability immediately before
    the merge attempt — the window from step 2 through the master-CI gate can span minutes.
    If conflicting, fire MergeConflict → rework cycle. If mergeable, proceed.
-6. Execute `gh pr merge` — success → Done; policy-blocked → Cancelled;
-   retryable failure → rework.
+6. Execute `gh pr merge` — success → Done; policy-blocked → Failed with a durable
+   `merging` resume marker; retryable failure → rework.
 7. Self-update drain: if enabled, a successful merge triggers drain mode →
    exit 75 for the supervisor to rebuild and relaunch.
 8. **Post-merge analytics collector** (#125) — fire-and-forget `tokio::spawn` runs

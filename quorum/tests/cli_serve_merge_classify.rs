@@ -358,8 +358,23 @@ fn policy_blocked_merge_parks_task_no_rework() {
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
     assert!(
-        stdout.contains("\"status\":\"cancelled\"") || stdout.contains("\"status\": \"cancelled\""),
-        "task should be cancelled after policy-blocked merge, got: {stdout}"
+        stdout.contains("\"status\":\"failed\"") || stdout.contains("\"status\": \"failed\""),
+        "task should be parked after policy-blocked merge, got: {stdout}"
+    );
+    assert!(stdout.contains("daemon_resume_status"));
+    assert!(stdout.contains("merging"));
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-retry", "--task-id", "1", "--by", "operator"])
+        .output()
+        .unwrap();
+    assert!(retry.status.success());
+    let retry_stdout = String::from_utf8_lossy(&retry.stdout);
+    assert!(
+        retry_stdout.contains("\"status\":\"merging\""),
+        "retry must restore the same merge stage: {retry_stdout}"
     );
 }
 

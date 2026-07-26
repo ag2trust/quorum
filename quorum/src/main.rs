@@ -950,7 +950,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::TaskRetry { task_id, by } => {
             let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::retry_provider_blocked(&mut conn, task_id, &by, now)? {
+            let retried = match quorum_core::tasks::retry_parked(&mut conn, task_id, &by, now)? {
+                some @ Some(_) => some,
+                None => quorum_core::tasks::retry_provider_blocked(&mut conn, task_id, &by, now)?,
+            };
+            match retried {
                 Some(task) => {
                     output::emit(&quorum_core::tasks::TaskCompact::from(&task));
                     Ok(0)
@@ -958,7 +962,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 None => {
                     output::emit(&serde_json::json!({
                         "ok": false,
-                        "reason": "task is not provider-blocked or is terminal",
+                        "reason": "task is not daemon-parked or provider-blocked",
                     }));
                     Ok(1)
                 }

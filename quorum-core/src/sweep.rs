@@ -97,9 +97,9 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
     Ok(())
 }
 
-/// Cancel open tasks whose dependencies can never be satisfied: every dep is terminal
-/// (done/failed/cancelled) but at least one is failed or cancelled. Without this, a
-/// cancelled dependency permanently blocks its dependents (#57 G1).
+/// Park open tasks whose dependencies cannot currently be satisfied: every dep is terminal
+/// (done/failed/cancelled) but at least one is failed or cancelled. They stay excluded from
+/// provisioning until an explicit retry, without losing their dependency context.
 pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
     let doomed: Vec<(i64, i64)> = {
         let mut stmt = conn.prepare(
@@ -133,13 +133,28 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
         if !seen.insert(*task_id) {
             continue;
         }
-        conn.execute(
-            "UPDATE tasks SET status='cancelled', assignee=NULL, updated_at=?1 WHERE id=?2",
-            params![now, task_id],
-        )?;
         let target = format!("task#{task_id}");
-        let body = format!("dep-cascade: dependency #{failed_dep} is terminal-not-done");
-        crate::events::emit(conn, "dep_cascade", &target, &body, now)?;
+        let reason = format!("dependency #{failed_dep} is terminal-not-done");
+        conn.execute(
+            "UPDATE tasks
+             SET status='failed',
+                 assignee=NULL,
+                 refs=json_set(
+                     COALESCE(refs, '{}'),
+                     '$.daemon_parked', json('true'),
+                     '$.daemon_parked_reason', ?1,
+                     '$.daemon_resume_status', 'open'
+                 ),
+                 updated_at=?2
+             WHERE id=?3",
+            params![reason, now, task_id],
+        )?;
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body)
+             VALUES (?1, ?2, 'daemon', ?3)",
+            params![task_id, now, format!("parked: {reason}")],
+        )?;
+        crate::events::emit(conn, "task_parked", &target, &reason, now)?;
         count += 1;
     }
     Ok(count)
@@ -383,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn cascade_cancels_task_blocked_by_cancelled_dep() {
+    fn cascade_parks_task_blocked_by_cancelled_dep() {
         let (_d, mut c) = open_tmp();
         let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
             .unwrap();
@@ -414,13 +429,16 @@ mod tests {
         let n = cascade_dead_deps(&c, 300, 100).unwrap();
         assert_eq!(n, 1);
         let t = crate::tasks::get(&c, child).unwrap().unwrap();
-        assert_eq!(t.status, "cancelled", "child must be cancelled by cascade");
+        assert_eq!(t.status, "failed", "child must be parked by cascade");
+        let refs: serde_json::Value = serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert_eq!(refs["daemon_resume_status"], "open");
         // Event emitted.
         let target = format!("task#{child}");
         let evs = crate::events::list(&c, 0, Some(&target), 10, 300).unwrap();
         assert!(
-            evs.iter().any(|e| e.kind == "dep_cascade"),
-            "dep_cascade event must be emitted"
+            evs.iter().any(|e| e.kind == "task_parked"),
+            "task_parked event must be emitted"
         );
     }
 
@@ -555,7 +573,7 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(
             crate::tasks::get(&c, child).unwrap().unwrap().status,
-            "cancelled"
+            "failed"
         );
     }
 
@@ -596,19 +614,13 @@ mod tests {
             params![a],
         )
         .unwrap();
-        // First cascade: b cancelled.
+        // First cascade: b parked.
         cascade_dead_deps(&c, 300, 100).unwrap();
-        assert_eq!(
-            crate::tasks::get(&c, b).unwrap().unwrap().status,
-            "cancelled"
-        );
-        // c still open (b just became cancelled, need another sweep).
-        // Second cascade: c cancelled.
+        assert_eq!(crate::tasks::get(&c, b).unwrap().unwrap().status, "failed");
+        // c still open (b just became failed, need another sweep).
+        // Second cascade: c parked.
         cascade_dead_deps(&c, 400, 100).unwrap();
-        assert_eq!(
-            crate::tasks::get(&c, ch).unwrap().unwrap().status,
-            "cancelled"
-        );
+        assert_eq!(crate::tasks::get(&c, ch).unwrap().unwrap().status, "failed");
     }
 
     // ── Review-only reaper recovery (table-driven) ─────────────────

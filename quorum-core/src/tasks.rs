@@ -30,9 +30,9 @@ pub const DEFAULT_LEASE_TTL_SECS: i64 = 3600;
 
 pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 
-/// Body prefix for all daemon-parked tasks. Any cancelled task whose body starts with this
-/// prefix is reopenable by creator or (former) assignee (#182).
-pub const PARKED_BODY_PREFIX: &str = "daemon:parked:";
+pub const PARKED_REF: &str = "daemon_parked";
+pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
+pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
 
 /// Body marker for review-only tasks whose approved PR failed to merge (e.g. conflicts).
 /// The daemon's orphan-in-review handler detects this and retries merge when the PR
@@ -744,7 +744,8 @@ pub fn apply_event(
         .map_err(|e| QuorumError::Usage(e.to_string()))?;
 
     // Recovery budget: crash-recovery transitions (Working/Rework → Open via
-    // AgentFailed/LeaseExpired) are bounded. Override to Cancelled when exhausted.
+    // AgentFailed/LeaseExpired) are bounded. Park loudly in Failed when exhausted;
+    // only an explicit caller may originate Cancelled.
     let is_crash_recovery = new_status == Status::Open
         && matches!(status, Status::Working | Status::Rework)
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
@@ -756,8 +757,11 @@ pub fn apply_event(
     };
 
     if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
-        new_status = Status::Cancelled;
+        new_status = Status::Failed;
         effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. }));
+        if !effects.contains(&Effect::ReleaseLease) {
+            effects.push(Effect::ReleaseLease);
+        }
         effects.push(Effect::NotifyOwner {
             reason: format!(
                 "recovery budget exhausted ({}/{MAX_RECOVERY_ATTEMPTS} attempts); \
@@ -790,6 +794,17 @@ pub fn apply_event(
     let mut rework_round = task.rework_round;
     let mut assignee = task.assignee.clone();
     let mut refs = task.refs.clone();
+    if is_crash_recovery && new_status == Status::Failed {
+        refs = Some(set_parked_refs(
+            refs.as_deref(),
+            failure_cause,
+            if status == Status::Rework {
+                "rework"
+            } else {
+                "open"
+            },
+        )?);
+    }
 
     for eff in &effects {
         match eff {
@@ -969,31 +984,15 @@ pub fn update(
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
 
     let n = match fields.status {
-        Some("open") => {
-            let rows = tx.execute(
-                "UPDATE tasks SET
+        Some("open") => tx.execute(
+            "UPDATE tasks SET
                     status='open', assignee=NULL,
                     body  = COALESCE(?3, body),
                     refs  = COALESCE(?4, refs),
                     updated_at = ?5
                  WHERE id=?1 AND assignee=?6 AND status='working'",
-                params![id, "open", fields.body, fields.refs, now, agent],
-            )?;
-            if rows == 0 {
-                tx.execute(
-                    "UPDATE tasks SET
-                        status='open', assignee=NULL,
-                        body  = COALESCE(?3, body),
-                        refs  = COALESCE(?4, refs),
-                        updated_at = ?5
-                     WHERE id=?1 AND (created_by=?6 OR assignee=?6)
-                           AND status='cancelled'",
-                    params![id, "open", fields.body, fields.refs, now, agent],
-                )?
-            } else {
-                rows
-            }
-        }
+            params![id, "open", fields.body, fields.refs, now, agent],
+        )?,
         Some("cancelled") => tx.execute(
             "UPDATE tasks SET
                 status='cancelled',
@@ -1037,7 +1036,14 @@ pub fn update(
         let dep_rows = tx.execute(
             "UPDATE tasks SET depends_on=?2, updated_at=?3
              WHERE id=?1 AND (created_by=?4 OR assignee=?4)
-                   AND status NOT IN ('done', 'failed')",
+                   AND status NOT IN ('done', 'cancelled')
+                   AND (
+                       status != 'failed'
+                       OR (
+                           json_valid(refs)
+                           AND json_extract(refs, '$.daemon_parked')=1
+                       )
+                   )",
             params![id, dep_json, now, agent],
         )?;
         if dep_rows == 0 && n == 0 {
@@ -1102,6 +1108,140 @@ pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) 
     )?;
     tx.commit()?;
     Ok(())
+}
+
+fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Result<String> {
+    let mut value: serde_json::Value = match refs {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?,
+        None => serde_json::json!({}),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?;
+    object.insert(PARKED_REF.into(), serde_json::Value::Bool(true));
+    object.insert(
+        PARKED_REASON_REF.into(),
+        serde_json::Value::String(reason.into()),
+    );
+    object.insert(
+        PARKED_RESUME_STATUS_REF.into(),
+        serde_json::Value::String(resume_status.into()),
+    );
+    serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
+}
+
+/// Durably park an automatically blocked task. Failed is deliberately excluded
+/// from daemon provisioning; the task can only continue through `task-retry`.
+pub fn park(
+    conn: &mut Connection,
+    id: i64,
+    reason: &str,
+    resume_status: &str,
+    now: i64,
+) -> Result<Option<Task>> {
+    if !matches!(resume_status, "open" | "rework" | "in-review" | "merging") {
+        return Err(QuorumError::Usage(format!(
+            "invalid parked resume status: {resume_status}"
+        )));
+    }
+    let tx = begin_immediate(conn)?;
+    let current: Option<Option<String>> = tx
+        .query_row(
+            "SELECT refs FROM tasks
+             WHERE id=?1 AND status NOT IN ('done','failed','cancelled')",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(refs) = current else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let refs = set_parked_refs(refs.as_deref(), reason, resume_status)?;
+    tx.execute(
+        "UPDATE tasks
+         SET status='failed', assignee=NULL, refs=?2, updated_at=?3
+         WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    deactivate_lease(&tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, format!("parked: {reason}")],
+    )?;
+    crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
+    tx.commit()?;
+    Ok(Some(task))
+}
+
+/// Explicitly resume the same task after an automatic park. PR, branch,
+/// dependency, approval, author, and rework context remain untouched.
+pub fn retry_parked(conn: &mut Connection, id: i64, by: &str, now: i64) -> Result<Option<Task>> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, by, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let resume_status: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(refs, '$.daemon_resume_status')
+             FROM tasks
+             WHERE id=?1 AND status='failed'
+               AND json_valid(refs)
+               AND json_extract(refs, '$.daemon_parked')=1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(resume_status) = resume_status else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    if !matches!(
+        resume_status.as_str(),
+        "open" | "rework" | "in-review" | "merging"
+    ) {
+        return Err(QuorumError::Io(format!(
+            "invalid persisted resume status for task #{id}: {resume_status}"
+        )));
+    }
+    tx.execute(
+        "UPDATE tasks
+         SET status=?2,
+             assignee=NULL,
+             recovery_attempts=0,
+             refs=json_remove(
+                 refs,
+                 '$.daemon_parked',
+                 '$.daemon_parked_reason',
+                 '$.daemon_resume_status'
+             ),
+             updated_at=?3
+         WHERE id=?1",
+        params![id, resume_status, now],
+    )?;
+    deactivate_lease(&tx, id, now)?;
+    crate::events::emit(
+        &tx,
+        "task_retry",
+        &lease_target(id),
+        &format!("parked task resumed by {by}"),
+        now,
+    )?;
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![id],
+        row_to_task,
+    )?;
+    task.ready = compute_ready(&tx, &task.depends_on)?;
+    tx.commit()?;
+    Ok(Some(task))
 }
 
 /// Atomically retry a task parked after a bounded provider failure.
@@ -2162,7 +2302,7 @@ mod tests {
     }
 
     #[test]
-    fn reopen_parked_task() {
+    fn cancelled_task_with_legacy_parked_body_is_terminal() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
@@ -2178,8 +2318,11 @@ mod tests {
             1001,
         )
         .unwrap();
-        let t = release(&mut c, "A", id, 1002).unwrap();
-        assert_eq!(t.status, "open");
+        assert!(matches!(
+            release(&mut c, "A", id, 1002),
+            Err(QuorumError::NotHolder)
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "cancelled");
     }
 
     // ── deps ────────────────────────────────────────────────────────────────
@@ -2216,7 +2359,7 @@ mod tests {
     }
 
     #[test]
-    fn resurrect_cancelled_dep_unblocks_child() {
+    fn cancelled_dependency_and_parked_child_stay_blocked() {
         let (_d, mut c) = open_tmp();
         let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
         let child = create(
@@ -2236,25 +2379,17 @@ mod tests {
         cancel(&mut c, "W", dep, 1001).unwrap();
         // Child is blocked (dep is cancelled, not done)
         assert!(!get(&c, child).unwrap().unwrap().ready);
-        // Resurrect the dep (creator reopens — no parked prefix needed)
-        let reopened_dep = release(&mut c, "boss", dep, 1003).unwrap();
-        assert_eq!(reopened_dep.status, "open");
-        // Also resurrect child (cascade_dead_deps may have cancelled it on the
-        // previous write; in the live system it fires on the next daemon tick)
-        let child_task = get(&c, child).unwrap().unwrap();
-        if child_task.status == "cancelled" {
-            release(&mut c, "boss", child, 1003).unwrap();
-        }
-        // Complete the dep
-        claim(&mut c, "W", Some(dep), &[], TTL, 1004)
+        assert!(matches!(
+            release(&mut c, "boss", dep, 1003),
+            Err(QuorumError::NotHolder)
+        ));
+        // Resume preserves the cancelled dependency and remains gated.
+        let resumed = retry_parked(&mut c, child, "boss", 1004).unwrap().unwrap();
+        assert_eq!(resumed.status, "open");
+        assert!(!resumed.ready);
+        assert!(claim(&mut c, "A", Some(child), &[], TTL, 1005)
             .unwrap()
-            .unwrap();
-        close_after_merge(&mut c, dep, "merged", 1005).unwrap();
-        // Now child is unblocked
-        let t = claim(&mut c, "A", Some(child), &[], TTL, 1006)
-            .unwrap()
-            .expect("child should be claimable now that dep is done");
-        assert_eq!(t.status, "working");
+            .is_none());
     }
 
     #[test]
@@ -2278,7 +2413,7 @@ mod tests {
         cancel(&mut c, "W", dep, 1001).unwrap();
         // child is blocked (dep is cancelled, not done)
         assert!(!get(&c, child).unwrap().unwrap().ready);
-        // Clear child's deps (works even on cancelled tasks)
+        // Corrective metadata edits are allowed while parked.
         let updated = update(
             &mut c,
             "boss",
@@ -2287,16 +2422,14 @@ mod tests {
                 depends_on: Some("[]"),
                 ..Default::default()
             },
-            1002,
+            1003,
         )
         .unwrap();
         assert!(updated.ready);
         assert_eq!(updated.depends_on.as_deref(), Some("[]"));
-        // If cascade cancelled the child, resurrect it (now safe — no dead deps)
-        if updated.status == "cancelled" {
-            let reopened = release(&mut c, "boss", child, 1003).unwrap();
-            assert_eq!(reopened.status, "open");
-        }
+        assert_eq!(updated.status, "failed");
+        let resumed = retry_parked(&mut c, child, "boss", 1003).unwrap().unwrap();
+        assert_eq!(resumed.status, "open");
         // Now claimable
         let t = claim(&mut c, "A", Some(child), &[], TTL, 1004)
             .unwrap()
@@ -2305,15 +2438,16 @@ mod tests {
     }
 
     #[test]
-    fn reopen_cancelled_task_without_parked_prefix() {
+    fn cancelled_task_cannot_be_reopened() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         cancel(&mut c, "A", id, 1001).unwrap();
-        // Reopen by creator — no parked prefix required
-        let t = release(&mut c, "boss", id, 1002).unwrap();
-        assert_eq!(t.status, "open");
-        assert!(t.assignee.is_none());
+        assert!(matches!(
+            release(&mut c, "boss", id, 1002),
+            Err(QuorumError::NotHolder)
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "cancelled");
     }
 
     #[test]
@@ -3592,7 +3726,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_budget_cancels_on_exhaustion() {
+    fn recovery_budget_parks_on_exhaustion() {
         let (_d, mut c) = open_tmp();
         let tid = create(
             &mut c,
@@ -3625,7 +3759,7 @@ mod tests {
             assert_eq!(tr.task.recovery_attempts, attempt);
         }
 
-        // Attempt 4: claim again, crash → should cancel, not reopen
+        // Attempt 4: claim again, crash → should park, not reopen
         claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
         let tr = apply_event(
             &mut c,
@@ -3637,7 +3771,7 @@ mod tests {
             550,
         )
         .unwrap();
-        assert_eq!(tr.task.status, "cancelled");
+        assert_eq!(tr.task.status, "failed");
         assert!(
             tr.effects
                 .iter()
@@ -3886,7 +4020,7 @@ mod tests {
         let t = get(&c, tid).unwrap().unwrap();
         assert_eq!(t.recovery_attempts, 3);
 
-        // Fourth crash → cancel
+        // Fourth crash → parked
         claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
         let tr = apply_event(
             &mut c,
@@ -3898,7 +4032,7 @@ mod tests {
             550,
         )
         .unwrap();
-        assert_eq!(tr.task.status, "cancelled");
+        assert_eq!(tr.task.status, "failed");
     }
 
     #[test]
@@ -3936,7 +4070,7 @@ mod tests {
             assert_eq!(tr.task.recovery_attempts, attempt);
         }
 
-        // Attempt 4: budget exhausted → cancelled, not reopened
+        // Attempt 4: budget exhausted → parked, not reopened
         claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
         let tr = apply_event(
             &mut c,
@@ -3948,15 +4082,15 @@ mod tests {
             550,
         )
         .unwrap();
-        assert_eq!(tr.task.status, "cancelled");
+        assert_eq!(tr.task.status, "failed");
 
-        // Verify the cancellation includes the failure cause
+        // Verify the park includes the failure cause
         let has_cause = tr.effects.iter().any(|e| {
             matches!(e, Effect::NotifyOwner { reason }
                 if reason.contains("recovery budget exhausted")
                     && reason.contains("not-holder"))
         });
-        assert!(has_cause, "cancellation must include the rejection cause");
+        assert!(has_cause, "park must include the rejection cause");
     }
 
     #[test]
@@ -3992,7 +4126,7 @@ mod tests {
             .unwrap();
         }
 
-        // Fourth crash → cancelled
+        // Fourth crash → parked
         claim(&mut c, "w1", None, &[], TTL, 500).unwrap();
         let tr = apply_event(
             &mut c,
@@ -4004,11 +4138,11 @@ mod tests {
             550,
         )
         .unwrap();
-        assert_eq!(tr.task.status, "cancelled");
+        assert_eq!(tr.task.status, "failed");
 
         // Task is now terminal — claim must fail (no 4th spawn possible)
         let claimed = claim(&mut c, "w2", None, &[], TTL, 600).unwrap();
-        assert!(claimed.is_none(), "must not claim a cancelled task");
+        assert!(claimed.is_none(), "must not claim a parked task");
     }
 
     #[test]
@@ -4077,7 +4211,7 @@ mod tests {
             550,
         )
         .unwrap();
-        assert_eq!(tr.task.status, "cancelled");
+        assert_eq!(tr.task.status, "failed");
 
         let reason = tr
             .effects
@@ -4091,6 +4225,113 @@ mod tests {
             reason
                 .contains("last failure: lifecycle transition rejected at done signal: not-holder"),
             "exhaustion message must carry the triggering failure reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn parked_task_retry_preserves_pr_and_dependency_context() {
+        let (_dir, mut conn) = open_tmp();
+        let dep = create(
+            &mut conn, "owner", "dep", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            Some("original task context"),
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            Some(419),
+            11,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='in-review', refs='{\"pr\":419,\"branch\":\"feature/x\"}',
+                 author='worker', reviewer='reviewer', rework_round=2
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        let parked = park(
+            &mut conn,
+            task_id,
+            "reviewer repo mismatch",
+            "in-review",
+            12,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parked.status, "failed");
+        assert_eq!(parked.body.as_deref(), Some("original task context"));
+        let expected_deps = format!("[{dep}]");
+        assert_eq!(parked.depends_on.as_deref(), Some(expected_deps.as_str()));
+        let refs: serde_json::Value =
+            serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 419);
+        assert_eq!(refs["branch"], "feature/x");
+        assert_eq!(refs["daemon_parked_reason"], "reviewer repo mismatch");
+
+        let retried = retry_parked(&mut conn, task_id, "operator", 13)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "in-review");
+        assert_eq!(retried.body.as_deref(), Some("original task context"));
+        assert_eq!(retried.author.as_deref(), Some("worker"));
+        assert_eq!(retried.reviewer.as_deref(), Some("reviewer"));
+        assert_eq!(retried.rework_round, 2);
+        assert_eq!(retried.depends_on.as_deref(), Some(expected_deps.as_str()));
+        let refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 419);
+        assert!(refs.get("daemon_parked").is_none());
+    }
+
+    #[test]
+    fn dependency_park_retry_restores_same_open_task_without_spawning_early() {
+        let (_dir, mut conn) = open_tmp();
+        let dep = create(
+            &mut conn, "owner", "dep", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        let child = create(
+            &mut conn,
+            "owner",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            11,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![dep])
+            .unwrap();
+        crate::sweep::cascade_dead_deps(&conn, 12, 100).unwrap();
+        assert_eq!(get(&conn, child).unwrap().unwrap().status, "failed");
+        assert!(
+            claim(&mut conn, "worker", None, &[], TTL, 13)
+                .unwrap()
+                .is_none(),
+            "parked dependency task must not be provisioned"
+        );
+
+        let retried = retry_parked(&mut conn, child, "operator", 14)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "open");
+        assert!(!retried.ready, "failed dependency must still gate the task");
+        assert!(
+            claim(&mut conn, "worker", None, &[], TTL, 15)
+                .unwrap()
+                .is_none(),
+            "retry must preserve dependency gating"
         );
     }
 

@@ -1340,10 +1340,10 @@ fn replacement_instant_death_stops_at_budget() {
         _sentinel: Some(sentinel),
     };
 
-    // Recovery fires AgentFailed → budget exhausted → cancelled.
+    // Recovery fires AgentFailed → budget exhausted → durably parked.
     assert!(
-        handle.wait_for("-> cancelled", 30) || handle.wait_for("recovery budget", 30),
-        "task not cancelled after budget exhaustion. Lines: {:?}",
+        handle.wait_for("-> failed", 30) || handle.wait_for("recovery budget", 30),
+        "task not parked after budget exhaustion. Lines: {:?}",
         handle.lines
     );
 
@@ -1353,8 +1353,8 @@ fn replacement_instant_death_stops_at_budget() {
     // Verify final state.
     let task = get_task(home.path(), task_id);
     assert_eq!(
-        task.status, "cancelled",
-        "task must be cancelled after budget exhaustion"
+        task.status, "failed",
+        "task must be parked after budget exhaustion"
     );
 
     // Owner signal: messages table must contain budget-exhaustion alert.

@@ -3190,16 +3190,17 @@ async fn tick(
                             | merge::MergeFailureKind::PolicyPending => {
                                 log(&format!(
                                     "MERGE BLOCKED: PR #{pr_num} merge failed \
-                                     (not worker-fixable): {} — cancelling task",
+                                     (not worker-fixable): {} — parking task",
                                     merge_result.message
                                 ));
-                                fire_event(
+                                park_task(
                                     &db_path,
-                                    "system",
                                     reviewer_task_id,
-                                    &Event::Cancelled {
-                                        by: "daemon".into(),
-                                    },
+                                    &format!(
+                                        "merge policy blocked PR #{pr_num}: {}",
+                                        merge_result.message
+                                    ),
+                                    "merging",
                                 )
                                 .await;
                                 let r = reviewers.remove(ri);
@@ -3209,7 +3210,7 @@ async fn tick(
                                     workers.iter().position(|w| w.task_id == reviewer_task_id)
                                 {
                                     let w = workers.remove(wi);
-                                    cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled")
+                                    cleanup_slot(config, wt_mgr, name_pool, w, None, "parked")
                                         .await;
                                 }
                             }
@@ -4348,21 +4349,14 @@ async fn tick(
             let strikes = poison_tracker.record_strike(dead.task_id);
             if strikes >= MAX_POISON_STRIKES {
                 let task_id = dead.task_id;
-                fire_event(
+                park_task(
                     &db_path,
-                    "daemon",
                     task_id,
-                    &Event::Cancelled {
-                        by: format!(
-                            "daemon: poisoned — worker died {strikes} time(s) without producing output"
-                        ),
-                    },
+                    &format!("worker died {strikes} time(s) without producing output"),
+                    "open",
                 )
                 .await;
-                cleanup_slot(config, wt_mgr, name_pool, dead, None, "cancelled").await;
-                log(&format!(
-                    "POISON: task #{task_id} cancelled after {strikes} strikes"
-                ));
+                cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
             } else {
                 log(&format!(
                     "POISON: task #{} strike {strikes}/{MAX_POISON_STRIKES}",
@@ -4712,22 +4706,16 @@ async fn tick(
             let pr_label =
                 w.pr.map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "unknown".to_string());
-            fire_event(
+            park_task(
                 &db_path,
-                &w.agent_name,
                 w.task_id,
-                &Event::Cancelled {
-                    by: "daemon:parked:repo-mismatch".into(),
-                },
+                &format!(
+                    "repo mismatch: PR {pr_label} belongs to {task_repo}, not {}",
+                    config.repo
+                ),
+                "in-review",
             )
             .await;
-            let body = format!(
-                "{}repo-mismatch | PR {pr_label} belongs to {task_repo}, \
-                 not {} — cannot provision reviewer from this daemon",
-                tasks::PARKED_BODY_PREFIX,
-                config.repo
-            );
-            set_task_body(&db_path, w.task_id, &body).await;
             notify_provision_failure(
                 &db_path,
                 w.task_id,
@@ -4735,30 +4723,21 @@ async fn tick(
                 &pr_label,
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled").await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
         for &wi in parked_workers.iter().rev() {
             let w = workers.remove(wi);
             let pr_label =
                 w.pr.map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "unknown".to_string());
-            fire_event(
-                &db_path,
-                &w.agent_name,
-                w.task_id,
-                &Event::Cancelled {
-                    by: "daemon:provision-exhausted".into(),
-                },
-            )
-            .await;
-            set_task_body(
+            park_task(
                 &db_path,
                 w.task_id,
                 &format!(
-                    "{}provision-exhausted | PR {pr_label} | \
-                     reviewer provision failed {MAX_REVIEWER_PROVISION_STRIKES} time(s)",
-                    tasks::PARKED_BODY_PREFIX
+                    "reviewer provision exhausted for PR {pr_label} after \
+                     {MAX_REVIEWER_PROVISION_STRIKES} attempts"
                 ),
+                "in-review",
             )
             .await;
             notify_provision_failure(
@@ -4768,7 +4747,7 @@ async fn tick(
                 &pr_label,
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, w, None, "cancelled").await;
+            cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
 
         // ── Phase 5b: Spawn reviewers for orphan in-review tasks ──────
@@ -4879,22 +4858,16 @@ async fn tick(
                      belongs to {other_repo}, not {} — parking",
                     config.repo
                 ));
-                fire_event(
+                park_task(
                     &db_path,
-                    "daemon",
                     *task_id,
-                    &Event::Cancelled {
-                        by: "daemon:parked:repo-mismatch".into(),
-                    },
+                    &format!(
+                        "repo mismatch: PR #{pr} belongs to {other_repo}, not {}",
+                        config.repo
+                    ),
+                    "in-review",
                 )
                 .await;
-                let body = format!(
-                    "{}repo-mismatch | PR #{pr} belongs to {other_repo}, \
-                     not {} — cannot provision reviewer from this daemon",
-                    tasks::PARKED_BODY_PREFIX,
-                    config.repo
-                );
-                set_task_body(&db_path, *task_id, &body).await;
                 notify_provision_failure(
                     &db_path,
                     *task_id,
@@ -4942,23 +4915,11 @@ async fn tick(
                         "orphan in-review task #{task_id} PR #{pr}: \
                          provision exhausted — parking"
                     ));
-                    fire_event(
-                        &db_path,
-                        "daemon",
-                        *task_id,
-                        &Event::Cancelled {
-                            by: "daemon:parked:provision-exhausted".into(),
-                        },
-                    )
-                    .await;
-                    set_task_body(
+                    park_task(
                         &db_path,
                         *task_id,
-                        &format!(
-                            "{}provision-exhausted | PR #{pr} | \
-                             reviewer provision failed (orphan in-review)",
-                            tasks::PARKED_BODY_PREFIX
-                        ),
+                        &format!("reviewer provision exhausted for orphan PR #{pr}"),
+                        "in-review",
                     )
                     .await;
                     notify_provision_failure(
@@ -7044,27 +7005,28 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
 }
 
 async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strikes: u32) {
-    log(&format!(
-        "POISON: task #{task_id} cancelled after {strikes} consecutive instant-death failures"
-    ));
+    let reason = format!("worker {agent} died {strikes} time(s) without producing output");
+    park_task(db_path, task_id, &reason, "open").await;
+}
+
+async fn park_task(db_path: &std::path::Path, task_id: i64, reason: &str, resume_status: &str) {
+    log(&format!("PARKED: task #{task_id}: {reason}"));
     let p = db_path.to_path_buf();
-    let a = agent.to_string();
-    let body = format!("daemon: poisoned — worker died {strikes} time(s) without producing output");
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let reason = reason.to_string();
+    let resume_status = resume_status.to_string();
+    match tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
-        let now = now_unix();
-        let fields = tasks::TaskUpdate {
-            status: Some("cancelled"),
-            body: Some(&body),
-            refs: None,
-            verdict: None,
-            depends_on: None,
-        };
-        tasks::update(&mut conn, &a, task_id, &fields, now)?;
+        tasks::park(&mut conn, task_id, &reason, &resume_status, now_unix())?;
         Ok(())
     })
     .await
-    .ok();
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!("FATAL: failed to park task #{task_id}: {error}")),
+        Err(error) => log(&format!(
+            "FATAL: park task #{task_id} join failure: {error}"
+        )),
+    }
 }
 
 /// Fire a lifecycle event, returning the result or an error description.

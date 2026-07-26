@@ -557,7 +557,7 @@ pub enum Command {
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
     },
-    /// Retry a Codex worker task parked by a daemon provider failure.
+    /// Explicitly retry a task parked by the daemon after a bounded failure.
     TaskRetry {
         #[arg(long = "task-id")]
         task_id: i64,
