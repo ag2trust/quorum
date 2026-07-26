@@ -6349,22 +6349,14 @@ async fn provision_reviewer(
                 .ok();
             }
 
-            fire_event(
-                &config.db_path,
-                &reviewer_name,
-                worker.task_id,
-                &Event::ReviewerAttached {
-                    agent: reviewer_name.clone(),
-                },
-            )
-            .await;
-
-            // Record agent run — R2 uses insert_r2 (sub_role='r2').
-            // Reviewers always use Claude; provider is recorded for consistency.
+            // Persist the run before attaching the reviewer. The run history is
+            // the durable identity-exclusion source, so attachment must never
+            // become visible without it. A crash after this insert is safe:
+            // recovery excludes the name even if ReviewerAttached never fired.
             let reviewer_provider = resolve_provider(&reviewer_model)
                 .map(|k| k.to_string())
                 .unwrap_or_else(|_| "claude".to_string());
-            let reviewer_run_id = {
+            let reviewer_run_result = {
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
                 let m = reviewer_model.clone();
@@ -6398,9 +6390,47 @@ async fn provision_reviewer(
                     }
                 })
                 .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok()
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
             };
+            let reviewer_run_id = match reviewer_run_result {
+                Ok(Ok(run_id)) => run_id,
+                Ok(Err(e)) | Err(e) => {
+                    log(&format!(
+                        "{}: reviewer run persistence failed before attachment: {e}",
+                        role.as_str().to_uppercase()
+                    ));
+                    proc.kill_and_reap().await;
+                    name_pool.release(&reviewer_name);
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    let p = config.db_path.clone();
+                    let rn = reviewer_name.clone();
+                    let failed_cap_run_id = cap_run_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut conn) = quorum_core::db::open(&p) {
+                            let _ = journal::delete(&mut conn, &rn);
+                            let _ = quorum_core::capabilities::revoke(
+                                &mut conn,
+                                &failed_cap_run_id,
+                                now_unix(),
+                            );
+                        }
+                    })
+                    .await
+                    .ok();
+                    return Err(e);
+                }
+            };
+
+            fire_event(
+                &config.db_path,
+                &reviewer_name,
+                worker.task_id,
+                &Event::ReviewerAttached {
+                    agent: reviewer_name.clone(),
+                },
+            )
+            .await;
 
             // R2: stash metadata for audit recording when the reviewer finishes.
             if let ReviewRole::R2 {
@@ -6465,7 +6495,7 @@ async fn provision_reviewer(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 last_error_text: None,
-                agent_run_id: reviewer_run_id,
+                agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id),
                 r2_origin: role.is_r2(),
                 reviewed_head_sha: spawn_head_sha,

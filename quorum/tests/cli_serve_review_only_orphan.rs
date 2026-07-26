@@ -411,6 +411,142 @@ fn orphan_r1_does_not_reuse_torn_down_worker_name() {
 }
 
 #[test]
+fn orphan_r1_restart_excludes_reviewer_persisted_before_attachment() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let interrupted_reviewer = "InterruptedR1";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    // Simulate a daemon crash after the fail-safe run insert and before
+    // ReviewerAttached: there is durable run history but no task reviewer.
+    record_closed_run(home.path(), task_id, interrupted_reviewer, "reviewer");
+    assert_eq!(get_task(home.path(), task_id).reviewer, None);
+    let names = write_named_pool(
+        home.path(),
+        &[interrupted_reviewer.into(), "FreshR1".into()],
+    );
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "replacement R1 reviewer not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert_eq!(reviewer, "FreshR1");
+    assert_ne!(reviewer, interrupted_reviewer);
+    drop(handle);
+}
+
+#[test]
+fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reviewer_run
+             BEFORE INSERT ON agent_runs
+             WHEN NEW.role = 'reviewer'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected reviewer run failure');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let mut failed = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        failed.wait_for("reviewer run persistence failed before attachment", 30),
+        "injected persistence failure was not surfaced: {:?}",
+        failed.lines
+    );
+    assert!(
+        failed.wait_for("tick error", 10),
+        "daemon did not finish fail-safe cleanup: {:?}",
+        failed.lines
+    );
+    drop(failed);
+
+    let task = get_task(home.path(), task_id);
+    assert_eq!(task.reviewer, None, "failed persistence must not attach");
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        let reviewer_runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND role='reviewer'",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reviewer_runs, 0);
+        conn.execute_batch("DROP TRIGGER fail_reviewer_run;")
+            .unwrap();
+    }
+
+    let retry_wt_base = tempfile::tempdir().unwrap();
+    let mut recovered = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        retry_wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        recovered.wait_for("R1: reviewer Reviewer spawned", 30),
+        "restart did not recover reviewer provisioning: {:?}",
+        recovered.lines
+    );
+    assert_eq!(
+        get_task(home.path(), task_id).reviewer.as_deref(),
+        Some("Reviewer")
+    );
+    drop(recovered);
+}
+
+#[test]
 fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
