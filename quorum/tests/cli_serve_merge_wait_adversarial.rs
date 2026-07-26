@@ -121,6 +121,10 @@ impl ServeHandle {
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env(
+                "FAKE_AGENT_PROMPT_LOG",
+                home.join("fake-agent-prompts.jsonl"),
+            )
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -411,6 +415,33 @@ fn db_path(home: &std::path::Path) -> std::path::PathBuf {
 fn get_task(home: &std::path::Path, id: i64) -> quorum_core::tasks::Task {
     let conn = quorum_core::db::open(&db_path(home)).unwrap();
     quorum_core::tasks::get(&conn, id).unwrap().unwrap()
+}
+
+fn active_claim(home: &std::path::Path, task_id: i64) -> Option<(String, i64)> {
+    let conn = quorum_core::db::open(&db_path(home)).unwrap();
+    let target = format!("task#{task_id}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    conn.query_row(
+        "SELECT holder, expires_at FROM claims
+         WHERE target=?1 AND active=1 AND expires_at > ?2",
+        rusqlite::params![target, now],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+fn worker_journal_target(home: &std::path::Path, task_id: i64) -> Option<(String, Option<i64>)> {
+    let conn = quorum_core::db::open(&db_path(home)).unwrap();
+    conn.query_row(
+        "SELECT branch, pr FROM journal
+         WHERE task_id=?1 AND role='worker'",
+        [task_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
 }
 
 fn get_agent_runs(home: &std::path::Path, task_id: i64) -> Vec<quorum_core::agent_runs::AgentRun> {
@@ -1018,11 +1049,10 @@ fn head_sha_change_invalidates_approvals() {
     handle2.sigkill();
 }
 
-/// Merge conflict with absent worker → task parked in in-review (not rework),
-/// because a conflict can't be fixed without an active worker to rebase.
-/// With a live worker, MergeConflict fires rework directly.
+/// Implementation task + merge conflict + absent worker → MergeConflict
+/// and a leased remediation worker continuing the existing PR.
 #[test]
-fn merge_conflict_absent_worker_parks_task() {
+fn merge_conflict_absent_worker_spawns_remediation() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -1111,30 +1141,171 @@ fn merge_conflict_absent_worker_parks_task() {
     std::thread::sleep(Duration::from_secs(2));
     handle.drain_pending_lines();
 
-    // Absent worker + conflict → MergeFailed → parked in in-review.
+    assert!(
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning remediation worker"))
+            || handle.wait_for("spawning remediation worker", 15),
+        "remediation worker was not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let remediation_name = handle
+        .extract_agent_name("spawning remediation worker ")
+        .expect("could not extract remediation worker name");
+
+    // Persisted implementation responsibility drives MergeConflict → rework.
     let task = get_task(home.path(), task_id);
     assert_eq!(
-        task.status, "in-review",
-        "absent worker + conflict must park in in-review"
+        task.status, "rework",
+        "implementation task must enter rework despite absent original worker"
     );
+    assert_eq!(task.rework_round, 1);
 
-    // No remediation spawned (conflict, not checks failure).
-    let remediation_spawns = handle
-        .lines
-        .iter()
-        .filter(|l| l.contains("spawning remediation worker"))
-        .count();
+    let (holder, expires_at) =
+        active_claim(home.path(), task_id).expect("remediation lease must be active");
     assert_eq!(
-        remediation_spawns, 0,
-        "conflict must NOT spawn remediation (no worker to rebase)"
+        holder, remediation_name,
+        "remediation worker must hold the task lease"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(expires_at > now, "remediation lease must be unexpired");
+
+    let expected_branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+    let (branch, journal_pr) =
+        worker_journal_target(home.path(), task_id).expect("remediation journal row");
+    assert_eq!(branch, expected_branch, "must reuse the existing PR branch");
+    assert_eq!(journal_pr, Some(pr), "must continue the existing PR");
+
+    assert!(
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains(&format!("worker {remediation_name} result")))
+            || handle.wait_for(&format!("worker {remediation_name} result"), 15),
+        "remediation worker did not receive its turn. Lines: {:?}",
+        handle.lines
+    );
+    let prompts = std::fs::read_to_string(home.path().join("fake-agent-prompts.jsonl")).unwrap();
+    assert!(
+        prompts.contains("Fix the widget"),
+        "remediation turn must include the existing task body: {prompts}"
+    );
+    assert!(
+        prompts.contains("has conflicts with main")
+            && prompts.contains("Rebase on main, resolve conflicts"),
+        "remediation turn must include conflict instructions: {prompts}"
     );
 
-    // Parking log confirms the behavior.
-    let parked = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("parking, not failing"));
-    assert!(parked, "merge-blocked parking log expected");
+    handle.sigkill();
+}
+
+/// Genuine review-only tasks remain parked for their external author and
+/// never acquire an implementation lease or remediation worker.
+#[test]
+fn merge_conflict_review_only_parks_without_remediation() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "ExternalAuthor";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute("UPDATE tasks SET review_only=1 WHERE id=?1", [task_id])
+            .unwrap();
+    }
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    {
+        let mut conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+        quorum_core::pr_targets::upsert(&mut conn, task_id, pr, &branch, head_sha.trim(), false)
+            .unwrap();
+    }
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--merge-mergeability-cmd", "echo conflicting"],
+    );
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "{:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "{:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    complete_r2_review(home.path(), &mut handle, &pr.to_string());
+    assert!(
+        handle.wait_for("parking, not failing", 20),
+        "{:?}",
+        handle.lines
+    );
+
+    let task = get_task(home.path(), task_id);
+    assert_eq!(task.status, "in-review");
+    assert_eq!(task.rework_round, 0);
+    assert!(
+        get_agent_runs(home.path(), task_id)
+            .iter()
+            .all(|run| run.role != "worker"),
+        "review-only conflict must not allocate a worker"
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning remediation worker")),
+        "review-only conflict must not spawn remediation: {:?}",
+        handle.lines
+    );
 
     handle.sigkill();
 }
