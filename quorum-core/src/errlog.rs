@@ -256,8 +256,10 @@ mod tests {
         )
         .unwrap();
         // Insert an active agent_run.
-        crate::agent_runs::insert(&conn, task_id, "worker-1", "worker", "opus-46", "high", now)
-            .unwrap();
+        crate::agent_runs::insert(
+            &conn, task_id, "worker-1", "worker", "opus-46", "high", "claude", now,
+        )
+        .unwrap();
 
         // Fire the diagnostic.
         persist_lifecycle_diagnostic(

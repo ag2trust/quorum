@@ -1209,8 +1209,18 @@ Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
 Runner-specific configuration is scoped under `[claude]` or `[codex]`.
 
-The initial release uses one runner kind per daemon. Per-task runners, mixed providers
-within one daemon, and switching an in-flight task between runners are out of scope.
+**Per-run model selection (#194).** Each managed run resolves its provider from
+the task's model selection, not from a daemon-global runner kind:
+
+- A task with an explicit `tier:` label resolves to a full model ID
+  (`tier_to_model_id`). `resolve_provider` maps the model to `AgentKind::Claude`
+  (any `claude-*` model) or `AgentKind::Codex` (known OpenAI models: `o3`,
+  `o4-mini`, `gpt-4.1*`, `gpt-5*`). Unknown models are rejected before spawning.
+- A task with no explicit model selection uses the daemon's configured
+  `runner_kind` and `model`, preserving existing Claude-default behavior.
+- The resolved provider, model, and effort are persisted in `agent_runs.provider`
+  so continuation and recovery cannot switch providers mid-task.
+- Reviewers continue to use the daemon's configured provider.
 
 Claude's Sonnet/Opus order is not a cross-runner abstraction. Replace shared rank
 inference with explicit per-role selections while preserving Claude defaults:

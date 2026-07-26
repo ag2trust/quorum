@@ -432,8 +432,14 @@ mod tests {
         let task_id =
             crate::tasks::create(c, "boss", "test-task", None, 0, None, None, None, None, 100)
                 .unwrap();
-        let w = agent_runs::insert(c, task_id, "Alice", "worker", "opus-46", "high", 100).unwrap();
-        let r = agent_runs::insert(c, task_id, "Bob", "reviewer", "opus-46", "high", 100).unwrap();
+        let w = agent_runs::insert(
+            c, task_id, "Alice", "worker", "opus-46", "high", "claude", 100,
+        )
+        .unwrap();
+        let r = agent_runs::insert(
+            c, task_id, "Bob", "reviewer", "opus-46", "high", "claude", 100,
+        )
+        .unwrap();
         (task_id, w, r)
     }
 
@@ -488,7 +494,8 @@ mod tests {
     fn broadcast_includes_r2_runs() {
         let (_d, mut c) = open_tmp();
         let (tid, w_run, _r1_run) = seed_task_with_runs(&mut c);
-        let r2_run = agent_runs::insert_r2(&c, tid, "Carol", "opus-46", "high", 100).unwrap();
+        let r2_run =
+            agent_runs::insert_r2(&c, tid, "Carol", "opus-46", "high", "claude", 100).unwrap();
 
         let result = send_broadcast(&mut c, tid, w_run, "Alice", "all hands", 1000, 200).unwrap();
         match &result {
@@ -539,7 +546,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let (tid, w_run, _) = seed_task_with_runs(&mut c);
         // Two active runs with the same agent name (unusual but possible)
-        agent_runs::insert(&c, tid, "Bob", "reviewer", "opus-46", "high", 100).unwrap();
+        agent_runs::insert(&c, tid, "Bob", "reviewer", "opus-46", "high", "claude", 100).unwrap();
 
         let result = send_direct(&mut c, tid, w_run, "Alice", "Bob", "hi", 1000, 200).unwrap();
         match &result {
@@ -570,8 +577,10 @@ mod tests {
             &mut c, "boss", "lonely", None, 0, None, None, None, None, 100,
         )
         .unwrap();
-        let solo =
-            agent_runs::insert(&c, task_id, "Solo", "worker", "opus-46", "high", 100).unwrap();
+        let solo = agent_runs::insert(
+            &c, task_id, "Solo", "worker", "opus-46", "high", "claude", 100,
+        )
+        .unwrap();
 
         let result = send_broadcast(&mut c, task_id, solo, "Solo", "echo", 1000, 200).unwrap();
         match &result {
@@ -782,9 +791,9 @@ mod tests {
             let tid =
                 crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, None, 100)
                     .unwrap();
-            agent_runs::insert(&c, tid, "W1", "worker", "m", "h", 100).unwrap();
-            agent_runs::insert(&c, tid, "R1", "reviewer", "m", "h", 100).unwrap();
-            agent_runs::insert_r2(&c, tid, "R2", "m", "h", 100).unwrap();
+            agent_runs::insert(&c, tid, "W1", "worker", "m", "h", "claude", 100).unwrap();
+            agent_runs::insert(&c, tid, "R1", "reviewer", "m", "h", "claude", 100).unwrap();
+            agent_runs::insert_r2(&c, tid, "R2", "m", "h", "claude", 100).unwrap();
         }
 
         let handles: Vec<_> = (0..4)
@@ -833,9 +842,9 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let tid = crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, None, 100)
             .unwrap();
-        let w = agent_runs::insert(&c, tid, "W", "worker", "m", "h", 100).unwrap();
-        agent_runs::insert(&c, tid, "R1", "reviewer", "m", "h", 100).unwrap();
-        agent_runs::insert(&c, tid, "R2", "reviewer", "m", "h", 100).unwrap();
+        let w = agent_runs::insert(&c, tid, "W", "worker", "m", "h", "claude", 100).unwrap();
+        agent_runs::insert(&c, tid, "R1", "reviewer", "m", "h", "claude", 100).unwrap();
+        agent_runs::insert(&c, tid, "R2", "reviewer", "m", "h", "claude", 100).unwrap();
 
         let result = send_broadcast(&mut c, tid, w, "W", "hi all", 1000, 200).unwrap();
         let msg_id = match &result {

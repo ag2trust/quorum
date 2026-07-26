@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 30;
+pub const SCHEMA_VERSION: i64 = 31;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -454,6 +454,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // Landing at v30 because main shipped SCHEMA_VERSION=29 for the
         // recovery_attempts column; a live DB at user_version=29 would
         // short-circuit SCHEMA_SQL and miss the new table.
+
+        // v31 = per-run provider column on agent_runs (#194). NULL for
+        // pre-existing rows (implies Claude, the only prior provider).
+        if current < 31 && !column_exists(conn, "agent_runs", "provider")? {
+            conn.execute("ALTER TABLE agent_runs ADD COLUMN provider TEXT", [])?;
+        }
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())

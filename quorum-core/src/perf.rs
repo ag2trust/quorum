@@ -468,8 +468,10 @@ mod tests {
     }
 
     fn seed_run(conn: &Connection, task_id: i64, model: &str, effort: &str, spawned_at: i64) {
-        crate::agent_runs::insert(conn, task_id, "agent", "worker", model, effort, spawned_at)
-            .unwrap();
+        crate::agent_runs::insert(
+            conn, task_id, "agent", "worker", model, effort, "claude", spawned_at,
+        )
+        .unwrap();
     }
 
     fn seed_reviewer_run(
@@ -480,7 +482,7 @@ mod tests {
         ended_at: i64,
     ) {
         let run_id = crate::agent_runs::insert(
-            conn, task_id, agent, "reviewer", "opus-46", "high", spawned_at,
+            conn, task_id, agent, "reviewer", "opus-46", "high", "claude", spawned_at,
         )
         .unwrap();
         crate::agent_runs::close(conn, run_id, ended_at, "done").unwrap();
@@ -563,8 +565,17 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let tid = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
         // Only a reviewer run — should fall back to defaults
-        crate::agent_runs::insert(&c, tid, "rev", "reviewer", "claude-opus-4-8", "max", 1001)
-            .unwrap();
+        crate::agent_runs::insert(
+            &c,
+            tid,
+            "rev",
+            "reviewer",
+            "claude-opus-4-8",
+            "max",
+            "claude",
+            1001,
+        )
+        .unwrap();
 
         let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
         assert_eq!(r.rows[0].model, DM);

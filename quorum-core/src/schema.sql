@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 30). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 31). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -293,7 +293,10 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     end_reason  TEXT,
     -- v23: NULL = normal R1/worker run. 'r2' = R2 adversarial audit pass.
     -- Perf queries filter `sub_role IS NULL` to exclude R2 from R1 stats.
-    sub_role    TEXT
+    sub_role    TEXT,
+    -- v31: resolved provider for this run ('claude' or 'codex'). NULL for
+    -- pre-existing rows (implies Claude). Recovery must use this, not re-resolve.
+    provider    TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 
