@@ -343,6 +343,37 @@ pub fn resolve_provider(model: &str) -> Result<runner::AgentKind> {
     )))
 }
 
+fn resolve_worker_provider(
+    model: &str,
+    has_model_override: bool,
+    is_retry: bool,
+    default_runner: crate::serve_config::RunnerKind,
+) -> Result<runner::AgentKind> {
+    if is_retry || has_model_override {
+        resolve_provider(model)
+    } else {
+        Ok(runner_kind_to_agent_kind(default_runner))
+    }
+}
+
+fn resolve_remediation_provider(
+    recorded_provider: Option<&str>,
+    recorded_model: Option<String>,
+    config_model: &str,
+    config_runner: crate::serve_config::RunnerKind,
+) -> (String, runner::AgentKind) {
+    let model = recorded_model.unwrap_or_else(|| config_model.to_string());
+    let kind = recorded_provider
+        .and_then(|provider| match provider {
+            "claude" => Some(runner::AgentKind::Claude),
+            "codex" => Some(runner::AgentKind::Codex),
+            _ => None,
+        })
+        .or_else(|| resolve_provider(&model).ok())
+        .unwrap_or_else(|| runner_kind_to_agent_kind(config_runner));
+    (model, kind)
+}
+
 const MODEL_TIERS: &[&str] = &[
     "claude-sonnet-5",
     "claude-opus-4-6",
@@ -6802,11 +6833,12 @@ async fn spawn_worker(
         |retry| retry.prompt.clone(),
     );
 
-    let resolved_kind = if retry_turn.is_some() || has_label_model {
-        resolve_provider(&resolved_model)?
-    } else {
-        runner_kind_to_agent_kind(config.runner_kind)
-    };
+    let resolved_kind = resolve_worker_provider(
+        &resolved_model,
+        has_label_model,
+        retry_turn.is_some(),
+        config.runner_kind,
+    )?;
 
     // Codex cannot fabricate USD cost — reject rather than silently spawn
     // with no cost enforcement.
@@ -7799,17 +7831,8 @@ async fn spawn_remediation_worker(
                 .flatten();
             let model = quorum_core::agent_runs::worker_model(&conn, tid)
                 .ok()
-                .flatten()
-                .unwrap_or(cfg_model);
-            let kind = provider
-                .and_then(|p| match p.as_str() {
-                    "claude" => Some(runner::AgentKind::Claude),
-                    "codex" => Some(runner::AgentKind::Codex),
-                    _ => None,
-                })
-                .or_else(|| resolve_provider(&model).ok())
-                .unwrap_or_else(|| runner_kind_to_agent_kind(cfg_kind));
-            (model, kind)
+                .flatten();
+            resolve_remediation_provider(provider.as_deref(), model, &cfg_model, cfg_kind)
         })
         .await
         .unwrap_or_else(|_| {
@@ -9742,6 +9765,228 @@ mod tests {
         assert_eq!(kind, runner::AgentKind::Claude);
         let kind = runner_kind_to_agent_kind(crate::serve_config::RunnerKind::Codex);
         assert_eq!(kind, runner::AgentKind::Codex);
+    }
+
+    #[test]
+    fn deterministic_provider_matrix_records_worker_r1_and_r2_routes() {
+        struct Case {
+            name: &'static str,
+            default_runner: crate::serve_config::RunnerKind,
+            config_model: &'static str,
+            worker_model: &'static str,
+            has_override: bool,
+            expected: [&'static str; 3],
+        }
+
+        let cases = [
+            Case {
+                name: "claude-default",
+                default_runner: crate::serve_config::RunnerKind::Claude,
+                config_model: "claude-opus-4-6",
+                worker_model: "claude-opus-4-6",
+                has_override: false,
+                expected: ["claude", "claude", "claude"],
+            },
+            Case {
+                name: "all-codex",
+                default_runner: crate::serve_config::RunnerKind::Codex,
+                config_model: "o3",
+                worker_model: "o3",
+                has_override: false,
+                expected: ["codex", "codex", "codex"],
+            },
+            Case {
+                name: "mixed-codex-worker-claude-reviewers",
+                default_runner: crate::serve_config::RunnerKind::Claude,
+                config_model: "claude-opus-4-6",
+                worker_model: "o3",
+                has_override: true,
+                expected: ["codex", "claude", "claude"],
+            },
+        ];
+
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("{}.db", case.name));
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn, "owner", case.name, None, 0, None, None, None, None, 10,
+            )
+            .unwrap();
+
+            let worker_kind = resolve_worker_provider(
+                case.worker_model,
+                case.has_override,
+                false,
+                case.default_runner,
+            )
+            .unwrap();
+            let reviewer_model = escalated_reviewer_model(case.worker_model, case.config_model);
+            let reviewer_kind = resolve_provider(&reviewer_model).unwrap();
+
+            quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "worker",
+                "worker",
+                case.worker_model,
+                "high",
+                &worker_kind.to_string(),
+                11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "r1",
+                "reviewer",
+                &reviewer_model,
+                "high",
+                &reviewer_kind.to_string(),
+                12,
+            )
+            .unwrap();
+            quorum_core::agent_runs::insert_r2(
+                &conn,
+                task_id,
+                "r2",
+                &reviewer_model,
+                "high",
+                &reviewer_kind.to_string(),
+                13,
+            )
+            .unwrap();
+
+            let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+            assert_eq!(
+                runs.len(),
+                3,
+                "{} should record all lifecycle runs",
+                case.name
+            );
+            assert_eq!(runs[0].role, "worker");
+            assert_eq!(runs[1].role, "reviewer");
+            assert_eq!(runs[1].sub_role, None);
+            assert_eq!(runs[2].sub_role.as_deref(), Some("r2"));
+            assert_eq!(
+                [
+                    runs[0].provider.as_deref().unwrap(),
+                    runs[1].provider.as_deref().unwrap(),
+                    runs[2].provider.as_deref().unwrap(),
+                ],
+                case.expected,
+                "{} provider route changed",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn remediation_reopens_with_original_worker_provider_and_fresh_reviews() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rework-provider.db");
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "mixed task",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            quorum_core::agent_runs::insert(
+                &conn, task_id, "worker-a", "worker", "o3", "high", "codex", 11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "r1-changes",
+                "reviewer",
+                "claude-opus-4-6",
+                "high",
+                "claude",
+                12,
+            )
+            .unwrap();
+        }
+
+        // A daemon restart closes and reopens the sole source of truth.
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded_provider = quorum_core::agent_runs::worker_provider(&conn, task_id).unwrap();
+        let recorded_model = quorum_core::agent_runs::worker_model(&conn, task_id).unwrap();
+        let (model, kind) = resolve_remediation_provider(
+            recorded_provider.as_deref(),
+            recorded_model,
+            "claude-opus-4-6",
+            crate::serve_config::RunnerKind::Claude,
+        );
+        assert_eq!(model, "o3");
+        assert_eq!(
+            kind,
+            runner::AgentKind::Codex,
+            "rework must not fall back to the daemon's Claude default"
+        );
+
+        quorum_core::agent_runs::insert(
+            &conn,
+            task_id,
+            "worker-a",
+            "worker",
+            &model,
+            "high",
+            &kind.to_string(),
+            13,
+        )
+        .unwrap();
+        quorum_core::agent_runs::insert(
+            &conn,
+            task_id,
+            "r1-fresh",
+            "reviewer",
+            "claude-opus-4-6",
+            "high",
+            "claude",
+            14,
+        )
+        .unwrap();
+        quorum_core::agent_runs::insert_r2(
+            &conn,
+            task_id,
+            "r2-fresh",
+            "claude-opus-4-6",
+            "high",
+            "claude",
+            15,
+        )
+        .unwrap();
+
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+        assert_eq!(runs.len(), 5);
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.role == "worker")
+                .map(|run| (
+                    run.agent.as_str(),
+                    run.model.as_str(),
+                    run.provider.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("worker-a", "o3", Some("codex")),
+                ("worker-a", "o3", Some("codex")),
+            ],
+            "changes must resume the same worker identity, model, and provider"
+        );
+        assert_eq!(runs[3].agent, "r1-fresh");
+        assert_eq!(runs[4].sub_role.as_deref(), Some("r2"));
     }
 
     #[test]

@@ -82,7 +82,9 @@ impl AgentKind {
     /// Known Codex/OpenAI prefixes route to Codex; everything else
     /// (including short Claude aliases like "sonnet") defaults to Claude.
     pub fn for_model(model: &str) -> Self {
-        if model.starts_with("o1-")
+        if model == "o1"
+            || model == "o3"
+            || model.starts_with("o1-")
             || model.starts_with("o3-")
             || model.starts_with("o4-")
             || model.starts_with("gpt-")
@@ -100,6 +102,18 @@ impl std::fmt::Display for AgentKind {
             Self::Claude => f.write_str("claude"),
             Self::Codex => f.write_str("codex"),
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_tests {
+    use super::AgentKind;
+
+    #[test]
+    fn exact_o_series_model_ids_route_to_codex() {
+        assert_eq!(AgentKind::for_model("o1"), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("o3"), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("o4-mini"), AgentKind::Codex);
     }
 }
 
