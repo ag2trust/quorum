@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 31). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 32). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -313,6 +313,22 @@ CREATE TABLE IF NOT EXISTS activity_events (
 );
 CREATE INDEX IF NOT EXISTS activity_events_agent_ts ON activity_events(agent_name, ts DESC);
 CREATE INDEX IF NOT EXISTS activity_events_expires  ON activity_events(expires_at);
+
+-- Durable PR target persistence (#201). Stores the authoritative PR target
+-- tuple (head ref, head SHA, fork status) from `gh pr view` so remediation
+-- and recovery can reuse it when GitHub is temporarily unavailable. Without
+-- this, review-only tasks (where orphan_worker_branch returns None) are
+-- stranded on GitHub outages. Keyed by task_id (one target per task); the
+-- pr_number is stored for validation (a persisted target for a different PR
+-- is stale). Not TTL'd — durable like task_branches.
+CREATE TABLE IF NOT EXISTS pr_targets (
+    task_id     INTEGER PRIMARY KEY,
+    pr_number   INTEGER NOT NULL,
+    head_ref    TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    is_fork     INTEGER NOT NULL DEFAULT 0,
+    resolved_at INTEGER NOT NULL
+);
 
 -- Review-comment interpreter output (#93): structured findings parsed from PR
 -- comment threads by a cheap Haiku pass. Captures blocking findings, non-blocking

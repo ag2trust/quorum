@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 31;
+pub const SCHEMA_VERSION: i64 = 32;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -460,6 +460,11 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         if current < 31 && !column_exists(conn, "agent_runs", "provider")? {
             conn.execute("ALTER TABLE agent_runs ADD COLUMN provider TEXT", [])?;
         }
+
+        // v32 = durable PR target persistence (#201). Net-new `pr_targets`
+        // table via SCHEMA_SQL — no ALTER needed. Landing at v32 because
+        // main shipped SCHEMA_VERSION=31; a live DB at user_version=31
+        // would short-circuit SCHEMA_SQL and miss the new table.
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -1979,5 +1984,55 @@ mod tests {
             .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(title, "pre-v30");
+    }
+
+    #[test]
+    fn migrates_v31_to_v32_adds_pr_targets_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                 created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                 sticky_until INTEGER, orig TEXT,
+                 author TEXT, reviewer TEXT,
+                 rework_round INTEGER NOT NULL DEFAULT 0,
+                 review_only INTEGER NOT NULL DEFAULT 0,
+                 recovery_attempts INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('pre-v32', 'open', 'boss', 100, 100);
+             PRAGMA user_version = 31;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='pr_targets'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "pr_targets table missing after v31→v32 migration");
+
+        let title: String = c
+            .query_row("SELECT title FROM tasks WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "pre-v32");
     }
 }

@@ -28,6 +28,7 @@ use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
+use quorum_core::pr_targets;
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
 use std::collections::{HashMap, VecDeque};
@@ -255,6 +256,38 @@ fn orphan_worker_branch(author: &str, task_id: i64, review_only: bool) -> Option
     } else {
         Some(format!("daemon/{}-t{}", author.to_lowercase(), task_id))
     }
+}
+
+/// Resolve PR target from GitHub, persist on success, fall back to
+/// persisted target when GitHub is unavailable.
+fn resolve_or_load_pr_target(
+    pr: i64,
+    task_id: i64,
+    db_path: &Path,
+    repo_dir: &Path,
+    gh_repo: Option<&str>,
+) -> Option<PrTarget> {
+    if let Some(target) = resolve_pr_target(pr, repo_dir, gh_repo) {
+        if let Ok(mut conn) = quorum_core::db::open(db_path) {
+            let _ = pr_targets::upsert(
+                &mut conn,
+                task_id,
+                target.pr,
+                &target.head_ref,
+                &target.head_sha,
+                target.is_fork,
+            );
+        }
+        return Some(target);
+    }
+    let conn = quorum_core::db::open(db_path).ok()?;
+    let stored = pr_targets::get(&conn, task_id, pr).ok()??;
+    Some(PrTarget {
+        pr: stored.pr_number,
+        head_ref: stored.head_ref,
+        head_sha: stored.head_sha,
+        is_fork: stored.is_fork,
+    })
 }
 
 /// Map a tier label suffix to a full Claude model ID.
@@ -1681,10 +1714,18 @@ async fn tick(
                                 Some(("external".to_string(), reviewer_task_id, branch))
                             } else {
                                 let pr_val = pr_num;
+                                let tid = reviewer_task_id;
+                                let dbp = db_path.clone();
                                 let repo_dir = config.repo_dir.clone();
                                 let gh_repo = config.repo.clone();
                                 let resolved = tokio::task::spawn_blocking(move || {
-                                    resolve_pr_target(pr_val, &repo_dir, Some(&gh_repo))
+                                    resolve_or_load_pr_target(
+                                        pr_val,
+                                        tid,
+                                        &dbp,
+                                        &repo_dir,
+                                        Some(&gh_repo),
+                                    )
                                 })
                                 .await
                                 .ok()
@@ -4951,30 +4992,33 @@ async fn tick(
                     } else {
                         ReviewRole::R1
                     };
-                    let branch =
-                        if let Some(b) = orphan_worker_branch(author, *task_id, *review_only) {
-                            b
-                        } else {
-                            let pr_num = *pr;
-                            let repo_dir = config.repo_dir.clone();
-                            let gh_repo = config.repo.clone();
-                            let resolved = tokio::task::spawn_blocking(move || {
-                                resolve_pr_target(pr_num, &repo_dir, Some(&gh_repo))
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                            match resolved {
-                                Some(target) => target.head_ref,
-                                None => {
-                                    log(&format!(
-                                        "orphan in-review task #{task_id} PR #{pr}: \
+                    let branch = if let Some(b) =
+                        orphan_worker_branch(author, *task_id, *review_only)
+                    {
+                        b
+                    } else {
+                        let pr_num = *pr;
+                        let tid = *task_id;
+                        let dbp = config.db_path.clone();
+                        let repo_dir = config.repo_dir.clone();
+                        let gh_repo = config.repo.clone();
+                        let resolved = tokio::task::spawn_blocking(move || {
+                            resolve_or_load_pr_target(pr_num, tid, &dbp, &repo_dir, Some(&gh_repo))
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        match resolved {
+                            Some(target) => target.head_ref,
+                            None => {
+                                log(&format!(
+                                    "orphan in-review task #{task_id} PR #{pr}: \
                                          could not resolve PR head ref — skipping"
-                                    ));
-                                    continue;
-                                }
+                                ));
+                                continue;
                             }
-                        };
+                        }
+                    };
                     let counterpart = ReviewCounterpart {
                         agent_name: if author.is_empty() {
                             "external"
@@ -5950,15 +5994,17 @@ async fn provision_reviewer(
     let branch = reviewer::reviewer_branch(pr, &reviewer_name);
     let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &reviewer_name);
 
-    // #189: resolve PR target from GitHub (authoritative head ref, SHA, fork
-    // status). Falls back to worker branch convention when GitHub is
-    // unavailable (e.g. integration tests with fake repos).
+    // #189/#201: resolve PR target from GitHub (authoritative head ref, SHA,
+    // fork status). Persists on success; falls back to persisted target, then
+    // worker branch convention when GitHub is unavailable.
     let task_repo_dir = &config.repo_dir;
     let pr_num = pr;
+    let tid = worker.task_id;
+    let dbp = config.db_path.clone();
     let repo_dir_for_gh = task_repo_dir.to_path_buf();
     let gh_repo = config.repo.clone();
     let pr_target = tokio::task::spawn_blocking(move || {
-        resolve_pr_target(pr_num, &repo_dir_for_gh, Some(&gh_repo))
+        resolve_or_load_pr_target(pr_num, tid, &dbp, &repo_dir_for_gh, Some(&gh_repo))
     })
     .await
     .ok()
@@ -7476,16 +7522,20 @@ async fn spawn_remediation_worker(
         .unwrap_or((String::new(), String::new(), false))
     };
 
-    // #189: resolve PR target from GitHub. Falls back to daemon branch
-    // convention when GitHub is unavailable.
+    // #189/#201: resolve PR target from GitHub, persist on success, fall
+    // back to persisted target when GitHub is unavailable.
     let pr_target = {
         let pr_val = pr;
+        let tid = task_id;
+        let dbp = db_path.clone();
         let repo_dir = config.repo_dir.clone();
         let gh_repo = config.repo.clone();
-        tokio::task::spawn_blocking(move || resolve_pr_target(pr_val, &repo_dir, Some(&gh_repo)))
-            .await
-            .ok()
-            .flatten()
+        tokio::task::spawn_blocking(move || {
+            resolve_or_load_pr_target(pr_val, tid, &dbp, &repo_dir, Some(&gh_repo))
+        })
+        .await
+        .ok()
+        .flatten()
     };
     let fallback_branch = if pr_target.is_none() {
         let fb = orphan_worker_branch(&task_author, task_id, task_review_only);
@@ -9468,5 +9518,124 @@ mod tests {
         let t = parse_pr_target_json(3779, json).unwrap();
         assert_eq!(t.head_ref, "daemon/alloy-hvjv-t200");
         assert_eq!(t.head_sha, "deadbeef");
+    }
+
+    // ── resolve_or_load_pr_target (persisted fallback) ───────────────────
+
+    fn open_test_db(dir: &std::path::Path) -> quorum_core::Connection {
+        quorum_core::db::open(&dir.join("q.db")).unwrap()
+    }
+
+    #[test]
+    fn persisted_target_reused_when_gh_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = open_test_db(dir.path());
+        pr_targets::upsert(&mut conn, 10, 42, "daemon/lever-t10", "abc123", false).unwrap();
+        drop(conn);
+
+        // gh will fail (fake repo_dir), so fallback kicks in
+        let result = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo"));
+        let t = result.unwrap();
+        assert_eq!(t.pr, 42);
+        assert_eq!(t.head_ref, "daemon/lever-t10");
+        assert_eq!(t.head_sha, "abc123");
+        assert!(!t.is_fork);
+    }
+
+    #[test]
+    fn persisted_fork_target_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = open_test_db(dir.path());
+        pr_targets::upsert(&mut conn, 10, 42, "fix-bug", "def456", true).unwrap();
+        drop(conn);
+
+        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
+        assert!(t.is_fork);
+        assert_eq!(t.head_ref, "fix-bug");
+    }
+
+    #[test]
+    fn persisted_target_wrong_pr_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = open_test_db(dir.path());
+        pr_targets::upsert(&mut conn, 10, 42, "branch", "sha1", false).unwrap();
+        drop(conn);
+
+        // PR 99 doesn't match persisted PR 42
+        assert!(
+            resolve_or_load_pr_target(99, 10, &db_path, dir.path(), Some("fake/repo")).is_none()
+        );
+    }
+
+    #[test]
+    fn no_persisted_target_no_gh_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let _conn = open_test_db(dir.path());
+
+        // No persisted target, gh will fail
+        assert!(
+            resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_target_stale_head_still_returned() {
+        // Stale head_sha is returned — SHA verification happens downstream
+        // at worktree checkout, not here
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = open_test_db(dir.path());
+        pr_targets::upsert(&mut conn, 10, 42, "branch", "old_sha", false).unwrap();
+        drop(conn);
+
+        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
+        assert_eq!(t.head_sha, "old_sha");
+    }
+
+    #[test]
+    fn review_only_no_gh_no_persisted_returns_none() {
+        // Review-only tasks: orphan_worker_branch returns None AND no persisted
+        // target → no worker spawned (the fail-safe)
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let _conn = open_test_db(dir.path());
+
+        assert!(orphan_worker_branch("Anvil", 15, true).is_none());
+        assert!(
+            resolve_or_load_pr_target(42, 15, &db_path, dir.path(), Some("fake/repo")).is_none()
+        );
+    }
+
+    #[test]
+    fn review_only_with_persisted_target_succeeds() {
+        // Review-only tasks with a persisted target CAN spawn
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = open_test_db(dir.path());
+        pr_targets::upsert(&mut conn, 15, 42, "external/pr-branch", "sha999", false).unwrap();
+        drop(conn);
+
+        assert!(orphan_worker_branch("Anvil", 15, true).is_none());
+        let t = resolve_or_load_pr_target(42, 15, &db_path, dir.path(), Some("fake/repo")).unwrap();
+        assert_eq!(t.head_ref, "external/pr-branch");
+    }
+
+    #[test]
+    fn persisted_target_updated_on_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = open_test_db(dir.path());
+        pr_targets::upsert(&mut conn, 10, 42, "old-branch", "sha1", false).unwrap();
+        pr_targets::upsert(&mut conn, 10, 42, "new-branch", "sha2", true).unwrap();
+        drop(conn);
+
+        let t = resolve_or_load_pr_target(42, 10, &db_path, dir.path(), Some("fake/repo")).unwrap();
+        assert_eq!(t.head_ref, "new-branch");
+        assert_eq!(t.head_sha, "sha2");
+        assert!(t.is_fork);
     }
 }

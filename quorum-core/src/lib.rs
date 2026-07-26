@@ -28,6 +28,7 @@ pub mod lifecycle;
 pub mod mailbox;
 pub mod perf;
 pub mod pinned;
+pub mod pr_targets;
 pub mod provision_attempts;
 pub mod review_audits;
 pub mod review_findings;
