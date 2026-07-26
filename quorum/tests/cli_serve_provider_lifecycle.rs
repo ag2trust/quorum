@@ -112,6 +112,11 @@ impl ServeHandle {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
         assert!(self.child.wait().unwrap().success());
     }
+
+    fn stop_mut(&mut self) {
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
+        assert!(self.child.wait().unwrap().success());
+    }
 }
 
 struct Case {
@@ -221,6 +226,65 @@ impl Case {
 
     fn db(&self) -> rusqlite::Connection {
         quorum_core::db::open(&self.home.path().join("repos/test__repo/quorum.db")).unwrap()
+    }
+
+    fn restart(&mut self, default_provider: &str, model: &str) {
+        self.handle.stop_mut();
+        let names = self.home.path().join("names.txt");
+        let runner = self.home.path().join("dual-runner.sh");
+        let sentinel = tempfile::tempdir().unwrap();
+        let mut child = Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", self.home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .env("RUNNER_LOG", &self.runner_log)
+            .args([
+                "serve",
+                "--repo",
+                "test/repo",
+                "--cap",
+                "1",
+                "--repo-dir",
+                &self._repo.path().to_string_lossy(),
+                "--worktree-base",
+                &self._worktrees.path().to_string_lossy(),
+                "--names-file",
+                &names.to_string_lossy(),
+                "--agent",
+                default_provider,
+                "--model",
+                model,
+                "--agent-bin",
+                &runner.to_string_lossy(),
+                "--merge-cmd",
+                "true",
+                "--merge-checks-cmd",
+                "echo ready",
+                "--merge-checks-timeout-secs",
+                "10",
+                "--merge-checks-poll-secs",
+                "1",
+                "--exit-when-gone",
+                &sentinel.path().to_string_lossy(),
+            ])
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        self.handle = ServeHandle {
+            child,
+            rx,
+            lines: Vec::new(),
+            _sentinel: sentinel,
+        };
     }
 
     fn done(&self, agent: &str, args: &[&str]) {
@@ -437,5 +501,74 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
         "changes must require a fresh R1"
     );
     drop(conn);
+    case.handle.stop();
+}
+
+#[test]
+fn restart_resumes_codex_reviewer_with_persisted_identity_model_and_thread() {
+    let mut case = Case::start("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+    case.done(&worker, &["--pr", "1"]);
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    assert_ne!(
+        reviewer, worker,
+        "fresh reviewer provisioning must exclude the durable worker identity"
+    );
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    let expected_thread = format!("thread-{reviewer}");
+    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        refs["codex_reviewer_r1_thread_id"].as_str(),
+        Some(expected_thread.as_str())
+    );
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let mut conn = case.db();
+    conn.execute("UPDATE tasks SET author='' WHERE id=1", [])
+        .unwrap();
+    quorum_core::pr_targets::upsert(&mut conn, 1, 1, "main", head_sha.trim(), false).unwrap();
+    drop(conn);
+
+    // Change daemon defaults across restart. Orphan provisioning must recover
+    // the interrupted reviewer's durable identity instead of reclassifying.
+    case.restart("claude", "claude-opus-4-6");
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let expected_resume = format!("{reviewer}|exec resume {expected_thread} --json ");
+    assert!(
+        log.lines().any(|line| {
+            line.starts_with(&expected_resume) && line.contains("--model gpt-5.6-terra")
+        }),
+        "reviewer restart must resume the exact persisted Codex identity: {log}"
+    );
+    let runs = quorum_core::agent_runs::runs_for_task(&case.db(), 1).unwrap();
+    let recovered = runs.last().unwrap();
+    assert_eq!(recovered.agent, reviewer);
+    assert_ne!(
+        recovered.agent, worker,
+        "restart recovery must preserve the reviewer identity without weakening task exclusions"
+    );
+    assert_eq!(recovered.model, "gpt-5.6-terra");
+    assert_eq!(recovered.provider.as_deref(), Some("codex"));
     case.handle.stop();
 }

@@ -78,10 +78,11 @@ impl RunnerProc {
 }
 
 impl AgentKind {
-    /// Resolve provider from the model string chosen for a managed run.
-    /// Known Codex/OpenAI prefixes route to Codex; everything else
-    /// (including short Claude aliases like "sonnet") defaults to Claude.
-    pub fn for_model(model: &str) -> Self {
+    /// Resolve the provider from the model string chosen for a managed run.
+    ///
+    /// This is the authoritative model-to-runner mapping. Unknown models are
+    /// rejected so callers cannot spawn one runner and persist another.
+    pub fn for_model(model: &str) -> Result<Self, String> {
         if model == "o1"
             || model == "o3"
             || model.starts_with("o1-")
@@ -89,9 +90,21 @@ impl AgentKind {
             || model.starts_with("o4-")
             || model.starts_with("gpt-")
         {
-            Self::Codex
+            Ok(Self::Codex)
+        } else if model.starts_with("claude-")
+            || model == "sonnet"
+            || model.starts_with("sonnet-")
+            || model == "opus"
+            || model.starts_with("opus-")
+            || model == "fable"
+            || model.starts_with("fable-")
+        {
+            Ok(Self::Claude)
         } else {
-            Self::Claude
+            Err(format!(
+                "unknown model '{model}': cannot resolve provider \
+                 (expected claude-*/Claude alias or supported OpenAI model)"
+            ))
         }
     }
 }
@@ -111,9 +124,9 @@ mod provider_tests {
 
     #[test]
     fn exact_o_series_model_ids_route_to_codex() {
-        assert_eq!(AgentKind::for_model("o1"), AgentKind::Codex);
-        assert_eq!(AgentKind::for_model("o3"), AgentKind::Codex);
-        assert_eq!(AgentKind::for_model("o4-mini"), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("o1").unwrap(), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("o3").unwrap(), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("o4-mini").unwrap(), AgentKind::Codex);
     }
 }
 
@@ -531,31 +544,57 @@ mod tests {
 
     #[test]
     fn for_model_claude_prefix() {
-        assert_eq!(AgentKind::for_model("claude-sonnet-5"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("claude-opus-4-6"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("claude-opus-4-7"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("claude-opus-4-8"), AgentKind::Claude);
+        assert_eq!(
+            AgentKind::for_model("claude-sonnet-5").unwrap(),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            AgentKind::for_model("claude-opus-4-6").unwrap(),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            AgentKind::for_model("claude-opus-4-7").unwrap(),
+            AgentKind::Claude
+        );
+        assert_eq!(
+            AgentKind::for_model("claude-opus-4-8").unwrap(),
+            AgentKind::Claude
+        );
     }
 
     #[test]
     fn for_model_codex_models() {
-        assert_eq!(AgentKind::for_model("o4-mini"), AgentKind::Codex);
-        assert_eq!(AgentKind::for_model("gpt-4o"), AgentKind::Codex);
-        assert_eq!(AgentKind::for_model("gpt-5.6-codex"), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("o4-mini").unwrap(), AgentKind::Codex);
+        assert_eq!(AgentKind::for_model("gpt-4o").unwrap(), AgentKind::Codex);
+        assert_eq!(
+            AgentKind::for_model("gpt-5.6-codex").unwrap(),
+            AgentKind::Codex
+        );
+        assert_eq!(
+            AgentKind::for_model("gpt-5.6-terra").unwrap(),
+            AgentKind::Codex
+        );
     }
 
     #[test]
-    fn for_model_unknown_defaults_claude() {
-        assert_eq!(AgentKind::for_model("unknown-model"), AgentKind::Claude);
+    fn for_model_unknown_is_rejected() {
+        assert!(AgentKind::for_model("unknown-model").is_err());
     }
 
     #[test]
     fn for_model_short_claude_aliases() {
-        assert_eq!(AgentKind::for_model("sonnet"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("sonnet-5"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("opus-46"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("opus-47"), AgentKind::Claude);
-        assert_eq!(AgentKind::for_model("opus-48"), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("sonnet").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("sonnet-5").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus-46").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus-47").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("opus-48").unwrap(), AgentKind::Claude);
+        assert_eq!(AgentKind::for_model("fable").unwrap(), AgentKind::Claude);
+        assert_eq!(
+            AgentKind::for_model("fable-preview").unwrap(),
+            AgentKind::Claude
+        );
+        assert!(AgentKind::for_model("haiku").is_err());
     }
 
     #[test]

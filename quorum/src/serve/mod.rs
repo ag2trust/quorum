@@ -313,65 +313,103 @@ fn tier_to_model_id(tier: &str) -> Option<String> {
     }
 }
 
-fn runner_kind_to_agent_kind(kind: crate::serve_config::RunnerKind) -> runner::AgentKind {
-    match kind {
-        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
-        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
-    }
-}
-
-/// Known OpenAI/Codex model prefixes. A model matches if it equals a prefix
-/// or starts with `<prefix>-`.
-const CODEX_MODEL_PREFIXES: &[&str] = &["o3", "o4-mini", "gpt-4.1", "gpt-5"];
-
 /// Resolve the provider (AgentKind) from a fully-qualified model ID.
-///
-/// Claude models start with `claude-`. OpenAI/Codex models match
-/// `CODEX_MODEL_PREFIXES`. Unknown models are rejected before spawning.
 pub fn resolve_provider(model: &str) -> Result<runner::AgentKind> {
-    if model.starts_with("claude-") {
-        return Ok(runner::AgentKind::Claude);
-    }
-    for &prefix in CODEX_MODEL_PREFIXES {
-        if model == prefix || model.starts_with(&format!("{prefix}-")) {
-            return Ok(runner::AgentKind::Codex);
-        }
-    }
-    Err(QuorumError::Usage(format!(
-        "unknown model '{model}': cannot resolve provider \
-         (expected claude-* or known OpenAI model)"
-    )))
+    runner::AgentKind::for_model(model).map_err(QuorumError::Usage)
 }
 
-fn resolve_worker_provider(
-    model: &str,
-    has_model_override: bool,
-    is_retry: bool,
-    default_runner: crate::serve_config::RunnerKind,
-) -> Result<runner::AgentKind> {
-    if is_retry || has_model_override {
-        resolve_provider(model)
-    } else {
-        Ok(runner_kind_to_agent_kind(default_runner))
-    }
+fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
+    resolve_provider(model)
 }
 
 fn resolve_remediation_provider(
     recorded_provider: Option<&str>,
     recorded_model: Option<String>,
     config_model: &str,
-    config_runner: crate::serve_config::RunnerKind,
-) -> (String, runner::AgentKind) {
+    _config_runner: crate::serve_config::RunnerKind,
+) -> Result<(String, runner::AgentKind)> {
     let model = recorded_model.unwrap_or_else(|| config_model.to_string());
-    let kind = recorded_provider
-        .and_then(|provider| match provider {
-            "claude" => Some(runner::AgentKind::Claude),
-            "codex" => Some(runner::AgentKind::Codex),
-            _ => None,
-        })
-        .or_else(|| resolve_provider(&model).ok())
-        .unwrap_or_else(|| runner_kind_to_agent_kind(config_runner));
-    (model, kind)
+    let model_kind = resolve_provider(&model)?;
+    let kind = match recorded_provider {
+        Some("claude") => runner::AgentKind::Claude,
+        Some("codex") => runner::AgentKind::Codex,
+        Some(provider) => {
+            return Err(QuorumError::Io(format!(
+                "unknown persisted provider '{provider}' for model '{model}'"
+            )));
+        }
+        None => model_kind,
+    };
+    if kind != model_kind {
+        return Err(QuorumError::Io(format!(
+            "persisted provider '{kind}' does not match model '{model}' resolved as '{model_kind}'"
+        )));
+    }
+    Ok((model, kind))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewerRecovery {
+    agent: String,
+    model: String,
+    effort: String,
+    kind: runner::AgentKind,
+    thread_id: Option<String>,
+}
+
+fn reviewer_thread_ref_key(is_r2: bool) -> &'static str {
+    if is_r2 {
+        "codex_reviewer_r2_thread_id"
+    } else {
+        "codex_reviewer_r1_thread_id"
+    }
+}
+
+fn resolve_reviewer_recovery(
+    db_path: &std::path::Path,
+    task_id: i64,
+    is_r2: bool,
+) -> Result<Option<ReviewerRecovery>> {
+    let conn = quorum_core::db::open(db_path)?;
+    let task = tasks::get(&conn, task_id)?;
+    let task_refs = task.as_ref().and_then(|task| task.refs.as_deref());
+    let Some(run) = quorum_core::agent_runs::interrupted_reviewer(&conn, task_id, is_r2)? else {
+        return Ok(None);
+    };
+    let provider = run.provider.as_deref().ok_or_else(|| {
+        QuorumError::Io(format!(
+            "interrupted reviewer run {} has no persisted provider",
+            run.id
+        ))
+    })?;
+    let kind = resolve_provider(&run.model)?;
+    if provider != kind.to_string() {
+        return Err(QuorumError::Io(format!(
+            "persisted provider '{provider}' does not match reviewer model '{}' resolved as '{kind}'",
+            run.model
+        )));
+    }
+    let thread_id = task_refs
+        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| {
+            refs.get(reviewer_thread_ref_key(is_r2))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    if kind == runner::AgentKind::Codex && thread_id.is_none() {
+        return Err(QuorumError::Io(format!(
+            "interrupted Codex reviewer run {} has no persisted {}",
+            run.id,
+            reviewer_thread_ref_key(is_r2)
+        )));
+    }
+    Ok(Some(ReviewerRecovery {
+        agent: run.agent,
+        model: run.model,
+        effort: run.effort,
+        kind,
+        thread_id,
+    }))
 }
 
 const MODEL_TIERS: &[&str] = &[
@@ -385,22 +423,22 @@ fn model_rank(model: &str) -> Option<usize> {
     MODEL_TIERS.iter().position(|&m| m == model)
 }
 
-fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> String {
+fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> Result<String> {
     use crate::serve::runner::AgentKind;
-    let worker_is_claude = AgentKind::for_model(worker_model) == AgentKind::Claude;
-    let config_is_claude = AgentKind::for_model(config_model) == AgentKind::Claude;
+    let worker_is_claude = resolve_provider(worker_model)? == AgentKind::Claude;
+    let config_is_claude = resolve_provider(config_model)? == AgentKind::Claude;
 
     // Both non-Claude (e.g. Codex): no tier escalation available, use
     // config model as-is so the reviewer inherits the daemon's provider.
     if !worker_is_claude && !config_is_claude {
-        return config_model.to_string();
+        return Ok(config_model.to_string());
     }
 
     let worker_rank = model_rank(worker_model).unwrap_or(0);
     let config_rank = model_rank(config_model).unwrap_or(0);
     let escalated = (worker_rank + 1).min(MODEL_TIERS.len() - 1);
     let final_rank = escalated.max(config_rank);
-    MODEL_TIERS[final_rank].to_string()
+    Ok(MODEL_TIERS[final_rank].to_string())
 }
 
 fn extract_cx_est(refs: &Option<String>) -> Option<i64> {
@@ -1807,6 +1845,7 @@ async fn tick(
                                 worker_cp,
                                 &role,
                                 &head_sha,
+                                false,
                             )
                             .await
                             .ok();
@@ -4756,6 +4795,7 @@ async fn tick(
                         counterpart,
                         &role,
                         &head_sha,
+                        false,
                     )
                     .await?;
                 }
@@ -5071,6 +5111,7 @@ async fn tick(
                         counterpart,
                         &role,
                         &head_sha,
+                        true,
                     )
                     .await?;
                 }
@@ -5694,7 +5735,12 @@ fn codex_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str)
     }
 }
 
-async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread_id: &str) {
+async fn persist_codex_thread_id(
+    db_path: &std::path::Path,
+    task_id: i64,
+    thread_id: &str,
+    ref_key: &'static str,
+) {
     let p = db_path.to_path_buf();
     let tid = thread_id.to_string();
     let task_id_val = task_id;
@@ -5707,7 +5753,7 @@ async fn persist_codex_thread_id(db_path: &std::path::Path, task_id: i64, thread
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
-            refs["codex_thread_id"] = serde_json::Value::String(tid);
+            refs[ref_key] = serde_json::Value::String(tid);
             let refs_str = refs.to_string();
             tasks::update_refs_daemon(&mut conn, task_id_val, &refs_str, now_unix())?;
         }
@@ -5809,7 +5855,12 @@ async fn drain_events(
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
                     slot.codex_thread_id = Some(thread_id.clone());
-                    persist_codex_thread_id(db_path, slot.task_id, thread_id).await;
+                    let ref_key = if role == "worker" {
+                        "codex_thread_id"
+                    } else {
+                        reviewer_thread_ref_key(slot.r2_origin)
+                    };
+                    persist_codex_thread_id(db_path, slot.task_id, thread_id, ref_key).await;
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
@@ -6023,29 +6074,56 @@ async fn provision_reviewer(
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
     head_sha: &str,
+    recover_interrupted: bool,
 ) -> Result<()> {
-    // Reviewer identity is task-scoped, not slot-scoped. A completed worker or
-    // reviewer has already left `Pool::in_use`, so consult the durable run
-    // history before acquiring a name. This also protects stateless recovery.
-    let prior_runs = {
+    let recovery = if recover_interrupted {
         let p = config.db_path.clone();
         let task_id = worker.task_id;
-        tokio::task::spawn_blocking(move || -> Result<Vec<quorum_core::agent_runs::AgentRun>> {
-            let conn = quorum_core::db::open(&p)?;
-            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+        let is_r2 = role.is_r2();
+        tokio::task::spawn_blocking(move || -> Result<Option<ReviewerRecovery>> {
+            resolve_reviewer_recovery(&p, task_id, is_r2)
         })
         .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+        .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+    } else {
+        None
     };
-    let excluded = reviewer_name_exclusions(worker.agent_name, role, &prior_runs);
-    let acquire_result = name_pool.acquire_excluding(&excluded);
-    if acquire_result.is_generated() && name_pool.has_file() {
-        log(&format!(
-            "names pool exhausted, generated fallback reviewer name: {}",
-            acquire_result.name()
-        ));
-    }
-    let reviewer_name = acquire_result.into_name();
+    let reviewer_name = if let Some(recovery) = &recovery {
+        // Restart recovery deliberately reuses the interrupted reviewer's
+        // durable identity. Normal provisioning below excludes every prior
+        // task participant, including this name.
+        name_pool.acquire_named(&recovery.agent).ok_or_else(|| {
+            QuorumError::Io(format!(
+                "persisted reviewer identity '{}' is already in use",
+                recovery.agent
+            ))
+        })?
+    } else {
+        // Reviewer identity is task-scoped, not slot-scoped. A completed
+        // participant has left `Pool::in_use`, so consult durable run history
+        // before acquiring a fresh name.
+        let prior_runs = {
+            let p = config.db_path.clone();
+            let task_id = worker.task_id;
+            tokio::task::spawn_blocking(
+                move || -> Result<Vec<quorum_core::agent_runs::AgentRun>> {
+                    let conn = quorum_core::db::open(&p)?;
+                    quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                },
+            )
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+        };
+        let excluded = reviewer_name_exclusions(worker.agent_name, role, &prior_runs);
+        let acquire_result = name_pool.acquire_excluding(&excluded);
+        if acquire_result.is_generated() && name_pool.has_file() {
+            log(&format!(
+                "names pool exhausted, generated fallback reviewer name: {}",
+                acquire_result.name()
+            ));
+        }
+        acquire_result.into_name()
+    };
     // #181: register in the lifetime roster BEFORE any DB work so any concurrent
     // sibling daemon polling us now can see we own this name via future rows.
     lifetime_roster.register(&reviewer_name);
@@ -6219,24 +6297,38 @@ async fn provision_reviewer(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let reviewer_model = {
-        let p = config.db_path.clone();
-        let tid = worker.task_id;
-        let cfg_model = config.model.clone();
-        tokio::task::spawn_blocking(move || -> String {
-            let worker_model = quorum_core::db::open(&p)
-                .ok()
-                .and_then(|conn| {
-                    quorum_core::agent_runs::worker_model(&conn, tid)
-                        .ok()
-                        .flatten()
+    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_thread_id) =
+        if let Some(recovery) = &recovery {
+            log(&format!(
+                "recovering {} reviewer {} with persisted provider {} model {}",
+                role.as_str().to_uppercase(),
+                reviewer_name,
+                recovery.kind,
+                recovery.model
+            ));
+            (
+                recovery.model.clone(),
+                recovery.effort.clone(),
+                recovery.kind,
+                recovery.thread_id.clone(),
+            )
+        } else {
+            let reviewer_model = {
+                let p = config.db_path.clone();
+                let tid = worker.task_id;
+                let cfg_model = config.model.clone();
+                tokio::task::spawn_blocking(move || -> Result<String> {
+                    let conn = quorum_core::db::open(&p)?;
+                    let worker_model = quorum_core::agent_runs::worker_model(&conn, tid)?
+                        .unwrap_or_else(|| cfg_model.clone());
+                    escalated_reviewer_model(&worker_model, &cfg_model)
                 })
-                .unwrap_or_else(|| cfg_model.clone());
-            escalated_reviewer_model(&worker_model, &cfg_model)
-        })
-        .await
-        .unwrap_or_else(|_| config.model.clone())
-    };
+                .await
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+            };
+            let kind = resolve_provider(&reviewer_model)?;
+            (reviewer_model, config.effort.clone(), kind, None)
+        };
     log(&format!(
         "reviewer model escalated to {reviewer_model} for task {}",
         worker.task_id
@@ -6266,7 +6358,6 @@ async fn provision_reviewer(
 
     // Build the role-appropriate prompt BEFORE spawn — Codex takes it as a
     // CLI argument while Claude receives it via stdin after spawn.
-    let reviewer_kind = runner::AgentKind::for_model(&reviewer_model);
     let prompt = match role {
         ReviewRole::R1 => {
             let spec = reviewer::ReviewerSpec {
@@ -6274,7 +6365,7 @@ async fn provision_reviewer(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &config.effort)
+            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
             let spec = reviewer::R2ReviewSpec {
@@ -6283,26 +6374,43 @@ async fn provision_reviewer(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &config.effort)
+            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
         }
     };
 
-    match reviewer::spawn_reviewer(
-        &reviewer_model,
-        &config.effort,
-        &session_id,
-        &wt_path,
-        config.agent_bin.as_deref(),
-        config.bare_agent,
-        vec![
-            ("QUORUM_REPO".into(), config.repo.clone()),
-            ("QUORUM_AGENT".into(), reviewer_name.clone()),
-            ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
-        ],
-        config.allowed_tools.as_deref(),
-        &config.codex_sandbox,
-        &prompt,
-    ) {
+    let reviewer_env = vec![
+        ("QUORUM_REPO".into(), config.repo.clone()),
+        ("QUORUM_AGENT".into(), reviewer_name.clone()),
+        ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
+    ];
+    let spawn_result = if let Some(thread_id) = reviewer_thread_id.as_deref() {
+        codex_agent::CodexProc::spawn_resume(
+            thread_id,
+            &reviewer_model,
+            &reviewer_effort,
+            &config.codex_sandbox,
+            &wt_path,
+            &prompt,
+            &reviewer_env,
+            config.agent_bin.as_deref(),
+        )
+        .map(runner::RunnerProc::Codex)
+    } else {
+        reviewer::spawn_reviewer(
+            reviewer_kind,
+            &reviewer_model,
+            &reviewer_effort,
+            &session_id,
+            &wt_path,
+            config.agent_bin.as_deref(),
+            config.bare_agent,
+            reviewer_env,
+            config.allowed_tools.as_deref(),
+            &config.codex_sandbox,
+            &prompt,
+        )
+    };
+    match spawn_result {
         Ok(mut proc) => {
             // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
             if !proc.is_codex() {
@@ -6364,14 +6472,14 @@ async fn provision_reviewer(
             // the durable identity-exclusion source, so attachment must never
             // become visible without it. A crash after this insert is safe:
             // recovery excludes the name even if ReviewerAttached never fired.
-            let reviewer_provider = resolve_provider(&reviewer_model)
-                .map(|k| k.to_string())
-                .unwrap_or_else(|_| "claude".to_string());
+            // Persist the exact provider that was authoritatively resolved and
+            // used to spawn the process; never silently fall back here.
+            let reviewer_provider = reviewer_kind.to_string();
             let reviewer_run_result = {
                 let p = config.db_path.clone();
                 let name = reviewer_name.clone();
                 let m = reviewer_model.clone();
-                let e = config.effort.clone();
+                let e = reviewer_effort.clone();
                 let prov = reviewer_provider;
                 let tid = worker.task_id;
                 let is_r2 = role.is_r2();
@@ -6535,7 +6643,7 @@ async fn provision_reviewer(
                 task_id: worker.task_id,
                 session_id,
                 model: reviewer_model,
-                effort: config.effort.clone(),
+                effort: reviewer_effort,
                 worktree_path: wt_path,
                 branch,
                 draining: true,
@@ -6555,7 +6663,7 @@ async fn provision_reviewer(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: role.is_r2(),
                 reviewed_head_sha: spawn_head_sha,
-                codex_thread_id: None,
+                codex_thread_id: reviewer_thread_id,
                 pending_prompt: String::new(),
                 pending_turn_kind: if role.is_r2() {
                     "r2-review".into()
@@ -6810,7 +6918,6 @@ async fn spawn_worker(
     .ok();
 
     let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
-    let has_label_model = label_model.is_some();
     let resolved_model = label_model.unwrap_or_else(|| config.model.clone());
     let resolved_effort = label_effort.unwrap_or_else(|| config.effort.clone());
 
@@ -6932,12 +7039,7 @@ async fn spawn_worker(
         |retry| retry.prompt.clone(),
     );
 
-    let resolved_kind = resolve_worker_provider(
-        &resolved_model,
-        has_label_model,
-        retry_turn.is_some(),
-        config.runner_kind,
-    )?;
+    let resolved_kind = resolve_worker_provider(&resolved_model)?;
 
     // Codex cannot fabricate USD cost — reject rather than silently spawn
     // with no cost enforcement.
@@ -7925,26 +8027,48 @@ async fn spawn_remediation_worker(
         let tid = task_id;
         let cfg_model = config.model.clone();
         let cfg_kind = config.runner_kind;
-        tokio::task::spawn_blocking(move || -> (String, runner::AgentKind) {
-            let conn = match quorum_core::db::open(&p) {
-                Ok(c) => c,
-                Err(_) => return (cfg_model, runner_kind_to_agent_kind(cfg_kind)),
-            };
-            let provider = quorum_core::agent_runs::worker_provider(&conn, tid)
-                .ok()
-                .flatten();
-            let model = quorum_core::agent_runs::worker_model(&conn, tid)
-                .ok()
-                .flatten();
+        let resolved = tokio::task::spawn_blocking(move || -> Result<_> {
+            let conn = quorum_core::db::open(&p)?;
+            let provider = quorum_core::agent_runs::worker_provider(&conn, tid)?;
+            let model = quorum_core::agent_runs::worker_model(&conn, tid)?;
             resolve_remediation_provider(provider.as_deref(), model, &cfg_model, cfg_kind)
         })
-        .await
-        .unwrap_or_else(|_| {
-            (
-                config.model.clone(),
-                runner_kind_to_agent_kind(config.runner_kind),
-            )
-        })
+        .await;
+        match resolved {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => {
+                log(&format!(
+                    "remediation: provider recovery failed for task #{task_id}: {error}"
+                ));
+                let p = db_path.clone();
+                let name = agent_name.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+                })
+                .await;
+                name_pool.release(&agent_name);
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                return false;
+            }
+            Err(error) => {
+                log(&format!(
+                    "remediation: provider recovery join failed for task #{task_id}: {error}"
+                ));
+                let p = db_path.clone();
+                let name = agent_name.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+                })
+                .await;
+                name_pool.release(&agent_name);
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                return false;
+            }
+        }
     };
     let remediation_effort = config.effort.clone();
 
@@ -8369,7 +8493,7 @@ mod tests {
     #[test]
     fn escalated_reviewer_default_worker_steps_up() {
         assert_eq!(
-            escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6"),
+            escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6").unwrap(),
             "claude-opus-4-7"
         );
     }
@@ -8377,7 +8501,7 @@ mod tests {
     #[test]
     fn escalated_reviewer_top_tier_caps() {
         assert_eq!(
-            escalated_reviewer_model("claude-opus-4-8", "claude-opus-4-6"),
+            escalated_reviewer_model("claude-opus-4-8", "claude-opus-4-6").unwrap(),
             "claude-opus-4-8"
         );
     }
@@ -8385,24 +8509,21 @@ mod tests {
     #[test]
     fn escalated_reviewer_config_higher_wins() {
         assert_eq!(
-            escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7"),
+            escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7").unwrap(),
             "claude-opus-4-7"
         );
     }
 
     #[test]
-    fn escalated_reviewer_unknown_worker_uses_rank_zero() {
-        assert_eq!(
-            escalated_reviewer_model("unknown-model", "claude-opus-4-6"),
-            "claude-opus-4-6"
-        );
+    fn escalated_reviewer_unknown_worker_is_rejected() {
+        assert!(escalated_reviewer_model("unknown-model", "claude-opus-4-6").is_err());
     }
 
     // R2 model-routing: Sonnet worker → Opus 4.6 reviewer
     #[test]
     fn r2_model_routing_sonnet_to_opus_46() {
         assert_eq!(
-            escalated_reviewer_model("claude-sonnet-5", "claude-sonnet-5"),
+            escalated_reviewer_model("claude-sonnet-5", "claude-sonnet-5").unwrap(),
             "claude-opus-4-6"
         );
     }
@@ -8411,7 +8532,7 @@ mod tests {
     #[test]
     fn r2_model_routing_opus_46_to_opus_47() {
         assert_eq!(
-            escalated_reviewer_model("claude-opus-4-6", "claude-sonnet-5"),
+            escalated_reviewer_model("claude-opus-4-6", "claude-sonnet-5").unwrap(),
             "claude-opus-4-7"
         );
     }
@@ -8420,7 +8541,7 @@ mod tests {
     #[test]
     fn r2_model_routing_top_tier_capped() {
         assert_eq!(
-            escalated_reviewer_model("claude-opus-4-8", "claude-sonnet-5"),
+            escalated_reviewer_model("claude-opus-4-8", "claude-sonnet-5").unwrap(),
             "claude-opus-4-8"
         );
     }
@@ -8429,7 +8550,7 @@ mod tests {
     #[test]
     fn r2_model_routing_floor_overrides_escalation() {
         assert_eq!(
-            escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7"),
+            escalated_reviewer_model("claude-sonnet-5", "claude-opus-4-7").unwrap(),
             "claude-opus-4-7",
             "config floor must override natural escalation when higher"
         );
@@ -8439,12 +8560,12 @@ mod tests {
     #[test]
     fn escalated_reviewer_codex_both_returns_config() {
         assert_eq!(
-            escalated_reviewer_model("o4-mini", "o4-mini"),
+            escalated_reviewer_model("o4-mini", "o4-mini").unwrap(),
             "o4-mini",
             "both non-Claude: return config model as-is"
         );
         assert_eq!(
-            escalated_reviewer_model("gpt-4o", "gpt-5.6-codex"),
+            escalated_reviewer_model("gpt-4o", "gpt-5.6-codex").unwrap(),
             "gpt-5.6-codex",
             "both non-Claude: return config model"
         );
@@ -8454,7 +8575,7 @@ mod tests {
     #[test]
     fn escalated_reviewer_claude_worker_codex_config() {
         assert_eq!(
-            escalated_reviewer_model("claude-opus-4-6", "o4-mini"),
+            escalated_reviewer_model("claude-opus-4-6", "o4-mini").unwrap(),
             "claude-opus-4-7",
             "Claude worker with non-Claude config: escalate within Claude tiers"
         );
@@ -8464,7 +8585,7 @@ mod tests {
     #[test]
     fn escalated_reviewer_codex_worker_claude_config() {
         assert_eq!(
-            escalated_reviewer_model("o4-mini", "claude-opus-4-7"),
+            escalated_reviewer_model("o4-mini", "claude-opus-4-7").unwrap(),
             "claude-opus-4-7",
             "non-Claude worker with Claude config: config floor wins"
         );
@@ -8473,35 +8594,35 @@ mod tests {
     // #196: recovery retains provider — deterministic model resolution
     #[test]
     fn escalated_reviewer_model_is_deterministic() {
-        let model_a = escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6");
-        let model_b = escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6");
+        let model_a = escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6").unwrap();
+        let model_b = escalated_reviewer_model("claude-opus-4-6", "claude-opus-4-6").unwrap();
         assert_eq!(model_a, model_b, "same inputs must yield same output");
         assert_eq!(
-            runner::AgentKind::for_model(&model_a),
+            runner::AgentKind::for_model(&model_a).unwrap(),
             runner::AgentKind::Claude
         );
 
-        let codex_a = escalated_reviewer_model("o4-mini", "o4-mini");
-        let codex_b = escalated_reviewer_model("o4-mini", "o4-mini");
+        let codex_a = escalated_reviewer_model("o4-mini", "o4-mini").unwrap();
+        let codex_b = escalated_reviewer_model("o4-mini", "o4-mini").unwrap();
         assert_eq!(
             codex_a, codex_b,
             "Codex: same inputs must yield same output"
         );
         assert_eq!(
-            runner::AgentKind::for_model(&codex_a),
+            runner::AgentKind::for_model(&codex_a).unwrap(),
             runner::AgentKind::Codex
         );
     }
 
     #[test]
     fn escalated_reviewer_short_alias_sonnet() {
-        let result = escalated_reviewer_model("sonnet", "sonnet");
+        let result = escalated_reviewer_model("sonnet", "sonnet").unwrap();
         assert_eq!(
             result, "claude-opus-4-6",
             "short alias 'sonnet' must escalate within Claude tiers, not pass through as Codex"
         );
         assert_eq!(
-            runner::AgentKind::for_model(&result),
+            runner::AgentKind::for_model(&result).unwrap(),
             runner::AgentKind::Claude,
         );
     }
@@ -8693,7 +8814,7 @@ mod tests {
             Some("high"),
         );
         assert_eq!(worker_model, "claude-opus-4-7");
-        let reviewer = escalated_reviewer_model(&worker_model, "claude-sonnet-5");
+        let reviewer = escalated_reviewer_model(&worker_model, "claude-sonnet-5").unwrap();
         assert_eq!(reviewer, "claude-opus-4-8");
         assert!(model_rank(&reviewer) > model_rank(&worker_model));
     }
@@ -9839,7 +9960,7 @@ mod tests {
     #[test]
     fn retry_turn_forces_provider_resolution_from_model() {
         // A Codex retry_turn with model "o3" must route to Codex even when
-        // the daemon default is Claude (has_label_model=false).
+        // the daemon model is Claude.
         let retry_model = "o3";
         let kind = resolve_provider(retry_model).unwrap();
         assert_eq!(kind, runner::AgentKind::Codex);
@@ -9862,49 +9983,45 @@ mod tests {
     }
 
     #[test]
-    fn no_model_label_falls_back_to_daemon_default() {
+    fn no_model_label_resolves_daemon_model() {
         let (m, _) = labels_to_model_effort(None);
         assert!(m.is_none(), "no label must produce no model override");
-        let kind = runner_kind_to_agent_kind(crate::serve_config::RunnerKind::Claude);
-        assert_eq!(kind, runner::AgentKind::Claude);
-        let kind = runner_kind_to_agent_kind(crate::serve_config::RunnerKind::Codex);
-        assert_eq!(kind, runner::AgentKind::Codex);
+        assert_eq!(
+            resolve_provider("claude-opus-4-6").unwrap(),
+            runner::AgentKind::Claude
+        );
+        assert_eq!(
+            resolve_provider("gpt-5.6-terra").unwrap(),
+            runner::AgentKind::Codex
+        );
     }
 
     #[test]
     fn deterministic_provider_matrix_records_worker_r1_and_r2_routes() {
         struct Case {
             name: &'static str,
-            default_runner: crate::serve_config::RunnerKind,
             config_model: &'static str,
             worker_model: &'static str,
-            has_override: bool,
             expected: [&'static str; 3],
         }
 
         let cases = [
             Case {
                 name: "claude-default",
-                default_runner: crate::serve_config::RunnerKind::Claude,
                 config_model: "claude-opus-4-6",
                 worker_model: "claude-opus-4-6",
-                has_override: false,
                 expected: ["claude", "claude", "claude"],
             },
             Case {
                 name: "all-codex",
-                default_runner: crate::serve_config::RunnerKind::Codex,
-                config_model: "o3",
-                worker_model: "o3",
-                has_override: false,
+                config_model: "gpt-5.6-terra",
+                worker_model: "gpt-5.6-terra",
                 expected: ["codex", "codex", "codex"],
             },
             Case {
                 name: "mixed-codex-worker-claude-reviewers",
-                default_runner: crate::serve_config::RunnerKind::Claude,
                 config_model: "claude-opus-4-6",
                 worker_model: "o3",
-                has_override: true,
                 expected: ["codex", "claude", "claude"],
             },
         ];
@@ -9918,14 +10035,9 @@ mod tests {
             )
             .unwrap();
 
-            let worker_kind = resolve_worker_provider(
-                case.worker_model,
-                case.has_override,
-                false,
-                case.default_runner,
-            )
-            .unwrap();
-            let reviewer_model = escalated_reviewer_model(case.worker_model, case.config_model);
+            let worker_kind = resolve_worker_provider(case.worker_model).unwrap();
+            let reviewer_model =
+                escalated_reviewer_model(case.worker_model, case.config_model).unwrap();
             let reviewer_kind = resolve_provider(&reviewer_model).unwrap();
 
             quorum_core::agent_runs::insert(
@@ -9986,6 +10098,97 @@ mod tests {
     }
 
     #[test]
+    fn gpt_terra_reviewer_restart_recovers_codex_and_exact_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-restart.db");
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "review with terra",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let kind = resolve_provider("gpt-5.6-terra").unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "r1-terra",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                &kind.to_string(),
+                11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    r#"{"codex_reviewer_r1_thread_id":"thread-terra-exact"}"#,
+                    task_id
+                ],
+            )
+            .unwrap();
+        }
+
+        // This is the same resolver called by orphan in-review provisioning.
+        let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+            .unwrap()
+            .expect("interrupted reviewer recovery");
+        let thread_id = recovery.thread_id.as_deref().unwrap();
+        let args = codex_agent::resume_args(
+            thread_id,
+            &recovery.model,
+            &recovery.effort,
+            "continue review",
+        );
+
+        assert_eq!(recovery.agent, "r1-terra");
+        assert_eq!(recovery.kind, runner::AgentKind::Codex);
+        assert_eq!(args[0..3], ["exec", "resume", "thread-terra-exact"]);
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].as_str()),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_unknown_or_mismatched_provider_metadata() {
+        assert!(resolve_remediation_provider(
+            Some("claude"),
+            Some("gpt-5.6-terra".into()),
+            "claude-opus-4-6",
+            crate::serve_config::RunnerKind::Claude,
+        )
+        .is_err());
+        assert!(resolve_remediation_provider(
+            Some("mystery"),
+            Some("gpt-5.6-terra".into()),
+            "claude-opus-4-6",
+            crate::serve_config::RunnerKind::Claude,
+        )
+        .is_err());
+        assert!(resolve_remediation_provider(
+            None,
+            Some("unknown-model".into()),
+            "claude-opus-4-6",
+            crate::serve_config::RunnerKind::Claude,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn remediation_reopens_with_original_worker_provider_and_fresh_reviews() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("rework-provider.db");
@@ -10031,7 +10234,8 @@ mod tests {
             recorded_model,
             "claude-opus-4-6",
             crate::serve_config::RunnerKind::Claude,
-        );
+        )
+        .unwrap();
         assert_eq!(model, "o3");
         assert_eq!(
             kind,
