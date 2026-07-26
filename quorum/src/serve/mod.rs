@@ -2009,10 +2009,33 @@ async fn tick(
                     }
 
                     if mergeability == merge::MergeabilityState::Conflicting {
-                        let has_worker = workers.iter().any(|w| w.task_id == reviewer_task_id);
+                        // Responsibility is persisted on the task. Live slot presence
+                        // only decides whether to feed the original worker or provision
+                        // a remediation worker; an implementation task does not become
+                        // review-only merely because its worker exited after submit.
+                        let review_only = {
+                            let p = db_path.clone();
+                            let tid = reviewer_task_id;
+                            tokio::task::spawn_blocking(move || -> Result<bool> {
+                                let conn = quorum_core::db::open(&p)?;
+                                tasks::get(&conn, tid)?
+                                    .map(|task| task.review_only)
+                                    .ok_or_else(|| {
+                                        QuorumError::Io(format!(
+                                            "task #{tid} disappeared during merge conflict"
+                                        ))
+                                    })
+                            })
+                            .await
+                            .map_err(|e| {
+                                QuorumError::Io(format!(
+                                    "merge-conflict task lookup spawn_blocking join: {e}"
+                                ))
+                            })??
+                        };
 
-                        if !has_worker {
-                            // Review-only: no worker to rebase. Fire MergeFailed
+                        if review_only {
+                            // Review-only: the external author owns rebasing. Fire MergeFailed
                             // (merging → in-review) and park as merge-blocked;
                             // orphan handler retries when PR becomes MERGEABLE.
                             log(&format!(
