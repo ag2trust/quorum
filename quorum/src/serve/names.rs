@@ -112,12 +112,31 @@ impl Pool {
             let word = WORD_LIST[self.simple_random() % WORD_LIST.len()];
             let suffix = self.random_suffix();
             let name = format!("{word}-{suffix}");
-            if !self.in_use.contains(&name) && !excluded.contains(&name) {
-                self.in_use.insert(name.clone());
+            if self.try_reserve_generated(&name, excluded) {
                 return name;
             }
         }
         unreachable!("100 generate attempts all collided");
+    }
+
+    fn try_reserve_generated(&mut self, name: &str, excluded: &HashSet<String>) -> bool {
+        if self.in_use.contains(name) || excluded.contains(name) {
+            return false;
+        }
+        self.in_use.insert(name.to_string());
+        true
+    }
+
+    #[cfg(test)]
+    fn generate_from_candidates(
+        &mut self,
+        excluded: &HashSet<String>,
+        candidates: &[&str],
+    ) -> Option<String> {
+        candidates.iter().find_map(|name| {
+            self.try_reserve_generated(name, excluded)
+                .then(|| (*name).to_string())
+        })
     }
 
     fn simple_random(&self) -> usize {
@@ -326,13 +345,13 @@ mod tests {
     #[test]
     fn generated_pool_does_not_reacquire_released_excluded_name() {
         let mut pool = Pool::new_generated();
-        let worker = pool.acquire().into_name();
-        pool.release(&worker);
+        let excluded = HashSet::from(["Anvil-dead".to_string()]);
+        let reviewer = pool
+            .generate_from_candidates(&excluded, &["Anvil-dead", "Beacon-safe"])
+            .unwrap();
 
-        let excluded = HashSet::from([worker.clone()]);
-        let reviewer = pool.acquire_excluding(&excluded);
-
-        assert!(reviewer.is_generated());
-        assert_ne!(reviewer.name(), worker);
+        assert_eq!(reviewer, "Beacon-safe");
+        assert!(!pool.in_use.contains("Anvil-dead"));
+        assert!(pool.in_use.contains("Beacon-safe"));
     }
 }

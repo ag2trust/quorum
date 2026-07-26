@@ -547,6 +547,77 @@ fn reviewer_run_insert_error_never_attaches_and_restart_recovers() {
 }
 
 #[test]
+fn persistent_reviewer_run_insert_error_stops_after_provision_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_reviewer_run_forever
+             BEFORE INSERT ON agent_runs
+             WHEN NEW.role = 'reviewer'
+             BEGIN
+               SELECT RAISE(ABORT, 'persistent reviewer run failure');
+             END;",
+        )
+        .unwrap();
+    }
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 30),
+        "persistent failure did not exhaust and park: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    let persistence_failures = handle
+        .lines
+        .iter()
+        .filter(|line| line.contains("reviewer run persistence failed before attachment"))
+        .count();
+    assert_eq!(
+        persistence_failures, 3,
+        "daemon must stop provisioning at the durable strike cap: {:?}",
+        handle.lines
+    );
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(attempts), 0) FROM reviewer_provision_attempts WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 3);
+    assert_eq!(get_task(home.path(), task_id).reviewer, None);
+    drop(handle);
+}
+
+#[test]
 fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();

@@ -6149,18 +6149,6 @@ async fn provision_reviewer(
         }
         name_pool.release(&reviewer_name);
         return Ok(());
-    } else {
-        // Clear provision attempts for this role on success.
-        let p = config.db_path.clone();
-        let tid = worker.task_id;
-        let role_str = role.as_str().to_string();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = quorum_core::db::open(&p) {
-                let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
-            }
-        })
-        .await
-        .ok();
     }
     log(&format!(
         "reviewer worktree provisioned at {}",
@@ -6418,9 +6406,54 @@ async fn provision_reviewer(
                     })
                     .await
                     .ok();
+                    let task_id = worker.task_id;
+                    let role_str = role.as_str().to_string();
+                    let sha = head_sha.to_string();
+                    let strikes = {
+                        let p = config.db_path.clone();
+                        tokio::task::spawn_blocking(move || -> i64 {
+                            quorum_core::db::open(&p)
+                                .ok()
+                                .and_then(|mut conn| {
+                                    quorum_core::provision_attempts::record_attempt(
+                                        &mut conn, task_id, pr, &role_str, &sha,
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or(0)
+                        })
+                        .await
+                        .unwrap_or(0)
+                    };
+                    log(&format!(
+                        "{role_label} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
+                         for task #{task_id} PR #{pr}",
+                        role_label = role.as_str().to_uppercase()
+                    ));
+                    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+                        log(&format!(
+                            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
+                             {strikes} consecutive {} provision failures for PR #{pr}",
+                            role.as_str().to_uppercase()
+                        ));
+                    }
                     return Err(e);
                 }
             };
+
+            // Provisioning is successful only after the reviewer run is
+            // durable. Clearing after worktree creation would reset strikes
+            // for a persistent run-insert failure on every daemon tick.
+            let p = config.db_path.clone();
+            let tid = worker.task_id;
+            let role_str = role.as_str().to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                    let _ = quorum_core::provision_attempts::clear(&mut conn, tid, pr, &role_str);
+                }
+            })
+            .await
+            .ok();
 
             fire_event(
                 &config.db_path,
