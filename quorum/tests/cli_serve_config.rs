@@ -241,6 +241,48 @@ fn serve_config_rejects_unknown_keys() {
 }
 
 #[test]
+fn strict_codex_config_rejects_claude_only_model_floor_at_startup() {
+    let home = tempfile::tempdir().unwrap();
+
+    let init_status = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    assert!(init_status.success(), "init failed");
+
+    let config_path = home.path().join("codex-with-claude-floor.toml");
+    std::fs::write(
+        &config_path,
+        "repo = \"test/repo\"\nprovider = \"codex\"\nmin_model = \"opus-47\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "serve",
+            "--config",
+            &config_path.to_string_lossy(),
+            "--repo-dir",
+            "/tmp/x",
+            "--worktree-base",
+            "/tmp/y",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot use min_model"),
+        "startup error should explain the provider conflict: {stderr}"
+    );
+}
+
+#[test]
 fn serve_config_explicit_missing_file_fails() {
     let home = tempfile::tempdir().unwrap();
 

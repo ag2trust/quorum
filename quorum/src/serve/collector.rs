@@ -18,7 +18,8 @@
 
 use super::agent::{self, AgentProc, AgentSpec};
 use super::classifier::{CLASSIFIER_EFFORT, CLASSIFIER_MODEL};
-use super::stream::Event;
+use super::codex_agent::{CodexProc, CodexSpec};
+use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::review_findings::{
@@ -56,6 +57,9 @@ pub struct CollectionRequest {
     pub repo_dir: PathBuf,
     pub agent_bin: Option<String>,
     pub bare_agent: bool,
+    pub classifier_model: String,
+    pub classifier_effort: String,
+    pub codex_sandbox: String,
     /// Extra env vars threaded into the spawned classifier process. Empty in
     /// production. Used by tests to script the fake-agent binary per-call so
     /// concurrent tests do not race on a process-global env var.
@@ -82,8 +86,23 @@ impl CollectionRequest {
             repo_dir,
             agent_bin,
             bare_agent,
+            classifier_model: CLASSIFIER_MODEL.to_string(),
+            classifier_effort: CLASSIFIER_EFFORT.to_string(),
+            codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
         }
+    }
+
+    pub fn with_classifier(
+        mut self,
+        model: impl Into<String>,
+        effort: impl Into<String>,
+        codex_sandbox: impl Into<String>,
+    ) -> Self {
+        self.classifier_model = model.into();
+        self.classifier_effort = effort.into();
+        self.codex_sandbox = codex_sandbox.into();
+        self
     }
 }
 
@@ -140,7 +159,7 @@ pub async fn run_collection_with_inputs(
         &response_text,
         request.pr_number,
         request.task_id,
-        Some(CLASSIFIER_MODEL),
+        Some(&request.classifier_model),
         Some(COLLECTOR_VERSION),
     ) {
         Some(f) => f,
@@ -159,6 +178,7 @@ pub async fn run_collection_with_inputs(
     let pr = request.pr_number;
     let task_id = request.task_id;
     let db_path = request.db_path.clone();
+    let collector_model = request.classifier_model.clone();
     let count = findings.len() as i64;
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
@@ -171,7 +191,7 @@ pub async fn run_collection_with_inputs(
                 task_id,
                 status: RunStatus::Success,
                 error: None,
-                collector_model: CLASSIFIER_MODEL.to_string(),
+                collector_model,
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: count,
                 attempted_at,
@@ -210,6 +230,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let pr = request.pr_number;
     let task_id = request.task_id;
     let error_text = error.to_string();
+    let collector_model = request.classifier_model.clone();
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = quorum_core::db::open(&db_path)?;
         let now = clock::now();
@@ -220,7 +241,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 task_id,
                 status: RunStatus::Failed,
                 error: Some(error_text.clone()),
-                collector_model: CLASSIFIER_MODEL.to_string(),
+                collector_model,
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: 0,
                 attempted_at,
@@ -501,25 +522,41 @@ async fn spawn_and_run_classifier(
     inputs: &CollectorInputs,
 ) -> Result<String> {
     let prompt = review_findings::build_collector_prompt(inputs);
-    let turn = agent::user_turn(&prompt);
-
-    let spec = AgentSpec {
-        kind: super::runner::AgentKind::Claude,
-        model: CLASSIFIER_MODEL.to_string(),
-        effort: CLASSIFIER_EFFORT.to_string(),
-        session_id: agent::new_session_id(),
-        worktree: request.repo_dir.clone(),
-        bare: request.bare_agent,
-        allowed_tools: String::new(),
-        env_vars: request.env_vars.clone(),
+    let kind = AgentKind::for_model(&request.classifier_model)
+        .map_err(|e| QuorumError::Io(format!("classifier provider: {e}")))?;
+    let mut proc = match kind {
+        AgentKind::Claude => {
+            let spec = AgentSpec {
+                kind,
+                model: request.classifier_model.clone(),
+                effort: request.classifier_effort.clone(),
+                session_id: agent::new_session_id(),
+                worktree: request.repo_dir.clone(),
+                bare: request.bare_agent,
+                allowed_tools: String::new(),
+                env_vars: request.env_vars.clone(),
+            };
+            let mut proc = AgentProc::spawn(&spec, request.agent_bin.as_deref())
+                .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
+            proc.feed_turn(&agent::user_turn(&prompt))
+                .await
+                .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
+            RunnerProc::Claude(proc)
+        }
+        AgentKind::Codex => {
+            let spec = CodexSpec {
+                model: request.classifier_model.clone(),
+                effort: request.classifier_effort.clone(),
+                sandbox: request.codex_sandbox.clone(),
+                worktree: request.repo_dir.clone(),
+                prompt,
+                env_vars: request.env_vars.clone(),
+            };
+            CodexProc::spawn(&spec, request.agent_bin.as_deref())
+                .map(RunnerProc::Codex)
+                .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?
+        }
     };
-
-    let mut proc = AgentProc::spawn(&spec, request.agent_bin.as_deref())
-        .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
-
-    proc.feed_turn(&turn)
-        .await
-        .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
@@ -531,28 +568,48 @@ async fn spawn_and_run_classifier(
                 request.pr_number
             )));
         }
-        match timeout(remaining, proc.next_event()).await {
-            Ok(Some(Event::Result {
-                result, is_error, ..
-            })) => {
-                if is_error.unwrap_or(false) {
-                    break Err(QuorumError::Io("classifier returned is_error=true".into()));
+        match timeout(remaining, proc.next_raw_line()).await {
+            Ok(Some(raw)) => {
+                if kind == AgentKind::Claude {
+                    if let Some(super::stream::Event::Result {
+                        result, is_error, ..
+                    }) = super::stream::parse_line(&raw)
+                    {
+                        let text = super::stream::result_text(&result);
+                        if is_error.unwrap_or(false) {
+                            break Err(QuorumError::Io(format!(
+                                "classifier returned an error: {text}"
+                            )));
+                        }
+                        if !text.is_empty() {
+                            response_text = text;
+                        }
+                        break Ok(response_text.clone());
+                    }
                 }
-                let text = result
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| result.to_string());
-                if !text.is_empty() {
-                    response_text = text;
+                let events = match kind {
+                    AgentKind::Claude => super::runner::normalize_claude_line(&raw),
+                    AgentKind::Codex => super::runner::normalize_codex_line(&raw),
+                };
+                let mut terminal = None;
+                for event in events {
+                    match event {
+                        AgentEvent::AssistantText { text } => response_text.push_str(&text),
+                        AgentEvent::TurnCompleted { .. } => {
+                            terminal = Some(Ok(response_text.clone()))
+                        }
+                        AgentEvent::TurnFailed { message, .. } => {
+                            terminal = Some(Err(QuorumError::Io(format!(
+                                "classifier returned an error: {message}"
+                            ))))
+                        }
+                        _ => {}
+                    }
                 }
-                break Ok(response_text.clone());
+                if let Some(result) = terminal {
+                    break result;
+                }
             }
-            Ok(Some(Event::Assistant { message })) => {
-                if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
-                    response_text.push_str(content);
-                }
-            }
-            Ok(Some(_)) => {}
             Ok(None) => {
                 break if response_text.is_empty() {
                     Err(QuorumError::Io(
@@ -650,14 +707,15 @@ mod tests {
             std::env::current_dir().unwrap(),
             None,
             true,
-        );
+        )
+        .with_classifier("gpt-5.6-terra", "medium", "danger-full-access");
         record_failure(&request, "boom", 1000).await;
 
         let conn = db::open(&db_path).unwrap();
         let run = review_findings::get_run(&conn, 42).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.error.as_deref(), Some("boom"));
-        assert_eq!(run.collector_model, CLASSIFIER_MODEL);
+        assert_eq!(run.collector_model, "gpt-5.6-terra");
         assert_eq!(run.collector_version, COLLECTOR_VERSION);
 
         let n: i64 = conn
@@ -698,6 +756,33 @@ mod tests {
         let run = review_findings::get_run(&conn, 43).unwrap().unwrap();
         assert_eq!(run.error.as_deref(), Some("attempt-2"));
         assert_eq!(run.attempted_at, 2000);
+    }
+
+    #[tokio::test]
+    async fn unknown_classifier_model_fails_loudly_without_runner_fallback() {
+        let dir = setup_git_dir();
+        let db_path = dir.path().join("q.db");
+        let _ = db::open(&db_path).unwrap();
+        let request = CollectionRequest::new(
+            44,
+            None,
+            None,
+            db_path.clone(),
+            dir.path().to_path_buf(),
+            Some("/bin/false".into()),
+            true,
+        )
+        .with_classifier("unknown-provider-model", "medium", "danger-full-access");
+
+        let error = run_collection_with_inputs(&request, synthetic_inputs(44), 1000)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown model"));
+
+        let conn = db::open(&db_path).unwrap();
+        let run = review_findings::get_run(&conn, 44).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.collector_model, "unknown-provider-model");
     }
 
     #[tokio::test]
@@ -764,6 +849,9 @@ mod tests {
             repo_dir: dir.to_path_buf(),
             agent_bin: Some(fake_agent_path().to_string_lossy().to_string()),
             bare_agent: true,
+            classifier_model: CLASSIFIER_MODEL.to_string(),
+            classifier_effort: CLASSIFIER_EFFORT.to_string(),
+            codex_sandbox: "danger-full-access".to_string(),
             env_vars,
         }
     }
@@ -1030,6 +1118,9 @@ mod tests {
             repo_dir: dir.path().to_path_buf(),
             agent_bin: Some("/nonexistent/quorum-fake-agent-t126".into()),
             bare_agent: true,
+            classifier_model: CLASSIFIER_MODEL.to_string(),
+            classifier_effort: CLASSIFIER_EFFORT.to_string(),
+            codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
         };
         let result = run_collection(&retry).await;
