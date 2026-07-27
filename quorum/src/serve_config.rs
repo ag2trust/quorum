@@ -555,11 +555,16 @@ pub fn resolve_floor(
     min_effort: Option<&str>,
 ) -> Result<(Option<String>, Option<String>)> {
     let model = match min_model {
-        Some(tier) => Some(crate::serve::tier_to_model_id_pub(tier).ok_or_else(|| {
-            QuorumError::Usage(format!(
-                "bad min_model: \"{tier}\" (expected sonnet-5|opus-46|opus-47|opus-48)"
-            ))
-        })?),
+        Some(tier) => Some(
+            quorum_core::model_tiers::claude_model_id_for_tier(tier)
+                .ok_or_else(|| {
+                    QuorumError::Usage(format!(
+                        "bad min_model: \"{tier}\" (expected Claude tier: {})",
+                        quorum_core::model_tiers::known_claude_tiers(),
+                    ))
+                })?
+                .to_string(),
+        ),
         None => None,
     };
     let effort = match min_effort {
@@ -798,10 +803,16 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
-    fn resolve_floor_bad_model_exits_2() {
-        let err = resolve_floor(Some("opus-99"), None).unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("min_model"), "{err}");
+    fn resolve_floor_codex_and_unknown_models_exit_2() {
+        for model in ["terra", "opus-99"] {
+            let err = resolve_floor(Some(model), None).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{model}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("expected Claude tier: sonnet-5|opus-46|opus-47|opus-48"),
+                "{model}: {err}"
+            );
+        }
     }
 
     #[test]

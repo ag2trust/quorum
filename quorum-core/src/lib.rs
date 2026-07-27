@@ -26,6 +26,7 @@ pub mod inspect;
 pub mod journal;
 pub mod lifecycle;
 pub mod mailbox;
+pub mod model_tiers;
 pub mod perf;
 pub mod pinned;
 pub mod pr_targets;

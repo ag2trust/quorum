@@ -40,7 +40,6 @@ pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
 /// becomes MERGEABLE again.
 pub const MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked";
 
-const KNOWN_TIERS: &[&str] = &["opus-46", "opus-47", "opus-48", "sonnet-5"];
 const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
 const KNOWN_COMPLEXITIES: &[&str] = &["1", "2", "3", "4", "5"];
 
@@ -243,12 +242,13 @@ fn validate_labels(s: &str) -> Result<()> {
     })?;
     for label in &labels {
         if let Some(tier) = label.strip_prefix("tier:") {
-            if !tier.is_empty() && !KNOWN_TIERS.contains(&tier) {
-                eprintln!(
-                    "warn: unrecognized tier '{tier}' in --labels (known: {}); \
-                     serve will fall back to the global default model",
-                    KNOWN_TIERS.join(", ")
-                );
+            // Empty tier labels are historical no-ops; retain that behavior so
+            // existing stored labels still use the daemon default.
+            if !tier.is_empty() && crate::model_tiers::model_id_for_tier(tier).is_none() {
+                return Err(QuorumError::Usage(format!(
+                    "invalid tier '{tier}' in --labels; only {} are accepted",
+                    crate::model_tiers::known_tiers(),
+                )));
             }
         }
         if let Some(effort) = label.strip_prefix("effort:") {
@@ -3448,6 +3448,43 @@ mod tests {
     }
 
     #[test]
+    fn validate_labels_accepts_all_supported_tiers_with_both_efforts() {
+        for tier in crate::model_tiers::MODEL_TIERS {
+            for effort in KNOWN_EFFORTS {
+                let labels = format!(r#"["tier:{}","effort:{effort}"]"#, tier.tier);
+                assert!(validate_labels(&labels).is_ok(), "{labels}");
+            }
+        }
+    }
+
+    #[test]
+    fn create_rejects_legacy_and_unknown_tiers_before_enqueue() {
+        let (_d, mut c) = open_tmp();
+        for tier in ["o3", "o4-mini", "unknown"] {
+            let labels = format!(r#"["tier:{tier}"]"#);
+            let err = create(
+                &mut c,
+                "boss",
+                "bad-tier",
+                None,
+                0,
+                Some(&labels),
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{tier}");
+            assert!(matches!(err, QuorumError::Usage(_)), "{tier}: {err:?}");
+        }
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "invalid tiers must not enqueue tasks");
+    }
+
+    #[test]
     fn validate_labels_rejects_effort_low() {
         let err = validate_labels(r#"["effort:low"]"#).unwrap_err();
         assert!(
@@ -3462,25 +3499,33 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_effort_low_at_task_create() {
+    fn create_rejects_unsupported_efforts_at_task_create() {
         let (_d, mut c) = open_tmp();
-        let err = create(
-            &mut c,
-            "boss",
-            "bad-effort",
-            None,
-            0,
-            Some(r#"["effort:low"]"#),
-            None,
-            None,
-            None,
-            1000,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort")),
-            "task-create must reject effort:low, got {err:?}"
-        );
+        for effort in ["low", "max", "adaptive"] {
+            let labels = format!(r#"["effort:{effort}"]"#);
+            let err = create(
+                &mut c,
+                "boss",
+                "bad-effort",
+                None,
+                0,
+                Some(&labels),
+                None,
+                None,
+                None,
+                1000,
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{effort}");
+            assert!(
+                matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort")),
+                "task-create must reject effort:{effort}, got {err:?}"
+            );
+        }
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "invalid efforts must not enqueue tasks");
     }
 
     #[test]
