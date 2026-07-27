@@ -1426,7 +1426,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
             log("daemon lock stolen — tearing down and exiting");
             if let Some(slot) = classifier_slot.take() {
-                slot.proc.kill_and_reap().await;
+                let _terminal_output = slot.proc.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -1446,7 +1446,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("shutting down (signal, no in-flight agents)");
             }
             if let Some(slot) = classifier_slot.take() {
-                slot.proc.kill_and_reap().await;
+                let _terminal_output = slot.proc.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -1469,14 +1469,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if !sentinel.exists() {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
-                    slot.proc.kill_and_reap().await;
+                    let _terminal_output = slot.proc.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
-                    r.proc.kill_and_reap().await;
+                    let _terminal_output = r.proc.kill_and_reap().await;
                     name_pool.release(&r.agent_name);
                 }
                 for w in workers.drain(..) {
-                    w.proc.kill_and_reap().await;
+                    let _terminal_output = w.proc.kill_and_reap().await;
                     name_pool.release(&w.agent_name);
                 }
                 return Ok(1);
@@ -1524,7 +1524,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     "DRAIN: all agents finished (sha={sha}), exiting {exit}"
                 ));
                 if let Some(slot) = classifier_slot.take() {
-                    slot.proc.kill_and_reap().await;
+                    let _terminal_output = slot.proc.kill_and_reap().await;
                 }
                 return Ok(exit);
             }
@@ -1538,7 +1538,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     reviewers.len(),
                 ));
                 if let Some(slot) = classifier_slot.take() {
-                    slot.proc.kill_and_reap().await;
+                    let _terminal_output = slot.proc.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
@@ -1603,14 +1603,14 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     // against a too-new schema); just reap the processes and release their
                     // names. Journal recovery reclaims the tasks on restart.
                     if let Some(slot) = classifier_slot.take() {
-                        slot.proc.kill_and_reap().await;
+                        let _terminal_output = slot.proc.kill_and_reap().await;
                     }
                     for r in reviewers.drain(..) {
-                        r.proc.kill_and_reap().await;
+                        let _terminal_output = r.proc.kill_and_reap().await;
                         name_pool.release(&r.agent_name);
                     }
                     for w in workers.drain(..) {
-                        w.proc.kill_and_reap().await;
+                        let _terminal_output = w.proc.kill_and_reap().await;
                         name_pool.release(&w.agent_name);
                     }
                     return Ok(EXIT_SELF_UPDATE);
@@ -6206,6 +6206,7 @@ async fn drain_events(
     role: &str,
     limits: &CostLimits,
 ) -> Result<Option<LimitBreached>> {
+    persist_diagnostics(slot);
     while let Ok(Some(raw_line)) =
         tokio::time::timeout(std::time::Duration::from_secs(5), slot.proc.next_raw_line()).await
     {
@@ -6353,8 +6354,32 @@ async fn drain_events(
                 }
             }
         }
+        persist_diagnostics(slot);
     }
     Ok(None)
+}
+
+fn persist_diagnostics(slot: &mut SlotState) {
+    for output in slot.proc.drain_diagnostics() {
+        if let Some(ref mut sl) = slot.session_log {
+            let line = output.session_line();
+            sl.log_raw_and_normalized(&line, &[]);
+        }
+    }
+}
+
+fn persist_terminal_output(
+    session_log: &mut Option<session_log::SessionLog>,
+    output: Vec<runner::CapturedOutput>,
+) {
+    if let Some(sl) = session_log {
+        for captured in output {
+            let line = captured.session_line();
+            // Teardown output is diagnostic evidence only. It must not drive
+            // lifecycle after the daemon has decided to stop the run.
+            sl.log_raw_and_normalized(&line, &[]);
+        }
+    }
 }
 
 fn truncate_now_label(s: &str) -> String {
@@ -6847,7 +6872,7 @@ async fn provision_reviewer(
                         "{}: reviewer feed_turn failed: {e}",
                         role.as_str().to_uppercase()
                     ));
-                    proc.kill_and_reap().await;
+                    let _terminal_output = proc.kill_and_reap().await;
                     name_pool.release(&reviewer_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -6945,7 +6970,7 @@ async fn provision_reviewer(
                         "{}: reviewer run persistence failed before attachment: {e}",
                         role.as_str().to_uppercase()
                     ));
-                    proc.kill_and_reap().await;
+                    let _terminal_output = proc.kill_and_reap().await;
                     name_pool.release(&reviewer_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -7588,7 +7613,7 @@ async fn spawn_worker(
                 let turn1 = agent::user_turn(&prompt_text);
                 if let Err(e) = proc.feed_turn(&turn1).await {
                     log(&format!("feed_turn failed: {e}"));
-                    proc.kill_and_reap().await;
+                    let _terminal_output = proc.kill_and_reap().await;
                     let strikes = poison_tracker.record_strike(task.id);
                     if strikes >= MAX_POISON_STRIKES {
                         poison_task(&db_path, &agent_name, task.id, strikes).await;
@@ -8137,11 +8162,11 @@ async fn cleanup_slot_inner(
         },
     ));
 
+    let terminal = state.proc.kill_and_reap().await;
+    persist_terminal_output(&mut state.session_log, terminal);
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(finalize_verdict);
     }
-
-    state.proc.kill_and_reap().await;
     close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
     let p = config.db_path.clone();
@@ -8192,11 +8217,11 @@ async fn teardown_worker_with_body(
     } else {
         None
     };
+    let terminal = state.proc.kill_and_reap().await;
+    persist_terminal_output(&mut state.session_log, terminal);
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(verdict);
     }
-
-    state.proc.kill_and_reap().await;
     let end_reason = if task_status == "open" {
         "failed"
     } else {
@@ -8276,11 +8301,11 @@ async fn teardown_reviewer(
 ) {
     log(&format!("tearing down reviewer {}", state.agent_name));
 
+    let terminal = state.proc.kill_and_reap().await;
+    persist_terminal_output(&mut state.session_log, terminal);
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(None);
     }
-
-    state.proc.kill_and_reap().await;
     close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
     // #130: revoke run capability
@@ -8806,7 +8831,7 @@ async fn spawn_remediation_worker(
                 let turn1 = agent::user_turn(&prompt);
                 if let Err(e) = proc.feed_turn(&turn1).await {
                     log(&format!("remediation feed_turn failed: {e}"));
-                    proc.kill_and_reap().await;
+                    let _terminal_output = proc.kill_and_reap().await;
                     // Release the lease installed by claim_remediation_rework.
                     {
                         let p = db_path.clone();
@@ -11855,5 +11880,47 @@ mod tests {
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "done");
+    }
+
+    #[test]
+    fn terminal_provider_output_is_persisted_but_lifecycle_inert() {
+        let root = tempfile::tempdir().unwrap();
+        let log = session_log::SessionLog::create(
+            root.path(),
+            "TestAgent",
+            "worker",
+            Some(7),
+            "session",
+            "fix/test",
+            100,
+        )
+        .unwrap();
+        let dir = log.dir().to_path_buf();
+        let mut log = Some(log);
+        persist_terminal_output(
+            &mut log,
+            vec![
+                runner::CapturedOutput::Stdout(
+                    r#"{"type":"result","result":"must-not-complete"}"#.into(),
+                ),
+                runner::CapturedOutput::Stderr("provider warning".into()),
+                runner::CapturedOutput::StderrTruncated { dropped: 42 },
+                runner::CapturedOutput::StderrBytesTruncated { dropped: 99 },
+            ],
+        );
+        drop(log);
+
+        let stream = std::fs::read_to_string(dir.join("stream.jsonl")).unwrap();
+        assert!(stream.contains("must-not-complete"));
+        assert!(stream.contains("\"type\":\"provider.stderr\""));
+        assert!(stream.contains("\"type\":\"provider.stderr_truncated\""));
+        assert!(stream.contains("\"dropped_lines\":42"));
+        assert!(stream.contains("\"type\":\"provider.stderr_bytes_truncated\""));
+        assert!(stream.contains("\"dropped_bytes\":99"));
+
+        let transcript = std::fs::read_to_string(dir.join("transcript.md")).unwrap();
+        assert!(!transcript.contains("must-not-complete"));
+        assert!(!transcript.contains("provider warning"));
+        assert!(!transcript.contains("42"));
     }
 }

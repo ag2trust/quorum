@@ -10,6 +10,128 @@
 
 use super::agent::AgentProc;
 use super::codex_agent::CodexProc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use tokio::io::AsyncReadExt;
+
+const DIAGNOSTIC_CAPACITY: usize = 256;
+const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
+
+pub enum CapturedOutput {
+    Stdout(String),
+    Stderr(String),
+    StderrTruncated { dropped: usize },
+    StderrBytesTruncated { dropped: usize },
+}
+
+impl CapturedOutput {
+    pub fn session_line(&self) -> String {
+        match self {
+            Self::Stdout(line) => line.clone(),
+            Self::Stderr(text) => {
+                serde_json::json!({"type":"provider.stderr","text":text}).to_string()
+            }
+            Self::StderrTruncated { dropped } => serde_json::json!({
+                "type":"provider.stderr_truncated",
+                "dropped_lines":dropped
+            })
+            .to_string(),
+            Self::StderrBytesTruncated { dropped } => serde_json::json!({
+                "type":"provider.stderr_bytes_truncated",
+                "dropped_bytes":dropped
+            })
+            .to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct DiagnosticBuffer(Arc<Mutex<DiagnosticState>>);
+
+#[derive(Default)]
+struct DiagnosticState {
+    lines: VecDeque<String>,
+    dropped: usize,
+    dropped_bytes: usize,
+}
+
+impl DiagnosticBuffer {
+    pub fn push(&self, line: String) {
+        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        if state.lines.len() == DIAGNOSTIC_CAPACITY {
+            state.lines.pop_front();
+            state.dropped += 1;
+        }
+        state.lines.push_back(line);
+    }
+
+    pub fn drain(&self) -> Vec<CapturedOutput> {
+        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        let mut output = Vec::with_capacity(
+            state.lines.len()
+                + usize::from(state.dropped > 0)
+                + usize::from(state.dropped_bytes > 0),
+        );
+        if state.dropped > 0 {
+            output.push(CapturedOutput::StderrTruncated {
+                dropped: state.dropped,
+            });
+            state.dropped = 0;
+        }
+        if state.dropped_bytes > 0 {
+            output.push(CapturedOutput::StderrBytesTruncated {
+                dropped: state.dropped_bytes,
+            });
+            state.dropped_bytes = 0;
+        }
+        output.extend(state.lines.drain(..).map(CapturedOutput::Stderr));
+        output
+    }
+
+    fn note_dropped_bytes(&self, count: usize) {
+        let mut state = self.0.lock().expect("diagnostic buffer poisoned");
+        state.dropped_bytes = state.dropped_bytes.saturating_add(count);
+    }
+}
+
+pub async fn capture_diagnostics<R>(mut reader: R, diagnostics: DiagnosticBuffer)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0u8; 4096];
+    let mut line = Vec::new();
+    let mut line_dropped = 0usize;
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                for &byte in &chunk[..read] {
+                    if byte == b'\n' {
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        diagnostics.push(String::from_utf8_lossy(&line).into_owned());
+                        if line_dropped > 0 {
+                            diagnostics.note_dropped_bytes(line_dropped);
+                            line_dropped = 0;
+                        }
+                        line.clear();
+                    } else if line.len() < DIAGNOSTIC_LINE_BYTES {
+                        line.push(byte);
+                    } else {
+                        line_dropped = line_dropped.saturating_add(1);
+                    }
+                }
+            }
+        }
+    }
+    if !line.is_empty() {
+        diagnostics.push(String::from_utf8_lossy(&line).into_owned());
+    }
+    if line_dropped > 0 {
+        diagnostics.note_dropped_bytes(line_dropped);
+    }
+}
 use super::{codex_stream, stream};
 
 /// Closed runner enum — supporting another runner requires an explicit code
@@ -34,7 +156,7 @@ impl RunnerProc {
         }
     }
 
-    pub async fn kill_and_reap(self) {
+    pub async fn kill_and_reap(self) -> Vec<CapturedOutput> {
         match self {
             Self::Claude(proc) => proc.kill_and_reap().await,
             Self::Codex(proc) => proc.kill_and_reap().await,
@@ -74,6 +196,13 @@ impl RunnerProc {
 
     pub fn is_codex(&self) -> bool {
         matches!(self, Self::Codex(_))
+    }
+
+    pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
+        match self {
+            Self::Claude(proc) => proc.drain_diagnostics(),
+            Self::Codex(proc) => proc.drain_diagnostics(),
+        }
     }
 }
 
@@ -613,5 +742,40 @@ mod tests {
         assert_eq!(events.len(), 1);
         // The raw line is distinct from re-serialized — it contains extra_field
         assert!(raw.contains("extra_field"));
+    }
+
+    #[test]
+    fn diagnostic_buffer_is_bounded_and_stderr_is_explicitly_typed() {
+        let buffer = DiagnosticBuffer::default();
+        for index in 0..(DIAGNOSTIC_CAPACITY + 50) {
+            buffer.push(format!("diagnostic-{index}"));
+        }
+        let captured = buffer.drain();
+        assert_eq!(captured.len(), DIAGNOSTIC_CAPACITY + 1);
+        assert!(matches!(
+            captured.first(),
+            Some(CapturedOutput::StderrTruncated { dropped: 50 })
+        ));
+        assert!(captured
+            .last()
+            .unwrap()
+            .session_line()
+            .contains("diagnostic-305"));
+    }
+
+    #[tokio::test]
+    async fn newline_free_diagnostic_is_byte_bounded_with_exact_marker() {
+        let input = vec![b'x'; DIAGNOSTIC_LINE_BYTES + 1234];
+        let buffer = DiagnosticBuffer::default();
+        capture_diagnostics(std::io::Cursor::new(input), buffer.clone()).await;
+        let captured = buffer.drain();
+        assert!(matches!(
+            captured.first(),
+            Some(CapturedOutput::StderrBytesTruncated { dropped: 1234 })
+        ));
+        assert!(matches!(
+            captured.last(),
+            Some(CapturedOutput::Stderr(line)) if line.len() == DIAGNOSTIC_LINE_BYTES
+        ));
     }
 }

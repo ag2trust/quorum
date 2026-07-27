@@ -1,6 +1,6 @@
 //! AgentProc: spawn, feed, read, and kill one claude child process.
 
-use super::runner::AgentKind;
+use super::runner::{capture_diagnostics, AgentKind, CapturedOutput, DiagnosticBuffer};
 use super::stream::{self, Event};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -32,6 +32,8 @@ pub struct AgentProc {
     child: Child,
     stdin: tokio::process::ChildStdin,
     reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    diagnostics: DiagnosticBuffer,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Tool allowlist for spawned agents (dontAsk auto-denies everything else).
@@ -91,7 +93,7 @@ impl AgentProc {
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -106,11 +108,18 @@ impl AgentProc {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout).lines();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
 
         Ok(Self {
             child,
             stdin,
             reader,
+            diagnostics,
+            stderr_task: Some(stderr_task),
         })
     }
 
@@ -155,20 +164,27 @@ impl AgentProc {
         self.child.try_wait()
     }
 
+    pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
+        self.diagnostics.drain()
+    }
+
     #[cfg(test)]
     pub fn from_parts(
         child: Child,
         stdin: tokio::process::ChildStdin,
         reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     ) -> Self {
+        let diagnostics = DiagnosticBuffer::default();
         Self {
             child,
             stdin,
             reader,
+            diagnostics,
+            stderr_task: None,
         }
     }
 
-    pub async fn kill_and_reap(mut self) {
+    pub async fn kill_and_reap(mut self) -> Vec<CapturedOutput> {
         if let Some(pid) = self.child.id() {
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
@@ -176,12 +192,55 @@ impl AgentProc {
         }
         // Reap the child to avoid zombie accumulation
         let _ = self.child.wait().await;
+        let mut terminal = Vec::new();
+        while let Ok(Some(line)) = self.reader.next_line().await {
+            terminal.push(CapturedOutput::Stdout(line));
+        }
+        let diagnostics = self.diagnostics.clone();
+        if let Some(stderr_task) = self.stderr_task {
+            let _ = stderr_task.await;
+        }
+        terminal.extend(diagnostics.drain());
+        terminal
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn shell_proc(script: &str) -> AgentProc {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        AgentProc {
+            child,
+            stdin,
+            reader,
+            diagnostics,
+            stderr_task: Some(stderr_task),
+        }
+    }
 
     /// The claude CLI rejects any non-UUID --session-id before the first turn;
     /// a formatted string here respawn-loops the daemon (observed 2026-07-10).
@@ -242,7 +301,7 @@ mod tests {
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("claude produced no event within 60s — args may hang the CLI");
-        proc.kill_and_reap().await;
+        let _terminal_output = proc.kill_and_reap().await;
         assert!(
             event.is_some(),
             "claude exited without emitting any stream event — the AgentSpec \
@@ -270,7 +329,7 @@ mod tests {
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("claude neither exited nor emitted within 60s");
-        proc.kill_and_reap().await;
+        let _terminal_output = proc.kill_and_reap().await;
         assert!(
             event.is_none(),
             "claude accepted a non-UUID --session-id — CLI validation changed"
@@ -321,5 +380,44 @@ mod tests {
             "claude CLI exits 1 on turns without message.role"
         );
         assert_eq!(parsed["message"]["content"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn claude_boundary_bounds_stderr_drains_terminal_output_and_reaps() {
+        let mut proc = shell_proc(
+            "printf '\\377invalid\\n' >&2; \
+             head -c 131072 /dev/zero | tr '\\000' x >&2; echo >&2; \
+             i=0; while [ $i -lt 10000 ]; do echo claude-stderr-$i >&2; i=$((i+1)); done; \
+             echo '{\"type\":\"provider.ready\"}'; \
+             echo '{\"type\":\"result\",\"result\":\"trailing\"}'; \
+             sleep 30",
+        )
+        .await;
+        let pid = proc.pid().unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
+            .await
+            .expect("provider never finished stderr")
+            .expect("provider stdout ended before ready");
+        assert!(ready.contains("provider.ready"));
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), proc.kill_and_reap())
+            .await
+            .expect("kill_and_reap deadlocked");
+        assert!(
+            output.len() <= 259,
+            "two markers, bounded stderr, and one stdout"
+        );
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::StderrTruncated { dropped } if *dropped > 0)
+        ));
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::StderrBytesTruncated { dropped } if *dropped > 0)
+        ));
+        assert!(output
+            .iter()
+            .any(|line| matches!(line, CapturedOutput::Stdout(text) if text.contains("trailing"))));
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::Stderr(text) if text == "claude-stderr-9999")
+        ));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child was not reaped");
     }
 }

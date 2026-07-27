@@ -6,6 +6,7 @@
 //! `thread.started` JSONL event.
 
 use super::codex_stream::{self, Event};
+use super::runner::{capture_diagnostics, CapturedOutput, DiagnosticBuffer};
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -74,6 +75,8 @@ pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> 
 pub struct CodexProc {
     child: Child,
     reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    diagnostics: DiagnosticBuffer,
+    stderr_task: tokio::task::JoinHandle<()>,
 }
 
 impl CodexProc {
@@ -98,7 +101,7 @@ impl CodexProc {
         cmd.current_dir(worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -112,8 +115,18 @@ impl CodexProc {
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout).lines();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
 
-        Ok(Self { child, reader })
+        Ok(Self {
+            child,
+            reader,
+            diagnostics,
+            stderr_task,
+        })
     }
 
     pub fn spawn(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -127,7 +140,7 @@ impl CodexProc {
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -141,8 +154,18 @@ impl CodexProc {
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout).lines();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
 
-        Ok(Self { child, reader })
+        Ok(Self {
+            child,
+            reader,
+            diagnostics,
+            stderr_task,
+        })
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -176,13 +199,25 @@ impl CodexProc {
         self.child.try_wait()
     }
 
-    pub async fn kill_and_reap(mut self) {
+    pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
+        self.diagnostics.drain()
+    }
+
+    pub async fn kill_and_reap(mut self) -> Vec<CapturedOutput> {
         if let Some(pid) = self.child.id() {
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
         }
         let _ = self.child.wait().await;
+        let mut terminal = Vec::new();
+        while let Ok(Some(line)) = self.reader.next_line().await {
+            terminal.push(CapturedOutput::Stdout(line));
+        }
+        let diagnostics = self.diagnostics.clone();
+        let _ = self.stderr_task.await;
+        terminal.extend(diagnostics.drain());
+        terminal
     }
 }
 
@@ -193,6 +228,37 @@ impl CodexProc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn shell_proc(script: &str) -> CodexProc {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        let stderr = BufReader::new(child.stderr.take().unwrap());
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        CodexProc {
+            child,
+            reader,
+            diagnostics,
+            stderr_task,
+        }
+    }
 
     fn test_spec() -> CodexSpec {
         CodexSpec {
@@ -384,7 +450,7 @@ mod tests {
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("codex produced no event within 60s — args may hang the CLI");
-        proc.kill_and_reap().await;
+        let _terminal_output = proc.kill_and_reap().await;
         assert!(
             event.is_some(),
             "codex exited without emitting any JSONL event — exec argument \
@@ -414,7 +480,7 @@ mod tests {
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("no event within 60s");
-        proc.kill_and_reap().await;
+        let _terminal_output = proc.kill_and_reap().await;
         match event {
             Some(Event::ThreadStarted { thread_id }) => {
                 assert!(!thread_id.is_empty(), "thread_id must not be empty");
@@ -482,5 +548,44 @@ mod tests {
                 "codex rejected resume argument shape: {stderr}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn codex_boundary_bounds_stderr_drains_terminal_output_and_reaps() {
+        let mut proc = shell_proc(
+            "printf '\\377invalid\\n' >&2; \
+             head -c 131072 /dev/zero | tr '\\000' x >&2; echo >&2; \
+             i=0; while [ $i -lt 10000 ]; do echo codex-stderr-$i >&2; i=$((i+1)); done; \
+             echo '{\"type\":\"provider.ready\"}'; \
+             echo '{\"type\":\"turn.completed\"}'; \
+             sleep 30",
+        )
+        .await;
+        let pid = proc.pid().unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
+            .await
+            .expect("provider never finished stderr")
+            .expect("provider stdout ended before ready");
+        assert!(ready.contains("provider.ready"));
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), proc.kill_and_reap())
+            .await
+            .expect("kill_and_reap deadlocked");
+        assert!(
+            output.len() <= 259,
+            "two markers, bounded stderr, and one stdout"
+        );
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::StderrTruncated { dropped } if *dropped > 0)
+        ));
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::StderrBytesTruncated { dropped } if *dropped > 0)
+        ));
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::Stdout(text) if text.contains("turn.completed"))
+        ));
+        assert!(output.iter().any(
+            |line| matches!(line, CapturedOutput::Stderr(text) if text == "codex-stderr-9999")
+        ));
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child was not reaped");
     }
 }
