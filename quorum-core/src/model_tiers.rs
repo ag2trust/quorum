@@ -59,6 +59,21 @@ pub fn known_tiers() -> String {
         .join("|")
 }
 
+/// Resolve a Claude-only model floor tier to its exact model ID.
+pub fn claude_model_id_for_tier(tier: &str) -> Option<&'static str> {
+    model_id_for_tier(tier).filter(|model_id| model_id.starts_with("claude-"))
+}
+
+/// Render the Claude-only vocabulary accepted by `min_model`.
+pub fn known_claude_tiers() -> String {
+    MODEL_TIERS
+        .iter()
+        .filter(|entry| entry.model_id.starts_with("claude-"))
+        .map(|entry| entry.tier)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +100,14 @@ mod tests {
         for tier in ["o3", "o4-mini", "unknown"] {
             assert_eq!(model_id_for_tier(tier), None, "{tier}");
         }
+    }
+
+    #[test]
+    fn claude_floor_vocabulary_excludes_codex_tiers() {
+        assert_eq!(claude_model_id_for_tier("opus-47"), Some("claude-opus-4-7"));
+        for tier in ["luna", "terra", "sol", "unknown"] {
+            assert_eq!(claude_model_id_for_tier(tier), None, "{tier}");
+        }
+        assert_eq!(known_claude_tiers(), "sonnet-5|opus-46|opus-47|opus-48");
     }
 }
