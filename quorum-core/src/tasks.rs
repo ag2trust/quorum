@@ -12,7 +12,7 @@ use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use crate::lifecycle::{Effect, Event, Status, TaskView};
 use crate::sweep::SWEEP_LIMIT;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Serialize;
 
 pub const STATUSES: &[&str] = &[
@@ -688,6 +688,55 @@ pub fn apply_event(
     now: i64,
 ) -> Result<TransitionResult> {
     let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, agent, id, event, now)
+}
+
+/// Atomically fail a reviewer only while it still owns the active review phase.
+///
+/// Reviewer processes are turn-oriented and may exit after their verdict has
+/// already transferred the task to remediation. The ownership predicate and
+/// `AgentFailed` transition must therefore share one write transaction.
+pub fn fail_reviewer_if_owner(
+    conn: &mut Connection,
+    reviewer: &str,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<Option<TransitionResult>> {
+    let tx = begin_immediate(conn)?;
+    let still_owns_review = tx
+        .query_row(
+            "SELECT 1 FROM tasks
+             WHERE id=?1 AND status='in-review' AND reviewer=?2",
+            params![id, reviewer],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !still_owns_review {
+        tx.commit()?;
+        return Ok(None);
+    }
+
+    apply_event_tx(
+        tx,
+        reviewer,
+        id,
+        &Event::AgentFailed {
+            reason: reason.to_string(),
+        },
+        now,
+    )
+    .map(Some)
+}
+
+fn apply_event_tx(
+    tx: Transaction<'_>,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+) -> Result<TransitionResult> {
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
 
@@ -1867,6 +1916,88 @@ mod tests {
         assert_eq!(r.task.rework_round, 1);
         assert!(r.effects.contains(&Effect::IncrementReworkRound));
         assert!(r.effects.contains(&Effect::ResumeWorker));
+    }
+
+    #[test]
+    fn stale_reviewer_failure_after_verdict_changes_is_atomic_noop() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+        claim_remediation_rework(&mut c, "remediation", id, TTL, 1004)
+            .unwrap()
+            .unwrap();
+
+        let lease_before: (String, i64) = c
+            .query_row(
+                "SELECT holder, expires_at FROM claims WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let errors_before: i64 = c
+            .query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+
+        let result =
+            fail_reviewer_if_owner(&mut c, "reviewer", id, "reviewer exited", 1005).unwrap();
+        assert!(result.is_none());
+
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.assignee.as_deref(), Some("remediation"));
+        let lease_after: (String, i64) = c
+            .query_row(
+                "SELECT holder, expires_at FROM claims WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lease_after, lease_before);
+        let errors_after: i64 = c
+            .query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(errors_after, errors_before);
+
+        let pushed = apply_event(&mut c, "remediation", id, &Event::ReworkPushed, 1006).unwrap();
+        assert_eq!(pushed.task.status, "in-review");
+    }
+
+    #[test]
+    fn current_reviewer_failure_still_triggers_recovery() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+
+        let result = fail_reviewer_if_owner(&mut c, "reviewer", id, "reviewer process died", 1003)
+            .unwrap()
+            .expect("current reviewer failure must apply");
+        assert_eq!(result.task.status, "in-review");
+        assert!(result.effects.contains(&Effect::SpawnReviewer));
+        assert!(result.task.reviewer.is_none());
+        assert!(result.task.assignee.is_none());
     }
 
     #[test]

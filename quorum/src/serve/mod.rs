@@ -1647,6 +1647,7 @@ async fn tick(
 
         // Kill rows — hard-terminate the targeted agent immediately.
         if row.kind == mailbox::MailboxKind::Kill {
+            let mut consume_kill = true;
             if let Some(target) = &row.to_agent {
                 let reason = row.note.as_deref().unwrap_or("no reason given");
                 let by = &row.agent;
@@ -1676,19 +1677,23 @@ async fn tick(
                         "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
                         reviewers[ri].agent_name, reviewers[ri].task_id,
                     ));
-                    let r = reviewers.remove(ri);
-                    let task_id = r.task_id;
-                    fire_event(
+                    let mutation = fail_reviewer_if_owner(
                         &db_path,
-                        &r.agent_name,
-                        task_id,
-                        &Event::AgentFailed {
-                            reason: format!("killed by {by}: {reason}"),
-                        },
+                        &reviewers[ri].agent_name,
+                        reviewers[ri].task_id,
+                        &format!("killed by {by}: {reason}"),
                     )
                     .await;
-                    emit_kill_event(&db_path, target, by, reason).await;
-                    teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
+                    if mutation.is_some() {
+                        let r = reviewers.remove(ri);
+                        emit_kill_event(&db_path, target, by, reason).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
+                    } else {
+                        log(&format!(
+                            "kill: reviewer {target} lifecycle mutation failed — retaining slot and kill request for retry"
+                        ));
+                        consume_kill = false;
+                    }
                 } else if lifetime_roster.owns(target) {
                     log(&format!(
                         "kill: agent {target} not active (already dead/finished)"
@@ -1701,7 +1706,7 @@ async fn tick(
                     ));
                 }
             }
-            if !consume_mailbox_row(&db_path, *id).await {
+            if consume_kill && !consume_mailbox_row(&db_path, *id).await {
                 break;
             }
             continue;
@@ -4126,16 +4131,21 @@ async fn tick(
         }
     }
     for &i in reviewers_to_kill.iter().rev() {
-        let dead = reviewers.remove(i);
-        fire_event(
+        let mutation = fail_reviewer_if_owner(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: "reviewer killed by watchdog".into(),
-            },
+            &reviewers[i].agent_name,
+            reviewers[i].task_id,
+            "reviewer killed by watchdog",
         )
         .await;
+        if mutation.is_none() {
+            log(&format!(
+                "reviewer {} watchdog mutation failed — retaining slot for retry",
+                reviewers[i].agent_name
+            ));
+            continue;
+        }
+        let dead = reviewers.remove(i);
         teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
     }
 
@@ -4159,20 +4169,25 @@ async fn tick(
         }
     }
     for &i in idle_reviewers.iter().rev() {
-        let dead = reviewers.remove(i);
-        fire_event(
+        let mutation = fail_reviewer_if_owner(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: format!(
-                    "reviewer idle {}s between turns (limit {}s) — zombie reaped",
-                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
-                    idle_timeout
-                ),
-            },
+            &reviewers[i].agent_name,
+            reviewers[i].task_id,
+            &format!(
+                "reviewer idle {}s between turns (limit {}s) — zombie reaped",
+                reviewers[i].turn_ended_at.unwrap().elapsed().as_secs(),
+                idle_timeout
+            ),
         )
         .await;
+        if mutation.is_none() {
+            log(&format!(
+                "reviewer {} idle-reap mutation failed — retaining slot for retry",
+                reviewers[i].agent_name
+            ));
+            continue;
+        }
+        let dead = reviewers.remove(i);
         teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
     }
 
@@ -4413,20 +4428,25 @@ async fn tick(
             }
         }
         for &i in drain_reviewers.iter().rev() {
-            let r = reviewers.remove(i);
             log(&format!(
                 "DRAIN: tearing down idle reviewer {}",
-                r.agent_name
+                reviewers[i].agent_name
             ));
-            fire_event(
+            let mutation = fail_reviewer_if_owner(
                 &db_path,
-                &r.agent_name,
-                r.task_id,
-                &Event::AgentFailed {
-                    reason: "daemon draining".into(),
-                },
+                &reviewers[i].agent_name,
+                reviewers[i].task_id,
+                "daemon draining",
             )
             .await;
+            if mutation.is_none() {
+                log(&format!(
+                    "reviewer {} drain mutation failed — retaining slot for retry",
+                    reviewers[i].agent_name
+                ));
+                continue;
+            }
+            let r = reviewers.remove(i);
             teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await;
         }
     }
@@ -4558,17 +4578,23 @@ async fn tick(
         }
     }
     for &i in dead_reviewers.iter().rev() {
-        let dead = reviewers.remove(i);
-        fire_event(
+        let applied = fail_reviewer_if_owner(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: "reviewer process died".into(),
-            },
+            &reviewers[i].agent_name,
+            reviewers[i].task_id,
+            "reviewer process died",
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+        let Some(applied) = applied else {
+            log(&format!(
+                "reviewer {} failure mutation failed — retaining slot for retry",
+                reviewers[i].agent_name
+            ));
+            continue;
+        };
+        let dead = reviewers.remove(i);
+        let end_reason = if applied { "crashed" } else { "completed" };
+        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
     }
 
     // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────
@@ -7539,6 +7565,74 @@ async fn fire_event(
     event: &Event,
 ) -> Option<tasks::TransitionResult> {
     fire_event_result(db_path, agent, task_id, event).await.ok()
+}
+
+/// Atomically fail a reviewer only if it still owns `in-review`.
+///
+/// A clean `false` means the reviewer already transferred ownership (normally
+/// via `VerdictChanges`) and teardown must not mutate the lifecycle.
+async fn fail_reviewer_if_owner(
+    db_path: &std::path::Path,
+    reviewer: &str,
+    task_id: i64,
+    reason: &str,
+) -> Option<bool> {
+    let p = db_path.to_path_buf();
+    let actor = reviewer.to_string();
+    let failure_reason = reason.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::fail_reviewer_if_owner(&mut conn, &actor, task_id, &failure_reason, now_unix())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(tr))) => {
+            let names: Vec<String> = tr.effects.iter().map(tasks::effect_name).collect();
+            log(&format!(
+                "lifecycle: task #{task_id} -> {} (effects: [{}])",
+                tr.task.status,
+                names.join(", ")
+            ));
+            Some(true)
+        }
+        Ok(Ok(None)) => {
+            log(&format!(
+                "reviewer {reviewer} failure ignored after review ownership transferred"
+            ));
+            Some(false)
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            log(&format!(
+                "lifecycle: guarded reviewer failure failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(
+                db_path,
+                reviewer,
+                task_id,
+                "guarded reviewer AgentFailed",
+                &message,
+            )
+            .await;
+            None
+        }
+        Err(error) => {
+            let message = format!("join error: {error}");
+            log(&format!(
+                "lifecycle: guarded reviewer failure failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(
+                db_path,
+                reviewer,
+                task_id,
+                "guarded reviewer AgentFailed",
+                &message,
+            )
+            .await;
+            None
+        }
+    }
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
