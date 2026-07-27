@@ -953,6 +953,71 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
     }
 }
 
+/// Resolve the task a roster-unmatched Done row genuinely belongs to.
+///
+/// Returns the task only when the row carries an exact task identity and still
+/// belongs to that task's current author/assignee in a worker-owned phase.
+/// Legacy NULL-task rows remain inert: an agent name can be reused, so name
+/// ownership alone cannot safely associate a delayed row with a task.
+async fn late_worker_done_task(
+    db_path: &Path,
+    agent: &str,
+    row_task_id: Option<i64>,
+) -> Result<Option<tasks::Task>> {
+    let Some(task_id) = row_task_id else {
+        return Ok(None);
+    };
+    let p = db_path.to_path_buf();
+    let agent = agent.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+        let conn = quorum_core::db::open(&p)?;
+        Ok(tasks::get(&conn, task_id)?.filter(|t| {
+            t.author.as_deref() == Some(agent.as_str())
+                && t.assignee.as_deref() == Some(agent.as_str())
+                && matches!(t.status.as_str(), "working" | "rework")
+        }))
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))?
+}
+
+/// Drive the lifecycle for a Done row that arrived after its worker slot was
+/// already reaped. Returns `true` when the transition was applied and the
+/// caller should consume the row; `false` leaves it a phantom.
+///
+/// Codex workers exit at turn end, immediately after `quorum submit` writes the
+/// mailbox row. Phase 4b (dead-worker detection) runs *after* Phase 2 in the
+/// same tick, so a slot can be torn down between the write and the read — the
+/// row then matches nobody. Dropping it wedges the task in `working` forever:
+/// `serve::recovery` deliberately leaves provider-blocked tasks in place on
+/// restart, so nothing heals it later.
+async fn recover_late_worker_done(db_path: &Path, row: &mailbox::MailboxRow) -> Result<bool> {
+    let Some(task) = late_worker_done_task(db_path, &row.agent, row.task_id).await? else {
+        return Ok(false);
+    };
+    // Same PR resolution as the matched-worker path: prefer the row, fall back
+    // to the PR recorded in refs.
+    let Some(pr) = row.pr.or_else(|| tasks::extract_pr_number(&task.refs)) else {
+        return Ok(false);
+    };
+    log(&format!(
+        "recovering late Done row from reaped worker {} — task #{} ({}) pr #{pr}",
+        row.agent, task.id, task.status
+    ));
+    // Derive the event from the task's current phase rather than rework_round:
+    // a re-claimed task carries a non-zero round while sitting in `working`,
+    // where ReworkPushed is rejected. Stale codex_provider_* / codex_retry_*
+    // refs are cleared by the transition itself (tasks::clear_codex_retry_refs)
+    // — the worker succeeded, so a staged retry would re-run finished work.
+    let event = worker_done_event(u32::from(task.status == "rework"), pr);
+    // No slot to attach here: Phase 5 provisions the reviewer for the resulting
+    // in-review task on the next tick.
+    fire_event_result(db_path, &row.agent, task.id, &event)
+        .await
+        .map(|_| true)
+        .map_err(QuorumError::Io)
+}
+
 fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
     refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
         .and_then(|refs| {
@@ -4084,7 +4149,17 @@ async fn tick(
 
         // F9: Done row matches neither worker nor reviewer.
         // #130: no passive agent handling — all unmatched Done rows are
-        // consumed as phantoms regardless of roster ownership.
+        // consumed as phantoms regardless of roster ownership. The one
+        // exception is a *late* row from a worker whose slot this daemon
+        // reaped between the `quorum submit` write and this read (Phase 4b
+        // runs after Phase 2 in the same tick): that signal is genuine, and
+        // discarding it wedges the task in `working` forever.
+        if recover_late_worker_done(&db_path, row).await? {
+            if !consume_mailbox_row(&db_path, *id).await {
+                break;
+            }
+            break;
+        }
         log(&format!(
             "consuming unmatched Done row from {} (matches no active agent)",
             row.agent
@@ -11018,5 +11093,301 @@ mod tests {
         }
         let tid = codex_thread_id_from_refs(&db_path, 1).await;
         assert_eq!(tid.as_deref(), Some("primary"));
+    }
+
+    // ── late Done row recovery (reaped worker slot) ────────────────────────
+
+    /// Create a task claimed by `agent` (status=working, author=assignee=agent).
+    fn working_task(db_path: &Path, agent: &str, refs: Option<&str>) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let now = now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "late done",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, agent, Some(task_id), &[], 3600, now)
+            .unwrap()
+            .expect("claim must succeed");
+        if let Some(refs) = refs {
+            tasks::update_refs_daemon(&mut conn, task_id, refs, now).unwrap();
+        }
+        task_id
+    }
+
+    fn done_row(agent: &str, task_id: Option<i64>, pr: Option<i64>) -> mailbox::MailboxRow {
+        mailbox::MailboxRow {
+            agent: agent.to_string(),
+            kind: mailbox::MailboxKind::Done,
+            task_id,
+            pr,
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        }
+    }
+
+    fn task_event_kinds(db_path: &Path, task_id: i64) -> Vec<String> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT kind FROM events WHERE subject=?1 ORDER BY seq")
+            .unwrap();
+        let kinds = stmt
+            .query_map([format!("task#{task_id}")], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        kinds
+    }
+
+    #[tokio::test]
+    async fn late_done_row_from_reaped_worker_transitions_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("late-done.db");
+        let id = working_task(&db_path, "Spool-9mti", None);
+
+        assert!(
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
+                .await
+                .unwrap(),
+            "late worker Done row must be recovered, not discarded"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(439));
+        assert!(
+            task_event_kinds(&db_path, id).contains(&"task_in_review".to_string()),
+            "lifecycle event must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_done_row_clears_stale_provider_retry_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("late-done-refs.db");
+        let refs = r#"{"pr":439,"codex_provider_blocked":true,"codex_provider_error":"quota",
+            "codex_retry_requested":true,"codex_retry_model":"gpt","codex_retry_effort":"high",
+            "codex_retry_prompt":"redo","codex_retry_turn_kind":"rework",
+            "codex_retry_thread_id":"t-1","keep":"yes"}"#;
+        let id = working_task(&db_path, "Spool-9mti", Some(refs));
+
+        assert!(
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
+                .await
+                .unwrap()
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        for key in [
+            "codex_provider_blocked",
+            "codex_provider_error",
+            "codex_retry_requested",
+            "codex_retry_model",
+            "codex_retry_effort",
+            "codex_retry_prompt",
+            "codex_retry_turn_kind",
+            "codex_retry_thread_id",
+        ] {
+            assert!(refs.get(key).is_none(), "{key} must be cleared: {refs}");
+        }
+        assert_eq!(
+            refs["keep"].as_str(),
+            Some("yes"),
+            "unrelated refs preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_done_row_backfills_pr_from_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("late-done-backfill.db");
+        let id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
+
+        assert!(
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), None))
+                .await
+                .unwrap(),
+            "PR must be backfilled from refs when the row carries none"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "in-review");
+    }
+
+    #[tokio::test]
+    async fn late_done_row_from_rework_worker_transitions_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("late-rework-done.db");
+        let id = working_task(&db_path, "Spool-9mti", None);
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Spool-9mti",
+                id,
+                &Event::SignaledDone {
+                    pr: "439".to_string(),
+                },
+                11,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Reviewer-1",
+                id,
+                &Event::ReviewerAttached {
+                    agent: "Reviewer-1".to_string(),
+                },
+                12,
+            )
+            .unwrap();
+            tasks::apply_event(&mut conn, "Reviewer-1", id, &Event::VerdictChanges, 13).unwrap();
+            tasks::claim(&mut conn, "Spool-9mti", Some(id), &[], 3600, now_unix())
+                .unwrap()
+                .expect("rework worker must reacquire the task lease");
+        }
+
+        assert!(
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
+                .await
+                .unwrap(),
+            "late rework delivery must fire ReworkPushed"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "in-review");
+    }
+
+    #[tokio::test]
+    async fn phantom_done_row_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("phantom-done.db");
+        let id = working_task(&db_path, "Spool-9mti", None);
+
+        // Wrong agent: not the task's author.
+        assert!(
+            !recover_late_worker_done(&db_path, &done_row("Drifter-7x", Some(id), Some(439)))
+                .await
+                .unwrap()
+        );
+        // Right agent, but no PR anywhere.
+        assert!(
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), None))
+                .await
+                .unwrap()
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "working");
+    }
+
+    #[tokio::test]
+    async fn late_done_row_from_former_author_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("former-author-done.db");
+        let id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET assignee='Replacement-2' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        }
+
+        assert!(
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
+                .await
+                .unwrap(),
+            "a former author must not override the replacement assignee"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "working");
+    }
+
+    #[tokio::test]
+    async fn null_task_done_row_cannot_bind_after_agent_name_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("name-reuse-done.db");
+        let old_task_id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Spool-9mti",
+                old_task_id,
+                &Event::AgentFailed {
+                    reason: "slot reaped".to_string(),
+                },
+                now_unix(),
+            )
+            .unwrap();
+        }
+        let new_task_id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":500}"#));
+
+        assert!(
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", None, Some(439)))
+                .await
+                .unwrap(),
+            "legacy NULL-task rows must stay inert after agent-name reuse"
+        );
+        assert!(
+            !recover_late_worker_done(
+                &db_path,
+                &done_row("Spool-9mti", Some(old_task_id), Some(439)),
+            )
+            .await
+            .unwrap(),
+            "an exact old task identity must not bind to the new task"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, old_task_id).unwrap().unwrap().status,
+            "open"
+        );
+        let new_task = tasks::get(&conn, new_task_id).unwrap().unwrap();
+        assert_eq!(new_task.status, "working");
+        assert_eq!(
+            tasks::extract_pr_number(&new_task.refs),
+            Some(500),
+            "the delayed row's PR must not overwrite the new task"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_done_row_for_terminal_task_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("terminal-done.db");
+        let id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::close_after_merge(&mut conn, id, "merged", 20).unwrap();
+        }
+
+        assert!(
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
+                .await
+                .unwrap(),
+            "a Done row for an already-terminal task stays a phantom"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "done");
     }
 }
