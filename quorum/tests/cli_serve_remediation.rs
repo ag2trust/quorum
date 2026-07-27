@@ -533,7 +533,7 @@ fn remediation_worker_resubmits_same_pr() {
         handle.lines
     );
     assert!(
-        handle.wait_for("exited after review ownership transferred", 15),
+        handle.wait_for("failure ignored after review ownership transferred", 15),
         "reviewer exit was not treated as teardown-only. Lines: {:?}",
         handle.lines
     );
@@ -541,6 +541,15 @@ fn remediation_worker_resubmits_same_pr() {
     let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
     assert_eq!(task.status, "rework");
     assert_eq!(task.assignee.as_deref(), Some(remediation_name.as_str()));
+    let remediation_runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs
+             WHERE task_id=?1 AND role='worker' AND agent_name=?2",
+            rusqlite::params![task_id, remediation_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remediation_runs, 1, "must not spawn duplicate remediation");
     drop(conn);
 
     assert!(

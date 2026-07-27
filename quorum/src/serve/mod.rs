@@ -1678,13 +1678,11 @@ async fn tick(
                     ));
                     let r = reviewers.remove(ri);
                     let task_id = r.task_id;
-                    fire_event(
+                    fail_reviewer_if_owner(
                         &db_path,
                         &r.agent_name,
                         task_id,
-                        &Event::AgentFailed {
-                            reason: format!("killed by {by}: {reason}"),
-                        },
+                        &format!("killed by {by}: {reason}"),
                     )
                     .await;
                     emit_kill_event(&db_path, target, by, reason).await;
@@ -4127,13 +4125,11 @@ async fn tick(
     }
     for &i in reviewers_to_kill.iter().rev() {
         let dead = reviewers.remove(i);
-        fire_event(
+        fail_reviewer_if_owner(
             &db_path,
             &dead.agent_name,
             dead.task_id,
-            &Event::AgentFailed {
-                reason: "reviewer killed by watchdog".into(),
-            },
+            "reviewer killed by watchdog",
         )
         .await;
         teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
@@ -4160,17 +4156,15 @@ async fn tick(
     }
     for &i in idle_reviewers.iter().rev() {
         let dead = reviewers.remove(i);
-        fire_event(
+        fail_reviewer_if_owner(
             &db_path,
             &dead.agent_name,
             dead.task_id,
-            &Event::AgentFailed {
-                reason: format!(
-                    "reviewer idle {}s between turns (limit {}s) — zombie reaped",
-                    dead.turn_ended_at.unwrap().elapsed().as_secs(),
-                    idle_timeout
-                ),
-            },
+            &format!(
+                "reviewer idle {}s between turns (limit {}s) — zombie reaped",
+                dead.turn_ended_at.unwrap().elapsed().as_secs(),
+                idle_timeout
+            ),
         )
         .await;
         teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
@@ -4418,15 +4412,7 @@ async fn tick(
                 "DRAIN: tearing down idle reviewer {}",
                 r.agent_name
             ));
-            fire_event(
-                &db_path,
-                &r.agent_name,
-                r.task_id,
-                &Event::AgentFailed {
-                    reason: "daemon draining".into(),
-                },
-            )
-            .await;
+            fail_reviewer_if_owner(&db_path, &r.agent_name, r.task_id, "daemon draining").await;
             teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await;
         }
     }
@@ -4558,48 +4544,23 @@ async fn tick(
         }
     }
     for &i in dead_reviewers.iter().rev() {
-        let task_id = reviewers[i].task_id;
-        let reviewer_name = reviewers[i].agent_name.clone();
-        let p = db_path.clone();
-        let still_owns_review = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let conn = quorum_core::db::open(&p)?;
-            let task = tasks::get(&conn, task_id)?;
-            Ok(task.is_some_and(|task| {
-                task.status == "in-review"
-                    && task.reviewer.as_deref() == Some(reviewer_name.as_str())
-            }))
-        })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-        let still_owns_review = match still_owns_review {
-            Ok(value) => value,
-            Err(error) => {
-                log(&format!(
-                    "reviewer {} exit ownership check failed: {error} — retaining slot for retry",
-                    reviewers[i].agent_name
-                ));
-                continue;
-            }
+        let applied = fail_reviewer_if_owner(
+            &db_path,
+            &reviewers[i].agent_name,
+            reviewers[i].task_id,
+            "reviewer process died",
+        )
+        .await;
+        let Some(applied) = applied else {
+            log(&format!(
+                "reviewer {} failure mutation failed — retaining slot for retry",
+                reviewers[i].agent_name
+            ));
+            continue;
         };
         let dead = reviewers.remove(i);
-        if still_owns_review {
-            fire_event(
-                &db_path,
-                &dead.agent_name,
-                dead.task_id,
-                &Event::AgentFailed {
-                    reason: "reviewer process died".into(),
-                },
-            )
-            .await;
-            teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
-        } else {
-            log(&format!(
-                "reviewer {} exited after review ownership transferred — teardown only",
-                dead.agent_name
-            ));
-            teardown_reviewer(config, wt_mgr, name_pool, dead, "completed").await;
-        }
+        let end_reason = if applied { "crashed" } else { "completed" };
+        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
     }
 
     // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────
@@ -7570,6 +7531,74 @@ async fn fire_event(
     event: &Event,
 ) -> Option<tasks::TransitionResult> {
     fire_event_result(db_path, agent, task_id, event).await.ok()
+}
+
+/// Atomically fail a reviewer only if it still owns `in-review`.
+///
+/// A clean `false` means the reviewer already transferred ownership (normally
+/// via `VerdictChanges`) and teardown must not mutate the lifecycle.
+async fn fail_reviewer_if_owner(
+    db_path: &std::path::Path,
+    reviewer: &str,
+    task_id: i64,
+    reason: &str,
+) -> Option<bool> {
+    let p = db_path.to_path_buf();
+    let actor = reviewer.to_string();
+    let failure_reason = reason.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::fail_reviewer_if_owner(&mut conn, &actor, task_id, &failure_reason, now_unix())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(tr))) => {
+            let names: Vec<String> = tr.effects.iter().map(tasks::effect_name).collect();
+            log(&format!(
+                "lifecycle: task #{task_id} -> {} (effects: [{}])",
+                tr.task.status,
+                names.join(", ")
+            ));
+            Some(true)
+        }
+        Ok(Ok(None)) => {
+            log(&format!(
+                "reviewer {reviewer} failure ignored after review ownership transferred"
+            ));
+            Some(false)
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            log(&format!(
+                "lifecycle: guarded reviewer failure failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(
+                db_path,
+                reviewer,
+                task_id,
+                "guarded reviewer AgentFailed",
+                &message,
+            )
+            .await;
+            None
+        }
+        Err(error) => {
+            let message = format!("join error: {error}");
+            log(&format!(
+                "lifecycle: guarded reviewer failure failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(
+                db_path,
+                reviewer,
+                task_id,
+                "guarded reviewer AgentFailed",
+                &message,
+            )
+            .await;
+            None
+        }
+    }
 }
 
 /// Gather task context from the DB and persist a structured lifecycle diagnostic.
