@@ -1370,9 +1370,14 @@ missing continuation metadata, and unavailable configured runners fail loudly an
 existing bounded retry or parked-task path.
 
 The initial operational profile uses Codex `gpt-5.6-terra` at medium effort for workers and
-classifiers and high effort for R1/R2. This profile is deliberately smaller than a
-vendor-specific fleet: it adds no complexity ladder, model benchmarker, generalized provider
-plugin, or cross-vendor strength ordering.
+classifiers and high effort for R1/R2. Complexity recommendations are provider-aware
+operational routing policy: Claude uses `sonnet-5`/`opus-46`/`opus-47`/`opus-48`, while Codex
+uses `luna`/`terra`/`sol`, each at medium or high effort only. The active daemon provider
+selects its own five-level ladder; `suggested_models` may explicitly override a level using
+only the closed task-tier vocabulary and medium/high effort. Task `tier:`/`effort:` labels
+still take precedence over worker defaults, and recommendations remain advisory. These
+ladders do not claim cross-vendor benchmark equivalence or establish a cross-vendor strength
+ordering.
 
 ### Verification gates
 

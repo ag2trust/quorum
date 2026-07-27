@@ -38,6 +38,16 @@ const DEFAULT_SERVE_TOML: &str = "\
 # review_effort = \"high\"
 # classifier_model = \"gpt-5.6-terra\"
 # classifier_effort = \"medium\"
+#
+# ## Advisory complexity routing policy
+# Claude: 1=sonnet-5/medium, 2=opus-46/medium, 3=opus-46/high,
+#         4=opus-47/high, 5=opus-48/high
+# Codex:  1=luna/medium, 2=terra/medium, 3=terra/high,
+#         4=sol/medium, 5=sol/high
+# The active provider selects its ladder. This is Quorum operational routing
+# policy, not a cross-vendor benchmark. Explicit task tier:/effort: labels win.
+# [suggested_models]
+# \"1\" = \"luna/medium\"  # closed tiers: sonnet-5|opus-46|opus-47|opus-48|luna|terra|sol
 # agent = \"claude\"        # runner: \"claude\" or \"codex\"
 # cap = 4
 # model = \"sonnet\"
@@ -1141,18 +1151,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             // R2 sampling config ignored — R2 is mandatory (#159).
 
             let r_suggested_models = file_cfg.suggested_models.clone().unwrap_or_default();
-            for (k, v) in &r_suggested_models {
-                let valid_key = matches!(k.as_str(), "1" | "2" | "3" | "4" | "5");
-                let valid_val = v.split_once('/').is_some_and(|(tier, effort)| {
-                    serve::tier_to_model_id_pub(tier).is_some()
-                        && (effort == "medium" || effort == "high")
-                });
-                if !valid_key || !valid_val {
-                    return Err(QuorumError::Usage(format!(
-                        "bad suggested_models entry: {k} = \"{v}\" (expected key 1-5, value \"tier/effort\")"
-                    )));
-                }
-            }
+            serve_config::validate_suggested_models(&r_suggested_models)?;
 
             // #172: worker model/effort floor. Validate + convert tier→model id at load;
             // bad tier or effort → exit 2 (Usage), consistent with serve_config style.

@@ -295,11 +295,6 @@ fn resolve_or_load_pr_target(
     })
 }
 
-/// Map a closed task tier suffix to its exact full model ID.
-pub fn tier_to_model_id_pub(tier: &str) -> Option<String> {
-    tier_to_model_id(tier)
-}
-
 fn tier_to_model_id(tier: &str) -> Option<String> {
     quorum_core::model_tiers::model_id_for_tier(tier).map(str::to_string)
 }
@@ -487,10 +482,22 @@ fn effort_rank(effort: &str) -> u8 {
     }
 }
 
-use quorum_core::complexity::DEFAULT_RECOMMENDATIONS as SUGGESTED_DEFAULTS;
+fn recommendation_provider(
+    kind: crate::serve_config::RunnerKind,
+) -> quorum_core::complexity::RecommendationProvider {
+    match kind {
+        crate::serve_config::RunnerKind::Claude => {
+            quorum_core::complexity::RecommendationProvider::Claude
+        }
+        crate::serve_config::RunnerKind::Codex => {
+            quorum_core::complexity::RecommendationProvider::Codex
+        }
+    }
+}
 
 fn suggested_for(
     cx: u8,
+    provider: crate::serve_config::RunnerKind,
     overrides: &std::collections::HashMap<String, String>,
 ) -> (String, String) {
     if let Some(val) = overrides.get(&cx.to_string()) {
@@ -502,18 +509,21 @@ fn suggested_for(
             }
         }
     }
-    SUGGESTED_DEFAULTS
+    quorum_core::complexity::recommendations_for(recommendation_provider(provider))
         .iter()
         .find(|(level, _, _)| *level == cx)
         .map(|(_, model, effort)| (model.to_string(), effort.to_string()))
-        .unwrap_or_else(|| ("claude-opus-4-6".into(), "medium".into()))
+        .unwrap_or_else(|| match provider {
+            crate::serve_config::RunnerKind::Claude => ("claude-opus-4-6".into(), "medium".into()),
+            crate::serve_config::RunnerKind::Codex => ("gpt-5.6-terra".into(), "medium".into()),
+        })
 }
 
 /// #172: clamp a resolved (model, effort) up to the configured floor for worker
 /// spawn. `min_model` is a full model id (e.g. "claude-opus-4-7"); `min_effort`
 /// is "medium"|"high". A `None` field imposes no floor on that dimension — the
-/// resolved value stands in as the missing companion, so the combined
-/// `is_model_effort_below` comparison only fires on the configured dimension.
+/// resolved value stands in as the missing companion, so the combined floor
+/// comparison only fires on the configured dimension.
 /// Never lowers a pair already at/above the floor.
 fn apply_model_effort_floor(
     resolved_model: &str,
@@ -526,21 +536,60 @@ fn apply_model_effort_floor(
     }
     let floor_model = min_model.unwrap_or(resolved_model);
     let floor_effort = min_effort.unwrap_or(resolved_effort);
-    if is_model_effort_below(resolved_model, resolved_effort, floor_model, floor_effort) {
+    if is_below_model_effort_floor(resolved_model, resolved_effort, floor_model, floor_effort) {
         (floor_model.to_string(), floor_effort.to_string())
     } else {
         (resolved_model.to_string(), resolved_effort.to_string())
     }
 }
 
-fn is_model_effort_below(
+/// Compare against the mandatory Claude-only worker floor. Legacy mode permits
+/// a Codex task tier with a Claude floor; that task must still be clamped to
+/// the floor rather than silently bypassing it.
+fn is_below_model_effort_floor(
+    resolved_model: &str,
+    resolved_effort: &str,
+    floor_model: &str,
+    floor_effort: &str,
+) -> bool {
+    let resolved_rank = model_rank(resolved_model).unwrap_or(0);
+    let floor_rank = model_rank(floor_model).unwrap_or(0);
+    resolved_rank < floor_rank
+        || (resolved_rank == floor_rank && effort_rank(resolved_effort) < effort_rank(floor_effort))
+}
+
+/// Compare a resolved pair with an advisory complexity recommendation.
+/// Recommendations are provider-scoped operational policy, so this never
+/// infers a cross-vendor ordering.
+fn is_below_advisory_recommendation(
     resolved_model: &str,
     resolved_effort: &str,
     suggested_model: &str,
     suggested_effort: &str,
 ) -> bool {
-    let r_rank = model_rank(resolved_model).unwrap_or(0);
-    let s_rank = model_rank(suggested_model).unwrap_or(0);
+    let resolved_provider = match resolve_provider(resolved_model) {
+        Ok(provider) => provider,
+        Err(_) => return false,
+    };
+    let suggested_provider = match resolve_provider(suggested_model) {
+        Ok(provider) => provider,
+        Err(_) => return false,
+    };
+    if resolved_provider != suggested_provider {
+        return false;
+    }
+    let provider = match resolved_provider {
+        runner::AgentKind::Claude => quorum_core::complexity::RecommendationProvider::Claude,
+        runner::AgentKind::Codex => quorum_core::complexity::RecommendationProvider::Codex,
+    };
+    let r_rank = quorum_core::complexity::recommendations_for(provider)
+        .iter()
+        .position(|(_, model, _)| *model == resolved_model)
+        .unwrap_or(0);
+    let s_rank = quorum_core::complexity::recommendations_for(provider)
+        .iter()
+        .position(|(_, model, _)| *model == suggested_model)
+        .unwrap_or(0);
     if r_rank < s_rank {
         return true;
     }
@@ -5569,13 +5618,22 @@ async fn tick(
                     &config.classifier_model,
                     &config.classifier_effort,
                     &config.codex_sandbox,
+                    &quorum_core::complexity::recommendation_lines(recommendation_provider(
+                        config.runner_kind,
+                    )),
                 ) {
                     Ok(mut slot) => {
                         if slot.proc.is_codex() {
                             log(&format!("classifier: spawned for {} task(s)", tasks.len()));
                             *classifier_slot = Some(slot);
                         } else {
-                            let turn = classifier::classifier_turn(&tasks, &dup_context);
+                            let turn = classifier::classifier_turn_with_recommendations(
+                                &tasks,
+                                &dup_context,
+                                &quorum_core::complexity::recommendation_lines(
+                                    recommendation_provider(config.runner_kind),
+                                ),
+                            );
                             if let Err(e) = slot.proc.feed_turn(&turn).await {
                                 log(&format!("classifier: feed_turn failed: {e}"));
                             } else {
@@ -7382,8 +7440,14 @@ async fn spawn_worker(
                 .map(|cx| (cx, "cx_est"))
         });
     if let Some((cx, source)) = cx_source {
-        let (sug_model, sug_effort) = suggested_for(cx, &config.suggested_models);
-        if is_model_effort_below(&resolved_model, &resolved_effort, &sug_model, &sug_effort) {
+        let (sug_model, sug_effort) =
+            suggested_for(cx, config.runner_kind, &config.suggested_models);
+        if is_below_advisory_recommendation(
+            &resolved_model,
+            &resolved_effort,
+            &sug_model,
+            &sug_effort,
+        ) {
             let alert_body = format!(
                 "model/effort mismatch: task #{} \"{}\" (creator: {}) — \
                  complexity {} (source: {}), using {}/{}, suggested {}/{}",
@@ -9348,20 +9412,39 @@ mod tests {
     }
 
     #[test]
-    fn suggested_for_defaults() {
+    fn suggested_for_claude_defaults() {
         let empty = std::collections::HashMap::new();
         assert_eq!(
-            suggested_for(1, &empty),
+            suggested_for(1, crate::serve_config::RunnerKind::Claude, &empty),
             ("claude-sonnet-5".into(), "medium".into())
         );
         assert_eq!(
-            suggested_for(4, &empty),
+            suggested_for(4, crate::serve_config::RunnerKind::Claude, &empty),
             ("claude-opus-4-7".into(), "high".into())
         );
         assert_eq!(
-            suggested_for(5, &empty),
+            suggested_for(5, crate::serve_config::RunnerKind::Claude, &empty),
             ("claude-opus-4-8".into(), "high".into())
         );
+    }
+
+    #[test]
+    fn suggested_for_codex_defaults_never_mix_claude_models() {
+        let empty = std::collections::HashMap::new();
+        let expected = [
+            (1, "gpt-5.6-luna", "medium"),
+            (2, "gpt-5.6-terra", "medium"),
+            (3, "gpt-5.6-terra", "high"),
+            (4, "gpt-5.6-sol", "medium"),
+            (5, "gpt-5.6-sol", "high"),
+        ];
+        for (cx, model, effort) in expected {
+            assert_eq!(
+                suggested_for(cx, crate::serve_config::RunnerKind::Codex, &empty),
+                (model.into(), effort.into()),
+                "Codex complexity {cx} must use its own ladder"
+            );
+        }
     }
 
     #[test]
@@ -9369,31 +9452,31 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert("3".into(), "opus-48/high".into());
         assert_eq!(
-            suggested_for(3, &m),
+            suggested_for(3, crate::serve_config::RunnerKind::Claude, &m),
             ("claude-opus-4-8".into(), "high".into())
         );
         // non-overridden key still uses default
         assert_eq!(
-            suggested_for(1, &m),
+            suggested_for(1, crate::serve_config::RunnerKind::Claude, &m),
             ("claude-sonnet-5".into(), "medium".into())
         );
     }
 
     #[test]
-    fn is_model_effort_below_detects_mismatch() {
-        assert!(is_model_effort_below(
+    fn advisory_recommendation_detects_mismatch() {
+        assert!(is_below_advisory_recommendation(
             "claude-opus-4-6",
             "medium",
             "claude-opus-4-7",
             "high"
         ));
-        assert!(is_model_effort_below(
+        assert!(is_below_advisory_recommendation(
             "claude-opus-4-7",
             "medium",
             "claude-opus-4-7",
             "high"
         ));
-        assert!(is_model_effort_below(
+        assert!(is_below_advisory_recommendation(
             "claude-sonnet-5",
             "high",
             "claude-opus-4-6",
@@ -9402,24 +9485,34 @@ mod tests {
     }
 
     #[test]
-    fn is_model_effort_below_no_mismatch_when_at_or_above() {
-        assert!(!is_model_effort_below(
+    fn advisory_recommendation_has_no_mismatch_when_at_or_above() {
+        assert!(!is_below_advisory_recommendation(
             "claude-opus-4-7",
             "high",
             "claude-opus-4-7",
             "high"
         ));
-        assert!(!is_model_effort_below(
+        assert!(!is_below_advisory_recommendation(
             "claude-opus-4-8",
             "medium",
             "claude-opus-4-7",
             "high"
         ));
-        assert!(!is_model_effort_below(
+        assert!(!is_below_advisory_recommendation(
             "claude-opus-4-7",
             "high",
             "claude-opus-4-6",
             "medium"
+        ));
+    }
+
+    #[test]
+    fn mismatch_comparison_never_crosses_providers() {
+        assert!(!is_below_advisory_recommendation(
+            "gpt-5.6-terra",
+            "medium",
+            "claude-opus-4-8",
+            "high"
         ));
     }
 
@@ -9440,6 +9533,21 @@ mod tests {
         );
         assert_eq!(m, "claude-opus-4-7");
         assert_eq!(e, "high");
+    }
+
+    #[test]
+    fn floor_clamps_legacy_codex_task_to_configured_claude_minimum() {
+        // Legacy mode permits a Codex task tier while min_model remains a
+        // Claude-only floor. The mandatory floor must win; provider-aware
+        // advisory comparisons must not bypass it.
+        let (model, effort) = apply_model_effort_floor(
+            "gpt-5.6-terra",
+            "medium",
+            Some("claude-opus-4-7"),
+            Some("high"),
+        );
+        assert_eq!(model, "claude-opus-4-7");
+        assert_eq!(effort, "high");
     }
 
     #[test]
@@ -9581,9 +9689,15 @@ mod tests {
 
         // Mismatch should be detected
         let empty = std::collections::HashMap::new();
-        let (sug_model, sug_effort) = suggested_for(5, &empty);
+        let (sug_model, sug_effort) =
+            suggested_for(5, crate::serve_config::RunnerKind::Claude, &empty);
         assert!(
-            is_model_effort_below(&resolved_model, &resolved_effort, &sug_model, &sug_effort),
+            is_below_advisory_recommendation(
+                &resolved_model,
+                &resolved_effort,
+                &sug_model,
+                &sug_effort,
+            ),
             "cx 5 on opus-4-6/medium should trigger mismatch alert"
         );
     }
@@ -9596,9 +9710,15 @@ mod tests {
         let resolved_effort = label_effort.unwrap_or_else(|| "medium".into());
 
         let empty = std::collections::HashMap::new();
-        let (sug_model, sug_effort) = suggested_for(4, &empty);
+        let (sug_model, sug_effort) =
+            suggested_for(4, crate::serve_config::RunnerKind::Claude, &empty);
         assert!(
-            !is_model_effort_below(&resolved_model, &resolved_effort, &sug_model, &sug_effort),
+            !is_below_advisory_recommendation(
+                &resolved_model,
+                &resolved_effort,
+                &sug_model,
+                &sug_effort,
+            ),
             "explicit tier:opus-47 effort:high should not trigger mismatch for cx 4"
         );
     }
@@ -9606,10 +9726,38 @@ mod tests {
     #[test]
     fn cx_2_default_no_alert() {
         let empty = std::collections::HashMap::new();
-        let (sug_model, sug_effort) = suggested_for(2, &empty);
+        let (sug_model, sug_effort) =
+            suggested_for(2, crate::serve_config::RunnerKind::Claude, &empty);
         assert!(
-            !is_model_effort_below("claude-opus-4-6", "medium", &sug_model, &sug_effort),
+            !is_below_advisory_recommendation("claude-opus-4-6", "medium", &sug_model, &sug_effort,),
             "cx 2 on opus-4-6/medium matches suggestion, no alert"
+        );
+    }
+
+    #[test]
+    fn explicit_task_labels_beat_worker_defaults_and_recommendations_stay_advisory() {
+        let labels = Some(r#"["tier:sol","effort:high","complexity:4"]"#);
+        let (label_model, label_effort) = labels_to_model_effort(labels);
+        let worker_default_model = "gpt-5.6-terra";
+        let worker_default_effort = "medium";
+        let resolved_model = label_model.unwrap_or_else(|| worker_default_model.into());
+        let resolved_effort = label_effort.unwrap_or_else(|| worker_default_effort.into());
+        let empty = std::collections::HashMap::new();
+        let (suggested_model, suggested_effort) =
+            suggested_for(4, crate::serve_config::RunnerKind::Codex, &empty);
+
+        assert_eq!(resolved_model, "gpt-5.6-sol");
+        assert_eq!(resolved_effort, "high");
+        assert_eq!(suggested_model, "gpt-5.6-sol");
+        assert_eq!(suggested_effort, "medium");
+        assert!(
+            !is_below_advisory_recommendation(
+                &resolved_model,
+                &resolved_effort,
+                &suggested_model,
+                &suggested_effort,
+            ),
+            "advisory recommendations must not rewrite an explicit task selection"
         );
     }
 
