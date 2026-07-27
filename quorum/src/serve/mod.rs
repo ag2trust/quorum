@@ -968,40 +968,27 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
 
 /// Resolve the task a roster-unmatched Done row genuinely belongs to.
 ///
-/// Returns the task only when the row looks like a late worker delivery rather
-/// than a phantom: the row's agent is the task's author (how an orphaned
-/// worker is identified elsewhere — see [`orphan_worker_branch`]) and the task
-/// still sits in a phase where a worker done means something. `quorum submit`
-/// writes `task_id=NULL`, so the task is normally found by author.
+/// Returns the task only when the row carries an exact task identity and still
+/// belongs to that task's current author/assignee in a worker-owned phase.
+/// Legacy NULL-task rows remain inert: an agent name can be reused, so name
+/// ownership alone cannot safely associate a delayed row with a task.
 async fn late_worker_done_task(
     db_path: &Path,
     agent: &str,
     row_task_id: Option<i64>,
 ) -> Result<Option<tasks::Task>> {
+    let Some(task_id) = row_task_id else {
+        return Ok(None);
+    };
     let p = db_path.to_path_buf();
     let agent = agent.to_string();
     tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        let candidates: Vec<tasks::Task> = match row_task_id {
-            Some(id) => tasks::get(&conn, id)?.into_iter().collect(),
-            None => ["working", "rework"]
-                .iter()
-                .map(|status| tasks::list(&conn, Some(status), None, Some(&agent)))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect(),
-        };
-        let mut owned = candidates.into_iter().filter(|t| {
+        Ok(tasks::get(&conn, task_id)?.filter(|t| {
             t.author.as_deref() == Some(agent.as_str())
                 && t.assignee.as_deref() == Some(agent.as_str())
                 && matches!(t.status.as_str(), "working" | "rework")
-        });
-        let Some(task) = owned.next() else {
-            return Ok(None);
-        };
-        // Ambiguous ownership — refuse to guess which task was delivered.
-        Ok(owned.next().is_none().then_some(task))
+        }))
     })
     .await
     .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))?
@@ -10905,12 +10892,11 @@ mod tests {
         task_id
     }
 
-    fn done_row(agent: &str, pr: Option<i64>) -> mailbox::MailboxRow {
+    fn done_row(agent: &str, task_id: Option<i64>, pr: Option<i64>) -> mailbox::MailboxRow {
         mailbox::MailboxRow {
             agent: agent.to_string(),
             kind: mailbox::MailboxKind::Done,
-            // `quorum submit` never sets task_id — the task is found by author.
-            task_id: None,
+            task_id,
             pr,
             verdict: None,
             feedback: None,
@@ -10940,7 +10926,7 @@ mod tests {
         let id = working_task(&db_path, "Spool-9mti", None);
 
         assert!(
-            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(439)))
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
                 .await
                 .unwrap(),
             "late worker Done row must be recovered, not discarded"
@@ -10967,7 +10953,7 @@ mod tests {
         let id = working_task(&db_path, "Spool-9mti", Some(refs));
 
         assert!(
-            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(439)))
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
                 .await
                 .unwrap()
         );
@@ -11001,7 +10987,7 @@ mod tests {
         let id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
 
         assert!(
-            recover_late_worker_done(&db_path, &done_row("Spool-9mti", None))
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), None))
                 .await
                 .unwrap(),
             "PR must be backfilled from refs when the row carries none"
@@ -11045,7 +11031,7 @@ mod tests {
         }
 
         assert!(
-            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(439)))
+            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
                 .await
                 .unwrap(),
             "late rework delivery must fire ReworkPushed"
@@ -11063,13 +11049,13 @@ mod tests {
 
         // Wrong agent: not the task's author.
         assert!(
-            !recover_late_worker_done(&db_path, &done_row("Drifter-7x", Some(439)))
+            !recover_late_worker_done(&db_path, &done_row("Drifter-7x", Some(id), Some(439)))
                 .await
                 .unwrap()
         );
         // Right agent, but no PR anywhere.
         assert!(
-            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", None))
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), None))
                 .await
                 .unwrap()
         );
@@ -11093,7 +11079,7 @@ mod tests {
         }
 
         assert!(
-            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(439)))
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
                 .await
                 .unwrap(),
             "a former author must not override the replacement assignee"
@@ -11101,6 +11087,56 @@ mod tests {
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "working");
+    }
+
+    #[tokio::test]
+    async fn null_task_done_row_cannot_bind_after_agent_name_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("name-reuse-done.db");
+        let old_task_id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Spool-9mti",
+                old_task_id,
+                &Event::AgentFailed {
+                    reason: "slot reaped".to_string(),
+                },
+                now_unix(),
+            )
+            .unwrap();
+        }
+        let new_task_id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":500}"#));
+
+        assert!(
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", None, Some(439)))
+                .await
+                .unwrap(),
+            "legacy NULL-task rows must stay inert after agent-name reuse"
+        );
+        assert!(
+            !recover_late_worker_done(
+                &db_path,
+                &done_row("Spool-9mti", Some(old_task_id), Some(439)),
+            )
+            .await
+            .unwrap(),
+            "an exact old task identity must not bind to the new task"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, old_task_id).unwrap().unwrap().status,
+            "open"
+        );
+        let new_task = tasks::get(&conn, new_task_id).unwrap().unwrap();
+        assert_eq!(new_task.status, "working");
+        assert_eq!(
+            tasks::extract_pr_number(&new_task.refs),
+            Some(500),
+            "the delayed row's PR must not overwrite the new task"
+        );
     }
 
     #[tokio::test]
@@ -11114,7 +11150,7 @@ mod tests {
         }
 
         assert!(
-            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(439)))
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), Some(439)))
                 .await
                 .unwrap(),
             "a Done row for an already-terminal task stays a phantom"
