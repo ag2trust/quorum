@@ -557,7 +557,8 @@ pub fn resolve_floor(
     let model = match min_model {
         Some(tier) => Some(crate::serve::tier_to_model_id_pub(tier).ok_or_else(|| {
             QuorumError::Usage(format!(
-                "bad min_model: \"{tier}\" (expected sonnet-5|opus-46|opus-47|opus-48)"
+                "bad min_model: \"{tier}\" (expected {})",
+                quorum_core::model_tiers::known_tiers(),
             ))
         })?),
         None => None,

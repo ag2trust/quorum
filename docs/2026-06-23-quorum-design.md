@@ -1256,10 +1256,17 @@ Runner-specific configuration is scoped under `[claude]` or `[codex]`.
 **Per-run model selection (#194).** Each managed run resolves its provider from
 the task's model selection, not from a daemon-global runner kind:
 
-- A task with an explicit `tier:` label resolves to a full model ID
-  (`tier_to_model_id`). `resolve_provider` maps the model to `AgentKind::Claude`
-  (any `claude-*` model) or `AgentKind::Codex` (known OpenAI models: `o3`,
-  `o4-mini`, `gpt-4.1*`, `gpt-5*`). Unknown models are rejected before spawning.
+- A task with an explicit `tier:` label is validated at creation against one closed,
+  shared vocabulary and resolves to its exact full model ID: `sonnet-5` →
+  `claude-sonnet-5`, `opus-46` → `claude-opus-4-6`, `opus-47` →
+  `claude-opus-4-7`, `opus-48` → `claude-opus-4-8`, `luna` →
+  `gpt-5.6-luna`, `terra` → `gpt-5.6-terra`, and `sol` → `gpt-5.6-sol`.
+  Unknown non-empty tiers (including legacy `o3` and `o4-mini`) fail with usage
+  exit 2 instead of falling back. Empty `tier:` and `effort:` suffixes remain
+  compatible no-ops for existing stored labels. Only `effort:medium` and
+  `effort:high` are accepted; other non-empty effort labels fail with usage exit 2.
+  `resolve_provider` maps the resulting model to `AgentKind::Claude` (any
+  `claude-*` model) or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
 - A task with no explicit model selection uses the daemon's configured
   `runner_kind` and `model`, preserving existing Claude-default behavior.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`

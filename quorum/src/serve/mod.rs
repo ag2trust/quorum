@@ -295,27 +295,13 @@ fn resolve_or_load_pr_target(
     })
 }
 
-/// Map a tier label suffix to a full Claude model ID.
-/// Returns `None` (fall back to global default) for unknown tiers.
+/// Map a closed task tier suffix to its exact full model ID.
 pub fn tier_to_model_id_pub(tier: &str) -> Option<String> {
     tier_to_model_id(tier)
 }
 
 fn tier_to_model_id(tier: &str) -> Option<String> {
-    match tier {
-        "opus-46" => Some("claude-opus-4-6".into()),
-        "opus-47" => Some("claude-opus-4-7".into()),
-        "opus-48" => Some("claude-opus-4-8".into()),
-        "sonnet-5" => Some("claude-sonnet-5".into()),
-        "o3" => Some("o3".into()),
-        "o4-mini" => Some("o4-mini".into()),
-        unknown => {
-            log(&format!(
-                "unknown tier label '{unknown}', falling back to global model"
-            ));
-            None
-        }
-    }
+    quorum_core::model_tiers::model_id_for_tier(tier).map(str::to_string)
 }
 
 /// Resolve the provider (AgentKind) from a fully-qualified model ID.
@@ -567,6 +553,7 @@ fn is_model_effort_below(
 /// Extract model and effort overrides from a task's labels JSON.
 ///
 /// Labels like `tier:opus-46` map to model `claude-opus-4-6`; `effort:high` maps to effort `high`.
+/// Empty suffixes remain no-ops for compatibility with pre-validation stored tasks.
 /// Returns (model_override, effort_override) — `None` means "use the global config value".
 fn labels_to_model_effort(labels_json: Option<&str>) -> (Option<String>, Option<String>) {
     let json = match labels_json {
@@ -8290,7 +8277,7 @@ async fn spawn_remediation_worker(
     ];
 
     // Recover the original worker's provider and model from agent_runs so
-    // remediation cannot silently switch providers (e.g. tier:o3 task reworked
+    // remediation cannot silently switch providers (e.g. a legacy Codex task reworked
     // as Claude because the daemon default is Claude).
     let (remediation_model, remediation_effort, remediation_kind) = {
         let p = db_path.clone();
@@ -8629,13 +8616,13 @@ mod tests {
     }
 
     #[test]
-    fn tier_to_model_id_o3() {
-        assert_eq!(tier_to_model_id("o3").as_deref(), Some("o3"));
+    fn tier_to_model_id_rejects_legacy_o3() {
+        assert_eq!(tier_to_model_id("o3"), None);
     }
 
     #[test]
-    fn tier_to_model_id_o4_mini() {
-        assert_eq!(tier_to_model_id("o4-mini").as_deref(), Some("o4-mini"));
+    fn tier_to_model_id_rejects_legacy_o4_mini() {
+        assert_eq!(tier_to_model_id("o4-mini"), None);
     }
 
     #[test]
@@ -8740,6 +8727,16 @@ mod tests {
     }
 
     #[test]
+    fn labels_to_model_effort_resolves_every_closed_tier() {
+        for tier in quorum_core::model_tiers::MODEL_TIERS {
+            let labels = format!(r#"["tier:{}"]"#, tier.tier);
+            let (model, effort) = labels_to_model_effort(Some(&labels));
+            assert_eq!(model.as_deref(), Some(tier.model_id), "{}", tier.tier);
+            assert_eq!(effort, None, "{}", tier.tier);
+        }
+    }
+
+    #[test]
     fn labels_to_model_effort_effort_override() {
         let labels = r#"["effort:high","tier:sonnet-5"]"#;
         let (model, effort) = labels_to_model_effort(Some(labels));
@@ -8777,7 +8774,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_to_model_effort_unknown_tier_falls_back() {
+    fn labels_to_model_effort_unknown_tier_is_not_resolved() {
         let labels = r#"["tier:unknown-model"]"#;
         let (model, effort) = labels_to_model_effort(Some(labels));
         assert_eq!(model, None);
@@ -10295,7 +10292,7 @@ mod tests {
     #[test]
     fn simultaneous_claude_and_codex_tasks_resolve_independently() {
         let claude_labels = Some(r#"["tier:opus-47"]"#);
-        let codex_labels = Some(r#"["tier:o3"]"#);
+        let codex_labels = Some(r#"["tier:terra"]"#);
         let (cm, _) = labels_to_model_effort(claude_labels);
         let (xm, _) = labels_to_model_effort(codex_labels);
         let ck = resolve_provider(cm.as_deref().unwrap()).unwrap();
@@ -10523,6 +10520,20 @@ mod tests {
             require_provider_match(Some(runner::AgentKind::Codex), kind, "remediation worker")
                 .is_err(),
             "provider=codex must not revive a historical Claude worker during remediation"
+        );
+    }
+
+    #[test]
+    fn strict_provider_mode_rejects_cross_provider_task_tiers() {
+        let claude = resolve_provider(&tier_to_model_id("opus-46").unwrap()).unwrap();
+        let codex = resolve_provider(&tier_to_model_id("terra").unwrap()).unwrap();
+        assert!(
+            require_provider_match(Some(runner::AgentKind::Codex), claude, "worker").is_err(),
+            "provider=codex must reject Claude task tiers"
+        );
+        assert!(
+            require_provider_match(Some(runner::AgentKind::Claude), codex, "worker").is_err(),
+            "provider=claude must reject GPT-5.6 task tiers"
         );
     }
 

@@ -527,13 +527,13 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
     let mixed = Case::start(
         "claude",
         "claude-opus-4-6",
-        Some(r#"["tier:o3","effort:high"]"#),
+        Some(r#"["tier:terra","effort:high"]"#),
     )
     .finish();
     assert_eq!(
         run_routes(&mixed),
         [
-            ("worker", None, "o3", "codex"),
+            ("worker", None, "gpt-5.6-terra", "codex"),
             ("reviewer", None, "claude-opus-4-6", "claude"),
             ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
         ]
@@ -545,7 +545,7 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
     let mut case = Case::start(
         "claude",
         "claude-opus-4-6",
-        Some(r#"["tier:o3","effort:high"]"#),
+        Some(r#"["tier:terra","effort:high"]"#),
     );
     case.handle.wait_for("spawning agent");
     let worker = case.handle.agent_after("spawning agent ");
@@ -607,7 +607,7 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
     assert_eq!(
         run_routes(&runs),
         [
-            ("worker", None, "o3", "codex"),
+            ("worker", None, "gpt-5.6-terra", "codex"),
             ("reviewer", None, "claude-opus-4-6", "claude"),
             ("reviewer", None, "claude-opus-4-6", "claude"),
             ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
@@ -620,7 +620,7 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
         "Codex continuation stays within the original durable worker run"
     );
     assert!(workers.iter().all(|run| run.agent == worker
-        && run.model == "o3"
+        && run.model == "gpt-5.6-terra"
         && run.provider.as_deref() == Some("codex")));
     assert_eq!(
         runs.iter()
