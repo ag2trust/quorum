@@ -1647,6 +1647,7 @@ async fn tick(
 
         // Kill rows — hard-terminate the targeted agent immediately.
         if row.kind == mailbox::MailboxKind::Kill {
+            let mut consume_kill = true;
             if let Some(target) = &row.to_agent {
                 let reason = row.note.as_deref().unwrap_or("no reason given");
                 let by = &row.agent;
@@ -1676,17 +1677,23 @@ async fn tick(
                         "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
                         reviewers[ri].agent_name, reviewers[ri].task_id,
                     ));
-                    let r = reviewers.remove(ri);
-                    let task_id = r.task_id;
-                    fail_reviewer_if_owner(
+                    let mutation = fail_reviewer_if_owner(
                         &db_path,
-                        &r.agent_name,
-                        task_id,
+                        &reviewers[ri].agent_name,
+                        reviewers[ri].task_id,
                         &format!("killed by {by}: {reason}"),
                     )
                     .await;
-                    emit_kill_event(&db_path, target, by, reason).await;
-                    teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
+                    if mutation.is_some() {
+                        let r = reviewers.remove(ri);
+                        emit_kill_event(&db_path, target, by, reason).await;
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
+                    } else {
+                        log(&format!(
+                            "kill: reviewer {target} lifecycle mutation failed — retaining slot and kill request for retry"
+                        ));
+                        consume_kill = false;
+                    }
                 } else if lifetime_roster.owns(target) {
                     log(&format!(
                         "kill: agent {target} not active (already dead/finished)"
@@ -1699,7 +1706,7 @@ async fn tick(
                     ));
                 }
             }
-            if !consume_mailbox_row(&db_path, *id).await {
+            if consume_kill && !consume_mailbox_row(&db_path, *id).await {
                 break;
             }
             continue;
@@ -4124,14 +4131,21 @@ async fn tick(
         }
     }
     for &i in reviewers_to_kill.iter().rev() {
-        let dead = reviewers.remove(i);
-        fail_reviewer_if_owner(
+        let mutation = fail_reviewer_if_owner(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
+            &reviewers[i].agent_name,
+            reviewers[i].task_id,
             "reviewer killed by watchdog",
         )
         .await;
+        if mutation.is_none() {
+            log(&format!(
+                "reviewer {} watchdog mutation failed — retaining slot for retry",
+                reviewers[i].agent_name
+            ));
+            continue;
+        }
+        let dead = reviewers.remove(i);
         teardown_reviewer(config, wt_mgr, name_pool, dead, "watchdog").await;
     }
 
@@ -4155,18 +4169,25 @@ async fn tick(
         }
     }
     for &i in idle_reviewers.iter().rev() {
-        let dead = reviewers.remove(i);
-        fail_reviewer_if_owner(
+        let mutation = fail_reviewer_if_owner(
             &db_path,
-            &dead.agent_name,
-            dead.task_id,
+            &reviewers[i].agent_name,
+            reviewers[i].task_id,
             &format!(
                 "reviewer idle {}s between turns (limit {}s) — zombie reaped",
-                dead.turn_ended_at.unwrap().elapsed().as_secs(),
+                reviewers[i].turn_ended_at.unwrap().elapsed().as_secs(),
                 idle_timeout
             ),
         )
         .await;
+        if mutation.is_none() {
+            log(&format!(
+                "reviewer {} idle-reap mutation failed — retaining slot for retry",
+                reviewers[i].agent_name
+            ));
+            continue;
+        }
+        let dead = reviewers.remove(i);
         teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
     }
 
@@ -4407,12 +4428,25 @@ async fn tick(
             }
         }
         for &i in drain_reviewers.iter().rev() {
-            let r = reviewers.remove(i);
             log(&format!(
                 "DRAIN: tearing down idle reviewer {}",
-                r.agent_name
+                reviewers[i].agent_name
             ));
-            fail_reviewer_if_owner(&db_path, &r.agent_name, r.task_id, "daemon draining").await;
+            let mutation = fail_reviewer_if_owner(
+                &db_path,
+                &reviewers[i].agent_name,
+                reviewers[i].task_id,
+                "daemon draining",
+            )
+            .await;
+            if mutation.is_none() {
+                log(&format!(
+                    "reviewer {} drain mutation failed — retaining slot for retry",
+                    reviewers[i].agent_name
+                ));
+                continue;
+            }
+            let r = reviewers.remove(i);
             teardown_reviewer(config, wt_mgr, name_pool, r, "drain").await;
         }
     }

@@ -526,7 +526,13 @@ fn remediation_worker_resubmits_same_pr() {
         )
         .unwrap();
     drop(conn);
-    unsafe { libc::kill(reviewer_pid, libc::SIGKILL) };
+    let kill_result = unsafe { libc::kill(reviewer_pid, libc::SIGKILL) };
+    assert_eq!(
+        kill_result,
+        0,
+        "failed to SIGKILL reviewer pid {reviewer_pid}: {}",
+        std::io::Error::last_os_error()
+    );
     assert!(
         handle.wait_for(&format!("reviewer {reviewer_name} died"), 15),
         "reviewer death not observed. Lines: {:?}",
