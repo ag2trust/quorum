@@ -5318,7 +5318,6 @@ async fn tick(
 
         if let Ok((tasks, dup_context)) = unclassified {
             if !tasks.is_empty() {
-                let turn = classifier::classifier_turn(&tasks, &dup_context);
                 match classifier::spawn_classifier_configured(
                     &tasks,
                     &dup_context,
@@ -5333,11 +5332,14 @@ async fn tick(
                         if slot.proc.is_codex() {
                             log(&format!("classifier: spawned for {} task(s)", tasks.len()));
                             *classifier_slot = Some(slot);
-                        } else if let Err(e) = slot.proc.feed_turn(&turn).await {
-                            log(&format!("classifier: feed_turn failed: {e}"));
                         } else {
-                            log(&format!("classifier: spawned for {} task(s)", tasks.len()));
-                            *classifier_slot = Some(slot);
+                            let turn = classifier::classifier_turn(&tasks, &dup_context);
+                            if let Err(e) = slot.proc.feed_turn(&turn).await {
+                                log(&format!("classifier: feed_turn failed: {e}"));
+                            } else {
+                                log(&format!("classifier: spawned for {} task(s)", tasks.len()));
+                                *classifier_slot = Some(slot);
+                            }
                         }
                     }
                     Err(e) => {
@@ -6167,8 +6169,8 @@ async fn record_reviewer_provision_failure(
     ));
     if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
         log(&format!(
-            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after \
-             {strikes} consecutive {} provision failures for PR #{pr}",
+            "REVIEWER PROVISION EXHAUSTED: task #{task_id} will be parked on the next \
+             provisioning scan after {strikes} consecutive {} failures for PR #{pr}",
             role.as_str().to_uppercase()
         ));
     }
