@@ -1171,8 +1171,9 @@ pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DeadCodexDisposition {
     DonePending,
+    DeliveryRecorded,
+    OwnershipTransferred,
     ProviderBlocked,
-    FallThrough,
 }
 
 pub struct CodexProviderBlock<'a> {
@@ -1199,18 +1200,44 @@ pub fn dispose_dead_codex(
     let tx = begin_immediate(conn)?;
     let task = tx
         .query_row(
-            "SELECT status, refs FROM tasks WHERE id=?1",
+            "SELECT status, refs, author, assignee FROM tasks WHERE id=?1",
             params![id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((status, refs_raw)) = task else {
+    let Some((status, refs_raw, author, assignee)) = task else {
         tx.commit()?;
-        return Ok(DeadCodexDisposition::FallThrough);
+        return Ok(DeadCodexDisposition::OwnershipTransferred);
     };
+    // Match apply_event's worker submission authority: the current assignee
+    // owns the phase directly, while a daemon-issued active worker capability
+    // authorizes replacement/remediation workers whose preserved `author`
+    // value still names the original branch author.
+    let has_worker_capability =
+        crate::capabilities::active_for_agent_task(&tx, agent, id, "worker")?.is_some();
+    let owns_worker_phase = assignee.as_deref() == Some(agent) || has_worker_capability;
     if status != "working" && status != "rework" {
+        let disposition = if status == "in-review"
+            && (author.as_deref() == Some(agent) || has_worker_capability)
+            && extract_pr_number(&refs_raw).is_some()
+        {
+            DeadCodexDisposition::DeliveryRecorded
+        } else {
+            DeadCodexDisposition::OwnershipTransferred
+        };
         tx.commit()?;
-        return Ok(DeadCodexDisposition::FallThrough);
+        return Ok(disposition);
+    }
+    if !owns_worker_phase {
+        tx.commit()?;
+        return Ok(DeadCodexDisposition::OwnershipTransferred);
     }
     if crate::mailbox::has_unconsumed(&tx, agent, crate::mailbox::MailboxKind::Done, id)? {
         tx.commit()?;

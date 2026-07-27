@@ -4519,15 +4519,15 @@ async fn tick(
     // !w.draining) never spawns a reviewer. `next_event`/`drain_events` alone
     // cannot detect this — stdout EOF is a hint but a stuck child can hold
     // its stdout open. `try_wait` is the authoritative signal.
-    let mut dead_workers: Vec<usize> = Vec::new();
+    let mut dead_workers = Vec::new();
     for (i, w) in workers.iter_mut().enumerate() {
         match w.proc.try_wait() {
             Ok(Some(status)) => {
                 log(&format!(
-                    "worker {} died mid-task (task #{}, status={:?}) — releasing task/name/worktree",
+                    "worker {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
                     w.agent_name, w.task_id, status
                 ));
-                dead_workers.push(i);
+                dead_workers.push((i, status));
             }
             Ok(None) => {}
             Err(e) => {
@@ -4535,7 +4535,7 @@ async fn tick(
             }
         }
     }
-    for &i in dead_workers.iter().rev() {
+    for &(i, status) in dead_workers.iter().rev() {
         let dead = workers.remove(i);
         if dead.proc.is_codex() {
             let reason = dead
@@ -4565,11 +4565,34 @@ async fn tick(
                     workers.insert(i, dead);
                     continue;
                 }
+                Ok(tasks::DeadCodexDisposition::DeliveryRecorded) => {
+                    log(&format!(
+                        "worker {} exited normally after delivering task #{} — cleaning up completed run",
+                        dead.agent_name, dead.task_id
+                    ));
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                    continue;
+                }
+                Ok(tasks::DeadCodexDisposition::OwnershipTransferred) => {
+                    log(&format!(
+                        "worker {} exit ignored after task #{} ownership/state advanced — cleaning up",
+                        dead.agent_name, dead.task_id
+                    ));
+                    cleanup_slot(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        dead,
+                        None,
+                        "ownership_transferred",
+                    )
+                    .await;
+                    continue;
+                }
                 Ok(tasks::DeadCodexDisposition::ProviderBlocked) => {
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
                     continue;
                 }
-                Ok(tasks::DeadCodexDisposition::FallThrough) => {}
                 Err(error) => {
                     log(&format!(
                         "FATAL: cannot durably park task #{}; retaining slot: {error}",
@@ -4580,6 +4603,10 @@ async fn tick(
                 }
             }
         }
+        log(&format!(
+            "worker {} died mid-task (task #{}, status={status:?}) — releasing task/name/worktree",
+            dead.agent_name, dead.task_id
+        ));
         let instant_death = dead.cost_tokens == 0;
         if instant_death {
             let strikes = poison_tracker.record_strike(dead.task_id);
@@ -10895,6 +10922,7 @@ mod tests {
 
     fn create_active_task(db_path: &Path, agent: &str, status: &str) {
         let mut conn = quorum_core::db::open(db_path).unwrap();
+        let now = now_unix();
         let task = tasks::create(
             &mut conn,
             "owner",
@@ -10905,14 +10933,19 @@ mod tests {
             Some(r#"{"branch":"daemon/spool-t1"}"#),
             None,
             None,
-            10,
+            now,
         )
         .unwrap();
-        conn.execute(
-            "UPDATE tasks SET status=?1, assignee=?2, author=?2 WHERE id=?3",
-            rusqlite::params![status, agent, task],
-        )
-        .unwrap();
+        tasks::claim(&mut conn, agent, Some(task), &[], 3600, now)
+            .unwrap()
+            .expect("test task claim must succeed");
+        if status != "working" {
+            conn.execute(
+                "UPDATE tasks SET status=?1 WHERE id=?2",
+                rusqlite::params![status, task],
+            )
+            .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -11057,6 +11090,197 @@ mod tests {
         assert!(
             refs.get("codex_retry_prompt").is_none(),
             "successful rework must not stage a duplicate retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_codex_rework_without_done_is_provider_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replacement-rework-no-done.db");
+        create_active_task(&db_path, "Original", "rework");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                "replacement-run",
+                1,
+                "Replacement",
+                "worker",
+                now_unix(),
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                1,
+                r#"{"branch":"daemon/original-t1","pr":444}"#,
+                now_unix(),
+            )
+            .unwrap();
+        }
+
+        let disposition = dispose_dead_codex_worker(
+            &db_path,
+            1,
+            "Replacement",
+            "provider quota exhausted",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(disposition, tasks::DeadCodexDisposition::ProviderBlocked);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.author.as_deref(), Some("Original"));
+        assert_eq!(task.assignee.as_deref(), Some("Original"));
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
+        assert_eq!(
+            refs["codex_provider_error"].as_str(),
+            Some("provider quota exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_codex_after_rework_consumed_is_completed_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replacement-rework-consumed.db");
+        create_active_task(&db_path, "Original", "rework");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                "replacement-run",
+                1,
+                "Replacement",
+                "worker",
+                now_unix(),
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                1,
+                r#"{"branch":"daemon/original-t1","pr":444}"#,
+                now_unix(),
+            )
+            .unwrap();
+        }
+        fire_event_result(&db_path, "Replacement", 1, &Event::ReworkPushed)
+            .await
+            .unwrap();
+
+        let disposition = dispose_dead_codex_worker(
+            &db_path,
+            1,
+            "Replacement",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            disposition,
+            tasks::DeadCodexDisposition::DeliveryRecorded,
+            "consumed replacement rework must use the completed cleanup path"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.author.as_deref(), Some("Original"));
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE subject='task#1' AND kind='task_in_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_review_events, 1,
+            "exit cleanup must not replay ReworkPushed"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get("codex_provider_blocked").is_none(),
+            "consumed rework must not stage a provider retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_codex_after_done_consumed_is_completed_without_duplicate_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("done-consumed.db");
+        create_active_task(&db_path, "Spool", "working");
+
+        fire_event_result(
+            &db_path,
+            "Spool",
+            1,
+            &Event::SignaledDone { pr: "443".into() },
+        )
+        .await
+        .unwrap();
+
+        let disposition =
+            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
+                .await
+                .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadCodexDisposition::DeliveryRecorded,
+            "a normal Codex exit after submission must be cleanup-only"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(443));
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE subject='task#1' AND kind='task_in_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_review_events, 1,
+            "process cleanup must not emit a second lifecycle transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_codex_after_ownership_transfer_is_cleanup_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ownership-transferred.db");
+        create_active_task(&db_path, "Spool", "working");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET assignee='Other', author='Other' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        }
+
+        let disposition =
+            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
+                .await
+                .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadCodexDisposition::OwnershipTransferred
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get("codex_provider_blocked").is_none(),
+            "a stale process must not stage a retry against another owner's task"
         );
     }
 
