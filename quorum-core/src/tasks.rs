@@ -1164,6 +1164,83 @@ pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) 
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeadCodexDisposition {
+    DonePending,
+    ProviderBlocked,
+    FallThrough,
+}
+
+pub struct CodexProviderBlock<'a> {
+    pub reason: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub prompt: &'a str,
+    pub turn_kind: &'a str,
+    pub thread_id: Option<&'a str>,
+}
+
+/// Atomically distinguish a submitted Codex worker from a provider failure.
+///
+/// The immediate transaction serializes the Done-row check with both mailbox
+/// append and provider-block persistence, so committed work cannot be staged
+/// for a duplicate retry through a check/write race.
+pub fn dispose_dead_codex(
+    conn: &mut Connection,
+    id: i64,
+    agent: &str,
+    block: &CodexProviderBlock<'_>,
+    now: i64,
+) -> Result<DeadCodexDisposition> {
+    let tx = begin_immediate(conn)?;
+    let task = tx
+        .query_row(
+            "SELECT status, refs FROM tasks WHERE id=?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((status, refs_raw)) = task else {
+        tx.commit()?;
+        return Ok(DeadCodexDisposition::FallThrough);
+    };
+    if status != "working" {
+        tx.commit()?;
+        return Ok(DeadCodexDisposition::FallThrough);
+    }
+    if crate::mailbox::has_unconsumed(&tx, agent, crate::mailbox::MailboxKind::Done, id)? {
+        tx.commit()?;
+        return Ok(DeadCodexDisposition::DonePending);
+    }
+
+    let mut refs: serde_json::Value = refs_raw
+        .as_deref()
+        .and_then(|refs| serde_json::from_str(refs).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    refs["codex_provider_blocked"] = serde_json::Value::Bool(true);
+    refs["codex_provider_error"] = serde_json::Value::String(block.reason.to_string());
+    refs["codex_retry_model"] = serde_json::Value::String(block.model.to_string());
+    refs["codex_retry_effort"] = serde_json::Value::String(block.effort.to_string());
+    refs["codex_retry_prompt"] = serde_json::Value::String(block.prompt.to_string());
+    refs["codex_retry_turn_kind"] = serde_json::Value::String(block.turn_kind.to_string());
+    match block.thread_id {
+        Some(thread_id) => {
+            refs["codex_retry_thread_id"] = serde_json::Value::String(thread_id.to_string());
+        }
+        None => {
+            if let Some(object) = refs.as_object_mut() {
+                object.remove("codex_retry_thread_id");
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
+        params![id, refs.to_string(), now],
+    )?;
+    tx.commit()?;
+    Ok(DeadCodexDisposition::ProviderBlocked)
+}
+
 fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Result<String> {
     let mut value: serde_json::Value = match refs {
         Some(raw) => serde_json::from_str(raw)

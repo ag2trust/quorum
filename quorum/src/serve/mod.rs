@@ -4476,36 +4476,39 @@ async fn tick(
     for &i in dead_workers.iter().rev() {
         let dead = workers.remove(i);
         if dead.proc.is_codex() {
-            let p = db_path.clone();
-            let task_id = dead.task_id;
-            let still_working = tokio::task::spawn_blocking(move || -> bool {
-                quorum_core::db::open(&p)
-                    .ok()
-                    .and_then(|conn| tasks::get(&conn, task_id).ok().flatten())
-                    .is_some_and(|task| task.status == "working")
-            })
+            let reason = dead
+                .last_error_text
+                .as_deref()
+                .unwrap_or("Codex process exited before task submission")
+                .to_string();
+            let retry = CodexRetryTurn {
+                model: dead.model.clone(),
+                effort: dead.effort.clone(),
+                prompt: dead.pending_prompt.clone(),
+                turn_kind: dead.pending_turn_kind.clone(),
+                thread_id: dead.codex_thread_id.clone(),
+            };
+            match dispose_dead_codex_worker(
+                &db_path,
+                dead.task_id,
+                &dead.agent_name,
+                &reason,
+                &retry,
+            )
             .await
-            .unwrap_or(false);
-            if still_working {
-                let reason = dead
-                    .last_error_text
-                    .as_deref()
-                    .unwrap_or("Codex process exited before task submission")
-                    .to_string();
-                if let Err(error) = persist_codex_provider_block(
-                    &db_path,
-                    dead.task_id,
-                    &reason,
-                    &CodexRetryTurn {
-                        model: dead.model.clone(),
-                        effort: dead.effort.clone(),
-                        prompt: dead.pending_prompt.clone(),
-                        turn_kind: dead.pending_turn_kind.clone(),
-                        thread_id: dead.codex_thread_id.clone(),
-                    },
-                )
-                .await
-                {
+            {
+                Ok(tasks::DeadCodexDisposition::DonePending) => {
+                    // Phase 2 must consume the row while the slot still owns its
+                    // branch/worktree. Keep the dead slot until the next tick.
+                    workers.insert(i, dead);
+                    continue;
+                }
+                Ok(tasks::DeadCodexDisposition::ProviderBlocked) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
+                    continue;
+                }
+                Ok(tasks::DeadCodexDisposition::FallThrough) => {}
+                Err(error) => {
                     log(&format!(
                         "FATAL: cannot durably park task #{}; retaining slot: {error}",
                         dead.task_id
@@ -4513,8 +4516,6 @@ async fn tick(
                     workers.insert(i, dead);
                     continue;
                 }
-                cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
-                continue;
             }
         }
         let instant_death = dead.cost_tokens == 0;
@@ -5850,6 +5851,48 @@ async fn persist_codex_thread_id(
             "persist_codex_thread_id join error for task #{task_id}: {e}"
         )),
     }
+}
+
+/// Phase 4b disposition for a dead Codex worker.
+///
+/// The Codex process exits at turn end, so a successful `quorum submit` and the
+/// process death land in the same tick window: the task is still `working`
+/// because the daemon has not drained the mailbox yet (task #218 / PR #439 —
+/// the done row was written 15s before the run was closed as `provider_blocked`,
+/// staging a retry of already-shipped work). So "still working" alone is not
+/// evidence of provider failure — park only when no done signal is pending.
+async fn dispose_dead_codex_worker(
+    db_path: &Path,
+    task_id: i64,
+    agent: &str,
+    reason: &str,
+    retry: &CodexRetryTurn,
+) -> Result<tasks::DeadCodexDisposition> {
+    let p = db_path.to_path_buf();
+    let agent = agent.to_string();
+    let retry = retry.clone();
+    let reason = reason.to_string();
+    let disposition =
+        tokio::task::spawn_blocking(move || -> Result<tasks::DeadCodexDisposition> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::dispose_dead_codex(
+                &mut conn,
+                task_id,
+                &agent,
+                &tasks::CodexProviderBlock {
+                    reason: &reason,
+                    model: &retry.model,
+                    effort: &retry.effort,
+                    prompt: &retry.prompt,
+                    turn_kind: &retry.turn_kind,
+                    thread_id: retry.thread_id.as_deref(),
+                },
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("dead-Codex disposition join failed: {error}")))?;
+    disposition
 }
 
 async fn persist_codex_provider_block(
@@ -10752,6 +10795,118 @@ mod tests {
             Some("thread-99"),
             "thread identity must survive parking"
         );
+    }
+
+    fn dead_codex_retry() -> CodexRetryTurn {
+        CodexRetryTurn {
+            model: "gpt-5.6-codex".into(),
+            effort: "high".into(),
+            prompt: "finish the active turn".into(),
+            turn_kind: "initial".into(),
+            thread_id: Some("thread-live".into()),
+        }
+    }
+
+    fn create_working_task(db_path: &Path, agent: &str) {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let task = tasks::create(
+            &mut conn,
+            "owner",
+            "codex task",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/spool-t1"}"#),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='working', assignee=?1, author=?1 WHERE id=?2",
+            rusqlite::params![agent, task],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_codex_with_pending_done_is_retained_without_retry_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("done-pending.db");
+        create_working_task(&db_path, "Spool");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Spool".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: Some(439),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let disposition =
+            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
+                .await
+                .unwrap();
+
+        assert_eq!(disposition, tasks::DeadCodexDisposition::DonePending);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["branch"].as_str(), Some("daemon/spool-t1"));
+        assert!(
+            refs.get("codex_provider_blocked").is_none(),
+            "a submitted worker must not be marked provider-blocked"
+        );
+        assert!(
+            refs.get("codex_retry_prompt").is_none(),
+            "already-shipped work must not stage a duplicate retry"
+        );
+        assert!(
+            mailbox::has_unconsumed(&conn, "Spool", mailbox::MailboxKind::Done, 1).unwrap(),
+            "Phase 2 must still own the unconsumed Done row"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_codex_without_pending_done_is_provider_blocked_with_retry_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-done.db");
+        create_working_task(&db_path, "Spool");
+
+        let disposition = dispose_dead_codex_worker(
+            &db_path,
+            1,
+            "Spool",
+            "provider quota exhausted",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(disposition, tasks::DeadCodexDisposition::ProviderBlocked);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
+        assert_eq!(
+            refs["codex_provider_error"].as_str(),
+            Some("provider quota exhausted")
+        );
+        assert_eq!(
+            refs["codex_retry_prompt"].as_str(),
+            Some("finish the active turn")
+        );
+        assert_eq!(refs["codex_retry_thread_id"].as_str(), Some("thread-live"));
     }
 
     #[tokio::test]

@@ -112,6 +112,24 @@ pub fn poll_unconsumed(conn: &Connection) -> Result<Vec<(i64, MailboxRow)>> {
     Ok(result)
 }
 
+/// True if `agent` has at least one unconsumed row of `kind` waiting for the
+/// daemon. Lets a caller tell "this agent already signalled" apart from "this
+/// agent's task status has not caught up yet": the row lands at CLI-invocation
+/// time, the status only changes when the daemon drains it.
+pub fn has_unconsumed(
+    conn: &Connection,
+    agent: &str,
+    kind: MailboxKind,
+    task_id: i64,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM mailbox
+         WHERE agent = ?1 AND kind = ?2 AND task_id = ?3 AND consumed_at IS NULL)",
+        params![agent, kind.as_str(), task_id],
+        |r| r.get(0),
+    )?)
+}
+
 pub fn mark_consumed(conn: &mut Connection, id: i64) -> Result<()> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
@@ -395,6 +413,43 @@ mod tests {
         let unconsumed = poll_unconsumed(&conn).unwrap();
         assert_eq!(unconsumed.len(), 1);
         assert_eq!(unconsumed[0].1.agent, "Beta");
+    }
+
+    #[test]
+    fn has_unconsumed_matches_agent_and_kind_until_consumed() {
+        let (mut conn, _dir) = test_conn();
+        let done = MailboxRow {
+            agent: "Spool".into(),
+            kind: MailboxKind::Done,
+            task_id: Some(218),
+            pr: Some(439),
+            verdict: None,
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: None,
+        };
+        let id = append(&mut conn, &done).unwrap();
+
+        assert!(has_unconsumed(&conn, "Spool", MailboxKind::Done, 218).unwrap());
+        assert!(
+            !has_unconsumed(&conn, "Other", MailboxKind::Done, 218).unwrap(),
+            "another agent's row must not count"
+        );
+        assert!(
+            !has_unconsumed(&conn, "Spool", MailboxKind::TaskUpdate, 218).unwrap(),
+            "another kind must not count"
+        );
+        assert!(
+            !has_unconsumed(&conn, "Spool", MailboxKind::Done, 219).unwrap(),
+            "another task must not count"
+        );
+
+        mark_consumed(&mut conn, id).unwrap();
+        assert!(
+            !has_unconsumed(&conn, "Spool", MailboxKind::Done, 218).unwrap(),
+            "consumed row must not count"
+        );
     }
 
     /// T6: if mark_consumed is skipped (simulating failure), poll_unconsumed
