@@ -980,6 +980,10 @@ fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
         .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
     if let Some(object) = value.as_object_mut() {
         for key in [
+            // The worker delivered a PR, so a staged provider retry is stale —
+            // replaying it would re-run already-completed work.
+            "codex_provider_blocked",
+            "codex_provider_error",
             "codex_retry_requested",
             "codex_retry_model",
             "codex_retry_effort",
