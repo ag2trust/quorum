@@ -31,7 +31,7 @@ use quorum_core::mailbox;
 use quorum_core::pr_targets;
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -4603,8 +4603,64 @@ async fn tick(
                 }
             }
         }
+        let Some(disposition) = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            &dead.agent_name,
+            dead.task_id,
+            "worker process died",
+        )
+        .await
+        else {
+            workers.insert(i, dead);
+            continue;
+        };
+        let cleanup_reason = managed_exit_end_reason(&disposition);
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "worker {} exited with submission pending — retaining slot for mailbox delivery",
+                    dead.agent_name
+                ));
+                workers.insert(i, dead);
+                continue;
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                log(&format!(
+                    "worker {} exited after recorded submission — cleaning up completed run",
+                    dead.agent_name
+                ));
+                cleanup_slot(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    cleanup_reason.expect("recorded outcome has cleanup reason"),
+                )
+                .await;
+                continue;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                log(&format!(
+                    "worker {} exit ignored after task ownership/state advanced — cleaning up",
+                    dead.agent_name
+                ));
+                cleanup_slot(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    cleanup_reason.expect("transferred outcome has cleanup reason"),
+                )
+                .await;
+                continue;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {}
+        }
         log(&format!(
-            "worker {} died mid-task (task #{}, status={status:?}) — releasing task/name/worktree",
+            "worker {} died mid-task after classification proved no submission and active ownership (task #{}, status={status:?}) — recovering worker",
             dead.agent_name, dead.task_id
         ));
         let instant_death = dead.cost_tokens == 0;
@@ -4625,29 +4681,27 @@ async fn tick(
                     "POISON: task #{} strike {strikes}/{MAX_POISON_STRIKES}",
                     dead.task_id
                 ));
-                fire_event(
-                    &db_path,
-                    &dead.agent_name,
-                    dead.task_id,
-                    &Event::AgentFailed {
-                        reason: "worker process died (instant death)".into(),
-                    },
+                cleanup_slot(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    None,
+                    cleanup_reason.expect("failed outcome has cleanup reason"),
                 )
                 .await;
-                cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
             }
         } else {
             poison_tracker.clear(dead.task_id);
-            fire_event(
-                &db_path,
-                &dead.agent_name,
-                dead.task_id,
-                &Event::AgentFailed {
-                    reason: "worker process died".into(),
-                },
+            cleanup_slot(
+                config,
+                wt_mgr,
+                name_pool,
+                dead,
+                None,
+                cleanup_reason.expect("failed outcome has cleanup reason"),
             )
             .await;
-            cleanup_slot(config, wt_mgr, name_pool, dead, None, "crashed").await;
         }
     }
 
@@ -4656,8 +4710,8 @@ async fn tick(
         match r.proc.try_wait() {
             Ok(Some(status)) => {
                 log(&format!(
-                    "reviewer {} died (status={:?}) — releasing name/worktree",
-                    r.agent_name, status
+                    "reviewer {} process exited (task #{}, status={:?}) — classifying lifecycle outcome",
+                    r.agent_name, r.task_id, status
                 ));
                 dead_reviewers.push(i);
             }
@@ -4668,23 +4722,75 @@ async fn tick(
         }
     }
     for &i in dead_reviewers.iter().rev() {
-        let applied = fail_reviewer_if_owner(
+        let disposition = dispose_managed_process_exit(
             &db_path,
+            tasks::ManagedRunRole::Reviewer,
             &reviewers[i].agent_name,
             reviewers[i].task_id,
             "reviewer process died",
         )
         .await;
-        let Some(applied) = applied else {
+        let Some(disposition) = disposition else {
             log(&format!(
-                "reviewer {} failure mutation failed — retaining slot for retry",
+                "reviewer {} exit classification failed — retaining slot for retry",
                 reviewers[i].agent_name
             ));
             continue;
         };
-        let dead = reviewers.remove(i);
-        let end_reason = if applied { "crashed" } else { "completed" };
-        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
+        let cleanup_reason = managed_exit_end_reason(&disposition);
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "reviewer {} exited with verdict pending — retaining slot for mailbox delivery",
+                    reviewers[i].agent_name
+                ));
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} exited after recorded verdict — cleaning up completed run",
+                    dead.agent_name
+                ));
+                teardown_reviewer(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    cleanup_reason.expect("recorded outcome has cleanup reason"),
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} exit ignored after review ownership/state advanced — cleaning up",
+                    dead.agent_name
+                ));
+                teardown_reviewer(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    cleanup_reason.expect("transferred outcome has cleanup reason"),
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                let dead = reviewers.remove(i);
+                log(&format!(
+                    "reviewer {} died after classification proved no verdict and active ownership of task #{} — recovering review",
+                    dead.agent_name, dead.task_id
+                ));
+                teardown_reviewer(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    dead,
+                    cleanup_reason.expect("failed outcome has cleanup reason"),
+                )
+                .await;
+            }
+        }
     }
 
     // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────
@@ -4822,7 +4928,7 @@ async fn tick(
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
     // Skip during drain — no new work, let existing agents finish.
     if !drain_state.draining {
-        let needs_reviewer_from_workers: Vec<(i64, i64, usize)> = workers
+        let mut needs_reviewer_from_workers: Vec<(i64, i64, usize)> = workers
             .iter()
             .enumerate()
             .filter_map(|(i, w)| {
@@ -4834,6 +4940,26 @@ async fn tick(
                 None
             })
             .collect();
+        if !needs_reviewer_from_workers.is_empty() {
+            let p = db_path.clone();
+            let task_ids: Vec<i64> = needs_reviewer_from_workers
+                .iter()
+                .map(|(_, task_id, _)| *task_id)
+                .collect();
+            let reviewable = tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
+                let conn = quorum_core::db::open(&p)?;
+                let mut ids = HashSet::new();
+                for task_id in task_ids {
+                    if tasks::get(&conn, task_id)?.is_some_and(|task| task.status == "in-review") {
+                        ids.insert(task_id);
+                    }
+                }
+                Ok(ids)
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??;
+            needs_reviewer_from_workers.retain(|(_, task_id, _)| reviewable.contains(task_id));
+        }
         let mut parked_workers: Vec<usize> = Vec::new();
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
@@ -7764,6 +7890,71 @@ async fn fail_reviewer_if_owner(
             .await;
             None
         }
+    }
+}
+
+async fn dispose_managed_process_exit(
+    db_path: &std::path::Path,
+    role: tasks::ManagedRunRole,
+    agent: &str,
+    task_id: i64,
+    reason: &str,
+) -> Option<tasks::ManagedExitDisposition> {
+    let p = db_path.to_path_buf();
+    let actor = agent.to_string();
+    let failure_reason = reason.to_string();
+    match tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::dispose_managed_exit(
+            &mut conn,
+            role,
+            &actor,
+            task_id,
+            &failure_reason,
+            now_unix(),
+        )
+    })
+    .await
+    {
+        Ok(Ok(disposition)) => {
+            if let tasks::ManagedExitDisposition::AgentFailed(transition) = &disposition {
+                let names: Vec<String> =
+                    transition.effects.iter().map(tasks::effect_name).collect();
+                log(&format!(
+                    "lifecycle: task #{task_id} -> {} (effects: [{}])",
+                    transition.task.status,
+                    names.join(", ")
+                ));
+            }
+            Some(disposition)
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            log(&format!(
+                "lifecycle: managed exit classification failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, "managed process exit", &message)
+                .await;
+            None
+        }
+        Err(error) => {
+            let message = format!("join error: {error}");
+            log(&format!(
+                "lifecycle: managed exit classification failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, "managed process exit", &message)
+                .await;
+            None
+        }
+    }
+}
+
+fn managed_exit_end_reason(disposition: &tasks::ManagedExitDisposition) -> Option<&'static str> {
+    match disposition {
+        tasks::ManagedExitDisposition::OutcomePending => None,
+        tasks::ManagedExitDisposition::OutcomeRecorded => Some("completed"),
+        tasks::ManagedExitDisposition::OwnershipTransferred => Some("ownership_transferred"),
+        tasks::ManagedExitDisposition::AgentFailed(_) => Some("crashed"),
     }
 }
 
@@ -10918,6 +11109,57 @@ mod tests {
             turn_kind: "initial".into(),
             thread_id: Some("thread-live".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn managed_exit_cleanup_records_truthful_agent_run_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("managed-exit-reasons.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let completed = quorum_core::agent_runs::insert(
+            &conn,
+            1,
+            "r1-complete",
+            "reviewer",
+            "gpt-5.6-terra",
+            "high",
+            "codex",
+            1000,
+        )
+        .unwrap();
+        let transferred = quorum_core::agent_runs::insert_r2(
+            &conn,
+            1,
+            "r2-stale",
+            "gpt-5.6-terra",
+            "high",
+            "codex",
+            1001,
+        )
+        .unwrap();
+        drop(conn);
+
+        close_agent_run(
+            &db_path,
+            Some(completed),
+            managed_exit_end_reason(&tasks::ManagedExitDisposition::OutcomeRecorded).unwrap(),
+        )
+        .await;
+        close_agent_run(
+            &db_path,
+            Some(transferred),
+            managed_exit_end_reason(&tasks::ManagedExitDisposition::OwnershipTransferred).unwrap(),
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+        assert_eq!(runs[0].end_reason.as_deref(), Some("completed"));
+        assert_eq!(runs[1].end_reason.as_deref(), Some("ownership_transferred"));
+        assert!(
+            managed_exit_end_reason(&tasks::ManagedExitDisposition::OutcomePending).is_none(),
+            "pending outcome must retain the run instead of closing it"
+        );
     }
 
     fn create_active_task(db_path: &Path, agent: &str, status: &str) {
