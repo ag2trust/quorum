@@ -534,12 +534,12 @@ fn remediation_worker_resubmits_same_pr() {
         std::io::Error::last_os_error()
     );
     assert!(
-        handle.wait_for(&format!("reviewer {reviewer_name} died"), 15),
-        "reviewer death not observed. Lines: {:?}",
+        handle.wait_for(&format!("reviewer {reviewer_name} process exited"), 15),
+        "reviewer process exit not observed. Lines: {:?}",
         handle.lines
     );
     assert!(
-        handle.wait_for("failure ignored after review ownership transferred", 15),
+        handle.wait_for("exited after recorded verdict", 15),
         "reviewer exit was not treated as teardown-only. Lines: {:?}",
         handle.lines
     );
@@ -556,10 +556,27 @@ fn remediation_worker_resubmits_same_pr() {
         )
         .unwrap();
     assert_eq!(remediation_runs, 1, "must not spawn duplicate remediation");
+    let reviewer_runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs
+             WHERE task_id=?1 AND role='reviewer'",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reviewer_runs, 1,
+        "rework must not spawn a second reviewer before remediation resubmits"
+    );
     drop(conn);
 
+    let remediation_result_seen = handle
+        .lines
+        .iter()
+        .any(|line| line.contains(&format!("worker {remediation_name} result")))
+        || handle.wait_for(&format!("worker {remediation_name} result"), 15);
     assert!(
-        handle.wait_for("result", 15),
+        remediation_result_seen,
         "remediation result not seen. Lines: {:?}",
         handle.lines
     );

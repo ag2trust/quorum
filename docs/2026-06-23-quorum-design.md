@@ -1183,25 +1183,36 @@ completion, EOF before a terminal event, missing thread identity, or idle/wall-c
 timeout.
 
 Process termination is a runner fact, not an independent task-lifecycle event. Before
-an exited worker may produce `AgentFailed`, the daemon atomically classifies the task,
-run owner, and any pending submission. Worker ownership uses the same authority as
-submission: current task assignee or an active daemon-issued task-scoped worker
-capability (including replacement/remediation workers whose preserved `author` names
-the original branch author):
+an exited managed process may produce `AgentFailed`, the daemon uses one immediate
+transaction to classify the task phase, current owner, and matching mailbox outcome.
+This contract covers initial workers, remediation workers, R1, and R2. Worker ownership
+uses the same authority as submission: current task assignee or an active daemon-issued
+task-scoped worker capability (including replacement/remediation workers whose preserved
+`author` names the original branch author). Reviewer ownership requires the task to
+remain `in-review` with that reviewer attached:
 
-- a pending submission retains the slot until the mailbox row is consumed;
-- a submission or rework push already reflected by `in-review` makes the normal
-  Codex exit completed cleanup-only;
+- a pending submission or verdict retains the slot until the mailbox row is consumed;
+- a consumed submission/verdict after the phase advances is completed cleanup-only;
 - transferred ownership or an already-advanced task makes a stale process exit
   cleanup-only;
-- only a worker that still owns a `working` or `rework` task without a submission is
-  treated as a provider failure.
+- only a run that still owns its phase without a current submission/verdict produces
+  `AgentFailed` (or, for a blocked Codex worker, durable provider-block recovery).
+
+Consumed mailbox history is not sufficient while the same sticky run owns a later
+round: an old initial submission cannot excuse a missing rework push, and an old R1/R2
+verdict cannot excuse a missing verdict after re-review. Exit status and provider stderr
+are retained as diagnostics, never lifecycle authority. The daemon classifies before
+using failure language or alerts. Cleanup records `completed` for a recorded outcome,
+`ownership_transferred` for a stale run, `crashed` only for a genuine owner-without-
+outcome failure, and `provider_blocked` only after durable Codex retry state is stored.
 
 This classification is intentionally independent of observation order. In particular,
 `submit → in-review → exit`, `submit → exit → in-review`, and
 `exit → late submission recovery` must converge on one lifecycle transition and one
-reviewer spawn. Cleanup must not emit a second `AgentFailed`, release the new owner's
-lease, or classify exit status 0 as a crash.
+reviewer spawn; the same applies to R1/R2 verdicts and remediation submissions. Cleanup
+must not emit a second `AgentFailed`, duplicate `task_in_review`/`task_rework`, release
+the new owner's lease, or classify exit status 0 as a crash merely because the
+turn-oriented provider process ended.
 
 ### Capabilities and safety limits
 

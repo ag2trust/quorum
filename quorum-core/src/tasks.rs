@@ -1176,6 +1176,144 @@ pub enum DeadCodexDisposition {
     ProviderBlocked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedRunRole {
+    Worker,
+    Reviewer,
+}
+
+pub enum ManagedExitDisposition {
+    OutcomePending,
+    OutcomeRecorded,
+    OwnershipTransferred,
+    AgentFailed(Box<TransitionResult>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedExitClassification {
+    OutcomePending,
+    OutcomeRecorded,
+    OwnershipTransferred,
+    ActiveWithoutOutcome,
+}
+
+fn classify_managed_exit_tx(
+    tx: &Transaction<'_>,
+    role: ManagedRunRole,
+    agent: &str,
+    id: i64,
+) -> Result<ManagedExitClassification> {
+    let task = tx
+        .query_row(
+            "SELECT status, assignee, reviewer FROM tasks WHERE id=?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, assignee, reviewer)) = task else {
+        return Ok(ManagedExitClassification::OwnershipTransferred);
+    };
+
+    let (owns_phase, outcome_predicate) = match role {
+        ManagedRunRole::Worker => {
+            let has_capability =
+                crate::capabilities::active_for_agent_task(tx, agent, id, "worker")?.is_some();
+            (
+                matches!(status.as_str(), "working" | "rework")
+                    && (assignee.as_deref() == Some(agent) || has_capability),
+                "verdict IS NULL AND pr IS NOT NULL",
+            )
+        }
+        ManagedRunRole::Reviewer => (
+            status == "in-review" && reviewer.as_deref() == Some(agent),
+            "verdict IS NOT NULL",
+        ),
+    };
+    let has_pending_outcome = tx.query_row(
+        &format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM mailbox
+                WHERE agent=?1 AND kind='done' AND task_id=?2
+                  AND consumed_at IS NULL AND {outcome_predicate}
+            )"
+        ),
+        params![agent, id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if has_pending_outcome {
+        return Ok(ManagedExitClassification::OutcomePending);
+    }
+    if owns_phase {
+        return Ok(ManagedExitClassification::ActiveWithoutOutcome);
+    }
+    let has_recorded_outcome = tx.query_row(
+        &format!(
+            "SELECT EXISTS(
+                SELECT 1 FROM mailbox
+                WHERE agent=?1 AND kind='done' AND task_id=?2
+                  AND consumed_at IS NOT NULL AND {outcome_predicate}
+            )"
+        ),
+        params![agent, id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if has_recorded_outcome {
+        return Ok(ManagedExitClassification::OutcomeRecorded);
+    }
+    Ok(ManagedExitClassification::OwnershipTransferred)
+}
+
+/// Atomically classify a managed process exit and fail only a run that still
+/// owns its lifecycle phase and has produced no durable outcome.
+///
+/// A pending matching mailbox row is authoritative. A consumed row is evidence
+/// of completion only after the run no longer owns the active phase, so stale
+/// rows from earlier rework/review rounds cannot hide a current failure. The
+/// ownership check and `AgentFailed` transition share the same immediate
+/// transaction.
+pub fn dispose_managed_exit(
+    conn: &mut Connection,
+    role: ManagedRunRole,
+    agent: &str,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<ManagedExitDisposition> {
+    let tx = begin_immediate(conn)?;
+    match classify_managed_exit_tx(&tx, role, agent, id)? {
+        ManagedExitClassification::OutcomePending => {
+            tx.commit()?;
+            return Ok(ManagedExitDisposition::OutcomePending);
+        }
+        ManagedExitClassification::OutcomeRecorded => {
+            tx.commit()?;
+            return Ok(ManagedExitDisposition::OutcomeRecorded);
+        }
+        ManagedExitClassification::OwnershipTransferred => {
+            tx.commit()?;
+            return Ok(ManagedExitDisposition::OwnershipTransferred);
+        }
+        ManagedExitClassification::ActiveWithoutOutcome => {}
+    }
+
+    apply_event_tx(
+        tx,
+        agent,
+        id,
+        &Event::AgentFailed {
+            reason: reason.to_string(),
+        },
+        now,
+    )
+    .map(|transition| ManagedExitDisposition::AgentFailed(Box::new(transition)))
+}
+
 pub struct CodexProviderBlock<'a> {
     pub reason: &'a str,
     pub model: &'a str,
@@ -1198,6 +1336,18 @@ pub fn dispose_dead_codex(
     now: i64,
 ) -> Result<DeadCodexDisposition> {
     let tx = begin_immediate(conn)?;
+    match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id)? {
+        ManagedExitClassification::OutcomePending => {
+            tx.commit()?;
+            return Ok(DeadCodexDisposition::DonePending);
+        }
+        ManagedExitClassification::OutcomeRecorded => {
+            tx.commit()?;
+            return Ok(DeadCodexDisposition::DeliveryRecorded);
+        }
+        ManagedExitClassification::OwnershipTransferred
+        | ManagedExitClassification::ActiveWithoutOutcome => {}
+    }
     let task = tx
         .query_row(
             "SELECT status, refs, author, assignee FROM tasks WHERE id=?1",
@@ -1239,11 +1389,6 @@ pub fn dispose_dead_codex(
         tx.commit()?;
         return Ok(DeadCodexDisposition::OwnershipTransferred);
     }
-    if crate::mailbox::has_unconsumed(&tx, agent, crate::mailbox::MailboxKind::Done, id)? {
-        tx.commit()?;
-        return Ok(DeadCodexDisposition::DonePending);
-    }
-
     let mut refs: serde_json::Value = refs_raw
         .as_deref()
         .and_then(|refs| serde_json::from_str(refs).ok())
@@ -2106,6 +2251,336 @@ mod tests {
         assert!(result.effects.contains(&Effect::SpawnReviewer));
         assert!(result.task.reviewer.is_none());
         assert!(result.task.assignee.is_none());
+    }
+
+    #[test]
+    fn managed_reviewer_exit_with_pending_verdict_retains_review_phase() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "reviewer".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(42),
+                verdict: Some("changes".into()),
+                feedback: Some("fix it".into()),
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+
+        let disposition = dispose_managed_exit(
+            &mut c,
+            ManagedRunRole::Reviewer,
+            "reviewer",
+            id,
+            "status 0",
+            1003,
+        )
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            ManagedExitDisposition::OutcomePending
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "in-review");
+        let review_events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_events, 1,
+            "exit must not duplicate review transition"
+        );
+    }
+
+    #[test]
+    fn managed_reviewer_exit_after_consumed_verdict_is_cleanup_only() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+        let row_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "reviewer".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(42),
+                verdict: Some("changes".into()),
+                feedback: Some("fix it".into()),
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+        crate::mailbox::mark_consumed(&mut c, row_id).unwrap();
+
+        let disposition = dispose_managed_exit(
+            &mut c,
+            ManagedRunRole::Reviewer,
+            "reviewer",
+            id,
+            "status 0",
+            1004,
+        )
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            ManagedExitDisposition::OutcomeRecorded
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "rework");
+        let rework_events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_rework'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rework_events, 1,
+            "exit must not duplicate rework transition"
+        );
+    }
+
+    #[test]
+    fn historical_worker_submission_does_not_hide_current_rework_failure() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        let row_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(42),
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "worker",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        crate::mailbox::mark_consumed(&mut c, row_id).unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+
+        let disposition = dispose_managed_exit(
+            &mut c,
+            ManagedRunRole::Worker,
+            "worker",
+            id,
+            "status 1: no rework submission",
+            1004,
+        )
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            ManagedExitDisposition::AgentFailed(_)
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "open");
+    }
+
+    #[test]
+    fn managed_reviewer_exit_without_verdict_recovers_once() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "r1", Some(id), &[], TTL, 1002).unwrap();
+
+        let disposition = dispose_managed_exit(
+            &mut c,
+            ManagedRunRole::Reviewer,
+            "r1",
+            id,
+            "status 1: no verdict",
+            1003,
+        )
+        .unwrap();
+        let ManagedExitDisposition::AgentFailed(transition) = disposition else {
+            panic!("owner without verdict must fail");
+        };
+        assert_eq!(
+            transition
+                .effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::SpawnReviewer))
+                .count(),
+            1,
+            "one exit may request exactly one replacement reviewer"
+        );
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(task.reviewer.is_none());
+        let recovery_events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(recovery_events, 2);
+    }
+
+    #[test]
+    fn r2_pending_verdict_is_retained_without_duplicate_reviewer_request() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "r2", Some(id), &[], TTL, 1002).unwrap();
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "r2".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(42),
+                verdict: Some("approved".into()),
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: Some(r#"{"blocking":0}"#.into()),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            dispose_managed_exit(&mut c, ManagedRunRole::Reviewer, "r2", id, "status 0", 1003,)
+                .unwrap(),
+            ManagedExitDisposition::OutcomePending
+        ));
+        let review_events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(review_events, 1);
+    }
+
+    #[test]
+    fn remediation_submission_exit_is_pending_then_recorded_without_reopening() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+        claim_remediation_rework(&mut c, "remediation", id, TTL, 1004).unwrap();
+        let row_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "remediation".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(42),
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            dispose_managed_exit(
+                &mut c,
+                ManagedRunRole::Worker,
+                "remediation",
+                id,
+                "status 0",
+                1005,
+            )
+            .unwrap(),
+            ManagedExitDisposition::OutcomePending
+        ));
+
+        apply_event(&mut c, "remediation", id, &Event::ReworkPushed, 1006).unwrap();
+        crate::mailbox::mark_consumed(&mut c, row_id).unwrap();
+        assert!(matches!(
+            dispose_managed_exit(
+                &mut c,
+                ManagedRunRole::Worker,
+                "remediation",
+                id,
+                "status 0",
+                1007,
+            )
+            .unwrap(),
+            ManagedExitDisposition::OutcomeRecorded
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "in-review");
+        let review_events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            review_events, 2,
+            "remediation exit must not add a third review transition"
+        );
     }
 
     #[test]
