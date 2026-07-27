@@ -1214,9 +1214,10 @@ fn task_display_identity(labels_json: Option<&str>) -> (String, String, String) 
     let labels: Vec<String> = labels_json
         .and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or_default();
-    let tier = labels.iter().find_map(|label| label.strip_prefix("tier:"));
-    let model = tier
-        .and_then(crate::model_tiers::model_id_for_tier)
+    let model = labels
+        .iter()
+        .filter_map(|label| label.strip_prefix("tier:"))
+        .find_map(crate::model_tiers::model_id_for_tier)
         .map(str::to_string);
     let Some(model) = model else {
         return ("pending".into(), "pending".into(), "pending".into());
@@ -1228,8 +1229,8 @@ fn task_display_identity(labels_json: Option<&str>) -> (String, String, String) 
     };
     let effort = labels
         .iter()
-        .find_map(|label| label.strip_prefix("effort:"))
-        .filter(|effort| matches!(*effort, "medium" | "high"))
+        .filter_map(|label| label.strip_prefix("effort:"))
+        .find(|effort| matches!(*effort, "medium" | "high"))
         .unwrap_or("pending");
     (provider.to_string(), model, effort.to_string())
 }
@@ -2215,6 +2216,50 @@ mod tests {
             assert_eq!(provider.as_deref(), Some("pending"));
             assert_eq!(model.as_deref(), Some("pending"));
             assert_eq!(effort.as_deref(), Some("pending"));
+        }
+    }
+
+    #[test]
+    fn empty_labels_do_not_mask_later_queue_and_blocked_identity() {
+        let (_d, mut c) = open_tmp();
+        let labels = r#"["tier:","tier:opus-47","effort:","effort:high"]"#;
+        let queued = crate::tasks::create(
+            &mut c,
+            "boss",
+            "empty labels before valid queued identity",
+            None,
+            0,
+            Some(labels),
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let blocked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "empty labels before valid blocked identity",
+            None,
+            0,
+            Some(labels),
+            None,
+            Some(&format!("[{queued}]")),
+            None,
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let q = s.queue_tasks.iter().find(|task| task.id == queued).unwrap();
+        let b = s.blocked.iter().find(|task| task.id == blocked).unwrap();
+        for (provider, model, effort) in [
+            (&q.provider, &q.model, &q.effort),
+            (&b.provider, &b.model, &b.effort),
+        ] {
+            assert_eq!(provider.as_deref(), Some("claude"));
+            assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
+            assert_eq!(effort.as_deref(), Some("high"));
         }
     }
 
