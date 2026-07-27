@@ -51,6 +51,17 @@ fn submit_writes_mailbox_row() {
         .success()
         .stdout(predicate::str::contains("\"ok\":true"))
         .stdout(predicate::str::contains("\"mailbox_id\""));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let rows = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.task_id,
+        Some(1),
+        "submit must bind the Done row to its validated run capability"
+    );
+    assert_eq!(rows[0].1.agent, "TestAgent");
+    assert_eq!(rows[0].1.kind, quorum_core::mailbox::MailboxKind::Done);
 }
 
 #[test]
