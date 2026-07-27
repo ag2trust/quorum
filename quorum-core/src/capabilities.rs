@@ -7,7 +7,7 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,12 +111,21 @@ pub fn validate(
 /// Revoke a capability (e.g. on agent death or task terminal transition).
 pub fn revoke(conn: &mut Connection, run_id: &str, now: i64) -> Result<bool> {
     let tx = begin_immediate(conn)?;
+    let revoked = revoke_tx(&tx, run_id, now)?;
+    tx.commit()?;
+    Ok(revoked)
+}
+
+/// Revoke one exact run capability within a caller-owned transaction.
+///
+/// This keeps capability revocation composable with the other authority
+/// mutations a controlled shutdown must make atomically.
+pub(crate) fn revoke_tx(tx: &Transaction<'_>, run_id: &str, now: i64) -> Result<bool> {
     let changed = tx.execute(
         "UPDATE run_capabilities SET revoked_at = ?1
          WHERE run_id = ?2 AND revoked_at IS NULL",
         params![now, run_id],
     )?;
-    tx.commit()?;
     Ok(changed > 0)
 }
 
