@@ -257,6 +257,29 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
     }
 }
 
+/// Validate explicit per-complexity routing overrides. The accepted tier
+/// vocabulary is owned by `quorum_core::model_tiers`, shared with task labels.
+/// Only Quorum's supported medium/high efforts are valid.
+pub fn validate_suggested_models(
+    suggested_models: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    for (level, selection) in suggested_models {
+        let valid_level = matches!(level.as_str(), "1" | "2" | "3" | "4" | "5");
+        let valid_selection = selection.split_once('/').is_some_and(|(tier, effort)| {
+            quorum_core::model_tiers::model_id_for_tier(tier).is_some()
+                && matches!(effort, "medium" | "high")
+        });
+        if !valid_level || !valid_selection {
+            return Err(QuorumError::Usage(format!(
+                "bad suggested_models entry: {level} = \"{selection}\" \
+                 (expected key 1-5, value supported-tier/medium|high; tiers: {})",
+                quorum_core::model_tiers::known_tiers(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Tracks where each resolved config value came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -787,6 +810,33 @@ worktree_base = "/tmp/wt"
         let sm = cfg.suggested_models.unwrap();
         assert_eq!(sm.get("3").unwrap(), "opus-48/high");
         assert_eq!(sm.get("5").unwrap(), "opus-47/medium");
+    }
+
+    #[test]
+    fn suggested_models_accepts_every_closed_tier_at_supported_efforts() {
+        let mut selections = std::collections::HashMap::new();
+        for (index, tier) in quorum_core::model_tiers::MODEL_TIERS.iter().enumerate() {
+            selections.insert(
+                ((index % 5) + 1).to_string(),
+                format!(
+                    "{}/{}",
+                    tier.tier,
+                    if index % 2 == 0 { "medium" } else { "high" }
+                ),
+            );
+            assert!(validate_suggested_models(&selections).is_ok(), "{tier:?}");
+            selections.clear();
+        }
+    }
+
+    #[test]
+    fn suggested_models_rejects_unknown_tiers_and_unsupported_efforts_with_exit_2() {
+        for selection in ["unknown/high", "terra/low", "sol/xhigh", "luna/pro"] {
+            let mut selections = std::collections::HashMap::new();
+            selections.insert("1".into(), selection.into());
+            let err = validate_suggested_models(&selections).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{selection}: {err}");
+        }
     }
 
     #[test]

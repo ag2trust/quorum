@@ -3,7 +3,7 @@
 pub fn cheatsheet() -> String {
     let rubric = quorum_core::complexity::rubric_inline();
     let rubric_full = quorum_core::complexity::rubric_lines();
-    let recommendations = quorum_core::complexity::recommendation_lines();
+    let recommendations = quorum_core::complexity::all_recommendation_lines();
 
     format!(
         r#"quorum — local agent coordination (by agents, for agents)
@@ -46,9 +46,10 @@ TASKS (daemon-managed queue) — lifecycle: open -> working -> in-review -> merg
 COMPLEXITY RUBRIC (used by classifier and for task-creation guidance)
 {rubric_full}
 
-  Default model/effort recommendations per complexity level:
+  Built-in model/effort routing policy per complexity level:
 {recommendations}
-  Daemon `suggested_models` config overrides these defaults when set.
+  The active daemon provider selects its ladder; this is routing policy, not a cross-vendor benchmark.
+  Daemon `suggested_models` config overrides the active provider's defaults when set.
   Explicit tier:/effort: labels on a task take precedence over defaults.
   Mismatch alerts are advisory — the daemon posts a note when actual < suggested.
 

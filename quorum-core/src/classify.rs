@@ -2,6 +2,7 @@
 //! duplicate-of hints. Observational v1: outputs are stored in `refs` and
 //! surfaced as notes; nothing acts on them automatically.
 
+use crate::complexity;
 use crate::db::begin_immediate;
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -249,7 +250,22 @@ pub fn build_prompt(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
 ) -> String {
-    let mut prompt = classifier_rubric();
+    build_prompt_with_recommendations(
+        tasks,
+        dup_context,
+        &complexity::recommendation_lines(complexity::RecommendationProvider::Claude),
+    )
+}
+
+/// Build the classifier prompt with the active provider's routing guidance.
+/// Recommendations describe Quorum's operational policy only; they do not
+/// alter the classifier's required complexity-only response.
+pub fn build_prompt_with_recommendations(
+    tasks: &[TaskForClassification],
+    dup_context: &[TaskForClassification],
+    recommendations: &str,
+) -> String {
+    let mut prompt = classifier_rubric(recommendations);
 
     prompt.push_str("\n\n## Tasks to classify\n\n");
     for t in tasks {
@@ -296,13 +312,17 @@ pub fn build_prompt(
 }
 
 /// Build the classifier rubric text from the shared complexity constants.
-fn classifier_rubric() -> String {
+fn classifier_rubric(recommendations: &str) -> String {
     let rubric_lines = crate::complexity::rubric_lines();
     format!(
         r#"You are a task classifier for an AI agent coordination system. For each task, produce:
 
 1. **cx_est** (integer 1-5): Complexity estimate based on the task description AS WRITTEN at creation time.
 {rubric_lines}
+
+The active daemon's operational routing policy for these levels is:
+{recommendations}
+This is not a cross-vendor benchmark and does not change the required output.
 
 2. **cx_flags** (array of strings, may be empty): Shape-lint flags.
    - "oversized": Task looks like > ~30-45 min of agent work (complexity 4-5 with broad scope)
@@ -426,6 +446,19 @@ mod tests {
         assert!(prompt.contains("Task #1"));
         assert!(prompt.contains("Fix bug"));
         assert!(prompt.contains("#2: Other task"));
+    }
+
+    #[test]
+    fn provider_specific_prompt_contains_only_its_routing_ladder() {
+        let prompt = build_prompt_with_recommendations(
+            &[],
+            &[],
+            &crate::complexity::recommendation_lines(
+                crate::complexity::RecommendationProvider::Codex,
+            ),
+        );
+        assert!(prompt.contains("gpt-5.6-sol / high"));
+        assert!(!prompt.contains("claude-opus-4-8"));
     }
 
     #[test]
@@ -622,7 +655,9 @@ mod tests {
 
     #[test]
     fn classifier_prompt_contains_shared_rubric_descriptions() {
-        let rubric = classifier_rubric();
+        let rubric = classifier_rubric(&complexity::recommendation_lines(
+            complexity::RecommendationProvider::Claude,
+        ));
         for (level, label, desc, _time) in &crate::complexity::RUBRIC {
             assert!(
                 rubric.contains(&format!("{level}: {label}")) && rubric.contains(*desc),

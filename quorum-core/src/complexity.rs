@@ -31,15 +31,42 @@ pub const RUBRIC: [(u8, &str, &str, &str); 5] = [
     ),
 ];
 
-/// Default (level, model_id, effort) recommendations.
+/// Provider whose operational routing policy supplies recommendations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecommendationProvider {
+    Claude,
+    Codex,
+}
+
+/// Claude default (level, model_id, effort) recommendations.
 /// Daemon `suggested_models` config overrides these when set.
-pub const DEFAULT_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
+pub const CLAUDE_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
     (1, "claude-sonnet-5", "medium"),
     (2, "claude-opus-4-6", "medium"),
     (3, "claude-opus-4-6", "high"),
     (4, "claude-opus-4-7", "high"),
     (5, "claude-opus-4-8", "high"),
 ];
+
+/// Codex default (level, model_id, effort) recommendations.
+/// This is Quorum's operational routing policy, not a cross-vendor benchmark.
+pub const CODEX_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
+    (1, "gpt-5.6-luna", "medium"),
+    (2, "gpt-5.6-terra", "medium"),
+    (3, "gpt-5.6-terra", "high"),
+    (4, "gpt-5.6-sol", "medium"),
+    (5, "gpt-5.6-sol", "high"),
+];
+
+/// Return the complete built-in recommendation ladder for one provider.
+pub fn recommendations_for(
+    provider: RecommendationProvider,
+) -> &'static [(u8, &'static str, &'static str); 5] {
+    match provider {
+        RecommendationProvider::Claude => &CLAUDE_RECOMMENDATIONS,
+        RecommendationProvider::Codex => &CODEX_RECOMMENDATIONS,
+    }
+}
 
 /// Render the rubric as lines for embedding in prompts or help text.
 /// Format: `  - N: Label — description[, time]`
@@ -57,14 +84,23 @@ pub fn rubric_lines() -> String {
         .join("\n")
 }
 
-/// Render the recommendation table for agent-facing help.
+/// Render one provider's recommendation table for agent-facing guidance.
 /// Each line: `  N → model / effort`
-pub fn recommendation_lines() -> String {
-    DEFAULT_RECOMMENDATIONS
+pub fn recommendation_lines(provider: RecommendationProvider) -> String {
+    recommendations_for(provider)
         .iter()
         .map(|(level, model, effort)| format!("   {level} → {model} / {effort}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Render both built-in routing ladders for provider-neutral help.
+pub fn all_recommendation_lines() -> String {
+    format!(
+        "  Claude:\n{}\n  Codex:\n{}",
+        recommendation_lines(RecommendationProvider::Claude),
+        recommendation_lines(RecommendationProvider::Codex),
+    )
 }
 
 /// Short inline rubric for cheatsheet (one-line per level).
@@ -91,13 +127,31 @@ mod tests {
     }
 
     #[test]
-    fn recommendations_cover_1_through_5() {
-        for i in 1..=5u8 {
-            assert!(
-                DEFAULT_RECOMMENDATIONS.iter().any(|(l, _, _)| *l == i),
-                "recommendations missing level {i}"
-            );
-        }
+    fn claude_recommendations_match_the_complete_legacy_ladder() {
+        assert_eq!(
+            CLAUDE_RECOMMENDATIONS,
+            [
+                (1, "claude-sonnet-5", "medium"),
+                (2, "claude-opus-4-6", "medium"),
+                (3, "claude-opus-4-6", "high"),
+                (4, "claude-opus-4-7", "high"),
+                (5, "claude-opus-4-8", "high"),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_recommendations_match_the_complete_routing_policy() {
+        assert_eq!(
+            CODEX_RECOMMENDATIONS,
+            [
+                (1, "gpt-5.6-luna", "medium"),
+                (2, "gpt-5.6-terra", "medium"),
+                (3, "gpt-5.6-terra", "high"),
+                (4, "gpt-5.6-sol", "medium"),
+                (5, "gpt-5.6-sol", "high"),
+            ]
+        );
     }
 
     #[test]
@@ -128,9 +182,19 @@ mod tests {
 
     #[test]
     fn recommendation_lines_renders_all_levels() {
-        let text = recommendation_lines();
+        let text = recommendation_lines(RecommendationProvider::Claude);
         for i in 1..=5 {
             assert!(text.contains(&format!("{i} →")), "missing level {i}");
         }
+    }
+
+    #[test]
+    fn provider_selection_never_mixes_ladders() {
+        let claude = recommendation_lines(RecommendationProvider::Claude);
+        let codex = recommendation_lines(RecommendationProvider::Codex);
+        assert!(claude.contains("claude-opus-4-8"));
+        assert!(!claude.contains("gpt-5.6"));
+        assert!(codex.contains("gpt-5.6-sol"));
+        assert!(!codex.contains("claude-"));
     }
 }

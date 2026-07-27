@@ -57,6 +57,7 @@ pub fn spawn_classifier_configured(
     model: &str,
     effort: &str,
     codex_sandbox: &str,
+    recommendations: &str,
 ) -> std::io::Result<ClassifierSlot> {
     let kind = classifier_kind(model)?;
     let pending_task_ids = tasks.iter().map(|t| t.id).collect();
@@ -71,7 +72,11 @@ pub fn spawn_classifier_configured(
                 effort: effort.to_string(),
                 sandbox: codex_sandbox.to_string(),
                 worktree: repo_dir.to_path_buf(),
-                prompt: classify::build_prompt(tasks, dup_context),
+                prompt: classify::build_prompt_with_recommendations(
+                    tasks,
+                    dup_context,
+                    recommendations,
+                ),
                 env_vars: vec![],
             };
             CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)?
@@ -90,6 +95,16 @@ pub fn classifier_turn(
     dup_context: &[TaskForClassification],
 ) -> String {
     let prompt = classify::build_prompt(tasks, dup_context);
+    super::agent::user_turn(&prompt)
+}
+
+/// Build a classifier turn using the active provider's routing policy.
+pub fn classifier_turn_with_recommendations(
+    tasks: &[TaskForClassification],
+    dup_context: &[TaskForClassification],
+    recommendations: &str,
+) -> String {
+    let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
     super::agent::user_turn(&prompt)
 }
 
@@ -268,6 +283,7 @@ mod tests {
             "gpt-5.6-terra",
             "medium",
             "danger-full-access",
+            "   1 → gpt-5.6-luna / medium",
         )
         .unwrap();
         while slot.proc.next_raw_line().await.is_some() {}
