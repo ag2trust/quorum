@@ -1216,9 +1216,16 @@ pub fn dispose_dead_codex(
         tx.commit()?;
         return Ok(DeadCodexDisposition::OwnershipTransferred);
     };
+    // Match apply_event's worker submission authority: the current assignee
+    // owns the phase directly, while a daemon-issued active worker capability
+    // authorizes replacement/remediation workers whose preserved `author`
+    // value still names the original branch author.
+    let has_worker_capability =
+        crate::capabilities::active_for_agent_task(&tx, agent, id, "worker")?.is_some();
+    let owns_worker_phase = assignee.as_deref() == Some(agent) || has_worker_capability;
     if status != "working" && status != "rework" {
         let disposition = if status == "in-review"
-            && author.as_deref() == Some(agent)
+            && (author.as_deref() == Some(agent) || has_worker_capability)
             && extract_pr_number(&refs_raw).is_some()
         {
             DeadCodexDisposition::DeliveryRecorded
@@ -1228,7 +1235,7 @@ pub fn dispose_dead_codex(
         tx.commit()?;
         return Ok(disposition);
     }
-    if author.as_deref() != Some(agent) || assignee.as_deref() != Some(agent) {
+    if !owns_worker_phase {
         tx.commit()?;
         return Ok(DeadCodexDisposition::OwnershipTransferred);
     }

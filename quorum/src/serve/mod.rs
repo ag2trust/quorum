@@ -11094,6 +11094,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacement_codex_rework_without_done_is_provider_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replacement-rework-no-done.db");
+        create_active_task(&db_path, "Original", "rework");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                "replacement-run",
+                1,
+                "Replacement",
+                "worker",
+                now_unix(),
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                1,
+                r#"{"branch":"daemon/original-t1","pr":444}"#,
+                now_unix(),
+            )
+            .unwrap();
+        }
+
+        let disposition = dispose_dead_codex_worker(
+            &db_path,
+            1,
+            "Replacement",
+            "provider quota exhausted",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(disposition, tasks::DeadCodexDisposition::ProviderBlocked);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.author.as_deref(), Some("Original"));
+        assert_eq!(task.assignee.as_deref(), Some("Original"));
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
+        assert_eq!(
+            refs["codex_provider_error"].as_str(),
+            Some("provider quota exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_codex_after_rework_consumed_is_completed_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("replacement-rework-consumed.db");
+        create_active_task(&db_path, "Original", "rework");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                "replacement-run",
+                1,
+                "Replacement",
+                "worker",
+                now_unix(),
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                1,
+                r#"{"branch":"daemon/original-t1","pr":444}"#,
+                now_unix(),
+            )
+            .unwrap();
+        }
+        fire_event_result(&db_path, "Replacement", 1, &Event::ReworkPushed)
+            .await
+            .unwrap();
+
+        let disposition = dispose_dead_codex_worker(
+            &db_path,
+            1,
+            "Replacement",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            disposition,
+            tasks::DeadCodexDisposition::DeliveryRecorded,
+            "consumed replacement rework must use the completed cleanup path"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.author.as_deref(), Some("Original"));
+        let in_review_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events \
+                 WHERE subject='task#1' AND kind='task_in_review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            in_review_events, 1,
+            "exit cleanup must not replay ReworkPushed"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get("codex_provider_blocked").is_none(),
+            "consumed rework must not stage a provider retry"
+        );
+    }
+
+    #[tokio::test]
     async fn dead_codex_after_done_consumed_is_completed_without_duplicate_transition() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("done-consumed.db");
