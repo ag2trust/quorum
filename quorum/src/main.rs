@@ -910,13 +910,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             } else {
                 "worker"
             };
-            quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
+            let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
                 .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
             let kind = quorum_core::mailbox::MailboxKind::Done;
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
                 kind,
-                task_id: None,
+                task_id: Some(cap.task_id),
                 pr,
                 verdict,
                 feedback,

@@ -1204,7 +1204,7 @@ pub fn dispose_dead_codex(
         tx.commit()?;
         return Ok(DeadCodexDisposition::FallThrough);
     };
-    if status != "working" {
+    if status != "working" && status != "rework" {
         tx.commit()?;
         return Ok(DeadCodexDisposition::FallThrough);
     }

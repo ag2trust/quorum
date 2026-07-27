@@ -10807,7 +10807,7 @@ mod tests {
         }
     }
 
-    fn create_working_task(db_path: &Path, agent: &str) {
+    fn create_active_task(db_path: &Path, agent: &str, status: &str) {
         let mut conn = quorum_core::db::open(db_path).unwrap();
         let task = tasks::create(
             &mut conn,
@@ -10823,8 +10823,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE tasks SET status='working', assignee=?1, author=?1 WHERE id=?2",
-            rusqlite::params![agent, task],
+            "UPDATE tasks SET status=?1, assignee=?2, author=?2 WHERE id=?3",
+            rusqlite::params![status, agent, task],
         )
         .unwrap();
     }
@@ -10833,7 +10833,7 @@ mod tests {
     async fn dead_codex_with_pending_done_is_retained_without_retry_staging() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("done-pending.db");
-        create_working_task(&db_path, "Spool");
+        create_active_task(&db_path, "Spool", "working");
         {
             let mut conn = quorum_core::db::open(&db_path).unwrap();
             mailbox::append(
@@ -10878,10 +10878,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_codex_without_pending_done_is_provider_blocked_with_retry_staged() {
+    async fn dead_codex_with_done_for_another_task_is_provider_blocked_with_retry_staged() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("no-done.db");
-        create_working_task(&db_path, "Spool");
+        create_active_task(&db_path, "Spool", "working");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Spool".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(2),
+                    pr: Some(999),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
 
         let disposition = dispose_dead_codex_worker(
             &db_path,
@@ -10897,6 +10915,10 @@ mod tests {
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            mailbox::has_unconsumed(&conn, "Spool", mailbox::MailboxKind::Done, 2).unwrap(),
+            "the mismatched task row remains pending but must not suppress task #1 parking"
+        );
         assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
         assert_eq!(
             refs["codex_provider_error"].as_str(),
@@ -10907,6 +10929,49 @@ mod tests {
             Some("finish the active turn")
         );
         assert_eq!(refs["codex_retry_thread_id"].as_str(), Some("thread-live"));
+    }
+
+    #[tokio::test]
+    async fn dead_codex_rework_with_pending_done_is_retained_without_retry_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("rework-done-pending.db");
+        create_active_task(&db_path, "Spool", "rework");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Spool".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: Some(439),
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let disposition =
+            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
+                .await
+                .unwrap();
+
+        assert_eq!(disposition, tasks::DeadCodexDisposition::DonePending);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get("codex_provider_blocked").is_none(),
+            "a successful rework submit must not be parked"
+        );
+        assert!(
+            refs.get("codex_retry_prompt").is_none(),
+            "successful rework must not stage a duplicate retry"
+        );
     }
 
     #[tokio::test]
