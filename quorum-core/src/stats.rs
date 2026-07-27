@@ -968,7 +968,9 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
             .ok()
             .map(|(provider, model, effort)| {
                 (
-                    provider.or_else(|| Some("unknown".into())),
+                    // v31 added this nullable column; NULL is the documented
+                    // legacy-Claude meaning, not an unknown provider.
+                    provider.or_else(|| Some("claude".into())),
                     Some(model),
                     Some(effort),
                 )
@@ -1178,7 +1180,8 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
             .ok()
             .map(|(provider, model, effort)| {
                 (
-                    Some(provider.unwrap_or_else(|| "unknown".into())),
+                    // See the v31 migration: pre-existing rows are Claude.
+                    Some(provider.unwrap_or_else(|| "claude".into())),
                     Some(model),
                     Some(effort),
                 )
@@ -1429,6 +1432,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
         (dir, c)
+    }
+
+    #[test]
+    fn legacy_null_run_provider_displays_as_claude_live_and_pipeline() {
+        let (_d, mut c) = open_tmp();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "legacy provider",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider, spawned_at)
+             VALUES (?1, 'W1', 'worker', 'claude-opus-4-6', 'high', NULL, 101)",
+            params![task_id],
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "W1".into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "legacy-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+            },
+        )
+        .unwrap();
+        let live = stats(&c, 102, crate::agents::ONLINE_WINDOW_SECS)
+            .unwrap()
+            .daemon_agents
+            .pop()
+            .unwrap();
+        assert_eq!(live.provider.as_deref(), Some("claude"));
+
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=102 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        let pipeline = stats(&c, 103, crate::agents::ONLINE_WINDOW_SECS)
+            .unwrap()
+            .pipeline
+            .pop()
+            .unwrap();
+        assert_eq!(pipeline.provider.as_deref(), Some("claude"));
+        assert_eq!(pipeline.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(pipeline.effort.as_deref(), Some("high"));
     }
 
     #[test]
