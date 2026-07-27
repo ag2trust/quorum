@@ -1218,23 +1218,20 @@ fn task_display_identity(labels_json: Option<&str>) -> (String, String, String) 
     let model = tier
         .and_then(crate::model_tiers::model_id_for_tier)
         .map(str::to_string);
-    let provider = model.as_deref().map(|model| {
-        if model.starts_with("claude-") {
-            "claude"
-        } else {
-            "codex"
-        }
-    });
+    let Some(model) = model else {
+        return ("pending".into(), "pending".into(), "pending".into());
+    };
+    let provider = if model.starts_with("claude-") {
+        "claude"
+    } else {
+        "codex"
+    };
     let effort = labels
         .iter()
         .find_map(|label| label.strip_prefix("effort:"))
         .filter(|effort| matches!(*effort, "medium" | "high"))
         .unwrap_or("pending");
-    (
-        provider.unwrap_or("pending").to_string(),
-        model.unwrap_or_else(|| "pending".into()),
-        effort.to_string(),
-    )
+    (provider.to_string(), model, effort.to_string())
 }
 
 /// Deduped errors from the last hour, with a count of older silenced errors (#204).
@@ -2176,6 +2173,49 @@ mod tests {
         assert!(s.blocked.is_empty());
         // The dependent should now appear in the queue.
         assert!(!s.queue_by_tier.is_empty());
+    }
+
+    #[test]
+    fn effort_only_labels_leave_queue_and_blocked_identity_pending() {
+        let (_d, mut c) = open_tmp();
+        let queued = crate::tasks::create(
+            &mut c,
+            "boss",
+            "effort-only queued",
+            None,
+            0,
+            Some(r#"["effort:high"]"#),
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let blocked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "effort-only blocked",
+            None,
+            0,
+            Some(r#"["effort:high"]"#),
+            None,
+            Some(&format!("[{queued}]")),
+            None,
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let q = s.queue_tasks.iter().find(|task| task.id == queued).unwrap();
+        let b = s.blocked.iter().find(|task| task.id == blocked).unwrap();
+        for (provider, model, effort) in [
+            (&q.provider, &q.model, &q.effort),
+            (&b.provider, &b.model, &b.effort),
+        ] {
+            assert_eq!(provider.as_deref(), Some("pending"));
+            assert_eq!(model.as_deref(), Some("pending"));
+            assert_eq!(effort.as_deref(), Some("pending"));
+        }
     }
 
     #[test]
