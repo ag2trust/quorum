@@ -1182,6 +1182,24 @@ includes `turn.failed`, fatal top-level error, non-zero exit without authoritati
 completion, EOF before a terminal event, missing thread identity, or idle/wall-clock
 timeout.
 
+Process termination is a runner fact, not an independent task-lifecycle event. Before
+an exited worker may produce `AgentFailed`, the daemon atomically classifies the task,
+run owner, and any pending submission:
+
+- a pending submission retains the slot until the mailbox row is consumed;
+- a submission already reflected by `in-review` makes the normal Codex exit
+  cleanup-only;
+- transferred ownership or an already-advanced task makes a stale process exit
+  cleanup-only;
+- only a worker that still owns a `working` or `rework` task without a submission is
+  treated as a provider failure.
+
+This classification is intentionally independent of observation order. In particular,
+`submit → in-review → exit`, `submit → exit → in-review`, and
+`exit → late submission recovery` must converge on one lifecycle transition and one
+reviewer spawn. Cleanup must not emit a second `AgentFailed`, release the new owner's
+lease, or classify exit status 0 as a crash.
+
 ### Capabilities and safety limits
 
 Capabilities are fixed internal facts, not a negotiation framework:
