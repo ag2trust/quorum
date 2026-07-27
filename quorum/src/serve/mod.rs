@@ -4558,17 +4558,48 @@ async fn tick(
         }
     }
     for &i in dead_reviewers.iter().rev() {
+        let task_id = reviewers[i].task_id;
+        let reviewer_name = reviewers[i].agent_name.clone();
+        let p = db_path.clone();
+        let still_owns_review = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = quorum_core::db::open(&p)?;
+            let task = tasks::get(&conn, task_id)?;
+            Ok(task.is_some_and(|task| {
+                task.status == "in-review"
+                    && task.reviewer.as_deref() == Some(reviewer_name.as_str())
+            }))
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+        let still_owns_review = match still_owns_review {
+            Ok(value) => value,
+            Err(error) => {
+                log(&format!(
+                    "reviewer {} exit ownership check failed: {error} — retaining slot for retry",
+                    reviewers[i].agent_name
+                ));
+                continue;
+            }
+        };
         let dead = reviewers.remove(i);
-        fire_event(
-            &db_path,
-            &dead.agent_name,
-            dead.task_id,
-            &Event::AgentFailed {
-                reason: "reviewer process died".into(),
-            },
-        )
-        .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+        if still_owns_review {
+            fire_event(
+                &db_path,
+                &dead.agent_name,
+                dead.task_id,
+                &Event::AgentFailed {
+                    reason: "reviewer process died".into(),
+                },
+            )
+            .await;
+            teardown_reviewer(config, wt_mgr, name_pool, dead, "crashed").await;
+        } else {
+            log(&format!(
+                "reviewer {} exited after review ownership transferred — teardown only",
+                dead.agent_name
+            ));
+            teardown_reviewer(config, wt_mgr, name_pool, dead, "completed").await;
+        }
     }
 
     // ── Phase 4b2: Detect externally-cancelled/terminal tasks ───────────

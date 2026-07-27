@@ -513,6 +513,36 @@ fn remediation_worker_resubmits_same_pr() {
         .unwrap()
         .to_string();
 
+    // Regression: a turn-oriented reviewer exits after its accepted changes
+    // verdict. Once remediation owns the rework phase, that exit must not fire
+    // reviewer AgentFailed and reopen the task.
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let reviewer_pid: i32 = conn
+        .query_row(
+            "SELECT pid FROM journal WHERE agent=?1",
+            [&reviewer_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(conn);
+    unsafe { libc::kill(reviewer_pid, libc::SIGKILL) };
+    assert!(
+        handle.wait_for(&format!("reviewer {reviewer_name} died"), 15),
+        "reviewer death not observed. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("exited after review ownership transferred", 15),
+        "reviewer exit was not treated as teardown-only. Lines: {:?}",
+        handle.lines
+    );
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.assignee.as_deref(), Some(remediation_name.as_str()));
+    drop(conn);
+
     assert!(
         handle.wait_for("result", 15),
         "remediation result not seen. Lines: {:?}",
