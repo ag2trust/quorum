@@ -5813,6 +5813,9 @@ async fn feed_worker_turn(
     config: &ServeConfig,
 ) -> std::io::Result<()> {
     if slot.proc.is_codex() {
+        if let Some(log) = slot.session_log.as_mut() {
+            log.begin_turn("continuation");
+        }
         if should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
@@ -5839,6 +5842,9 @@ async fn feed_worker_turn(
                 &slot.worktree_path,
                 raw_prompt,
                 &env_vars,
+                slot.session_log
+                    .as_ref()
+                    .map(|log| log.stderr_path().to_path_buf()),
                 config.agent_bin.as_deref(),
             )?
         } else {
@@ -5850,6 +5856,10 @@ async fn feed_worker_turn(
                     worktree: slot.worktree_path.clone(),
                     prompt: raw_prompt.to_string(),
                     env_vars,
+                    stderr_log: slot
+                        .session_log
+                        .as_ref()
+                        .map(|log| log.stderr_path().to_path_buf()),
                 },
                 config.agent_bin.as_deref(),
             )?
@@ -6523,7 +6533,7 @@ async fn provision_reviewer(
         wt_path.display()
     ));
 
-    let reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
+    let mut reviewer_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
             &reviewer_name,
@@ -6666,6 +6676,10 @@ async fn provision_reviewer(
             &wt_path,
             &prompt,
             &reviewer_env,
+            reviewer_session_log.as_mut().map(|log| {
+                log.begin_turn("continuation");
+                log.stderr_path().to_path_buf()
+            }),
             config.agent_bin.as_deref(),
         )
         .map(runner::RunnerProc::Codex)
@@ -6682,6 +6696,10 @@ async fn provision_reviewer(
             config.allowed_tools.as_deref(),
             &config.codex_sandbox,
             &prompt,
+            reviewer_session_log.as_mut().map(|log| {
+                log.begin_turn("initial");
+                log.stderr_path().to_path_buf()
+            }),
         )
     };
     match spawn_result {
@@ -7150,7 +7168,7 @@ async fn spawn_worker(
         }
     }
 
-    let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
+    let mut worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
             &agent_name,
@@ -7394,6 +7412,10 @@ async fn spawn_worker(
                     .clone()
                     .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
                 env_vars: worker_env_vars,
+                stderr_log: worker_session_log.as_mut().map(|log| {
+                    log.begin_turn("initial");
+                    log.stderr_path().to_path_buf()
+                }),
             };
             AgentProc::spawn(&spec, config.agent_bin.as_deref()).map(runner::RunnerProc::Claude)
         }
@@ -7410,6 +7432,10 @@ async fn spawn_worker(
                     &wt_path,
                     &prompt_text,
                     &worker_env_vars,
+                    worker_session_log.as_mut().map(|log| {
+                        log.begin_turn("initial-resume");
+                        log.stderr_path().to_path_buf()
+                    }),
                     config.agent_bin.as_deref(),
                 )
                 .map(runner::RunnerProc::Codex)
@@ -7421,6 +7447,10 @@ async fn spawn_worker(
                     worktree: wt_path.clone(),
                     prompt: prompt_text.clone(),
                     env_vars: worker_env_vars,
+                    stderr_log: worker_session_log.as_mut().map(|log| {
+                        log.begin_turn("initial");
+                        log.stderr_path().to_path_buf()
+                    }),
                 };
                 codex_agent::CodexProc::spawn(&spec, config.agent_bin.as_deref())
                     .map(runner::RunnerProc::Codex)
@@ -8324,7 +8354,7 @@ async fn spawn_remediation_worker(
 
     // Author was already set by claim_remediation_rework.
 
-    let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
+    let mut worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
             &agent_name,
@@ -8561,6 +8591,10 @@ async fn spawn_remediation_worker(
                     .unwrap_or(agent::ALLOWED_TOOLS)
                     .to_string(),
                 env_vars: remediation_env,
+                stderr_log: worker_session_log.as_mut().map(|log| {
+                    log.begin_turn("initial");
+                    log.stderr_path().to_path_buf()
+                }),
             },
             config.agent_bin.as_deref(),
         )
@@ -8574,6 +8608,10 @@ async fn spawn_remediation_worker(
                 &wt_path,
                 &prompt,
                 &remediation_env,
+                worker_session_log.as_mut().map(|log| {
+                    log.begin_turn("initial-resume");
+                    log.stderr_path().to_path_buf()
+                }),
                 config.agent_bin.as_deref(),
             )
         } else {

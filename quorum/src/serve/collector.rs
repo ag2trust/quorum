@@ -535,6 +535,7 @@ async fn spawn_and_run_classifier(
                 bare: request.bare_agent,
                 allowed_tools: String::new(),
                 env_vars: request.env_vars.clone(),
+                stderr_log: None,
             };
             let mut proc = AgentProc::spawn(&spec, request.agent_bin.as_deref())
                 .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
@@ -551,6 +552,7 @@ async fn spawn_and_run_classifier(
                 worktree: request.repo_dir.clone(),
                 prompt,
                 env_vars: request.env_vars.clone(),
+                stderr_log: None,
             };
             CodexProc::spawn(&spec, request.agent_bin.as_deref())
                 .map(RunnerProc::Codex)

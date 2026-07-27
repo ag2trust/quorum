@@ -1104,9 +1104,18 @@ enum AgentEvent {
 }
 ```
 
-Do not mirror either CLI's complete schema. Preserve each raw JSON line in
+Do not mirror either CLI's complete schema. Preserve each raw stdout JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
-transcript, and ignore unknown events without advancing lifecycle state.
+transcript, and ignore unknown events without advancing lifecycle state. Every managed
+provider process also has a concurrent stderr drain into `provider-stderr.log` in its
+session directory. The stderr log is append-only, incrementally flushed, and delimits
+each provider invocation; stderr is diagnostic evidence and never independently changes
+lifecycle state. This prevents provider diagnostics from leaking to the daemon terminal
+or blocking a child on a full stderr pipe.
+
+The transcript may render reasoning summaries/items only when the public provider event
+protocol emits a safe, normalized representation. Hidden provider chain-of-thought is
+not available to Quorum and is neither requested nor claimed as captured.
 
 `journal.session_id` becomes an opaque **runner continuation ID** while retaining its
 column name for schema compatibility:

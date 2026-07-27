@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
 pub struct AgentSpec {
     #[allow(dead_code)] // consumed when runner dispatch is added
@@ -17,6 +18,7 @@ pub struct AgentSpec {
     pub bare: bool,
     pub allowed_tools: String,
     pub env_vars: Vec<(String, String)>,
+    pub stderr_log: Option<PathBuf>,
 }
 
 /// Fresh session id for a spawned agent. The claude CLI validates
@@ -32,6 +34,7 @@ pub struct AgentProc {
     child: Child,
     stdin: tokio::process::ChildStdin,
     reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_task: Option<JoinHandle<()>>,
 }
 
 /// Tool allowlist for spawned agents (dontAsk auto-denies everything else).
@@ -91,7 +94,7 @@ impl AgentProc {
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -105,12 +108,15 @@ impl AgentProc {
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
         let reader = BufReader::new(stdout).lines();
+        let stderr_task = Some(drain_stderr(stderr, spec.stderr_log.clone()));
 
         Ok(Self {
             child,
             stdin,
             reader,
+            stderr_task,
         })
     }
 
@@ -165,6 +171,7 @@ impl AgentProc {
             child,
             stdin,
             reader,
+            stderr_task: None,
         }
     }
 
@@ -176,12 +183,67 @@ impl AgentProc {
         }
         // Reap the child to avoid zombie accumulation
         let _ = self.child.wait().await;
+        if let Some(task) = self.stderr_task.take() {
+            let _ = task.await;
+        }
     }
+}
+
+fn drain_stderr(stderr: tokio::process::ChildStderr, path: Option<PathBuf>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut input = BufReader::new(stderr);
+        if let Some(path) = path.filter(|p| p.exists()) {
+            let Ok(mut output) = std::fs::OpenOptions::new().append(true).open(path) else {
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut input, &mut sink).await;
+                return;
+            };
+            let mut buf = [0; 8192];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut input, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = std::io::Write::write_all(&mut output, &buf[..n]);
+                        let _ = std::io::Write::flush(&mut output);
+                    }
+                }
+            }
+        } else {
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut input, &mut sink).await;
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stderr_drain_captures_large_diagnostics_without_waiting_for_stdout() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-stderr.log");
+        std::fs::write(&path, "--- turn ---\n").unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("head -c 1048576 /dev/zero | tr '\\0' x >&2; printf done")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let drain = drain_stderr(stderr, Some(path.clone()));
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut output = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut reader, &mut output)
+            .await
+            .unwrap();
+        assert_eq!(output, "done");
+        child.wait().await.unwrap();
+        drain.await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 1_048_589);
+    }
 
     /// The claude CLI rejects any non-UUID --session-id before the first turn;
     /// a formatted string here respawn-loops the daemon (observed 2026-07-10).
@@ -298,6 +360,7 @@ mod tests {
             bare: false,
             allowed_tools: "Bash,Read".to_string(),
             env_vars: vec![],
+            stderr_log: None,
         };
         assert_eq!(spec.allowed_tools, "Bash,Read");
     }

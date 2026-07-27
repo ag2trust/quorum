@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -22,6 +23,7 @@ pub struct CodexSpec {
     pub worktree: PathBuf,
     pub prompt: String,
     pub env_vars: Vec<(String, String)>,
+    pub stderr_log: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,7 @@ pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> 
 pub struct CodexProc {
     child: Child,
     reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr_task: Option<JoinHandle<()>>,
 }
 
 impl CodexProc {
@@ -86,6 +89,7 @@ impl CodexProc {
         worktree: &std::path::Path,
         prompt: &str,
         env_vars: &[(String, String)],
+        stderr_log: Option<PathBuf>,
         codex_bin: Option<&str>,
     ) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
@@ -98,7 +102,7 @@ impl CodexProc {
         cmd.current_dir(worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -111,9 +115,15 @@ impl CodexProc {
 
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
         let reader = BufReader::new(stdout).lines();
+        let stderr_task = Some(drain_stderr(stderr, stderr_log));
 
-        Ok(Self { child, reader })
+        Ok(Self {
+            child,
+            reader,
+            stderr_task,
+        })
     }
 
     pub fn spawn(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -127,7 +137,7 @@ impl CodexProc {
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -140,9 +150,15 @@ impl CodexProc {
 
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
         let reader = BufReader::new(stdout).lines();
+        let stderr_task = Some(drain_stderr(stderr, spec.stderr_log.clone()));
 
-        Ok(Self { child, reader })
+        Ok(Self {
+            child,
+            reader,
+            stderr_task,
+        })
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
@@ -183,7 +199,36 @@ impl CodexProc {
             }
         }
         let _ = self.child.wait().await;
+        if let Some(task) = self.stderr_task.take() {
+            let _ = task.await;
+        }
     }
+}
+
+fn drain_stderr(stderr: tokio::process::ChildStderr, path: Option<PathBuf>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut input = BufReader::new(stderr);
+        if let Some(path) = path.filter(|p| p.exists()) {
+            let Ok(mut output) = std::fs::OpenOptions::new().append(true).open(path) else {
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut input, &mut sink).await;
+                return;
+            };
+            let mut buf = [0; 8192];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut input, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let _ = std::io::Write::write_all(&mut output, &buf[..n]);
+                        let _ = std::io::Write::flush(&mut output);
+                    }
+                }
+            }
+        } else {
+            let mut sink = tokio::io::sink();
+            let _ = tokio::io::copy(&mut input, &mut sink).await;
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +247,7 @@ mod tests {
             worktree: PathBuf::from("/tmp"),
             prompt: "say hello".into(),
             env_vars: vec![],
+            stderr_log: None,
         }
     }
 
@@ -379,6 +425,7 @@ mod tests {
             worktree: PathBuf::from("/tmp"),
             prompt: "ping".into(),
             env_vars: no_auth_env(tmp.path()),
+            stderr_log: None,
         };
         let mut proc = CodexProc::spawn(&spec, None).expect("spawn codex");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
@@ -409,6 +456,7 @@ mod tests {
             worktree: PathBuf::from("/tmp"),
             prompt: "ping".into(),
             env_vars: no_auth_env(tmp.path()),
+            stderr_log: None,
         };
         let mut proc = CodexProc::spawn(&spec, None).expect("spawn codex");
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())

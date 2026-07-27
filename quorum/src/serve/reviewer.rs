@@ -121,6 +121,7 @@ pub fn spawn_reviewer(
     allowed_tools_override: Option<&str>,
     codex_sandbox: &str,
     prompt: &str,
+    stderr_log: Option<PathBuf>,
 ) -> std::io::Result<RunnerProc> {
     match kind {
         AgentKind::Claude => {
@@ -133,6 +134,7 @@ pub fn spawn_reviewer(
                 bare,
                 allowed_tools: allowed_tools_override.unwrap_or(ALLOWED_TOOLS).to_string(),
                 env_vars,
+                stderr_log: stderr_log.clone(),
             };
             AgentProc::spawn(&agent_spec, agent_bin).map(RunnerProc::Claude)
         }
@@ -144,6 +146,7 @@ pub fn spawn_reviewer(
                 worktree: worktree_path.to_path_buf(),
                 prompt: prompt.to_string(),
                 env_vars,
+                stderr_log,
             };
             codex_agent::CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)
         }

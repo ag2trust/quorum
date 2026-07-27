@@ -1,4 +1,5 @@
-//! Per-agent session log: hierarchical files (stream.jsonl, transcript.md, meta.json).
+//! Per-agent session log: hierarchical files (stream.jsonl, transcript.md,
+//! provider-stderr.log, meta.json).
 //!
 //! Each agent session gets its own directory under `{log_dir}/{agent}-{start_ts}/`.
 //! `stream.jsonl` captures raw events, `transcript.md` formats assistant output for
@@ -15,6 +16,7 @@ pub struct SessionLog {
     dir: PathBuf,
     stream_file: File,
     transcript_file: File,
+    stderr_path: PathBuf,
     meta: SessionMeta,
 }
 
@@ -56,6 +58,8 @@ impl SessionLog {
             .create(true)
             .append(true)
             .open(dir.join("transcript.md"))?;
+        let stderr_path = dir.join("provider-stderr.log");
+        File::create(&stderr_path)?;
 
         writeln!(transcript_file, "# Session: {agent} ({role})")?;
         if let Some(tid) = task_id {
@@ -83,12 +87,31 @@ impl SessionLog {
             dir,
             stream_file,
             transcript_file,
+            stderr_path,
             meta,
         })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Destination for bytes emitted on the provider's stderr. The process
+    /// transport owns the concurrent drain; this object owns attribution.
+    pub fn stderr_path(&self) -> &Path {
+        &self.stderr_path
+    }
+
+    /// Delimit provider invocations without altering their emitted bytes.
+    pub fn begin_turn(&mut self, kind: &str) {
+        if let Ok(mut file) = OpenOptions::new().append(true).open(&self.stderr_path) {
+            let _ = writeln!(
+                file,
+                "\n--- quorum provider turn {kind} at {} ---",
+                super::now_unix()
+            );
+            let _ = file.flush();
+        }
     }
 
     #[cfg(test)]
@@ -212,6 +235,7 @@ mod tests {
 
         assert!(log.dir().join("stream.jsonl").exists());
         assert!(log.dir().join("transcript.md").exists());
+        assert!(log.dir().join("provider-stderr.log").exists());
 
         let event = Event::Assistant {
             message: serde_json::json!({"content": "Hello world"}),

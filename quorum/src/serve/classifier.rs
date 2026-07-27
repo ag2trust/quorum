@@ -41,6 +41,7 @@ pub fn classifier_spec_for(repo_dir: &Path, bare: bool, model: &str, effort: &st
         bare,
         allowed_tools: String::new(),
         env_vars: vec![],
+        stderr_log: None,
     }
 }
 
@@ -73,6 +74,7 @@ pub fn spawn_classifier_configured(
                 worktree: repo_dir.to_path_buf(),
                 prompt: classify::build_prompt(tasks, dup_context),
                 env_vars: vec![],
+                stderr_log: None,
             };
             CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)?
         }

@@ -109,6 +109,7 @@ pub fn spawn_doctor(
             ("QUORUM_REPO".into(), repo.into()),
             ("QUORUM_AGENT".into(), "Doctor".into()),
         ],
+        stderr_log: None,
     };
 
     let proc = AgentProc::spawn(&spec, agent_bin)?;
