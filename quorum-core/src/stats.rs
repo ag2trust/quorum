@@ -98,6 +98,13 @@ pub struct TierQueueCount {
 pub struct BlockedTask {
     pub id: i64,
     pub title: String,
+    /// Display identity from an explicit task tier, or `pending` when this
+    /// read-only snapshot cannot know the daemon's configured default.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Legacy compact label retained for JSON consumers. It is not an
+    /// execution identity and cockpit rendering must not use it.
     pub tier_eff: String,
     pub waiting_on: Vec<i64>,
     /// Dep ids that are cancelled — will never unblock without intervention.
@@ -191,6 +198,10 @@ pub struct DaemonAgentView {
     pub log_dir: Option<String>,
     pub last_activity_age_secs: Option<i64>,
     pub task_title: Option<String>,
+    /// Exact identity persisted for this managed run.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub tier_eff: Option<String>,
     pub pr: Option<i64>,
     pub rework_count: i32,
@@ -207,6 +218,9 @@ pub struct DaemonAgentView {
 pub struct QueueTask {
     pub id: i64,
     pub title: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub tier_eff: String,
     pub priority: i64,
     pub pr: Option<i64>,
@@ -217,6 +231,11 @@ pub struct QueueTask {
 pub struct PipelineTask {
     pub id: i64,
     pub title: String,
+    /// Identity of the latest managed run for this task, ordered by
+    /// `(spawned_at, id)` descending. This makes rework/R1/R2 history stable.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub status: String,
     pub pr: Option<i64>,
     pub blocked: bool,
@@ -708,6 +727,9 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
         blocked.push(BlockedTask {
             id,
             title,
+            provider: Some(task_display_identity(labels.as_deref()).0),
+            model: Some(task_display_identity(labels.as_deref()).1),
+            effort: Some(task_display_identity(labels.as_deref()).2),
             tier_eff: tier_eff_label(labels.as_deref()),
             waiting_on,
             deadlocked_on,
@@ -935,6 +957,24 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         } else {
             (None, None)
         };
+        let (provider, model, effort) = e.task_id.map_or((None, None, None), |tid| {
+            conn.query_row(
+                "SELECT provider, model, effort FROM agent_runs
+                 WHERE task_id=?1 AND agent_name=?2 AND role=?3
+                 ORDER BY spawned_at DESC, id DESC LIMIT 1",
+                params![tid, e.agent, e.role],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+            .map(|(provider, model, effort)| {
+                (
+                    provider.or_else(|| Some("unknown".into())),
+                    Some(model),
+                    Some(effort),
+                )
+            })
+            .unwrap_or((None, None, None))
+        });
         let (
             tool_count,
             now_label,
@@ -983,6 +1023,9 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
             log_dir: e.log_dir,
             last_activity_age_secs,
             task_title,
+            provider,
+            model,
+            effort,
             tier_eff,
             pr: e.pr,
             rework_count: e.rework_count,
@@ -1081,6 +1124,9 @@ fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
         result.push(QueueTask {
             id,
             title,
+            provider: Some(task_display_identity(labels.as_deref()).0),
+            model: Some(task_display_identity(labels.as_deref()).1),
+            effort: Some(task_display_identity(labels.as_deref()).2),
             tier_eff: tier_eff_label(labels.as_deref()),
             priority,
             pr: extract_pr_from_refs(refs.as_deref()),
@@ -1122,15 +1168,70 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let mut result = Vec::new();
     for (id, title, status, refs, _depends_on) in rows {
         let pr = extract_pr_from_refs(refs.as_deref());
+        let (provider, model, effort) = conn
+            .query_row(
+                "SELECT provider, model, effort FROM agent_runs WHERE task_id=?1
+                 ORDER BY spawned_at DESC, id DESC LIMIT 1",
+                params![id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+            .map(|(provider, model, effort)| {
+                (
+                    Some(provider.unwrap_or_else(|| "unknown".into())),
+                    Some(model),
+                    Some(effort),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    Some("pending".into()),
+                    Some("pending".into()),
+                    Some("pending".into()),
+                )
+            });
         result.push(PipelineTask {
             id,
             title,
+            provider,
+            model,
+            effort,
             status,
             pr,
             blocked: false,
         });
     }
     Ok(result)
+}
+
+/// Resolve only an explicit task tier into a display identity. Queue/blocked status
+/// is a read-only process and does not own the daemon's resolved serve config, so
+/// missing values are deliberately marked pending rather than guessed.
+fn task_display_identity(labels_json: Option<&str>) -> (String, String, String) {
+    let labels: Vec<String> = labels_json
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    let tier = labels.iter().find_map(|label| label.strip_prefix("tier:"));
+    let model = tier
+        .and_then(crate::model_tiers::model_id_for_tier)
+        .map(str::to_string);
+    let provider = model.as_deref().map(|model| {
+        if model.starts_with("claude-") {
+            "claude"
+        } else {
+            "codex"
+        }
+    });
+    let effort = labels
+        .iter()
+        .find_map(|label| label.strip_prefix("effort:"))
+        .filter(|effort| matches!(*effort, "medium" | "high"))
+        .unwrap_or("pending");
+    (
+        provider.unwrap_or("pending").to_string(),
+        model.unwrap_or_else(|| "pending".into()),
+        effort.to_string(),
+    )
 }
 
 /// Deduped errors from the last hour, with a count of older silenced errors (#204).
@@ -2295,6 +2396,9 @@ mod tests {
             last_activity_age_secs: age,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2335,6 +2439,9 @@ mod tests {
             last_activity_age_secs: age,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2526,6 +2633,9 @@ mod tests {
             last_activity_age_secs: None,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2555,6 +2665,9 @@ mod tests {
             last_activity_age_secs: None,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2825,6 +2938,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("task".into()),
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2853,6 +2969,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("task".into()),
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
