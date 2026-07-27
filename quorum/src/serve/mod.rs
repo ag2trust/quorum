@@ -928,6 +928,14 @@ struct CodexRetryTurn {
     thread_id: Option<String>,
 }
 
+fn worker_done_event(rework_count: u32, pr: i64) -> Event {
+    if rework_count > 0 {
+        Event::ReworkPushed
+    } else {
+        Event::SignaledDone { pr: pr.to_string() }
+    }
+}
+
 fn codex_retry_turn(refs: Option<&str>) -> Option<CodexRetryTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
     if !refs.get("codex_retry_requested")?.as_bool()? {
@@ -945,77 +953,171 @@ fn codex_retry_turn(refs: Option<&str>) -> Option<CodexRetryTurn> {
     })
 }
 
-fn worker_done_event(rework_count: u32, pr: i64) -> Event {
-    if rework_count > 0 {
-        Event::ReworkPushed
-    } else {
-        Event::SignaledDone { pr: pr.to_string() }
-    }
-}
-
-/// Resolve the task a roster-unmatched Done row genuinely belongs to.
-///
-/// Returns the task only when the row carries an exact task identity and still
-/// belongs to that task's current author/assignee in a worker-owned phase.
-/// Legacy NULL-task rows remain inert: an agent name can be reused, so name
-/// ownership alone cannot safely associate a delayed row with a task.
-async fn late_worker_done_task(
+/// Fold a worker completion that arrived after its slot disappeared. The core
+/// transaction re-reads the exact mailbox row, validates its durable identity,
+/// applies the lifecycle event, and consumes it together.
+async fn recover_late_worker_done_atomic(
     db_path: &Path,
-    agent: &str,
-    row_task_id: Option<i64>,
-) -> Result<Option<tasks::Task>> {
-    let Some(task_id) = row_task_id else {
-        return Ok(None);
+    mailbox_id: i64,
+    row: &mailbox::MailboxRow,
+) -> Result<bool> {
+    let (Some(task_id), Some(pr)) = (row.task_id, row.pr) else {
+        return Ok(false);
     };
+    if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
+        return Ok(false);
+    }
     let p = db_path.to_path_buf();
-    let agent = agent.to_string();
-    tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
-        let conn = quorum_core::db::open(&p)?;
-        Ok(tasks::get(&conn, task_id)?.filter(|t| {
-            t.author.as_deref() == Some(agent.as_str())
-                && t.assignee.as_deref() == Some(agent.as_str())
-                && matches!(t.status.as_str(), "working" | "rework")
-        }))
+    let agent = row.agent.clone();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::recover_late_worker_completion(
+            &mut conn,
+            mailbox_id,
+            &agent,
+            task_id,
+            pr,
+            now_unix(),
+        )
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))?
+    .map_err(|error| QuorumError::Io(format!("late worker recovery join: {error}")))?
 }
 
-/// Drive the lifecycle for a Done row that arrived after its worker slot was
-/// already reaped. Returns `true` when the transition was applied and the
-/// caller should consume the row; `false` leaves it a phantom.
-///
-/// Codex workers exit at turn end, immediately after `quorum submit` writes the
-/// mailbox row. Phase 4b (dead-worker detection) runs *after* Phase 2 in the
-/// same tick, so a slot can be torn down between the write and the read — the
-/// row then matches nobody. Dropping it wedges the task in `working` forever:
-/// `serve::recovery` deliberately leaves provider-blocked tasks in place on
-/// restart, so nothing heals it later.
+#[cfg(test)]
 async fn recover_late_worker_done(db_path: &Path, row: &mailbox::MailboxRow) -> Result<bool> {
-    let Some(task) = late_worker_done_task(db_path, &row.agent, row.task_id).await? else {
-        return Ok(false);
-    };
-    // Same PR resolution as the matched-worker path: prefer the row, fall back
-    // to the PR recorded in refs.
-    let Some(pr) = row.pr.or_else(|| tasks::extract_pr_number(&task.refs)) else {
-        return Ok(false);
-    };
-    log(&format!(
-        "recovering late Done row from reaped worker {} — task #{} ({}) pr #{pr}",
-        row.agent, task.id, task.status
-    ));
-    // Derive the event from the task's current phase rather than rework_round:
-    // a re-claimed task carries a non-zero round while sitting in `working`,
-    // where ReworkPushed is rejected. Stale codex_provider_* / codex_retry_*
-    // refs are cleared by the transition itself (tasks::clear_codex_retry_refs)
-    // — the worker succeeded, so a staged retry would re-run finished work.
-    let event = worker_done_event(u32::from(task.status == "rework"), pr);
-    // No slot to attach here: Phase 5 provisions the reviewer for the resulting
-    // in-review task on the next tick.
-    fire_event_result(db_path, &row.agent, task.id, &event)
+    let p = db_path.to_path_buf();
+    let row = row.clone();
+    let row_for_append = row.clone();
+    let mailbox_id = tokio::task::spawn_blocking(move || -> Result<i64> {
+        let mut conn = quorum_core::db::open(&p)?;
+        mailbox::append(&mut conn, &row_for_append)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row).await
+}
+
+async fn recover_late_worker_completions(config: &ServeConfig) -> Result<()> {
+    let p = config.db_path.clone();
+    let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, mailbox::MailboxRow)>> {
+        let conn = quorum_core::db::open(&p)?;
+        mailbox::poll_unconsumed(&conn)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late worker poll join: {error}")))??;
+    for (mailbox_id, row) in rows {
+        if recover_late_worker_done_atomic(&config.db_path, mailbox_id, &row).await? {
+            log(&format!(
+                "startup worker recovery: folded {} completion for task {:?}",
+                row.agent, row.task_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile late reviewer verdicts before generic recovery deletes the
+/// journal/worktree identity. Git and PR-head lookups happen before the core
+/// transaction; that transaction itself is storage-only.
+async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
+    let p = config.db_path.clone();
+    let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, mailbox::MailboxRow)>> {
+        let conn = quorum_core::db::open(&p)?;
+        mailbox::poll_unconsumed(&conn)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late reviewer poll join: {error}")))??;
+    for (mailbox_id, row) in rows {
+        let (Some(task_id), Some(pr), Some(raw_verdict)) =
+            (row.task_id, row.pr, row.verdict.as_deref())
+        else {
+            continue;
+        };
+        if row.kind != mailbox::MailboxKind::Done {
+            continue;
+        }
+        let gated = crate::verdict::gate(Some(raw_verdict), row.payload.as_deref());
+        let verdict = match gated.verdict.as_deref() {
+            Some("approved") => tasks::LateReviewerVerdict::Approved,
+            Some("changes") => tasks::LateReviewerVerdict::Changes,
+            _ => continue,
+        };
+        // A changed PR invalidates an approval, not a changes verdict. Changes
+        // must still enter durable rework before stateless recovery discards
+        // the reviewer journal identity; no approval is being stamped.
+        let reviewed_sha = if verdict == tasks::LateReviewerVerdict::Approved {
+            let p = config.db_path.clone();
+            let agent = row.agent.clone();
+            let reviewed_sha = tokio::task::spawn_blocking(move || -> Option<String> {
+                let conn = quorum_core::db::open(&p).ok()?;
+                let worktree: String = conn
+                    .query_row(
+                        "SELECT worktree FROM journal
+                         WHERE agent=?1 AND role='reviewer' AND task_id=?2 AND pr=?3",
+                        (&agent, task_id, pr),
+                        |r| r.get(0),
+                    )
+                    .ok()?;
+                let output = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(worktree)
+                    .output()
+                    .ok()?;
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(reviewed_sha) = reviewed_sha.filter(|sha| !sha.is_empty()) else {
+                continue;
+            };
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let current_sha = tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                .await
+                .ok()
+                .flatten();
+            if current_sha.as_deref() != Some(reviewed_sha.as_str()) {
+                log(&format!(
+                    "startup verdict recovery: PR #{pr} changed since {} reviewed it; retaining approval for fresh review",
+                    row.agent
+                ));
+                continue;
+            }
+            reviewed_sha
+        } else {
+            String::new()
+        };
+        let p = config.db_path.clone();
+        let agent = row.agent.clone();
+        let recovered = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::recover_late_reviewer_verdict(
+                &mut conn,
+                mailbox_id,
+                &agent,
+                task_id,
+                pr,
+                verdict,
+                gated.blocking_count.unwrap_or(0) as i64,
+                &reviewed_sha,
+                now_unix(),
+            )
+        })
         .await
-        .map(|_| true)
-        .map_err(QuorumError::Io)
+        .map_err(|error| QuorumError::Io(format!("late reviewer recovery join: {error}")))??;
+        if recovered {
+            log(&format!(
+                "startup verdict recovery: folded {} verdict for task #{task_id}, PR #{pr}",
+                row.agent
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
@@ -1324,6 +1426,21 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 &sha[..12.min(sha.len())]
             ));
         }
+    }
+
+    // Fold outcomes that were committed by a managed process just before the
+    // prior daemon died. These passes must run before approval and stateless
+    // recovery: the latter may reset task state or delete the journal row that
+    // supplies the exact managed-run identity.
+    if let Err(e) = recover_late_worker_completions(config).await {
+        log(&format!(
+            "late worker startup recovery failed: {e} — continuing"
+        ));
+    }
+    if let Err(e) = recover_late_reviewer_verdicts(config).await {
+        log(&format!(
+            "late reviewer startup recovery failed: {e} — continuing"
+        ));
     }
 
     // #228: approval recovery — merge already-approved PRs from durable,
@@ -4154,10 +4271,7 @@ async fn tick(
         // reaped between the `quorum submit` write and this read (Phase 4b
         // runs after Phase 2 in the same tick): that signal is genuine, and
         // discarding it wedges the task in `working` forever.
-        if recover_late_worker_done(&db_path, row).await? {
-            if !consume_mailbox_row(&db_path, *id).await {
-                break;
-            }
+        if recover_late_worker_done_atomic(&db_path, *id, row).await? {
             break;
         }
         log(&format!(
@@ -11608,6 +11722,30 @@ mod tests {
         tasks::claim(&mut conn, agent, Some(task_id), &[], 3600, now)
             .unwrap()
             .expect("claim must succeed");
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent.into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "late-worker".into(),
+                worktree: None,
+                branch: None,
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+            },
+        )
+        .unwrap();
+        quorum_core::agent_runs::insert(
+            &conn, task_id, agent, "worker", "model", "high", "codex", now,
+        )
+        .unwrap();
         if let Some(refs) = refs {
             tasks::update_refs_daemon(&mut conn, task_id, refs, now).unwrap();
         }
@@ -11703,20 +11841,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_done_row_backfills_pr_from_refs() {
+    async fn late_done_row_without_exact_pr_is_not_recovered() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("late-done-backfill.db");
         let id = working_task(&db_path, "Spool-9mti", Some(r#"{"pr":439}"#));
 
         assert!(
-            recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), None))
+            !recover_late_worker_done(&db_path, &done_row("Spool-9mti", Some(id), None))
                 .await
                 .unwrap(),
-            "PR must be backfilled from refs when the row carries none"
+            "late recovery must require the exact submitted PR"
         );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
-        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "in-review");
+        assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "working");
     }
 
     #[tokio::test]

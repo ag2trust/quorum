@@ -688,7 +688,7 @@ pub fn apply_event(
     now: i64,
 ) -> Result<TransitionResult> {
     let tx = begin_immediate(conn)?;
-    apply_event_tx(tx, agent, id, event, now)
+    apply_event_tx(tx, agent, id, event, now, |_| Ok(()))
 }
 
 /// Atomically fail a reviewer only while it still owns the active review phase.
@@ -726,17 +726,260 @@ pub fn fail_reviewer_if_owner(
             reason: reason.to_string(),
         },
         now,
+        |_| Ok(()),
     )
     .map(Some)
 }
 
-fn apply_event_tx(
+/// Verdict supplied to late-review recovery. R1/R2 is deliberately not an
+/// input: it is derived from the durable `agent_runs.sub_role` identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateReviewerVerdict {
+    Approved,
+    Changes,
+}
+
+/// Fold a worker submission that committed before a daemon restart into the
+/// lifecycle before generic recovery can discard the journal identity that
+/// proves its authority. The exact mailbox row is re-read and consumed in the
+/// same transaction as the lifecycle transition.
+pub fn recover_late_worker_completion(
+    conn: &mut Connection,
+    mailbox_id: i64,
+    agent: &str,
+    task_id: i64,
+    pr: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT t.status
+             FROM mailbox m
+             JOIN tasks t ON t.id=m.task_id
+             JOIN journal j ON j.agent=m.agent AND j.role='worker'
+                           AND j.task_id=m.task_id
+             WHERE m.id=?1 AND m.consumed_at IS NULL AND m.kind='done'
+               AND m.verdict IS NULL AND m.agent=?2 AND m.task_id=?3 AND m.pr=?4
+               AND t.status IN ('working','rework') AND t.assignee=m.agent
+               AND (json_extract(t.refs, '$.pr') IS NULL
+                    OR json_extract(t.refs, '$.pr')=?4)
+               AND EXISTS (
+                   SELECT 1 FROM agent_runs ar
+                   WHERE ar.task_id=m.task_id AND ar.agent_name=m.agent
+                     AND ar.role='worker'
+               )",
+            params![mailbox_id, agent, task_id, pr],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    let event = if status == "rework" {
+        Event::ReworkPushed
+    } else {
+        Event::SignaledDone { pr: pr.to_string() }
+    };
+    apply_event_tx(tx, agent, task_id, &event, now, |tx| {
+        consume_late_mailbox(tx, mailbox_id, now)
+    })
+    .map(|_| true)
+}
+
+/// Fold a reviewer verdict that committed before a daemon restart. Validation,
+/// approval persistence/invalidation, transition, and mailbox consumption are
+/// deliberately one immediate transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn recover_late_reviewer_verdict(
+    conn: &mut Connection,
+    mailbox_id: i64,
+    agent: &str,
+    task_id: i64,
+    pr: i64,
+    verdict: LateReviewerVerdict,
+    blocking_count: i64,
+    reviewed_head_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let role: Option<String> = tx
+        .query_row(
+            "SELECT CASE WHEN ar.sub_role='r2' THEN 'r2' WHEN ar.sub_role IS NULL THEN 'r1' END
+             FROM mailbox m
+             JOIN tasks t ON t.id=m.task_id
+             JOIN journal j ON j.agent=m.agent AND j.role='reviewer'
+                           AND j.task_id=m.task_id AND j.pr=m.pr
+             JOIN agent_runs ar ON ar.id=(
+                 SELECT MAX(ar2.id) FROM agent_runs ar2
+                 WHERE ar2.task_id=m.task_id AND ar2.agent_name=m.agent
+                   AND ar2.role='reviewer'
+             )
+             WHERE m.id=?1 AND m.consumed_at IS NULL AND m.kind='done'
+               AND m.agent=?2 AND m.task_id=?3 AND m.pr=?4
+               AND t.status='in-review' AND t.reviewer=m.agent
+               AND (ar.sub_role IS NULL OR ar.sub_role='r2')
+               AND ((?5='approved' AND m.verdict='approved')
+                    OR (?5='changes' AND m.verdict='changes'))",
+            params![
+                mailbox_id,
+                agent,
+                task_id,
+                pr,
+                match verdict {
+                    LateReviewerVerdict::Approved => "approved",
+                    LateReviewerVerdict::Changes => "changes",
+                }
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(role) = role else {
+        tx.commit()?;
+        return Ok(false);
+    };
+
+    let author: String = tx.query_row(
+        "SELECT COALESCE(author, '') FROM tasks WHERE id=?1",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+
+    match verdict {
+        LateReviewerVerdict::Approved => {
+            if reviewed_head_sha.is_empty() {
+                tx.commit()?;
+                return Ok(false);
+            }
+            if role == "r2" {
+                let valid_r1 = tx
+                    .query_row(
+                        "SELECT 1 FROM approvals
+                         WHERE pr_number=?1 AND review_role='r1' AND task_id=?2
+                           AND verdict='approved' AND blocking_count=0
+                           AND approved_head_sha=?3 AND reviewer != ?4",
+                        params![pr, task_id, reviewed_head_sha, agent],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !valid_r1 {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+                return apply_event_tx(tx, agent, task_id, &Event::VerdictApprove, now, |tx| {
+                    upsert_late_approval(
+                        tx,
+                        pr,
+                        &role,
+                        task_id,
+                        &author,
+                        agent,
+                        blocking_count,
+                        reviewed_head_sha,
+                        now,
+                    )?;
+                    consume_late_mailbox(tx, mailbox_id, now)
+                })
+                .map(|_| true);
+            }
+            upsert_late_approval(
+                &tx,
+                pr,
+                &role,
+                task_id,
+                &author,
+                agent,
+                blocking_count,
+                reviewed_head_sha,
+                now,
+            )?;
+            consume_late_mailbox(&tx, mailbox_id, now)?;
+            tx.commit()?;
+            Ok(true)
+        }
+        LateReviewerVerdict::Changes => {
+            apply_event_tx(tx, agent, task_id, &Event::VerdictChanges, now, |tx| {
+                tx.execute(
+                    "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
+                    params![pr, task_id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET assignee=NULL,
+                     refs=json_set(COALESCE(refs, '{}'),
+                       '$.daemon_rework_retry_requested', json('true'))
+                     WHERE id=?1 AND status='rework'",
+                    params![task_id],
+                )?;
+                consume_late_mailbox(tx, mailbox_id, now)
+            })
+            .map(|_| true)
+        }
+    }
+}
+
+fn consume_late_mailbox(tx: &Transaction<'_>, mailbox_id: i64, now: i64) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE mailbox SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL",
+        params![now, mailbox_id],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(format!(
+            "late mailbox row {mailbox_id} was not consumed"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_late_approval(
+    tx: &Transaction<'_>,
+    pr: i64,
+    role: &str,
+    task_id: i64,
+    author: &str,
+    reviewer: &str,
+    blocking_count: i64,
+    reviewed_head_sha: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO approvals
+           (pr_number, review_role, task_id, author, reviewer, verdict,
+            blocking_count, approved_head_sha, created_at)
+         VALUES (?1,?2,?3,?4,?5,'approved',?6,?7,?8)
+         ON CONFLICT(pr_number, review_role) DO UPDATE SET
+           task_id=excluded.task_id, author=excluded.author,
+           reviewer=excluded.reviewer, verdict=excluded.verdict,
+           blocking_count=excluded.blocking_count,
+           approved_head_sha=excluded.approved_head_sha,
+           created_at=excluded.created_at",
+        params![
+            pr,
+            role,
+            task_id,
+            author,
+            reviewer,
+            blocking_count,
+            reviewed_head_sha,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn apply_event_tx<F>(
     tx: Transaction<'_>,
     agent: &str,
     id: i64,
     event: &Event,
     now: i64,
-) -> Result<TransitionResult> {
+    before_commit: F,
+) -> Result<TransitionResult>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
 
@@ -957,6 +1200,8 @@ fn apply_event_tx(
         &format!("by {agent}"),
         now,
     )?;
+
+    before_commit(&tx)?;
 
     let mut result_task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
@@ -1310,6 +1555,7 @@ pub fn dispose_managed_exit(
             reason: reason.to_string(),
         },
         now,
+        |_| Ok(()),
     )
     .map(|transition| ManagedExitDisposition::AgentFailed(Box::new(transition)))
 }
@@ -1835,6 +2081,402 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
         (dir, c)
+    }
+
+    fn late_worker_identity(c: &mut Connection, task_id: i64, agent: &str, pr: Option<i64>) {
+        crate::journal::upsert(
+            c,
+            &crate::journal::JournalEntry {
+                agent: agent.into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "worker-run".into(),
+                worktree: None,
+                branch: None,
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr,
+                rework_count: 0,
+            },
+        )
+        .unwrap();
+        crate::agent_runs::insert(c, task_id, agent, "worker", "model", "high", "codex", 1000)
+            .unwrap();
+    }
+
+    fn late_reviewer_fixture(c: &mut Connection, r2: bool) -> (i64, i64) {
+        let task_id = create(
+            c,
+            "owner",
+            "late reviewer",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(c, "worker", Some(task_id), &[], TTL, 1000).unwrap();
+        apply_event(
+            c,
+            "worker",
+            task_id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(c, "reviewer", Some(task_id), &[], TTL, 1002).unwrap();
+        crate::journal::upsert(
+            c,
+            &crate::journal::JournalEntry {
+                agent: "reviewer".into(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "review-run".into(),
+                worktree: Some("/tmp/reviewer".into()),
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(42),
+                rework_count: 0,
+            },
+        )
+        .unwrap();
+        if r2 {
+            crate::agent_runs::insert_r2(c, task_id, "reviewer", "model", "high", "codex", 1002)
+                .unwrap();
+        } else {
+            crate::agent_runs::insert(
+                c, task_id, "reviewer", "reviewer", "model", "high", "codex", 1002,
+            )
+            .unwrap();
+        }
+        let mailbox_id = crate::mailbox::append(
+            c,
+            &crate::mailbox::MailboxRow {
+                agent: "reviewer".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(task_id),
+                pr: Some(42),
+                verdict: Some("approved".into()),
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: Some(r#"{"blocking":0}"#.into()),
+            },
+        )
+        .unwrap();
+        (task_id, mailbox_id)
+    }
+
+    #[test]
+    fn late_worker_completion_folds_and_consumes_atomically() {
+        let (_d, mut c) = open_tmp();
+        let task_id = create(
+            &mut c,
+            "owner",
+            "late worker",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(task_id), &[], TTL, 1000).unwrap();
+        late_worker_identity(&mut c, task_id, "worker", None);
+        let mailbox_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(task_id),
+                pr: Some(42),
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            recover_late_worker_completion(&mut c, mailbox_id, "worker", task_id, 42, 1001)
+                .unwrap()
+        );
+        assert_eq!(get(&c, task_id).unwrap().unwrap().status, "in-review");
+        assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
+        let events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_in_review'",
+                [lease_target(task_id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn late_replacement_completion_preserves_pr_and_uses_rework_pushed() {
+        let (_d, mut c) = open_tmp();
+        let task_id = create(
+            &mut c,
+            "owner",
+            "late rework",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "original", Some(task_id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "original",
+            task_id,
+            &Event::SignaledDone { pr: "42".into() },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(task_id), &[], TTL, 1002).unwrap();
+        apply_event(&mut c, "reviewer", task_id, &Event::VerdictChanges, 1003).unwrap();
+        c.execute(
+            "UPDATE tasks SET assignee='replacement' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        late_worker_identity(&mut c, task_id, "replacement", Some(42));
+        let mailbox_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "replacement".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(task_id),
+                pr: Some(42),
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        assert!(recover_late_worker_completion(
+            &mut c,
+            mailbox_id,
+            "replacement",
+            task_id,
+            42,
+            1004
+        )
+        .unwrap());
+        let task = get(&c, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(extract_pr_number(&task.refs), Some(42));
+        assert_eq!(task.author.as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn late_r1_approval_persists_once_without_merging() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, false);
+        assert!(recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Approved,
+            0,
+            "head",
+            1003
+        )
+        .unwrap());
+        assert_eq!(get(&c, task_id).unwrap().unwrap().status, "in-review");
+        assert_eq!(crate::approvals::get_for_pr(&c, 42).unwrap().len(), 1);
+        assert!(crate::approvals::get(&c, 42, "r1").unwrap().is_some());
+        assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn late_r2_requires_matching_distinct_r1_then_enters_merging() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, true);
+        crate::approvals::record(
+            &mut c,
+            &crate::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "r1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head".into(),
+            },
+        )
+        .unwrap();
+        assert!(recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Approved,
+            0,
+            "head",
+            1003
+        )
+        .unwrap());
+        assert_eq!(get(&c, task_id).unwrap().unwrap().status, "merging");
+        assert_eq!(crate::approvals::get_for_pr(&c, 42).unwrap().len(), 2);
+        let events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_merging'",
+                [lease_target(task_id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn late_r2_rejects_missing_or_stale_r1_without_mutation() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, true);
+        assert!(!recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Approved,
+            0,
+            "head",
+            1003,
+        )
+        .unwrap());
+        crate::approvals::record(
+            &mut c,
+            &crate::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "r1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "old-head".into(),
+            },
+        )
+        .unwrap();
+        assert!(!recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Approved,
+            0,
+            "head",
+            1003,
+        )
+        .unwrap());
+        assert_eq!(get(&c, task_id).unwrap().unwrap().status, "in-review");
+        assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn late_r1_and_r2_changes_enter_rework_and_clear_approvals() {
+        for r2 in [false, true] {
+            let (_d, mut c) = open_tmp();
+            let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, r2);
+            c.execute(
+                "UPDATE mailbox SET verdict='changes', payload='{\"blocking\":1}' WHERE id=?1",
+                [mailbox_id],
+            )
+            .unwrap();
+            crate::approvals::record(
+                &mut c,
+                &crate::approvals::Approval {
+                    pr_number: 42,
+                    review_role: "r1".into(),
+                    task_id,
+                    author: "worker".into(),
+                    reviewer: "prior-r1".into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head".into(),
+                },
+            )
+            .unwrap();
+            assert!(recover_late_reviewer_verdict(
+                &mut c,
+                mailbox_id,
+                "reviewer",
+                task_id,
+                42,
+                LateReviewerVerdict::Changes,
+                1,
+                "",
+                1003,
+            )
+            .unwrap());
+            assert_eq!(get(&c, task_id).unwrap().unwrap().status, "rework");
+            assert!(crate::approvals::get_for_pr(&c, 42).unwrap().is_empty());
+            assert_eq!(crate::mailbox::poll_unconsumed(&c).unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn late_reviewer_rejects_missing_journal_and_rolls_back_on_consume_failure() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, mailbox_id) = late_reviewer_fixture(&mut c, false);
+        c.execute("DELETE FROM journal WHERE agent='reviewer'", [])
+            .unwrap();
+        assert!(!recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Approved,
+            0,
+            "head",
+            1003
+        )
+        .unwrap());
+        c.execute("INSERT INTO journal(agent,role,task_id,session_id,phase,cost_tokens,cost_usd,pr,rework_count,updated_at) VALUES ('reviewer','reviewer',?1,'run','reviewing',0,0,42,0,1000)", [task_id]).unwrap();
+        c.execute_batch("CREATE TRIGGER reject_late_consume BEFORE UPDATE OF consumed_at ON mailbox BEGIN SELECT RAISE(ABORT, 'consume failed'); END;").unwrap();
+        assert!(recover_late_reviewer_verdict(
+            &mut c,
+            mailbox_id,
+            "reviewer",
+            task_id,
+            42,
+            LateReviewerVerdict::Approved,
+            0,
+            "head",
+            1003
+        )
+        .is_err());
+        assert!(crate::approvals::get(&c, 42, "r1").unwrap().is_none());
+        assert_eq!(get(&c, task_id).unwrap().unwrap().status, "in-review");
     }
 
     const TTL: i64 = 3600;
