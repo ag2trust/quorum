@@ -98,6 +98,13 @@ pub struct TierQueueCount {
 pub struct BlockedTask {
     pub id: i64,
     pub title: String,
+    /// Display identity from an explicit task tier, or `pending` when this
+    /// read-only snapshot cannot know the daemon's configured default.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Legacy compact label retained for JSON consumers. It is not an
+    /// execution identity and cockpit rendering must not use it.
     pub tier_eff: String,
     pub waiting_on: Vec<i64>,
     /// Dep ids that are cancelled — will never unblock without intervention.
@@ -191,6 +198,10 @@ pub struct DaemonAgentView {
     pub log_dir: Option<String>,
     pub last_activity_age_secs: Option<i64>,
     pub task_title: Option<String>,
+    /// Exact identity persisted for this managed run.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub tier_eff: Option<String>,
     pub pr: Option<i64>,
     pub rework_count: i32,
@@ -207,6 +218,9 @@ pub struct DaemonAgentView {
 pub struct QueueTask {
     pub id: i64,
     pub title: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub tier_eff: String,
     pub priority: i64,
     pub pr: Option<i64>,
@@ -217,6 +231,11 @@ pub struct QueueTask {
 pub struct PipelineTask {
     pub id: i64,
     pub title: String,
+    /// Identity of the latest managed run for this task, ordered by
+    /// `(spawned_at, id)` descending. This makes rework/R1/R2 history stable.
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub status: String,
     pub pr: Option<i64>,
     pub blocked: bool,
@@ -708,6 +727,9 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
         blocked.push(BlockedTask {
             id,
             title,
+            provider: Some(task_display_identity(labels.as_deref()).0),
+            model: Some(task_display_identity(labels.as_deref()).1),
+            effort: Some(task_display_identity(labels.as_deref()).2),
             tier_eff: tier_eff_label(labels.as_deref()),
             waiting_on,
             deadlocked_on,
@@ -935,6 +957,26 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
         } else {
             (None, None)
         };
+        let (provider, model, effort) = e.task_id.map_or((None, None, None), |tid| {
+            conn.query_row(
+                "SELECT provider, model, effort FROM agent_runs
+                 WHERE task_id=?1 AND agent_name=?2 AND role=?3
+                 ORDER BY spawned_at DESC, id DESC LIMIT 1",
+                params![tid, e.agent, e.role],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+            .map(|(provider, model, effort)| {
+                (
+                    // v31 added this nullable column; NULL is the documented
+                    // legacy-Claude meaning, not an unknown provider.
+                    provider.or_else(|| Some("claude".into())),
+                    Some(model),
+                    Some(effort),
+                )
+            })
+            .unwrap_or((None, None, None))
+        });
         let (
             tool_count,
             now_label,
@@ -983,6 +1025,9 @@ fn daemon_agents_view(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView
             log_dir: e.log_dir,
             last_activity_age_secs,
             task_title,
+            provider,
+            model,
+            effort,
             tier_eff,
             pr: e.pr,
             rework_count: e.rework_count,
@@ -1081,6 +1126,9 @@ fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
         result.push(QueueTask {
             id,
             title,
+            provider: Some(task_display_identity(labels.as_deref()).0),
+            model: Some(task_display_identity(labels.as_deref()).1),
+            effort: Some(task_display_identity(labels.as_deref()).2),
             tier_eff: tier_eff_label(labels.as_deref()),
             priority,
             pr: extract_pr_from_refs(refs.as_deref()),
@@ -1122,15 +1170,69 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let mut result = Vec::new();
     for (id, title, status, refs, _depends_on) in rows {
         let pr = extract_pr_from_refs(refs.as_deref());
+        let (provider, model, effort) = conn
+            .query_row(
+                "SELECT provider, model, effort FROM agent_runs WHERE task_id=?1
+                 ORDER BY spawned_at DESC, id DESC LIMIT 1",
+                params![id],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok()
+            .map(|(provider, model, effort)| {
+                (
+                    // See the v31 migration: pre-existing rows are Claude.
+                    Some(provider.unwrap_or_else(|| "claude".into())),
+                    Some(model),
+                    Some(effort),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    Some("pending".into()),
+                    Some("pending".into()),
+                    Some("pending".into()),
+                )
+            });
         result.push(PipelineTask {
             id,
             title,
+            provider,
+            model,
+            effort,
             status,
             pr,
             blocked: false,
         });
     }
     Ok(result)
+}
+
+/// Resolve only an explicit task tier into a display identity. Queue/blocked status
+/// is a read-only process and does not own the daemon's resolved serve config, so
+/// missing values are deliberately marked pending rather than guessed.
+fn task_display_identity(labels_json: Option<&str>) -> (String, String, String) {
+    let labels: Vec<String> = labels_json
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    let model = labels
+        .iter()
+        .filter_map(|label| label.strip_prefix("tier:"))
+        .find_map(crate::model_tiers::model_id_for_tier)
+        .map(str::to_string);
+    let Some(model) = model else {
+        return ("pending".into(), "pending".into(), "pending".into());
+    };
+    let provider = if model.starts_with("claude-") {
+        "claude"
+    } else {
+        "codex"
+    };
+    let effort = labels
+        .iter()
+        .filter_map(|label| label.strip_prefix("effort:"))
+        .find(|effort| matches!(*effort, "medium" | "high"))
+        .unwrap_or("pending");
+    (provider.to_string(), model, effort.to_string())
 }
 
 /// Deduped errors from the last hour, with a count of older silenced errors (#204).
@@ -1328,6 +1430,70 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
         (dir, c)
+    }
+
+    #[test]
+    fn legacy_null_run_provider_displays_as_claude_live_and_pipeline() {
+        let (_d, mut c) = open_tmp();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "legacy provider",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider, spawned_at)
+             VALUES (?1, 'W1', 'worker', 'claude-opus-4-6', 'high', NULL, 101)",
+            params![task_id],
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "W1".into(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "legacy-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+            },
+        )
+        .unwrap();
+        let live = stats(&c, 102, crate::agents::ONLINE_WINDOW_SECS)
+            .unwrap()
+            .daemon_agents
+            .pop()
+            .unwrap();
+        assert_eq!(live.provider.as_deref(), Some("claude"));
+
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=102 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        let pipeline = stats(&c, 103, crate::agents::ONLINE_WINDOW_SECS)
+            .unwrap()
+            .pipeline
+            .pop()
+            .unwrap();
+        assert_eq!(pipeline.provider.as_deref(), Some("claude"));
+        assert_eq!(pipeline.model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(pipeline.effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -2011,6 +2177,93 @@ mod tests {
     }
 
     #[test]
+    fn effort_only_labels_leave_queue_and_blocked_identity_pending() {
+        let (_d, mut c) = open_tmp();
+        let queued = crate::tasks::create(
+            &mut c,
+            "boss",
+            "effort-only queued",
+            None,
+            0,
+            Some(r#"["effort:high"]"#),
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let blocked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "effort-only blocked",
+            None,
+            0,
+            Some(r#"["effort:high"]"#),
+            None,
+            Some(&format!("[{queued}]")),
+            None,
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let q = s.queue_tasks.iter().find(|task| task.id == queued).unwrap();
+        let b = s.blocked.iter().find(|task| task.id == blocked).unwrap();
+        for (provider, model, effort) in [
+            (&q.provider, &q.model, &q.effort),
+            (&b.provider, &b.model, &b.effort),
+        ] {
+            assert_eq!(provider.as_deref(), Some("pending"));
+            assert_eq!(model.as_deref(), Some("pending"));
+            assert_eq!(effort.as_deref(), Some("pending"));
+        }
+    }
+
+    #[test]
+    fn empty_labels_do_not_mask_later_queue_and_blocked_identity() {
+        let (_d, mut c) = open_tmp();
+        let labels = r#"["tier:","tier:opus-47","effort:","effort:high"]"#;
+        let queued = crate::tasks::create(
+            &mut c,
+            "boss",
+            "empty labels before valid queued identity",
+            None,
+            0,
+            Some(labels),
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let blocked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "empty labels before valid blocked identity",
+            None,
+            0,
+            Some(labels),
+            None,
+            Some(&format!("[{queued}]")),
+            None,
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let q = s.queue_tasks.iter().find(|task| task.id == queued).unwrap();
+        let b = s.blocked.iter().find(|task| task.id == blocked).unwrap();
+        for (provider, model, effort) in [
+            (&q.provider, &q.model, &q.effort),
+            (&b.provider, &b.model, &b.effort),
+        ] {
+            assert_eq!(provider.as_deref(), Some("claude"));
+            assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
+            assert_eq!(effort.as_deref(), Some("high"));
+        }
+    }
+
+    #[test]
     fn blocked_section_surfaces_deadlocked_cancelled_deps() {
         let (_d, mut c) = open_tmp();
         let dep = crate::tasks::create(
@@ -2295,6 +2548,9 @@ mod tests {
             last_activity_age_secs: age,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2335,6 +2591,9 @@ mod tests {
             last_activity_age_secs: age,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2526,6 +2785,9 @@ mod tests {
             last_activity_age_secs: None,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2555,6 +2817,9 @@ mod tests {
             last_activity_age_secs: None,
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2825,6 +3090,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("task".into()),
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -2853,6 +3121,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("task".into()),
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,

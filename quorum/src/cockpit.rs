@@ -127,8 +127,10 @@ pub fn render(s: &Stats) {
 }
 
 pub fn render_with_style(s: &Stats, sty: &Style, w: &mut dyn Write) {
-    let width = 78;
+    render_with_style_at_width(s, sty, w, 78);
+}
 
+fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
     render_header(s, sty, w, width);
     render_working(s, sty, w, width);
     render_queue(&s.queue_tasks, sty, w, width);
@@ -280,8 +282,8 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
     let _ = writeln!(
         w,
-        "  {:<12}  {:<8} {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
-        "AGENT", "MODEL", "EFF", "TASK", "WHAT", "UP", "TOK", "T", "EV/m"
+        "  {:<12}  {:<8} {:<18} {:<8} {:>5}  {:>3}  {:>5}  {:>3}  {:>4}  NOW",
+        "AGENT", "PROVIDER", "MODEL", "EFF", "TASK", "UP", "TOK", "T", "EV/m"
     );
 
     for d in &workers {
@@ -303,15 +305,12 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
 fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
     let dot = sty.freshness_dot(d.last_activity_age_secs);
-    let (model, effort) = split_tier_eff(d.tier_eff.as_deref());
+    let provider = d.provider.as_deref().unwrap_or("pending");
+    let model = d.model.as_deref().unwrap_or("pending");
+    let effort = d.effort.as_deref().unwrap_or("pending");
     let task_str = d
         .task_id
         .map(|id| format!("#{id}"))
-        .unwrap_or_else(|| "—".to_string());
-    let title = d
-        .task_title
-        .as_deref()
-        .map(|t| truncate(t, 18))
         .unwrap_or_else(|| "—".to_string());
     let up = d
         .uptime_secs
@@ -339,13 +338,13 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
 
     let _ = writeln!(
         w,
-        "{} {:<12}  {:<8} {:<4}  {:>4}  {:<18}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}{}",
+        "{} {:<12}  {:<8} {:<18} {:<8} {:>5}  {:>3}  {:>5}  {:>3}  {:>4}  {}{}{}",
         dot,
         agent_label,
+        provider,
         model,
         effort,
         task_str,
-        title,
         up,
         tok,
         tools,
@@ -354,6 +353,9 @@ fn render_agent_row(d: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
         rework_suffix,
         error_suffix,
     );
+    if let Some(title) = d.task_title.as_deref() {
+        let _ = writeln!(w, "      {}", truncate(title, 72));
+    }
 }
 
 fn format_live_error(d: &DaemonAgentView, sty: &Style) -> String {
@@ -376,11 +378,6 @@ fn format_live_error(d: &DaemonAgentView, sty: &Style) -> String {
 
 const MAX_ERROR_RETRIES: u32 = 3;
 
-fn split_tier_eff(tier_eff: Option<&str>) -> (&str, &str) {
-    let value = tier_eff.unwrap_or("—");
-    value.split_once('·').unwrap_or((value, "—"))
-}
-
 fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
     let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
         rev.last_activity_age_secs
@@ -396,18 +393,28 @@ fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write)
     let error_suffix = format_live_error(rev, sty);
     let sub = if sty.color {
         format!(
-            "    {} {}  {} · {} · {} tok{}",
+            "    {} {}  {} · {} · {} · {} · {} · {} tok{}",
             sty.dim("└"),
             role_label,
             rev.agent,
+            rev.provider.as_deref().unwrap_or("pending"),
+            rev.model.as_deref().unwrap_or("pending"),
+            rev.effort.as_deref().unwrap_or("pending"),
             rev_up,
             rev_tok,
             error_suffix,
         )
     } else {
         format!(
-            "    +- {}  {} · {} · {} tok{}",
-            role_label, rev.agent, rev_up, rev_tok, error_suffix,
+            "    +- {}  {} · {} · {} · {} · {} · {} tok{}",
+            role_label,
+            rev.agent,
+            rev.provider.as_deref().unwrap_or("pending"),
+            rev.model.as_deref().unwrap_or("pending"),
+            rev.effort.as_deref().unwrap_or("pending"),
+            rev_up,
+            rev_tok,
+            error_suffix,
         )
     };
     let _ = writeln!(w, "{sub}");
@@ -422,24 +429,24 @@ fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usiz
     }
     let _ = writeln!(
         w,
-        "  {:<6} {:<24} {:<8} {:<4} {:>3}  PR",
-        "TASK", "WHAT", "MODEL", "EFF", "PRI"
+        "  {:<6} {:<8} {:<18} {:<8} {:>3}  PR",
+        "TASK", "PROVIDER", "MODEL", "EFF", "PRI"
     );
     for q in queue {
-        let (model, effort) = split_tier_eff(Some(&q.tier_eff));
         let pr_str =
             q.pr.map(|p| format!("#{p}"))
                 .unwrap_or_else(|| "—".to_string());
         let _ = writeln!(
             w,
-            "  #{:<5} {:<24} {:<8} {:<4} {:>3}  {}",
+            "  #{:<5} {:<8} {:<18} {:<8} {:>3}  {}",
             q.id,
-            truncate(&q.title, 24),
-            model,
-            effort,
+            q.provider.as_deref().unwrap_or("pending"),
+            q.model.as_deref().unwrap_or("pending"),
+            q.effort.as_deref().unwrap_or("pending"),
             q.priority,
             pr_str,
         );
+        let _ = writeln!(w, "      {}", truncate(&q.title, width.saturating_sub(6)));
     }
 }
 
@@ -452,11 +459,10 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
     }
     let _ = writeln!(
         w,
-        "  {:<6} {:<24} {:<8} {:<4} BLOCKER",
-        "TASK", "WHAT", "MODEL", "EFF"
+        "  {:<6} {:<8} {:<18} {:<8} BLOCKER",
+        "TASK", "PROVIDER", "MODEL", "EFF"
     );
     for b in blocked {
-        let (model, effort) = split_tier_eff(Some(&b.tier_eff));
         let dep = if b.waiting_on.is_empty() {
             "?".to_string()
         } else {
@@ -488,15 +494,16 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<24} {:<8} {:<4} {} waits on {}{}",
+            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}",
             b.id,
-            truncate(&b.title, 24),
-            model,
-            effort,
+            b.provider.as_deref().unwrap_or("pending"),
+            b.model.as_deref().unwrap_or("pending"),
+            b.effort.as_deref().unwrap_or("pending"),
             block_icon,
             dep,
             suffix,
         );
+        let _ = writeln!(w, "      {}", truncate(&b.title, width.saturating_sub(6)));
     }
 }
 
@@ -523,6 +530,11 @@ fn render_pipeline(
         let _ = writeln!(w, "  {}", sty.dim("(no tasks)"));
         return;
     }
+    let _ = writeln!(
+        w,
+        "  {:<6} {:<8} {:<18} {:<8} PR  STATE",
+        "TASK", "PROVIDER", "MODEL", "EFF"
+    );
     for p in pipeline {
         let in_review = daemon_agents
             .iter()
@@ -534,13 +546,16 @@ fn render_pipeline(
                 .unwrap_or_else(|| "—".to_string());
         let _ = writeln!(
             w,
-            "  #{:<4} {:<24} {} {:<14} {}",
+            "  #{:<5} {:<8} {:<18} {:<8} {:<3} {} {}",
             p.id,
-            truncate(&p.title, 24),
+            p.provider.as_deref().unwrap_or("pending"),
+            p.model.as_deref().unwrap_or("pending"),
+            p.effort.as_deref().unwrap_or("pending"),
+            pr_str,
             icon,
             label,
-            pr_str,
         );
+        let _ = writeln!(w, "      {}", truncate(&p.title, width.saturating_sub(6)));
     }
 }
 
@@ -783,7 +798,10 @@ mod tests {
             log_dir: None,
             last_activity_age_secs: Some(1),
             task_title: Some("active task".into()),
-            tier_eff: Some("opus48·hi".into()),
+            tier_eff: Some("c2".into()),
+            provider: Some("codex".into()),
+            model: Some("gpt-5.6-terra".into()),
+            effort: Some("medium".into()),
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -796,6 +814,9 @@ mod tests {
         s.queue_tasks.push(QueueTask {
             id: 2,
             title: "queued task".into(),
+            provider: Some("claude".into()),
+            model: Some("claude-opus-4-7".into()),
+            effort: Some("medium".into()),
             tier_eff: "opus47·md".into(),
             priority: 10,
             pr: None,
@@ -803,6 +824,9 @@ mod tests {
         s.blocked.push(BlockedTask {
             id: 3,
             title: "blocked task".into(),
+            provider: Some("claude".into()),
+            model: Some("claude-opus-4-6".into()),
+            effort: Some("high".into()),
             tier_eff: "opus46·hi".into(),
             waiting_on: vec![1],
             deadlocked_on: vec![],
@@ -812,18 +836,29 @@ mod tests {
         render_with_style(&s, &Style::plain(), &mut buf);
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("MODEL"), "missing MODEL header: {output}");
-        for (title, model, effort) in [
-            ("active task", "opus48", "hi"),
-            ("queued task", "opus47", "md"),
-            ("blocked task", "opus46", "hi"),
+        for (title, provider, model, effort) in [
+            ("active task", "codex", "gpt-5.6-terra", "medium"),
+            ("queued task", "claude", "claude-opus-4-7", "medium"),
+            ("blocked task", "claude", "claude-opus-4-6", "high"),
         ] {
             assert!(
-                output.lines().any(|line| line.contains(title)
-                    && line.contains(model)
-                    && line.contains(effort)),
+                output.contains(title)
+                    && output.contains(provider)
+                    && output.contains(model)
+                    && output.contains(effort),
                 "{title} model/effort missing: {output}"
             );
         }
+        assert!(
+            !output.contains("WHAT"),
+            "legacy WHAT header remains: {output}"
+        );
+        assert!(
+            output
+                .lines()
+                .all(|line| !line.contains("gpt-5.6-terra") || !line.contains("c2")),
+            "complexity leaked into model: {output}"
+        );
     }
 
     #[test]
@@ -868,6 +903,9 @@ mod tests {
             last_activity_age_secs: Some(200),
             task_title: Some("test".into()),
             tier_eff: Some("opus46·hi".into()),
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -926,6 +964,9 @@ mod tests {
         let done = PipelineTask {
             id: 1,
             title: "t".into(),
+            provider: None,
+            model: None,
+            effort: None,
             status: "done".into(),
             pr: Some(42),
             blocked: false,
@@ -937,6 +978,9 @@ mod tests {
         let in_review = PipelineTask {
             id: 4,
             title: "t".into(),
+            provider: None,
+            model: None,
+            effort: None,
             status: "working".into(),
             pr: Some(99),
             blocked: false,
@@ -961,6 +1005,9 @@ mod tests {
             last_activity_age_secs: Some(3),
             task_title: Some("parks reopenable".into()),
             tier_eff: Some("opus46·md".into()),
+            provider: Some("claude".into()),
+            model: Some("claude-opus-4-6".into()),
+            effort: Some("medium".into()),
             pr: Some(193),
             rework_count: 0,
             tool_count: 27,
@@ -983,6 +1030,9 @@ mod tests {
             last_activity_age_secs: Some(120),
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 5,
@@ -1013,7 +1063,7 @@ mod tests {
             .unwrap();
         let data_line = output.lines().find(|l| l.contains("W1")).unwrap();
         let header_eff_col = header_line.find("EFF").unwrap();
-        let data_eff_col = data_line.find("md").unwrap(); // "md" = eff value from "opus46·md"
+        let data_eff_col = data_line.find("medium").unwrap();
         assert_eq!(
             header_eff_col, data_eff_col,
             "EFF header col ({header_eff_col}) must match data col ({data_eff_col})\nheader: {header_line}\n  data: {data_line}"
@@ -1078,6 +1128,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("review PR #3610".into()),
             tier_eff: Some("opus46·hi".into()),
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 12,
@@ -1126,6 +1179,9 @@ mod tests {
             last_activity_age_secs: Some(10),
             task_title: Some("merged task".into()),
             tier_eff: Some("opus46·hi".into()),
+            provider: None,
+            model: None,
+            effort: None,
             pr: Some(3667),
             rework_count: 0,
             tool_count: 3,
@@ -1165,6 +1221,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("task".into()),
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -1187,6 +1246,9 @@ mod tests {
             last_activity_age_secs: Some(3),
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 1,
@@ -1330,6 +1392,9 @@ mod tests {
             id: 10,
             title: "multi-dep task".into(),
             tier_eff: "opus46·hi".into(),
+            provider: None,
+            model: None,
+            effort: None,
             waiting_on: vec![4, 6, 9],
             deadlocked_on: vec![],
         });
@@ -1354,6 +1419,9 @@ mod tests {
             id: 20,
             title: "mixed-dep task".into(),
             tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
             waiting_on: vec![3, 5, 7],
             deadlocked_on: vec![5],
         });
@@ -1511,6 +1579,9 @@ mod tests {
             last_activity_age_secs: Some(2),
             task_title: Some("erroring task".into()),
             tier_eff: Some("opus46·hi".into()),
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 3,
@@ -1570,6 +1641,9 @@ mod tests {
             last_activity_age_secs: Some(5),
             task_title: Some("task".into()),
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 0,
@@ -1592,6 +1666,9 @@ mod tests {
             last_activity_age_secs: Some(3),
             task_title: None,
             tier_eff: None,
+            provider: None,
+            model: None,
+            effort: None,
             pr: None,
             rework_count: 0,
             tool_count: 1,

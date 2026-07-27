@@ -86,7 +86,8 @@ fn status_dashboard_emits_all_sections() {
         .stdout(predicates::str::contains("PIPELINE"))
         .stdout(predicates::str::contains("ERRORS"))
         .stdout(predicates::str::contains("ship-it"))
-        .stdout(predicates::str::contains("opus47"));
+        .stdout(predicates::str::contains("claude"))
+        .stdout(predicates::str::contains("claude-opus-4-7"));
 }
 
 #[test]

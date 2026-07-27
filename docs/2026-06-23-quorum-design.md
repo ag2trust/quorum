@@ -23,6 +23,12 @@ properties, in order:
 The one concession to humans: a read-only **`quorum status`** command (optionally
 long-lived with `--watch`) for at-a-glance health. It mutates nothing.
 
+`status --json` exposes task `title`, `provider`, `model`, and `effort` as separate,
+additive fields for live, queue, blocked, and pipeline rows. Live and pipeline values
+come from persisted `agent_runs`; queue/blocked rows without an explicit task tier use
+the explicit `pending` marker because a read-only status process does not invent the
+daemon's configured provider default. Complexity is task metadata, never a model value.
+
 ### Product boundary: opinionated Git delivery
 
 Quorum is an opinionated local **agentic Git/GitHub coding pipeline**. It provisions
