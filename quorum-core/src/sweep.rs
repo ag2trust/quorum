@@ -97,6 +97,109 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
     Ok(())
 }
 
+/// Delete, at most `limit` rows at a time, from task-owned operational tables whose task has
+/// passed the done-task retention horizon. Keeping each child delete independently bounded is
+/// important: one old task can have far more than `limit` historical rows.
+fn delete_reclaimable_task_rows_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    let eligible = "SELECT id FROM tasks WHERE status='done' AND updated_at < ?1";
+    for table in [
+        "agent_runs",
+        "task_branches",
+        "task_notes",
+        "mailbox",
+        "journal",
+        "approvals",
+        "reviewer_provision_attempts",
+        "pr_targets",
+        "review_interpret_jobs",
+    ] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE rowid IN \
+             (SELECT rowid FROM {table} WHERE task_id IN ({eligible}) LIMIT ?2)"
+        );
+        conn.execute(&sql, params![now - DONE_TASK_TTL_SECS, limit as i64])?;
+    }
+    // Deliveries are keyed through their task message, rather than directly by task ID.
+    conn.execute(
+        "DELETE FROM task_message_deliveries WHERE rowid IN \
+         (SELECT d.rowid FROM task_message_deliveries d
+          JOIN task_messages m ON m.id=d.message_id
+          WHERE m.task_id IN (SELECT id FROM tasks WHERE status='done' AND updated_at < ?1)
+          LIMIT ?2)",
+        params![now - DONE_TASK_TTL_SECS, limit as i64],
+    )?;
+    conn.execute(
+        "DELETE FROM task_messages WHERE rowid IN \
+         (SELECT rowid FROM task_messages
+          WHERE task_id IN (SELECT id FROM tasks WHERE status='done' AND updated_at < ?1)
+            AND NOT EXISTS (SELECT 1 FROM task_message_deliveries d WHERE d.message_id=task_messages.id)
+          LIMIT ?2)",
+        params![now - DONE_TASK_TTL_SECS, limit as i64],
+    )?;
+    Ok(())
+}
+
+/// Remove bounded, already-orphaned operational rows left by older sweep versions. Analytics
+/// records intentionally do not participate: review audits/findings and run capabilities remain
+/// useful after task reclamation.
+fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<()> {
+    for table in [
+        "agent_runs",
+        "task_branches",
+        "task_notes",
+        "mailbox",
+        "journal",
+        "approvals",
+        "reviewer_provision_attempts",
+        "pr_targets",
+        "review_interpret_jobs",
+    ] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE rowid IN \
+             (SELECT rowid FROM {table} WHERE task_id IS NOT NULL \
+              AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.id={table}.task_id) LIMIT ?1)"
+        );
+        conn.execute(&sql, params![limit as i64])?;
+    }
+    conn.execute(
+        "DELETE FROM task_message_deliveries WHERE rowid IN \
+         (SELECT d.rowid FROM task_message_deliveries d
+          WHERE NOT EXISTS (SELECT 1 FROM task_messages m WHERE m.id=d.message_id)
+          LIMIT ?1)",
+        params![limit as i64],
+    )?;
+    conn.execute(
+        "DELETE FROM task_messages WHERE rowid IN \
+         (SELECT rowid FROM task_messages WHERE NOT EXISTS \
+          (SELECT 1 FROM tasks WHERE tasks.id=task_messages.task_id) LIMIT ?1)",
+        params![limit as i64],
+    )?;
+    Ok(())
+}
+
+fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    // Do not remove a parent until bounded child cleanup has caught up. This makes a large task
+    // take several opportunistic sweeps rather than letting one write delete an unbounded fanout.
+    conn.execute(
+        "DELETE FROM tasks WHERE rowid IN \
+         (SELECT t.rowid FROM tasks t
+          WHERE t.status='done' AND t.updated_at < ?1
+            AND NOT EXISTS (SELECT 1 FROM agent_runs x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM task_branches x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM task_notes x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM task_messages x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM mailbox x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM journal x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM approvals x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_attempts x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM pr_targets x WHERE x.task_id=t.id)
+            AND NOT EXISTS (SELECT 1 FROM review_interpret_jobs x WHERE x.task_id=t.id)
+          LIMIT ?2)",
+        params![now - DONE_TASK_TTL_SECS, limit as i64],
+    )?;
+    Ok(())
+}
+
 /// Park open tasks whose dependencies cannot currently be satisfied: every dep is terminal
 /// (done/failed/cancelled) but at least one is failed or cancelled. They stay excluded from
 /// provisioning until an explicit retry, without losing their dependency context.
@@ -179,40 +282,42 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "activity_events", now, limit)?;
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
-    conn.execute(
-        "DELETE FROM tasks WHERE rowid IN \
-         (SELECT rowid FROM tasks WHERE status='done' AND updated_at < ?1 LIMIT ?2)",
-        params![now - DONE_TASK_TTL_SECS, limit as i64],
-    )?;
+    delete_reclaimable_task_rows_bounded(conn, now, limit)?;
+    delete_orphaned_task_rows_bounded(conn, limit)?;
+    delete_reclaimable_tasks_bounded(conn, now, limit)?;
     Ok(())
 }
 
 /// Unbounded sweep + `wal_checkpoint(TRUNCATE)`. Backs `quorum sweep`.
 pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
-    reap_lapsed_tasks(conn, now, usize::MAX)?;
-    cascade_dead_deps(conn, now, usize::MAX)?;
-    conn.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
-    conn.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
-    conn.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
-    conn.execute("DELETE FROM claims WHERE expires_at <= ?1", params![now])?;
+    // Keep task children and their parent atomic here too. Sweep-on-write already receives its
+    // caller's write transaction; explicit sweep owns this transaction itself.
+    let tx = conn.unchecked_transaction()?;
+    reap_lapsed_tasks(&tx, now, usize::MAX)?;
+    cascade_dead_deps(&tx, now, usize::MAX)?;
+    tx.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
+    tx.execute("DELETE FROM events WHERE expires_at <= ?1", params![now])?;
+    tx.execute("DELETE FROM errors WHERE expires_at <= ?1", params![now])?;
+    tx.execute("DELETE FROM claims WHERE expires_at <= ?1", params![now])?;
     // Issue #101 — see sweep_on_write for rationale.
-    conn.execute(
+    tx.execute(
         "DELETE FROM agent_sessions WHERE expires_at <= ?1",
         params![now],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM activity_events WHERE expires_at <= ?1",
         params![now],
     )?;
-    crate::task_messages::expire_stale_deliveries(conn, now, usize::MAX)?;
-    conn.execute(
+    crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
+    tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",
         params![now],
     )?;
-    conn.execute(
-        "DELETE FROM tasks WHERE status='done' AND updated_at < ?1",
-        params![now - DONE_TASK_TTL_SECS],
-    )?;
+    let unbounded = i64::MAX as usize;
+    delete_reclaimable_task_rows_bounded(&tx, now, unbounded)?;
+    delete_orphaned_task_rows_bounded(&tx, unbounded)?;
+    delete_reclaimable_tasks_bounded(&tx, now, unbounded)?;
+    tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
 }
@@ -245,6 +350,130 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(bodies, vec!["live".to_string()]);
+    }
+
+    fn reclaimable_task(c: &mut Connection, title: &str) -> i64 {
+        let id =
+            crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, 1).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=0 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn insert_run(c: &Connection, task_id: i64, agent: &str) -> i64 {
+        crate::agent_runs::insert(c, task_id, agent, "worker", "model", "high", "codex", 1).unwrap()
+    }
+
+    #[test]
+    fn sweep_reclaims_task_agent_runs_without_touching_live_task_runs() {
+        let (_d, mut c) = open_tmp();
+        let reclaimed = reclaimable_task(&mut c, "reclaim me");
+        let live = crate::tasks::create(
+            &mut c, "boss", "keep me", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        insert_run(&c, reclaimed, "old-run");
+        insert_run(&c, live, "live-run");
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        let old_count: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1",
+                [reclaimed],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let live_count: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1",
+                [live],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let reclaimed_task_count: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [reclaimed], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(old_count, 0, "task reclamation must remove its agent runs");
+        assert_eq!(reclaimed_task_count, 0, "reclaimable task must be deleted");
+        assert_eq!(live_count, 1, "must not delete runs for a live task");
+    }
+
+    #[test]
+    fn sweep_reclaims_preexisting_orphan_agent_runs() {
+        let (_d, c) = open_tmp();
+        insert_run(&c, 99_999, "orphan-run");
+
+        sweep_on_write(&c, 1, SWEEP_LIMIT).unwrap();
+
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM agent_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "normal sweep must clean old orphaned runs");
+    }
+
+    #[test]
+    fn sweep_task_cleanup_is_bounded() {
+        let (_d, mut c) = open_tmp();
+        let task = reclaimable_task(&mut c, "many runs");
+        insert_run(&c, task, "first");
+        insert_run(&c, task, "second");
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, 1).unwrap();
+
+        let runs_left: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1",
+                [task],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let task_left: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [task], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            runs_left, 1,
+            "agent-run cleanup must honor the per-sweep limit"
+        );
+        assert_eq!(
+            task_left, 1,
+            "parent waits until its bounded child cleanup finishes"
+        );
+    }
+
+    #[test]
+    fn sweep_retains_review_audits_for_stratum_coverage() {
+        let (_d, mut c) = open_tmp();
+        let task = reclaimable_task(&mut c, "audited task");
+        c.execute(
+            "INSERT INTO review_audits(task_id, pr_number, r1_run_id, r2_run_id,
+               r1_reviewer, r2_reviewer, model, effort, cx_bucket, missed_count,
+               overcaught_count, r1_verdict, created_at)
+             VALUES (?1, 7, 1, 2, 'r1', 'r2', 'model', 'high', '2', 0, 0, 'approved', 1)",
+            [task],
+        )
+        .unwrap();
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        let audit_count: i64 = c
+            .query_row(
+                "SELECT count(*) FROM review_audits WHERE task_id=?1",
+                [task],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            audit_count, 1,
+            "audit history must survive task reclamation"
+        );
     }
 
     #[test]
