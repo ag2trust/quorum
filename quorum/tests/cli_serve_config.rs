@@ -241,6 +241,55 @@ fn serve_config_rejects_unknown_keys() {
 }
 
 #[test]
+fn serve_config_rejects_invalid_r2_sampling_values_with_exit_2() {
+    let home = tempfile::tempdir().unwrap();
+    let init_status = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    assert!(init_status.success(), "init failed");
+
+    for (name, contents, expected) in [
+        (
+            "bad-r2-p.toml",
+            "r2_steady_state_p = 1.5\n",
+            "r2_steady_state_p",
+        ),
+        (
+            "bad-r2-target.toml",
+            "r2_target_per_stratum = -1\n",
+            "r2_target_per_stratum",
+        ),
+    ] {
+        let config_path = home.path().join(name);
+        std::fs::write(&config_path, contents).unwrap();
+        let output = Command::new(cargo_bin())
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .args([
+                "serve",
+                "--config",
+                &config_path.to_string_lossy(),
+                "--repo",
+                "test/repo",
+                "--repo-dir",
+                "/tmp/x",
+                "--worktree-base",
+                "/tmp/y",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "error must name {expected}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn strict_codex_config_rejects_claude_only_model_floor_at_startup() {
     let home = tempfile::tempdir().unwrap();
 

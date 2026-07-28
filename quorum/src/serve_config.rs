@@ -81,12 +81,11 @@ pub struct ServeFileConfig {
     pub master_ci_gate: Option<bool>,
     pub master_ci_timeout_secs: Option<u64>,
     pub doctor_enabled: Option<bool>,
-    // R2 is mandatory (#159) — sampling config removed. Fields kept for TOML compat.
-    #[allow(dead_code)]
+    /// Whether deterministic R2 sampling participates. `false` keeps R2 mandatory.
     pub r2_enabled: Option<bool>,
-    #[allow(dead_code)]
+    /// Guaranteed coverage floor per (model, effort, complexity) stratum.
     pub r2_target_per_stratum: Option<i64>,
-    #[allow(dead_code)]
+    /// Sampling probability once a stratum reaches its coverage floor.
     pub r2_steady_state_p: Option<f64>,
     /// Per-complexity suggested model/effort (keys "1".."5", values "tier/effort").
     pub suggested_models: Option<std::collections::HashMap<String, String>>,
@@ -276,6 +275,22 @@ pub fn validate_suggested_models(
                 quorum_core::model_tiers::known_tiers(),
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate the opt-in R2 sampling knobs. Invalid values are configuration
+/// errors, never values to silently clamp into a different review policy.
+pub fn validate_r2_sampling(target_per_stratum: i64, steady_state_p: f64) -> Result<()> {
+    if target_per_stratum < 0 {
+        return Err(QuorumError::Usage(format!(
+            "r2_target_per_stratum must be >= 0 (got {target_per_stratum})"
+        )));
+    }
+    if !(0.0..=1.0).contains(&steady_state_p) {
+        return Err(QuorumError::Usage(format!(
+            "r2_steady_state_p must be in 0.0..=1.0 (got {steady_state_p})"
+        )));
     }
     Ok(())
 }
@@ -915,6 +930,16 @@ worktree_base = "/tmp/wt"
         assert!(cfg.cap.is_none());
         assert!(cfg.r2_enabled.is_none());
         assert!(cfg.model.is_none());
+    }
+
+    #[test]
+    fn r2_sampling_validation_rejects_invalid_values_with_usage_exit() {
+        for (target, probability) in [(0, 1.5), (-1, 0.30)] {
+            let err = validate_r2_sampling(target, probability).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{err}");
+        }
+        validate_r2_sampling(0, 0.0).unwrap();
+        validate_r2_sampling(3, 1.0).unwrap();
     }
 
     #[test]

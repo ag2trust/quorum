@@ -87,9 +87,10 @@ const DEFAULT_SERVE_TOML: &str = "\
 # log_dir = \"/path/to/logs\"
 # doctor_enabled = false
 
-## R2 pre-merge review is mandatory (#159) — no sampling config needed.
-## Legacy keys (r2_enabled, r2_target_per_stratum, r2_steady_state_p) are
-## accepted but ignored.
+## R2 pre-merge review sampling (safe defaults remain mandatory).
+## r2_enabled = true                 # false disables sampling, not the R2 gate
+## r2_target_per_stratum = 0         # guaranteed coverage before probability
+## r2_steady_state_p = 1.0           # 1.0 preserves mandatory R2 by default
 ";
 
 fn run() -> Result<i32> {
@@ -1148,7 +1149,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_master_ci_gate = resolve_bool(false, file_cfg.master_ci_gate, false);
             let r_master_ci_timeout = resolve_val(None, file_cfg.master_ci_timeout_secs, 300);
             let r_doctor_enabled = resolve_bool(doctor_enabled, file_cfg.doctor_enabled, false);
-            // R2 sampling config ignored — R2 is mandatory (#159).
+            // Defaults preserve the mandatory R2 gate.  Sampling is opt-in by
+            // lowering p (and optionally setting a coverage floor).
+            let r_r2_enabled = file_cfg.r2_enabled.unwrap_or(true);
+            let r_r2_target_per_stratum = file_cfg.r2_target_per_stratum.unwrap_or(0);
+            let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(1.0);
+            serve_config::validate_r2_sampling(r_r2_target_per_stratum, r_r2_steady_state_p)?;
 
             let r_suggested_models = file_cfg.suggested_models.clone().unwrap_or_default();
             serve_config::validate_suggested_models(&r_suggested_models)?;
@@ -1306,6 +1312,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_timeout_secs: r_master_ci_timeout.value,
                 allowed_tools: r_allowed_tools.value.map(|s| s.to_string()),
                 doctor_enabled: r_doctor_enabled.value,
+                r2_enabled: r_r2_enabled,
+                r2_target_per_stratum: r_r2_target_per_stratum,
+                r2_steady_state_p: r_r2_steady_state_p,
                 suggested_models: r_suggested_models,
                 min_model: r_min_model,
                 min_effort: r_min_effort,

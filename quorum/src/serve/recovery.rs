@@ -220,17 +220,30 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
 
             // #191: stay in merging only when ALL required review roles are
             // approved for the same SHA (genuine merge-wait). Incomplete
-            // approval (e.g. R1 only, R2 missing) resets to in-review so
-            // the tick loop provisions the first missing role.
+            // approval (e.g. R1 only with R2 still required) resets to
+            // in-review so the tick loop provisions the first missing role.
+            //
+            // "Required" must honour a durable sampled R2 skip. `dual_approved`
+            // hard-codes "R1 and R2 both approved", so a sampled-out head — which
+            // never gets an `r2` approval row — read as incomplete, bounced the
+            // task back to in-review, and the tick loop then had nothing to
+            // provision and parked it. Evaluate against R1's approved head so a
+            // required R2 still gates exactly as before.
             let pr_number = tasks::extract_pr_number(&task.refs);
             let fully_approved = if let Some(pr) = pr_number {
                 let p2 = db_path.clone();
                 tokio::task::spawn_blocking(move || -> bool {
-                    quorum_core::db::open(&p2)
-                        .ok()
-                        .and_then(|conn| approvals::dual_approved(&conn, pr).ok())
-                        .flatten()
-                        .is_some()
+                    let Ok(conn) = quorum_core::db::open(&p2) else {
+                        return false;
+                    };
+                    let Ok(Some(r1)) = approvals::get(&conn, pr, "r1") else {
+                        return false;
+                    };
+                    if r1.approved_head_sha.is_empty() {
+                        return false;
+                    }
+                    super::all_required_roles_approved(&conn, pr, &r1.approved_head_sha)
+                        .unwrap_or(false)
                 })
                 .await
                 .unwrap_or(false)

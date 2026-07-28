@@ -233,6 +233,28 @@ fn seed_task(home: &std::path::Path, title: &str) {
     );
 }
 
+fn configure_r2_sampling(home: &std::path::Path, target: i64, probability: f64) {
+    let path = home.join("serve").join("test__repo.toml");
+    std::fs::write(
+        path,
+        format!(
+            "r2_enabled = true\nr2_target_per_stratum = {target}\nr2_steady_state_p = {probability}\n"
+        ),
+    )
+    .unwrap();
+}
+
+fn r2_run_count(home: &std::path::Path, task_id: i64) -> i64 {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND sub_role='r2'",
+        [task_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) {
     assert!(
         handle.wait_for("R2: pre-merge reviewer", 15),
@@ -374,7 +396,34 @@ fn approve_flow_tears_down_both_agents() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+
+    // No R2 config is present: the default must preserve the mandatory gate.
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "default R1 approval must provision R2: {:?}",
+        handle.lines
+    );
+    assert_eq!(r2_run_count(home.path(), 1), 1, "R2 run must be recorded");
+    assert!(
+        !handle.wait_for("merged", 1),
+        "R1 approval alone must not merge while mandatory R2 is pending"
+    );
+    let r2_name = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("could not extract R2 reviewer name");
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2_name,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
 
     // Daemon should merge, then tear down both
     assert!(
@@ -401,6 +450,153 @@ fn approve_flow_tears_down_both_agents() {
         "task not done after in-cycle merge + auto-resolve: {stdout}"
     );
 
+    handle.stop();
+}
+
+#[test]
+fn sampled_skip_merges_once_without_an_r2_slot() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    configure_r2_sampling(home.path(), 0, 0.0);
+    seed_task(home.path(), "sampled skip");
+    let merge_marker = home.path().join("merged-count");
+    let merge_cmd = format!("printf merged >> {}", merge_marker.display());
+    let mut handle = ServeHandle::start_with_merge(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        &merge_cmd,
+    );
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(handle.wait_for("merged", 15), "{:?}", handle.lines);
+    assert_eq!(r2_run_count(home.path(), 1), 0, "skip must not create R2");
+    assert_eq!(
+        std::fs::read_to_string(&merge_marker).unwrap(),
+        "merged",
+        "R1-only sampled skip must issue exactly one merge"
+    );
+    handle.stop();
+}
+
+#[test]
+fn coverage_floor_forces_r2_even_when_steady_state_sampling_is_zero() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    configure_r2_sampling(home.path(), 1, 0.0);
+    seed_task(home.path(), "coverage floor");
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(handle.wait_for("R2: pre-merge reviewer", 15));
+    assert_eq!(r2_run_count(home.path(), 1), 1);
+    assert!(
+        !handle.wait_for("merged", 1),
+        "coverage-floor R2 must block merge until it approves"
+    );
+    handle.stop();
+}
+
+#[test]
+fn configured_always_sample_still_blocks_merge_until_r2_approves() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    configure_r2_sampling(home.path(), 0, 1.0);
+    seed_task(home.path(), "always sample");
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(handle.wait_for("R2: pre-merge reviewer", 15));
+    assert_eq!(r2_run_count(home.path(), 1), 1);
+    assert!(
+        !handle.wait_for("merged", 1),
+        "configured always-sample R2 must block merge until its verdict"
+    );
     handle.stop();
 }
 

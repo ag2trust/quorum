@@ -159,8 +159,8 @@ fn init_creates_serve_config_scaffold() {
     assert!(toml_path.exists(), "serve config scaffold must be created");
     let content = std::fs::read_to_string(&toml_path).unwrap();
     assert!(
-        content.contains("R2 pre-merge review is mandatory"),
-        "scaffold must note R2 is mandatory"
+        content.contains("R2 pre-merge review sampling"),
+        "scaffold must document R2 sampling"
     );
 }
 

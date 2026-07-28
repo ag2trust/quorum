@@ -424,6 +424,20 @@ CREATE TABLE IF NOT EXISTS review_audits (
 CREATE INDEX IF NOT EXISTS review_audits_task ON review_audits(task_id);
 CREATE INDEX IF NOT EXISTS review_audits_stratum ON review_audits(model, effort, cx_bucket);
 
+-- Daemon-owned R2 sampling decisions.  Task refs are agent-writable metadata,
+-- so they must never authorize bypassing the pre-merge R2 gate.  A decision is
+-- immutable for one PR head and survives rework/restart without being exposed
+-- through the task-update surface.
+CREATE TABLE IF NOT EXISTS r2_sampling_decisions (
+    pr_number  INTEGER NOT NULL,
+    head_sha   TEXT NOT NULL,
+    task_id    INTEGER NOT NULL,
+    required   INTEGER NOT NULL CHECK(required IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (pr_number, head_sha)
+);
+CREATE INDEX IF NOT EXISTS r2_sampling_decisions_task ON r2_sampling_decisions(task_id);
+
 -- Run-targeted task messages (#131): durable, non-interrupting messages scoped
 -- to a task. Each send creates one message row plus per-recipient delivery rows
 -- keyed by agent_runs.id (run ID), never reusable agent name. Messages are
