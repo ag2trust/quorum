@@ -1,9 +1,24 @@
+use std::path::PathBuf;
 use std::process::Command;
 
+fn git_path(name: &str) -> Option<PathBuf> {
+    Command::new("git")
+        .args(["rev-parse", "--git-path", name])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|path| PathBuf::from(path.trim()))
+        // Cargo treats a missing rerun-if-changed path as perpetually dirty.
+        .filter(|path| path.exists())
+}
+
 fn main() {
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/refs/");
-    println!("cargo:rerun-if-changed=../.git/packed-refs");
+    for name in ["HEAD", "refs", "packed-refs"] {
+        if let Some(path) = git_path(name) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 
     let git_describe = Command::new("git")
         .args(["describe", "--tags", "--always", "--dirty"])
