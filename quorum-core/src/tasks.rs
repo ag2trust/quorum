@@ -1948,6 +1948,10 @@ pub fn set_author(conn: &mut Connection, id: i64, author: &str) -> Result<()> {
 
 // ── close_manual ─────────────────────────────────────────────────────────────
 
+/// `failed` is closable: a task whose PR merged outside the managed lifecycle
+/// (rework cap exhausted, then landed by hand) has no other route to `done`,
+/// and dependents stay parked until it gets there — `compute_ready` counts only
+/// `done`. `done` and `cancelled` stay refused: neither is a wrong record.
 pub fn close_manual(
     conn: &mut Connection,
     agent: &str,
@@ -1960,7 +1964,7 @@ pub fn close_manual(
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
-         WHERE id=?1 AND status NOT IN ('done', 'failed', 'cancelled')",
+         WHERE id=?1 AND status NOT IN ('done', 'cancelled')",
         params![id, now],
     )?;
     if n == 0 {
@@ -4067,6 +4071,37 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "already cancelled — should return None"
+        );
+    }
+
+    #[test]
+    fn close_manual_from_failed_unblocks_dependents() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let child = create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![dep])
+            .unwrap();
+        assert!(!get(&c, child).unwrap().unwrap().ready);
+
+        let t = close_manual(&mut c, "owner", dep, "PR merged by hand", 1001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(t.status, "done");
+        assert!(
+            compute_ready(&c, &get(&c, child).unwrap().unwrap().depends_on).unwrap(),
+            "dependent must become ready once the failed head closes to done"
         );
     }
 

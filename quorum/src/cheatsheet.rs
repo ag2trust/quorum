@@ -29,7 +29,8 @@ TASKS (daemon-managed queue) — lifecycle: open -> working -> in-review -> merg
                                                                #   Verdict transitions are daemon-managed only (#130).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
   quorum task-close --agent <id> --task-id <n> --reason-stdin   # manual/external terminal close (merged by hand, fixed elsewhere,
-                                                               # obsolete). Emits `task_closed_manual` event — NEVER `task_done`.
+                                                               # obsolete). Also closes a `failed` task whose PR landed by hand.
+                                                               # Emits `task_closed_manual` event — NEVER `task_done`.
                                                                # Owner/manual use; managed agents finishing work use `quorum submit`.
   quorum task-retry --task-id <n> --by <operator>               # retry a task durably parked by a provider failure
   quorum task-list [--status <s>] [--label <l>] [--assignee <id>] [--brief]

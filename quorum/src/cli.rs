@@ -542,8 +542,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Explicitly close a task from any non-terminal state, with a required reason.
-    /// For manual/external resolution (merged by hand, fixed elsewhere, obsolete).
+    /// Explicitly close a task from any state except `done`/`cancelled`, with a
+    /// required reason. For manual/external resolution (merged by hand, fixed
+    /// elsewhere, obsolete) — including a `failed` task whose PR later landed,
+    /// which otherwise has no route to `done` and leaves dependents parked.
     /// Sets the task to `done` but emits a `task_closed_manual` event (never
     /// `task_done`), so the audit log distinguishes manual closes from the
     /// reviewed+merged lifecycle. Reason via --reason-stdin or --reason-file.

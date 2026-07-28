@@ -960,7 +960,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 None => {
                     output::emit(&serde_json::json!({
                         "ok": false,
-                        "reason": "task not found or already terminal",
+                        "reason": "task not found or already done/cancelled",
                     }));
                     Ok(1)
                 }
