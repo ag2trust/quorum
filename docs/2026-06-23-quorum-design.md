@@ -306,7 +306,7 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   parked until it gets there (`compute_ready` counts only `done`). Reason REQUIRED.
   Sets `done` but emits `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
-  agents finishing work must use `quorum done`.
+  agents finishing work must use `quorum submit` (`quorum done` is a deprecated alias).
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
   durably parked after an automatic bounded failure. General daemon parks restore
   their recorded lifecycle stage as specified in § Explicit cancellation and durable
