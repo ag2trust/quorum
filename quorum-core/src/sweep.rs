@@ -162,16 +162,18 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
         conn.execute(&sql, params![limit as i64])?;
     }
     conn.execute(
+        "DELETE FROM task_messages WHERE rowid IN \
+         (SELECT rowid FROM task_messages WHERE NOT EXISTS \
+          (SELECT 1 FROM tasks WHERE tasks.id=task_messages.task_id) LIMIT ?1)",
+        params![limit as i64],
+    )?;
+    // Remove deliveries after their orphaned message parents so one explicit sweep reclaims
+    // both levels of legacy task-message data.
+    conn.execute(
         "DELETE FROM task_message_deliveries WHERE rowid IN \
          (SELECT d.rowid FROM task_message_deliveries d
           WHERE NOT EXISTS (SELECT 1 FROM task_messages m WHERE m.id=d.message_id)
           LIMIT ?1)",
-        params![limit as i64],
-    )?;
-    conn.execute(
-        "DELETE FROM task_messages WHERE rowid IN \
-         (SELECT rowid FROM task_messages WHERE NOT EXISTS \
-          (SELECT 1 FROM tasks WHERE tasks.id=task_messages.task_id) LIMIT ?1)",
         params![limit as i64],
     )?;
     Ok(())
@@ -418,6 +420,42 @@ mod tests {
             .query_row("SELECT count(*) FROM agent_runs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "normal sweep must clean old orphaned runs");
+    }
+
+    #[test]
+    fn sweep_all_reclaims_legacy_orphan_task_message_and_delivery_together() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO task_messages(task_id, sender_run_id, sender_agent, kind, body,
+                 recipient_count, created_at, expires_at)
+             VALUES (99999, 1, 'old-run', 'direct', 'legacy', 1, 1, 9999)",
+            [],
+        )
+        .unwrap();
+        let message_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_message_deliveries(message_id, recipient_run_id, recipient_agent,
+                 created_at, updated_at)
+             VALUES (?1, 2, 'recipient', 1, 1)",
+            [message_id],
+        )
+        .unwrap();
+
+        sweep_all(&c, 1).unwrap();
+
+        let messages: i64 = c
+            .query_row("SELECT count(*) FROM task_messages", [], |r| r.get(0))
+            .unwrap();
+        let deliveries: i64 = c
+            .query_row("SELECT count(*) FROM task_message_deliveries", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(messages, 0, "legacy orphan task message must be reclaimed");
+        assert_eq!(
+            deliveries, 0,
+            "its delivery must be reclaimed by the same explicit sweep"
+        );
     }
 
     #[test]
