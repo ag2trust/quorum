@@ -6501,7 +6501,8 @@ async fn tick(
                 classifier::ClassifierResult::Done(text) => {
                     if let Some(results) = classifier::parse_response(&text) {
                         let p = db_path.clone();
-                        let version = quorum_core::classify::CLASSIFIER_VERSION.to_string();
+                        let version =
+                            quorum_core::classify::classifier_provenance(&config.classifier_model);
                         let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
                             let mut conn = quorum_core::db::open(&p)?;
                             let now = now_unix();
@@ -6550,7 +6551,8 @@ async fn tick(
                 let text = std::mem::take(&mut slot.response_text);
                 if let Some(results) = classifier::parse_response(&text) {
                     let p = db_path.clone();
-                    let version = quorum_core::classify::CLASSIFIER_VERSION.to_string();
+                    let version =
+                        quorum_core::classify::classifier_provenance(&config.classifier_model);
                     let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
                         let mut conn = quorum_core::db::open(&p)?;
                         let now = now_unix();

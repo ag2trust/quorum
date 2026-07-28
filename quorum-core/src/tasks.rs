@@ -2307,6 +2307,41 @@ mod tests {
         (dir, c)
     }
 
+    #[test]
+    fn merging_pr_refs_preserves_existing_classifier_provenance() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "already classified",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":2,"cx_by":"haiku-45:v1","cx_tags":["kind:chore"]}"#),
+            None,
+            None,
+            1_000,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(task_id), &[], TTL, 1_001).unwrap();
+        apply_event(
+            &mut conn,
+            "worker",
+            task_id,
+            &Event::SignaledDone { pr: "42".into() },
+            1_002,
+        )
+        .unwrap();
+
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+
+        assert_eq!(refs["pr"], 42);
+        assert_eq!(refs["cx_est"], 2);
+        assert_eq!(refs["cx_by"], "haiku-45:v1");
+        assert_eq!(refs["cx_tags"][0], "kind:chore");
+    }
+
     fn late_worker_identity(c: &mut Connection, task_id: i64, agent: &str, pr: Option<i64>) {
         crate::journal::upsert(
             c,

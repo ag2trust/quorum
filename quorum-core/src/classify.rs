@@ -129,7 +129,7 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
 pub fn store_classifications(
     conn: &mut Connection,
     results: &[TaskClassification],
-    classifier_version: &str,
+    classifier_provenance: &str,
     now: i64,
 ) -> Result<usize> {
     let tx = begin_immediate(conn)?;
@@ -150,7 +150,7 @@ pub fn store_classifications(
             .flatten();
 
         let sanitized = sanitize(result);
-        let new_refs = merge_cx_into_refs(&current_refs, &sanitized, classifier_version);
+        let new_refs = merge_cx_into_refs(&current_refs, &sanitized, classifier_provenance);
 
         let n = tx.execute(
             "UPDATE tasks SET refs = ?1, updated_at = ?2 WHERE id = ?3",
@@ -341,8 +341,14 @@ Output format (JSON array wrapped in an object):
     )
 }
 
-/// Classifier version string for `cx_by`.
-pub const CLASSIFIER_VERSION: &str = "haiku-45:v1";
+/// Stable classifier provenance string for `cx_by`.
+///
+/// The model is part of the identifier so classification quality can be grouped
+/// by the model that actually produced it. `v1` distinguishes this prompt and
+/// parser contract from future revisions.
+pub fn classifier_provenance(model: &str) -> String {
+    format!("{model}:v1")
+}
 
 #[cfg(test)]
 mod tests {
@@ -378,6 +384,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&refs).unwrap();
         assert_eq!(v["pr"], 42);
         assert_eq!(v["cx_est"], 2);
+    }
+
+    #[test]
+    fn classifier_provenance_identifies_the_model() {
+        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v1");
+        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v1");
     }
 
     #[test]
@@ -543,6 +555,49 @@ mod tests {
             .notes;
         assert_eq!(notes.len(), 1);
         assert!(notes[0].body.contains("oversized"));
+    }
+
+    #[test]
+    fn store_classifications_records_each_classifier_model() {
+        let (_dir, mut conn) = open_tmp();
+        let luna_task = create_task(&mut conn, "Luna task", 1);
+        let terra_task = create_task(&mut conn, "Terra task", 2);
+        let result = |task_id| {
+            vec![TaskClassification {
+                task_id,
+                cx_est: 2,
+                cx_flags: vec![],
+                cx_tags: vec![],
+                cx_dup_of: vec![],
+            }]
+        };
+
+        store_classifications(
+            &mut conn,
+            &result(luna_task),
+            &classifier_provenance("gpt-5.6-luna"),
+            2_000_000,
+        )
+        .unwrap();
+        store_classifications(
+            &mut conn,
+            &result(terra_task),
+            &classifier_provenance("gpt-5.6-terra"),
+            2_000_001,
+        )
+        .unwrap();
+
+        let cx_by = |task_id| {
+            let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            refs["cx_by"].as_str().unwrap().to_string()
+        };
+        let luna_by = cx_by(luna_task);
+        let terra_by = cx_by(terra_task);
+        assert_eq!(luna_by, "gpt-5.6-luna:v1");
+        assert_eq!(terra_by, "gpt-5.6-terra:v1");
+        assert_ne!(luna_by, terra_by);
     }
 
     #[test]
