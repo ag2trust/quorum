@@ -6,7 +6,7 @@
 //! explicit sweep (`quorum sweep`) plus a WAL checkpoint.
 
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
@@ -292,7 +292,10 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
 pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     // Keep task children and their parent atomic here too. Sweep-on-write already receives its
     // caller's write transaction; explicit sweep owns this transaction itself.
-    let tx = conn.unchecked_transaction()?;
+    // `unchecked_transaction()` defaults to BEGIN DEFERRED. This sweep reads while reaping
+    // before its first delete, so a concurrent writer could otherwise commit between those
+    // operations and make SQLite reject the later upgrade with SQLITE_BUSY_SNAPSHOT.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     reap_lapsed_tasks(&tx, now, usize::MAX)?;
     cascade_dead_deps(&tx, now, usize::MAX)?;
     tx.execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
