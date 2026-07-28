@@ -559,12 +559,12 @@ mod tests {
         // races a concurrent fork(), and a child born after the kernel's group scan
         // starts with an empty pending-signal set, survives as an orphan, and holds
         // the stderr pipe open until it exits on its own — a 30s hang, not a deadlock.
+        // One write makes observing provider.ready proof that the terminal record is queued.
         let mut proc = shell_proc(
             "printf '\\377invalid\\n' >&2; \
              head -c 17618 /dev/zero | tr '\\000' x >&2; echo >&2; \
              i=0; while [ $i -lt 306 ]; do echo codex-stderr-$i >&2; i=$((i+1)); done; \
-             echo '{\"type\":\"provider.ready\"}'; \
-             echo '{\"type\":\"turn.completed\"}'; \
+             printf '%s\n%s\n' '{\"type\":\"provider.ready\"}' '{\"type\":\"turn.completed\"}'; \
              exec sleep 30",
         )
         .await;
