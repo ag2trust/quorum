@@ -38,6 +38,8 @@ const DEFAULT_SERVE_TOML: &str = "\
 # review_effort = \"high\"
 # classifier_model = \"gpt-5.6-terra\"
 # classifier_effort = \"medium\"
+# collector_model = \"gpt-5.6-terra\"  # defaults to classifier_model when absent
+# collector_effort = \"medium\"        # defaults to classifier_effort when absent
 #
 # ## Advisory complexity routing policy
 # Claude: 1=sonnet-5/medium, 2=opus-46/medium, 3=opus-46/high,
@@ -1212,6 +1214,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 review_effort: &roles.review_effort,
                 classifier_model: &roles.classifier_model,
                 classifier_effort: &roles.classifier_effort,
+                collector_model: &roles.collector_model,
+                collector_effort: &roles.collector_effort,
                 log_dir: &r_log_dir,
                 no_bare_agent: &r_no_bare,
                 self_update_drain: &r_self_update,
@@ -1286,6 +1290,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 review_effort: roles.review_effort,
                 classifier_model: roles.classifier_model,
                 classifier_effort: roles.classifier_effort,
+                collector_model: roles.collector_model,
+                collector_effort: roles.collector_effort,
                 merge_executor,
                 bare_agent: !r_no_bare.value,
                 limits: serve::CostLimits {
