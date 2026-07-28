@@ -77,6 +77,9 @@ pub enum Event {
     },
     VerdictApprove,
     VerdictChanges,
+    ChecksFailed {
+        checks: Vec<String>,
+    },
     ReworkPushed,
     MergeSucceeded,
     MergeFailed {
@@ -190,6 +193,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Open, Event::ReviewerAttached { .. }) => reject("no reviewer in open"),
         (Status::Open, Event::VerdictApprove) => reject("no verdict in open"),
         (Status::Open, Event::VerdictChanges) => reject("no verdict in open"),
+        (Status::Open, Event::ChecksFailed { .. }) => reject("no PR checks in open"),
         (Status::Open, Event::ReworkPushed) => reject("no rework from open"),
         (Status::Open, Event::MergeSucceeded) => reject("no merge from open"),
         (Status::Open, Event::MergeFailed { .. }) => reject("no merge from open"),
@@ -234,6 +238,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Working, Event::ReviewerAttached { .. }) => reject("not in review"),
         (Status::Working, Event::VerdictApprove) => reject("not in review"),
         (Status::Working, Event::VerdictChanges) => reject("not in review"),
+        (Status::Working, Event::ChecksFailed { .. }) => reject("not in review"),
         (Status::Working, Event::ReworkPushed) => reject("not in rework"),
         (Status::Working, Event::MergeSucceeded) => reject("not merging"),
         (Status::Working, Event::MergeFailed { .. }) => reject("not merging"),
@@ -260,7 +265,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
                 pr: t.pr.clone().unwrap_or_default(),
             }],
         )),
-        (Status::InReview, Event::VerdictChanges) => {
+        (Status::InReview, Event::VerdictChanges | Event::ChecksFailed { .. }) => {
             if t.rework_round >= REWORK_CAP {
                 return Ok((
                     Status::Failed,
@@ -374,6 +379,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Rework, Event::ReviewerAttached { .. }) => reject("not in review"),
         (Status::Rework, Event::VerdictApprove) => reject("not in review"),
         (Status::Rework, Event::VerdictChanges) => reject("not in review"),
+        (Status::Rework, Event::ChecksFailed { .. }) => reject("not in review"),
         (Status::Rework, Event::MergeSucceeded) => reject("not merging"),
         (Status::Rework, Event::MergeFailed { .. }) => reject("not merging"),
         (Status::Rework, Event::MergeConflict) => reject("not merging"),
@@ -436,6 +442,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Merging, Event::ReviewerAttached { .. }) => reject("merging in progress"),
         (Status::Merging, Event::VerdictApprove) => reject("merging in progress"),
         (Status::Merging, Event::VerdictChanges) => reject("merging in progress"),
+        (Status::Merging, Event::ChecksFailed { .. }) => reject("merging in progress"),
         (Status::Merging, Event::ReworkPushed) => reject("merging in progress"),
         (Status::Merging, Event::PrFoundMerged) => reject("merging in progress"),
         (Status::Merging, Event::PrFoundClosed) => reject("merging in progress"),
@@ -623,6 +630,9 @@ mod tests {
             Event::ReviewerAttached { agent: "R1".into() },
             Event::VerdictApprove,
             Event::VerdictChanges,
+            Event::ChecksFailed {
+                checks: vec!["test".into()],
+            },
             Event::ReworkPushed,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
@@ -739,6 +749,9 @@ mod tests {
             Event::ReviewerAttached { agent: "R1".into() },
             Event::VerdictApprove,
             Event::VerdictChanges,
+            Event::ChecksFailed {
+                checks: vec!["test".into()],
+            },
             Event::ReworkPushed,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
@@ -790,6 +803,23 @@ mod tests {
         assert_ok(
             &t,
             &Event::VerdictChanges,
+            Status::Rework,
+            &[
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ],
+        );
+    }
+
+    #[test]
+    fn in_review_checks_failed_uses_rework_path_without_reviewer() {
+        let t = view_with_author(Status::InReview, "W1");
+        assert_ok(
+            &t,
+            &Event::ChecksFailed {
+                checks: vec!["fmt".into()],
+            },
             Status::Rework,
             &[
                 Effect::ReleaseLease,
@@ -1963,6 +1993,9 @@ mod proptests {
             Just(Event::ReviewerAttached { agent: "R1".into() }),
             Just(Event::VerdictApprove),
             Just(Event::VerdictChanges),
+            Just(Event::ChecksFailed {
+                checks: vec!["test".into()]
+            }),
             Just(Event::ReworkPushed),
             Just(Event::MergeSucceeded),
             Just(Event::MergeFailed {
@@ -2134,7 +2167,7 @@ mod proptests {
             prop_assert_eq!(next, Status::Cancelled);
         }
 
-        /// IncrementReworkRound effect only appears on VerdictChanges or MergeConflict → Rework.
+        /// IncrementReworkRound only appears on an actionable rework event.
         #[test]
         fn increment_rework_only_on_rework_events(events in arb_event_seq(40)) {
             let mut t = TaskView {
@@ -2150,7 +2183,12 @@ mod proptests {
                 if let Ok((next, effects)) = transition(&t, event) {
                     if effects.contains(&Effect::IncrementReworkRound) {
                         prop_assert!(
-                            matches!(event, Event::VerdictChanges | Event::MergeConflict),
+                            matches!(
+                                event,
+                                Event::VerdictChanges
+                                    | Event::ChecksFailed { .. }
+                                    | Event::MergeConflict
+                            ),
                             "IncrementReworkRound from event {:?}", event
                         );
                         prop_assert_eq!(

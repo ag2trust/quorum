@@ -34,6 +34,78 @@ pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
+pub const CI_REMEDIATION_REQUESTED_REF: &str = "ci_remediation_requested";
+pub const CI_REMEDIATION_PR_REF: &str = "ci_remediation_pr";
+pub const CI_REMEDIATION_HEAD_SHA_REF: &str = "ci_remediation_head_sha";
+pub const CI_REMEDIATION_FEEDBACK_REF: &str = "ci_remediation_feedback";
+pub const CI_REMEDIATION_CHECKS_REF: &str = "ci_remediation_checks";
+pub const CI_REMEDIATION_ATTEMPTS_REF: &str = "ci_remediation_attempts";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRemediationIntent {
+    pub pr: i64,
+    pub head_sha: String,
+    pub feedback: String,
+    pub checks: Vec<String>,
+    pub attempts: i64,
+}
+
+pub fn ci_remediation_intent(refs: Option<&str>) -> Result<Option<CiRemediationIntent>> {
+    let Some(raw) = refs else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
+    if value
+        .get(CI_REMEDIATION_REQUESTED_REF)
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Ok(None);
+    }
+    let required_string = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| QuorumError::Io(format!("persisted CI remediation is missing {key}")))
+    };
+    let pr = value
+        .get(CI_REMEDIATION_PR_REF)
+        .and_then(serde_json::Value::as_i64)
+        .filter(|pr| *pr > 0)
+        .ok_or_else(|| QuorumError::Io("persisted CI remediation has invalid PR".into()))?;
+    let checks = value
+        .get(CI_REMEDIATION_CHECKS_REF)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            QuorumError::Io("persisted CI remediation is missing failing checks".into())
+        })?
+        .iter()
+        .map(|check| {
+            check
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| QuorumError::Io("persisted CI remediation check is not text".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if checks.is_empty() {
+        return Err(QuorumError::Io(
+            "persisted CI remediation has no failing checks".into(),
+        ));
+    }
+    Ok(Some(CiRemediationIntent {
+        pr,
+        head_sha: required_string(CI_REMEDIATION_HEAD_SHA_REF)?,
+        feedback: required_string(CI_REMEDIATION_FEEDBACK_REF)?,
+        checks,
+        attempts: value
+            .get(CI_REMEDIATION_ATTEMPTS_REF)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+    }))
+}
 
 /// Body marker for review-only tasks whose approved PR failed to merge (e.g. conflicts).
 /// The daemon's orphan-in-review handler detects this and retries merge when the PR
@@ -723,6 +795,114 @@ pub fn apply_event(
     apply_event_tx(tx, agent, id, event, now, |_| Ok(()))
 }
 
+/// Atomically enter rework for failed pre-review CI and persist the exact
+/// remediation intent that restart recovery must replay on the same PR/head.
+pub fn apply_checks_failed_with_remediation(
+    conn: &mut Connection,
+    id: i64,
+    pr: i64,
+    head_sha: &str,
+    checks: &[String],
+    feedback: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    if pr <= 0 || head_sha.is_empty() || checks.is_empty() || feedback.is_empty() {
+        return Err(QuorumError::BadInput(
+            "CI remediation requires PR, head SHA, checks, and feedback".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let checks_json = serde_json::to_string(checks)
+        .map_err(|error| QuorumError::Io(format!("serialize failing checks: {error}")))?;
+    apply_event_tx(
+        tx,
+        "system",
+        id,
+        &Event::ChecksFailed {
+            checks: checks.to_vec(),
+        },
+        now,
+        |tx| {
+            // The lifecycle update has already selected the destination. Only
+            // rework receives retry intent; a rework-cap failure remains terminal.
+            tx.execute(
+                "UPDATE tasks SET refs=json_set(
+                     COALESCE(refs, '{}'),
+                     '$.ci_remediation_requested', json('true'),
+                     '$.ci_remediation_pr', ?2,
+                     '$.ci_remediation_head_sha', ?3,
+                     '$.ci_remediation_feedback', ?4,
+                     '$.ci_remediation_checks', json(?5),
+                     '$.ci_remediation_attempts', 0
+                 )
+                 WHERE id=?1 AND status='rework'",
+                params![id, pr, head_sha, feedback, checks_json],
+            )?;
+            tx.execute(
+                "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
+                params![pr, id],
+            )?;
+            Ok(())
+        },
+    )
+}
+
+/// Persist one failed attempt to provision a CI remediation worker.
+/// Returns `None` if the task no longer owns this durable rework intent.
+pub fn record_ci_remediation_attempt(
+    conn: &mut Connection,
+    id: i64,
+    now: i64,
+) -> Result<Option<i64>> {
+    let tx = begin_immediate(conn)?;
+    let attempts = tx
+        .query_row(
+            "UPDATE tasks
+             SET refs=json_set(
+                     refs,
+                     '$.ci_remediation_attempts',
+                     COALESCE(json_extract(refs, '$.ci_remediation_attempts'), 0) + 1
+                 ),
+                 updated_at=?2
+             WHERE id=?1 AND status='rework' AND json_valid(refs)
+               AND json_extract(refs, '$.ci_remediation_requested')=1
+             RETURNING json_extract(refs, '$.ci_remediation_attempts')",
+            params![id, now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(attempts)
+}
+
+/// Clear stale runtime ownership for a durable CI remediation after daemon
+/// restart while preserving its rework status and exact retry intent.
+pub fn reset_ci_remediation_for_recovery(conn: &mut Connection, id: i64, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let preserved = tx.execute(
+        "UPDATE tasks SET assignee=NULL, updated_at=?2
+         WHERE id=?1 AND status='rework' AND json_valid(refs)
+           AND json_extract(refs, '$.ci_remediation_requested')=1",
+        params![id, now],
+    )? == 1;
+    if preserved {
+        tx.execute(
+            "UPDATE claims SET active=0
+             WHERE target=?1 AND active=1",
+            params![lease_target(id)],
+        )?;
+        crate::events::emit(
+            &tx,
+            "ci_remediation_recovered",
+            &lease_target(id),
+            "daemon restart preserved CI remediation intent",
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(preserved)
+}
+
 /// Atomically fail a reviewer only while it still owns the active review phase.
 ///
 /// Reviewer processes are turn-oriented and may exit after their verdict has
@@ -1049,6 +1229,7 @@ where
         }
         Event::Claimed { .. }
         | Event::ReviewerAttached { .. }
+        | Event::ChecksFailed { .. }
         | Event::LeaseExpired
         | Event::AgentFailed { .. }
         | Event::ControlledShutdown
@@ -1269,6 +1450,12 @@ fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
             "codex_retry_turn_kind",
             "codex_retry_thread_id",
             PARKED_REWORK_RETRY_REF,
+            CI_REMEDIATION_REQUESTED_REF,
+            CI_REMEDIATION_PR_REF,
+            CI_REMEDIATION_HEAD_SHA_REF,
+            CI_REMEDIATION_FEEDBACK_REF,
+            CI_REMEDIATION_CHECKS_REF,
+            CI_REMEDIATION_ATTEMPTS_REF,
         ] {
             object.remove(key);
         }
@@ -6569,5 +6756,83 @@ mod tests {
         crate::sweep::reap_lapsed_tasks(&c, 1500, 100).unwrap();
         let t = get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "open", "expired remediation lease must be reaped");
+    }
+
+    #[test]
+    fn failed_ci_remediation_intent_is_atomic_recoverable_and_cleared_on_push() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "durable CI remediation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "453".into() },
+            1100,
+        )
+        .unwrap();
+
+        let checks = vec!["fmt".to_string(), "test".to_string()];
+        let transition = apply_checks_failed_with_remediation(
+            &mut c,
+            id,
+            453,
+            "abc123",
+            &checks,
+            "fix the exact failed CI",
+            1200,
+        )
+        .unwrap();
+        assert_eq!(transition.task.status, "rework");
+        let intent = ci_remediation_intent(transition.task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent,
+            CiRemediationIntent {
+                pr: 453,
+                head_sha: "abc123".into(),
+                feedback: "fix the exact failed CI".into(),
+                checks,
+                attempts: 0,
+            }
+        );
+        assert_eq!(
+            record_ci_remediation_attempt(&mut c, id, 1201).unwrap(),
+            Some(1)
+        );
+
+        claim_remediation_rework(&mut c, "REM1", id, TTL, 1202)
+            .unwrap()
+            .unwrap();
+        assert!(reset_ci_remediation_for_recovery(&mut c, id, 1203).unwrap());
+        let recovered = get(&c, id).unwrap().unwrap();
+        assert_eq!(recovered.status, "rework");
+        assert_eq!(recovered.assignee, None);
+        assert!(!has_live_lease(&c, id, 1203));
+
+        claim_remediation_rework(&mut c, "REM2", id, TTL, 1204)
+            .unwrap()
+            .unwrap();
+        apply_event(&mut c, "REM2", id, &Event::ReworkPushed, 1205).unwrap();
+        let submitted = get(&c, id).unwrap().unwrap();
+        assert_eq!(submitted.status, "in-review");
+        assert_eq!(
+            ci_remediation_intent(submitted.refs.as_deref()).unwrap(),
+            None,
+            "successful rework submission must consume durable CI intent"
+        );
     }
 }

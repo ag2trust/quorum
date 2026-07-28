@@ -104,6 +104,8 @@ impl ServeHandle {
                 &names.to_string_lossy(),
                 "--agent-bin",
                 &fake_agent.to_string_lossy(),
+                "--merge-cmd",
+                "true",
                 "--exit-when-gone",
                 &sentinel_path,
             ])

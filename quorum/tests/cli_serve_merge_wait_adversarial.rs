@@ -287,6 +287,15 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
 }
 
 fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) {
+    complete_r2_review_after(home, handle, pr, || {});
+}
+
+fn complete_r2_review_after(
+    home: &std::path::Path,
+    handle: &mut ServeHandle,
+    pr: &str,
+    before_submit: impl FnOnce(),
+) {
     assert!(
         handle.wait_for("R2: pre-merge reviewer", 15),
         "R2 reviewer was not spawned: {:?}",
@@ -303,6 +312,7 @@ fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str
         handle.lines
     );
 
+    before_submit();
     quorum_done(
         home,
         &[
@@ -320,6 +330,15 @@ fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str
 
 /// Drive a task through worker + R1 + R2 approval to reach the merge-checks phase.
 fn drive_to_approved(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) -> String {
+    drive_to_approved_after(home, handle, pr, || {})
+}
+
+fn drive_to_approved_after(
+    home: &std::path::Path,
+    handle: &mut ServeHandle,
+    pr: &str,
+    before_r2_submit: impl FnOnce(),
+) -> String {
     assert!(
         handle.wait_for("spawning agent", 15),
         "worker not spawned. Lines: {:?}",
@@ -360,7 +379,7 @@ fn drive_to_approved(home: &std::path::Path, handle: &mut ServeHandle, pr: &str)
             "0",
         ],
     );
-    complete_r2_review(home, handle, pr);
+    complete_r2_review_after(home, handle, pr, before_r2_submit);
 
     worker_name
 }
@@ -500,7 +519,7 @@ fn scenario_a_merge_wait_with_dependents() {
     let names_file = write_names_file(home.path());
 
     let checks_state = home.path().join("checks_state");
-    std::fs::write(&checks_state, "pending").unwrap();
+    std::fs::write(&checks_state, "ready").unwrap();
     let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -534,7 +553,9 @@ fn scenario_a_merge_wait_with_dependents() {
         ],
     );
 
-    drive_to_approved(home.path(), &mut handle, "1");
+    drive_to_approved_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     assert!(
         handle.wait_for("merge wait", 15),
@@ -621,7 +642,7 @@ fn scenario_a_restart_pending_then_ready_merges() {
     let names_file = write_names_file(home.path());
 
     let checks_state = home.path().join("checks_state");
-    std::fs::write(&checks_state, "pending").unwrap();
+    std::fs::write(&checks_state, "ready").unwrap();
     let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -649,7 +670,9 @@ fn scenario_a_restart_pending_then_ready_merges() {
         ],
     );
 
-    drive_to_approved(home.path(), &mut handle, "1");
+    drive_to_approved_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     assert!(
         handle.wait_for("merge wait", 15),
@@ -733,7 +756,7 @@ fn scenario_b_failed_checks_absent_worker_replacement_cycle() {
     let names_file = write_names_file(home.path());
 
     let checks_state = home.path().join("checks_state");
-    std::fs::write(&checks_state, "pending").unwrap();
+    std::fs::write(&checks_state, "ready").unwrap();
     let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -799,7 +822,9 @@ fn scenario_b_failed_checks_absent_worker_replacement_cycle() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, &pr.to_string());
+    complete_r2_review_after(home.path(), &mut handle, &pr.to_string(), || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     // Enter merge-wait with Pending.
     assert!(
@@ -882,6 +907,9 @@ fn repeated_pending_never_increments_counters() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("repeated_pending_checks_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -900,7 +928,7 @@ fn repeated_pending_never_increments_counters() {
         "true",
         &[
             "--merge-checks-cmd",
-            "echo pending",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
@@ -908,7 +936,9 @@ fn repeated_pending_never_increments_counters() {
         ],
     );
 
-    drive_to_approved(home.path(), &mut handle, "1");
+    drive_to_approved_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     // Wait for multiple merge-wait ticks (at least 3 seconds of retries).
     assert!(
@@ -951,7 +981,7 @@ fn head_sha_change_invalidates_approvals() {
     let names_file = write_names_file(home.path());
 
     let checks_state = home.path().join("checks_state");
-    std::fs::write(&checks_state, "pending").unwrap();
+    std::fs::write(&checks_state, "ready").unwrap();
     let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -980,7 +1010,9 @@ fn head_sha_change_invalidates_approvals() {
         ],
     );
 
-    drive_to_approved(home.path(), &mut handle, "1");
+    drive_to_approved_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     assert!(
         handle.wait_for("merge wait", 15),
@@ -1566,7 +1598,7 @@ fn no_duplicate_events_under_restart() {
     let names_file = write_names_file(home.path());
 
     let checks_state = home.path().join("checks_state");
-    std::fs::write(&checks_state, "pending").unwrap();
+    std::fs::write(&checks_state, "ready").unwrap();
     let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -1594,7 +1626,9 @@ fn no_duplicate_events_under_restart() {
         ],
     );
 
-    drive_to_approved(home.path(), &mut handle, "1");
+    drive_to_approved_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     assert!(
         handle.wait_for("merge wait", 15),

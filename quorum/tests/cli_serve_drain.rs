@@ -404,7 +404,6 @@ fn other_repo_merge_does_not_drain() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
-
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -594,6 +593,9 @@ fn drain_timeout_honored_during_merge_checks() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("drain_merge_checks_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -608,8 +610,8 @@ fn drain_timeout_honored_during_merge_checks() {
         r#"{"repo":"test-owner/test-repo"}"#,
     );
 
-    // checks-cmd always returns "pending" → wait_for_checks blocks for up to
-    // merge_checks_timeout_secs (30s) inside a spawn_blocking.
+    // CI starts green so R1 and R2 can run. Before R2 submits, the test flips
+    // it to pending so the merge-time wait blocks for up to 30s.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
@@ -623,7 +625,7 @@ fn drain_timeout_honored_during_merge_checks() {
             "--drain-timeout-secs",
             "2",
             "--merge-checks-cmd",
-            "echo pending",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "30",
             "--merge-checks-poll-secs",
@@ -698,6 +700,7 @@ fn drain_timeout_honored_during_merge_checks() {
     );
 
     // R2 approves → daemon enters wait_for_checks (blocks up to 30s).
+    std::fs::write(&checks_state, "pending").unwrap();
     quorum_done(
         home.path(),
         &[
@@ -764,6 +767,9 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("pending_merge_checks_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -778,7 +784,8 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
         r#"{"repo":"test/repo"}"#,
     );
 
-    // checks-cmd always returns "pending" → times out after 3s.
+    // CI starts green so R1 and R2 can run, then becomes pending before the
+    // merge-time check wait and times out after 3s.
     let mut handle = ServeHandle::start(
         home.path(),
         repo_dir.path(),
@@ -787,7 +794,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
         "true",
         &[
             "--merge-checks-cmd",
-            "echo pending",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "3",
             "--merge-checks-poll-secs",
@@ -862,6 +869,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
     );
 
     // R2 approves → daemon enters wait_for_checks (times out after 3s).
+    std::fs::write(&checks_state, "pending").unwrap();
     quorum_done(
         home.path(),
         &[

@@ -39,6 +39,7 @@ use worktree::WorktreeManager;
 
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
+const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 
@@ -66,6 +67,24 @@ impl ReviewRole {
 
 struct PoisonTracker {
     strikes: HashMap<i64, u32>,
+}
+
+enum PreReviewChecksState {
+    Waiting(tokio::task::JoinHandle<merge::ChecksOutcome>),
+    Ready,
+}
+
+struct PreReviewChecksEntry {
+    pr: i64,
+    head_sha: String,
+    state: PreReviewChecksState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PreReviewChecksGate {
+    Waiting,
+    Ready,
+    Failed { failing_checks: Vec<String> },
 }
 
 impl PoisonTracker {
@@ -1578,6 +1597,503 @@ fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
     }
 }
 
+async fn poll_pre_review_checks(
+    config: &ServeConfig,
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+) -> Result<PreReviewChecksGate> {
+    if head_sha.is_empty() {
+        log(&format!(
+            "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — current head SHA unavailable; waiting"
+        ));
+        return Ok(PreReviewChecksGate::Waiting);
+    }
+
+    let target_changed = waits
+        .get(&task_id)
+        .is_some_and(|entry| entry.pr != pr || entry.head_sha != head_sha);
+    if target_changed {
+        if let Some(entry) = waits.remove(&task_id) {
+            log(&format!(
+                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} head changed \
+                 from {} to {}; discarding result and restarting",
+                entry.head_sha, head_sha
+            ));
+            if let PreReviewChecksState::Waiting(handle) = entry.state {
+                handle.abort();
+            }
+        }
+    }
+
+    if let Some(entry) = waits.get(&task_id) {
+        match &entry.state {
+            PreReviewChecksState::Ready => return Ok(PreReviewChecksGate::Ready),
+            PreReviewChecksState::Waiting(handle) if !handle.is_finished() => {
+                return Ok(PreReviewChecksGate::Waiting);
+            }
+            PreReviewChecksState::Waiting(_) => {}
+        }
+    } else {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        let timeout = config.merge_checks_timeout_secs;
+        let poll = config.merge_checks_poll_secs;
+        let handle =
+            tokio::task::spawn_blocking(move || executor.wait_for_checks(pr, &repo, timeout, poll));
+        waits.insert(
+            task_id,
+            PreReviewChecksEntry {
+                pr,
+                head_sha: head_sha.to_string(),
+                state: PreReviewChecksState::Waiting(handle),
+            },
+        );
+        log(&format!(
+            "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — waiting for checks before reviewer provisioning"
+        ));
+        return Ok(PreReviewChecksGate::Waiting);
+    }
+
+    let Some(entry) = waits.remove(&task_id) else {
+        return Ok(PreReviewChecksGate::Waiting);
+    };
+    let PreReviewChecksState::Waiting(handle) = entry.state else {
+        return Ok(PreReviewChecksGate::Ready);
+    };
+    let checks = handle
+        .await
+        .map_err(|error| QuorumError::Io(format!("pre-review checks join: {error}")))?;
+
+    let gate = match checks {
+        merge::ChecksOutcome::Ready if config.required_jobs.is_empty() => {
+            PreReviewChecksGate::Ready
+        }
+        merge::ChecksOutcome::Ready => {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let jobs = config.required_jobs.clone();
+            let required =
+                tokio::task::spawn_blocking(move || executor.check_required_jobs(pr, &repo, &jobs))
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("pre-review required jobs join: {error}"))
+                    })?;
+            match merge::apply_required_jobs_gate(merge::ChecksOutcome::Ready, required) {
+                merge::ChecksOutcome::Ready => PreReviewChecksGate::Ready,
+                merge::ChecksOutcome::Failed { failing_checks } => {
+                    PreReviewChecksGate::Failed { failing_checks }
+                }
+                merge::ChecksOutcome::Pending { reason } => {
+                    log(&format!(
+                        "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — {reason}"
+                    ));
+                    PreReviewChecksGate::Waiting
+                }
+                merge::ChecksOutcome::TimedOut => PreReviewChecksGate::Waiting,
+            }
+        }
+        merge::ChecksOutcome::Failed { failing_checks } => {
+            PreReviewChecksGate::Failed { failing_checks }
+        }
+        merge::ChecksOutcome::Pending { reason } => {
+            log(&format!(
+                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — {reason}"
+            ));
+            PreReviewChecksGate::Waiting
+        }
+        merge::ChecksOutcome::TimedOut => {
+            log(&format!(
+                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — checks still pending"
+            ));
+            PreReviewChecksGate::Waiting
+        }
+    };
+
+    if gate == PreReviewChecksGate::Ready {
+        waits.insert(
+            task_id,
+            PreReviewChecksEntry {
+                pr,
+                head_sha: head_sha.to_string(),
+                state: PreReviewChecksState::Ready,
+            },
+        );
+        log(&format!(
+            "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — checks ready"
+        ));
+    }
+    Ok(gate)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_pre_review_checks_failure(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    _lifetime_roster: &mut LifetimeRoster,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    failing_checks: &[String],
+) {
+    let names = failing_checks.join(", ");
+    let feedback = format!(
+        "CI checks failed before review for PR #{pr}: {names}\n\n\
+         Fix the failing checks, push the same PR branch, and submit it again."
+    );
+    log(&format!(
+        "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) — entering rework without spawning a reviewer"
+    ));
+
+    let transition = {
+        let p = config.db_path.clone();
+        let sha = head_sha.to_string();
+        let checks = failing_checks.to_vec();
+        let remediation_feedback = feedback.clone();
+        match tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::apply_checks_failed_with_remediation(
+                &mut conn,
+                task_id,
+                pr,
+                &sha,
+                &checks,
+                &remediation_feedback,
+                now_unix(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(result)) => {
+                log(&format!(
+                    "lifecycle: task #{task_id} -> {}",
+                    result.task.status
+                ));
+                Some(result)
+            }
+            Ok(Err(error)) => {
+                log(&format!(
+                    "PRE-REVIEW CI GATE: failed to durably enter remediation \
+                     for task #{task_id}: {error}"
+                ));
+                None
+            }
+            Err(error) => {
+                log(&format!(
+                    "PRE-REVIEW CI GATE: remediation transition join failed \
+                     for task #{task_id}: {error}"
+                ));
+                None
+            }
+        }
+    };
+    match transition {
+        Some(ref result) if result.task.status == "rework" => {
+            if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
+                let prompt = reviewer::build_rework_prompt(
+                    &workers[worker_index].agent_name,
+                    task_id,
+                    pr,
+                    &feedback,
+                    workers[worker_index].cost_usd,
+                    config.limits.max_task_cost_usd,
+                );
+                if let Err(error) =
+                    feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                {
+                    log(&format!(
+                        "pre-review CI rework feed failed for task #{task_id}: {error}; \
+                         preserving durable remediation intent"
+                    ));
+                    let worker = workers.remove(worker_index);
+                    let p = config.db_path.clone();
+                    let agent = worker.agent_name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut conn) = quorum_core::db::open(&p) {
+                            let _ = tasks::release_remediation_lease(
+                                &mut conn,
+                                &agent,
+                                task_id,
+                                now_unix(),
+                            );
+                        }
+                    })
+                    .await
+                    .ok();
+                    cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                } else {
+                    let worker = &mut workers[worker_index];
+                    worker.draining = true;
+                    worker.pr = None;
+                    worker.rework_count += 1;
+                    worker.turn_started_at = std::time::Instant::now();
+                    if let Some(ref mut session_log) = worker.session_log {
+                        session_log.log_rework(worker.rework_count);
+                    }
+                    let p = config.db_path.clone();
+                    let entry = slot_journal_entry(worker, "worker", "working");
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        journal::upsert(&mut conn, &entry)
+                    })
+                    .await
+                    .ok();
+                    log(&format!(
+                        "worker {} rework #{} (pre-review CI failure)",
+                        worker.agent_name, worker.rework_count
+                    ));
+                }
+            } else {
+                log(&format!(
+                    "no live worker for pre-review CI rework on task #{task_id} — \
+                     durable remediation will provision from the tick reconciler"
+                ));
+            }
+        }
+        Some(_) => {
+            if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
+                let worker = workers.remove(worker_index);
+                cleanup_slot(config, wt_mgr, name_pool, worker, None, "rework_cap").await;
+            }
+        }
+        None => {
+            log(&format!(
+                "PRE-REVIEW CI GATE: ChecksFailed transition failed for task #{task_id}"
+            ));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_reviewer_after_ci(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    reviewers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+) -> Result<bool> {
+    let Some(reviewer_index) = reviewers
+        .iter()
+        .position(|reviewer| reviewer.task_id == task_id)
+    else {
+        return Ok(true);
+    };
+    let Some(worker_index) = workers.iter().position(|worker| worker.task_id == task_id) else {
+        return Ok(true);
+    };
+
+    let gated_head_sha = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    };
+    match poll_pre_review_checks(config, pre_review_checks, task_id, pr, &gated_head_sha).await? {
+        PreReviewChecksGate::Waiting => {
+            log(&format!(
+                "ResumeReviewer: CI pending for task #{task_id} PR #{pr}; reviewer not fed"
+            ));
+            return Ok(false);
+        }
+        PreReviewChecksGate::Failed { failing_checks } => {
+            pre_review_checks.remove(&task_id);
+            handle_pre_review_checks_failure(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                lifetime_roster,
+                task_id,
+                pr,
+                &gated_head_sha,
+                &failing_checks,
+            )
+            .await;
+            return Ok(true);
+        }
+        PreReviewChecksGate::Ready => {}
+    }
+
+    // Re-resolve immediately before feeding. A changed or unavailable head
+    // invalidates the cached result and starts a fresh gate on the next tick.
+    let confirmed_head_sha = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .ok()
+            .flatten()
+    };
+    if confirmed_head_sha.as_deref() != Some(gated_head_sha.as_str()) {
+        pre_review_checks.remove(&task_id);
+        log(&format!(
+            "ResumeReviewer: PR #{pr} head moved after CI gate \
+             (gated {}, current {}); reviewer not fed",
+            if gated_head_sha.is_empty() {
+                "<missing>"
+            } else {
+                &gated_head_sha
+            },
+            confirmed_head_sha.as_deref().unwrap_or("<missing>")
+        ));
+        return Ok(false);
+    }
+
+    let rereview_turn = reviewer::build_rereview_turn(
+        &reviewers[reviewer_index].agent_name,
+        pr,
+        &workers[worker_index].agent_name,
+        &config.effort,
+    );
+    if let Err(error) = reviewers[reviewer_index]
+        .proc
+        .feed_turn(&rereview_turn)
+        .await
+    {
+        let reason = if reviewers[reviewer_index].proc.is_codex() {
+            "codex_rereview"
+        } else {
+            "failed"
+        };
+        log(&format!(
+            "ResumeReviewer: feed_turn failed for task #{task_id}: {error} \
+             — tearing down ({reason})"
+        ));
+        let reviewer = reviewers.remove(reviewer_index);
+        teardown_reviewer(config, wt_mgr, name_pool, reviewer, reason).await;
+    } else {
+        log(&format!(
+            "ResumeReviewer: fed re-review turn to {} for task #{task_id}",
+            reviewers[reviewer_index].agent_name
+        ));
+        reviewers[reviewer_index].draining = true;
+        reviewers[reviewer_index].turn_started_at = std::time::Instant::now();
+        reviewers[reviewer_index].reviewed_head_sha = Some(gated_head_sha);
+    }
+    pre_review_checks.remove(&task_id);
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_ci_remediations(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    draining: bool,
+) -> Result<()> {
+    if draining {
+        return Ok(());
+    }
+    let pending = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(i64, tasks::CiRemediationIntent)>> {
+            let conn = quorum_core::db::open(&p)?;
+            tasks::list(&conn, Some("rework"), None, None)?
+                .into_iter()
+                .filter_map(
+                    |task| match tasks::ci_remediation_intent(task.refs.as_deref()) {
+                        Ok(Some(intent)) => Some(Ok((task.id, intent))),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                )
+                .collect()
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("CI remediation scan join: {error}")))??
+    };
+
+    for (task_id, intent) in pending {
+        if workers.iter().any(|worker| worker.task_id == task_id) {
+            continue;
+        }
+        if intent.attempts >= MAX_CI_REMEDIATION_PROVISION_STRIKES {
+            let reason = format!(
+                "CI remediation provisioning exhausted for PR #{} head {} after {} attempts",
+                intent.pr,
+                &intent.head_sha[..12.min(intent.head_sha.len())],
+                intent.attempts
+            );
+            park_task(&config.db_path, task_id, &reason, "rework").await;
+            notify_provision_failure(
+                &config.db_path,
+                task_id,
+                "CI remediation provisioning exhausted",
+                &format!("#{}", intent.pr),
+            )
+            .await;
+            continue;
+        }
+
+        log(&format!(
+            "durable CI remediation: provisioning task #{task_id} on PR #{} head {}",
+            intent.pr,
+            &intent.head_sha[..12.min(intent.head_sha.len())]
+        ));
+        if spawn_remediation_worker(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            lifetime_roster,
+            task_id,
+            intent.pr,
+            &intent.feedback,
+        )
+        .await
+        {
+            continue;
+        }
+
+        let p = config.db_path.clone();
+        let attempts = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::record_ci_remediation_attempt(&mut conn, task_id, now_unix())
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "CI remediation attempt persistence join for task #{task_id}: {error}"
+            ))
+        })??;
+        if let Some(attempts) = attempts {
+            log(&format!(
+                "CI remediation provision strike \
+                 {attempts}/{MAX_CI_REMEDIATION_PROVISION_STRIKES} for task #{task_id} PR #{}",
+                intent.pr
+            ));
+            if attempts >= MAX_CI_REMEDIATION_PROVISION_STRIKES {
+                let reason = format!(
+                    "CI remediation provisioning exhausted for PR #{} head {} after {attempts} attempts",
+                    intent.pr,
+                    &intent.head_sha[..12.min(intent.head_sha.len())]
+                );
+                park_task(&config.db_path, task_id, &reason, "rework").await;
+                notify_provision_failure(
+                    &config.db_path,
+                    task_id,
+                    "CI remediation provisioning exhausted",
+                    &format!("#{}", intent.pr),
+                )
+                .await;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -1631,6 +2147,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let wt_mgr = WorktreeManager::new();
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
+    let mut pre_review_checks: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+    let mut pending_reviewer_resumes: HashMap<i64, i64> = HashMap::new();
     let mut poison_tracker = PoisonTracker::new();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
@@ -1917,6 +2435,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut name_pool,
             &mut workers,
             &mut reviewers,
+            &mut pre_review_checks,
+            &mut pending_reviewer_resumes,
             &mut poison_tracker,
             &mut drain_state,
             &mut lifetime_roster,
@@ -1971,6 +2491,8 @@ async fn tick(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
+    pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
+    pending_reviewer_resumes: &mut HashMap<i64, i64>,
     poison_tracker: &mut PoisonTracker,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
@@ -2365,34 +2887,54 @@ async fn tick(
                                     r1_run_id,
                                 };
 
-                                let pre_count = reviewers.len();
-                                provision_reviewer(
+                                let ci_gate = poll_pre_review_checks(
                                     config,
-                                    wt_mgr,
-                                    name_pool,
-                                    reviewers,
-                                    lifetime_roster,
+                                    pre_review_checks,
+                                    reviewer_task_id,
                                     pr_num,
-                                    worker_cp,
-                                    &role,
                                     &head_sha,
-                                    false,
                                 )
-                                .await
-                                .ok();
+                                .await?;
+                                let pre_count = reviewers.len();
+                                if ci_gate == PreReviewChecksGate::Ready {
+                                    provision_reviewer(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        reviewers,
+                                        lifetime_roster,
+                                        pr_num,
+                                        worker_cp,
+                                        &role,
+                                        &head_sha,
+                                        false,
+                                    )
+                                    .await
+                                    .ok();
+                                    pre_review_checks.remove(&reviewer_task_id);
+                                }
                                 let r2_added = reviewers.len() > pre_count;
 
-                                if r2_added {
-                                    log(&format!(
+                                match &ci_gate {
+                                    PreReviewChecksGate::Ready if r2_added => log(&format!(
                                         "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
-                                     tearing down R1 reviewer {}",
+                                         tearing down R1 reviewer {}",
                                         r1_reviewer
-                                    ));
-                                } else {
-                                    log(&format!(
+                                    )),
+                                    PreReviewChecksGate::Ready => log(&format!(
                                         "R2 GATE: R2 spawn failed for PR #{pr_num} \
-                                     — R1 approval stored, Phase 5 will retry"
-                                    ));
+                                         — R1 approval stored, Phase 5 will retry"
+                                    )),
+                                    PreReviewChecksGate::Waiting => log(&format!(
+                                        "R2 GATE: PR #{pr_num} — CI pending for current head; \
+                                         R1 approval stored and Phase 5 will retry without a reviewer"
+                                    )),
+                                    PreReviewChecksGate::Failed { failing_checks } => {
+                                        log(&format!(
+                                            "R2 GATE: PR #{pr_num} — CI failed before R2: {}",
+                                            failing_checks.join(", ")
+                                        ))
+                                    }
                                 }
                                 let r = reviewers.remove(ri);
                                 teardown_reviewer(
@@ -2407,6 +2949,21 @@ async fn tick(
                                     },
                                 )
                                 .await;
+                                if let PreReviewChecksGate::Failed { failing_checks } = ci_gate {
+                                    pre_review_checks.remove(&reviewer_task_id);
+                                    handle_pre_review_checks_failure(
+                                        config,
+                                        wt_mgr,
+                                        name_pool,
+                                        workers,
+                                        lifetime_roster,
+                                        reviewer_task_id,
+                                        pr_num,
+                                        &head_sha,
+                                        &failing_checks,
+                                    )
+                                    .await;
+                                }
                                 if !consume_mailbox_row(&db_path, *id).await {
                                     break;
                                 }
@@ -2905,36 +3462,22 @@ async fn tick(
                                 QuorumError::Io(format!("required_jobs spawn_blocking join: {e}"))
                             })?
                         };
-                        match rj_outcome {
-                            merge::RequiredJobsOutcome::AllSucceeded => {
+                        let outcome = merge::apply_required_jobs_gate(checks_outcome, rj_outcome);
+                        match &outcome {
+                            merge::ChecksOutcome::Ready => {
                                 log("required jobs gate: all required jobs succeeded");
-                                checks_outcome
                             }
-                            merge::RequiredJobsOutcome::NotReady { issues } => {
-                                let failing: Vec<String> = issues
-                                    .iter()
-                                    .map(|(name, status)| format!("{name} ({status})"))
-                                    .collect();
-                                log(&format!(
-                                    "REQUIRED JOBS GATE: PR #{pr_num} required jobs \
-                                     not SUCCESS: {}",
-                                    failing.join(", ")
-                                ));
-                                merge::ChecksOutcome::Failed {
-                                    failing_checks: failing,
-                                }
+                            merge::ChecksOutcome::Failed { failing_checks } => log(&format!(
+                                "REQUIRED JOBS GATE: PR #{pr_num} required jobs \
+                                 not SUCCESS: {}",
+                                failing_checks.join(", ")
+                            )),
+                            merge::ChecksOutcome::Pending { reason } => {
+                                log(&format!("REQUIRED JOBS GATE: PR #{pr_num} {reason}"))
                             }
-                            merge::RequiredJobsOutcome::Pending { pending_jobs } => {
-                                let pending_list = pending_jobs.join(", ");
-                                log(&format!(
-                                    "REQUIRED JOBS GATE: PR #{pr_num} required jobs \
-                                     still pending: {pending_list}",
-                                ));
-                                merge::ChecksOutcome::Pending {
-                                    reason: format!("required jobs still pending: {pending_list}"),
-                                }
-                            }
+                            merge::ChecksOutcome::TimedOut => {}
                         }
+                        outcome
                     } else {
                         checks_outcome
                     };
@@ -4119,14 +4662,11 @@ async fn tick(
                         .await;
                     }
 
-                    // Task #124: the daemon no longer mirrors the reviewer's
-                    // changes verdict into a duplicate generic GitHub
-                    // REQUEST_CHANGES review. Reviewer agents own their own
-                    // GitHub review interactions (inline comments, review
-                    // summaries, `gh pr review --request-changes`) — the PR is
-                    // the source of truth for findings + author pushback.
-                    // The submit feedback is still fed to the warm worker as
-                    // rework-turn context below.
+                    // Reviewer agents own findings, evidence, and author
+                    // discussion through inline and summary comments. The
+                    // daemon owns the formal REQUEST_CHANGES review from the
+                    // merge account; submit feedback is also fed to the warm
+                    // worker as rework-turn context below.
 
                     // #90/#159: record the changes verdict in approvals (mirrors approved path).
                     if let Some(pr_num) = row.pr {
@@ -4169,9 +4709,8 @@ async fn tick(
                         .ok();
                     }
 
-                    // #159: verify GitHub has a REQUEST_CHANGES review from this
-                    // reviewer. The reviewer is encouraged to post one, but the
-                    // daemon verifies and backstops.
+                    // #159: post/verify the formal REQUEST_CHANGES review from
+                    // the daemon's merge account.
                     if let Some(pr_num) = row.pr {
                         let repo = config.repo_dir.clone();
                         let executor = Arc::clone(&config.merge_executor);
@@ -4442,53 +4981,32 @@ async fn tick(
                         for effect in &tr.effects {
                             match effect {
                                 Effect::ResumeReviewer => {
-                                    // C6: feed the existing reviewer a re-review
-                                    // turn so it keeps its session context.
-                                    if let Some(ri) = reviewers
+                                    // Sticky re-review turns are subject to the
+                                    // same current-head CI gate as fresh R1/R2
+                                    // provisioning. A ReworkPushed effect must
+                                    // never bypass Quorum's gate merely because
+                                    // the reviewer process is already alive.
+                                    if reviewers
                                         .iter()
                                         .position(|r| r.task_id == workers[wi].task_id)
+                                        .is_some()
                                     {
-                                        let rereview_turn = reviewer::build_rereview_turn(
-                                            &reviewers[ri].agent_name,
+                                        let task_id = workers[wi].task_id;
+                                        pending_reviewer_resumes.insert(task_id, pr);
+                                        let completed = resume_reviewer_after_ci(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            workers,
+                                            reviewers,
+                                            lifetime_roster,
+                                            pre_review_checks,
+                                            task_id,
                                             pr,
-                                            &workers[wi].agent_name,
-                                            &config.effort,
-                                        );
-                                        if let Err(e) =
-                                            reviewers[ri].proc.feed_turn(&rereview_turn).await
-                                        {
-                                            let reason = if reviewers[ri].proc.is_codex() {
-                                                "codex_rereview"
-                                            } else {
-                                                "failed"
-                                            };
-                                            log(&format!(
-                                                "ResumeReviewer: feed_turn failed \
-                                                 for task #{}: {e} — tearing down ({reason})",
-                                                workers[wi].task_id
-                                            ));
-                                            let r = reviewers.remove(ri);
-                                            teardown_reviewer(config, wt_mgr, name_pool, r, reason)
-                                                .await;
-                                        } else {
-                                            log(&format!(
-                                                "ResumeReviewer: fed re-review turn \
-                                                 to {} for task #{}",
-                                                reviewers[ri].agent_name, workers[wi].task_id
-                                            ));
-                                            reviewers[ri].turn_started_at =
-                                                std::time::Instant::now();
-                                            // Update reviewed head SHA for stale
-                                            // approval detection on re-review.
-                                            let repo = config.repo_dir.clone();
-                                            let executor = Arc::clone(&config.merge_executor);
-                                            reviewers[ri].reviewed_head_sha =
-                                                tokio::task::spawn_blocking(move || {
-                                                    executor.head_sha(pr, &repo)
-                                                })
-                                                .await
-                                                .ok()
-                                                .flatten();
+                                        )
+                                        .await?;
+                                        if completed {
+                                            pending_reviewer_resumes.remove(&task_id);
                                         }
                                     }
                                 }
@@ -4599,6 +5117,33 @@ async fn tick(
         ));
         if !consume_mailbox_row(&db_path, *id).await {
             break;
+        }
+    }
+
+    // ── Phase 2b: Retry CI-gated sticky reviewer resumes ───────────────
+    // The lifecycle effect is delivered once, but a pending CI result may
+    // span many ticks. Keep only the lightweight task/PR intent in memory;
+    // restart recovery tears down the sticky process and Phase 5 provisions a
+    // fresh reviewer through the same durable current-head gate.
+    let resume_candidates: Vec<(i64, i64)> = pending_reviewer_resumes
+        .iter()
+        .map(|(task_id, pr)| (*task_id, *pr))
+        .collect();
+    for (task_id, pr) in resume_candidates {
+        if resume_reviewer_after_ci(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            reviewers,
+            lifetime_roster,
+            pre_review_checks,
+            task_id,
+            pr,
+        )
+        .await?
+        {
+            pending_reviewer_resumes.remove(&task_id);
         }
     }
 
@@ -5361,6 +5906,20 @@ async fn tick(
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
     // Skip during drain — no new work, let existing agents finish.
     if !drain_state.draining {
+        let active_in_review = {
+            let p = db_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
+                let conn = quorum_core::db::open(&p)?;
+                Ok(tasks::list(&conn, Some("in-review"), None, None)?
+                    .into_iter()
+                    .map(|task| task.id)
+                    .collect())
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+        };
+        pre_review_checks.retain(|task_id, _| active_in_review.contains(task_id));
+
         let mut needs_reviewer_from_workers: Vec<(i64, i64, usize)> = workers
             .iter()
             .enumerate()
@@ -5396,6 +5955,7 @@ async fn tick(
         let mut parked_workers: Vec<usize> = Vec::new();
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
+        let mut failed_pre_review_checks: Vec<(i64, i64, String, Vec<String>)> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
             let pr_state = {
                 let exec = config.merge_executor.clone();
@@ -5448,6 +6008,21 @@ async fn tick(
                     .flatten()
                     .unwrap_or_default()
             };
+            match poll_pre_review_checks(config, pre_review_checks, *task_id, *pr, &head_sha)
+                .await?
+            {
+                PreReviewChecksGate::Waiting => continue,
+                PreReviewChecksGate::Failed { failing_checks } => {
+                    failed_pre_review_checks.push((
+                        *task_id,
+                        *pr,
+                        head_sha.clone(),
+                        failing_checks,
+                    ));
+                    continue;
+                }
+                PreReviewChecksGate::Ready => {}
+            }
             let provision_decision = {
                 let p = db_path.clone();
                 let tid = *task_id;
@@ -5516,6 +6091,7 @@ async fn tick(
                         false,
                     )
                     .await?;
+                    pre_review_checks.remove(task_id);
                 }
                 Err(e) => {
                     log(&format!(
@@ -5578,6 +6154,21 @@ async fn tick(
             )
             .await;
             cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
+        }
+        for (task_id, pr, head_sha, failing_checks) in failed_pre_review_checks {
+            pre_review_checks.remove(&task_id);
+            handle_pre_review_checks_failure(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                lifetime_roster,
+                task_id,
+                pr,
+                &head_sha,
+                &failing_checks,
+            )
+            .await;
         }
 
         // ── Phase 5b: Spawn reviewers for orphan in-review tasks ──────
@@ -5718,6 +6309,28 @@ async fn tick(
                     .flatten()
                     .unwrap_or_default()
             };
+            match poll_pre_review_checks(config, pre_review_checks, *task_id, *pr, &head_sha)
+                .await?
+            {
+                PreReviewChecksGate::Waiting => continue,
+                PreReviewChecksGate::Failed { failing_checks } => {
+                    pre_review_checks.remove(task_id);
+                    handle_pre_review_checks_failure(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        workers,
+                        lifetime_roster,
+                        *task_id,
+                        *pr,
+                        &head_sha,
+                        &failing_checks,
+                    )
+                    .await;
+                    continue;
+                }
+                PreReviewChecksGate::Ready => {}
+            }
             let provision_decision = {
                 let p = db_path.clone();
                 let tid = *task_id;
@@ -5831,6 +6444,7 @@ async fn tick(
                         true,
                     )
                     .await?;
+                    pre_review_checks.remove(task_id);
                 }
                 Err(e) => {
                     log(&format!(
@@ -5840,6 +6454,20 @@ async fn tick(
             }
         }
     }
+
+    // ── Phase 5c: Recover durable failed-CI remediation ────────────────
+    // This scan is intentionally before generic worker provisioning:
+    // failed-CI rework must retain its exact PR/head turn and can never fall
+    // through to a fresh implementation prompt.
+    reconcile_ci_remediations(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        lifetime_roster,
+        drain_state.draining,
+    )
+    .await?;
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
@@ -6945,6 +7573,65 @@ async fn provision_reviewer(
     head_sha: &str,
     recover_interrupted: bool,
 ) -> Result<()> {
+    // The check result is meaningful only for the exact PR head that was
+    // gated. Re-resolve through the configured executor immediately before
+    // acquiring a name or creating reviewer resources.
+    let confirmed_head_sha = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .ok()
+            .flatten()
+    };
+    if confirmed_head_sha.as_deref() != Some(head_sha) {
+        log(&format!(
+            "{}: PR #{pr} head moved after CI gate (gated {}, current {}) — \
+             reviewer not acquired or spawned",
+            role.as_str().to_uppercase(),
+            if head_sha.is_empty() {
+                "<missing>"
+            } else {
+                head_sha
+            },
+            confirmed_head_sha.as_deref().unwrap_or("<missing>")
+        ));
+        return Ok(());
+    }
+
+    // Resolve/fetch metadata before acquisition too. Production gets the
+    // authoritative GitHub target; command-executor tests can fall back to
+    // their managed branch, whose fetched HEAD is still verified below.
+    let pr_target = {
+        let pr_num = pr;
+        let task_id = worker.task_id;
+        let repo_dir = config.repo_dir.clone();
+        let gh_repo = config.repo.clone();
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_or_load_pr_target(pr_num, task_id, &db_path, &repo_dir, Some(&gh_repo))
+        })
+        .await
+        .ok()
+        .flatten()
+    };
+    if pr_target
+        .as_ref()
+        .is_some_and(|target| target.head_sha != head_sha)
+    {
+        log(&format!(
+            "{}: PR #{pr} resolved target moved after CI gate (gated {}, current {}) — \
+             reviewer not acquired or spawned",
+            role.as_str().to_uppercase(),
+            head_sha,
+            pr_target
+                .as_ref()
+                .map(|target| target.head_sha.as_str())
+                .unwrap_or("<missing>")
+        ));
+        return Ok(());
+    }
+
     let recovery = if recover_interrupted {
         let p = config.db_path.clone();
         let task_id = worker.task_id;
@@ -7042,23 +7729,11 @@ async fn provision_reviewer(
     let branch = reviewer::reviewer_branch(pr, &reviewer_name);
     let wt_path = reviewer::reviewer_worktree_path(&config.worktree_base, pr, &reviewer_name);
 
-    // #189/#201: resolve PR target from GitHub (authoritative head ref, SHA,
-    // fork status). Persists on success; falls back to persisted target, then
-    // worker branch convention when GitHub is unavailable.
+    // The authoritative target was resolved and matched to the gated SHA
+    // before reviewer identity acquisition above.
     let task_repo_dir = &config.repo_dir;
-    let pr_num = pr;
-    let tid = worker.task_id;
-    let dbp = config.db_path.clone();
-    let repo_dir_for_gh = task_repo_dir.to_path_buf();
-    let gh_repo = config.repo.clone();
-    let pr_target = tokio::task::spawn_blocking(move || {
-        resolve_or_load_pr_target(pr_num, tid, &dbp, &repo_dir_for_gh, Some(&gh_repo))
-    })
-    .await
-    .ok()
-    .flatten();
-    let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
-        let result = if target.is_fork {
+    let provision_result = if let Some(ref target) = pr_target {
+        if target.is_fork {
             wt_mgr
                 .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
                 .await
@@ -7066,36 +7741,29 @@ async fn provision_reviewer(
             wt_mgr
                 .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
                 .await
-        };
-        (result, Some(target.head_sha.as_str()))
+        }
     } else {
         log(&format!(
-            "PR #{pr} target not resolved from GitHub — falling back to worker branch '{}'",
+            "PR #{pr} target metadata unavailable — fetching managed branch '{}' \
+             and verifying gated SHA",
             worker.branch
         ));
-        let result = wt_mgr
+        wt_mgr
             .fetch_and_provision(task_repo_dir, &branch, &wt_path, worker.branch)
-            .await;
-        (result, None)
+            .await
     };
     let provision_ok = match provision_result {
-        Ok(_) => {
-            if let Some(expected_sha) = sha_to_verify {
-                match wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log(&format!(
-                            "reviewer worktree HEAD SHA mismatch for PR #{pr}: {e}"
-                        ));
-                        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                        wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                        false
-                    }
-                }
-            } else {
-                true
+        Ok(_) => match wt_mgr.verify_head_sha(&wt_path, head_sha).await {
+            Ok(()) => true,
+            Err(e) => {
+                log(&format!(
+                    "reviewer worktree does not match gated HEAD for PR #{pr}: {e}"
+                ));
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                false
             }
-        }
+        },
         Err(e) => {
             log(&format!(
                 "reviewer worktree provision failed for PR #{pr}: {e}"
@@ -12627,7 +13295,7 @@ mod tests {
             )
             .unwrap();
             tasks::apply_event(&mut conn, "Reviewer-1", id, &Event::VerdictChanges, 13).unwrap();
-            tasks::claim(&mut conn, "Spool-9mti", Some(id), &[], 3600, now_unix())
+            tasks::claim_remediation_rework(&mut conn, "Spool-9mti", id, 3600, now_unix())
                 .unwrap()
                 .expect("rework worker must reacquire the task lease");
         }

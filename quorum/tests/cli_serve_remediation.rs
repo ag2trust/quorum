@@ -272,8 +272,46 @@ fn create_pr_branch(repo_dir: &std::path::Path, author: &str, task_id: i64) {
         .unwrap();
 }
 
-/// Complete the mandatory R2 pre-merge review.
-fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) {
+fn stage_failed_ci_remediation(
+    home: &std::path::Path,
+    repo_dir: &std::path::Path,
+    task_id: i64,
+    pr: i64,
+) -> String {
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &repo_dir.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let db_path = home.join("repos").join("test__repo").join("quorum.db");
+    let mut conn = quorum_core::db::open(&db_path).unwrap();
+    quorum_core::tasks::apply_checks_failed_with_remediation(
+        &mut conn,
+        task_id,
+        pr,
+        &head_sha,
+        &["ci-test".into()],
+        "CI checks failed before review for PR #1: ci-test\n\nFix the failing checks.",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
+    )
+    .unwrap();
+    head_sha
+}
+
+fn complete_r2_review_after(
+    home: &std::path::Path,
+    handle: &mut ServeHandle,
+    pr: &str,
+    before_submit: impl FnOnce(),
+) {
     assert!(
         handle.wait_for("R2: pre-merge reviewer", 15),
         "R2 reviewer was not spawned: {:?}",
@@ -290,6 +328,7 @@ fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str
         handle.lines
     );
 
+    before_submit();
     quorum_done(
         home,
         &[
@@ -352,40 +391,19 @@ fn failed_checks_absent_worker_spawns_remediation() {
         handle.lines
     );
 
-    // Phase 5b provisions a reviewer for the orphan in-review task.
+    // The daemon detects failed CI before reviewer provisioning and enters the
+    // normal remediation path directly.
     assert!(
-        handle.wait_for("spawning reviewer", 30),
-        "reviewer not provisioned. Lines: {:?}",
+        handle.wait_for("entering rework without spawning a reviewer", 30),
+        "pre-review CI failure not detected. Lines: {:?}",
         handle.lines
     );
-    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
-
     assert!(
-        handle.wait_for("result", 15),
-        "reviewer result not seen. Lines: {:?}",
-        handle.lines
-    );
-
-    // Reviewer approves → triggers merge handling → checks fail.
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &reviewer_name,
-            "--pr",
-            &pr.to_string(),
-            "--verdict",
-            "approved",
-            "--blocking",
-            "0",
-        ],
-    );
-    complete_r2_review(home.path(), &mut handle, &pr.to_string());
-
-    // Checks fail → rework needed → no worker → remediation spawned.
-    assert!(
-        handle.wait_for("checks failed", 30),
-        "checks-failed log not seen. Lines: {:?}",
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning reviewer")),
+        "failed CI must not consume a reviewer. Lines: {:?}",
         handle.lines
     );
     assert!(
@@ -421,6 +439,138 @@ fn failed_checks_absent_worker_spawns_remediation() {
         handle.lines
     );
 
+    handle.sigkill();
+}
+
+#[test]
+fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let staged_head = stage_failed_ci_remediation(home.path(), repo_dir.path(), task_id, pr);
+
+    // This DB state is the crash window: ChecksFailed and its exact intent
+    // committed, but no remediation process or journal row exists.
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("preserving exact CI remediation", 15),
+        "restart did not preserve the staged intent: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("remediation worker", 15),
+        "restart did not provision same-PR remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning agent")),
+        "recovery must not launch a generic implementation worker: {:?}",
+        handle.lines
+    );
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    let intent = quorum_core::tasks::ci_remediation_intent(task.refs.as_deref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.pr, pr);
+    assert_eq!(intent.head_sha, staged_head);
+    assert!(intent.feedback.contains("ci-test"));
+    handle.sigkill();
+}
+
+#[test]
+fn repeated_ci_remediation_provision_failure_parks_without_open_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    let author = "MissingBranchWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    let staged_head = stage_failed_ci_remediation(home.path(), repo_dir.path(), task_id, pr);
+    // Deliberately do not create the expected PR branch: provisioning must
+    // fail repeatedly, remain same-PR rework, then park loudly.
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("CI remediation provision strike 3/3", 20),
+        "bounded provision failures not observed: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("PARKED", 10),
+        "exhausted CI remediation did not park loudly: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning agent")),
+        "failed remediation must not fall through to a generic worker: {:?}",
+        handle.lines
+    );
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "failed", "parked task must not become open");
+    let intent = quorum_core::tasks::ci_remediation_intent(task.refs.as_deref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.pr, pr);
+    assert_eq!(intent.head_sha, staged_head);
+    assert_eq!(intent.attempts, 3);
     handle.sigkill();
 }
 
@@ -606,6 +756,9 @@ fn pending_checks_no_remediation() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("pending_checks_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -628,7 +781,7 @@ fn pending_checks_no_remediation() {
         "true",
         &[
             "--merge-checks-cmd",
-            "echo pending",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "2",
             "--merge-checks-poll-secs",
@@ -668,7 +821,9 @@ fn pending_checks_no_remediation() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, &pr.to_string());
+    complete_r2_review_after(home.path(), &mut handle, &pr.to_string(), || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     // Wait for timeout to fire.
     assert!(
@@ -757,38 +912,19 @@ fn rework_cap_bounds_remediation_attempts() {
         handle.lines
     );
 
+    // Checks fail before review, but the rework cap is exhausted: the task
+    // fails directly without consuming a reviewer or spawning remediation.
     assert!(
-        handle.wait_for("spawning reviewer", 30),
-        "reviewer not provisioned. Lines: {:?}",
+        handle.wait_for("lifecycle: task #1 -> failed", 30),
+        "capped pre-review CI failure not seen. Lines: {:?}",
         handle.lines
     );
-    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
-
     assert!(
-        handle.wait_for("result", 15),
-        "reviewer result not seen. Lines: {:?}",
-        handle.lines
-    );
-
-    quorum_done(
-        home.path(),
-        &[
-            "--agent",
-            &reviewer_name,
-            "--pr",
-            &pr.to_string(),
-            "--verdict",
-            "approved",
-            "--blocking",
-            "0",
-        ],
-    );
-    complete_r2_review(home.path(), &mut handle, &pr.to_string());
-
-    // Checks fail, but rework cap is exhausted → task should fail, not spawn remediation.
-    assert!(
-        handle.wait_for("checks failed", 30),
-        "checks-failed not seen. Lines: {:?}",
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning reviewer")),
+        "capped failed CI must not consume a reviewer. Lines: {:?}",
         handle.lines
     );
 
