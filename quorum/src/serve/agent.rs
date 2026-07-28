@@ -384,22 +384,30 @@ mod tests {
 
     #[tokio::test]
     async fn claude_boundary_bounds_stderr_drains_terminal_output_and_reaps() {
+        // 17618 bytes must stay above runner::DIAGNOSTIC_LINE_BYTES (16384) and 306
+        // lines above runner::DIAGNOSTIC_CAPACITY (256) — both constants are private
+        // to runner, so mirror the margins its own unit tests use (+1234 / +50).
+        // `exec sleep` (not `sleep`) so the shell never forks a grandchild: killpg
+        // races a concurrent fork(), and a child born after the kernel's group scan
+        // starts with an empty pending-signal set, survives as an orphan, and holds
+        // the stderr pipe open until it exits on its own — a 30s hang, not a deadlock.
         let mut proc = shell_proc(
             "printf '\\377invalid\\n' >&2; \
-             head -c 131072 /dev/zero | tr '\\000' x >&2; echo >&2; \
-             i=0; while [ $i -lt 10000 ]; do echo claude-stderr-$i >&2; i=$((i+1)); done; \
+             head -c 17618 /dev/zero | tr '\\000' x >&2; echo >&2; \
+             i=0; while [ $i -lt 306 ]; do echo claude-stderr-$i >&2; i=$((i+1)); done; \
              echo '{\"type\":\"provider.ready\"}'; \
              echo '{\"type\":\"result\",\"result\":\"trailing\"}'; \
-             sleep 30",
+             exec sleep 30",
         )
         .await;
         let pid = proc.pid().unwrap();
-        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
+        // 30s catches a genuine deadlock without reporting CPU contention as one.
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(30), proc.next_raw_line())
             .await
             .expect("provider never finished stderr")
             .expect("provider stdout ended before ready");
         assert!(ready.contains("provider.ready"));
-        let output = tokio::time::timeout(std::time::Duration::from_secs(5), proc.kill_and_reap())
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), proc.kill_and_reap())
             .await
             .expect("kill_and_reap deadlocked");
         assert!(
@@ -416,7 +424,7 @@ mod tests {
             .iter()
             .any(|line| matches!(line, CapturedOutput::Stdout(text) if text.contains("trailing"))));
         assert!(output.iter().any(
-            |line| matches!(line, CapturedOutput::Stderr(text) if text == "claude-stderr-9999")
+            |line| matches!(line, CapturedOutput::Stderr(text) if text == "claude-stderr-305")
         ));
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child was not reaped");
     }
