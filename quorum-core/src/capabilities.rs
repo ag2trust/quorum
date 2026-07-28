@@ -129,6 +129,34 @@ pub(crate) fn revoke_tx(tx: &Transaction<'_>, run_id: &str, now: i64) -> Result<
     Ok(changed > 0)
 }
 
+/// Revoke a capability only when its immutable identity matches the supplied
+/// managed run tuple. A matching, previously revoked capability returns
+/// `false`; an unknown or mismatched run is rejected before any authority
+/// mutation can be committed.
+pub(crate) fn revoke_for_agent_task_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    agent: &str,
+    task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let matches_run = tx
+        .query_row(
+            "SELECT 1 FROM run_capabilities
+             WHERE run_id=?1 AND agent=?2 AND task_id=?3",
+            params![run_id, agent, task_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !matches_run {
+        return Err(QuorumError::Usage(format!(
+            "run_id '{run_id}' does not belong to agent '{agent}' on task {task_id}"
+        )));
+    }
+    revoke_tx(tx, run_id, now)
+}
+
 /// Revoke all active capabilities for an agent. Used on agent death/recovery.
 pub fn revoke_all_for_agent(conn: &mut Connection, agent: &str, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;

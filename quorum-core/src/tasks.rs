@@ -685,7 +685,8 @@ pub fn release_remediation_lease(
 /// later restart can decide how to resume the preserved task phase.
 ///
 /// Returns whether the exact capability was live and has now been revoked.
-/// A previously revoked (or unknown) run is an idempotent `false` result.
+/// A previously revoked matching run is an idempotent `false` result. An
+/// unknown or mismatched run/task/agent tuple is rejected without mutation.
 pub fn suspend_run_for_controlled_shutdown(
     conn: &mut Connection,
     agent: &str,
@@ -694,7 +695,8 @@ pub fn suspend_run_for_controlled_shutdown(
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    let capability_was_live = crate::capabilities::revoke_tx(&tx, run_id, now)?;
+    let capability_was_live =
+        crate::capabilities::revoke_for_agent_task_tx(&tx, run_id, agent, id, now)?;
     deactivate_lease(&tx, id, now)?;
     let target = lease_target(id);
     crate::events::emit(
@@ -6366,6 +6368,60 @@ mod tests {
             second_revoked_at.is_none(),
             "suspending one run must not revoke another run for the same agent"
         );
+    }
+
+    #[test]
+    fn controlled_shutdown_rejects_mismatched_run_tuple_without_mutation() {
+        let (_d, mut c) = open_tmp();
+        let first = create(
+            &mut c, "owner", "first", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        let second = create(
+            &mut c, "owner", "second", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "agent-a", Some(first), &[], TTL, 1000).unwrap();
+        claim(&mut c, "agent-b", Some(second), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-first", first, "agent-a", "worker", 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-second", second, "agent-b", "worker", 1000)
+            .unwrap();
+
+        let wrong_task =
+            suspend_run_for_controlled_shutdown(&mut c, "agent-a", first, "run-second", 1001)
+                .unwrap_err();
+        assert!(format!("{wrong_task}").contains("does not belong"));
+        let wrong_agent =
+            suspend_run_for_controlled_shutdown(&mut c, "agent-b", first, "run-first", 1001)
+                .unwrap_err();
+        assert!(format!("{wrong_agent}").contains("does not belong"));
+
+        for run_id in ["run-first", "run-second"] {
+            let revoked_at: Option<i64> = c
+                .query_row(
+                    "SELECT revoked_at FROM run_capabilities WHERE run_id=?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(revoked_at.is_none(), "{run_id} must stay active");
+        }
+        assert!(
+            has_live_lease(&c, first, 1001),
+            "first lease must stay active"
+        );
+        assert!(
+            has_live_lease(&c, second, 1001),
+            "second lease must stay active"
+        );
+        let event_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='controlled_shutdown_suspended'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0, "mismatches must not write audit events");
     }
 
     #[test]
