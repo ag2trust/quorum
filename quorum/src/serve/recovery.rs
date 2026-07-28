@@ -164,9 +164,46 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
                             .get(tasks::PARKED_REWORK_RETRY_REF)
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false)
+                        || refs
+                            .get(tasks::CI_REMEDIATION_REQUESTED_REF)
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false);
             if retry_queued {
+                if task
+                    .refs
+                    .as_deref()
+                    .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                    .and_then(|refs| {
+                        refs.get(tasks::CI_REMEDIATION_REQUESTED_REF)
+                            .and_then(serde_json::Value::as_bool)
+                    })
+                    == Some(true)
+                {
+                    let p = db_path.clone();
+                    let tid = task.id;
+                    let preserved = tokio::task::spawn_blocking(move || -> Result<bool> {
+                        let mut conn = quorum_core::db::open(&p)?;
+                        tasks::reset_ci_remediation_for_recovery(
+                            &mut conn,
+                            tid,
+                            crate::serve::now_unix(),
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!(
+                            "CI remediation recovery join for task #{tid}: {error}"
+                        ))
+                    })??;
+                    if preserved {
+                        log(&format!(
+                            "recovery: preserving exact CI remediation for task #{} in rework",
+                            task.id
+                        ));
+                    }
+                }
                 log(&format!(
                     "recovery: leaving explicitly retried task #{} in {} for worker claim",
                     task.id, task.status

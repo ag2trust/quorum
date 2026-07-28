@@ -85,6 +85,27 @@ pub enum RequiredJobsOutcome {
     Pending { pending_jobs: Vec<String> },
 }
 
+pub fn apply_required_jobs_gate(
+    checks: ChecksOutcome,
+    required_jobs: RequiredJobsOutcome,
+) -> ChecksOutcome {
+    if !matches!(checks, ChecksOutcome::Ready) {
+        return checks;
+    }
+    match required_jobs {
+        RequiredJobsOutcome::AllSucceeded => ChecksOutcome::Ready,
+        RequiredJobsOutcome::NotReady { issues } => ChecksOutcome::Failed {
+            failing_checks: issues
+                .into_iter()
+                .map(|(name, status)| format!("{name} ({status})"))
+                .collect(),
+        },
+        RequiredJobsOutcome::Pending { pending_jobs } => ChecksOutcome::Pending {
+            reason: format!("required jobs still pending: {}", pending_jobs.join(", ")),
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefaultBranchStatus {
     Green,
@@ -143,9 +164,9 @@ pub trait MergeExecutor: Send + Sync {
         DefaultBranchStatus::Green
     }
 
-    /// #159: verify the PR has an active REQUEST_CHANGES review with the blocking
-    /// findings. Reviewer agents are encouraged to post one, but the daemon
-    /// verifies and backstops — never merge around unresolved blockers.
+    /// #159: post or verify the daemon-owned REQUEST_CHANGES review carrying the
+    /// blocking findings. Managed reviewer agents share the PR author's GitHub
+    /// identity, so formal review state stays with the daemon's merge account.
     fn ensure_changes_requested(&self, _pr: i64, _repo_dir: &Path, _body: &str) {
         // Default no-op; real executor posts via `gh pr review --request-changes`.
     }
@@ -1711,6 +1732,44 @@ mod tests {
             }
             other => panic!("expected NotReady, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn required_jobs_gate_preserves_pending_and_failed_semantics() {
+        assert_eq!(
+            apply_required_jobs_gate(
+                ChecksOutcome::Ready,
+                RequiredJobsOutcome::Pending {
+                    pending_jobs: vec!["test".into()]
+                }
+            ),
+            ChecksOutcome::Pending {
+                reason: "required jobs still pending: test".into()
+            }
+        );
+        assert_eq!(
+            apply_required_jobs_gate(
+                ChecksOutcome::Ready,
+                RequiredJobsOutcome::NotReady {
+                    issues: vec![("fmt".into(), "SKIPPED".into())]
+                }
+            ),
+            ChecksOutcome::Failed {
+                failing_checks: vec!["fmt (SKIPPED)".into()]
+            }
+        );
+        assert_eq!(
+            apply_required_jobs_gate(
+                ChecksOutcome::Failed {
+                    failing_checks: vec!["clippy".into()]
+                },
+                RequiredJobsOutcome::AllSucceeded
+            ),
+            ChecksOutcome::Failed {
+                failing_checks: vec!["clippy".into()]
+            },
+            "required-job success must not erase a general check failure"
+        );
     }
 
     // ── Default branch CI gate tests ──────────────────────────────────

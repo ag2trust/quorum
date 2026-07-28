@@ -858,13 +858,13 @@ fn review_only_orphan_full_lifecycle() {
 
     // ── Step 7: ReworkPushed → in-review + re-review fed to reviewer ──
     assert!(
-        handle.wait_for("fed re-review turn", 15),
-        "reviewer was not fed re-review turn: {:?}",
+        handle.wait_for("ready for review", 15),
+        "task did not return to review after remediation push: {:?}",
         handle.lines
     );
     assert!(
-        handle.wait_for("ready for review", 15),
-        "task did not return to review after remediation push: {:?}",
+        handle.wait_for("fed re-review turn", 15),
+        "reviewer was not fed re-review turn after CI passed: {:?}",
         handle.lines
     );
 

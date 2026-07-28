@@ -34,6 +34,17 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
                  SELECT 1 FROM claims c
                  WHERE c.target = 'task#' || t.id AND c.active=1 AND c.expires_at > ?1
              )
+             AND (
+                 t.status != 'rework'
+                 OR CASE
+                     WHEN json_valid(t.refs)
+                     THEN COALESCE(
+                         json_extract(t.refs, '$.ci_remediation_requested'),
+                         0
+                     )
+                     ELSE 0
+                 END != 1
+             )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
              LIMIT ?2",
         )?;
@@ -905,5 +916,52 @@ mod tests {
             t.status, "open",
             "working task must not get provisioning grace"
         );
+    }
+
+    #[test]
+    fn reaper_never_converts_durable_ci_remediation_to_generic_open() {
+        let (_d, mut c) = open_tmp();
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "durable CI remediation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        crate::tasks::claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+        crate::tasks::apply_event(
+            &mut c,
+            "W1",
+            id,
+            &crate::lifecycle::Event::SignaledDone { pr: "453".into() },
+            1050,
+        )
+        .unwrap();
+        crate::tasks::apply_checks_failed_with_remediation(
+            &mut c,
+            id,
+            453,
+            "abc123",
+            &["test".into()],
+            "fix test",
+            1060,
+        )
+        .unwrap();
+
+        reap_lapsed_tasks(&c, 5000, SWEEP_LIMIT).unwrap();
+        let task = crate::tasks::get(&c, id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "rework",
+            "durable same-PR remediation must never fall through to generic open"
+        );
+        assert!(crate::tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .is_some());
     }
 }

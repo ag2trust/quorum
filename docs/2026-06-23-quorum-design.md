@@ -39,10 +39,11 @@ accepted task
   → isolated worktree and branch
   → coding worker
   → pushed pull request
+  → required checks
   → independent R1 review
   → adversarial R2 review
   → rework when required
-  → required checks
+  → final required-checks revalidation
   → daemon-controlled approval and merge
 ```
 
@@ -477,6 +478,7 @@ only through an explicit outside request)
 | `ReviewerAttached { agent }` | reviewer name | `task-claim` on an in-review task |
 | `VerdictApprove` | — | `submit --verdict approved --blocking 0` |
 | `VerdictChanges` | — | `submit --verdict changes --feedback "..."` |
+| `ChecksFailed { checks }` | failing check names | Daemon pre-review CI gate |
 | `ReworkPushed` | — | `submit --pr N` when `rework_round > 0` |
 | `MergeSucceeded` | — | Daemon after successful `gh pr merge` |
 | `MergeFailed { reason }` | description | Daemon after merge failure |
@@ -514,6 +516,7 @@ only through an explicit outside request)
 - `ReviewerAttached { agent }` → InReview (stays) · effects: SetReviewer · **guard: agent ≠ author**
 - `VerdictApprove` → Merging · effects: MergePr
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
+- `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `VerdictChanges` (review_only=true) → Failed · effects: PostFindingsNote, ReleaseLease
 - `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
@@ -608,9 +611,9 @@ conversation. Concretely:
 - **Reviewer agents** post every blocking and advisory finding to the PR — inline
   comments where a specific file/line applies, review summary comments for
   cross-cutting findings — and respond to author pushback on the PR itself.
-  Encouraged GitHub operations: normal comments, inline comments, review summary
-  comments, and reviewer-owned `gh pr review --request-changes` (the reviewer's own
-  durable GitHub record when the verdict is `changes`).
+  Encouraged GitHub operations are normal comments, inline comments, and review
+  summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
+  because managed reviewers use the same GitHub account as PR authors.
 - **Author/rework agents** address findings on the PR. If disagreeing with a finding,
   the author replies to it on the PR with concrete evidence rather than silently
   ignoring it. The final PR history must let a later collector determine, for each
@@ -622,9 +625,9 @@ conversation. Concretely:
   worker but is not the authoritative record.
 - **Daemon retains:** the final formal `gh pr review --approve` (posted from the merge
   account) and `gh pr merge`. Reviewer-owned APPROVE and merge remain forbidden.
-- **Daemon no longer mirrors** a reviewer's `changes` verdict into a duplicate generic
-  GitHub REQUEST_CHANGES review. That mirror was redundant with reviewer-owned
-  REQUEST_CHANGES and buried the reviewer's actual findings under a generic body.
+- **Daemon writes** the formal REQUEST_CHANGES review from the merge account when a
+  reviewer signals `changes`. This is lifecycle authority, not the findings ledger;
+  the reviewer's inline and summary comments remain the source of truth.
 
 This preserves #206 verdict attestation, reviewer separation, the rework cap, sticky
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
@@ -660,9 +663,11 @@ approval path merges; when it requires R2, the following dual-review flow applie
 2. **R1 teardown** — R1 is torn down (end reason `r2-superseded`). Task stays InReview.
 3. **R2 spawn** — R2 is spawned with a `ReviewCounterpart` built from the worker
    slot if available, or resolved from the PR head ref via GitHub (allowing R2 to
-   proceed even without a live worker). R2's prompt frames it as an adversarial
-   second reviewer that attempts to falsify the merge-safety claim, reviews
-   independently before comparing against R1, and requires evidence-bound findings.
+   proceed even without a live worker). Before provisioning, the daemon applies the
+   pre-review CI gate to the current head SHA; a moved head must become green again
+   before R2 consumes a slot. R2's prompt frames it as an adversarial second reviewer
+   that attempts to falsify the merge-safety claim, reviews independently before
+   comparing against R1, and requires evidence-bound findings.
 4. **Verdict flow** — R2's verdict drives lifecycle:
    - Approved → record R2 durable approval `(pr, 'r2')`. Merge proceeds only when
      `dual_approved(pr)` returns a common head SHA (both R1 and R2 approved with
@@ -690,6 +695,42 @@ No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` t
 **Severity contract** — both R1 and R2 prompts enforce that concrete failure classes
 (resource exhaustion, unbounded growth, network calls in DB txns, data loss, stuck paths)
 are BLOCKING unless evidence disproves the failure.
+
+### Daemon-owned pre-review CI gate
+
+Every reviewer provisioning attempt, initial or after rework, is gated by the daemon
+against the current PR head SHA. Reviewer agents do not poll CI and do not run local
+test/build/fmt/lint commands; they inspect code and the PR body's verification evidence.
+
+- `Ready` plus all configured `required_jobs` at `SUCCESS` permits provisioning.
+- `Pending`, `TimedOut`, and pending required jobs keep the task `in-review`. The daemon
+  polls in a background blocking task, consumes no reviewer identity or process slot, and
+  makes no lifecycle transition.
+- `Failed` or a completed required-job result other than `SUCCESS` fires
+  `ChecksFailed` from the daemon and enters the existing rework/remediation path without
+  spawning a reviewer.
+- The gate is keyed by `(task, PR, head SHA)` and discarded after each provisioning
+  attempt. R2 and sticky `ResumeReviewer` turns therefore recheck CI; a prior review
+  cannot authorize any later review turn against a moved or newly failing head. A pending
+  sticky resume is retained as lightweight daemon intent and retried without feeding the
+  reviewer until the gate becomes ready.
+- Immediately before acquiring or feeding a reviewer, the daemon re-resolves the
+  authoritative PR head and requires it still equals the gated SHA. Reviewer worktree
+  provisioning then verifies the fetched `HEAD` is that exact SHA. A mismatch discards
+  the cached result and restarts gating without spawning a reviewer; the SHA recorded for
+  stale-verdict detection is the same SHA that passed both checks.
+- Before `ChecksFailed` commits `in-review → rework`, the daemon atomically persists the
+  exact CI remediation PR, head SHA, failing checks, feedback, and bounded provision
+  attempt count in task refs. Reaper and restart recovery preserve this rework intent,
+  clear only stale runtime ownership, and retry remediation on the existing PR branch.
+  Provisioning exhaustion parks loudly in `failed` with a `rework` resume marker; it never
+  degrades to a generic `open` task or a fresh implementation prompt.
+- Gate state is optimization-only memory. On shutdown it is dropped without mutating the
+  task; restart finds the durable `in-review` task and polls again. Stateful lifecycle work
+  is never raced inside `select!`.
+
+The pre-merge checks wait remains as defense in depth for changes or check reruns that occur
+after reviewer provisioning.
 
 ### Daemon merge flow
 
@@ -903,6 +944,24 @@ verification.
 
 Each invariant below requires both a positive and a negative test. Tests marked
 **(restart-spanning)** must exercise daemon stop/restart across the boundary.
+
+**Pre-review CI gate:**
+
+1. `pre_review_checks_pending_do_not_spawn_reviewer` — pending/not-yet-reported
+   checks leave the task `in-review`, with no reviewer run or provision attempt.
+
+2. `pre_review_checks_failed_enter_rework_without_reviewer` — failed checks fire
+   the normal rework path with check names and no reviewer run.
+
+3. `pre_review_checks_ready_spawn_reviewer` — green checks and successful configured
+   required jobs permit R1 provisioning.
+
+4. `pre_review_checks_restart_safe` **(restart-spanning)** — stop while the
+   background check wait is pending, restart, and assert the durable `in-review`
+   task is polled again before any reviewer spawns.
+
+5. `r2_rechecks_current_head` — R1 approval followed by a moved or newly non-green
+   head does not provision R2 until that current head is green.
 
 **Infrastructure-pending (merge-wait):**
 

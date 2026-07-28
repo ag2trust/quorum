@@ -171,6 +171,24 @@ impl ServeHandle {
         }
         let _ = self.child.wait();
     }
+
+    fn crash(mut self) {
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = self.child.wait();
+    }
+
+    fn force_stop(mut self) {
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
+        }
+        let _ = self.child.wait();
+    }
 }
 
 fn seed_task(home: &std::path::Path, title: &str) {
@@ -195,6 +213,15 @@ fn seed_task(home: &std::path::Path, title: &str) {
 
 /// #159: after R1 approves, wait for mandatory R2 and post R2's approval.
 fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str) {
+    complete_r2_review_after(home, handle, pr, || {});
+}
+
+fn complete_r2_review_after(
+    home: &std::path::Path,
+    handle: &mut ServeHandle,
+    pr: &str,
+    before_submit: impl FnOnce(),
+) {
     assert!(
         handle.wait_for("R2: pre-merge reviewer", 15),
         "R2 reviewer was not spawned: {:?}",
@@ -211,6 +238,7 @@ fn complete_r2_review(home: &std::path::Path, handle: &mut ServeHandle, pr: &str
         handle.lines
     );
 
+    before_submit();
     quorum_done(
         home,
         &[
@@ -266,6 +294,573 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         "done failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn task_state(home: &std::path::Path) -> (String, i64, i64) {
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    let reviewer_runs = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=1 AND role='reviewer'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    (task.status, task.rework_round, reviewer_runs)
+}
+
+fn drive_to_rework(home: &std::path::Path, handle: &mut ServeHandle) -> (String, String) {
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home, &["--agent", &worker, "--pr", "1"]);
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "R1 did not spawn: {:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            &reviewer,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix the blocking behavior",
+        ],
+    );
+    assert!(
+        handle.wait_for("rework #1 started", 15),
+        "worker did not enter rework: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker rework result not seen: {:?}",
+        handle.lines
+    );
+    (worker, reviewer)
+}
+
+#[test]
+fn rereview_pending_does_not_feed_then_ready_resumes_exactly_once() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("rereview_checks");
+    std::fs::write(&checks_state, "ready").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "re-review pending gate");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    let (worker, _) = drive_to_rework(home.path(), &mut handle);
+    std::fs::write(&checks_state, "pending").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("ResumeReviewer: CI pending", 15),
+        "sticky reviewer did not enter CI wait: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.wait_for("ResumeReviewer: fed re-review turn", 3),
+        "pending CI must not feed the sticky reviewer: {:?}",
+        handle.lines
+    );
+    assert_eq!(task_state(home.path()).0, "in-review");
+
+    std::fs::write(&checks_state, "ready").unwrap();
+    assert!(
+        handle.wait_for("ResumeReviewer: fed re-review turn", 15),
+        "green CI did not resume the sticky reviewer: {:?}",
+        handle.lines
+    );
+    while let Ok(line) = handle.rx.try_recv() {
+        handle.lines.push(line);
+    }
+    assert_eq!(
+        handle
+            .lines
+            .iter()
+            .filter(|line| line.contains("ResumeReviewer: fed re-review turn"))
+            .count(),
+        1,
+        "the pending resume intent must be consumed exactly once"
+    );
+    handle.force_stop();
+}
+
+#[test]
+fn rereview_failed_ci_reenters_rework_without_feeding_reviewer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("rereview_failed_checks");
+    std::fs::write(&checks_state, "ready").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "re-review failed gate");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    let (worker, _) = drive_to_rework(home.path(), &mut handle);
+    std::fs::write(&checks_state, "failed\nrereview-ci").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("failed (rereview-ci)", 15),
+        "red CI did not enter failed-CI rework: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("rework #2 (pre-review CI failure)", 15),
+        "failed-CI lifecycle transition did not complete: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("ResumeReviewer: fed re-review turn")),
+        "red CI must not feed the sticky reviewer: {:?}",
+        handle.lines
+    );
+    assert_eq!(
+        task_state(home.path()).0,
+        "rework",
+        "red re-review CI must return to rework"
+    );
+    assert_eq!(task_state(home.path()).1, 2);
+    handle.force_stop();
+}
+
+#[test]
+fn head_move_during_ci_wait_discards_old_gate_before_reviewer_spawn() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let moved_marker = home.path().join("head_moved_once");
+    let worker_wt = wt_base.path().join("Agent0-t1");
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "head move during CI wait");
+
+    let checks_cmd = format!(
+        "if [ ! -e '{marker}' ]; then \
+           touch '{marker}'; \
+           git -C '{repo}' commit --allow-empty -m moved >/dev/null; \
+           sha=$(git -C '{repo}' rev-parse HEAD); \
+           git -C '{worker_wt}' reset --hard \"$sha\" >/dev/null; \
+           git -C '{worker_wt}' push --force origin HEAD:daemon/agent0-t1 >/dev/null; \
+         fi; printf 'ready\\n'",
+        marker = moved_marker.to_string_lossy(),
+        repo = repo_dir.path().to_string_lossy(),
+        worker_wt = worker_wt.to_string_lossy(),
+    );
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "2",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("head changed", 15),
+        "daemon did not invalidate the old gated SHA: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning reviewer")),
+        "reviewer spawned for the ungated moved head: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "new head was not gated and reviewed: {:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("reviewer worktree provisioned", 15),
+        "reviewer worktree was not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer_wt = wt_base.path().join(format!("pr-1-{reviewer}"));
+    let reviewed_sha = Command::new("git")
+        .args(["-C", &reviewer_wt.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let current_sha = Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&reviewed_sha.stdout).trim(),
+        String::from_utf8_lossy(&current_sha.stdout).trim(),
+        "reviewer worktree must be the newly gated head"
+    );
+    handle.force_stop();
+}
+
+#[test]
+fn pre_review_pending_waits_without_reviewer_then_ready_spawns() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("pre_review_checks");
+    std::fs::write(&checks_state, "pending").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "pre-review pending gate");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("PRE-REVIEW CI GATE", 15),
+        "gate did not start: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.wait_for("spawning reviewer", 3),
+        "pending checks must not consume a reviewer: {:?}",
+        handle.lines
+    );
+    assert_eq!(
+        task_state(home.path()),
+        ("in-review".into(), 0, 0),
+        "pending checks must be lifecycle-inert"
+    );
+
+    std::fs::write(&checks_state, "ready").unwrap();
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "green checks did not release the reviewer gate: {:?}",
+        handle.lines
+    );
+    handle.force_stop();
+}
+
+#[test]
+fn pre_review_failed_enters_rework_without_reviewer() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "pre-review failed gate");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            "printf 'failed\\nfmt\\n'",
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+
+    assert!(
+        handle.wait_for("entering rework without spawning a reviewer", 15),
+        "failed checks did not enter rework: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("pre-review CI failure", 15),
+        "worker did not receive CI rework: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning reviewer")),
+        "failed checks must not consume a reviewer: {:?}",
+        handle.lines
+    );
+    assert_eq!(
+        task_state(home.path()),
+        ("rework".into(), 1, 0),
+        "failed checks must use the normal rework budget without a reviewer run"
+    );
+    assert!(
+        handle.lines.iter().any(|line| line.contains("fmt")),
+        "failing check names must reach the rework path: {:?}",
+        handle.lines
+    );
+    handle.force_stop();
+}
+
+#[test]
+fn pre_review_pending_survives_daemon_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("restart_pre_review_checks");
+    std::fs::write(&checks_state, "pending").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "pre-review restart gate");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let args = [
+        "--merge-checks-cmd",
+        checks_cmd.as_str(),
+        "--merge-checks-timeout-secs",
+        "10",
+        "--merge-checks-poll-secs",
+        "1",
+    ];
+    let mut first = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &args,
+    );
+    assert!(first.wait_for("spawning agent", 15), "{:?}", first.lines);
+    assert!(first.wait_for("result", 15), "{:?}", first.lines);
+    let worker = first.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(
+        first.wait_for("waiting for checks before reviewer provisioning", 15),
+        "{:?}",
+        first.lines
+    );
+    assert!(
+        !first
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning reviewer")),
+        "reviewer spawned before crash: {:?}",
+        first.lines
+    );
+    first.crash();
+
+    std::fs::write(&checks_state, "ready").unwrap();
+    let mut restarted = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &args,
+    );
+    assert!(
+        restarted.wait_for("spawning reviewer", 30),
+        "restart did not re-poll and release the durable in-review task: {:?}",
+        restarted.lines
+    );
+    assert_eq!(task_state(home.path()).0, "in-review");
+    restarted.force_stop();
+}
+
+#[test]
+fn r2_rechecks_ci_before_spawning() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("r2_pre_review_checks");
+    std::fs::write(&checks_state, "ready").unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    seed_task(home.path(), "R2 pre-review gate");
+
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            &checks_cmd,
+            "--merge-checks-timeout-secs",
+            "1",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "R1 did not spawn: {:?}",
+        handle.lines
+    );
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+
+    std::fs::write(&checks_state, "pending").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("CI pending for current head", 15),
+        "R2 CI gate did not hold: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.wait_for("R2: pre-merge reviewer", 3),
+        "R2 must not spawn while current-head CI is pending: {:?}",
+        handle.lines
+    );
+
+    std::fs::write(&checks_state, "ready").unwrap();
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 did not spawn after current-head CI became green: {:?}",
+        handle.lines
+    );
+    handle.force_stop();
 }
 
 /// Checks pass immediately → merge proceeds.
@@ -368,6 +963,9 @@ fn checks_fail_sends_rework() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("checks_fail_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -386,7 +984,7 @@ fn checks_fail_sends_rework() {
         "true",
         &[
             "--merge-checks-cmd",
-            "printf 'failed\\nclipper\\ntest'",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "10",
             "--merge-checks-poll-secs",
@@ -434,7 +1032,9 @@ fn checks_fail_sends_rework() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "failed\nclipper\ntest").unwrap();
+    });
 
     assert!(
         handle.wait_for("checks failed", 15),
@@ -467,6 +1067,9 @@ fn checks_timeout_enters_merge_wait() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("checks_timeout_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -485,7 +1088,7 @@ fn checks_timeout_enters_merge_wait() {
         "true",
         &[
             "--merge-checks-cmd",
-            "echo pending",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
@@ -533,7 +1136,9 @@ fn checks_timeout_enters_merge_wait() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     // Should see merge-wait log, NOT rework/MERGE BLOCKED.
     assert!(
@@ -604,7 +1209,7 @@ fn checks_pending_then_ready_merges_via_merge_wait() {
     let names_file = write_names_file(home.path());
 
     let state_file = home.path().join("checks_state");
-    std::fs::write(&state_file, "pending").unwrap();
+    std::fs::write(&state_file, "ready").unwrap();
     let checks_cmd = format!("cat {}", state_file.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -672,7 +1277,9 @@ fn checks_pending_then_ready_merges_via_merge_wait() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&state_file, "pending").unwrap();
+    });
 
     // First timeout enters merge-wait.
     assert!(
@@ -717,7 +1324,7 @@ fn checks_pending_then_failed_enters_rework() {
     let names_file = write_names_file(home.path());
 
     let state_file = home.path().join("checks_state");
-    std::fs::write(&state_file, "pending").unwrap();
+    std::fs::write(&state_file, "ready").unwrap();
     let checks_cmd = format!("cat {}", state_file.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -785,7 +1392,9 @@ fn checks_pending_then_failed_enters_rework() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&state_file, "pending").unwrap();
+    });
 
     // First timeout enters merge-wait.
     assert!(
@@ -830,7 +1439,7 @@ fn checks_pending_survives_restart() {
     let names_file = write_names_file(home.path());
 
     let checks_state = home.path().join("checks_state");
-    std::fs::write(&checks_state, "pending").unwrap();
+    std::fs::write(&checks_state, "ready").unwrap();
     let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -899,7 +1508,9 @@ fn checks_pending_survives_restart() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     assert!(
         handle.wait_for("merge wait", 15),
@@ -976,7 +1587,7 @@ fn checks_pending_then_ready_merges_after_wait() {
     let names_file = write_names_file(home.path());
 
     let state_file = home.path().join("checks_state");
-    std::fs::write(&state_file, "pending").unwrap();
+    std::fs::write(&state_file, "ready").unwrap();
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -1045,7 +1656,9 @@ fn checks_pending_then_ready_merges_after_wait() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&state_file, "pending").unwrap();
+    });
 
     assert!(
         handle.wait_for("waiting for checks", 10),
@@ -1094,7 +1707,7 @@ fn empty_checks_treated_as_pending() {
     // Checks command returns "pending" (simulating empty check rollup that
     // transitions to ready after 2 polls).
     let state_file = home.path().join("checks_state");
-    std::fs::write(&state_file, "pending").unwrap();
+    std::fs::write(&state_file, "ready").unwrap();
     let checks_cmd = format!("cat {}", state_file.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
@@ -1162,7 +1775,9 @@ fn empty_checks_treated_as_pending() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&state_file, "pending").unwrap();
+    });
 
     // Wait long enough that the old (buggy) code would have merged immediately.
     assert!(
@@ -1235,7 +1850,7 @@ fn policy_pending_retries_then_merges() {
     // Checks cmd starts pending, then transitions to ready (which also
     // flips the merge state so the retry merge succeeds).
     let checks_state_file = home.path().join("checks_state");
-    std::fs::write(&checks_state_file, "pending").unwrap();
+    std::fs::write(&checks_state_file, "ready").unwrap();
 
     let checks_cmd = format!("cat {}", checks_state_file.to_string_lossy());
 
@@ -1429,10 +2044,9 @@ fn approved_without_pr_skips_merge() {
         handle.lines
     );
 
-    let saw_merge_attempt = handle
-        .lines
-        .iter()
-        .any(|l| l.contains("proceeding to merge") || l.contains("waiting for checks"));
+    let saw_merge_attempt = handle.lines.iter().any(|l| {
+        l.contains("proceeding to merge") || l.contains("verdict: approved — waiting for checks")
+    });
     assert!(
         !saw_merge_attempt,
         "merge should NOT be attempted without PR number. Lines: {:?}",
@@ -1454,6 +2068,9 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
+    let checks_state = home.path().join("conflict_checks_state");
+    std::fs::write(&checks_state, "ready").unwrap();
+    let checks_cmd = format!("cat {}", checks_state.to_string_lossy());
 
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
@@ -1464,15 +2081,17 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
 
     seed_task(home.path(), "Task for conflict-during-checks test");
 
-    // mergeability-cmd: returns "mergeable" for the first N calls (Phase 5
-    // worker-needs-reviewer check + pre-merge check), then "conflicting"
-    // on the post-timeout recheck. Uses a counter file.
+    // mergeability-cmd: stays mergeable while checks are ready. Once the test
+    // flips checks to pending, the first mergeability check (before waiting) is
+    // mergeable and the second (after timeout) is conflicting.
     let counter_file = home.path().join("mergeability_counter");
     std::fs::write(&counter_file, "0").unwrap();
     let mergeability_script = format!(
-        "n=$(cat {f}); n=$((n + 1)); echo $n > {f}; \
-         if [ $n -le 2 ]; then echo mergeable; else echo conflicting; fi",
-        f = counter_file.display()
+        "if [ \"$(cat {s})\" != pending ]; then echo mergeable; \
+         else n=$(cat {f}); n=$((n + 1)); echo $n > {f}; \
+         if [ $n -le 1 ]; then echo mergeable; else echo conflicting; fi; fi",
+        f = counter_file.display(),
+        s = checks_state.display()
     );
 
     let mut handle = ServeHandle::start(
@@ -1483,7 +2102,7 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
         "true",
         &[
             "--merge-checks-cmd",
-            "echo pending",
+            &checks_cmd,
             "--merge-checks-timeout-secs",
             "1",
             "--merge-checks-poll-secs",
@@ -1533,7 +2152,9 @@ fn conflict_during_checks_wait_triggers_rework_not_cancel() {
             "0",
         ],
     );
-    complete_r2_review(home.path(), &mut handle, "1");
+    complete_r2_review_after(home.path(), &mut handle, "1", || {
+        std::fs::write(&checks_state, "pending").unwrap();
+    });
 
     // Should see the conflict detected after timeout, NOT a cancel.
     assert!(

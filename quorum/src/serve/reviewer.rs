@@ -17,9 +17,9 @@
 //! - Quorum coordinates lifecycle: reviewers signal state with
 //!   `quorum submit --verdict ... --blocking ...`. The submit payload is a
 //!   lifecycle signal, not a second review ledger — the PR is.
-//! - The daemon retains ownership of the final formal GitHub APPROVE and merge.
-//!   Reviewer-owned APPROVE and merge remain forbidden; reviewer-owned
-//!   REQUEST_CHANGES, review summaries, and inline comments are encouraged.
+//! - The daemon retains ownership of formal GitHub reviews and merge. Reviewers
+//!   post findings as inline and summary comments; the daemon posts formal
+//!   approval or request-changes from the reviewer verdict as the merge account.
 
 use super::agent::{AgentProc, AgentSpec, ALLOWED_TOOLS};
 use super::codex_agent;
@@ -53,11 +53,14 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Respond to author pushback on the PR itself. If the author replies to a finding \
          with evidence, engage there — resolve, downgrade, or reaffirm on the PR so a later \
          reader can determine fixed / accepted / overridden / unaddressed outcomes.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, review summary \
-         comments, and reviewer-owned `gh pr review --request-changes` (a REQUEST_CHANGES \
-         review is your durable GitHub record when the verdict is `changes`).\n\
-         - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
-         `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
+         comments.\n\
+         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
+         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
+         your verdict as the merge account and owns merge.\n\n\
+         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
+         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
+         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -178,11 +181,14 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Respond to author pushback on the PR itself. If the author replies to a finding \
          with evidence, engage there — resolve, downgrade, or reaffirm on the PR so a later \
          reader can determine fixed / accepted / overridden / unaddressed outcomes.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, review summary \
-         comments, and reviewer-owned `gh pr review --request-changes` (a REQUEST_CHANGES \
-         review is your durable GitHub record when the verdict is `changes`).\n\
-         - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
-         `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
+         comments.\n\
+         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
+         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
+         your verdict as the merge account and owns merge.\n\n\
+         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
+         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
+         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -269,11 +275,14 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Respond to author pushback on the PR itself. If the author replies to a finding \
          with evidence, engage there — resolve, downgrade, or reaffirm on the PR so a later \
          reader can determine fixed / accepted / overridden / unaddressed outcomes.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, review summary \
-         comments, and reviewer-owned `gh pr review --request-changes` (a REQUEST_CHANGES \
-         review is your durable GitHub record when the verdict is `changes`).\n\
-         - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
-         `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
+         comments.\n\
+         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
+         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
+         your verdict as the merge account and owns merge.\n\n\
+         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
+         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
+         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -358,11 +367,14 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Respond to author pushback on the PR itself. If the author replies to a finding \
          with evidence, engage there — resolve, downgrade, or reaffirm on the PR so a later \
          reader can determine fixed / accepted / overridden / unaddressed outcomes.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, review summary \
-         comments, and reviewer-owned `gh pr review --request-changes` (a REQUEST_CHANGES \
-         review is your durable GitHub record when the verdict is `changes`).\n\
-         - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
-         `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
+         comments.\n\
+         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
+         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
+         your verdict as the merge account and owns merge.\n\n\
+         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
+         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
+         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -493,10 +505,14 @@ pub fn build_rereview_turn(
          drop a prior blocker.\n\
          - Post new findings to the PR (inline where a specific file/line is involved, \
          summary comment for cross-cutting findings) and reply to author pushback there.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, review summary \
-         comments, and reviewer-owned `gh pr review --request-changes`.\n\
-         - Forbidden GitHub operations: the final formal `gh pr review --approve` and \
-         `gh pr merge` — the daemon owns both after your verdict.\n\n\
+         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
+         comments.\n\
+         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
+         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
+         your verdict as the merge account and owns merge.\n\n\
+         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
+         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
+         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING or advisory.\n\
          - Missing or red `PREFLIGHT: PASS` under `## Verification` is BLOCKING.\n\
@@ -703,14 +719,79 @@ mod tests {
             "reviewer prompt must require a PR history that supports later outcome collection"
         );
         assert!(
-            prompt.contains("gh pr review --request-changes"),
-            "reviewer prompt must explicitly encourage reviewer-owned REQUEST_CHANGES"
+            prompt.contains("Forbidden GitHub operations")
+                && prompt.contains("`gh pr review --request-changes`"),
+            "reviewer prompt must forbid reviewer-owned REQUEST_CHANGES"
         );
         assert!(
             prompt.contains("lifecycle-signal summary") || prompt.contains("lifecycle signal"),
             "reviewer prompt must frame submit --feedback as a lifecycle-signal summary, \
              not the ledger of findings"
         );
+    }
+
+    #[test]
+    fn all_reviewer_prompts_delegate_formal_reviews_and_ci_gating_to_the_daemon() {
+        let r1_spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Reviewer-1".into(),
+            r2_name: "Reviewer-2".into(),
+        };
+        let prompts = [
+            ("Claude R1", build_review_prompt(&r1_spec, "high")),
+            (
+                "Codex R1",
+                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+            ),
+            ("Claude R2", build_r2_review_prompt(&r2_spec, "high")),
+            (
+                "Codex R2",
+                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+            ),
+            (
+                "re-review",
+                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+            ),
+        ];
+
+        for (name, prompt) in prompts {
+            assert!(
+                prompt.contains("Forbidden GitHub operations")
+                    && prompt.contains("`gh pr review --request-changes`"),
+                "{name} must forbid reviewer-owned REQUEST_CHANGES"
+            );
+            assert!(
+                !prompt.contains("reviewer-owned `gh pr review --request-changes`"),
+                "{name} must not encourage reviewer-owned REQUEST_CHANGES"
+            );
+            assert!(
+                prompt.contains("inline comments") && prompt.contains("review summary comments"),
+                "{name} must still encourage inline and summary review comments"
+            );
+            assert!(
+                prompt.contains("Do NOT run tests, builds, formatters, or linters locally"),
+                "{name} must forbid local verification runs"
+            );
+            assert!(
+                prompt.contains("daemon gates reviewer provisioning on green CI"),
+                "{name} must describe the daemon-owned CI gate"
+            );
+            assert!(
+                !prompt.contains("gh pr checks"),
+                "{name} must not delegate CI polling to the reviewer"
+            );
+            assert!(
+                prompt.contains("Inspect the PR body's `## Verification` evidence")
+                    && prompt.contains("`PREFLIGHT: PASS`"),
+                "{name} must retain document-evidence review"
+            );
+        }
     }
 
     #[test]
@@ -857,8 +938,9 @@ mod tests {
             "rereview template must require PR resolution of prior findings"
         );
         assert!(
-            turn.contains("gh pr review --request-changes"),
-            "rereview template must encourage reviewer-owned REQUEST_CHANGES"
+            turn.contains("Forbidden GitHub operations")
+                && turn.contains("`gh pr review --request-changes`"),
+            "rereview template must forbid reviewer-owned REQUEST_CHANGES"
         );
         assert!(
             turn.contains("Do NOT run `gh pr review --approve`"),
@@ -1048,8 +1130,9 @@ mod tests {
             "R2 prompt must declare the PR as the source of truth for findings"
         );
         assert!(
-            prompt.contains("gh pr review --request-changes"),
-            "R2 prompt must explicitly encourage reviewer-owned REQUEST_CHANGES"
+            prompt.contains("Forbidden GitHub operations")
+                && prompt.contains("`gh pr review --request-changes`"),
+            "R2 prompt must forbid reviewer-owned REQUEST_CHANGES"
         );
         assert!(
             prompt.contains("author pushback"),
