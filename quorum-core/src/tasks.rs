@@ -678,6 +678,38 @@ pub fn release_remediation_lease(
     Ok(())
 }
 
+/// Suspend one managed run's authority during a controlled daemon shutdown.
+///
+/// The exact run capability, task lease, and audit event commit together. The
+/// task lifecycle status and assignee are deliberately left unchanged so a
+/// later restart can decide how to resume the preserved task phase.
+///
+/// Returns whether the exact capability was live and has now been revoked.
+/// A previously revoked matching run is an idempotent `false` result. An
+/// unknown or mismatched run/task/agent tuple is rejected without mutation.
+pub fn suspend_run_for_controlled_shutdown(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    run_id: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let capability_was_live =
+        crate::capabilities::revoke_for_agent_task_tx(&tx, run_id, agent, id, now)?;
+    deactivate_lease(&tx, id, now)?;
+    let target = lease_target(id);
+    crate::events::emit(
+        &tx,
+        "controlled_shutdown_suspended",
+        &target,
+        &format!("by {agent} (run {run_id})"),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(capability_was_live)
+}
+
 // ── apply_event ───────────────────────────────────────────────────────────────
 
 pub fn apply_event(
@@ -1019,6 +1051,7 @@ where
         | Event::ReviewerAttached { .. }
         | Event::LeaseExpired
         | Event::AgentFailed { .. }
+        | Event::ControlledShutdown
         | Event::Cancelled { .. }
         | Event::MergeSucceeded
         | Event::MergeFailed { .. }
@@ -6252,6 +6285,216 @@ mod tests {
         assert!(
             evs.iter().any(|e| e.kind == "remediation_lease_released"),
             "remediation_lease_released event must be emitted"
+        );
+    }
+
+    #[test]
+    fn controlled_shutdown_suspends_exact_run_lease_and_records_audit_event() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "owner", "shutdown", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-shutdown", id, "worker", "worker", 1000).unwrap();
+        let status_before = get(&c, id).unwrap().unwrap().status;
+
+        assert!(
+            suspend_run_for_controlled_shutdown(&mut c, "worker", id, "run-shutdown", 1001,)
+                .unwrap()
+        );
+
+        let revoked_at: Option<i64> = c
+            .query_row(
+                "SELECT revoked_at FROM run_capabilities WHERE run_id='run-shutdown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoked_at, Some(1001), "the exact run must be revoked");
+        let active: i64 = c
+            .query_row(
+                "SELECT active FROM claims WHERE target=?1",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0, "the task lease must be inactive");
+        assert_eq!(get(&c, id).unwrap().unwrap().status, status_before);
+        let events = crate::events::list(&c, 0, Some(&lease_target(id)), 20, 1001).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "controlled_shutdown_suspended"),
+            "controlled shutdown must have its own audit event"
+        );
+    }
+
+    #[test]
+    fn controlled_shutdown_revokes_only_the_named_run_for_an_agent() {
+        let (_d, mut c) = open_tmp();
+        let first = create(
+            &mut c, "owner", "first", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        let second = create(
+            &mut c, "owner", "second", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "shared-agent", Some(first), &[], TTL, 1000).unwrap();
+        claim(&mut c, "shared-agent", Some(second), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-first", first, "shared-agent", "worker", 1000)
+            .unwrap();
+        crate::capabilities::issue(&mut c, "run-second", second, "shared-agent", "worker", 1000)
+            .unwrap();
+
+        assert!(suspend_run_for_controlled_shutdown(
+            &mut c,
+            "shared-agent",
+            first,
+            "run-first",
+            1001,
+        )
+        .unwrap());
+
+        let second_revoked_at: Option<i64> = c
+            .query_row(
+                "SELECT revoked_at FROM run_capabilities WHERE run_id='run-second'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            second_revoked_at.is_none(),
+            "suspending one run must not revoke another run for the same agent"
+        );
+    }
+
+    #[test]
+    fn controlled_shutdown_rejects_mismatched_run_tuple_without_mutation() {
+        let (_d, mut c) = open_tmp();
+        let first = create(
+            &mut c, "owner", "first", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        let second = create(
+            &mut c, "owner", "second", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "agent-a", Some(first), &[], TTL, 1000).unwrap();
+        claim(&mut c, "agent-b", Some(second), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-first", first, "agent-a", "worker", 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-second", second, "agent-b", "worker", 1000)
+            .unwrap();
+
+        let wrong_task =
+            suspend_run_for_controlled_shutdown(&mut c, "agent-a", first, "run-second", 1001)
+                .unwrap_err();
+        assert!(format!("{wrong_task}").contains("does not belong"));
+        let wrong_agent =
+            suspend_run_for_controlled_shutdown(&mut c, "agent-b", first, "run-first", 1001)
+                .unwrap_err();
+        assert!(format!("{wrong_agent}").contains("does not belong"));
+
+        for run_id in ["run-first", "run-second"] {
+            let revoked_at: Option<i64> = c
+                .query_row(
+                    "SELECT revoked_at FROM run_capabilities WHERE run_id=?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(revoked_at.is_none(), "{run_id} must stay active");
+        }
+        assert!(
+            has_live_lease(&c, first, 1001),
+            "first lease must stay active"
+        );
+        assert!(
+            has_live_lease(&c, second, 1001),
+            "second lease must stay active"
+        );
+        let event_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='controlled_shutdown_suspended'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0, "mismatches must not write audit events");
+    }
+
+    #[test]
+    fn controlled_shutdown_rolls_back_when_lease_deactivation_fails() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "owner", "rollback", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-rollback", id, "worker", "worker", 1000).unwrap();
+        c.execute_batch(&format!(
+            "CREATE TRIGGER fail_shutdown_lease_deactivation
+             BEFORE UPDATE OF active ON claims
+             WHEN OLD.target = '{}' AND OLD.active = 1
+             BEGIN SELECT RAISE(ABORT, 'forced lease failure'); END;",
+            lease_target(id)
+        ))
+        .unwrap();
+
+        let err = suspend_run_for_controlled_shutdown(&mut c, "worker", id, "run-rollback", 1001)
+            .unwrap_err();
+        assert!(format!("{err}").contains("forced lease failure"));
+
+        let revoked_at: Option<i64> = c
+            .query_row(
+                "SELECT revoked_at FROM run_capabilities WHERE run_id='run-rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(revoked_at.is_none(), "capability revocation must roll back");
+        assert!(
+            has_live_lease(&c, id, 1001),
+            "lease deactivation must roll back"
+        );
+        let event_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind='controlled_shutdown_suspended'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 0, "audit event must not partially commit");
+    }
+
+    #[test]
+    fn controlled_shutdown_is_idempotent_and_reports_already_revoked_run() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "idempotent",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        crate::capabilities::issue(&mut c, "run-idempotent", id, "worker", "worker", 1000).unwrap();
+
+        assert!(
+            suspend_run_for_controlled_shutdown(&mut c, "worker", id, "run-idempotent", 1001,)
+                .unwrap()
+        );
+        assert!(
+            !suspend_run_for_controlled_shutdown(&mut c, "worker", id, "run-idempotent", 1002,)
+                .unwrap(),
+            "the second suspension must report that the capability was already revoked"
         );
     }
 

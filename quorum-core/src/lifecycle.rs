@@ -66,20 +66,35 @@ impl FromStr for Status {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    Claimed { agent: String },
-    SignaledDone { pr: String },
-    ReviewerAttached { agent: String },
+    Claimed {
+        agent: String,
+    },
+    SignaledDone {
+        pr: String,
+    },
+    ReviewerAttached {
+        agent: String,
+    },
     VerdictApprove,
     VerdictChanges,
     ReworkPushed,
     MergeSucceeded,
-    MergeFailed { reason: String },
+    MergeFailed {
+        reason: String,
+    },
     MergeConflict,
     PrFoundMerged,
     PrFoundClosed,
     LeaseExpired,
-    AgentFailed { reason: String },
-    Cancelled { by: String },
+    AgentFailed {
+        reason: String,
+    },
+    /// Daemon-controlled teardown. This records suspension without treating
+    /// the managed run as failed or advancing the task lifecycle.
+    ControlledShutdown,
+    Cancelled {
+        by: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +197,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Open, Event::PrFoundMerged) => reject("no PR from open"),
         (Status::Open, Event::PrFoundClosed) => reject("no PR from open"),
         (Status::Open, Event::AgentFailed { .. }) => reject("no agent in open"),
+        (Status::Open, Event::ControlledShutdown) => Ok((Status::Open, vec![])),
 
         // ---- Working ----
         (Status::Working, Event::SignaledDone { .. }) => {
@@ -224,6 +240,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Working, Event::MergeConflict) => reject("not merging"),
         (Status::Working, Event::PrFoundMerged) => reject("not in review"),
         (Status::Working, Event::PrFoundClosed) => reject("not in review"),
+        (Status::Working, Event::ControlledShutdown) => Ok((Status::Working, vec![])),
 
         // ---- InReview ----
         (Status::InReview, Event::ReviewerAttached { agent }) => {
@@ -303,6 +320,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
                 },
             ],
         )),
+        (Status::InReview, Event::ControlledShutdown) => Ok((Status::InReview, vec![])),
 
         // ---- Rework ----
         (Status::Rework, Event::ReworkPushed) => {
@@ -361,6 +379,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Rework, Event::MergeConflict) => reject("not merging"),
         (Status::Rework, Event::PrFoundMerged) => reject("not in review"),
         (Status::Rework, Event::PrFoundClosed) => reject("not in review"),
+        (Status::Rework, Event::ControlledShutdown) => Ok((Status::Rework, vec![])),
 
         // ---- Merging ----
         (Status::Merging, Event::MergeSucceeded) => Ok((Status::Done, vec![Effect::ReleaseLease])),
@@ -421,14 +440,18 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::Merging, Event::PrFoundMerged) => reject("merging in progress"),
         (Status::Merging, Event::PrFoundClosed) => reject("merging in progress"),
         (Status::Merging, Event::LeaseExpired) => reject("merging in progress"),
+        (Status::Merging, Event::ControlledShutdown) => Ok((Status::Merging, vec![])),
 
         // ---- Done (terminal) ----
+        (Status::Done, Event::ControlledShutdown) => reject("task is done"),
         (Status::Done, _) => reject("task is done"),
 
         // ---- Failed (terminal) ----
+        (Status::Failed, Event::ControlledShutdown) => reject("task has failed"),
         (Status::Failed, _) => reject("task has failed"),
 
         // ---- Cancelled (terminal) ----
+        (Status::Cancelled, Event::ControlledShutdown) => reject("task is cancelled"),
         (Status::Cancelled, _) => reject("task is cancelled"),
     }
 }
@@ -517,6 +540,47 @@ mod tests {
         assert!(Status::Done.is_terminal());
         assert!(Status::Failed.is_terminal());
         assert!(Status::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn controlled_shutdown_preserves_every_nonterminal_status_and_rejects_terminals() {
+        // This match intentionally has no wildcard: adding a Status requires
+        // declaring its controlled-shutdown contract here before tests compile.
+        let expected = |status| match status {
+            Status::Open => Ok(Status::Open),
+            Status::Working => Ok(Status::Working),
+            Status::InReview => Ok(Status::InReview),
+            Status::Rework => Ok(Status::Rework),
+            Status::Merging => Ok(Status::Merging),
+            Status::Done => Err(()),
+            Status::Failed => Err(()),
+            Status::Cancelled => Err(()),
+        };
+        let all_statuses = [
+            Status::Open,
+            Status::Working,
+            Status::InReview,
+            Status::Rework,
+            Status::Merging,
+            Status::Done,
+            Status::Failed,
+            Status::Cancelled,
+        ];
+
+        for status in all_statuses {
+            match expected(status) {
+                Ok(next_status) => {
+                    let (next, effects) = transition(&view(status), &Event::ControlledShutdown)
+                        .expect("controlled shutdown must be accepted for non-terminal status");
+                    assert_eq!(next, next_status);
+                    assert!(
+                        effects.is_empty(),
+                        "controlled shutdown must have no effects"
+                    );
+                }
+                Err(()) => assert_invalid(&view(status), &Event::ControlledShutdown),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
