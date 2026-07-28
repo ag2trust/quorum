@@ -1440,7 +1440,7 @@ worker_effort = "medium"
 review_model = "gpt-5.6-terra"
 review_effort = "high"
 
-classifier_model = "gpt-5.6-terra"
+classifier_model = "gpt-5.6-luna"
 classifier_effort = "medium"
 ```
 

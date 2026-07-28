@@ -36,9 +36,9 @@ const DEFAULT_SERVE_TOML: &str = "\
 # worker_effort = \"medium\"
 # review_model = \"gpt-5.6-terra\"
 # review_effort = \"high\"
-# classifier_model = \"gpt-5.6-terra\"
+# classifier_model = \"gpt-5.6-luna\"
 # classifier_effort = \"medium\"
-# collector_model = \"gpt-5.6-terra\"  # defaults to classifier_model when absent
+# collector_model = \"gpt-5.6-luna\"   # defaults to classifier_model when absent
 # collector_effort = \"medium\"        # defaults to classifier_effort when absent
 #
 # ## Advisory complexity routing policy
@@ -1511,7 +1511,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         quorum_core::classify::store_classifications(
                             &mut conn,
                             &results,
-                            quorum_core::classify::CLASSIFIER_VERSION,
+                            &quorum_core::classify::classifier_provenance(
+                                serve::classifier::CLASSIFIER_MODEL,
+                            ),
                             now,
                         )
                     } else {

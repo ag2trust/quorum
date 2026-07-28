@@ -156,7 +156,7 @@ pub fn resolve_roles(
             "medium",
             "gpt-5.6-terra",
             "high",
-            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "medium",
         )
     } else {
@@ -786,10 +786,26 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
                 "medium",
                 "gpt-5.6-terra",
                 "high",
-                "gpt-5.6-terra",
+                "gpt-5.6-luna",
                 "medium",
             )
         );
+    }
+
+    #[test]
+    fn explicit_classifier_model_overrides_codex_default() {
+        let cfg: ServeFileConfig = toml::from_str(
+            "provider = \"codex\"\nclassifier_model = \"gpt-5.6-sol\"\nclassifier_effort = \"high\"\n",
+        )
+        .unwrap();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+
+        assert_eq!(roles.worker_model, "gpt-5.6-terra");
+        assert_eq!(roles.worker_effort, "medium");
+        assert_eq!(roles.review_model, "gpt-5.6-terra");
+        assert_eq!(roles.review_effort, "high");
+        assert_eq!(roles.classifier_model, "gpt-5.6-sol");
+        assert_eq!(roles.classifier_effort, "high");
     }
 
     #[test]
