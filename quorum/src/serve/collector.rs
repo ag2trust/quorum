@@ -57,8 +57,8 @@ pub struct CollectionRequest {
     pub repo_dir: PathBuf,
     pub agent_bin: Option<String>,
     pub bare_agent: bool,
-    pub classifier_model: String,
-    pub classifier_effort: String,
+    pub collector_model: String,
+    pub collector_effort: String,
     pub codex_sandbox: String,
     /// Extra env vars threaded into the spawned classifier process. Empty in
     /// production. Used by tests to script the fake-agent binary per-call so
@@ -86,21 +86,21 @@ impl CollectionRequest {
             repo_dir,
             agent_bin,
             bare_agent,
-            classifier_model: CLASSIFIER_MODEL.to_string(),
-            classifier_effort: CLASSIFIER_EFFORT.to_string(),
+            collector_model: CLASSIFIER_MODEL.to_string(),
+            collector_effort: CLASSIFIER_EFFORT.to_string(),
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
         }
     }
 
-    pub fn with_classifier(
+    pub fn with_collector(
         mut self,
         model: impl Into<String>,
         effort: impl Into<String>,
         codex_sandbox: impl Into<String>,
     ) -> Self {
-        self.classifier_model = model.into();
-        self.classifier_effort = effort.into();
+        self.collector_model = model.into();
+        self.collector_effort = effort.into();
         self.codex_sandbox = codex_sandbox.into();
         self
     }
@@ -159,7 +159,7 @@ pub async fn run_collection_with_inputs(
         &response_text,
         request.pr_number,
         request.task_id,
-        Some(&request.classifier_model),
+        Some(&request.collector_model),
         Some(COLLECTOR_VERSION),
     ) {
         Some(f) => f,
@@ -178,7 +178,7 @@ pub async fn run_collection_with_inputs(
     let pr = request.pr_number;
     let task_id = request.task_id;
     let db_path = request.db_path.clone();
-    let collector_model = request.classifier_model.clone();
+    let collector_model = request.collector_model.clone();
     let count = findings.len() as i64;
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
@@ -230,7 +230,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let pr = request.pr_number;
     let task_id = request.task_id;
     let error_text = error.to_string();
-    let collector_model = request.classifier_model.clone();
+    let collector_model = request.collector_model.clone();
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = quorum_core::db::open(&db_path)?;
         let now = clock::now();
@@ -522,14 +522,14 @@ async fn spawn_and_run_classifier(
     inputs: &CollectorInputs,
 ) -> Result<String> {
     let prompt = review_findings::build_collector_prompt(inputs);
-    let kind = AgentKind::for_model(&request.classifier_model)
-        .map_err(|e| QuorumError::Io(format!("classifier provider: {e}")))?;
+    let kind = AgentKind::for_model(&request.collector_model)
+        .map_err(|e| QuorumError::Io(format!("collector provider: {e}")))?;
     let mut proc = match kind {
         AgentKind::Claude => {
             let spec = AgentSpec {
                 kind,
-                model: request.classifier_model.clone(),
-                effort: request.classifier_effort.clone(),
+                model: request.collector_model.clone(),
+                effort: request.collector_effort.clone(),
                 session_id: agent::new_session_id(),
                 worktree: request.repo_dir.clone(),
                 bare: request.bare_agent,
@@ -545,8 +545,8 @@ async fn spawn_and_run_classifier(
         }
         AgentKind::Codex => {
             let spec = CodexSpec {
-                model: request.classifier_model.clone(),
-                effort: request.classifier_effort.clone(),
+                model: request.collector_model.clone(),
+                effort: request.collector_effort.clone(),
                 sandbox: request.codex_sandbox.clone(),
                 worktree: request.repo_dir.clone(),
                 prompt,
@@ -661,6 +661,23 @@ pub fn spawn_detached(request: CollectionRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_collector_identity_is_carried_by_collection_request() {
+        let request = CollectionRequest::new(
+            1,
+            None,
+            None,
+            PathBuf::from("/tmp/q.db"),
+            PathBuf::from("/tmp"),
+            None,
+            false,
+        )
+        .with_collector("gpt-5.6-terra", "high", "danger-full-access");
+
+        assert_eq!(request.collector_model, "gpt-5.6-terra");
+        assert_eq!(request.collector_effort, "high");
+    }
     use quorum_core::db;
 
     fn tmp_conn() -> (tempfile::TempDir, PathBuf) {
@@ -708,7 +725,7 @@ mod tests {
             None,
             true,
         )
-        .with_classifier("gpt-5.6-terra", "medium", "danger-full-access");
+        .with_collector("gpt-5.6-terra", "medium", "danger-full-access");
         record_failure(&request, "boom", 1000).await;
 
         let conn = db::open(&db_path).unwrap();
@@ -772,7 +789,7 @@ mod tests {
             Some("/bin/false".into()),
             true,
         )
-        .with_classifier("unknown-provider-model", "medium", "danger-full-access");
+        .with_collector("unknown-provider-model", "medium", "danger-full-access");
 
         let error = run_collection_with_inputs(&request, synthetic_inputs(44), 1000)
             .await
@@ -849,8 +866,8 @@ mod tests {
             repo_dir: dir.to_path_buf(),
             agent_bin: Some(fake_agent_path().to_string_lossy().to_string()),
             bare_agent: true,
-            classifier_model: CLASSIFIER_MODEL.to_string(),
-            classifier_effort: CLASSIFIER_EFFORT.to_string(),
+            collector_model: CLASSIFIER_MODEL.to_string(),
+            collector_effort: CLASSIFIER_EFFORT.to_string(),
             codex_sandbox: "danger-full-access".to_string(),
             env_vars,
         }
@@ -1118,8 +1135,8 @@ mod tests {
             repo_dir: dir.path().to_path_buf(),
             agent_bin: Some("/nonexistent/quorum-fake-agent-t126".into()),
             bare_agent: true,
-            classifier_model: CLASSIFIER_MODEL.to_string(),
-            classifier_effort: CLASSIFIER_EFFORT.to_string(),
+            collector_model: CLASSIFIER_MODEL.to_string(),
+            collector_effort: CLASSIFIER_EFFORT.to_string(),
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
         };

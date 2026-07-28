@@ -58,6 +58,8 @@ pub struct ServeFileConfig {
     pub review_effort: Option<String>,
     pub classifier_model: Option<String>,
     pub classifier_effort: Option<String>,
+    pub collector_model: Option<String>,
+    pub collector_effort: Option<String>,
     pub merge_token_file: Option<String>,
     pub no_bare_agent: Option<bool>,
     pub max_turn_tokens: Option<i64>,
@@ -108,6 +110,8 @@ pub struct RoleConfig {
     pub review_effort: String,
     pub classifier_model: String,
     pub classifier_effort: String,
+    pub collector_model: String,
+    pub collector_effort: String,
 }
 
 pub fn resolve_roles(
@@ -166,6 +170,14 @@ pub fn resolve_roles(
         )
     };
 
+    let classifier_model = file
+        .classifier_model
+        .clone()
+        .unwrap_or_else(|| classifier_default_model.into());
+    let classifier_effort = file
+        .classifier_effort
+        .clone()
+        .unwrap_or_else(|| classifier_default_effort.into());
     let roles = RoleConfig {
         provider,
         provider_explicit,
@@ -185,24 +197,28 @@ pub fn resolve_roles(
             .review_effort
             .clone()
             .unwrap_or_else(|| review_default_effort.into()),
-        classifier_model: file
-            .classifier_model
+        collector_model: file
+            .collector_model
             .clone()
-            .unwrap_or_else(|| classifier_default_model.into()),
-        classifier_effort: file
-            .classifier_effort
+            .unwrap_or_else(|| classifier_model.clone()),
+        collector_effort: file
+            .collector_effort
             .clone()
-            .unwrap_or_else(|| classifier_default_effort.into()),
+            .unwrap_or_else(|| classifier_effort.clone()),
+        classifier_model,
+        classifier_effort,
     };
 
     let role_models_explicit = file.worker_model.is_some()
         || file.review_model.is_some()
-        || file.classifier_model.is_some();
+        || file.classifier_model.is_some()
+        || file.collector_model.is_some();
     if provider_explicit || role_models_explicit {
         for (role, model) in [
             ("worker", roles.worker_model.as_str()),
             ("review", roles.review_model.as_str()),
             ("classifier", roles.classifier_model.as_str()),
+            ("collector", roles.collector_model.as_str()),
         ] {
             let actual =
                 crate::serve::runner::AgentKind::for_model(model).map_err(QuorumError::Usage)?;
@@ -438,6 +454,8 @@ pub struct BannerData<'a> {
     pub review_effort: &'a str,
     pub classifier_model: &'a str,
     pub classifier_effort: &'a str,
+    pub collector_model: &'a str,
+    pub collector_effort: &'a str,
     pub log_dir: &'a Sourced<Option<String>>,
     pub no_bare_agent: &'a Sourced<bool>,
     pub self_update_drain: &'a Sourced<bool>,
@@ -485,6 +503,14 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  classifier_effort:         {}",
         d.classifier_effort
+    ));
+    lines.push(format!(
+        "  collector_model:           {}",
+        d.collector_model
+    ));
+    lines.push(format!(
+        "  collector_effort:          {}",
+        d.collector_effort
     ));
     match &d.log_dir.value {
         Some(v) => lines.push(format!(
@@ -775,6 +801,27 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         assert_eq!(roles.worker_model, "sonnet");
         assert_eq!(roles.review_model, "sonnet");
         assert_eq!(roles.classifier_model, "claude-haiku-4-5-20251001");
+        assert_eq!(roles.collector_model, roles.classifier_model);
+        assert_eq!(roles.collector_effort, roles.classifier_effort);
+    }
+
+    #[test]
+    fn collector_roles_default_to_classifier_values_when_absent() {
+        let cfg: ServeFileConfig = toml::from_str(
+            "classifier_model = \"claude-sonnet-5\"\nclassifier_effort = \"high\"\n",
+        )
+        .unwrap();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+        assert_eq!(roles.collector_model, roles.classifier_model);
+        assert_eq!(roles.collector_effort, roles.classifier_effort);
+    }
+
+    #[test]
+    fn explicit_collector_roles_override_classifier_values() {
+        let cfg: ServeFileConfig = toml::from_str("classifier_model = \"claude-haiku-4-5-20251001\"\nclassifier_effort = \"low\"\ncollector_model = \"claude-opus-4-8\"\ncollector_effort = \"high\"\n").unwrap();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+        assert_eq!(roles.collector_model, "claude-opus-4-8");
+        assert_eq!(roles.collector_effort, "high");
     }
 
     #[test]
@@ -784,6 +831,16 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("review_model"), "{err}");
+    }
+
+    #[test]
+    fn explicit_provider_rejects_collector_model_mismatch() {
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"codex\"\ncollector_model = \"claude-opus-4-8\"\n")
+                .unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("collector_model"), "{err}");
     }
 
     #[test]
@@ -979,6 +1036,8 @@ worktree_base = "/tmp/wt"
             review_effort: "high",
             classifier_model: "claude-haiku-4-5-20251001",
             classifier_effort: "low",
+            collector_model: "claude-haiku-4-5-20251001",
+            collector_effort: "low",
             log_dir: &Sourced {
                 value: None,
                 source: Source::Default,

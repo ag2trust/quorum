@@ -412,9 +412,9 @@ fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
         config.agent_bin.clone(),
         config.bare_agent,
     )
-    .with_classifier(
-        config.classifier_model.clone(),
-        config.classifier_effort.clone(),
+    .with_collector(
+        config.collector_model.clone(),
+        config.collector_effort.clone(),
         config.codex_sandbox.clone(),
     );
     collector::spawn_detached(request);
@@ -921,6 +921,8 @@ pub struct ServeConfig {
     pub review_effort: String,
     pub classifier_model: String,
     pub classifier_effort: String,
+    pub collector_model: String,
+    pub collector_effort: String,
     pub merge_executor: Arc<dyn merge::MergeExecutor>,
     /// Pass `--bare` to spawned agents, stripping operator-local hooks,
     /// plugins, memory, and MCP config. Default: false (inherit operator login).
@@ -6137,9 +6139,9 @@ async fn tick(
                 config.agent_bin.clone(),
                 config.bare_agent,
             )
-            .with_classifier(
-                config.classifier_model.clone(),
-                config.classifier_effort.clone(),
+            .with_collector(
+                config.collector_model.clone(),
+                config.collector_effort.clone(),
                 config.codex_sandbox.clone(),
             );
             collector::spawn_detached(request);
