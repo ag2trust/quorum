@@ -96,6 +96,55 @@ impl PoisonTracker {
     }
 }
 
+/// Why no reviewer slot is being provisioned for a PR head.
+///
+/// `AllApproved` and `Exhausted` both mean "provision nothing", but they are
+/// opposite outcomes: `AllApproved` is success awaiting merge, `Exhausted` is
+/// failure requiring a park. Collapsing both into a bare `None` parks a
+/// fully-approved task — reachable once a sampled R2 skip makes R1-only
+/// approval sufficient (a skipped R2 leaves no `r2` approval row, so any
+/// strict "both roles approved" predicate reports incomplete).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProvisionDecision {
+    Needed(&'static str),
+    AllApproved,
+    Exhausted,
+}
+
+/// Decide whether a reviewer slot is needed for `head_sha`, distinguishing
+/// "every required role already approved" from "provisioning is exhausted".
+fn decide_provision(
+    conn: &quorum_core::Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<ProvisionDecision> {
+    if is_reviewer_cap_exceeded(conn, task_id)? {
+        return Ok(ProvisionDecision::Exhausted);
+    }
+    match next_needed_role(conn, pr_number, head_sha)? {
+        None => Ok(ProvisionDecision::AllApproved),
+        Some(role) => {
+            if is_provision_exhausted(conn, task_id, pr_number, role, head_sha)? {
+                Ok(ProvisionDecision::Exhausted)
+            } else {
+                Ok(ProvisionDecision::Needed(role))
+            }
+        }
+    }
+}
+
+/// Whether every review role required for `head_sha` is approved. Unlike
+/// `quorum_core::approvals::dual_approved`, this honours a durable sampled R2
+/// skip, so an R1-only approval for a sampled-out head counts as complete.
+fn all_required_roles_approved(
+    conn: &quorum_core::Connection,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<bool> {
+    Ok(next_needed_role(conn, pr_number, head_sha)?.is_none())
+}
+
 /// Determine the next review role needed for a PR, checking durable approvals.
 /// Returns `None` if all required roles are approved for the given `head_sha`.
 fn next_needed_role(
@@ -5402,24 +5451,25 @@ async fn tick(
                 let tid = *task_id;
                 let pr_num = *pr;
                 let sha = head_sha.clone();
-                tokio::task::spawn_blocking(move || -> Result<Option<&'static str>> {
+                tokio::task::spawn_blocking(move || -> Result<ProvisionDecision> {
                     let conn = quorum_core::db::open(&p)?;
-                    if is_reviewer_cap_exceeded(&conn, tid)? {
-                        return Ok(None);
-                    }
-                    let role = next_needed_role(&conn, pr_num, &sha)?;
-                    if let Some(r) = role {
-                        if is_provision_exhausted(&conn, tid, pr_num, r, &sha)? {
-                            return Ok(None);
-                        }
-                    }
-                    Ok(role)
+                    decide_provision(&conn, tid, pr_num, &sha)
                 })
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             };
             match provision_decision {
-                Ok(None) => {
+                // Every required role approved for this head (including a
+                // sampled R2 skip). Nothing to provision and nothing wrong —
+                // approval recovery merges it. Parking here would strand it.
+                Ok(ProvisionDecision::AllApproved) => {
+                    log(&format!(
+                        "task #{task_id} PR #{pr}: all required reviews approved \
+                         — awaiting merge, not provisioning"
+                    ));
+                    continue;
+                }
+                Ok(ProvisionDecision::Exhausted) => {
                     log(&format!(
                         "reviewer provision exhausted for task #{task_id} PR #{pr} \
                          — parking worker"
@@ -5427,7 +5477,7 @@ async fn tick(
                     parked_workers.push(*wi);
                     continue;
                 }
-                Ok(Some(role_str)) => {
+                Ok(ProvisionDecision::Needed(role_str)) => {
                     let role = if role_str == "r2" {
                         // Look up R1 reviewer info from durable approval
                         let r1_info = {
@@ -5671,24 +5721,23 @@ async fn tick(
                 let tid = *task_id;
                 let pr_num = *pr;
                 let sha = head_sha.clone();
-                tokio::task::spawn_blocking(move || -> Result<Option<&'static str>> {
+                tokio::task::spawn_blocking(move || -> Result<ProvisionDecision> {
                     let conn = quorum_core::db::open(&p)?;
-                    if is_reviewer_cap_exceeded(&conn, tid)? {
-                        return Ok(None);
-                    }
-                    let role = next_needed_role(&conn, pr_num, &sha)?;
-                    if let Some(r) = role {
-                        if is_provision_exhausted(&conn, tid, pr_num, r, &sha)? {
-                            return Ok(None);
-                        }
-                    }
-                    Ok(role)
+                    decide_provision(&conn, tid, pr_num, &sha)
                 })
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             };
             match provision_decision {
-                Ok(None) => {
+                // Success, not exhaustion — see the worker-side arm above.
+                Ok(ProvisionDecision::AllApproved) => {
+                    log(&format!(
+                        "orphan in-review task #{task_id} PR #{pr}: all required \
+                         reviews approved — awaiting merge, not provisioning"
+                    ));
+                    continue;
+                }
+                Ok(ProvisionDecision::Exhausted) => {
                     log(&format!(
                         "orphan in-review task #{task_id} PR #{pr}: \
                          provision exhausted — parking"
@@ -5709,7 +5758,7 @@ async fn tick(
                     .await;
                     continue;
                 }
-                Ok(Some(role_str)) => {
+                Ok(ProvisionDecision::Needed(role_str)) => {
                     let role = if role_str == "r2" {
                         let r1_info = {
                             let p = db_path.clone();
@@ -10826,6 +10875,101 @@ mod tests {
             next_needed_role(&conn, 42, "head-a").unwrap(),
             Some("r2"),
             "force-pushing the prior required head back must still require R2"
+        );
+    }
+
+    /// A sampled-out head leaves no `r2` approval row. The provisioning
+    /// decision must read that as "complete, awaiting merge", never as
+    /// exhaustion — the latter parks a fully-approved task forever.
+    #[test]
+    fn sampled_r2_skip_reports_all_approved_not_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "sampled skip merge-wait",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 77, "head-x", false)
+            .unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 77,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head-x".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            decide_provision(&conn, task_id, 77, "head-x").unwrap(),
+            ProvisionDecision::AllApproved,
+            "an R1-only approval for a sampled-out head is complete, not exhausted"
+        );
+        assert!(
+            all_required_roles_approved(&conn, 77, "head-x").unwrap(),
+            "merge-wait recovery must treat a sampled skip as fully approved"
+        );
+    }
+
+    /// The negative path: when R2 is genuinely required, an R1-only approval
+    /// must still demand R2 and must not be mistaken for completion.
+    #[test]
+    fn required_r2_still_gates_and_is_not_reported_as_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "required r2 gate",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 78, "head-y", true)
+            .unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 78,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head-y".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            decide_provision(&conn, task_id, 78, "head-y").unwrap(),
+            ProvisionDecision::Needed("r2"),
+            "a required R2 must still be provisioned after R1 approves"
+        );
+        assert!(
+            !all_required_roles_approved(&conn, 78, "head-y").unwrap(),
+            "R1-only must not count as complete while R2 is required"
         );
     }
 
