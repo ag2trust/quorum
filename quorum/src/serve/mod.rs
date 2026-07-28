@@ -42,8 +42,6 @@ const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 
-const REQUIRED_REVIEW_ROLES: &[&str] = &["r1", "r2"];
-
 #[derive(Debug, Clone)]
 enum ReviewRole {
     R1,
@@ -105,20 +103,141 @@ fn next_needed_role(
     pr_number: i64,
     head_sha: &str,
 ) -> Result<Option<&'static str>> {
-    for &role in REQUIRED_REVIEW_ROLES {
-        match quorum_core::approvals::get(conn, pr_number, role)? {
-            Some(a)
-                if a.verdict == "approved"
-                    && a.blocking_count == 0
-                    && !a.approved_head_sha.is_empty()
-                    && a.approved_head_sha == head_sha =>
-            {
-                continue;
-            }
-            _ => return Ok(Some(role)),
+    let r1 = quorum_core::approvals::get(conn, pr_number, "r1")?;
+    let Some(r1) = r1.filter(|a| {
+        a.verdict == "approved"
+            && a.blocking_count == 0
+            && !a.approved_head_sha.is_empty()
+            && a.approved_head_sha == head_sha
+    }) else {
+        return Ok(Some("r1"));
+    };
+
+    if !r2_required_for_head(conn, r1.task_id, pr_number, head_sha) {
+        return Ok(None);
+    }
+
+    match quorum_core::approvals::get(conn, pr_number, "r2")? {
+        Some(a)
+            if a.verdict == "approved"
+                && a.blocking_count == 0
+                && !a.approved_head_sha.is_empty()
+                && a.approved_head_sha == head_sha =>
+        {
+            Ok(None)
+        }
+        _ => Ok(Some("r2")),
+    }
+}
+
+/// Return the deterministic sampling seed for one exact PR head.  This is
+/// intentionally independent of daemon instance, run id, clock, and task id.
+fn r2_sampling_seed(pr_number: i64, head_sha: &str) -> u64 {
+    // FNV-1a is sufficient here: this is deterministic bucket selection, not
+    // a security boundary, and avoids adding an RNG/hash dependency.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in pr_number
+        .to_be_bytes()
+        .into_iter()
+        .chain([0xff])
+        .chain(head_sha.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Capture the exact PR head assigned to either review role. The approval path
+/// compares this value with the live head before any merge transition.
+fn review_launch_head_sha(role: &ReviewRole, head_sha: &str) -> Option<String> {
+    match role {
+        ReviewRole::R1 | ReviewRole::R2 { .. } => {
+            Some(head_sha.to_string()).filter(|sha| !sha.is_empty())
         }
     }
-    Ok(None)
+}
+
+/// A reviewer may authorize a head only when the head at verdict time still
+/// matches the one fetched into its review worktree. Missing launch/current
+/// state is fail-closed: a new review is cheaper than merging an unreviewed
+/// diff.
+fn review_head_matches_launch(
+    launch_head_sha: Option<&str>,
+    current_head_sha: Option<&str>,
+) -> bool {
+    matches!(
+        (launch_head_sha, current_head_sha),
+        (Some(launch), Some(current)) if !launch.is_empty() && launch == current
+    )
+}
+
+/// Whether an R2 was required for this PR head when R1 approved. Decisions are
+/// retained in a daemon-owned table by PR and head SHA so a later rework head
+/// cannot change the requirement if an earlier head is force-pushed back.
+/// Missing or unreadable state fails closed to mandatory R2.
+fn r2_required_for_head(
+    conn: &quorum_core::Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> bool {
+    quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+}
+
+struct R2SamplingPolicy {
+    enabled: bool,
+    target_per_stratum: i64,
+    steady_state_p: f64,
+    default_model: String,
+    default_effort: String,
+}
+
+/// Read or durably choose the R2 requirement for an R1 approval.  Persisting
+/// the result prevents later ticks/restarts from changing a decision merely
+/// because another PR advanced the stratum coverage count.
+fn decide_r2_requirement(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+    policy: &R2SamplingPolicy,
+) -> Result<bool> {
+    if tasks::get(conn, task_id)?.is_none() {
+        return Err(QuorumError::Io(format!(
+            "task #{task_id} disappeared while sampling R2"
+        )));
+    }
+    if let Some(required) =
+        quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)?
+    {
+        return Ok(required);
+    }
+
+    // `false` opts out of sampling, never out of the R2 gate itself.
+    let required = if policy.enabled {
+        let stratum = quorum_core::review_audits::task_stratum(
+            conn,
+            task_id,
+            &policy.default_model,
+            &policy.default_effort,
+        )?;
+        let counts = quorum_core::review_audits::stratum_counts(conn)?;
+        quorum_core::review_audits::should_sample(
+            &counts,
+            &stratum,
+            policy.target_per_stratum,
+            policy.steady_state_p,
+            r2_sampling_seed(pr_number, head_sha),
+        )
+    } else {
+        true
+    };
+
+    quorum_core::review_audits::record_r2_requirement(conn, task_id, pr_number, head_sha, required)
 }
 
 /// Check whether provision attempts for a (task, PR, role) are exhausted.
@@ -796,7 +915,12 @@ pub struct ServeConfig {
     /// When true, the daemon spawns a one-shot doctor agent for tasks stalled
     /// with no active worker/reviewer. Default: false.
     pub doctor_enabled: bool,
-    // R2 is mandatory (#159) — no sampling config needed.
+    /// Enable deterministic R2 sampling. False retains the mandatory R2 gate.
+    pub r2_enabled: bool,
+    /// Guaranteed R2 coverage per stratum before steady-state sampling.
+    pub r2_target_per_stratum: i64,
+    /// Probability of an R2 after its stratum reaches the coverage target.
+    pub r2_steady_state_p: f64,
     /// Per-complexity suggested model/effort overrides (keys "1".."5", values "tier/effort").
     pub suggested_models: std::collections::HashMap<String, String>,
     /// #172: minimum worker model floor as a full model id (e.g. "claude-opus-4-7"),
@@ -1981,11 +2105,79 @@ async fn tick(
                         continue;
                     };
 
-                    // #159/#190: mandatory dual-review gate. When R1 (non-R2)
-                    // approves, store durable approval and provision R2 via the
-                    // unified path. If R2 spawn fails, the durable approval
-                    // persists and Phase 5 retries on next tick with bounded
-                    // attempt tracking.
+                    // Verify the launch SHA *before* recording an approval or
+                    // choosing a sampled R2 requirement. Otherwise an R1 that
+                    // reviewed A can return after a force-push to B and stamp
+                    // both its approval and an R2 skip onto unreviewed B.
+                    let launch_head_sha = reviewers[ri].reviewed_head_sha.clone();
+                    let current_head_sha = {
+                        let repo = config.repo_dir.clone();
+                        let executor = Arc::clone(&config.merge_executor);
+                        tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    if !review_head_matches_launch(
+                        launch_head_sha.as_deref(),
+                        current_head_sha.as_deref(),
+                    ) {
+                        let expected = launch_head_sha.as_deref().unwrap_or("<missing>");
+                        let current = current_head_sha.as_deref().unwrap_or("<unavailable>");
+                        log(&format!(
+                            "STALE SHA: reviewer {} returned for head {} but current head is {} \
+                             — discarding verdict before approval/sampling",
+                            reviewers[ri].agent_name, expected, current
+                        ));
+
+                        // A normal verdict is still in-review and needs no
+                        // lifecycle transition: Phase 5 sees no approval for
+                        // the new head and provisions a fresh R1. A merge-wait
+                        // retry is already merging, so return it to in-review.
+                        let already_merging = {
+                            let p = db_path.clone();
+                            tokio::task::spawn_blocking(move || -> bool {
+                                quorum_core::db::open(&p)
+                                    .ok()
+                                    .and_then(|conn| {
+                                        tasks::get(&conn, reviewer_task_id).ok().flatten()
+                                    })
+                                    .map(|task| task.status == "merging")
+                                    .unwrap_or(false)
+                            })
+                            .await
+                            .unwrap_or(false)
+                        };
+                        if already_merging {
+                            fire_event(
+                                &db_path,
+                                "system",
+                                reviewer_task_id,
+                                &Event::MergeFailed {
+                                    reason: format!(
+                                        "PR #{pr_num} head moved since review \
+                                         (reviewed {}, now {})",
+                                        &expected[..8.min(expected.len())],
+                                        &current[..8.min(current.len())]
+                                    ),
+                                },
+                            )
+                            .await;
+                        }
+                        let r = reviewers.remove(ri);
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                        continue;
+                    }
+                    let head_sha = current_head_sha
+                        .expect("review_head_matches_launch requires a current head SHA");
+
+                    // When R1 (non-R2) approves, record its durable approval
+                    // and make one durable sampling decision for this exact PR
+                    // head. A required R2 uses the existing dual-review gate;
+                    // a sampled skip falls through to the ordinary merge path.
                     if !reviewers[ri].r2_origin && !drain_state.draining {
                         let r1_reviewer = reviewers[ri].agent_name.clone();
                         let r1_run_id = reviewers[ri].agent_run_id;
@@ -1994,15 +2186,6 @@ async fn tick(
                             .find(|w| w.task_id == reviewer_task_id)
                             .map(|w| w.agent_name.clone())
                             .unwrap_or_default();
-                        let head_sha = {
-                            let repo = config.repo_dir.clone();
-                            let executor = Arc::clone(&config.merge_executor);
-                            tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
-                                .await
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default()
-                        };
                         // Record R1's durable approval.
                         {
                             let p = db_path.clone();
@@ -2042,120 +2225,154 @@ async fn tick(
                         )
                         .await;
 
-                        // Build counterpart from worker if available, otherwise
-                        // resolve from task author or PR head ref.
-                        let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
-                            workers.iter().find(|w| w.task_id == reviewer_task_id)
-                        {
-                            Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
-                        } else {
-                            let db_branch = {
-                                let p = db_path.clone();
-                                let tid = reviewer_task_id;
-                                tokio::task::spawn_blocking(move || -> Option<String> {
-                                    let conn = quorum_core::db::open(&p).ok()?;
-                                    let t = tasks::get(&conn, tid).ok()??;
-                                    let a = t.author.unwrap_or_default();
-                                    orphan_worker_branch(&a, tid, t.review_only)
-                                })
-                                .await
-                                .ok()
-                                .flatten()
+                        let r2_required = {
+                            let p = db_path.clone();
+                            let sha = head_sha.clone();
+                            let policy = R2SamplingPolicy {
+                                enabled: config.r2_enabled,
+                                target_per_stratum: config.r2_target_per_stratum,
+                                steady_state_p: config.r2_steady_state_p,
+                                default_model: config.model.clone(),
+                                default_effort: config.effort.clone(),
                             };
-                            if let Some(branch) = db_branch {
-                                Some(("external".to_string(), reviewer_task_id, branch))
-                            } else {
-                                let pr_val = pr_num;
-                                let tid = reviewer_task_id;
-                                let dbp = db_path.clone();
-                                let repo_dir = config.repo_dir.clone();
-                                let gh_repo = config.repo.clone();
-                                let resolved = tokio::task::spawn_blocking(move || {
-                                    resolve_or_load_pr_target(
-                                        pr_val,
-                                        tid,
-                                        &dbp,
-                                        &repo_dir,
-                                        Some(&gh_repo),
-                                    )
-                                })
-                                .await
-                                .ok()
-                                .flatten();
-                                resolved.map(|target| {
-                                    ("external".to_string(), reviewer_task_id, target.head_ref)
-                                })
-                            }
+                            tokio::task::spawn_blocking(move || -> Result<bool> {
+                                let mut conn = quorum_core::db::open(&p)?;
+                                decide_r2_requirement(
+                                    &mut conn,
+                                    reviewer_task_id,
+                                    pr_num,
+                                    &sha,
+                                    &policy,
+                                )
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or(true)
                         };
 
-                        if let Some((cp_agent, cp_tid, cp_branch)) = worker_cp_owned {
-                            let worker_cp = ReviewCounterpart {
-                                agent_name: &cp_agent,
-                                task_id: cp_tid,
-                                branch: &cp_branch,
-                            };
-                            let role = ReviewRole::R2 {
-                                r1_reviewer: r1_reviewer.clone(),
-                                r1_run_id,
+                        if !r2_required {
+                            log(&format!(
+                                "R2 GATE: PR #{pr_num} — sampling skipped R2 for head {head_sha}; \
+                                 proceeding with R1 approval"
+                            ));
+                        } else {
+                            // Build counterpart from worker if available, otherwise
+                            // resolve from task author or PR head ref.
+                            let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
+                                workers.iter().find(|w| w.task_id == reviewer_task_id)
+                            {
+                                Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
+                            } else {
+                                let db_branch = {
+                                    let p = db_path.clone();
+                                    let tid = reviewer_task_id;
+                                    tokio::task::spawn_blocking(move || -> Option<String> {
+                                        let conn = quorum_core::db::open(&p).ok()?;
+                                        let t = tasks::get(&conn, tid).ok()??;
+                                        let a = t.author.unwrap_or_default();
+                                        orphan_worker_branch(&a, tid, t.review_only)
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                };
+                                if let Some(branch) = db_branch {
+                                    Some(("external".to_string(), reviewer_task_id, branch))
+                                } else {
+                                    let pr_val = pr_num;
+                                    let tid = reviewer_task_id;
+                                    let dbp = db_path.clone();
+                                    let repo_dir = config.repo_dir.clone();
+                                    let gh_repo = config.repo.clone();
+                                    let resolved = tokio::task::spawn_blocking(move || {
+                                        resolve_or_load_pr_target(
+                                            pr_val,
+                                            tid,
+                                            &dbp,
+                                            &repo_dir,
+                                            Some(&gh_repo),
+                                        )
+                                    })
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                    resolved.map(|target| {
+                                        ("external".to_string(), reviewer_task_id, target.head_ref)
+                                    })
+                                }
                             };
 
-                            let pre_count = reviewers.len();
-                            provision_reviewer(
-                                config,
-                                wt_mgr,
-                                name_pool,
-                                reviewers,
-                                lifetime_roster,
-                                pr_num,
-                                worker_cp,
-                                &role,
-                                &head_sha,
-                                false,
-                            )
-                            .await
-                            .ok();
-                            let r2_added = reviewers.len() > pre_count;
+                            if let Some((cp_agent, cp_tid, cp_branch)) = worker_cp_owned {
+                                let worker_cp = ReviewCounterpart {
+                                    agent_name: &cp_agent,
+                                    task_id: cp_tid,
+                                    branch: &cp_branch,
+                                };
+                                let role = ReviewRole::R2 {
+                                    r1_reviewer: r1_reviewer.clone(),
+                                    r1_run_id,
+                                };
 
-                            if r2_added {
-                                log(&format!(
-                                    "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
+                                let pre_count = reviewers.len();
+                                provision_reviewer(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    reviewers,
+                                    lifetime_roster,
+                                    pr_num,
+                                    worker_cp,
+                                    &role,
+                                    &head_sha,
+                                    false,
+                                )
+                                .await
+                                .ok();
+                                let r2_added = reviewers.len() > pre_count;
+
+                                if r2_added {
+                                    log(&format!(
+                                        "R2 GATE: PR #{pr_num} — mandatory R2 review spawned, \
                                      tearing down R1 reviewer {}",
-                                    r1_reviewer
-                                ));
+                                        r1_reviewer
+                                    ));
+                                } else {
+                                    log(&format!(
+                                        "R2 GATE: R2 spawn failed for PR #{pr_num} \
+                                     — R1 approval stored, Phase 5 will retry"
+                                    ));
+                                }
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    r,
+                                    if r2_added {
+                                        "r2-pending"
+                                    } else {
+                                        "r2-spawn-failed"
+                                    },
+                                )
+                                .await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                continue;
                             } else {
                                 log(&format!(
-                                    "R2 GATE: R2 spawn failed for PR #{pr_num} \
-                                     — R1 approval stored, Phase 5 will retry"
-                                ));
-                            }
-                            let r = reviewers.remove(ri);
-                            teardown_reviewer(
-                                config,
-                                wt_mgr,
-                                name_pool,
-                                r,
-                                if r2_added {
-                                    "r2-pending"
-                                } else {
-                                    "r2-spawn-failed"
-                                },
-                            )
-                            .await;
-                            if !consume_mailbox_row(&db_path, *id).await {
-                                break;
-                            }
-                            continue;
-                        } else {
-                            log(&format!(
-                                "R2 GATE: PR #{pr_num} — could not resolve branch for R2 \
+                                    "R2 GATE: PR #{pr_num} — could not resolve branch for R2 \
                                  counterpart, R1 approval stored, Phase 5 will retry"
-                            ));
-                            let r = reviewers.remove(ri);
-                            teardown_reviewer(config, wt_mgr, name_pool, r, "r2-no-branch").await;
-                            if !consume_mailbox_row(&db_path, *id).await {
-                                break;
+                                ));
+                                let r = reviewers.remove(ri);
+                                teardown_reviewer(config, wt_mgr, name_pool, r, "r2-no-branch")
+                                    .await;
+                                if !consume_mailbox_row(&db_path, *id).await {
+                                    break;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
 
@@ -2262,44 +2479,48 @@ async fn tick(
                     // Stale-SHA gate: if the reviewer recorded a head SHA at
                     // spawn time, verify the PR head hasn't moved. A stale
                     // approval cannot authorize a changed diff.
-                    if let Some(ref expected_sha) = reviewers[ri].reviewed_head_sha {
-                        let current_sha = {
-                            let repo = config.repo_dir.clone();
-                            let executor = Arc::clone(&config.merge_executor);
-                            tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
-                                .await
-                                .ok()
-                                .flatten()
-                        };
-                        if let Some(ref current) = current_sha {
-                            if current != expected_sha {
-                                log(&format!(
-                                    "STALE SHA: reviewer {} approved head {} but current \
-                                     head is {} — firing MergeFailed for rework",
-                                    reviewers[ri].agent_name, expected_sha, current
-                                ));
-                                fire_event(
-                                    &db_path,
-                                    "system",
-                                    reviewer_task_id,
-                                    &Event::MergeFailed {
-                                        reason: format!(
-                                            "PR #{pr_num} head moved since review \
-                                             (approved {}, now {})",
-                                            &expected_sha[..8.min(expected_sha.len())],
-                                            &current[..8.min(current.len())]
-                                        ),
-                                    },
-                                )
-                                .await;
-                                let r = reviewers.remove(ri);
-                                teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
-                                if !consume_mailbox_row(&db_path, *id).await {
-                                    break;
-                                }
-                                continue;
-                            }
+                    let current_sha = {
+                        let repo = config.repo_dir.clone();
+                        let executor = Arc::clone(&config.merge_executor);
+                        tokio::task::spawn_blocking(move || executor.head_sha(pr_num, &repo))
+                            .await
+                            .ok()
+                            .flatten()
+                    };
+                    if !review_head_matches_launch(
+                        reviewers[ri].reviewed_head_sha.as_deref(),
+                        current_sha.as_deref(),
+                    ) {
+                        let expected = reviewers[ri]
+                            .reviewed_head_sha
+                            .as_deref()
+                            .unwrap_or("<missing>");
+                        let current = current_sha.as_deref().unwrap_or("<unavailable>");
+                        log(&format!(
+                            "STALE SHA: reviewer {} approved head {} but current \
+                             head is {} — firing MergeFailed for rework",
+                            reviewers[ri].agent_name, expected, current
+                        ));
+                        fire_event(
+                            &db_path,
+                            "system",
+                            reviewer_task_id,
+                            &Event::MergeFailed {
+                                reason: format!(
+                                    "PR #{pr_num} head moved since review \
+                                     (approved {}, now {})",
+                                    &expected[..8.min(expected.len())],
+                                    &current[..8.min(current.len())]
+                                ),
+                            },
+                        )
+                        .await;
+                        let r = reviewers.remove(ri);
+                        teardown_reviewer(config, wt_mgr, name_pool, r, "stale-sha").await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
                         }
+                        continue;
                     }
 
                     // Pre-merge mergeability check: if the PR is conflicting
@@ -4208,17 +4429,15 @@ async fn tick(
                                                 std::time::Instant::now();
                                             // Update reviewed head SHA for stale
                                             // approval detection on re-review.
-                                            if reviewers[ri].r2_origin {
-                                                let repo = config.repo_dir.clone();
-                                                let executor = Arc::clone(&config.merge_executor);
-                                                reviewers[ri].reviewed_head_sha =
-                                                    tokio::task::spawn_blocking(move || {
-                                                        executor.head_sha(pr, &repo)
-                                                    })
-                                                    .await
-                                                    .ok()
-                                                    .flatten();
-                                            }
+                                            let repo = config.repo_dir.clone();
+                                            let executor = Arc::clone(&config.merge_executor);
+                                            reviewers[ri].reviewed_head_sha =
+                                                tokio::task::spawn_blocking(move || {
+                                                    executor.head_sha(pr, &repo)
+                                                })
+                                                .await
+                                                .ok()
+                                                .flatten();
                                         }
                                     }
                                 }
@@ -7254,11 +7473,7 @@ async fn provision_reviewer(
             }
 
             // Capture head SHA at spawn time for stale-approval detection.
-            let spawn_head_sha = if role.is_r2() {
-                Some(head_sha.to_string()).filter(|s| !s.is_empty())
-            } else {
-                None
-            };
+            let spawn_head_sha = review_launch_head_sha(role, head_sha);
 
             let now_instant = std::time::Instant::now();
             reviewers.push(SlotState {
@@ -10514,6 +10729,239 @@ mod tests {
         .unwrap();
         let role = next_needed_role(&conn, 42, "abc123").unwrap();
         assert_eq!(role, Some("r2"));
+    }
+
+    #[test]
+    fn next_needed_role_accepts_a_durably_recorded_r2_skip_for_the_same_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "sampled task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 42, "abc123", false)
+            .unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "abc123".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next_needed_role(&conn, 42, "abc123").unwrap(), None);
+        assert_eq!(
+            next_needed_role(&conn, 42, "new-head").unwrap(),
+            Some("r1"),
+            "a new head must be reviewed independently"
+        );
+    }
+
+    #[test]
+    fn r2_sampling_retains_an_earlier_head_decision_after_rework() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "sampled task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 42, "head-a", true)
+            .unwrap();
+        let policy = R2SamplingPolicy {
+            enabled: true,
+            target_per_stratum: 0,
+            steady_state_p: 0.0,
+            default_model: "model".into(),
+            default_effort: "high".into(),
+        };
+
+        assert!(!decide_r2_requirement(&mut conn, task_id, 42, "head-b", &policy,).unwrap());
+        assert!(
+            r2_required_for_head(&conn, task_id, 42, "head-a"),
+            "a newer skipped head must not overwrite a prior required R2"
+        );
+        assert!(
+            !r2_required_for_head(&conn, task_id, 42, "head-b"),
+            "the rework head keeps its independently sampled skip"
+        );
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head-a".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            next_needed_role(&conn, 42, "head-a").unwrap(),
+            Some("r2"),
+            "force-pushing the prior required head back must still require R2"
+        );
+    }
+
+    #[test]
+    fn task_refs_cannot_forge_an_r2_sampling_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "forged sampling metadata",
+            None,
+            0,
+            None,
+            Some(r#"{"r2_sampling":{"42":{"forged-head":false}}}"#),
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "rev1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "forged-head".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            next_needed_role(&conn, 42, "forged-head").unwrap(),
+            Some("r2"),
+            "agent-writable task refs must not authorize a sampled R2 skip"
+        );
+    }
+
+    #[test]
+    fn launch_sha_is_captured_for_r1_and_r2_reviews() {
+        for role in [
+            ReviewRole::R1,
+            ReviewRole::R2 {
+                r1_reviewer: "r1".into(),
+                r1_run_id: Some(1),
+            },
+        ] {
+            assert_eq!(
+                review_launch_head_sha(&role, "reviewed-head"),
+                Some("reviewed-head".into()),
+                "{} must carry its launch SHA into the stale-head gate",
+                role.as_str(),
+            );
+        }
+        assert_eq!(review_launch_head_sha(&ReviewRole::R1, ""), None);
+        assert!(review_head_matches_launch(Some("head-a"), Some("head-a")));
+        assert!(
+            !review_head_matches_launch(Some("head-a"), Some("head-b")),
+            "a force-pushed head must not be accepted by the reviewer launched for head-a"
+        );
+        assert!(
+            !review_head_matches_launch(Some("head-a"), None),
+            "an unavailable current head must fail closed"
+        );
+    }
+
+    #[test]
+    fn sampled_r1_force_push_leaves_new_head_without_approval_or_r2_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "sampled task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let launch_head = "reviewed-head";
+        let force_pushed_head = "unreviewed-head";
+        assert!(
+            !review_head_matches_launch(Some(launch_head), Some(force_pushed_head)),
+            "the verdict path must stop before decide_r2_requirement"
+        );
+
+        // The production path only calls `decide_r2_requirement` after the
+        // launch-SHA guard above. Prove the rejected head has neither durable
+        // approval nor a sampled skip, so normal reconciliation asks for R1.
+        assert_eq!(
+            quorum_core::review_audits::r2_requirement(&conn, task_id, 42, force_pushed_head)
+                .unwrap(),
+            None
+        );
+        assert!(quorum_core::approvals::get(&conn, 42, "r1")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            next_needed_role(&conn, 42, force_pushed_head).unwrap(),
+            Some("r1"),
+            "the force-pushed head must receive a fresh R1, not park in review"
+        );
+    }
+
+    #[test]
+    fn r2_sampling_seed_is_stable_per_pr_head_and_independent_per_new_head() {
+        let counts = HashMap::new();
+        let stratum = ("model".into(), "high".into(), "3".into());
+        let first = quorum_core::review_audits::should_sample(
+            &counts,
+            &stratum,
+            0,
+            0.30,
+            r2_sampling_seed(224, "head-a"),
+        );
+        let repeated = quorum_core::review_audits::should_sample(
+            &counts,
+            &stratum,
+            0,
+            0.30,
+            r2_sampling_seed(224, "head-a"),
+        );
+        assert_eq!(first, repeated, "same PR head must keep its decision");
+
+        let new_head_seed = r2_sampling_seed(224, "head-b");
+        assert_ne!(r2_sampling_seed(224, "head-a"), new_head_seed);
+        let _independent =
+            quorum_core::review_audits::should_sample(&counts, &stratum, 0, 0.30, new_head_seed);
     }
 
     #[test]

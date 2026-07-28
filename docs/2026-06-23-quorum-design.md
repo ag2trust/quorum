@@ -627,11 +627,30 @@ This preserves #206 verdict attestation, reviewer separation, the rework cap, st
 reviewer, the stale-SHA gate, and R1/R2 lifecycle. It shifts only who writes to the PR:
 agents, directly.
 
-### R2 pre-merge review gate (#159 — mandatory dual review)
+### R2 pre-merge review gate (#159, configurable sampling)
 
-Every PR requires both R1 and R2 approval for the same head SHA before merge.
-R2 is mandatory, not sampled — there is no `r2_enabled` / `r2_steady_state_p`
-config (legacy keys accepted but ignored). When R1 approves:
+By default, every PR requires both R1 and R2 approval for the same head SHA
+before merge. R2 sampling is opt-in: absent config resolves to
+`r2_enabled = true`, `r2_target_per_stratum = 0`, and
+`r2_steady_state_p = 1.0`, which preserves mandatory R2 exactly. Operators may
+lower `r2_steady_state_p` (for example, to 0.30) and optionally set a per-stratum
+coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
+error; values are never clamped. `r2_enabled = false` disables sampling, not the
+R2 safety gate, and therefore also leaves R2 mandatory.
+
+When R1 approves, Quorum records a sampling decision in a daemon-owned table,
+keyed by both PR number and head SHA; it is not task refs because task refs are
+agent-writable metadata and cannot authorize a merge-gate bypass. Later rework
+heads append rather than overwrite earlier decisions. The seed is derived only
+from those stable values; the persisted decision prevents a restart, advancing
+coverage count, or force-push back to a prior head from changing that head's
+review requirement. Missing, unreadable, or task-mismatched persisted state
+fails closed to mandatory R2. R1 and R2 both bind their approval to the head
+captured when their review starts. A force-push during an R1-only sampled
+review discards that stale verdict before it can write an approval or sampling
+decision; reconciliation provisions a fresh R1 for the new head rather than
+parking or merging an unreviewed diff. When sampling skips R2, the normal R1
+approval path merges; when it requires R2, the following dual-review flow applies:
 
 1. **Durable R1 approval** — the daemon records R1's approval in the `approvals`
    table keyed by `(pr_number, review_role='r1')` with `head_sha` and `blocking=0`.
@@ -647,8 +666,10 @@ config (legacy keys accepted but ignored). When R1 approves:
      matching non-empty head SHAs and zero blocking findings).
    - Changes → fire VerdictChanges → invalidate both R1 and R2 approvals →
      rework → author pushes → ReworkPushed resumes R2 (not R1).
-5. **Stale-SHA gate** — head SHA is recorded at R2 spawn and refreshed on re-review.
-   Before merge, the daemon requires matching head SHAs from both approvals.
+5. **Stale-SHA gate** — head SHA is recorded at each R1 and R2 spawn and refreshed
+   on re-review. Before durable approval or sampling, the daemon rejects a verdict
+   whose launch SHA no longer matches the live PR; before merge it checks again to
+   cover a push during merge processing.
 6. **Rework routing** — after R2-requested rework, `ReworkPushed` yields
    `ResumeReviewer` (not `SpawnReviewer`). The `r2_origin` flag on the slot
    ensures rework routes back to R2.

@@ -3,7 +3,8 @@
 //! Stratified sampling picks which PRs get an R2 pass; the audit row is a
 //! durable stratum-coverage record.
 
-use crate::error::Result;
+use crate::db::begin_immediate;
+use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -77,6 +78,68 @@ pub fn stratum_counts(conn: &Connection) -> Result<HashMap<Stratum, i64>> {
         map.insert((model, effort, cx), count);
     }
     Ok(map)
+}
+
+/// Return the daemon-owned R2 requirement for one PR head.  Task refs are
+/// deliberately not consulted: agents can update those refs, but cannot
+/// authorize bypassing the pre-merge review gate.
+pub fn r2_requirement(
+    conn: &Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<Option<bool>> {
+    let row = conn.query_row(
+        "SELECT task_id, required FROM r2_sampling_decisions \
+         WHERE pr_number = ?1 AND head_sha = ?2",
+        params![pr_number, head_sha],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    );
+    match row {
+        Ok((recorded_task_id, required)) if recorded_task_id == task_id => Ok(Some(required != 0)),
+        Ok((_recorded_task_id, _required)) => Err(QuorumError::Io(format!(
+            "R2 sampling decision for PR #{pr_number} head {head_sha} belongs to another task"
+        ))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Persist an immutable R2 requirement for one PR head, returning the stored
+/// result. Concurrent callers converge on the first durable value; a decision
+/// associated with a different task is an error so callers fail closed.
+pub fn record_r2_requirement(
+    conn: &mut Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+    required: bool,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "INSERT INTO r2_sampling_decisions (pr_number, head_sha, task_id, required, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(pr_number, head_sha) DO NOTHING",
+        params![
+            pr_number,
+            head_sha,
+            task_id,
+            if required { 1 } else { 0 },
+            crate::clock::now(),
+        ],
+    )?;
+    let (recorded_task_id, stored): (i64, i64) = tx.query_row(
+        "SELECT task_id, required FROM r2_sampling_decisions \
+         WHERE pr_number = ?1 AND head_sha = ?2",
+        params![pr_number, head_sha],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if recorded_task_id != task_id {
+        return Err(QuorumError::Io(format!(
+            "R2 sampling decision for PR #{pr_number} head {head_sha} belongs to another task"
+        )));
+    }
+    tx.commit()?;
+    Ok(stored != 0)
 }
 
 /// Decide whether to spawn R2 for a given stratum, given current counts.
@@ -232,6 +295,22 @@ mod tests {
         assert_eq!(
             counts.get(&("opus".into(), "high".into(), "complex".into())),
             Some(&1)
+        );
+    }
+
+    #[test]
+    fn r2_sampling_requirement_is_daemon_owned_and_immutable_per_pr_head() {
+        let (_d, mut c) = open_tmp();
+        assert_eq!(r2_requirement(&c, 7, 42, "head-a").unwrap(), None);
+        assert!(!record_r2_requirement(&mut c, 7, 42, "head-a", false).unwrap());
+        assert_eq!(r2_requirement(&c, 7, 42, "head-a").unwrap(), Some(false));
+        assert!(
+            !record_r2_requirement(&mut c, 7, 42, "head-a", true).unwrap(),
+            "the first durable decision wins for this PR head"
+        );
+        assert!(
+            r2_requirement(&c, 8, 42, "head-a").is_err(),
+            "a decision cannot be reused by a different task"
         );
     }
 
