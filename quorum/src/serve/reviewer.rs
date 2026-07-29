@@ -47,6 +47,22 @@ Before submitting, publish one complete PR review summary for this reviewed SHA,
 comments where needed, that reports the complete blocker and advisory set discovered. \
 `--blocking` must equal the complete BLOCKING count for that SHA.\n";
 
+/// Verification requirements belong to the reviewed repository, not Quorum's
+/// own development workflow. This wording is shared by every reviewer prompt
+/// so a repository without a preflight script or CI is not held to one.
+const REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT: &str = "\
+Do NOT run tests, builds, formatters, or linters locally. The daemon owns the applicable \
+CI gate for the current PR head, including repositories with no configured CI. Inspect the \
+PR's verification evidence against the target repository's checked-in instructions and \
+applicable CI/delivery contract without rerunning it locally. Do not invent or demand \
+scripts, commands, headings, evidence tokens, or checks that repository does not require.\n";
+
+const REPOSITORY_RELATIVE_VERIFICATION_CONTRACT: &str = "\
+- Check verification evidence against the target repository's checked-in instructions and \
+applicable CI/delivery contract. Treat missing, red, or incomplete evidence as BLOCKING only \
+when that repository requires it; do not invent or demand unavailable scripts, commands, \
+headings, evidence tokens, or checks.\n";
+
 pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
     format!(
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
@@ -74,9 +90,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_requirement}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -90,8 +104,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
+         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -114,6 +127,8 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
+        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
     )
 }
 
@@ -204,9 +219,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_requirement}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -220,8 +233,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
+         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -244,6 +256,8 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
+        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
     )
 }
 
@@ -300,9 +314,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_requirement}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -316,8 +328,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
+         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -341,6 +352,8 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
+        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
     )
 }
 
@@ -394,9 +407,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_requirement}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -410,8 +421,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
+         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -435,6 +445,8 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
+        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
     )
 }
 
@@ -537,12 +549,10 @@ pub fn build_rereview_turn(
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_requirement}\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING or advisory.\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` is BLOCKING.\n\
+         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -557,6 +567,8 @@ pub fn build_rereview_turn(
         name = reviewer_name,
         pr = pr,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
+        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
     ))
 }
 
@@ -583,7 +595,8 @@ pub fn build_rework_prompt(
          on the PR, not in this turn.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and pushing:\n\
-         1. Run preflight: ./preflight.sh\n\
+         1. Run the verification prescribed by the target repository's checked-in instructions \
+         and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
          2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\
          3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
@@ -641,7 +654,8 @@ pub fn build_remediation_turn(
          it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and pushing:\n\
-         1. Run preflight: ./preflight.sh\n\
+         1. Run the verification prescribed by the target repository's checked-in instructions \
+         and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
          2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\
          3. Post progress: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
@@ -705,8 +719,8 @@ mod tests {
             "prompt must warn that author/deliverer comments are not review input"
         );
         assert!(
-            prompt.contains("PREFLIGHT: PASS"),
-            "prompt must flag missing preflight as BLOCKING"
+            prompt.contains("target repository's checked-in instructions"),
+            "prompt must use repository-relative verification requirements"
         );
         assert!(
             prompt.contains("Never review your own delivery"),
@@ -807,7 +821,7 @@ mod tests {
                 "{name} must forbid local verification runs"
             );
             assert!(
-                prompt.contains("daemon gates reviewer provisioning on green CI"),
+                prompt.contains("daemon owns the applicable CI gate"),
                 "{name} must describe the daemon-owned CI gate"
             );
             assert!(
@@ -815,9 +829,19 @@ mod tests {
                 "{name} must not delegate CI polling to the reviewer"
             );
             assert!(
-                prompt.contains("Inspect the PR body's `## Verification` evidence")
-                    && prompt.contains("`PREFLIGHT: PASS`"),
-                "{name} must retain document-evidence review"
+                prompt.contains("target repository's checked-in instructions")
+                    && prompt.contains("applicable CI/delivery contract"),
+                "{name} must retain repository-relative verification review"
+            );
+            assert!(
+                prompt.contains("Treat missing, red, or incomplete evidence as BLOCKING only"),
+                "{name} may block on verification only when the repository requires it"
+            );
+            assert!(
+                prompt.contains("do not invent or demand")
+                    && !prompt.contains("PREFLIGHT: PASS")
+                    && !prompt.contains("./preflight.sh"),
+                "{name} must not invent Quorum-specific verification requirements"
             );
         }
     }
@@ -956,8 +980,29 @@ mod tests {
             "rework template must warn against manual task-done"
         );
         assert!(
-            turn.contains("preflight"),
-            "rework template must instruct agent to run preflight"
+            turn.contains("verification prescribed by the target repository")
+                && turn.contains("do not invent unavailable scripts or checks"),
+            "rework template must use repository-relative verification"
+        );
+        assert!(!turn.contains("./preflight.sh"));
+    }
+
+    #[test]
+    fn remediation_turn_uses_repository_relative_verification() {
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        assert!(
+            turn.contains("verification prescribed by the target repository")
+                && turn.contains("checked-in instructions")
+                && turn.contains("applicable CI/delivery contract"),
+            "remediation template must defer verification to the target repository"
+        );
+        assert!(
+            turn.contains("do not invent unavailable scripts or checks"),
+            "remediation template must forbid invented verification"
+        );
+        assert!(
+            !turn.contains("PREFLIGHT: PASS") && !turn.contains("./preflight.sh"),
+            "remediation template must not require Quorum-specific preflight"
         );
     }
 
@@ -1021,8 +1066,8 @@ mod tests {
             "rereview template must require branch advancement before re-approval"
         );
         assert!(
-            turn.contains("PREFLIGHT: PASS"),
-            "rereview template must flag missing preflight as BLOCKING"
+            turn.contains("target repository's checked-in instructions"),
+            "rereview template must use repository-relative verification"
         );
         // Task #124: PR-source-of-truth guidance also carries into rereview,
         // because the second pass must resolve the prior review thread on the PR.
@@ -1215,7 +1260,7 @@ mod tests {
         assert!(prompt.contains("--blocking 0"));
         assert!(prompt.contains("BLOCKING"));
         assert!(prompt.contains("builtin `review` skill"));
-        assert!(prompt.contains("PREFLIGHT: PASS"));
+        assert!(prompt.contains("target repository's checked-in instructions"));
         assert!(prompt.contains("Do NOT merge the PR yourself"));
         assert!(
             prompt.contains("Do NOT run `gh pr review --approve`"),
@@ -1426,7 +1471,7 @@ mod tests {
         assert!(prompt.contains("PR #42"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
-        assert!(prompt.contains("PREFLIGHT: PASS"));
+        assert!(prompt.contains("target repository's checked-in instructions"));
         assert!(prompt.contains("Do NOT merge the PR yourself"));
     }
 
@@ -1454,7 +1499,7 @@ mod tests {
         assert!(prompt.contains("R1 reviewer R1 already approved"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
-        assert!(prompt.contains("PREFLIGHT: PASS"));
+        assert!(prompt.contains("target repository's checked-in instructions"));
     }
 
     #[test]
