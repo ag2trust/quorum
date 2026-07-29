@@ -265,6 +265,15 @@ pub enum Command {
         #[arg(long)]
         agents: bool,
     },
+    /// Serve the read-only local dashboard (binds to 127.0.0.1 by default).
+    Web {
+        /// TCP port for the dashboard.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Bind address. Use 0.0.0.0 only when remote access is intentional.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
     /// EXPERIMENTAL (issue #101) — register a Claude session UUID → agent name
