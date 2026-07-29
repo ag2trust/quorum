@@ -1235,10 +1235,11 @@ fn merge_conflict_absent_worker_spawns_remediation() {
     handle.sigkill();
 }
 
-/// Genuine review-only tasks remain parked for their external author and
-/// never acquire an implementation lease or remediation worker.
+/// Review-only conflicts are remediated on their persisted PR target just
+/// like implementation conflicts; an external author is not required to
+/// resurrect a task after both reviewers have approved it.
 #[test]
-fn merge_conflict_review_only_parks_without_remediation() {
+fn merge_conflict_review_only_spawns_remediation_on_persisted_target() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -1316,29 +1317,39 @@ fn merge_conflict_review_only_parks_without_remediation() {
     );
     complete_r2_review(home.path(), &mut handle, &pr.to_string());
     assert!(
-        handle.wait_for("parking, not failing", 20),
+        handle.wait_for("spawning remediation worker", 20),
         "{:?}",
         handle.lines
     );
+    let remediation_name = handle
+        .extract_agent_name("spawning remediation worker ")
+        .expect("remediation worker name");
 
     let task = get_task(home.path(), task_id);
-    assert_eq!(task.status, "in-review");
-    assert_eq!(task.rework_round, 0);
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.rework_round, 1);
+    assert!(
+        handle.wait_for(&format!("worker {remediation_name} result"), 15),
+        "remediation worker did not receive a turn: {:?}",
+        handle.lines
+    );
     assert!(
         get_agent_runs(home.path(), task_id)
             .iter()
-            .all(|run| run.role != "worker"),
-        "review-only conflict must not allocate a worker"
+            .filter(|run| run.role == "worker")
+            .count()
+            == 1,
+        "review-only conflict must allocate exactly one remediation worker"
     );
-    assert!(
-        !handle
-            .lines
-            .iter()
-            .any(|line| line.contains("spawning remediation worker")),
-        "review-only conflict must not spawn remediation: {:?}",
-        handle.lines
+    let (holder, _) = active_claim(home.path(), task_id).expect("remediation lease");
+    assert_eq!(holder, remediation_name);
+    let (branch, journal_pr) =
+        worker_journal_target(home.path(), task_id).expect("remediation journal row");
+    assert_eq!(
+        branch,
+        format!("daemon/{}-t{}", author.to_lowercase(), task_id)
     );
-
+    assert_eq!(journal_pr, Some(pr), "must retain the authoritative PR");
     handle.sigkill();
 }
 

@@ -156,7 +156,7 @@ impl fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
-pub const REWORK_CAP: u32 = 5;
+pub const REWORK_CAP: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match
@@ -1184,6 +1184,25 @@ mod tests {
     #[test]
     fn merging_conflict_below_cap() {
         let t = view(Status::Merging);
+        assert_ok(
+            &t,
+            &Event::MergeConflict,
+            Status::Rework,
+            &[
+                Effect::ReleaseLease,
+                Effect::IncrementReworkRound,
+                Effect::ResumeWorker,
+            ],
+        );
+    }
+
+    #[test]
+    fn merging_conflict_review_only_uses_same_remediation_transition() {
+        // The daemon provisions a remediation worker from the persisted PR
+        // target; task kind must not strand an approved review-only PR in
+        // merge-wait when GitHub reports DIRTY.
+        let mut t = view(Status::Merging);
+        t.review_only = true;
         assert_ok(
             &t,
             &Event::MergeConflict,
