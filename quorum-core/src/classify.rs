@@ -46,6 +46,11 @@ const VALID_KINDS: &[&str] = &[
     "kind:chore",
 ];
 
+/// Classification and its durable telemetry attribution share this bounded
+/// batch. The classifier retries an unparseable response, so this bound must
+/// hold before a provider is spawned rather than only at storage time.
+pub const CLASSIFIER_BATCH_LIMIT: i64 = crate::token_usage::TASK_ATTRIBUTION_BATCH_LIMIT as i64;
+
 /// Query open/working/terminal tasks that have no `cx_est` in refs.
 /// Terminal tasks are included so the classifier catches them within one tick
 /// of reaching done/failed/cancelled (terminal fallback).
@@ -54,10 +59,12 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
         "SELECT id, title, body FROM tasks
          WHERE status IN ('open', 'working', 'in-review', 'rework', 'merging',
                           'done', 'failed', 'cancelled')
-         AND (refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL)",
+         AND (refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL)
+         ORDER BY id
+         LIMIT ?1",
     )?;
     let tasks = stmt
-        .query_map([], |row| {
+        .query_map([CLASSIFIER_BATCH_LIMIT], |row| {
             Ok(TaskForClassification {
                 id: row.get(0)?,
                 title: row.get(1)?,
@@ -555,6 +562,19 @@ mod tests {
             .notes;
         assert_eq!(notes.len(), 1);
         assert!(notes[0].body.contains("oversized"));
+    }
+
+    #[test]
+    fn unclassified_tasks_returns_a_bounded_stable_batch() {
+        let (_dir, mut conn) = open_tmp();
+        for seq in 1..=(CLASSIFIER_BATCH_LIMIT + 1) {
+            create_task(&mut conn, &format!("Task {seq}"), seq);
+        }
+
+        let tasks = unclassified_tasks(&conn).unwrap();
+        assert_eq!(tasks.len(), CLASSIFIER_BATCH_LIMIT as usize);
+        assert_eq!(tasks.first().unwrap().id, 1);
+        assert_eq!(tasks.last().unwrap().id, CLASSIFIER_BATCH_LIMIT);
     }
 
     #[test]

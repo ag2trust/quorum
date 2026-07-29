@@ -7444,7 +7444,7 @@ async fn drain_events(
                     persist_codex_thread_id(db_path, slot.task_id, thread_id, ref_key).await;
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
-                    let turn_tokens = usage.map_or(0, |u| u.total_tokens() as i64);
+                    let turn_tokens = usage.map_or(0, |u| u.live_total_tokens() as i64);
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }
@@ -7505,7 +7505,7 @@ async fn drain_events(
                     usage,
                     cost_usd,
                 } => {
-                    let turn_tokens = usage.map_or(0, |u| u.total_tokens() as i64);
+                    let turn_tokens = usage.map_or(0, |u| u.live_total_tokens() as i64);
                     if let Some(usage) = usage {
                         slot.token_usage.saturating_add_assign(*usage);
                     }

@@ -4,6 +4,10 @@ use crate::error::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+/// Attributions are inserted while holding SQLite's global writer lock.
+/// Keep every durable telemetry mutation bounded, including classifier retries.
+pub const TASK_ATTRIBUTION_BATCH_LIMIT: usize = 32;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct TokenUsage {
     pub uncached_input_tokens: i64,
@@ -40,6 +44,11 @@ pub fn record(
     usage: TokenUsage,
     recorded_at: i64,
 ) -> Result<i64> {
+    if task_ids.len() > TASK_ATTRIBUTION_BATCH_LIMIT {
+        return Err(crate::error::QuorumError::Usage(format!(
+            "token usage attribution batch exceeds {TASK_ATTRIBUTION_BATCH_LIMIT} tasks"
+        )));
+    }
     let tx = crate::db::begin_immediate(conn)?;
     // Token telemetry is also written by daemon-internal classifier and
     // collector turns, which do not pass through another command mutation.
@@ -235,6 +244,35 @@ mod tests {
             .unwrap()
             .iter()
             .any(|run| run.purpose == "classifier"));
+    }
+
+    #[test]
+    fn record_rejects_unbounded_task_attribution_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("q.db")).unwrap();
+        let task_ids: Vec<i64> = (1..=(TASK_ATTRIBUTION_BATCH_LIMIT as i64 + 1)).collect();
+
+        let error = record(
+            &mut conn,
+            None,
+            "classifier",
+            &task_ids,
+            None,
+            "claude",
+            "haiku",
+            "low",
+            TokenUsage::default(),
+            1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, crate::error::QuorumError::Usage(_)));
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_usage_runs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(runs, 0);
     }
 
     #[test]

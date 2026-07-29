@@ -310,10 +310,11 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    pub fn total_tokens(self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cached_input_tokens)
-            .saturating_add(self.output_tokens)
+    /// Legacy live/cap measurement: uncached input plus output. Cache activity
+    /// is retained in the durable breakdown but must not change configured
+    /// token-limit behavior or the existing live gauge.
+    pub fn live_total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 
     pub fn saturating_add_assign(&mut self, other: Self) {
@@ -597,6 +598,21 @@ mod tests {
             }
             other => panic!("expected one completed event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_total_excludes_durable_cache_breakdown() {
+        let usage = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 900,
+            cache_write_input_tokens: 50,
+            output_tokens: 25,
+            reasoning_tokens: 10,
+        };
+
+        assert_eq!(usage.live_total_tokens(), 125);
+        assert_eq!(usage.cached_input_tokens, 900);
+        assert_eq!(usage.cache_write_input_tokens, 50);
     }
 
     #[test]
