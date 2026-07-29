@@ -708,7 +708,11 @@ are BLOCKING unless evidence disproves the failure.
 
 Every reviewer provisioning attempt, initial or after rework, is gated by the daemon
 against the current PR head SHA. Reviewer agents do not poll CI and do not run local
-test/build/fmt/lint commands; they inspect code and the PR body's verification evidence.
+test/build/fmt/lint commands; they inspect code and verification evidence against the
+target repository's checked-in instructions and applicable CI/delivery contract. Shared
+reviewer prompts must not invent or require scripts, commands, headings, evidence tokens,
+or checks absent from that repository; missing or failed verification evidence is BLOCKING
+only when the repository requires it.
 
 - `Ready` plus all configured `required_jobs` at `SUCCESS` permits provisioning.
 - `Pending`, `TimedOut`, and pending required jobs keep the task `in-review`. The daemon
