@@ -13,46 +13,68 @@
     return ellipsize(stripShellWrapper(command).replace(/\s+/g, ' ').trim());
   }
 
-  function normalizeEvent(event) {
+  function commandEvent(name, input) {
+    return {kind: 'command', title: `${name || 'tool'} ${ellipsize(JSON.stringify(input || {}), 90)}`, body: {command: name || 'tool', output: ''}, exit_code: null};
+  }
+
+  function usageEvent(usage, title = 'Turn completed') {
+    const input = Number(usage && usage.input_tokens || 0), cached = Number(usage && usage.cached_input_tokens || 0), output = Number(usage && usage.output_tokens || 0), reasoning = Number(usage && usage.reasoning_output_tokens || 0);
+    return {kind: 'meta', title: `${title} · ${input + output + reasoning} tokens${input ? ` · ${Math.round(cached * 100 / input)}% cached` : ''}`, body: '', exit_code: null};
+  }
+
+  function normalizeEvents(event) {
     const item = event && event.item;
     if (event && event.type === 'item.completed' && item && item.type === 'agent_message') {
-      return {kind: 'message', title: 'Agent message', body: String(item.text || ''), exit_code: null};
+      return [{kind: 'message', title: 'Agent message', body: String(item.text || ''), exit_code: null}];
     }
     if (event && event.type === 'item.completed' && item && item.type === 'command_execution') {
-      return {kind: 'command', title: commandSummary(item.command), body: {command: String(item.command || ''), output: String(item.aggregated_output || '')}, exit_code: item.exit_code ?? null};
+      return [{kind: 'command', title: commandSummary(item.command), body: {command: String(item.command || ''), output: String(item.aggregated_output || '')}, exit_code: item.exit_code ?? null}];
     }
     if (event && event.type === 'turn.completed') {
-      const usage = event.usage || {}, input = Number(usage.input_tokens || 0), cached = Number(usage.cached_input_tokens || 0), output = Number(usage.output_tokens || 0), reasoning = Number(usage.reasoning_output_tokens || 0);
-      return {kind: 'meta', title: `Turn completed · ${input + output + reasoning} tokens${input ? ` · ${Math.round(cached * 100 / input)}% cached` : ''}`, body: '', exit_code: null};
+      return [usageEvent(event.usage)];
     }
     if (event && (event.type === 'provider.stderr' || event.type === 'thread.started')) {
-      return {kind: 'meta', title: event.type, body: String(event.text || event.thread_id || ''), exit_code: null};
+      return [{kind: 'meta', title: event.type, body: String(event.text || event.thread_id || ''), exit_code: null}];
     }
     if (event && event.type === 'assistant') {
       const content = event.message && event.message.content;
       if (typeof content === 'string') {
-        return {kind: 'message', title: 'Assistant message', body: content, exit_code: null};
+        return [{kind: 'message', title: 'Assistant message', body: content, exit_code: null}];
       }
       const blocks = Array.isArray(content) ? content : [];
-      const text = blocks.filter(part => part.type === 'text').map(part => part.text || '').join('\n');
-      const tool = blocks.find(part => part.type === 'tool_use');
-      if (tool) return {kind: 'command', title: `${tool.name || 'tool'} ${ellipsize(JSON.stringify(tool.input || {}), 90)}`, body: {command: tool.name || 'tool', output: ''}, exit_code: null};
-      if (text) return {kind: 'message', title: 'Assistant message', body: text, exit_code: null};
+      if (blocks.length) return blocks.map(part => {
+        if (part.type === 'text') return {kind: 'message', title: 'Assistant message', body: String(part.text || ''), exit_code: null};
+        if (part.type === 'tool_use') return commandEvent(part.name, part.input);
+        return {kind: 'unknown', title: `Unrecognized assistant block: ${part.type || 'unknown'}`, body: '', exit_code: null};
+      });
+    }
+    if (event && event.type === 'tool_use') {
+      return [commandEvent(event.name, event.input)];
+    }
+    if (event && event.type === 'result') {
+      const result = typeof event.result === 'string' ? event.result : JSON.stringify(event.result || '');
+      const rows = [{kind: 'message', title: event.is_error ? 'Result error' : 'Result', body: result, exit_code: null}];
+      if (event.usage) rows.push(usageEvent(event.usage, 'Result completed'));
+      return rows;
     }
     if (event && event.type === 'user') {
       const content = event.message && event.message.content;
       const result = Array.isArray(content) ? content.find(part => part.type === 'tool_result') : content && content.type === 'tool_result' ? content : null;
-      if (result) return {kind: 'result', title: 'Tool result', body: typeof result.content === 'string' ? result.content : JSON.stringify(result.content || ''), exit_code: null};
+      if (result) return [{kind: 'result', title: 'Tool result', body: typeof result.content === 'string' ? result.content : JSON.stringify(result.content || ''), exit_code: null}];
     }
-    return {kind: 'unknown', title: event && event.type ? `Unrecognized: ${event.type}` : 'Unrecognized event', body: '', exit_code: null};
+    return [{kind: 'unknown', title: event && event.type ? `Unrecognized: ${event.type}` : 'Unrecognized event', body: '', exit_code: null}];
+  }
+
+  function normalizeEvent(event) {
+    return normalizeEvents(event)[0];
   }
 
   function parseEventLine(line) {
-    try { return normalizeEvent(JSON.parse(line)); }
-    catch (_) { return normalizeEvent(null); }
+    try { return normalizeEvents(JSON.parse(line)); }
+    catch (_) { return normalizeEvents(null); }
   }
 
-  globalThis.QuorumWeb = {stripShellWrapper, commandSummary, normalizeEvent, parseEventLine};
+  globalThis.QuorumWeb = {stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine};
   if (typeof document === 'undefined') return;
 
   let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null;
@@ -77,7 +99,7 @@
     renderedChars += row.textContent.length; $('stream').append(row); trimStream();
   }
   function renderRaw() { $('rawStream').textContent = rawText.length > MAX_RENDERED_TAIL_CHARS ? rawText.slice(-MAX_RENDERED_TAIL_CHARS) : rawText; }
-  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); lines.forEach(line => renderEvent(parseEventLine(line))); if (rawMode) renderRaw(); }
+  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); lines.forEach(line => parseEventLine(line).forEach(renderEvent)); if (rawMode) renderRaw(); }
   async function state() { if (document.hidden) return; const s = await fetch('/api/state').then(r => r.json()), counts = Object.fromEntries(s.counts.map(x => [x.status, x.count])); $('tiles').replaceChildren(); ['working', 'open', 'in-review', 'done'].forEach(key => { const tile = document.createElement('span'); tile.className = 'tile'; put(tile, key + '\n' + (counts[key] || 0)); $('tiles').append(tile); }); const tasks = $('tasks'); tasks.replaceChildren(); appendRow(tasks, ['State', 'Task', 'Provider/model', 'PR', 'Age'], true); s.tasks.forEach(x => { const pr = document.createElement('span'); if (x.pr) { const link = document.createElement('a'); link.href = 'https://github.com/ag2trust/quorum/pull/' + x.pr; put(link, '#' + x.pr); pr.append(link); } appendRow(tasks, [x.state, '#' + x.id + ' ' + x.title, (x.provider || 'pending') + ' ' + (x.model || ''), pr, age(x.age_secs)]); }); renderAgents(s.agents, s.now); $('alerts').textContent = JSON.stringify({alerts: s.alerts, errors: s.errors}, null, 2); }
   function renderAgents(agents, now) { const online = agents.filter(agent => agent.online), offline = agents.filter(agent => !agent.online); const render = (table, rows) => { table.replaceChildren(); appendRow(table, ['Agent', 'Task', 'Last seen'], true); rows.forEach(agent => { const seen = document.createElement('span'); put(seen, relativeTime(agent.last_seen, now)); seen.title = timestamp(agent.last_seen); appendRow(table, [agent.name, agent.task_held ? '#' + agent.task_held.id + ' ' + agent.task_held.title : '—', seen]); }); }; render($('agentTable'), online); render($('offlineAgentTable'), offline); $('offlineAgents').classList.toggle('hidden', !offline.length); put($('offlineAgents').querySelector('summary'), `${offline.length} offline`); }
   function duration(meta) { const start = meta.start_time, end = meta.end_time; return start && end ? age(Math.max(0, end - start)) : '—'; }
