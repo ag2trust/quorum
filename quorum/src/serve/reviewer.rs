@@ -47,21 +47,14 @@ Before submitting, publish one complete PR review summary for this reviewed SHA,
 comments where needed, that reports the complete blocker and advisory set discovered. \
 `--blocking` must equal the complete BLOCKING count for that SHA.\n";
 
-/// Verification requirements belong to the reviewed repository, not Quorum's
-/// own development workflow. This wording is shared by every reviewer prompt
-/// so a repository without a preflight script or CI is not held to one.
-const REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT: &str = "\
-Do NOT run tests, builds, formatters, or linters locally. The daemon owns the applicable \
-CI gate for the current PR head, including repositories with no configured CI. Inspect the \
-PR's verification evidence against the target repository's checked-in instructions and \
-applicable CI/delivery contract without rerunning it locally. Do not invent or demand \
-scripts, commands, headings, evidence tokens, or checks that repository does not require.\n";
-
-const REPOSITORY_RELATIVE_VERIFICATION_CONTRACT: &str = "\
-- Check verification evidence against the target repository's checked-in instructions and \
-applicable CI/delivery contract. Treat missing, red, or incomplete evidence as BLOCKING only \
-when that repository requires it; do not invent or demand unavailable scripts, commands, \
-headings, evidence tokens, or checks.\n";
+/// CI and author-side verification are daemon concerns, never review findings.
+/// This wording is shared by every reviewer prompt.
+const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
+Do NOT run tests, builds, formatters, or linters locally. Do not inspect, report, or block \
+on CI status or PR-body verification evidence, formatting, transcripts, links, headings, \
+tokens, or checklists. The daemon alone gates reviewer provisioning and merge on the \
+applicable CI state for the current PR head. Review the implementation and its tests as \
+code, but leave execution evidence and CI enforcement to the daemon.\n";
 
 pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
     format!(
@@ -69,9 +62,8 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
-         and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
-         invariants, and check the PR's verification evidence — then apply the contract \
-         below.\n\n\
+         and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
+         invariants — then apply the contract below.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
          valid outcome — do not manufacture findings to justify requesting changes. \
          Every BLOCKING finding must cite a concrete code path and explain a \
@@ -90,7 +82,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         {verification_requirement}\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -104,7 +96,6 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -127,8 +118,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
-        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -199,8 +189,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
          Follow the repository AGENTS.md instructions for the review methodology. \
          Read the full PR diff and surrounding code (never the diff hunks alone), \
-         check the repo CLAUDE.md/AGENTS.md invariants, and check the PR's \
-         verification evidence. Review at effort level {effort}.\n\n\
+         check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
          valid outcome — do not manufacture findings to justify requesting changes. \
          Every BLOCKING finding must cite a concrete code path and explain a \
@@ -219,7 +208,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         {verification_requirement}\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -233,7 +222,6 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -256,8 +244,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
-        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -281,9 +268,8 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          ## Independent coverage focus\n\n\
          Provide a fresh assessment of whether this PR is safe to merge, then check whether \
          R1 left any material gaps, if any exist. Pay particular attention to failure modes, \
-         invariant violations, concurrency hazards, negative \
-         paths, incomplete verification evidence, and interactions with code outside \
-         the changed hunks.\n\n\
+         invariant violations, concurrency hazards, negative paths, and interactions \
+         with code outside the changed hunks.\n\n\
          ## Independent-first review\n\n\
          Review the full diff and surrounding code BEFORE reading R1's comments or \
          verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
@@ -299,8 +285,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          not blocking.\n\n\
          Follow the repository AGENTS.md instructions for the review methodology. \
          Read the full PR diff and surrounding code (never the diff hunks alone), \
-         check the repo CLAUDE.md/AGENTS.md invariants, and check the PR's \
-         verification evidence. Review at effort level {effort}.\n\n\
+         check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
@@ -315,7 +300,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         {verification_requirement}\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -329,7 +314,6 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -353,8 +337,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
-        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -373,9 +356,8 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          ## Independent coverage focus\n\n\
          Provide a fresh assessment of whether this PR is safe to merge, then check whether \
          R1 left any material gaps, if any exist. Pay particular attention to failure modes, \
-         invariant violations, concurrency hazards, negative \
-         paths, incomplete verification evidence, and interactions with code outside \
-         the changed hunks.\n\n\
+         invariant violations, concurrency hazards, negative paths, and interactions \
+         with code outside the changed hunks.\n\n\
          ## Independent-first review\n\n\
          Review the full diff and surrounding code BEFORE reading R1's comments or \
          verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
@@ -392,9 +374,8 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
-         and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
-         invariants, and check the PR's verification evidence — then apply the contract \
-         below.\n\n\
+         and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
+         invariants — then apply the contract below.\n\n\
          {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
@@ -409,7 +390,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         {verification_requirement}\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -423,7 +404,6 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -447,8 +427,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
-        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -533,8 +512,7 @@ pub fn build_rereview_turn(
          an unchanged diff over prior blocking findings is forbidden.\n\n\
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology. If the builtin skill is unavailable, read the full \
-         PR diff and surrounding code, check the repo CLAUDE.md invariants, and check \
-         the PR's verification evidence.\n\n\
+         PR diff and surrounding code and check the repo CLAUDE.md invariants.\n\n\
          Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
          full current diff and relevant sibling paths; do not narrowly inspect only the last \
          remediation commit.\n\n\
@@ -551,10 +529,9 @@ pub fn build_rereview_turn(
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         {verification_requirement}\n\
+         {verification_boundary}\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING or advisory.\n\
-         {verification_contract}\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -569,8 +546,7 @@ pub fn build_rereview_turn(
         name = reviewer_name,
         pr = pr,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
-        verification_requirement = REPOSITORY_RELATIVE_VERIFICATION_REQUIREMENT,
-        verification_contract = REPOSITORY_RELATIVE_VERIFICATION_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     ))
 }
 
@@ -720,10 +696,7 @@ mod tests {
             prompt.contains("NOT review input"),
             "prompt must warn that author/deliverer comments are not review input"
         );
-        assert!(
-            prompt.contains("target repository's checked-in instructions"),
-            "prompt must use repository-relative verification requirements"
-        );
+        assert!(prompt.contains("daemon alone gates reviewer provisioning and merge"));
         assert!(
             prompt.contains("Never review your own delivery"),
             "prompt must disqualify self-review of own delivery"
@@ -823,26 +796,25 @@ mod tests {
                 "{name} must forbid local verification runs"
             );
             assert!(
-                prompt.contains("daemon owns the applicable CI gate"),
-                "{name} must describe the daemon-owned CI gate"
+                prompt.contains("daemon alone gates reviewer provisioning and merge"),
+                "{name} must describe the daemon-only CI gate"
             );
             assert!(
                 !prompt.contains("gh pr checks"),
                 "{name} must not delegate CI polling to the reviewer"
             );
             assert!(
-                prompt.contains("target repository's checked-in instructions")
-                    && prompt.contains("applicable CI/delivery contract"),
-                "{name} must retain repository-relative verification review"
+                prompt.contains("Do not inspect, report, or block on CI status")
+                    && prompt.contains("PR-body verification evidence"),
+                "{name} must exclude CI and PR-evidence policing from review"
             );
             assert!(
-                prompt.contains("Treat missing, red, or incomplete evidence as BLOCKING only"),
-                "{name} may block on verification only when the repository requires it"
+                !prompt.contains("Treat missing, red, or incomplete evidence as BLOCKING")
+                    && !prompt.contains("applicable CI/delivery contract"),
+                "{name} must never turn verification evidence into a finding"
             );
             assert!(
-                prompt.contains("do not invent or demand")
-                    && !prompt.contains("PREFLIGHT: PASS")
-                    && !prompt.contains("./preflight.sh"),
+                !prompt.contains("PREFLIGHT: PASS") && !prompt.contains("./preflight.sh"),
                 "{name} must not invent Quorum-specific verification requirements"
             );
         }
@@ -1068,10 +1040,7 @@ mod tests {
             turn.contains("branch actually advanced"),
             "rereview template must require branch advancement before re-approval"
         );
-        assert!(
-            turn.contains("target repository's checked-in instructions"),
-            "rereview template must use repository-relative verification"
-        );
+        assert!(turn.contains("Do not inspect, report, or block on CI status"));
         // Task #124: PR-source-of-truth guidance also carries into rereview,
         // because the second pass must resolve the prior review thread on the PR.
         assert!(
@@ -1263,7 +1232,7 @@ mod tests {
         assert!(prompt.contains("--blocking 0"));
         assert!(prompt.contains("BLOCKING"));
         assert!(prompt.contains("builtin `review` skill"));
-        assert!(prompt.contains("target repository's checked-in instructions"));
+        assert!(prompt.contains("Do not inspect, report, or block on CI status"));
         assert!(prompt.contains("Do NOT merge the PR yourself"));
         assert!(
             prompt.contains("Do NOT run `gh pr review --approve`"),
@@ -1481,7 +1450,7 @@ mod tests {
         assert!(prompt.contains("PR #42"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
-        assert!(prompt.contains("target repository's checked-in instructions"));
+        assert!(prompt.contains("Do not inspect, report, or block on CI status"));
         assert!(prompt.contains("Do NOT merge the PR yourself"));
     }
 
@@ -1513,7 +1482,7 @@ mod tests {
         assert!(prompt.contains("R1 reviewer R1 already approved"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
-        assert!(prompt.contains("target repository's checked-in instructions"));
+        assert!(prompt.contains("Do not inspect, report, or block on CI status"));
     }
 
     #[test]
