@@ -36,68 +36,188 @@ impl RunnerKind {
     }
 }
 
-/// Deserializable TOML config for `quorum serve`. Every field is optional —
-/// missing fields fall back to built-in defaults; CLI flags override everything.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ServeFileConfig {
+// Keep the field declarations and the set inspected by the consumption guard in
+// one macro invocation. Adding a field extends `DECLARED_SERVE_FILE_CONFIG_KEYS`
+// automatically; the guard test then fails until it is either consumed at
+// runtime or deliberately registered as deprecated.
+macro_rules! declare_serve_file_config {
+    ($( $(#[$meta:meta])* $field:ident: $ty:ty, )*) => {
+        /// Deserializable TOML config for `quorum serve`. Every field is optional —
+        /// missing fields fall back to built-in defaults; CLI flags override everything.
+        #[derive(Debug, Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct ServeFileConfig {
+            $(
+                $(#[$meta])*
+                pub $field: $ty,
+            )*
+            // This exists only to prove the guard catches a field with no
+            // runtime consumer. It is explicitly deprecated in test builds.
+            #[cfg(test)]
+            pub test_only_unconsumed: Option<bool>,
+        }
+
+        const DECLARED_SERVE_FILE_CONFIG_KEYS: &[&str] = &[
+            $(stringify!($field),)*
+            #[cfg(test)]
+            "test_only_unconsumed",
+        ];
+    };
+}
+
+declare_serve_file_config! {
     /// Optional provider-wide runner selection. Unlike the legacy `agent`
     /// setting, this also constrains every role-specific model.
-    pub provider: Option<String>,
-    pub agent: Option<String>,
-    pub cap: Option<usize>,
-    pub repo_dir: Option<String>,
-    pub worktree_base: Option<String>,
-    pub names_file: Option<String>,
-    pub agent_bin: Option<String>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    pub worker_model: Option<String>,
-    pub worker_effort: Option<String>,
-    pub review_model: Option<String>,
-    pub review_effort: Option<String>,
-    pub classifier_model: Option<String>,
-    pub classifier_effort: Option<String>,
-    pub collector_model: Option<String>,
-    pub collector_effort: Option<String>,
-    pub merge_token_file: Option<String>,
-    pub no_bare_agent: Option<bool>,
-    pub max_turn_tokens: Option<i64>,
-    pub max_task_tokens: Option<i64>,
-    pub max_turn_cost_usd: Option<f64>,
-    pub max_task_cost_usd: Option<f64>,
-    pub max_turn_wall_secs: Option<u64>,
-    pub max_task_wall_secs: Option<u64>,
-    pub idle_timeout_secs: Option<u64>,
-    pub allowed_tools: Option<String>,
-    pub log_dir: Option<String>,
-    pub self_update_drain: Option<bool>,
-    pub drain_timeout_secs: Option<u64>,
-    pub self_repo: Option<String>,
-    pub sha_poll_interval_secs: Option<u64>,
-    pub repo: Option<String>,
-    pub base_branch: Option<String>,
-    pub merge_checks_timeout_secs: Option<u64>,
-    pub merge_checks_poll_secs: Option<u64>,
-    pub required_jobs: Option<Vec<String>>,
-    pub master_ci_gate: Option<bool>,
-    pub master_ci_timeout_secs: Option<u64>,
-    pub doctor_enabled: Option<bool>,
+    provider: Option<String>,
+    agent: Option<String>,
+    cap: Option<usize>,
+    repo_dir: Option<String>,
+    worktree_base: Option<String>,
+    names_file: Option<String>,
+    agent_bin: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    worker_model: Option<String>,
+    worker_effort: Option<String>,
+    review_model: Option<String>,
+    review_effort: Option<String>,
+    classifier_model: Option<String>,
+    classifier_effort: Option<String>,
+    collector_model: Option<String>,
+    collector_effort: Option<String>,
+    merge_token_file: Option<String>,
+    no_bare_agent: Option<bool>,
+    max_turn_tokens: Option<i64>,
+    max_task_tokens: Option<i64>,
+    max_turn_cost_usd: Option<f64>,
+    max_task_cost_usd: Option<f64>,
+    max_turn_wall_secs: Option<u64>,
+    max_task_wall_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
+    allowed_tools: Option<String>,
+    log_dir: Option<String>,
+    self_update_drain: Option<bool>,
+    drain_timeout_secs: Option<u64>,
+    self_repo: Option<String>,
+    sha_poll_interval_secs: Option<u64>,
+    repo: Option<String>,
+    base_branch: Option<String>,
+    merge_checks_timeout_secs: Option<u64>,
+    merge_checks_poll_secs: Option<u64>,
+    required_jobs: Option<Vec<String>>,
+    master_ci_gate: Option<bool>,
+    master_ci_timeout_secs: Option<u64>,
+    doctor_enabled: Option<bool>,
     /// Whether deterministic R2 sampling participates. `false` keeps R2 mandatory.
-    pub r2_enabled: Option<bool>,
+    r2_enabled: Option<bool>,
     /// Guaranteed coverage floor per (model, effort, complexity) stratum.
-    pub r2_target_per_stratum: Option<i64>,
+    r2_target_per_stratum: Option<i64>,
     /// Sampling probability once a stratum reaches its coverage floor.
-    pub r2_steady_state_p: Option<f64>,
+    r2_steady_state_p: Option<f64>,
     /// Per-complexity suggested model/effort (keys "1".."5", values "tier/effort").
-    pub suggested_models: Option<std::collections::HashMap<String, String>>,
+    suggested_models: Option<std::collections::HashMap<String, String>>,
     /// #172: minimum worker model tier floor ("sonnet-5"|"opus-46"|"opus-47"|"opus-48").
     /// A worker resolving below this is bumped up to it at spawn. None = no floor.
-    pub min_model: Option<String>,
+    min_model: Option<String>,
     /// #172: minimum worker effort floor ("medium"|"high"). None = no floor.
-    pub min_effort: Option<String>,
+    min_effort: Option<String>,
     /// Runner-specific Codex configuration.
-    pub codex: Option<CodexFileConfig>,
+    codex: Option<CodexFileConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigKeyDisposition {
+    Runtime,
+    Deprecated,
+}
+
+// This is the explicit bridge between file keys and the runtime resolution
+// paths in `main.rs` / `resolve_roles`. A deprecated key remains parseable for
+// compatibility, but startup warns that it has no effect.
+const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
+    ("provider", ConfigKeyDisposition::Runtime),
+    ("agent", ConfigKeyDisposition::Runtime),
+    ("cap", ConfigKeyDisposition::Runtime),
+    ("repo_dir", ConfigKeyDisposition::Runtime),
+    ("worktree_base", ConfigKeyDisposition::Runtime),
+    ("names_file", ConfigKeyDisposition::Runtime),
+    ("agent_bin", ConfigKeyDisposition::Runtime),
+    ("model", ConfigKeyDisposition::Runtime),
+    ("effort", ConfigKeyDisposition::Runtime),
+    ("worker_model", ConfigKeyDisposition::Runtime),
+    ("worker_effort", ConfigKeyDisposition::Runtime),
+    ("review_model", ConfigKeyDisposition::Runtime),
+    ("review_effort", ConfigKeyDisposition::Runtime),
+    ("classifier_model", ConfigKeyDisposition::Runtime),
+    ("classifier_effort", ConfigKeyDisposition::Runtime),
+    ("collector_model", ConfigKeyDisposition::Runtime),
+    ("collector_effort", ConfigKeyDisposition::Runtime),
+    ("merge_token_file", ConfigKeyDisposition::Runtime),
+    ("no_bare_agent", ConfigKeyDisposition::Runtime),
+    ("max_turn_tokens", ConfigKeyDisposition::Runtime),
+    ("max_task_tokens", ConfigKeyDisposition::Runtime),
+    ("max_turn_cost_usd", ConfigKeyDisposition::Runtime),
+    ("max_task_cost_usd", ConfigKeyDisposition::Runtime),
+    ("max_turn_wall_secs", ConfigKeyDisposition::Runtime),
+    ("max_task_wall_secs", ConfigKeyDisposition::Runtime),
+    ("idle_timeout_secs", ConfigKeyDisposition::Runtime),
+    ("allowed_tools", ConfigKeyDisposition::Runtime),
+    ("log_dir", ConfigKeyDisposition::Runtime),
+    ("self_update_drain", ConfigKeyDisposition::Runtime),
+    ("drain_timeout_secs", ConfigKeyDisposition::Runtime),
+    ("self_repo", ConfigKeyDisposition::Runtime),
+    ("sha_poll_interval_secs", ConfigKeyDisposition::Runtime),
+    ("repo", ConfigKeyDisposition::Runtime),
+    ("base_branch", ConfigKeyDisposition::Runtime),
+    ("merge_checks_timeout_secs", ConfigKeyDisposition::Runtime),
+    ("merge_checks_poll_secs", ConfigKeyDisposition::Runtime),
+    ("required_jobs", ConfigKeyDisposition::Runtime),
+    ("master_ci_gate", ConfigKeyDisposition::Runtime),
+    ("master_ci_timeout_secs", ConfigKeyDisposition::Runtime),
+    ("doctor_enabled", ConfigKeyDisposition::Runtime),
+    ("r2_enabled", ConfigKeyDisposition::Runtime),
+    ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
+    ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
+    ("suggested_models", ConfigKeyDisposition::Runtime),
+    ("min_model", ConfigKeyDisposition::Runtime),
+    ("min_effort", ConfigKeyDisposition::Runtime),
+    ("codex", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
+    ("test_only_unconsumed", ConfigKeyDisposition::Deprecated),
+];
+
+fn validate_config_key_registry(
+    declared: &[&str],
+    registry: &[(&str, ConfigKeyDisposition)],
+) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let declared: BTreeSet<_> = declared.iter().copied().collect();
+    let mut registered = BTreeSet::new();
+    for (key, _) in registry {
+        if !registered.insert(*key) {
+            return Err(QuorumError::Io(format!(
+                "serve config key registry registers \"{key}\" more than once"
+            )));
+        }
+    }
+    let missing: Vec<_> = declared.difference(&registered).copied().collect();
+    let unknown: Vec<_> = registered.difference(&declared).copied().collect();
+    if missing.is_empty() && unknown.is_empty() {
+        return Ok(());
+    }
+    Err(QuorumError::Io(format!(
+        "serve config key registry drift: unclassified declared keys [{}]; registrations for undeclared keys [{}]",
+        missing.join(", "),
+        unknown.join(", "),
+    )))
+}
+
+fn validate_serve_file_config_key_registry() -> Result<()> {
+    validate_config_key_registry(
+        DECLARED_SERVE_FILE_CONFIG_KEYS,
+        SERVE_FILE_CONFIG_KEY_REGISTRY,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,11 +368,13 @@ pub struct CodexFileConfig {
 /// When `explicit` is true (user passed --config), missing file → exit 2.
 /// When false (auto-discovered default path), missing file → built-in defaults.
 pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
+    validate_serve_file_config_key_registry()?;
     match std::fs::read_to_string(path) {
         Ok(s) => {
             let cfg: ServeFileConfig = toml::from_str(&s).map_err(|e| {
                 QuorumError::Usage(format!("bad serve config {}: {e}", path.display()))
             })?;
+            warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -270,6 +392,23 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             path.display()
         ))),
     }
+}
+
+fn warn_for_deprecated_keys(toml_source: &str) -> Result<()> {
+    let value: toml::Value = toml::from_str(toml_source).map_err(|e| {
+        QuorumError::Io(format!(
+            "validated serve config could not be inspected: {e}"
+        ))
+    })?;
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    for (key, disposition) in SERVE_FILE_CONFIG_KEY_REGISTRY {
+        if *disposition == ConfigKeyDisposition::Deprecated && table.contains_key(*key) {
+            eprintln!("quorum serve: WARNING: deprecated config key \"{key}\" has no effect");
+        }
+    }
+    Ok(())
 }
 
 /// Validate explicit per-complexity routing overrides. The accepted tier
@@ -725,6 +864,37 @@ mod tests {
             msg.contains("bogus_key"),
             "error should name the bad key: {msg}"
         );
+    }
+
+    #[test]
+    fn config_key_registry_covers_every_declared_field() {
+        validate_serve_file_config_key_registry().unwrap();
+    }
+
+    #[test]
+    fn config_key_registry_rejects_an_unconsumed_test_only_field() {
+        let registry: Vec<_> = SERVE_FILE_CONFIG_KEY_REGISTRY
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key != "test_only_unconsumed")
+            .collect();
+        let err =
+            validate_config_key_registry(DECLARED_SERVE_FILE_CONFIG_KEYS, &registry).unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        assert!(
+            err.to_string().contains("test_only_unconsumed"),
+            "guard should name the unconsumed field: {err}"
+        );
+    }
+
+    #[test]
+    fn deprecated_key_warns_and_still_loads_for_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "test_only_unconsumed = true\n").unwrap();
+
+        let cfg = load(&path, true).unwrap();
+        assert_eq!(cfg.test_only_unconsumed, Some(true));
     }
 
     #[test]
