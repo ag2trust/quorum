@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, detailNavigationState, shouldTrim} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -97,3 +97,21 @@ assert.equal(parseEventLine(tail.lines[0])[0].body, 'whole');
 tail = reassembleTail({}, [], '61'.repeat(MAX_PENDING_STREAM_BYTES + 1), false);
 assert.equal(tail.state.pending.length, 0);
 assert.equal(tail.state.discardLeading, true);
+
+// A dense 2 MiB response can contain hundreds of thousands of complete records.
+// Reassembly must retain/decode only the suffix that normalization can inspect.
+const denseLines = Array.from({length: 50_000}, () => '7b7d');
+tail = reassembleTail({}, denseLines, null, false);
+assert.equal(tail.lines.length, MAX_NORMALIZED_RECORDS_PER_POLL);
+assert.equal(tail.omitted, denseLines.length - MAX_NORMALIZED_RECORDS_PER_POLL);
+assert.equal(tail.lines[0], '{}');
+
+// Explicit navigation always starts a new, live view; offset zero is a replacement,
+// not an append to a paused stream or its partial continuation.
+const detail = detailNavigationState('B-200', 0);
+assert.equal(detail.openRun, 'B-200');
+assert.equal(detail.offset, 0);
+assert.equal(detail.paused, false);
+assert.equal(detail.rawMode, false);
+assert.equal(detail.renderedChars, 0);
+assert.equal(Object.keys(detail.tailState).length, 0);
