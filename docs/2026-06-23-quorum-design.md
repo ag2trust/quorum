@@ -41,7 +41,7 @@ accepted task
   → pushed pull request
   → required checks
   → independent R1 review
-  → adversarial R2 review
+  → independent R2 review focused on any material gaps left by R1
   → rework when required
   → final required-checks revalidation
   → daemon-controlled approval and merge
@@ -675,9 +675,9 @@ approval path merges; when it requires R2, the following dual-review flow applie
    slot if available, or resolved from the PR head ref via GitHub (allowing R2 to
    proceed even without a live worker). Before provisioning, the daemon applies the
    pre-review CI gate to the current head SHA; a moved head must become green again
-   before R2 consumes a slot. R2's prompt frames it as an adversarial second reviewer
-   that attempts to falsify the merge-safety claim, reviews independently before
-   comparing against R1, and requires evidence-bound findings.
+   before R2 consumes a slot. R2 reviews independently before comparing against R1,
+   then checks for any material gaps R1 did not surface, if such gaps exist. Agreement
+   with R1 and no additional findings are valid outcomes; findings remain evidence-bound.
 4. **Verdict flow** — R2's verdict drives lifecycle:
    - Approved → record R2 durable approval `(pr, 'r2')`. Merge proceeds only when
      `dual_approved(pr)` returns a common head SHA (both R1 and R2 approved with
@@ -709,12 +709,11 @@ are BLOCKING unless evidence disproves the failure.
 ### Daemon-owned pre-review CI gate
 
 Every reviewer provisioning attempt, initial or after rework, is gated by the daemon
-against the current PR head SHA. Reviewer agents do not poll CI and do not run local
-test/build/fmt/lint commands; they inspect code and verification evidence against the
-target repository's checked-in instructions and applicable CI/delivery contract. Shared
-reviewer prompts must not invent or require scripts, commands, headings, evidence tokens,
-or checks absent from that repository; missing or failed verification evidence is BLOCKING
-only when the repository requires it.
+against the current PR head SHA. Reviewer agents do not poll CI, run local
+test/build/fmt/lint commands, inspect CI status, or police PR-body verification evidence,
+formatting, transcripts, links, headings, evidence tokens, or checklists. They review the
+implementation and its tests as code. The daemon alone owns CI enforcement for reviewer
+provisioning and merge.
 
 - `Ready` plus all configured `required_jobs` at `SUCCESS` permits provisioning.
 - `Pending`, `TimedOut`, and pending required jobs keep the task `in-review`. The daemon
@@ -1463,7 +1462,7 @@ there is no universal "next stronger model" across families.
 3. **Enable Codex workers.** Prove initial work, submit, rework continuation, restart,
    watchdogs, auth/quota failure, and unsupported-USD-limit rejection.
 4. **Enable Codex R1 and R2.** Prove changes/rework/re-review, stale-head rejection,
-   self-review prevention, preflight evidence, CI wait, daemon approval, and merge.
+   self-review prevention, daemon-owned CI wait, approval, and merge.
 5. **Simplify configuration.** Preserve old Claude configuration, add explicit
    per-role mappings, and install runner-appropriate Quorum guidance.
 
