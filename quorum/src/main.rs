@@ -461,6 +461,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
+            quorum_core::tasks::validate_creator_labels(labels.as_deref())?;
+            quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
             let resolved_repo = resolve_repo_override(repo.as_deref())?;
             let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
             let id = quorum_core::tasks::create(
@@ -489,6 +491,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             note_file,
             depends_on,
         } => {
+            quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
             let body = read_optional_body(body_stdin, body_file)?;
             let note = read_optional_note(note_stdin, note_file)?;
             let has_field_update =
@@ -1302,6 +1305,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 model: r_model.value,
                 effort: r_effort.value,
                 provider_explicit: roles.provider_explicit,
+                review_model_explicit: roles.review_model_explicit,
                 review_model: roles.review_model,
                 review_effort: roles.review_effort,
                 classifier_model: roles.classifier_model,

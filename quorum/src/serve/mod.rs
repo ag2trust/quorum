@@ -250,10 +250,26 @@ fn r2_required_for_head(
     pr_number: i64,
     head_sha: &str,
 ) -> bool {
-    quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)
-        .ok()
-        .flatten()
-        .unwrap_or(true)
+    // A head's durable decision is immutable, including after a force-push
+    // returns the PR to that head.  The exhausted-budget skip may establish a
+    // decision only for a previously unseen head; it must never weaken one
+    // already recorded as required.
+    match quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha) {
+        Ok(Some(required)) => return required,
+        // Missing state is the only case where the cap may establish a new
+        // R2 skip. An unreadable or task-mismatched decision fails closed.
+        Ok(None) => {}
+        Err(_) => return true,
+    }
+    if matches!(
+        tasks::get(conn, task_id),
+        Ok(Some(task))
+            if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP)
+    ) {
+        return false;
+    }
+    // Missing, unreadable, or task-mismatched state fails closed to R2.
+    true
 }
 
 struct R2SamplingPolicy {
@@ -274,15 +290,17 @@ fn decide_r2_requirement(
     head_sha: &str,
     policy: &R2SamplingPolicy,
 ) -> Result<bool> {
-    if tasks::get(conn, task_id)?.is_none() {
-        return Err(QuorumError::Io(format!(
-            "task #{task_id} disappeared while sampling R2"
-        )));
-    }
+    let task = tasks::get(conn, task_id)?
+        .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared while sampling R2")))?;
     if let Some(required) =
         quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)?
     {
         return Ok(required);
+    }
+    if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP) {
+        return quorum_core::review_audits::record_r2_requirement(
+            conn, task_id, pr_number, head_sha, false,
+        );
     }
 
     // `false` opts out of sampling, never out of the R2 gate itself.
@@ -319,6 +337,47 @@ fn is_provision_exhausted(
     let attempts =
         quorum_core::provision_attempts::get_attempts(conn, task_id, pr, role, head_sha)?;
     Ok(attempts >= MAX_REVIEWER_PROVISION_STRIKES as i64)
+}
+
+/// Record a reviewer provisioning failure before returning to the daemon loop.
+/// Configuration/recovery mismatches must use this same bounded path as
+/// worktree and process failures; otherwise a stale persisted reviewer aborts
+/// every tick without ever parking the task.
+async fn record_reviewer_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    role: &ReviewRole,
+    head_sha: &str,
+) {
+    let role_str = role.as_str().to_string();
+    let sha = head_sha.to_string();
+    let strikes = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> i64 {
+            quorum_core::db::open(&p)
+                .ok()
+                .and_then(|mut conn| {
+                    quorum_core::provision_attempts::record_attempt(
+                        &mut conn, task_id, pr, &role_str, &sha,
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    };
+    log(&format!(
+        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} for task #{task_id} PR #{pr}",
+        role.as_str().to_uppercase()
+    ));
+    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+        log(&format!(
+            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after {strikes} consecutive {} provision failures for PR #{pr}",
+            role.as_str().to_uppercase()
+        ));
+    }
 }
 
 /// Check whether total reviewer runs for a task exceed the safety cap.
@@ -512,6 +571,71 @@ fn require_configured_provider(
     require_provider_match(explicitly_configured_provider(config), actual, context)
 }
 
+/// Reviewer recovery is governed by the configured reviewer model, not the
+/// worker provider. This permits an intentional cross-provider reviewer while
+/// still refusing to revive a persisted reviewer from a different configuration.
+fn require_configured_reviewer_provider(
+    config: &ServeConfig,
+    actual: runner::AgentKind,
+    context: &str,
+) -> Result<()> {
+    require_reviewer_provider(
+        config.provider_explicit || config.review_model_explicit,
+        &config.review_model,
+        actual,
+        context,
+    )
+}
+
+fn require_reviewer_provider(
+    provider_explicit: bool,
+    review_model: &str,
+    actual: runner::AgentKind,
+    context: &str,
+) -> Result<()> {
+    let expected = provider_explicit
+        .then(|| resolve_provider(review_model))
+        .transpose()?;
+    require_provider_match(expected, actual, context)
+}
+
+/// `agent_bin` overrides the CLI for the configured worker provider. A reviewer
+/// may intentionally use the other provider, in which case it must use that
+/// provider's default executable rather than receiving incompatible flags.
+fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&str> {
+    agent_bin_for_runner(
+        config.provider_explicit || config.review_model_explicit,
+        config.runner_kind,
+        config.agent_bin.as_deref(),
+        kind,
+    )
+}
+
+fn agent_bin_for_runner(
+    provider_explicit: bool,
+    runner_kind: crate::serve_config::RunnerKind,
+    agent_bin: Option<&str>,
+    kind: runner::AgentKind,
+) -> Option<&str> {
+    if !provider_explicit {
+        return agent_bin;
+    }
+    let configured_kind = match runner_kind {
+        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
+        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+    };
+    (kind == configured_kind).then_some(agent_bin).flatten()
+}
+
+fn configured_reviewer_selection<'a>(
+    provider_explicit: bool,
+    review_model_explicit: bool,
+    review_model: &'a str,
+    review_effort: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    (provider_explicit || review_model_explicit).then_some((review_model, review_effort))
+}
+
 fn require_provider_match(
     expected: Option<runner::AgentKind>,
     actual: runner::AgentKind,
@@ -594,13 +718,20 @@ fn resolve_reviewer_recovery(
             run.model
         )));
     }
-    let thread_id = task_refs
-        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-        .and_then(|refs| {
-            refs.get(reviewer_thread_ref_key(is_r2))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
+    // Continuation IDs are Codex-specific. A task can retain an older Codex
+    // reviewer thread while a later Claude reviewer is interrupted; never let
+    // that stale ref select the Codex resume path for the Claude run.
+    let thread_id = (kind == runner::AgentKind::Codex)
+        .then(|| {
+            task_refs
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                .and_then(|refs| {
+                    refs.get(reviewer_thread_ref_key(is_r2))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .flatten();
     if kind == runner::AgentKind::Codex && thread_id.is_none() {
         return Err(QuorumError::Io(format!(
             "interrupted Codex reviewer run {} has no persisted {}",
@@ -652,13 +783,10 @@ fn extract_cx_est(refs: &Option<String>) -> Option<i64> {
     v.get("cx_est")?.as_i64()
 }
 
-fn extract_complexity_label(labels_json: Option<&str>) -> Option<u8> {
-    let arr: Vec<String> = serde_json::from_str(labels_json?).ok()?;
-    arr.iter().find_map(|l| {
-        l.strip_prefix("complexity:")
-            .and_then(|v| v.parse::<u8>().ok())
-            .filter(|&v| (1..=5).contains(&v))
-    })
+fn classifier_complexity(refs: &Option<String>) -> Option<u8> {
+    extract_cx_est(refs)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (1..=5).contains(value))
 }
 
 fn effort_rank(effort: &str) -> u8 {
@@ -706,6 +834,21 @@ fn suggested_for(
         })
 }
 
+fn classifier_worker_selection(
+    task_id: i64,
+    refs: &Option<String>,
+    provider: crate::serve_config::RunnerKind,
+    overrides: &std::collections::HashMap<String, String>,
+) -> Result<(u8, String, String)> {
+    let complexity = classifier_complexity(refs).ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "task #{task_id} cannot dispatch without classifier-owned complexity"
+        ))
+    })?;
+    let (model, effort) = suggested_for(complexity, provider, overrides);
+    Ok((complexity, model, effort))
+}
+
 /// #172: clamp a resolved (model, effort) up to the configured floor for worker
 /// spawn. `min_model` is a full model id (e.g. "claude-opus-4-7"); `min_effort`
 /// is "medium"|"high". A `None` field imposes no floor on that dimension — the
@@ -743,82 +886,6 @@ fn is_below_model_effort_floor(
     let floor_rank = model_rank(floor_model).unwrap_or(0);
     resolved_rank < floor_rank
         || (resolved_rank == floor_rank && effort_rank(resolved_effort) < effort_rank(floor_effort))
-}
-
-/// Compare a resolved pair with an advisory complexity recommendation.
-/// Recommendations are provider-scoped operational policy, so this never
-/// infers a cross-vendor ordering.
-fn is_below_advisory_recommendation(
-    resolved_model: &str,
-    resolved_effort: &str,
-    suggested_model: &str,
-    suggested_effort: &str,
-) -> bool {
-    let resolved_provider = match resolve_provider(resolved_model) {
-        Ok(provider) => provider,
-        Err(_) => return false,
-    };
-    let suggested_provider = match resolve_provider(suggested_model) {
-        Ok(provider) => provider,
-        Err(_) => return false,
-    };
-    if resolved_provider != suggested_provider {
-        return false;
-    }
-    let provider = match resolved_provider {
-        runner::AgentKind::Claude => quorum_core::complexity::RecommendationProvider::Claude,
-        runner::AgentKind::Codex => quorum_core::complexity::RecommendationProvider::Codex,
-    };
-    let r_rank = quorum_core::complexity::recommendations_for(provider)
-        .iter()
-        .position(|(_, model, _)| *model == resolved_model)
-        .unwrap_or(0);
-    let s_rank = quorum_core::complexity::recommendations_for(provider)
-        .iter()
-        .position(|(_, model, _)| *model == suggested_model)
-        .unwrap_or(0);
-    if r_rank < s_rank {
-        return true;
-    }
-    if r_rank == s_rank && effort_rank(resolved_effort) < effort_rank(suggested_effort) {
-        return true;
-    }
-    false
-}
-
-/// Extract model and effort overrides from a task's labels JSON.
-///
-/// Labels like `tier:opus-46` map to model `claude-opus-4-6`; `effort:high` maps to effort `high`.
-/// Empty suffixes remain no-ops for compatibility with pre-validation stored tasks.
-/// Returns (model_override, effort_override) — `None` means "use the global config value".
-fn labels_to_model_effort(labels_json: Option<&str>) -> (Option<String>, Option<String>) {
-    let json = match labels_json {
-        Some(s) => s,
-        None => return (None, None),
-    };
-    let arr: Vec<String> = match serde_json::from_str(json) {
-        Ok(a) => a,
-        Err(_) => return (None, None),
-    };
-    let mut model = None;
-    let mut effort = None;
-    for label in &arr {
-        if model.is_none() {
-            if let Some(val) = label.strip_prefix("tier:") {
-                if !val.is_empty() {
-                    model = tier_to_model_id(val);
-                }
-            }
-        }
-        if effort.is_none() {
-            if let Some(val) = label.strip_prefix("effort:") {
-                if val == "medium" || val == "high" {
-                    effort = Some(val.to_string());
-                }
-            }
-        }
-    }
-    (model, effort)
 }
 
 fn now_unix() -> i64 {
@@ -936,6 +1003,7 @@ pub struct ServeConfig {
     pub model: String,
     pub effort: String,
     pub provider_explicit: bool,
+    pub review_model_explicit: bool,
     pub review_model: String,
     pub review_effort: String,
     pub classifier_model: String,
@@ -1372,6 +1440,28 @@ fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn remediation_retry_feedback(refs: Option<&str>) -> Option<String> {
+    let refs = refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())?;
+    if !refs
+        .get(tasks::PARKED_REWORK_RETRY_REF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    refs.get("remediation_feedback")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+        .map(str::to_string)
+}
+
+/// The remediation reconcilers run before Phase 6's ordinary worker-cap loop,
+/// so they must apply the same slot accounting themselves.
+fn available_worker_slots(cap: usize, active_workers: usize) -> usize {
+    cap.saturating_sub(active_workers)
+}
+
 fn retry_slot_rework_count(
     rework_round: i64,
     retry: Option<&CodexRetryTurn>,
@@ -1595,6 +1685,17 @@ fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
         | QuorumError::Db(_)
         | QuorumError::Io(_) => TickErrorAction::Continue,
     }
+}
+
+async fn persist_classifier_error(db_path: &Path, detail: &str) {
+    let path = db_path.to_path_buf();
+    let detail = detail.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&path) {
+            quorum_core::errlog::log_error(&conn, now_unix(), "classifier", &detail);
+        }
+    })
+    .await;
 }
 
 async fn poll_pre_review_checks(
@@ -2089,6 +2190,82 @@ async fn reconcile_ci_remediations(
                 )
                 .await;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Resume an owner-requested retry of a remediation that was parked before a
+/// worker process existed. These retries must not fall through to generic
+/// worker provisioning: that path builds an initial-task prompt and, for
+/// Codex, may start a fresh thread. Reusing `spawn_remediation_worker` preserves
+/// the accepted blocker feedback, verified PR target, original provider/model,
+/// and exact continuation identity when an original worker exists.
+async fn reconcile_remediation_retries(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    draining: bool,
+) -> Result<()> {
+    if draining {
+        return Ok(());
+    }
+    let pending = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
+            let conn = quorum_core::db::open(&p)?;
+            Ok(tasks::list(&conn, Some("rework"), None, None)?
+                .into_iter()
+                .filter(|task| remediation_retry_feedback(task.refs.as_deref()).is_some())
+                .collect())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("review-only remediation scan join: {error}")))??
+    };
+
+    // This reconciler runs before Phase 6, whose ordinary worker loop enforces
+    // the cap. Limit this pre-Phase-6 path explicitly so a bulk retry cannot
+    // provision more workers or worktrees than the daemon owns slots for.
+    for task in pending {
+        if available_worker_slots(config.cap, workers.len()) == 0 {
+            break;
+        }
+        if workers.iter().any(|worker| worker.task_id == task.id) {
+            continue;
+        }
+        let Some(pr) = tasks::extract_pr_number(&task.refs) else {
+            park_task(
+                &config.db_path,
+                task.id,
+                "remediation retry is missing its PR identity",
+                "rework",
+            )
+            .await;
+            continue;
+        };
+        let Some(feedback) = remediation_retry_feedback(task.refs.as_deref()) else {
+            continue;
+        };
+
+        log(&format!(
+            "durable remediation retry: provisioning task #{} on PR #{pr}",
+            task.id
+        ));
+        if !spawn_remediation_worker(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            lifetime_roster,
+            task.id,
+            pr,
+            &feedback,
+        )
+        .await
+        {
+            park_remediation_provision_failure(config, task.id, pr, &feedback).await;
         }
     }
     Ok(())
@@ -2826,7 +3003,8 @@ async fn tick(
 
                         if !r2_required {
                             log(&format!(
-                                "R2 GATE: PR #{pr_num} — sampling skipped R2 for head {head_sha}; \
+                                "R2 GATE: PR #{pr_num} — sampling or exhausted rework budget \
+                                 skipped R2 for head {head_sha}; \
                                  proceeding with R1 approval"
                             ));
                         } else {
@@ -3329,18 +3507,11 @@ async fn tick(
                                             )
                                             .await;
                                             if !spawn_ok {
-                                                log(&format!(
-                                                    "remediation worker spawn failed for task \
-                                                     #{reviewer_task_id} — firing AgentFailed"
-                                                ));
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
+                                                park_remediation_provision_failure(
+                                                    config,
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "remediation worker spawn failed"
-                                                            .into(),
-                                                    },
+                                                    pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -3610,18 +3781,11 @@ async fn tick(
                                             )
                                             .await;
                                             if !spawn_ok {
-                                                log(&format!(
-                                                    "remediation worker spawn failed for task \
-                                                     #{reviewer_task_id} — firing AgentFailed"
-                                                ));
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
+                                                park_remediation_provision_failure(
+                                                    config,
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "remediation worker spawn failed"
-                                                            .into(),
-                                                    },
+                                                    pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -3825,19 +3989,11 @@ async fn tick(
                                                 )
                                                 .await;
                                                 if !spawn_ok {
-                                                    log(&format!(
-                                                        "remediation worker spawn failed for task \
-                                                         #{reviewer_task_id} — firing AgentFailed"
-                                                    ));
-                                                    fire_event(
-                                                        &db_path,
-                                                        "daemon",
+                                                    park_remediation_provision_failure(
+                                                        config,
                                                         reviewer_task_id,
-                                                        &Event::AgentFailed {
-                                                            reason:
-                                                                "remediation worker spawn failed"
-                                                                    .into(),
-                                                        },
+                                                        pr_num,
+                                                        &rework_msg,
                                                     )
                                                     .await;
                                                 }
@@ -4165,18 +4321,11 @@ async fn tick(
                                             )
                                             .await;
                                             if !spawn_ok {
-                                                log(&format!(
-                                                    "remediation worker spawn failed for task \
-                                                     #{reviewer_task_id} — firing AgentFailed"
-                                                ));
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
+                                                park_remediation_provision_failure(
+                                                    config,
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "remediation worker spawn failed"
-                                                            .into(),
-                                                    },
+                                                    pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -4555,17 +4704,11 @@ async fn tick(
                                                     )
                                                     .await;
                                                     if !spawn_ok {
-                                                        log(&format!(
-                                                            "remediation worker spawn failed for task \
-                                                             #{reviewer_task_id} — firing AgentFailed"
-                                                        ));
-                                                        fire_event(
-                                                            &db_path,
-                                                            "daemon",
+                                                        park_remediation_provision_failure(
+                                                            config,
                                                             reviewer_task_id,
-                                                            &Event::AgentFailed {
-                                                                reason: "remediation worker spawn failed".into(),
-                                                            },
+                                                            pr_num,
+                                                            &rework_msg,
                                                         )
                                                         .await;
                                                     }
@@ -4819,17 +4962,11 @@ async fn tick(
                                     )
                                     .await;
                                     if !spawn_ok {
-                                        log(&format!(
-                                            "remediation worker spawn failed for task \
-                                             #{reviewer_task_id} — firing AgentFailed"
-                                        ));
-                                        fire_event(
-                                            &db_path,
-                                            "daemon",
+                                        park_remediation_provision_failure(
+                                            config,
                                             reviewer_task_id,
-                                            &Event::AgentFailed {
-                                                reason: "remediation worker spawn failed".into(),
-                                            },
+                                            rework_pr,
+                                            feedback,
                                         )
                                         .await;
                                     }
@@ -6204,6 +6341,12 @@ async fn tick(
             .unwrap_or_default()
         };
         for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
+            if classifier_complexity(task_refs).is_none() {
+                log(&format!(
+                    "task #{task_id} PR #{pr}: awaiting classifier-owned complexity before review dispatch"
+                ));
+                continue;
+            }
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -6468,6 +6611,15 @@ async fn tick(
         drain_state.draining,
     )
     .await?;
+    reconcile_remediation_retries(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        lifetime_roster,
+        drain_state.draining,
+    )
+    .await?;
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
@@ -6519,6 +6671,11 @@ async fn tick(
                         }
                     } else {
                         log("classifier: failed to parse response");
+                        persist_classifier_error(
+                            &db_path,
+                            "classifier returned an unparseable response; unclassified tasks remain undispatchable",
+                        )
+                        .await;
                     }
                     *classifier_consec_errors = 0;
                     *classifier_backoff_until = None;
@@ -6533,6 +6690,13 @@ async fn tick(
                     } else {
                         log(&format!("classifier: {e}"));
                     }
+                    persist_classifier_error(
+                        &db_path,
+                        &format!(
+                            "{e}; unclassified tasks remain undispatchable until a successful retry"
+                        ),
+                    )
+                    .await;
                     *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
                     let delay =
                         std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
@@ -6571,6 +6735,11 @@ async fn tick(
                     *classifier_backoff_until = None;
                 } else {
                     log("classifier: process exited without parseable response");
+                    persist_classifier_error(
+                        &db_path,
+                        "classifier exited without a parseable response; unclassified tasks remain undispatchable",
+                    )
+                    .await;
                     *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
                     let delay =
                         std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
@@ -6579,6 +6748,11 @@ async fn tick(
                 }
             } else {
                 log("classifier: process exited without response");
+                persist_classifier_error(
+                    &db_path,
+                    "classifier exited without a response; unclassified tasks remain undispatchable",
+                )
+                .await;
                 *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
                 let delay =
                     std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
@@ -6658,6 +6832,13 @@ async fn tick(
                     }
                     Err(e) => {
                         log(&format!("classifier: spawn failed: {e}"));
+                        persist_classifier_error(
+                            &db_path,
+                            &format!(
+                                "classifier spawn failed: {e}; unclassified tasks remain undispatchable"
+                            ),
+                        )
+                        .await;
                     }
                 }
             }
@@ -7257,9 +7438,23 @@ async fn codex_thread_id_from_refs(db_path: &std::path::Path, task_id: i64) -> O
 
 fn require_codex_remediation_thread(
     kind: runner::AgentKind,
+    review_only: bool,
+    has_original_worker: bool,
     thread_id: Option<String>,
 ) -> Result<Option<String>> {
-    if kind == runner::AgentKind::Codex && thread_id.is_none() {
+    // A managed Codex worker can only be resumed through its exact durable
+    // provider thread.  Review-only tasks are different: they deliberately
+    // have no managed worker run, so their first remediation is a fresh turn
+    // on the already verified PR worktree.  Once that turn emits and persists
+    // its thread ID, later remediation follows the normal exact continuation
+    // rule. Controlled shutdown treats the fresh turn as an ordinary worker:
+    // its capability is revoked and rework is retained; recovery resumes only
+    // after the thread ID is durable. A shutdown before that event therefore
+    // fails closed rather than creating a second fresh turn.
+    if kind == runner::AgentKind::Codex
+        && thread_id.is_none()
+        && (!review_only || has_original_worker)
+    {
         return Err(QuorumError::Io(
             "Codex remediation requires the original persisted thread_id".into(),
         ));
@@ -7519,44 +7714,6 @@ fn reviewer_name_exclusions(
     excluded
 }
 
-async fn record_reviewer_provision_failure(
-    config: &ServeConfig,
-    task_id: i64,
-    pr: i64,
-    role: &ReviewRole,
-    head_sha: &str,
-    reason: &str,
-) {
-    let role_str = role.as_str().to_string();
-    let sha = head_sha.to_string();
-    let p = config.db_path.clone();
-    let strikes = tokio::task::spawn_blocking(move || -> i64 {
-        quorum_core::db::open(&p)
-            .ok()
-            .and_then(|mut conn| {
-                quorum_core::provision_attempts::record_attempt(
-                    &mut conn, task_id, pr, &role_str, &sha,
-                )
-                .ok()
-            })
-            .unwrap_or(0)
-    })
-    .await
-    .unwrap_or(0);
-    log(&format!(
-        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-         for task #{task_id} PR #{pr}: {reason}",
-        role.as_str().to_uppercase()
-    ));
-    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-        log(&format!(
-            "REVIEWER PROVISION EXHAUSTED: task #{task_id} will be parked on the next \
-             provisioning scan after {strikes} consecutive {} failures for PR #{pr}",
-            role.as_str().to_uppercase()
-        ));
-    }
-}
-
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -7647,20 +7804,16 @@ async fn provision_reviewer(
         None
     };
     if let Some(recovery) = &recovery {
-        if let Err(error) = require_configured_provider(
+        if let Err(error) = require_configured_reviewer_provider(
             config,
             recovery.kind,
             &format!("interrupted {} reviewer", role.as_str().to_uppercase()),
         ) {
-            record_reviewer_provision_failure(
-                config,
-                worker.task_id,
-                pr,
-                role,
-                head_sha,
-                &error.to_string(),
-            )
-            .await;
+            record_reviewer_provision_failure(config, worker.task_id, pr, role, head_sha).await;
+            log(&format!(
+                "{}: refusing interrupted reviewer recovery: {error}",
+                role.as_str().to_uppercase()
+            ));
             return Ok(());
         }
     }
@@ -7870,8 +8023,13 @@ async fn provision_reviewer(
                 recovery.thread_id.clone(),
             )
         } else {
-            let reviewer_model = if config.provider_explicit {
-                config.review_model.clone()
+            let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
+                config.provider_explicit,
+                config.review_model_explicit,
+                &config.review_model,
+                &config.review_effort,
+            ) {
+                model.to_string()
             } else {
                 let p = config.db_path.clone();
                 let tid = worker.task_id;
@@ -7886,8 +8044,13 @@ async fn provision_reviewer(
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
             };
             let kind = resolve_provider(&reviewer_model)?;
-            let effort = if config.provider_explicit {
-                config.review_effort.clone()
+            let effort = if let Some((_, effort)) = configured_reviewer_selection(
+                config.provider_explicit,
+                config.review_model_explicit,
+                &config.review_model,
+                &config.review_effort,
+            ) {
+                effort.to_string()
             } else {
                 config.effort.clone()
             };
@@ -7947,6 +8110,7 @@ async fn provision_reviewer(
         ("QUORUM_AGENT".into(), reviewer_name.clone()),
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
+    let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let spawn_result = if let Some(thread_id) = reviewer_thread_id.as_deref() {
         codex_agent::CodexProc::spawn_resume(
             thread_id,
@@ -7956,7 +8120,7 @@ async fn provision_reviewer(
             &wt_path,
             &prompt,
             &reviewer_env,
-            config.agent_bin.as_deref(),
+            reviewer_agent_bin,
         )
         .map(runner::RunnerProc::Codex)
     } else {
@@ -7966,7 +8130,7 @@ async fn provision_reviewer(
             &reviewer_effort,
             &session_id,
             &wt_path,
-            config.agent_bin.as_deref(),
+            reviewer_agent_bin,
             config.bare_agent,
             reviewer_env,
             config.allowed_tools.as_deref(),
@@ -8302,6 +8466,9 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
+            if classifier_complexity(&t.refs).is_none() {
+                return false;
+            }
             if t.review_only {
                 return false;
             }
@@ -8477,72 +8644,20 @@ async fn spawn_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let (label_model, label_effort) = labels_to_model_effort(task.labels.as_deref());
-    let resolved_model = label_model.unwrap_or_else(|| config.model.clone());
-    let resolved_effort = label_effort.unwrap_or_else(|| config.effort.clone());
+    let (complexity, resolved_model, resolved_effort) = classifier_worker_selection(
+        task.id,
+        &task.refs,
+        config.runner_kind,
+        &config.suggested_models,
+    )?;
+    log(&format!(
+        "classifier routing: task #{} complexity {} -> {}/{}",
+        task.id, complexity, resolved_model, resolved_effort
+    ));
 
-    // Mismatch alert: complexity label > cx_est from refs > skip
-    let cx_source = extract_complexity_label(task.labels.as_deref())
-        .map(|cx| (cx, "label"))
-        .or_else(|| {
-            extract_cx_est(&task.refs)
-                .and_then(|v| u8::try_from(v).ok())
-                .map(|cx| (cx, "cx_est"))
-        });
-    if let Some((cx, source)) = cx_source {
-        let (sug_model, sug_effort) =
-            suggested_for(cx, config.runner_kind, &config.suggested_models);
-        if is_below_advisory_recommendation(
-            &resolved_model,
-            &resolved_effort,
-            &sug_model,
-            &sug_effort,
-        ) {
-            let alert_body = format!(
-                "model/effort mismatch: task #{} \"{}\" (creator: {}) — \
-                 complexity {} (source: {}), using {}/{}, suggested {}/{}",
-                task.id,
-                task.title,
-                task.author.as_deref().unwrap_or("unknown"),
-                cx,
-                source,
-                resolved_model,
-                resolved_effort,
-                sug_model,
-                sug_effort,
-            );
-            log(&format!("mismatch alert: {alert_body}"));
-            let p = db_path.clone();
-            let tid = task.id;
-            let body = alert_body.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut conn = quorum_core::db::open(&p)?;
-                let now = now_unix();
-                quorum_core::feed::post(
-                    &mut conn,
-                    "daemon",
-                    "alert",
-                    None,
-                    &body,
-                    None,
-                    Some("owner"),
-                    86400,
-                    now,
-                )?;
-                quorum_core::tasks::add_note(&mut conn, "daemon", tid, &body, now)?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-            .ok();
-        }
-    }
-
-    // #172: enforce the min model/effort floor for worker spawn. Applied AFTER the
-    // mismatch alert (so the alert reflects the label-resolved values) but BEFORE the
-    // AgentSpec build (so the spawn uses the floored values). Reviewers float above
-    // implicitly via escalated_reviewer_model. Separate clamp — not part of flag>file
-    // >default resolution.
+    // #172: enforce the operator-configured minimum after classifier routing and
+    // before AgentSpec construction. The floor may raise, but never lower, the
+    // classifier-owned selection.
     let (floored_model, floored_effort) = apply_model_effort_floor(
         &resolved_model,
         &resolved_effort,
@@ -9202,6 +9317,57 @@ async fn notify_provision_failure(
     }
 }
 
+/// A remediation worker is the only actor that can resolve an accepted
+/// changes verdict.  If it cannot be provisioned, returning a review-only
+/// task to `in-review` merely invites another reviewer to spend another
+/// rework round on the same unchanged PR.  Park the task instead; explicit
+/// retry remains the owner-controlled recovery path.
+async fn park_remediation_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) {
+    // `task-retry` restores a parked rework task without the original reviewer
+    // process or mailbox row. Preserve the accepted blocking feedback so the
+    // replacement remediation turn remains tied to the unresolved finding.
+    let p = config.db_path.clone();
+    let feedback = feedback.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let Some(task) = tasks::get(&conn, task_id)? else {
+            return Ok(());
+        };
+        let mut refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(object) = refs.as_object_mut() else {
+            return Err(QuorumError::Io(
+                "remediation task refs must be a JSON object".into(),
+            ));
+        };
+        object.insert(
+            "remediation_feedback".into(),
+            serde_json::Value::String(feedback),
+        );
+        tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
+    })
+    .await;
+    let reason = format!("remediation worker provisioning failed for PR #{pr}");
+    park_task(&config.db_path, task_id, &reason, "rework").await;
+    notify_provision_failure(
+        &config.db_path,
+        task_id,
+        "remediation worker provisioning failed",
+        &format!("#{pr}"),
+    )
+    .await;
+}
+
 /// Check if a task's refs.repo mismatches all repos this daemon can provision from.
 /// Returns `Some(task_repo)` on mismatch, `None` if matching or unknown.
 fn check_repo_mismatch(
@@ -9754,7 +9920,7 @@ async fn spawn_remediation_worker(
     // Recover the original worker's provider and model from agent_runs so
     // remediation cannot silently switch providers (e.g. a legacy Codex task reworked
     // as Claude because the daemon default is Claude).
-    let (remediation_model, remediation_effort, remediation_kind) = {
+    let (remediation_model, remediation_effort, remediation_kind, has_original_worker) = {
         let p = db_path.clone();
         let tid = task_id;
         let cfg_model = config.model.clone();
@@ -9764,14 +9930,16 @@ async fn spawn_remediation_worker(
             let conn = quorum_core::db::open(&p)?;
             let provider = quorum_core::agent_runs::worker_provider(&conn, tid)?;
             let model = quorum_core::agent_runs::worker_model(&conn, tid)?;
-            let effort = quorum_core::agent_runs::runs_for_task(&conn, tid)?
+            let worker_runs = quorum_core::agent_runs::runs_for_task(&conn, tid)?;
+            let has_original_worker = worker_runs.iter().any(|run| run.role == "worker");
+            let effort = worker_runs
                 .into_iter()
                 .find(|run| run.role == "worker")
                 .map(|run| run.effort)
                 .unwrap_or(cfg_effort);
             let (model, kind) =
                 resolve_remediation_provider(provider.as_deref(), model, &cfg_model, cfg_kind)?;
-            Ok((model, effort, kind))
+            Ok((model, effort, kind, has_original_worker))
         })
         .await;
         match resolved {
@@ -9808,6 +9976,7 @@ async fn spawn_remediation_worker(
                     tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
                 })
                 .await;
+                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -9824,6 +9993,7 @@ async fn spawn_remediation_worker(
                     tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
                 })
                 .await;
+                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -9855,6 +10025,14 @@ async fn spawn_remediation_worker(
         )
         .await
         .ok();
+        let p = db_path.clone();
+        let name = agent_name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+        })
+        .await;
+        cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
         name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -9867,41 +10045,45 @@ async fn spawn_remediation_worker(
     } else {
         None
     };
-    let codex_thread_id =
-        match require_codex_remediation_thread(remediation_kind, recovered_thread_id) {
-            Ok(thread_id) => thread_id,
-            Err(error) => {
-                log(&format!(
+    let codex_thread_id = match require_codex_remediation_thread(
+        remediation_kind,
+        task_review_only,
+        has_original_worker,
+        recovered_thread_id,
+    ) {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            log(&format!(
                 "remediation: task #{task_id} has no persisted Codex thread_id — parking: {error}"
             ));
-                persist_codex_provider_block(
-                    db_path,
-                    task_id,
-                    "Codex remediation requires the original persisted thread_id",
-                    &CodexRetryTurn {
-                        model: remediation_model.clone(),
-                        effort: remediation_effort.clone(),
-                        prompt: prompt.clone(),
-                        turn_kind: "rework".into(),
-                        thread_id: None,
-                    },
-                )
-                .await
-                .ok();
-                let p = db_path.clone();
-                let name = agent_name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
-                })
-                .await;
-                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return false;
-            }
-        };
+            persist_codex_provider_block(
+                db_path,
+                task_id,
+                "Codex remediation requires the original persisted thread_id",
+                &CodexRetryTurn {
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
+                    prompt: prompt.clone(),
+                    turn_kind: "rework".into(),
+                    thread_id: None,
+                },
+            )
+            .await
+            .ok();
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+            })
+            .await;
+            cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
+            name_pool.release(&agent_name);
+            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            return false;
+        }
+    };
 
     let spawn_result: std::io::Result<runner::RunnerProc> = match remediation_kind {
         runner::AgentKind::Claude => agent::AgentProc::spawn(
@@ -9922,8 +10104,8 @@ async fn spawn_remediation_worker(
             config.agent_bin.as_deref(),
         )
         .map(runner::RunnerProc::Claude),
-        runner::AgentKind::Codex => if let Some(ref tid) = codex_thread_id {
-            codex_agent::CodexProc::spawn_resume(
+        runner::AgentKind::Codex => match codex_thread_id.as_deref() {
+            Some(tid) => codex_agent::CodexProc::spawn_resume(
                 tid,
                 &remediation_model,
                 &remediation_effort,
@@ -9932,9 +10114,18 @@ async fn spawn_remediation_worker(
                 &prompt,
                 &remediation_env,
                 config.agent_bin.as_deref(),
-            )
-        } else {
-            unreachable!("missing Codex remediation thread is parked before spawn")
+            ),
+            None => codex_agent::CodexProc::spawn(
+                &codex_agent::CodexSpec {
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: wt_path.clone(),
+                    prompt: prompt.clone(),
+                    env_vars: remediation_env.clone(),
+                },
+                config.agent_bin.as_deref(),
+            ),
         }
         .map(runner::RunnerProc::Codex),
     };
@@ -9957,6 +10148,7 @@ async fn spawn_remediation_worker(
                         })
                         .await;
                     }
+                    cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -10041,6 +10233,7 @@ async fn spawn_remediation_worker(
                 })
                 .await;
             }
+            cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -10191,88 +10384,6 @@ mod tests {
         let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[1].provider.as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn labels_to_model_effort_tier_maps_to_full_id() {
-        let labels = r#"["kind:fix","tier:opus-46"]"#;
-        let (model, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn labels_to_model_effort_resolves_every_closed_tier() {
-        for tier in quorum_core::model_tiers::MODEL_TIERS {
-            let labels = format!(r#"["tier:{}"]"#, tier.tier);
-            let (model, effort) = labels_to_model_effort(Some(&labels));
-            assert_eq!(model.as_deref(), Some(tier.model_id), "{}", tier.tier);
-            assert_eq!(effort, None, "{}", tier.tier);
-        }
-    }
-
-    #[test]
-    fn labels_to_model_effort_effort_override() {
-        let labels = r#"["effort:high","tier:sonnet-5"]"#;
-        let (model, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model.as_deref(), Some("claude-sonnet-5"));
-        assert_eq!(effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn labels_to_model_effort_no_labels() {
-        let (model, effort) = labels_to_model_effort(None);
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn labels_to_model_effort_empty_suffix_ignored() {
-        let labels = r#"["tier:","effort:"]"#;
-        let (model, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn labels_to_model_effort_malformed_json() {
-        let (model, effort) = labels_to_model_effort(Some("not json"));
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn labels_to_model_effort_first_tier_wins() {
-        let labels = r#"["tier:opus-46","tier:sonnet-5"]"#;
-        let (model, _effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model.as_deref(), Some("claude-opus-4-6"));
-    }
-
-    #[test]
-    fn labels_to_model_effort_unknown_tier_is_not_resolved() {
-        let labels = r#"["tier:unknown-model"]"#;
-        let (model, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(model, None);
-        assert_eq!(effort, None);
-    }
-
-    #[test]
-    fn labels_to_model_effort_rejects_invalid_effort() {
-        let labels = r#"["effort:low"]"#;
-        let (_, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(effort, None, "effort:low must be rejected");
-
-        let labels = r#"["effort:max"]"#;
-        let (_, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(effort, None, "effort:max must be rejected");
-
-        let labels = r#"["effort:medium"]"#;
-        let (_, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(effort.as_deref(), Some("medium"));
-
-        let labels = r#"["effort:high"]"#;
-        let (_, effort) = labels_to_model_effort(Some(labels));
-        assert_eq!(effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -10439,26 +10550,71 @@ mod tests {
     }
 
     #[test]
-    fn extract_complexity_label_valid() {
-        assert_eq!(
-            extract_complexity_label(Some(r#"["complexity:3"]"#)),
-            Some(3)
-        );
-        assert_eq!(
-            extract_complexity_label(Some(r#"["complexity:5","tier:opus-46"]"#)),
-            Some(5)
-        );
+    fn classifier_selection_fails_closed_without_valid_complexity() {
+        let overrides = std::collections::HashMap::new();
+        for refs in [
+            None,
+            Some(r#"{"pr":42}"#.into()),
+            Some(r#"{"cx_est":0}"#.into()),
+            Some(r#"{"cx_est":6}"#.into()),
+            Some(r#"{"cx_est":"5"}"#.into()),
+        ] {
+            let err = classifier_worker_selection(
+                42,
+                &refs,
+                crate::serve_config::RunnerKind::Codex,
+                &overrides,
+            )
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(format!("{err}").contains("cannot dispatch"));
+        }
     }
 
     #[test]
-    fn extract_complexity_label_out_of_range() {
-        assert_eq!(extract_complexity_label(Some(r#"["complexity:0"]"#)), None);
-        assert_eq!(extract_complexity_label(Some(r#"["complexity:6"]"#)), None);
-        assert_eq!(
-            extract_complexity_label(Some(r#"["complexity:bad"]"#)),
-            None
-        );
-        assert_eq!(extract_complexity_label(None), None);
+    fn classifier_selection_owns_codex_model_and_effort() {
+        let overrides = std::collections::HashMap::new();
+        let expected = [
+            (1, "gpt-5.6-luna", "high"),
+            (2, "gpt-5.6-terra", "high"),
+            (3, "gpt-5.6-sol", "medium"),
+            (4, "gpt-5.6-sol", "high"),
+            (5, "gpt-5.6-sol", "high"),
+        ];
+        for (complexity, model, effort) in expected {
+            let refs = Some(format!(r#"{{"cx_est":{complexity}}}"#));
+            let selected = classifier_worker_selection(
+                42,
+                &refs,
+                crate::serve_config::RunnerKind::Codex,
+                &overrides,
+            )
+            .unwrap();
+            assert_eq!(selected, (complexity, model.into(), effort.into()));
+        }
+    }
+
+    #[test]
+    fn classifier_selection_owns_claude_model_and_effort() {
+        let overrides = std::collections::HashMap::new();
+        let expected = [
+            (1, "claude-sonnet-5", "medium"),
+            (2, "claude-opus-4-6", "medium"),
+            (3, "claude-opus-4-6", "high"),
+            (4, "claude-opus-4-7", "high"),
+            (5, "claude-opus-4-8", "high"),
+        ];
+        for (complexity, model, effort) in expected {
+            let refs = Some(format!(r#"{{"cx_est":{complexity}}}"#));
+            let selected = classifier_worker_selection(
+                42,
+                &refs,
+                crate::serve_config::RunnerKind::Claude,
+                &overrides,
+            )
+            .unwrap();
+            assert_eq!(selected, (complexity, model.into(), effort.into()));
+        }
     }
 
     #[test]
@@ -10482,10 +10638,10 @@ mod tests {
     fn suggested_for_codex_defaults_never_mix_claude_models() {
         let empty = std::collections::HashMap::new();
         let expected = [
-            (1, "gpt-5.6-luna", "medium"),
-            (2, "gpt-5.6-terra", "medium"),
-            (3, "gpt-5.6-terra", "high"),
-            (4, "gpt-5.6-sol", "medium"),
+            (1, "gpt-5.6-luna", "high"),
+            (2, "gpt-5.6-terra", "high"),
+            (3, "gpt-5.6-sol", "medium"),
+            (4, "gpt-5.6-sol", "high"),
             (5, "gpt-5.6-sol", "high"),
         ];
         for (cx, model, effort) in expected {
@@ -10510,60 +10666,6 @@ mod tests {
             suggested_for(1, crate::serve_config::RunnerKind::Claude, &m),
             ("claude-sonnet-5".into(), "medium".into())
         );
-    }
-
-    #[test]
-    fn advisory_recommendation_detects_mismatch() {
-        assert!(is_below_advisory_recommendation(
-            "claude-opus-4-6",
-            "medium",
-            "claude-opus-4-7",
-            "high"
-        ));
-        assert!(is_below_advisory_recommendation(
-            "claude-opus-4-7",
-            "medium",
-            "claude-opus-4-7",
-            "high"
-        ));
-        assert!(is_below_advisory_recommendation(
-            "claude-sonnet-5",
-            "high",
-            "claude-opus-4-6",
-            "medium"
-        ));
-    }
-
-    #[test]
-    fn advisory_recommendation_has_no_mismatch_when_at_or_above() {
-        assert!(!is_below_advisory_recommendation(
-            "claude-opus-4-7",
-            "high",
-            "claude-opus-4-7",
-            "high"
-        ));
-        assert!(!is_below_advisory_recommendation(
-            "claude-opus-4-8",
-            "medium",
-            "claude-opus-4-7",
-            "high"
-        ));
-        assert!(!is_below_advisory_recommendation(
-            "claude-opus-4-7",
-            "high",
-            "claude-opus-4-6",
-            "medium"
-        ));
-    }
-
-    #[test]
-    fn mismatch_comparison_never_crosses_providers() {
-        assert!(!is_below_advisory_recommendation(
-            "gpt-5.6-terra",
-            "medium",
-            "claude-opus-4-8",
-            "high"
-        ));
     }
 
     #[test]
@@ -10655,160 +10757,6 @@ mod tests {
         let reviewer = escalated_reviewer_model(&worker_model, "claude-sonnet-5").unwrap();
         assert_eq!(reviewer, "claude-opus-4-8");
         assert!(model_rank(&reviewer) > model_rank(&worker_model));
-    }
-
-    fn test_db() -> (rusqlite::Connection, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
-        (conn, dir)
-    }
-
-    #[test]
-    fn mismatch_alert_posts_feed_and_note() {
-        let (mut conn, _dir) = test_db();
-        let now = 1000;
-        // Create a task to attach the note to
-        quorum_core::tasks::create(
-            &mut conn,
-            "tester",
-            "test task",
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-            now,
-        )
-        .unwrap();
-        let tasks = quorum_core::tasks::list(&conn, None, None, None).unwrap();
-        let tid = tasks[0].id;
-
-        let body =
-            "model/effort mismatch: task #1 cx=4 using opus-4-6/medium, suggested opus-4-7/high";
-        quorum_core::feed::post(
-            &mut conn,
-            "daemon",
-            "alert",
-            None,
-            body,
-            None,
-            Some("owner"),
-            86400,
-            now,
-        )
-        .unwrap();
-        quorum_core::tasks::add_note(&mut conn, "daemon", tid, body, now).unwrap();
-
-        // Verify alert message in feed (read as "owner" — the recipient)
-        let msgs = quorum_core::feed::read(
-            &mut conn,
-            "owner",
-            None,
-            None,
-            quorum_core::feed::ReadFilter::All,
-            10,
-            now,
-        )
-        .unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].kind, "alert");
-        assert!(msgs[0].body.contains("mismatch"));
-
-        // Verify task note
-        let detail = quorum_core::tasks::get_with_notes(&conn, tid)
-            .unwrap()
-            .unwrap();
-        assert_eq!(detail.notes.len(), 1);
-        assert!(detail.notes[0].body.contains("mismatch"));
-    }
-
-    #[test]
-    fn cx_label_mismatch_detected_cx_est_no_upgrade() {
-        // cx_est=5, no labels -> resolved stays at config default, NOT upgraded
-        let labels: Option<&str> = None;
-        let (label_model, label_effort) = labels_to_model_effort(labels);
-        let config_model = "claude-opus-4-6";
-        let config_effort = "medium";
-        let resolved_model = label_model.unwrap_or_else(|| config_model.into());
-        let resolved_effort = label_effort.unwrap_or_else(|| config_effort.into());
-
-        // Verify: resolved is config default (revert proof)
-        assert_eq!(resolved_model, "claude-opus-4-6");
-        assert_eq!(resolved_effort, "medium");
-
-        // Mismatch should be detected
-        let empty = std::collections::HashMap::new();
-        let (sug_model, sug_effort) =
-            suggested_for(5, crate::serve_config::RunnerKind::Claude, &empty);
-        assert!(
-            is_below_advisory_recommendation(
-                &resolved_model,
-                &resolved_effort,
-                &sug_model,
-                &sug_effort,
-            ),
-            "cx 5 on opus-4-6/medium should trigger mismatch alert"
-        );
-    }
-
-    #[test]
-    fn cx_label_4_explicit_tier_high_no_alert() {
-        let labels = Some(r#"["tier:opus-47","effort:high","complexity:4"]"#);
-        let (label_model, label_effort) = labels_to_model_effort(labels);
-        let resolved_model = label_model.unwrap_or_else(|| "claude-opus-4-6".into());
-        let resolved_effort = label_effort.unwrap_or_else(|| "medium".into());
-
-        let empty = std::collections::HashMap::new();
-        let (sug_model, sug_effort) =
-            suggested_for(4, crate::serve_config::RunnerKind::Claude, &empty);
-        assert!(
-            !is_below_advisory_recommendation(
-                &resolved_model,
-                &resolved_effort,
-                &sug_model,
-                &sug_effort,
-            ),
-            "explicit tier:opus-47 effort:high should not trigger mismatch for cx 4"
-        );
-    }
-
-    #[test]
-    fn cx_2_default_no_alert() {
-        let empty = std::collections::HashMap::new();
-        let (sug_model, sug_effort) =
-            suggested_for(2, crate::serve_config::RunnerKind::Claude, &empty);
-        assert!(
-            !is_below_advisory_recommendation("claude-opus-4-6", "medium", &sug_model, &sug_effort,),
-            "cx 2 on opus-4-6/medium matches suggestion, no alert"
-        );
-    }
-
-    #[test]
-    fn explicit_task_labels_beat_worker_defaults_and_recommendations_stay_advisory() {
-        let labels = Some(r#"["tier:sol","effort:high","complexity:4"]"#);
-        let (label_model, label_effort) = labels_to_model_effort(labels);
-        let worker_default_model = "gpt-5.6-terra";
-        let worker_default_effort = "medium";
-        let resolved_model = label_model.unwrap_or_else(|| worker_default_model.into());
-        let resolved_effort = label_effort.unwrap_or_else(|| worker_default_effort.into());
-        let empty = std::collections::HashMap::new();
-        let (suggested_model, suggested_effort) =
-            suggested_for(4, crate::serve_config::RunnerKind::Codex, &empty);
-
-        assert_eq!(resolved_model, "gpt-5.6-sol");
-        assert_eq!(resolved_effort, "high");
-        assert_eq!(suggested_model, "gpt-5.6-sol");
-        assert_eq!(suggested_effort, "medium");
-        assert!(
-            !is_below_advisory_recommendation(
-                &resolved_model,
-                &resolved_effort,
-                &suggested_model,
-                &suggested_effort,
-            ),
-            "advisory recommendations must not rewrite an explicit task selection"
-        );
     }
 
     fn make_dummy_slot() -> SlotState {
@@ -11047,6 +10995,14 @@ mod tests {
             worker_done_event(0, 419),
             Event::SignaledDone { .. }
         ));
+    }
+
+    #[test]
+    fn remediation_retry_slots_never_exceed_worker_cap() {
+        assert_eq!(available_worker_slots(3, 0), 3);
+        assert_eq!(available_worker_slots(3, 2), 1);
+        assert_eq!(available_worker_slots(3, 3), 0);
+        assert_eq!(available_worker_slots(3, 4), 0);
     }
 
     #[tokio::test]
@@ -11548,6 +11504,71 @@ mod tests {
             Some("r2"),
             "force-pushing the prior required head back must still require R2"
         );
+    }
+
+    #[test]
+    fn exhausted_rework_budget_preserves_required_r2_for_returned_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "sampled task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let policy = R2SamplingPolicy {
+            enabled: true,
+            target_per_stratum: 0,
+            steady_state_p: 0.0,
+            default_model: "model".into(),
+            default_effort: "high".into(),
+        };
+
+        // Head A was reviewed before rework exhausted the budget and durably
+        // required R2. Rework then consumes the final bounded round.
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 42, "head-a", true)
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+            rusqlite::params![quorum_core::lifecycle::REWORK_CAP as i64, task_id],
+        )
+        .unwrap();
+
+        // The branch moves to new head B, which correctly receives the final
+        // round's recorded skip. It then force-pushes back to A and obtains a
+        // fresh R1 approval. The cap can establish a skip only for B; it
+        // cannot replace A's R2 gate.
+        assert!(!decide_r2_requirement(&mut conn, task_id, 42, "head-b", &policy).unwrap());
+        assert!(decide_r2_requirement(&mut conn, task_id, 42, "head-a", &policy).unwrap());
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "fresh-r1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head-a".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next_needed_role(&conn, 42, "head-a").unwrap(), Some("r2"));
+
+        // Restart reconciliation reads the same immutable decision.
+        drop(conn);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(r2_required_for_head(&conn, task_id, 42, "head-a"));
+        assert_eq!(next_needed_role(&conn, 42, "head-a").unwrap(), Some("r2"));
     }
 
     /// A sampled-out head leaves no `r2` approval row. The provisioning
@@ -12177,32 +12198,6 @@ mod tests {
     }
 
     #[test]
-    fn simultaneous_claude_and_codex_tasks_resolve_independently() {
-        let claude_labels = Some(r#"["tier:opus-47"]"#);
-        let codex_labels = Some(r#"["tier:terra"]"#);
-        let (cm, _) = labels_to_model_effort(claude_labels);
-        let (xm, _) = labels_to_model_effort(codex_labels);
-        let ck = resolve_provider(cm.as_deref().unwrap()).unwrap();
-        let xk = resolve_provider(xm.as_deref().unwrap()).unwrap();
-        assert_eq!(ck, runner::AgentKind::Claude);
-        assert_eq!(xk, runner::AgentKind::Codex);
-    }
-
-    #[test]
-    fn no_model_label_resolves_daemon_model() {
-        let (m, _) = labels_to_model_effort(None);
-        assert!(m.is_none(), "no label must produce no model override");
-        assert_eq!(
-            resolve_provider("claude-opus-4-6").unwrap(),
-            runner::AgentKind::Claude
-        );
-        assert_eq!(
-            resolve_provider("gpt-5.6-terra").unwrap(),
-            runner::AgentKind::Codex
-        );
-    }
-
-    #[test]
     fn deterministic_provider_matrix_records_worker_r1_and_r2_routes() {
         struct Case {
             name: &'static str,
@@ -12370,6 +12365,138 @@ mod tests {
     }
 
     #[test]
+    fn cross_provider_reviewer_recovery_keeps_persisted_claude_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-restart.db");
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "cross-provider review",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "r1-claude",
+                "reviewer",
+                "claude-opus-4-8",
+                "high",
+                "claude",
+                11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    r#"{"codex_reviewer_r1_thread_id":"stale-codex-thread"}"#,
+                    task_id
+                ],
+            )
+            .unwrap();
+        }
+
+        let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+            .unwrap()
+            .expect("interrupted Claude reviewer");
+        assert_eq!(recovery.kind, runner::AgentKind::Claude);
+        assert_eq!(recovery.model, "claude-opus-4-8");
+        assert_eq!(
+            recovery.thread_id, None,
+            "a Claude recovery must ignore a stale Codex continuation ref"
+        );
+        assert!(
+            require_reviewer_provider(
+                true,
+                "claude-opus-4-8",
+                recovery.kind,
+                "interrupted R1 reviewer",
+            )
+            .is_ok(),
+            "cross-provider reviewer recovery must follow review_model"
+        );
+        assert!(
+            require_reviewer_provider(
+                true,
+                "gpt-5.6-terra",
+                recovery.kind,
+                "interrupted R1 reviewer",
+            )
+            .is_err(),
+            "a stale Claude recovery must not bypass a configured Codex reviewer"
+        );
+    }
+
+    #[test]
+    fn cross_provider_reviewer_uses_its_own_default_binary() {
+        use crate::serve_config::RunnerKind;
+
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Codex,
+                Some("/opt/codex"),
+                runner::AgentKind::Codex
+            ),
+            Some("/opt/codex")
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Codex,
+                Some("/opt/codex"),
+                runner::AgentKind::Claude
+            ),
+            None,
+            "a Claude reviewer must not receive the configured Codex executable"
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Claude,
+                Some("/opt/claude"),
+                runner::AgentKind::Codex
+            ),
+            None,
+            "a Codex reviewer must not receive the configured Claude executable"
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                false,
+                RunnerKind::Claude,
+                Some("/opt/test-agent"),
+                runner::AgentKind::Codex
+            ),
+            Some("/opt/test-agent"),
+            "legacy mixed-provider recovery preserves its configured runner override"
+        );
+    }
+
+    #[test]
+    fn explicit_review_model_without_provider_selects_its_model_and_effort() {
+        assert_eq!(
+            configured_reviewer_selection(false, true, "gpt-5.6-terra", "high",),
+            Some(("gpt-5.6-terra", "high")),
+            "an explicit review_model must not be ignored when provider is absent"
+        );
+        assert_eq!(
+            configured_reviewer_selection(false, false, "gpt-5.6-terra", "high"),
+            None,
+            "legacy configuration continues to use escalation"
+        );
+    }
+
+    #[test]
     fn recovery_rejects_unknown_or_mismatched_provider_metadata() {
         assert!(resolve_remediation_provider(
             Some("claude"),
@@ -12425,20 +12552,35 @@ mod tests {
     }
 
     #[test]
-    fn codex_remediation_requires_durable_thread_but_claude_does_not() {
+    fn codex_remediation_only_starts_fresh_for_workerless_review_only_tasks() {
         assert!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, None).is_err(),
-            "Codex remediation must never silently start a fresh thread"
+            require_codex_remediation_thread(runner::AgentKind::Codex, false, true, None).is_err(),
+            "implementation remediation must never silently start a fresh thread"
+        );
+        assert!(
+            require_codex_remediation_thread(runner::AgentKind::Codex, true, true, None).is_err(),
+            "a review-only task with a prior managed worker must keep exact continuation semantics"
         );
         assert_eq!(
-            require_codex_remediation_thread(runner::AgentKind::Claude, None).unwrap(),
+            require_codex_remediation_thread(runner::AgentKind::Codex, true, false, None).unwrap(),
+            None,
+            "a workerless review-only task may start its first Codex remediation turn fresh"
+        );
+        assert_eq!(
+            require_codex_remediation_thread(runner::AgentKind::Claude, false, false, None)
+                .unwrap(),
             None,
             "legacy Claude remediation does not require Codex thread metadata"
         );
         assert_eq!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, Some("thread-exact".into()))
-                .unwrap()
-                .as_deref(),
+            require_codex_remediation_thread(
+                runner::AgentKind::Codex,
+                true,
+                true,
+                Some("thread-exact".into()),
+            )
+            .unwrap()
+            .as_deref(),
             Some("thread-exact")
         );
     }

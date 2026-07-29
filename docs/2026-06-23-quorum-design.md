@@ -41,7 +41,7 @@ accepted task
   → pushed pull request
   → required checks
   → independent R1 review
-  → adversarial R2 review
+  → independent R2 review focused on any material gaps left by R1
   → rework when required
   → final required-checks revalidation
   → daemon-controlled approval and merge
@@ -517,7 +517,8 @@ only through an explicit outside request)
 - `VerdictApprove` → Merging · effects: MergePr
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
-- `VerdictChanges` (review_only=true) → Failed · effects: PostFindingsNote, ReleaseLease
+- `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
+  ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
 - `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
 - `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
@@ -541,11 +542,12 @@ only through an explicit outside request)
 
 - **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
   The daemon enforces #206: the deliverer (who signaled `submit`) cannot review.
-- **Rework cap:** `REWORK_CAP = 3`. When `rework_round >= 3` and VerdictChanges fires,
+- **Rework cap:** `REWORK_CAP = 5`. When `rework_round >= 5` and VerdictChanges fires,
   the task goes to Failed (not Rework).
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
-  with `review_only=true`. VerdictChanges on a review-only task goes to Failed (no worker
-  to rework).
+  with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
+  through to generic implementation-worker provisioning, because remediation must retain
+  the adopted PR target.
 - **Sticky InReview:** reviewer crash/expiry does NOT leave InReview — the task stays and a
   new reviewer is spawned. Prevents review tasks from reverting to Open.
 - **Resume semantics:** rework feeds a new turn to the existing worker (ResumeWorker);
@@ -652,6 +654,13 @@ coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
 error; values are never clamped. `r2_enabled = false` disables sampling, not the
 R2 safety gate, and therefore also leaves R2 mandatory.
 
+R2 is skipped when R1 approves after `rework_round` has reached `REWORK_CAP`
+and that PR head has no prior decision. At that point no bounded rework round
+remains for an R2 changes verdict, so R1 approval is the final review gate. The
+skip is recorded for that PR head through the same daemon-owned sampling-decision
+mechanism. A prior decision requiring R2 remains authoritative if the branch
+later returns to that head.
+
 When R1 approves, Quorum records a sampling decision in a daemon-owned table,
 keyed by both PR number and head SHA; it is not task refs because task refs are
 agent-writable metadata and cannot authorize a merge-gate bypass. Later rework
@@ -673,9 +682,9 @@ approval path merges; when it requires R2, the following dual-review flow applie
    slot if available, or resolved from the PR head ref via GitHub (allowing R2 to
    proceed even without a live worker). Before provisioning, the daemon applies the
    pre-review CI gate to the current head SHA; a moved head must become green again
-   before R2 consumes a slot. R2's prompt frames it as an adversarial second reviewer
-   that attempts to falsify the merge-safety claim, reviews independently before
-   comparing against R1, and requires evidence-bound findings.
+   before R2 consumes a slot. R2 reviews independently before comparing against R1,
+   then checks for any material gaps R1 did not surface, if such gaps exist. Agreement
+   with R1 and no additional findings are valid outcomes; findings remain evidence-bound.
 4. **Verdict flow** — R2's verdict drives lifecycle:
    - Approved → record R2 durable approval `(pr, 'r2')`. Merge proceeds only when
      `dual_approved(pr)` returns a common head SHA (both R1 and R2 approved with
@@ -707,8 +716,11 @@ are BLOCKING unless evidence disproves the failure.
 ### Daemon-owned pre-review CI gate
 
 Every reviewer provisioning attempt, initial or after rework, is gated by the daemon
-against the current PR head SHA. Reviewer agents do not poll CI and do not run local
-test/build/fmt/lint commands; they inspect code and the PR body's verification evidence.
+against the current PR head SHA. Reviewer agents do not poll CI, run local
+test/build/fmt/lint commands, inspect CI status, or police PR-body verification evidence,
+formatting, transcripts, links, headings, evidence tokens, or checklists. They review the
+implementation and its tests as code. The daemon alone owns CI enforcement for reviewer
+provisioning and merge.
 
 - `Ready` plus all configured `required_jobs` at `SUCCESS` permits provisioning.
 - `Pending`, `TimedOut`, and pending required jobs keep the task `in-review`. The daemon
@@ -906,21 +918,52 @@ prevents a restart from merging code the reviewer never saw.
 
 #### Actionable rework with no live worker
 
-When an actionable outcome (Failed checks, MergeConflict, retryable merge failure) fires
-VerdictChanges and the resulting status is `rework`, but no live worker exists for the
-task, the daemon spawns a **remediation worker** (`spawn_remediation_worker` in
-`serve/mod.rs`). The remediation worker:
+When an actionable outcome (Failed checks, MergeConflict, retryable merge failure, or a
+blocking review verdict) enters `rework`, but no live worker exists for the task, the daemon
+spawns a **remediation worker** (`spawn_remediation_worker` in `serve/mod.rs`). The
+remediation worker:
 
 - Gets the existing PR branch (resolved from GitHub via `resolve_pr_target`, which returns
   the authoritative head ref, SHA, and fork status; falls back to daemon branch convention
   when GitHub is unavailable)
 - Gets the blocking findings / merge error as its rework prompt
 - Is bounded by the same recovery policy as other workers (idle timeout, cost cap)
-- Counts toward the rework cap (`rework_round` was already incremented by lifecycle)
+- Counts toward the worker cap and rework cap (`rework_round` was already incremented by
+  lifecycle)
 
-If remediation worker provisioning fails (branch not found, worktree failure), the daemon
-fires `AgentFailed { reason: "no worker for rework" }` which transitions the task back
-to InReview (sticky) and re-spawns a reviewer on the next tick — not a silent strand.
+#### Workerless review-only Codex boundary
+
+A review-only/adopted PR has no original managed worker by construction. For Codex only,
+the daemon therefore permits a fresh `codex exec` remediation turn **only** when durable
+`agent_runs` show that the task has no original managed worker and the task remains
+`review_only`. This is not a fallback for an implementation task or a lost continuation:
+
+- Before the fresh turn, the daemon resolves and persists the PR target, provisions the
+  exact verified branch/SHA worktree, atomically claims the rework, and issues the
+  run-scoped worker capability.
+- On `thread.started`, the provider-issued thread ID is persisted in task refs before any
+  later turn can depend on it. A later remediation is an exact `codex exec resume` of that
+  ID with the persisted model, effort, prompt, PR target, and worker role.
+- If an original managed worker exists, a Codex remediation requires its exact persisted
+  continuation ID. Missing or malformed identity is a fail-closed provisioning failure;
+  Quorum never silently starts a fresh thread for that implementation task.
+- Once a workerless fresh remediation has been started, it has become a managed worker for
+  this purpose. A crash or shutdown before a durable thread ID exists is also fail-closed,
+  rather than authorizing a replacement fresh turn.
+
+Deterministic remediation provisioning/configuration failure (including branch, worktree,
+provider, or missing required continuation identity) releases the lease, persists the
+blocking feedback, and parks the task in `failed` with its `rework` resume marker. It does
+not emit `AgentFailed` back to `in-review`, so unchanged code cannot repeatedly consume
+reviewer slots or rework rounds. An owner may explicitly `task-retry`; review-only retries
+use the same persisted PR target and feedback through a dedicated reconciliation path, not
+generic worker provisioning, and that path may fill only the remaining `config.cap` worker
+slots in a tick.
+
+During controlled shutdown/drain no fresh remediation is started. A running fresh
+remediation is reaped through the normal worker cleanup path; its persisted thread ID
+supports exact continuation after restart. If no durable ID was observed, recovery remains
+fail-closed and leaves the parked task for explicit operator action.
 
 #### Code paths (current implementation references)
 
@@ -1382,22 +1425,19 @@ Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
 Runner-specific configuration is scoped under `[claude]` or `[codex]`.
 
-**Per-run model selection (#194).** Each managed run resolves its provider from
-the task's model selection, not from a daemon-global runner kind:
+**Classifier-owned per-run model selection.** Task creators describe the outcome,
+constraints, and verification but have no routing authority. `task-create` rejects every
+`complexity:*`, `tier:*`, and `effort:*` label with usage exit 2. Existing stored routing
+labels are ignored.
 
-- A task with an explicit `tier:` label is validated at creation against one closed,
-  shared vocabulary and resolves to its exact full model ID: `sonnet-5` →
-  `claude-sonnet-5`, `opus-46` → `claude-opus-4-6`, `opus-47` →
-  `claude-opus-4-7`, `opus-48` → `claude-opus-4-8`, `luna` →
-  `gpt-5.6-luna`, `terra` → `gpt-5.6-terra`, and `sol` → `gpt-5.6-sol`.
-  Unknown non-empty tiers (including legacy `o3` and `o4-mini`) fail with usage
-  exit 2 instead of falling back. Empty `tier:` and `effort:` suffixes remain
-  compatible no-ops for existing stored labels. Only `effort:medium` and
-  `effort:high` are accepted; other non-empty effort labels fail with usage exit 2.
-  `resolve_provider` maps the resulting model to `AgentKind::Claude` (any
-  `claude-*` model) or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
-- A task with no explicit model selection uses the daemon's configured
-  `runner_kind` and `model`, preserving existing Claude-default behavior.
+- An open implementation task is not dispatchable until the daemon classifier has
+  persisted a valid `cx_est` from 1 through 5 in task refs. Missing, malformed, out-of-range,
+  timed-out, or failed classification never falls back to the daemon worker default.
+- The active daemon provider selects the corresponding model and effort from its five-level
+  routing ladder. Operator-owned `suggested_models` overrides and minimum model/effort
+  floors remain available; creators cannot lower or raise an individual task.
+- `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*` model)
+  or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - Reviewers continue to use the daemon's configured provider.
@@ -1426,7 +1466,7 @@ there is no universal "next stronger model" across families.
 3. **Enable Codex workers.** Prove initial work, submit, rework continuation, restart,
    watchdogs, auth/quota failure, and unsupported-USD-limit rejection.
 4. **Enable Codex R1 and R2.** Prove changes/rework/re-review, stale-head rejection,
-   self-review prevention, preflight evidence, CI wait, daemon approval, and merge.
+   self-review prevention, daemon-owned CI wait, approval, and merge.
 5. **Simplify configuration.** Preserve old Claude configuration, add explicit
    per-role mappings, and install runner-appropriate Quorum guidance.
 
@@ -1454,10 +1494,14 @@ classifier_effort = "medium"
 
 `provider` is optional. When absent, the legacy `agent` / `model` / `effort` configuration
 and Claude-compatible defaults remain available. When present, it is a fail-safe operating
-constraint: worker, R1, R2, live task classification, and post-merge review classification
-must all resolve to that provider. An explicit task model or `tier:` label for another
-provider is rejected rather than overriding the constraint, and spawn, retry, persistence,
-or recovery must never fall back to another provider.
+constraint for workers, live task classification, post-merge review classification, and
+collectors. `review_model` is the explicit exception: R1 and R2 resolve their runner from
+that model and may intentionally use the other supported provider. Classifier routing
+always stays within the configured worker provider; a cross-provider operator override is
+rejected rather than overriding the constraint. Reviewer spawn, retry, persistence, and
+recovery must instead remain bound to the configured reviewer model's provider; they must
+not fall back to a worker-provider CLI or resume a continuation belonging to another
+provider.
 
 The role model and effort fields are independently configurable. R1 and R2 use the explicit
 review selection instead of cross-provider strength inference. Every run persists the exact
@@ -1466,16 +1510,13 @@ attachment; recovery reuses those durable values. Unknown models, provider/model
 missing continuation metadata, and unavailable configured runners fail loudly and enter the
 existing bounded retry or parked-task path.
 
-The initial operational profile uses Codex `gpt-5.6-terra` at medium effort for workers,
-`gpt-5.6-luna` at medium effort for classifiers and defaulted collectors, and high effort
-for R1/R2. Complexity recommendations are provider-aware
-operational routing policy: Claude uses `sonnet-5`/`opus-46`/`opus-47`/`opus-48`, while Codex
-uses `luna`/`terra`/`sol`, each at medium or high effort only. The active daemon provider
-selects its own five-level ladder; `suggested_models` may explicitly override a level using
-only the closed task-tier vocabulary and medium/high effort. Task `tier:`/`effort:` labels
-still take precedence over worker defaults, and recommendations remain advisory. These
-ladders do not claim cross-vendor benchmark equivalence or establish a cross-vendor strength
-ordering.
+The classifier and defaulted collectors use Codex `gpt-5.6-luna` at medium effort, and
+R1/R2 retain their configured review selection. Worker routing is authoritative:
+complexities 1–5 map to `luna/high`, `terra/high`, `sol/medium`, `sol/high`, and `sol/high`.
+Claude retains its provider-specific five-level ladder. `suggested_models` may let an
+operator replace a level using only the closed task-tier vocabulary and medium/high effort.
+These ladders do not claim cross-vendor benchmark equivalence or establish a cross-vendor
+strength ordering.
 
 ### Verification gates
 

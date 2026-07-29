@@ -1,6 +1,6 @@
-//! Task classifier — complexity scoring, shape-lint flags, type tags, and
-//! duplicate-of hints. Observational v1: outputs are stored in `refs` and
-//! surfaced as notes; nothing acts on them automatically.
+//! Task classifier — authoritative complexity scoring plus shape-lint flags,
+//! type tags, and duplicate-of hints. `cx_est` gates worker dispatch and selects
+//! model/effort; the remaining outputs are observational metadata.
 
 use crate::complexity;
 use crate::db::begin_immediate;

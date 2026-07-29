@@ -138,6 +138,20 @@ impl Case {
         labels: Option<&str>,
         role_config: Option<&str>,
     ) -> Self {
+        Self::start_with_review_pr(default_provider, model, labels, role_config, None)
+    }
+
+    fn start_review_only(default_provider: &str, model: &str) -> Self {
+        Self::start_with_review_pr(default_provider, model, None, None, Some(1))
+    }
+
+    fn start_with_review_pr(
+        default_provider: &str,
+        model: &str,
+        labels: Option<&str>,
+        role_config: Option<&str>,
+        review_pr: Option<i64>,
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let worktrees = tempfile::tempdir().unwrap();
@@ -169,25 +183,65 @@ impl Case {
                 "provider lifecycle",
                 "--created-by",
                 "test",
-                "--refs",
-                r#"{"cx_by":"test:v1","cx_est":2}"#,
             ]);
-        if let Some(labels) = labels {
-            create.args(["--labels", labels]);
+        if let Some(pr) = review_pr {
+            let pr_string = pr.to_string();
+            create.args(["--review-pr", &pr_string]);
         }
         assert!(create.status().unwrap().success());
+        let db_path = home.path().join("repos/test__repo/quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 1,
+                cx_est: 2,
+                cx_flags: Vec::new(),
+                cx_tags: Vec::new(),
+                cx_dup_of: Vec::new(),
+            }],
+            "test-classifier:v1",
+            1,
+        )
+        .unwrap();
+        if let Some(labels) = labels {
+            conn.execute("UPDATE tasks SET labels = ?1 WHERE id = 1", [labels])
+                .unwrap();
+        }
+
+        // A review-only task has no managed branch or worker. Persist the
+        // resolved PR identity before the daemon begins orphan review
+        // provisioning so the test exercises the same verified-PR path as
+        // production rather than a branch-name fallback.
+        if let Some(pr) = review_pr {
+            let head_ref = format!("review-pr-{pr}");
+            assert!(Command::new("git")
+                .args(["-C", &repo.path().to_string_lossy(), "branch", &head_ref])
+                .status()
+                .unwrap()
+                .success());
+            let head_sha = String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &repo.path().to_string_lossy(), "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap();
+            let mut conn =
+                quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+            quorum_core::pr_targets::upsert(&mut conn, 1, pr, &head_ref, head_sha.trim(), false)
+                .unwrap();
+        }
 
         let sentinel = tempfile::tempdir().unwrap();
-        let cli_provider = if role_config.is_some() {
+        let codex_only = role_config.is_some_and(|config| config.contains(r#"provider = "codex""#));
+        let cli_provider = if codex_only {
             "codex"
         } else {
             default_provider
         };
-        let cli_model = if role_config.is_some() {
-            "gpt-5.6-terra"
-        } else {
-            model
-        };
+        let cli_model = if codex_only { "gpt-5.6-terra" } else { model };
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", home.path())
@@ -268,6 +322,15 @@ impl Case {
         role_config: Option<&str>,
     ) {
         self.handle.stop_mut();
+        self.restart_after_stop(default_provider, model, role_config);
+    }
+
+    fn restart_after_stop(
+        &mut self,
+        default_provider: &str,
+        model: &str,
+        role_config: Option<&str>,
+    ) {
         let names = self.home.path().join("names.txt");
         let runner = self.home.path().join("dual-runner.sh");
         let config_path = role_config.map(|contents| {
@@ -379,6 +442,20 @@ impl Case {
         );
     }
 
+    fn retry_parked(&self) {
+        let output = Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", self.home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .args(["task-retry", "--task-id", "1", "--by", "operator"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "task-retry failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn approve_current_reviewer(&mut self, marker: &str) {
         self.handle.wait_for(marker);
         let reviewer = self.handle.agent_after(marker);
@@ -471,7 +548,7 @@ fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
     assert_eq!(
         run_routes_with_effort(&runs),
         [
-            ("worker", None, "gpt-5.6-terra", "medium", "codex"),
+            ("worker", None, "gpt-5.6-terra", "high", "codex"),
             ("reviewer", None, "gpt-5.6-terra", "high", "codex"),
             ("reviewer", Some("r2"), "gpt-5.6-terra", "high", "codex"),
         ],
@@ -480,26 +557,24 @@ fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
 }
 
 #[test]
-fn configurable_chatgpt_only_rejects_claude_task_tier_without_spawning() {
-    let mut case = Case::start_with_role_config(
+fn configurable_chatgpt_only_ignores_legacy_claude_task_tier() {
+    let runs = Case::start_with_role_config(
         "claude",
         "claude-opus-4-6",
         Some(r#"["tier:opus-46"]"#),
         Some(CHATGPT_ONLY_ROLE_CONFIG),
-    );
+    )
+    .finish();
 
-    case.handle.wait_for("rejected in provider 'codex' mode");
-    let runs = quorum_core::agent_runs::runs_for_task(&case.db(), 1).unwrap();
-    assert!(
-        runs.is_empty(),
-        "a disallowed Claude tier must be rejected before any agent run is persisted: {runs:?}"
+    assert_eq!(
+        run_routes_with_effort(&runs),
+        [
+            ("worker", None, "gpt-5.6-terra", "high", "codex"),
+            ("reviewer", None, "gpt-5.6-terra", "high", "codex"),
+            ("reviewer", Some("r2"), "gpt-5.6-terra", "high", "codex"),
+        ],
+        "legacy task routing labels must not override classifier-owned routing"
     );
-    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
-    assert_ne!(
-        task.status, "working",
-        "a rejected task must not remain claimed without a worker"
-    );
-    case.handle.stop_mut();
 }
 
 #[test]
@@ -518,7 +593,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
     assert_eq!(
         run_routes(&codex),
         [
-            ("worker", None, "o3", "codex"),
+            ("worker", None, "gpt-5.6-terra", "codex"),
             ("reviewer", None, "o3", "codex"),
             ("reviewer", Some("r2"), "o3", "codex"),
         ]
@@ -533,19 +608,20 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
     assert_eq!(
         run_routes(&mixed),
         [
-            ("worker", None, "gpt-5.6-terra", "codex"),
-            ("reviewer", None, "claude-opus-4-6", "claude"),
-            ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
+            ("worker", None, "claude-opus-4-6", "claude"),
+            ("reviewer", None, "claude-opus-4-7", "claude"),
+            ("reviewer", Some("r2"), "claude-opus-4-7", "claude"),
         ]
     );
 }
 
 #[test]
 fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
-    let mut case = Case::start(
-        "claude",
-        "claude-opus-4-6",
-        Some(r#"["tier:terra","effort:high"]"#),
+    let mut case = Case::start_with_role_config(
+        "codex",
+        "gpt-5.6-terra",
+        None,
+        Some(CHATGPT_ONLY_ROLE_CONFIG),
     );
     case.handle.wait_for("spawning agent");
     let worker = case.handle.agent_after("spawning agent ");
@@ -571,13 +647,6 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
     case.handle.wait_for("rework #1 started");
     case.handle.wait_for("turn");
     let expected_thread = format!("thread-{worker}");
-    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
-    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        refs["codex_thread_id"].as_str(),
-        Some(expected_thread.as_str()),
-        "the original worker's provider thread must be durable before remediation"
-    );
     let log = std::fs::read_to_string(&case.runner_log).unwrap();
     let expected_resume = format!("{worker}|exec resume {expected_thread} --json ");
     assert!(
@@ -586,15 +655,6 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
          ({expected_resume:?}): {log}"
     );
     case.done(&worker, &["--pr", "1"]);
-    case.handle.wait_for("ResumeReviewer: fed re-review turn");
-    let reviewer_pid: i32 = case
-        .db()
-        .query_row("SELECT pid FROM journal WHERE agent=?1", [&r1], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    unsafe { libc::kill(reviewer_pid, libc::SIGKILL) };
-    case.handle.wait_for(&format!("reviewer {r1} died"));
     case.approve_current_reviewer("spawning reviewer ");
     case.approve_current_reviewer("R2: pre-merge reviewer ");
     case.handle.wait_for("merged — firing MergeSucceeded");
@@ -608,9 +668,9 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
         run_routes(&runs),
         [
             ("worker", None, "gpt-5.6-terra", "codex"),
-            ("reviewer", None, "claude-opus-4-6", "claude"),
-            ("reviewer", None, "claude-opus-4-6", "claude"),
-            ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
+            ("reviewer", None, "gpt-5.6-terra", "codex"),
+            ("reviewer", None, "gpt-5.6-terra", "codex"),
+            ("reviewer", Some("r2"), "gpt-5.6-terra", "codex"),
         ]
     );
     let workers: Vec<_> = runs.iter().filter(|run| run.role == "worker").collect();
@@ -630,6 +690,297 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
         "changes must require a fresh R1"
     );
     drop(conn);
+    case.handle.stop();
+}
+
+#[test]
+fn workerless_review_only_changes_start_fresh_codex_remediation_on_verified_pr() {
+    let mut case = Case::start_review_only("codex", "gpt-5.6-terra");
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for("result");
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "fix the review finding",
+        ],
+    );
+
+    case.handle.wait_for("spawning remediation worker ");
+    let remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {remediation} result"));
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert!(task.review_only);
+    assert_eq!(task.rework_round, 1);
+    assert_eq!(task.assignee.as_deref(), Some(remediation.as_str()));
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        refs["codex_thread_id"].as_str(),
+        Some(format!("thread-{remediation}").as_str()),
+        "the fresh remediation thread must be durable before any later continuation"
+    );
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target='task:1' AND active=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        active_claims, 0,
+        "a completed remediation turn must not leave a dangling active claim"
+    );
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        run_routes(&runs),
+        [
+            ("reviewer", None, "gpt-5.6-terra", "codex"),
+            ("worker", None, "gpt-5.6-terra", "codex"),
+        ],
+        "review-only remediation gets one new worker run without inventing an original one"
+    );
+    let target: (String, String) = conn
+        .query_row(
+            "SELECT head_ref, head_sha FROM pr_targets WHERE task_id=1 AND pr_number=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(target.0, "review-pr-1");
+    assert!(!target.1.is_empty());
+    drop(conn);
+
+    let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let fresh = format!("{remediation}|exec --json --model gpt-5.6-terra ");
+    assert!(
+        log.lines().any(|line| line.starts_with(&fresh)),
+        "workerless review-only remediation must start a fresh Codex turn: {log}"
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.starts_with(&format!("{remediation}|exec resume "))),
+        "workerless review-only remediation must not fabricate a continuation: {log}"
+    );
+
+    case.done(&remediation, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(task.rework_round, 1);
+    drop(conn);
+    case.handle.stop();
+}
+
+#[test]
+fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop() {
+    let mut case = Case::start_review_only("codex", "gpt-5.6-terra");
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for("result");
+
+    // Remove the executable only after the initial reviewer is running. The
+    // next process creation is the remediation worker, so this forces a
+    // deterministic spawn-time provisioning failure rather than an agent
+    // runtime failure.
+    std::fs::remove_file(case.home.path().join("dual-runner.sh")).unwrap();
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "still blocked",
+        ],
+    );
+    case.handle.wait_for("PARKED: task #1");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    assert_eq!(task.rework_round, 1, "the failed spawn consumes one round");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+    assert_eq!(refs["daemon_resume_status"], "rework");
+    assert_eq!(refs["remediation_feedback"], "still blocked");
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        runs.iter().filter(|run| run.role == "reviewer").count(),
+        1,
+        "the task must not provision a replacement reviewer after a failed remediation spawn"
+    );
+    assert!(
+        runs.iter().all(|run| run.role != "worker"),
+        "a spawn-time failure must not create a worker run"
+    );
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target='task:1' AND active=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_claims, 0, "parking releases the remediation claim");
+    drop(conn);
+
+    // An explicit retry must be schedulable through the review-only
+    // remediation path, not generic worker provisioning (which would create
+    // a daemon branch rather than reuse the adopted PR branch).
+    write_dual_protocol_runner(case.home.path());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "review-pr-1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.retry_parked();
+    case.handle
+        .wait_for("durable remediation retry: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
+    let remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {remediation} result"));
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.assignee.as_deref(), Some(remediation.as_str()));
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        runs.iter().filter(|run| run.role == "worker").count(),
+        1,
+        "one explicit retry must create exactly one remediation worker"
+    );
+    drop(conn);
+    case.done(&remediation, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
+    case.handle.stop();
+}
+
+#[test]
+fn remediation_retry_for_implementation_task_preserves_feedback_and_codex_thread() {
+    let mut case = Case::start("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("spawning agent ");
+    let original_worker = case.handle.agent_after("spawning agent ");
+    case.handle
+        .wait_for(&format!("worker {original_worker} result"));
+    let original_thread = format!("thread-{original_worker}");
+    case.done(&original_worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // A daemon restart drops the submitted worker slot while recovering the
+    // durable reviewer. The subsequent changes verdict must therefore create
+    // a replacement remediation worker rather than feed a live worker.
+    case.handle.stop_mut();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.restart_after_stop("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // Force the replacement remediation process spawn to fail after the
+    // original worker and its exact Codex thread have been persisted.
+    std::fs::remove_file(case.home.path().join("dual-runner.sh")).unwrap();
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "preserve this exact blocker",
+        ],
+    );
+    case.handle.wait_for("PARKED: task #1");
+    std::thread::sleep(Duration::from_millis(250));
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["remediation_feedback"], "preserve this exact blocker");
+    assert_eq!(refs["codex_thread_id"], original_thread);
+    drop(conn);
+
+    write_dual_protocol_runner(case.home.path());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.retry_parked();
+    case.handle
+        .wait_for("durable remediation retry: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
+    let replacement = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {replacement} result"));
+
+    let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let resume_prefix = format!("{replacement}|exec resume {original_thread} --json ");
+    let resume = log
+        .lines()
+        .find(|line| line.starts_with(&resume_prefix))
+        .unwrap_or_else(|| panic!("replacement must resume the original thread: {log}"));
+    assert!(
+        log.contains("preserve this exact blocker"),
+        "replacement prompt must contain the accepted reviewer feedback: {log}"
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.starts_with(&format!("{replacement}|exec --json "))),
+        "implementation remediation must not start a fresh Codex thread: {log}"
+    );
+    assert!(
+        !resume.contains(&format!("You are agent {replacement}.")),
+        "replacement must not receive the initial-task prompt: {resume}"
+    );
+
+    case.done(&replacement, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
     case.handle.stop();
 }
 
@@ -781,7 +1132,7 @@ fn codex_remediation_resumes_with_persisted_worker_effort() {
         .find(|line| line.starts_with(&format!("{worker}|exec resume {expected_thread} ")))
         .unwrap_or_else(|| panic!("missing exact Codex remediation resume: {log}"));
     assert!(
-        resume.contains("model_reasoning_effort=medium"),
+        resume.contains("model_reasoning_effort=high"),
         "remediation must reuse persisted worker effort, not review effort: {resume}"
     );
     case.handle.stop_mut();

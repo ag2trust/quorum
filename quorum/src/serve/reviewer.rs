@@ -37,9 +37,9 @@ pub struct ReviewerSpec {
 /// demanding speculative findings or an audit of unrelated code.
 const COMPLETE_REVIEW_CONTRACT: &str = "\
 ## Complete-review requirement\n\n\
-Complete the planned review before submitting a verdict. Finding one blocker never ends \
-review exploration: keep auditing the full current diff, surrounding code, and relevant \
-sibling and negative paths.\n\
+Complete the planned review before submitting a verdict. Coverage, not the number of \
+findings, determines when the review is complete: audit the full current diff, surrounding \
+code, and relevant sibling and negative paths. A complete review may have zero findings.\n\
 For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
 (for example, producers × success/error/shutdown) and audit every applicable cell together. \
 Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
@@ -47,15 +47,23 @@ Before submitting, publish one complete PR review summary for this reviewed SHA,
 comments where needed, that reports the complete blocker and advisory set discovered. \
 `--blocking` must equal the complete BLOCKING count for that SHA.\n";
 
+/// CI and author-side verification are daemon concerns, never review findings.
+/// This wording is shared by every reviewer prompt.
+const REVIEWER_VERIFICATION_BOUNDARY: &str = "\
+Do NOT run tests, builds, formatters, or linters locally. Do not inspect, report, or block \
+on CI status or PR-body verification evidence, formatting, transcripts, links, headings, \
+tokens, or checklists. The daemon alone gates reviewer provisioning and merge on the \
+applicable CI state for the current PR head. Review the implementation and its tests as \
+code, but leave execution evidence and CI enforcement to the daemon.\n";
+
 pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
     format!(
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
-         and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
-         invariants, and check the PR's verification evidence — then apply the contract \
-         below.\n\n\
+         and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
+         invariants — then apply the contract below.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
          valid outcome — do not manufacture findings to justify requesting changes. \
          Every BLOCKING finding must cite a concrete code path and explain a \
@@ -74,9 +82,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -90,8 +96,6 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -114,6 +118,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -184,8 +189,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
          Follow the repository AGENTS.md instructions for the review methodology. \
          Read the full PR diff and surrounding code (never the diff hunks alone), \
-         check the repo CLAUDE.md/AGENTS.md invariants, and check the PR's \
-         verification evidence. Review at effort level {effort}.\n\n\
+         check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
          valid outcome — do not manufacture findings to justify requesting changes. \
          Every BLOCKING finding must cite a concrete code path and explain a \
@@ -204,9 +208,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -220,8 +222,6 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -244,6 +244,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -261,21 +262,21 @@ pub fn build_r2_review_prompt_for_kind(
 
 fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
     format!(
-        "You are R2 reviewer {name}, an adversarial pre-merge second reviewer for \
+        "You are R2 reviewer {name}, an independent pre-merge second reviewer for \
          PR #{pr} opened by worker {worker}. R1 reviewer {r1} already approved this \
          PR.\n\n\
-         ## Adversarial mandate\n\n\
-         Your goal is to attempt to falsify the claim that this PR is safe to merge. \
-         Focus on: failure modes, invariant violations, concurrency hazards, negative \
-         paths, incomplete verification evidence, and interactions with code outside \
-         the changed hunks.\n\n\
+         ## Independent coverage focus\n\n\
+         Provide a fresh assessment of whether this PR is safe to merge, then check whether \
+         R1 left any material gaps, if any exist. Pay particular attention to failure modes, \
+         invariant violations, concurrency hazards, negative paths, and interactions \
+         with code outside the changed hunks.\n\n\
          ## Independent-first review\n\n\
          Review the full diff and surrounding code BEFORE reading R1's comments or \
          verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
          Only after your independent review, compare against R1's conclusion:\n\
-         1. Identify material issues R1 missed (false negatives).\n\
-         2. Disprove apparent concerns that surrounding code or tests already address \
-         (false positives you would have raised without checking).\n\n\
+         1. Identify any material gap R1 did not surface, if one exists.\n\
+         2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
+         and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
          Zero blocking findings is a valid outcome after a thorough review. Every \
          BLOCKING finding must cite a concrete code path (file:line or function) and \
@@ -284,8 +285,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          not blocking.\n\n\
          Follow the repository AGENTS.md instructions for the review methodology. \
          Read the full PR diff and surrounding code (never the diff hunks alone), \
-         check the repo CLAUDE.md/AGENTS.md invariants, and check the PR's \
-         verification evidence. Review at effort level {effort}.\n\n\
+         check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
@@ -300,9 +300,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -316,8 +314,6 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -341,6 +337,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -353,21 +350,21 @@ pub struct R2ReviewSpec {
 
 pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
     format!(
-        "You are R2 reviewer {name}, an adversarial pre-merge second reviewer for \
+        "You are R2 reviewer {name}, an independent pre-merge second reviewer for \
          PR #{pr} opened by worker {worker}. R1 reviewer {r1} already approved this \
          PR.\n\n\
-         ## Adversarial mandate\n\n\
-         Your goal is to attempt to falsify the claim that this PR is safe to merge. \
-         Focus on: failure modes, invariant violations, concurrency hazards, negative \
-         paths, incomplete verification evidence, and interactions with code outside \
-         the changed hunks.\n\n\
+         ## Independent coverage focus\n\n\
+         Provide a fresh assessment of whether this PR is safe to merge, then check whether \
+         R1 left any material gaps, if any exist. Pay particular attention to failure modes, \
+         invariant violations, concurrency hazards, negative paths, and interactions \
+         with code outside the changed hunks.\n\n\
          ## Independent-first review\n\n\
          Review the full diff and surrounding code BEFORE reading R1's comments or \
          verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
          Only after your independent review, compare against R1's conclusion:\n\
-         1. Identify material issues R1 missed (false negatives).\n\
-         2. Disprove apparent concerns that surrounding code or tests already address \
-         (false positives you would have raised without checking).\n\n\
+         1. Identify any material gap R1 did not surface, if one exists.\n\
+         2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
+         and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
          Zero blocking findings is a valid outcome after a thorough review. Every \
          BLOCKING finding must cite a concrete code path (file:line or function) and \
@@ -377,9 +374,8 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
-         and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
-         invariants, and check the PR's verification evidence — then apply the contract \
-         below.\n\n\
+         and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
+         invariants — then apply the contract below.\n\n\
          {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
@@ -394,9 +390,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_boundary}\n\
          Severity contract (#159 — concrete failure classes are BLOCKING unless you \
          cite evidence disproving the failure):\n\
          - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
@@ -410,8 +404,6 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          - Classify every finding as BLOCKING (correctness, security, data loss, \
          regression, invariant violation — anything that must be fixed before merge) \
          or advisory (quality/follow-up).\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` in the PR body is \
-         BLOCKING.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -435,6 +427,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
 
@@ -519,8 +512,7 @@ pub fn build_rereview_turn(
          an unchanged diff over prior blocking findings is forbidden.\n\n\
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology. If the builtin skill is unavailable, read the full \
-         PR diff and surrounding code, check the repo CLAUDE.md invariants, and check \
-         the PR's verification evidence.\n\n\
+         PR diff and surrounding code and check the repo CLAUDE.md invariants.\n\n\
          Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
          full current diff and relevant sibling paths; do not narrowly inspect only the last \
          remediation commit.\n\n\
@@ -537,12 +529,9 @@ pub fn build_rereview_turn(
          - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
-         Do NOT run tests, builds, formatters, or linters locally. The daemon gates reviewer \
-         provisioning on green CI for the current PR head. Inspect the PR body's `## Verification` \
-         evidence, including its required `PREFLIGHT: PASS`, without rerunning it locally.\n\n\
+         {verification_boundary}\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
          - Classify every finding as BLOCKING or advisory.\n\
-         - Missing or red `PREFLIGHT: PASS` under `## Verification` is BLOCKING.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
@@ -557,6 +546,7 @@ pub fn build_rereview_turn(
         name = reviewer_name,
         pr = pr,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     ))
 }
 
@@ -583,7 +573,8 @@ pub fn build_rework_prompt(
          on the PR, not in this turn.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and pushing:\n\
-         1. Run preflight: ./preflight.sh\n\
+         1. Run the verification prescribed by the target repository's checked-in instructions \
+         and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
          2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\
          3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
@@ -641,7 +632,8 @@ pub fn build_remediation_turn(
          it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and pushing:\n\
-         1. Run preflight: ./preflight.sh\n\
+         1. Run the verification prescribed by the target repository's checked-in instructions \
+         and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
          2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\
          3. Post progress: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
@@ -704,10 +696,7 @@ mod tests {
             prompt.contains("NOT review input"),
             "prompt must warn that author/deliverer comments are not review input"
         );
-        assert!(
-            prompt.contains("PREFLIGHT: PASS"),
-            "prompt must flag missing preflight as BLOCKING"
-        );
+        assert!(prompt.contains("daemon alone gates reviewer provisioning and merge"));
         assert!(
             prompt.contains("Never review your own delivery"),
             "prompt must disqualify self-review of own delivery"
@@ -807,17 +796,26 @@ mod tests {
                 "{name} must forbid local verification runs"
             );
             assert!(
-                prompt.contains("daemon gates reviewer provisioning on green CI"),
-                "{name} must describe the daemon-owned CI gate"
+                prompt.contains("daemon alone gates reviewer provisioning and merge"),
+                "{name} must describe the daemon-only CI gate"
             );
             assert!(
                 !prompt.contains("gh pr checks"),
                 "{name} must not delegate CI polling to the reviewer"
             );
             assert!(
-                prompt.contains("Inspect the PR body's `## Verification` evidence")
-                    && prompt.contains("`PREFLIGHT: PASS`"),
-                "{name} must retain document-evidence review"
+                prompt.contains("Do not inspect, report, or block on CI status")
+                    && prompt.contains("PR-body verification evidence"),
+                "{name} must exclude CI and PR-evidence policing from review"
+            );
+            assert!(
+                !prompt.contains("Treat missing, red, or incomplete evidence as BLOCKING")
+                    && !prompt.contains("applicable CI/delivery contract"),
+                "{name} must never turn verification evidence into a finding"
+            );
+            assert!(
+                !prompt.contains("PREFLIGHT: PASS") && !prompt.contains("./preflight.sh"),
+                "{name} must not invent Quorum-specific verification requirements"
             );
         }
     }
@@ -861,8 +859,9 @@ mod tests {
                 "{name} must require completion before verdict"
             );
             assert!(
-                prompt.contains("Finding one blocker never ends review exploration"),
-                "{name} must continue after the first blocker"
+                prompt.contains("Coverage, not the number of findings")
+                    && prompt.contains("complete review may have zero findings"),
+                "{name} must define completion by coverage without a finding quota"
             );
             assert!(
                 prompt.contains("affected-path matrix/checklist"),
@@ -956,8 +955,29 @@ mod tests {
             "rework template must warn against manual task-done"
         );
         assert!(
-            turn.contains("preflight"),
-            "rework template must instruct agent to run preflight"
+            turn.contains("verification prescribed by the target repository")
+                && turn.contains("do not invent unavailable scripts or checks"),
+            "rework template must use repository-relative verification"
+        );
+        assert!(!turn.contains("./preflight.sh"));
+    }
+
+    #[test]
+    fn remediation_turn_uses_repository_relative_verification() {
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        assert!(
+            turn.contains("verification prescribed by the target repository")
+                && turn.contains("checked-in instructions")
+                && turn.contains("applicable CI/delivery contract"),
+            "remediation template must defer verification to the target repository"
+        );
+        assert!(
+            turn.contains("do not invent unavailable scripts or checks"),
+            "remediation template must forbid invented verification"
+        );
+        assert!(
+            !turn.contains("PREFLIGHT: PASS") && !turn.contains("./preflight.sh"),
+            "remediation template must not require Quorum-specific preflight"
         );
     }
 
@@ -1020,10 +1040,7 @@ mod tests {
             turn.contains("branch actually advanced"),
             "rereview template must require branch advancement before re-approval"
         );
-        assert!(
-            turn.contains("PREFLIGHT: PASS"),
-            "rereview template must flag missing preflight as BLOCKING"
-        );
+        assert!(turn.contains("Do not inspect, report, or block on CI status"));
         // Task #124: PR-source-of-truth guidance also carries into rereview,
         // because the second pass must resolve the prior review thread on the PR.
         assert!(
@@ -1215,7 +1232,7 @@ mod tests {
         assert!(prompt.contains("--blocking 0"));
         assert!(prompt.contains("BLOCKING"));
         assert!(prompt.contains("builtin `review` skill"));
-        assert!(prompt.contains("PREFLIGHT: PASS"));
+        assert!(prompt.contains("Do not inspect, report, or block on CI status"));
         assert!(prompt.contains("Do NOT merge the PR yourself"));
         assert!(
             prompt.contains("Do NOT run `gh pr review --approve`"),
@@ -1246,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn r2_review_prompt_is_adversarial_and_evidence_bound() {
+    fn r2_review_prompt_is_independent_gap_focused_and_evidence_bound() {
         let spec = R2ReviewSpec {
             pr: 10,
             worker_agent: "W".into(),
@@ -1255,18 +1272,18 @@ mod tests {
         };
         let prompt = build_r2_review_prompt(&spec, "high");
         assert!(
-            prompt.contains("adversarial"),
-            "R2 prompt must carry the adversarial mandate"
+            !prompt.to_lowercase().contains("adversarial"),
+            "R2 prompt must not pressure the reviewer with adversarial framing"
         );
         assert!(
-            prompt.contains("falsify"),
-            "R2 prompt must instruct falsification of merge-safety claim"
+            !prompt.to_lowercase().contains("falsify"),
+            "R2 prompt must not create an implicit finding quota through falsification framing"
         );
         assert!(
             prompt.contains("failure modes")
                 && prompt.contains("invariant violation")
                 && prompt.contains("concurrency"),
-            "R2 prompt must specify adversarial focus areas"
+            "R2 prompt must specify high-risk coverage areas"
         );
         assert!(
             prompt.contains("BEFORE reading R1"),
@@ -1289,12 +1306,13 @@ mod tests {
             "R2 prompt must reject speculative/contrarian findings"
         );
         assert!(
-            prompt.contains("R1 missed"),
-            "R2 prompt must instruct identifying what R1 missed"
+            prompt.contains("material gap R1 did not surface") && prompt.contains("if one exists"),
+            "R2 prompt must check for R1 gaps without assuming one exists"
         );
         assert!(
-            prompt.contains("Disprove") || prompt.contains("false positive"),
-            "R2 prompt must instruct disproving apparent concerns already addressed"
+            prompt.contains("Agreement with R1")
+                && prompt.contains("no additional findings are both valid outcomes"),
+            "R2 prompt must explicitly permit agreement and zero additional findings"
         );
     }
 
@@ -1314,12 +1332,18 @@ mod tests {
         let r1 = build_review_prompt(&r1_spec, "high");
         let r2 = build_r2_review_prompt(&r2_spec, "high");
         assert!(
-            !r1.contains("adversarial") && r2.contains("adversarial"),
-            "only R2 should carry the adversarial mandate, not R1"
+            !r1.to_lowercase().contains("adversarial")
+                && !r2.to_lowercase().contains("adversarial"),
+            "neither review role should carry adversarial finding pressure"
         );
         assert!(
-            !r1.contains("falsify") && r2.contains("falsify"),
-            "only R2 should instruct falsification"
+            !r1.to_lowercase().contains("falsify") && !r2.to_lowercase().contains("falsify"),
+            "neither review role should imply a falsification quota"
+        );
+        assert!(
+            !r1.contains("material gap R1 did not surface")
+                && r2.contains("material gap R1 did not surface"),
+            "R2 remains distinct through its conditional R1-gap focus"
         );
         assert!(
             r1.contains("do not manufacture findings"),
@@ -1426,12 +1450,12 @@ mod tests {
         assert!(prompt.contains("PR #42"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
-        assert!(prompt.contains("PREFLIGHT: PASS"));
+        assert!(prompt.contains("Do not inspect, report, or block on CI status"));
         assert!(prompt.contains("Do NOT merge the PR yourself"));
     }
 
     #[test]
-    fn codex_r2_follows_agents_md_and_is_adversarial() {
+    fn codex_r2_follows_agents_md_and_checks_r1_gaps_without_quota() {
         let spec = R2ReviewSpec {
             pr: 55,
             worker_agent: "W".into(),
@@ -1448,13 +1472,17 @@ mod tests {
             "Codex R2 prompt must follow AGENTS.md instructions"
         );
         assert!(
-            prompt.contains("adversarial"),
-            "Codex R2 prompt must carry the adversarial mandate"
+            !prompt.to_lowercase().contains("adversarial")
+                && !prompt.to_lowercase().contains("falsify"),
+            "Codex R2 prompt must avoid finding-pressure language"
         );
+        assert!(prompt.contains("material gap R1 did not surface"));
+        assert!(prompt.contains("if one exists"));
+        assert!(prompt.contains("Agreement with R1"));
         assert!(prompt.contains("R1 reviewer R1 already approved"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
-        assert!(prompt.contains("PREFLIGHT: PASS"));
+        assert!(prompt.contains("Do not inspect, report, or block on CI status"));
     }
 
     #[test]

@@ -1,414 +1,161 @@
-# Quorum — Project Brief
+# Quorum — Agent Guide
 
-**Quorum is a local coordination substrate for AI agents** — a single `quorum` binary + one
-SQLite file per managed repo (`~/.quorum/repos/<owner>__<name>/quorum.db`). Agents post
-messages, claim work atomically, and run a shared task queue by invoking
-`quorum <subcommand>` as ordinary shell commands. It replaces an earlier
-GitHub-Issue-based "hub" that was slow, never expired, and couldn't claim atomically.
+Quorum is a local coordination substrate for AI coding agents: one `quorum` binary and one
+SQLite database per managed repository. Short-lived CLI commands perform atomic operations;
+`quorum serve` owns worker, review, rework, approval, and merge lifecycle.
 
-- **Design spec (source of truth):** `docs/2026-06-23-quorum-design.md` — read it before any
-  non-trivial work. This file is the *operating brief*; the spec is the *design of record*.
-- **Status:** implemented and shipping. Run `cargo test` for current module/test counts.
-  `cargo test` passes; release binary verified end-to-end.
+This file is the small, always-loaded operating contract. Do **not** read the full design
+spec by default. Read feature-specific design or history only when the task affects it; use
+the routing table at the end of this guide.
 
-## Purpose & principle (north star)
+## Product priorities
 
-**By agents, for agents.** There is **no human in the loop to design around** — no web UI,
-no human-readable formatting requirements, no manual pruning. The only lifecycle is TTL.
-Every choice optimizes for four properties, **in this priority order**:
+Optimize in this order:
 
-1. **Atomic** — concurrent ops never corrupt or double-grant. Race-safety is a property of
-   the storage engine, not of agent discipline.
-2. **Fail-safe** — failures are loud (distinct non-zero exit + error JSON), never silent
-   corruption or silent wrong-holder.
-3. **Simple** — smallest surface that solves the problem. YAGNI ruthlessly.
-4. **Effective / fast** — cheap polling, instant claims, no token-expensive reads.
+1. **Atomic** — concurrency safety comes from storage mechanisms, not agent discipline.
+2. **Fail-safe** — failures are loud and never silently corrupt state or grant authority.
+3. **Simple** — keep the command and lifecycle surface small.
+4. **Effective / fast** — cheap polling, instant claims, bounded context and storage.
 
-When a decision trades these off, the higher-priority property wins. The one concession to
-humans is a read-only `quorum status [--watch]`.
+Quorum is an opinionated Git/GitHub coding pipeline for agents. The only human-facing
+surface is read-only status/inspection. Avoid human workflow features, manual pruning, or
+general-purpose orchestration abstractions.
 
-## Architecture in one breath
+## Repository-wide invariants
 
-**CLI commands** are short-lived processes: open DB → apply PRAGMAs → migrate-if-needed →
-one atomic op (`BEGIN IMMEDIATE`) → print JSON → exit with a meaningful code. The per-repo
-SQLite file is the only state. SQLite's cross-process file locking is the concurrency
-authority. DB path resolution: `QUORUM_REPO` env var (set by daemon for workers) > cwd git
-detection > loud error (exit 2). **`quorum serve`** is the long-lived daemon that drives the
-task lifecycle state machine: spawn workers/reviewers, process verdicts, merge PRs. One
-daemon per DB, enforced via `daemon_lock` table (pid + heartbeat). Crate layout:
-`quorum-core` (lib: store, lifecycle, PRAGMAs, migrations — fully unit-testable) + `quorum`
-(bin: clap, stdin/file I/O, JSON, exit codes, serve daemon).
+These contracts apply to every relevant change:
 
-## Load-bearing invariants (do NOT regress — each cost a review round to get right)
+1. **Atomic claims:** enforce one active holder with
+   `UNIQUE(target) WHERE active = 1`; `active` is `INTEGER NOT NULL DEFAULT 0`.
+   Claims and task wins occur inside one `BEGIN IMMEDIATE` transaction.
+2. **Every SQLite connection:** set `busy_timeout=5000`, switch/retry
+   `journal_mode=WAL`, then use `synchronous=NORMAL`. Keep `rusqlite` bundled.
+3. **Race outcomes:** a lost race is `SQLITE_CONSTRAINT_UNIQUE` or zero guarded
+   `UPDATE … RETURNING` rows → clean exit 1, no `errors` row. Post-timeout
+   `SQLITE_BUSY` is abnormal → exit 3 and log it.
+4. **Exit codes:** 0 success · 1 expected clean negative · 2 usage/bad input ·
+   3 internal/DB/migration failure.
+5. **Expiry:** rows are dead at `expires_at <= now` and live at `expires_at > now`.
+   Logical read filters provide correctness; physical sweep is housekeeping. Agents and
+   tasks do not expire.
+6. **Short reads:** never hold a read transaction across polling ticks. A long reader pins
+   the WAL. `status --watch` opens and closes a connection every tick.
+7. **Migrations:** check `PRAGMA user_version` on every open; apply forward-only,
+   idempotent migrations under the write lock. Refuse a newer DB. `serve` maps
+   `SchemaTooNew` to exit 75 for supervised self-update.
+8. **Monotonic cursors:** advance with `MAX(last_seq, ?)`. Delivery is at-least-once.
+9. **Text safety:** free text enters through stdin/file/JSON, is SQL-bound, and is emitted
+   as JSON. Reject invalid UTF-8 and embedded NUL.
+10. **Single daemon:** `daemon_lock` is the per-DB authority. A live second daemon fails;
+    stale/dead ownership may be taken over.
+11. **Lifecycle authority:** managed agents signal outcomes; the daemon alone transitions
+    lifecycle, posts formal reviews, and merges. Messages never cause lifecycle changes.
 
-These are verified design decisions. Changing any of them needs the same scrutiny that
-established it.
+If a change intentionally alters one of these contracts, update the design spec in the
+same PR and provide concurrency/runtime evidence appropriate to the invariant.
 
-1. **Atomic claim = partial unique index, not application logic.**
-   `UNIQUE(target) WHERE active = 1`, with `active INTEGER NOT NULL DEFAULT 0` (a NULL falls
-   *out* of the partial index and silently disables protection). Claims/tasks are won inside
-   a single `BEGIN IMMEDIATE` transaction. **Empirically proven:** the committed canary races 20 concurrent processes →
-   exactly one winner. The N-process claim-race test is the canary — if it ever flakes, stop
-   and find out why before anything else.
-2. **Mandatory PRAGMAs, per connection:** `journal_mode=WAL`, `synchronous=NORMAL`,
-   `busy_timeout=5000`. Without `busy_timeout`, a lost race surfaces as "database is locked"
-   instead of a clean queue. Do **not** set `foreign_keys` (no FKs in v1 — it'd be a no-op).
-3. **`rusqlite` with the `bundled` feature. Never link system libsqlite3** (need ≥ 3.35 for
-   `RETURNING`; bundled also keeps "one file, one binary" true).
-4. **Error-branch contract.** With `busy_timeout` set, the *normal* lost-race signal is
-   `SQLITE_CONSTRAINT_UNIQUE` (or zero rows from a guarded `UPDATE … RETURNING`), **not**
-   `SQLITE_BUSY`. Map lost-race → clean `{ok:false, holder}` **exit 1**, and **do not write
-   an `errors` row** (it's normal operation). A post-timeout `SQLITE_BUSY` is a *distinct*
-   abnormal condition → **exit 3** + log to `errors`. Never conflate them.
-5. **Stable exit codes** (agents branch on these without parsing JSON): `0` success · `1`
-   clean "didn't get it" / not-holder (expected) · `2` usage/arg/bad-input error · `3`
-   internal / DB / migration error.
-6. **TTL is logical-first.** `expires_at = now + ttl` at write; every *expiring* table
-   (**messages, claims, events, errors**) filters `WHERE expires_at > now` so expiry is
-   instant. **Agents and tasks are NOT TTL'd** — agents have no `expires_at` column and
-   never expire; tasks have no `expires_at` column and persist indefinitely (only `done`
-   tasks older than the sweep TTL are physically reclaimed by `quorum sweep`/sweep-on-write).
-   Physical cleanup (bounded `DELETE … LIMIT 100` sweep-on-write, or `quorum sweep`) is
-   housekeeping, not correctness.
-7. **WAL self-truncates only with short-lived connections.** A long-lived reader holding an
-   open transaction pins the WAL and it grows unbounded (verified: 8.5 MB and climbing).
-   `status --watch` MUST open a fresh read per tick (connect→read→close), never hold a txn
-   across polls. `quorum sweep` runs `wal_checkpoint(TRUNCATE)` as the escape hatch.
-8. **Schema migration-on-open.** Read `PRAGMA user_version` on every command; apply
-   forward-only idempotent migrations (`CREATE … IF NOT EXISTS`, additive `ALTER`) under the
-   write lock; **refuse and fail loud (exit 3) if binary < db_version.** This is the defense
-   against "correct in repo, wrong against the running file" drift (see Practices §3).
-   One-shot commands exit 3 as above; the long-lived `serve` loop instead catches
-   `SchemaTooNew` at tick and exits 75 (`EXIT_SELF_UPDATE`) so the supervisor rebuilds and
-   relaunches on a current binary rather than fail-looping (see `classify_tick_error`).
-9. **Cursor advance is monotonic:** `SET last_seq = MAX(last_seq, ?)`, never a bare set
-   (concurrent/out-of-order acks must not move it backward). Delivery is at-least-once;
-   consumers must be idempotent on `seq`.
-10. **Text safety.** Free text enters via stdin/file/json (never a flag), is bound as a
-    SQLite parameter (never concatenated into SQL), and is emitted as JSON. **Reject invalid
-    UTF-8 and embedded NUL on input (exit 2)** — TEXT+JSON cannot carry arbitrary bytes; fail
-    loud rather than mangle.
-11. **Single daemon per DB.** `quorum serve` acquires an exclusive lease in the `daemon_lock`
-    table on startup (pid + heartbeat refreshed every tick). A second daemon on the same DB
-    exits 2 if the holder is live (heartbeat < 30s AND pid alive); takes over if stale/dead.
-    Lease released on clean shutdown. This replaces the safety that `instance_id` alone
-    provided — instance_id scopes journal rows, daemon_lock prevents concurrent instances.
+## Engineering and evidence
 
-## Quick start
+- Grep before coding and copy established patterns.
+- Fix root causes; prefer additive, idempotent migrations over backfills.
+- Tests must fail when the behavior breaks. Assert state, exit code, or JSON—not merely a
+  log line. State-machine changes need negative-path coverage.
+- Concurrency/storage claims require a real DB and concurrent processes, repeated enough
+  to expose flakes. The claim-race canary is a smoke alarm; investigate any flake.
+- Mechanism claims require a `file:line`, test result, or DB row. Separate **Verified**
+  evidence from **Hypothesis** in diagnoses.
+- Do not over-claim in docs, help, PRs, or commits.
+- Update the design spec only when product behavior or an established design contract
+  changes. Ordinary implementation, bug fixes within the contract, and reviews do not
+  require reading or editing the full spec.
+- If a fix takes more than two attempts, owner correction changes direction, or behavior
+  contradicts expectation, capture the correct reusable pattern in a focused reference
+  document or the relevant design section.
 
-```bash
-cargo build --release            # produces target/release/quorum
-cargo test                       # includes the N-thread claim race canary
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all
-./preflight.sh                   # all four PR gates (branch base + fmt + clippy + test)
-./dev-install.sh                 # build + install to ~/.local/bin + verify + install git hooks
-./dev-install.sh --verify-only   # just check the installed binary is current
-quorum init                      # create ~/.quorum/, DB, default config (idempotent)
-quorum help                      # one-call cheat-sheet for agents (alias: help-agent)
-scripts/serve-supervisor.sh [flags]  # supervised serve: auto-rebuild on exit 75
-```
+## Git and delivery workflow
 
-**Supervised launch (recommended).** Use `scripts/serve-supervisor.sh` instead of bare
-`quorum serve` when running with `--self-update-drain`. The supervisor catches exit 75,
-runs `git fetch origin main` + `./dev-install.sh` to rebuild, and relaunches. Build
-failures relaunch the old binary with a loud alert; non-75 exits propagate (no loop).
-A thrash guard caps restarts at 6/hour. This replaces the former manual "rebuild binary
-on quorum merges" standing duty.
+- Never edit the shared `~/dev/quorum` checkout. Create a worktree from `origin/main`:
 
-**After pulling new source, always run `./dev-install.sh`** — it builds, replaces the
-installed binary at `~/.local/bin/quorum`, and verifies that required subcommands (`sync`,
-`init`, `status`) exist and the DB schema is current. The 2026-06-26 cutover stalled
-because a stale binary at `~/.local/bin` lacked `sync`; this script prevents that (#74).
+  ```bash
+  git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/main
+  ```
 
-For toolchain-free installation from GitHub Releases (no cargo required), use `install.sh`.
+- Never branch from another feature branch. Do not rebase solely to become current;
+  up-to-date-before-merge is disabled, while a push dismisses prior approvals.
+- Commit, push, and open PRs with the default `ag2trust-dev` identity. Never override the
+  token or author as `brevitize`.
+- Use conventional commit subjects and end commits with the working session's
+  `Co-Authored-By:` trailer.
+- Review without checking the PR branch out in the shared checkout. Use `gh pr diff`,
+  `git show`, or a throwaway worktree.
+- Author, deliverer, R1, and R2 separation is session-based. Whoever authored, adopted, or
+  signaled a task cannot review that delivery.
+- Reviewers classify findings as BLOCKING or advisory. Approval requires zero blockers;
+  any blocker requires a changes verdict with feedback. Reviewers post findings/comments;
+  the daemon owns formal approval/request-changes and merge.
 
-Verified end-to-end (release binary): `init` → `task-create` →
-`post`/`read` → `status` all return clean JSON / the status table, exit 0. See `README.md`
-for the captured session.
+### Required verification before submission
 
-## Engineering practices (inherited from the parent project, trimmed to what fits Quorum)
-
-1. **All changes through branches → PRs. Never commit to `master`.** Conventional-commit
-   subjects (`feat:`, `fix:`, `docs:`, `test:`, `chore:`). End commit messages with a
-   `Co-Authored-By:` line for the working session.
-2. **Plans & specs are committed, not local-only (HARD RULE).** A design that lives only on
-   disk doesn't exist — the next session can't read it. Update the spec *in place* when the
-   design changes; `master` should always reflect what's actually being built. The spec is at
-   `docs/2026-06-23-quorum-design.md`.
-3. **Validate against the running system, not just the repo.** Quorum's hardest bugs are
-   exactly the ones a passing `cargo test` can miss: WAL growth under a held reader, schema
-   drift between a new binary and an old DB, cross-process lock behavior. Before claiming an
-   atomicity/storage change works, exercise it against a real `.db` with **concurrent
-   processes** — not a single-threaded test. "Compiles + unit-green" is necessary, not
-   sufficient.
-4. **Fix root causes; don't patch around bad designs.** If a workaround is growing, step back
-   and remove the complexity. Prefer forward-only, idempotent migrations over backfills
-   (local DB state is disposable).
-5. **TDD where it earns its keep; verification before completion always.** Write the failing
-   test first for the atomicity/TTL/migration invariants (they're easy to get subtly wrong,
-   hard to debug later). **Evidence before assertions:** never claim "passing"/"fixed"
-   without pasting the actual command output. If tests fail, say so with the output; if a
-   step was skipped, say that. This extends to diagnoses: any mechanism claim ("X happens
-   because Y") must cite a `file:line` or a DB row, and any proposed fix must cite the code
-   path where the behavior is missing — if you can't point at where it should be and isn't,
-   you haven't read the path. Separate **Verified** (with citations) from **Hypothesis**
-   (unproven) in every diagnosis; the 2026-07-14 "zombie worker" misdiagnosis shipped correct
-   DB facts and an invented mechanism in one confidence tone (see Gotchas).
-6. **Grep before you code; copy working patterns.** Match the surrounding code's idiom,
-   naming, and comment density rather than inventing a new style.
-7. **No over-claims** — in docs, `--help`, or commit messages. Say what it does, not what it
-   aspires to.
-8. **Leave a learnings trail.** When a fix took >2 attempts, an owner correction changed
-   direction, or a behavior contradicted expectation, capture the *fix/correct pattern* (not
-   the debugging steps) — append it to this file's Gotchas or a `docs/learnings.md`, and
-   include it in the PR. Aim to leave the project 1% better each session.
-
-## Agent workflow on this repo
-
-These rules exist because each caused a real multi-hour stall this week (2026-06-26).
-
-### 1. Author PRs as `ag2trust-dev`
-
-Use the default `gh` identity (ag2trust-dev) for commits and `gh pr create`. **Never author
-as `brevitize`** and never pass a token override. A brevitize-authored PR deadlocks: brevitize
-(PR author) can't self-approve, and ag2trust-dev's approval doesn't count (it's the commit
-co-author) — only `--admin` clears it, which requires owner intervention.
-
-### 2. Two-account merge model
-
-| Account        | Role                                    |
-|----------------|-----------------------------------------|
-| `ag2trust-dev` | Commit, push, open PR                   |
-| (different session) | Review (post `### Code review`)   |
-| `brevitize`    | `gh pr review --approve` + `gh pr merge`|
-
-Self-merge is blocked at the **session** level: the PR footer `🤖 <Name>` + `Co-Authored-By`
-trailers identify the author session. A reviewer must be a different session than the author —
-and different from the **deliverer**: whoever signaled the task's `done` (e.g. adopted the PR)
-is disqualified from reviewing it, even if the git author is someone else (#206).
-
-**Verdict contract (#206):** reviews classify findings BLOCKING/advisory and the verdict is
-derived, not chosen — `--verdict approved` requires `--blocking 0`; any blocking finding
-requires `--verdict changes --feedback`. The daemon reviewer prompt carries the full
-contract inline and invokes the builtin `review` skill. The daemon demotes unattested
-approvals to `changes`.
-
-### 3. Work in your own git worktree
-
-Never edit the shared `~/dev/quorum` checkout directly — a second agent's `git checkout -b`
-hijacks the first agent's working tree and can lose WIP. Instead:
+Run the full project gate before `quorum submit`:
 
 ```bash
-git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/main
-# work in ~/dev/quorum-wt/<branch>
-# when merged:
-git worktree remove ~/dev/quorum-wt/<branch>
+rtk proxy ./preflight.sh
 ```
 
-Keep `~/dev/quorum` on `main` clean as the shared fetch target.
+This is an author-side gate. Reviewers do not police CI status, PR-body verification
+formatting, transcripts, links, headings, or evidence tokens; the daemon owns CI gating.
+Never bypass the pre-push hook. For doc-only changes this gate still applies.
 
-**This includes reviews.** When reviewing a quorum PR via `review-and-merge`, do NOT
-`git checkout` the PR branch in `~/dev/quorum`. Use `gh pr diff --repo ag2trust/quorum`,
-`git show origin/<branch>:<path>`, or a throwaway worktree instead. The CTO rebuilds
-from this tree; leaving it on a feature branch builds the wrong code (observed 2026-06-28).
+After pulling merged source, run `./dev-install.sh` to rebuild, install, verify required
+commands, and check schema compatibility. Use `scripts/serve-supervisor.sh` for supervised
+serve/self-update operation.
 
-**Always branch from `origin/main` — never from another feature branch** (#114 shipped
-another PR's commits this way). `preflight.sh` gate 1 and the pre-push hook verify this
-mechanically: more than one distinct co-author session in `origin/main..HEAD` fails the gate.
+## Daemon and async checklist
 
-### 4. Branch protection: don't rebase just to be current
+For changes under `quorum/src/serve/` or other async lifecycle paths:
 
-"Require up-to-date before merging" is **OFF** — an approved + CI-green PR merges even if a
-few commits behind `main`. Don't rebase solely to catch up. "Dismiss stale approvals on new
-commits" stays **ON** — a real push (fix commit, rebase) invalidates the existing approval and
-requires re-review.
+- Never race stateful work inside `select!` unless every losing future is cancellation-safe.
+- Signals set shutdown flags; they do not complete work or transition tasks.
+- Enumerate shutdown path × task state for shutdown changes, and test the negative paths.
+- Never perform network/model calls while holding a DB transaction.
+- Bound retries, allocations, prompts, queues, logs, and persistent rows.
+- Provider CLI boundaries need real-binary argument/auth tests; `fake_agent` cannot catch
+  pre-protocol argument or authentication failures.
+- Thread `bare_agent` through every Claude spawn path. Session IDs come only from
+  `agent::new_session_id()`.
+- Codex continuation must preserve the provider-issued thread ID and exact pending turn.
+- `.claude/**` edits require an attended session because `dontAsk` denies that namespace.
 
-### 5. Preflight gate — green BEFORE `quorum submit` (HARD RULE)
+## Interactive owner sessions
 
-`submit` transitions the task to `in-review` and spawns a reviewer, so submitting with a
-red branch burns a reviewer session on mechanical findings (#112/#114 cost ~5 reviewer
-sessions in one week). The gate is mechanical, not judgment:
+Interactive sessions default to coordinator mode: investigate, reproduce, diagnose, scope,
+and design. Exploratory wording does not authorize implementation or external mutations.
+Implement directly only after an explicit instruction such as “implement it here.”
 
-```bash
-rtk proxy ./preflight.sh    # branch-base check + fmt + clippy + test, fail-fast
-```
+Use Quorum only for execution-ready tasks with observed/expected behavior, evidence,
+affected paths, proposed remediation, constraints, and verification. Do not dispatch
+open-ended production investigation or feature design.
 
-Paste the full output — it must end `PREFLIGHT: PASS` — in the PR body under
-`## Verification`. No green preflight → no `submit`. The pre-push hook (installed by
-`./dev-install.sh`) re-runs the cheap subset (`--quick`: branch base + fmt) on every
-push; never bypass it with `--no-verify`.
+If implementation moves out of an existing Quorum task, cancel that implementation task
+before external work begins; create a review-only task for the resulting PR. Interactive
+sessions do not claim, submit, or mark managed tasks done.
 
-### 6. Test quality bar (authors write to it, reviewers enforce it)
+## On-demand reading
 
-For every test you add, ask: **would this test fail if the feature broke?** If not, it
-isn't a test. Specifically:
+Read only the rows relevant to the task. The design spec is a searchable source of record,
+not foundation context.
 
-- No assertions on log-line presence alone — assert state/behavior (DB row, exit code,
-  JSON field), not that something was printed.
-- Lifecycle / state-machine code needs a **negative-path test**: the transition that
-  must NOT happen (e.g. SIGINT must NOT mark a task done), not only the happy path.
-- Concurrency claims need multi-process tests, run in a loop (see Gotchas — a single
-  green run hides flakiness).
+| Task area | Read on demand |
+|---|---|
+| Product behavior, lifecycle redesign, command/schema contract | Relevant section of `docs/2026-06-23-quorum-design.md` |
+| CLI usage or installation | `README.md`, `quorum help`, `quorum <command> --help` |
+| Task lifecycle/recovery/merge | `quorum-core/src/lifecycle.rs`, relevant `quorum/src/serve/` module, then the matching design section |
+| SQLite, claims, expiry, migration, WAL | Relevant `quorum-core/src/` module and matching design section |
+| Reviewer/R1/R2/rework prompts | `quorum/src/serve/reviewer.rs` and the review-responsibility design section |
+| Provider spawning, auth, continuation | `quorum/src/serve/agent.rs`, `codex_agent.rs`, `runner.rs`, and nearby contract tests |
+| Collector/review analytics | `quorum/src/serve/collector.rs`, `quorum-core/src/review_findings.rs` |
+| Historical audits | Specific file under `docs/audits/`; do not load the directory wholesale |
 
-### 7. Async / tokio pitfalls (server & daemon milestones)
-
-Known bug classes from the daemon/server work — treat as checklist items, not judgment
-calls:
-
-- **Never race stateful work inside `select!`.** Every branch must be cancellation-safe:
-  when another branch wins, the losing future is dropped mid-await and any state it
-  half-mutated is corrupt. Move stateful work outside the race or make it atomic.
-- **Signals set flags; they don't cancel or complete work.** A SIGINT/SIGTERM handler
-  records "shutdown requested" — it must never transition task state itself (the
-  SIGINT-marks-done bug class).
-- **Before `done` on any shutdown-path change:** enumerate every shutdown path × every
-  task state and state what happens in each cell (in the PR body or a test). The
-  unenumerated cell is where the bug lives.
-
-### 8. Interactive owner-facing sessions are coordinator-only by default
-
-When running as an interactive session with the owner (human), default to **coordinator
-mode**. Own ambiguity-heavy work: gather context, inspect code and runtime state, connect
-to production when authorized, reproduce or confirm reported issues, establish an
-evidence-backed diagnosis, and design or plan features. Do NOT edit files, create
-branches/worktrees, commit, push, open/close PRs, merge, or implement changes.
-
-Exploratory phrasing — "can we", "could we", "what about", "how should we" — authorizes
-analysis and read-only inspection only. When Quorum is available, enqueue bounded
-implementation and review work as Quorum tasks rather than acting directly.
-
-Quorum workers are execution workers, not owners of open-ended production investigations,
-SSH access, incident diagnosis, feature design, architectural planning, or task scoping.
-They may support the interactive agent with narrowly scoped discovery or research tasks.
-Do not file a fix task from a reported symptom alone. Before dispatch, state the observed
-and expected behavior, supporting evidence, affected path, proposed remediation, relevant
-constraints, and verification criteria.
-
-Implementation in the current interactive session is authorized only when the owner gives
-an explicit, unambiguous directive to implement (e.g. "do it", "make that change",
-"implement it here").
-
-**When an interactive/external session implements work that a Quorum task covers:** cancel
-the Quorum implementation task first (`task-update --status cancelled`), then create a
-review-only task (`task-create --review-pr N`) when the PR is ready. See the "Transferring
-implementation responsibility outside Quorum" section in the Quorum skill for the full
-protocol. Failing to cancel leaves the daemon believing it owns implementation and it will
-provision a redundant worker.
-
-Read-only operations (status checks, diagnosis, code inspection, `quorum status`) remain
-always allowed.
-
-**Origin:** PR #365 was implemented directly after an interactive session read "can we
-make it" as an implementation directive. PR #9 / BoostMyAgents demonstrated the duplicate-
-worker hazard when external implementation proceeds without cancelling the Quorum task.
-
-## Provider-specific guidance
-
-Everything above applies equally to Claude and Codex. The sections below apply only to the
-named provider.
-
-### Claude-only: RTK compresses Bash output
-
-This machine runs **RTK (Rust Token Killer)** as a global Claude Code hook — every `Bash`
-command is transparently rewritten and its output is **filtered/compressed** (you see a
-lossy summary, not raw output). `Read`/`Grep`/`Glob` bypass it. When you need the true,
-complete output — especially **`cargo test` / `cargo clippy` results you'll paste as
-verification evidence** — run it through `rtk proxy <cmd>` to get the raw, unfiltered output.
-A short or "all-green" test summary may be RTK hiding the failures.
-
-### Codex-only
-
-No additional Codex-only project instructions currently.
-
-## Gotchas (Quorum-specific time-savers)
-
-- The N-process claim-race test is the project's smoke alarm — keep it fast and in the
-  default `cargo test` run.
-- **The `claude` CLI boundary is invisible to fake_agent — test it for zero tokens.** Two
-  live respawn-loops in one day (2026-07-10) both failed *before* any API call: (1) a
-  non-UUID `--session-id` is rejected at arg parsing ("Invalid session ID. Must be a valid
-  UUID." — the daemon only sees "process exited without response"), (2) `--bare` strips
-  operator credentials, so on subscription-auth machines a bare agent's every turn returns
-  "Not logged in". Fix pattern: session ids come only from `agent::new_session_id()`; every
-  spawn path (worker, reviewer, classifier, backfill) must thread the `bare_agent` config —
-  never hardcode `bare`. **Default changed (#180):** `no_bare_agent` now defaults to `true`
-  (inherit operator's Claude login). Bare mode is opt-in via `no_bare_agent = false` for
-  operators providing non-interactive credentials (e.g. `ANTHROPIC_API_KEY`). Auth errors
-  now propagate the provider result text through daemon logs and trigger exponential backoff
-  (30s..300s) to prevent per-tick respawn loops. Prevention pattern: the real-CLI contract
-  tests in `agent.rs` (spawn the installed binary with `CLAUDE_CONFIG_DIR` → empty tempdir
-  + blanked cred env vars: it reaches arg-parse and auth but can never reach the API — any
-  stream event back means args parsed; event-less exit is the crash-loop signature).
-- `read --ack-through` is a **write** (it advances the cursor), so it takes the write lock
-  like everything else — it is not a "pure read." Plain `read`/`peek` without ack are reads.
-- **Presence is implicit and display-only.** There is no `heartbeat` or `register` command in
-  v1. Every write-taking command calls `agents::touch` (auto-create + bump `last_seen`) inside
-  its txn; pure reads do not. `online` is derived (`now - last_seen < window`) and never drives
-  eviction (claims are lease-only).
-- A normal "lost the race" (exit 1) is **not** a failure — don't log it to `errors`, don't
-  treat exit 1 as a crash in scripts/tests.
-- After a long laptop sleep, leases and messages with past `expires_at` vanish at once
-  (read-filter). Expected behavior, not a bug.
-- Config: missing file → built-in defaults (don't fail); malformed → fail loud (exit 3).
-- **WAL setup under concurrent first-creation needs care** (cost a flaky test to find): set
-  `busy_timeout` *before* the `journal_mode=WAL` switch, AND retry the WAL switch on transient
-  `SQLITE_BUSY`/`SQLITE_LOCKED` — the busy-timeout handler does **not** cover journal-mode
-  changes, so N processes creating the DB at once can fail the switch even with the timeout
-  set. WAL is persistent, so the race only exists on the very first switch (`db.rs::set_journal_wal`).
-  Always stress concurrency tests in a loop (`for i in $(seq 1 12)`); a single green run hides flakiness.
-- **Expiry boundary must be consistent everywhere: a claim/row is DEAD iff `expires_at <= now`,
-  LIVE iff `expires_at > now`.** A reviewer caught reap using `< now` while the read-filter used
-  `> now`: at exactly `now == expires_at` the corpse blocked the unique index but was invisible to
-  the re-SELECT → `QueryReturnedNoRows` → errlog'd exit 3 for a routine claim. Keep reap (`<=`),
-  read-filter (`>`), and release/renew holder-checks (`>`) all agreeing on this boundary. The race
-  canary now also asserts `errors` count == 0.
-- Match the **extended** SQLite code (`SQLITE_CONSTRAINT_UNIQUE`), not the primary
-  `ConstraintViolation`, when detecting a lost claim — so a future CHECK/NOT NULL violation fails
-  loud instead of being misread as a lost race.
-- **`dontAsk` mode denies edits to `.claude/**` paths** even when Edit is in `--allowedTools`
-  and the worktree contains `.claude/`. The claude CLI treats `.claude/` as a protected
-  namespace requiring explicit human approval. Tasks that edit `.claude/skills/**` or
-  `.claude/settings.*` will zombie in dontAsk mode — the worker asks "can you grant
-  permission?" to an empty room. Mitigations: (1) the idle watchdog (idle_timeout_secs,
-  default 300s) reaps such zombies automatically, (2) task descriptions involving `.claude/`
-  edits should be routed to a human-attended session or run with an operator that pre-grants
-  the paths.
-- **Raw `task-update --status done` bypasses lifecycle — use `quorum submit` or `quorum
-  task-close`.** The ag2trust task#81 / PR#3659 incident: an agent ran
-  `task-update --status done` to terminal-close a working P0 task, bypassing review entirely.
-  The `done` status is now lifecycle-only (enforced by the CLI — `task-update --status done`
-  exits 2). Three verbs replace it: `quorum submit --pr N` (worker/reviewer hand-off into
-  the state machine), `quorum task-close --reason-stdin` (manual/external terminal close with
-  distinct `task_closed_manual` audit event), and the `done` state itself (set only by the
-  system after approve + merge). See `quorum help` for the canonical surface.
-- **R2 is a pre-merge adversarial second reviewer** (`spawn_r2_reviewer`) sampled at R1
-  approval — it replaces R1 as the pre-merge gate and its verdict drives lifecycle
-  (approve → merge, changes → rework). Check `agent_runs.sub_role` (`r2`) before
-  diagnosing an unexpected reviewer slot. The legacy post-merge shadow R2 auditor
-  path was removed in #128.
-
-## Design notes & known limitations (v1)
-
-Intentional behaviors and known gaps — not bugs, but write them down so they're not
-rediscovered:
-
-- **Agent names are caller-owned, first-use-wins.** There is no `register` and no name
-  generator: `--agent <id>` is any free-form string, auto-created on first write. Uniqueness is
-  the PK only — two sessions that pick the same id are treated as **one** agent and silently
-  merge. Distinct-name discipline lives in the *caller's* convention, not the tool. (v2
-  consideration: optionally enforce uniqueness / hand out names.)
-- **Presence = "participated recently", not "succeeded recently".** Any *write-taking* command
-  bumps `last_seen` **before** its outcome — so a lost `tasks::claim` or a not-holder `release`
-  (both exit 1) still mark the agent online, because they took the write lock and ran `touch`.
-  A *pre-write* usage error (e.g. invalid `--kind`, exit 2) does NOT register the agent. So:
-  write-taking-any-outcome → online; usage/bad-input-rejected-pre-write → no trace.
-- **Test gaps:** no property/fuzz tests; the name-collision merge is untested; `status --watch`
-  (infinite loop) is only structurally verified, not run; renew-vs-claim concurrency is covered
-  deterministically but not as a multi-thread stress (claims has the 20-thread canary,
-  tasks::claim a 12-thread one).
-
-## Where to read next
-
-- **Design of record:** `docs/2026-06-23-quorum-design.md`
-- Data model, full command surface, and the test matrix all live in the spec.
+Provider note: Claude sessions on this machine see RTK-compressed Bash output. Use
+`rtk proxy <command>` whenever raw verification output is required. Codex does not need
+that workaround.

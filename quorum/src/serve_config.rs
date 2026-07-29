@@ -224,6 +224,10 @@ fn validate_serve_file_config_key_registry() -> Result<()> {
 pub struct RoleConfig {
     pub provider: RunnerKind,
     pub provider_explicit: bool,
+    /// Whether the reviewer model was explicitly selected, independently of
+    /// the worker provider. This preserves an intentional cross-provider
+    /// reviewer when `provider` remains on its legacy default.
+    pub review_model_explicit: bool,
     pub worker_model: String,
     pub worker_effort: String,
     pub review_model: String,
@@ -301,6 +305,7 @@ pub fn resolve_roles(
     let roles = RoleConfig {
         provider,
         provider_explicit,
+        review_model_explicit: file.review_model.is_some(),
         worker_model: file
             .worker_model
             .clone()
@@ -334,9 +339,11 @@ pub fn resolve_roles(
         || file.classifier_model.is_some()
         || file.collector_model.is_some();
     if provider_explicit || role_models_explicit {
+        // `review_model` may intentionally select the other supported provider:
+        // reviewer spawning resolves its provider from this model. The remaining
+        // daemon roles stay pinned to the explicit provider.
         for (role, model) in [
             ("worker", roles.worker_model.as_str()),
-            ("review", roles.review_model.as_str()),
             ("classifier", roles.classifier_model.as_str()),
             ("collector", roles.collector_model.as_str()),
         ] {
@@ -352,6 +359,9 @@ pub fn resolve_roles(
                 )));
             }
         }
+
+        crate::serve::runner::AgentKind::for_model(&roles.review_model)
+            .map_err(QuorumError::Usage)?;
     }
     Ok(roles)
 }
@@ -1011,12 +1021,55 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
     }
 
     #[test]
-    fn explicit_provider_rejects_role_model_mismatch() {
+    fn explicit_provider_allows_cross_provider_review_model() {
+        let cfg: ServeFileConfig = toml::from_str(
+            "provider = \"codex\"\nworker_model = \"gpt-5.6-terra\"\nreview_model = \"claude-opus-4-8\"\n",
+        )
+        .unwrap();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+        assert_eq!(roles.worker_model, "gpt-5.6-terra");
+        assert_eq!(roles.review_model, "claude-opus-4-8");
+        assert!(roles.review_model_explicit);
+    }
+
+    #[test]
+    fn no_provider_explicit_cross_provider_review_model_is_preserved() {
         let cfg: ServeFileConfig =
-            toml::from_str("provider = \"codex\"\nreview_model = \"claude-opus-4-8\"\n").unwrap();
+            toml::from_str("review_model = \"gpt-5.6-terra\"\nreview_effort = \"high\"\n").unwrap();
+        let roles = resolve_roles(&cfg, None, "claude-opus-4-8", "medium").unwrap();
+
+        assert!(!roles.provider_explicit);
+        assert!(roles.review_model_explicit);
+        assert_eq!(roles.review_model, "gpt-5.6-terra");
+        assert_eq!(roles.review_effort, "high");
+    }
+
+    #[test]
+    fn explicit_provider_rejects_unknown_review_model() {
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"codex\"\nreview_model = \"mystery\"\n").unwrap();
         let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
         assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("review_model"), "{err}");
+        assert!(err.to_string().contains("unknown model"), "{err}");
+    }
+
+    #[test]
+    fn explicit_provider_rejects_worker_model_mismatch() {
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"codex\"\nworker_model = \"claude-opus-4-8\"\n").unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("worker_model"), "{err}");
+    }
+
+    #[test]
+    fn explicit_provider_rejects_classifier_model_mismatch() {
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"codex\"\nclassifier_model = \"claude-sonnet-5\"\n")
+                .unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("classifier_model"), "{err}");
     }
 
     #[test]

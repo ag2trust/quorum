@@ -58,6 +58,7 @@ pub fn serve(
         .route("/api/state", get(api_state))
         .route("/api/runs", get(api_runs))
         .route("/api/runs/:dir/stream", get(api_stream))
+        .route("/api/runs/:dir/transcript", get(api_transcript))
         .with_state(state);
     eprintln!("quorum web listening on http://{addr}");
     tokio::runtime::Runtime::new()
@@ -140,12 +141,38 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
             "task_held": held_by_agent.get(&agent.id), "run_dir": Value::Null})
         })
         .collect();
+    let live_agents = quorum_core::stats::web_daemon_agents(&conn, now)?
+        .into_iter()
+        .map(|agent| {
+            let run_dir = agent
+                .log_dir
+                .as_deref()
+                .and_then(|path| FsPath::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .filter(|name| run_entry((*name).to_owned()).is_some());
+            json!({
+                "name": agent.agent,
+                "role": agent.role,
+                "task_id": agent.task_id,
+                "task_title": agent.task_title,
+                "phase": agent.phase,
+                "provider": agent.provider,
+                "model": agent.model,
+                "effort": agent.effort,
+                "pr": agent.pr,
+                "run_dir": run_dir,
+                "last_activity_age_secs": agent.last_activity_age_secs,
+                "now": agent.now_label,
+            })
+        })
+        .collect::<Vec<_>>();
     let counts = quorum_core::stats::web_task_counts(&conn)?;
     let alerts = quorum_core::stats::web_alerts(&conn, now)?;
     let errors = quorum_core::stats::web_recent_errors(&conn, now)?;
     drop(conn);
     Ok(
         json!({"now": now, "counts": counts, "tasks": tasks, "agents": agents,
+        "live_agents": live_agents,
         "recent_events": events, "alerts": alerts, "errors": errors}),
     )
 }
@@ -260,6 +287,24 @@ async fn api_stream(
     }
 }
 
+async fn api_transcript(
+    State(state): State<AppState>,
+    Path(dir): Path<String>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    let max = query
+        .max
+        .unwrap_or(DEFAULT_STREAM_BYTES)
+        .min(MAX_STREAM_BYTES);
+    match text_payload(&state.logs_root, &dir, "transcript.md", query.from, max) {
+        Ok(value) => Json(value).into_response(),
+        Err(StreamError::BadPath) => {
+            (StatusCode::BAD_REQUEST, "invalid run directory").into_response()
+        }
+        Err(StreamError::Io(error)) => (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+    }
+}
+
 #[derive(Debug)]
 enum StreamError {
     BadPath,
@@ -330,6 +375,31 @@ fn hex_bytes(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 15) as usize] as char);
     }
     encoded
+}
+
+fn text_payload(
+    root: &FsPath,
+    dir: &str,
+    filename: &str,
+    from: Option<u64>,
+    max: u64,
+) -> Result<Value, StreamError> {
+    let path = run_dir(root, dir)?.join(filename);
+    let mut file = File::open(&path).map_err(StreamError::Io)?;
+    let len = file.metadata().map_err(StreamError::Io)?.len();
+    let start = from
+        .unwrap_or_else(|| len.saturating_sub(DEFAULT_STREAM_BYTES))
+        .min(len);
+    file.seek(SeekFrom::Start(start)).map_err(StreamError::Io)?;
+    let mut bytes = vec![0; max as usize];
+    let read = file.read(&mut bytes).map_err(StreamError::Io)?;
+    bytes.truncate(read);
+    let next = start + read as u64;
+    Ok(json!({
+        "text": String::from_utf8_lossy(&bytes),
+        "next_offset": next,
+        "eof": next >= len,
+    }))
 }
 
 fn server_error(error: quorum_core::error::QuorumError) -> Response {
@@ -460,6 +530,19 @@ mod tests {
             tail["lines"],
             json!([hex_bytes(record.trim_end().as_bytes())])
         );
+    }
+
+    #[test]
+    fn transcript_offsets_only_return_new_text() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("transcript.md"), "first\nsecond\n").unwrap();
+        let first = text_payload(root.path(), "A-100", "transcript.md", Some(0), 6).unwrap();
+        assert_eq!(first["text"], "first\n");
+        let next = first["next_offset"].as_u64().unwrap();
+        let second = text_payload(root.path(), "A-100", "transcript.md", Some(next), 20).unwrap();
+        assert_eq!(second["text"], "second\n");
     }
 
     #[test]
