@@ -1302,6 +1302,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 model: r_model.value,
                 effort: r_effort.value,
                 provider_explicit: roles.provider_explicit,
+                review_model_explicit: roles.review_model_explicit,
                 review_model: roles.review_model,
                 review_effort: roles.review_effort,
                 classifier_model: roles.classifier_model,
