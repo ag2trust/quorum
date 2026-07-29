@@ -321,6 +321,47 @@ fn is_provision_exhausted(
     Ok(attempts >= MAX_REVIEWER_PROVISION_STRIKES as i64)
 }
 
+/// Record a reviewer provisioning failure before returning to the daemon loop.
+/// Configuration/recovery mismatches must use this same bounded path as
+/// worktree and process failures; otherwise a stale persisted reviewer aborts
+/// every tick without ever parking the task.
+async fn record_reviewer_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    role: &ReviewRole,
+    head_sha: &str,
+) {
+    let role_str = role.as_str().to_string();
+    let sha = head_sha.to_string();
+    let strikes = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> i64 {
+            quorum_core::db::open(&p)
+                .ok()
+                .and_then(|mut conn| {
+                    quorum_core::provision_attempts::record_attempt(
+                        &mut conn, task_id, pr, &role_str, &sha,
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    };
+    log(&format!(
+        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} for task #{task_id} PR #{pr}",
+        role.as_str().to_uppercase()
+    ));
+    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+        log(&format!(
+            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after {strikes} consecutive {} provision failures for PR #{pr}",
+            role.as_str().to_uppercase()
+        ));
+    }
+}
+
 /// Check whether total reviewer runs for a task exceed the safety cap.
 fn is_reviewer_cap_exceeded(conn: &quorum_core::Connection, task_id: i64) -> Result<bool> {
     let total = quorum_core::provision_attempts::total_reviewer_runs(conn, task_id)?;
@@ -512,6 +553,71 @@ fn require_configured_provider(
     require_provider_match(explicitly_configured_provider(config), actual, context)
 }
 
+/// Reviewer recovery is governed by the configured reviewer model, not the
+/// worker provider. This permits an intentional cross-provider reviewer while
+/// still refusing to revive a persisted reviewer from a different configuration.
+fn require_configured_reviewer_provider(
+    config: &ServeConfig,
+    actual: runner::AgentKind,
+    context: &str,
+) -> Result<()> {
+    require_reviewer_provider(
+        config.provider_explicit || config.review_model_explicit,
+        &config.review_model,
+        actual,
+        context,
+    )
+}
+
+fn require_reviewer_provider(
+    provider_explicit: bool,
+    review_model: &str,
+    actual: runner::AgentKind,
+    context: &str,
+) -> Result<()> {
+    let expected = provider_explicit
+        .then(|| resolve_provider(review_model))
+        .transpose()?;
+    require_provider_match(expected, actual, context)
+}
+
+/// `agent_bin` overrides the CLI for the configured worker provider. A reviewer
+/// may intentionally use the other provider, in which case it must use that
+/// provider's default executable rather than receiving incompatible flags.
+fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&str> {
+    agent_bin_for_runner(
+        config.provider_explicit || config.review_model_explicit,
+        config.runner_kind,
+        config.agent_bin.as_deref(),
+        kind,
+    )
+}
+
+fn agent_bin_for_runner(
+    provider_explicit: bool,
+    runner_kind: crate::serve_config::RunnerKind,
+    agent_bin: Option<&str>,
+    kind: runner::AgentKind,
+) -> Option<&str> {
+    if !provider_explicit {
+        return agent_bin;
+    }
+    let configured_kind = match runner_kind {
+        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
+        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+    };
+    (kind == configured_kind).then_some(agent_bin).flatten()
+}
+
+fn configured_reviewer_selection<'a>(
+    provider_explicit: bool,
+    review_model_explicit: bool,
+    review_model: &'a str,
+    review_effort: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    (provider_explicit || review_model_explicit).then_some((review_model, review_effort))
+}
+
 fn require_provider_match(
     expected: Option<runner::AgentKind>,
     actual: runner::AgentKind,
@@ -594,13 +700,20 @@ fn resolve_reviewer_recovery(
             run.model
         )));
     }
-    let thread_id = task_refs
-        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-        .and_then(|refs| {
-            refs.get(reviewer_thread_ref_key(is_r2))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
+    // Continuation IDs are Codex-specific. A task can retain an older Codex
+    // reviewer thread while a later Claude reviewer is interrupted; never let
+    // that stale ref select the Codex resume path for the Claude run.
+    let thread_id = (kind == runner::AgentKind::Codex)
+        .then(|| {
+            task_refs
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                .and_then(|refs| {
+                    refs.get(reviewer_thread_ref_key(is_r2))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .flatten();
     if kind == runner::AgentKind::Codex && thread_id.is_none() {
         return Err(QuorumError::Io(format!(
             "interrupted Codex reviewer run {} has no persisted {}",
@@ -936,6 +1049,7 @@ pub struct ServeConfig {
     pub model: String,
     pub effort: String,
     pub provider_explicit: bool,
+    pub review_model_explicit: bool,
     pub review_model: String,
     pub review_effort: String,
     pub classifier_model: String,
@@ -7519,44 +7633,6 @@ fn reviewer_name_exclusions(
     excluded
 }
 
-async fn record_reviewer_provision_failure(
-    config: &ServeConfig,
-    task_id: i64,
-    pr: i64,
-    role: &ReviewRole,
-    head_sha: &str,
-    reason: &str,
-) {
-    let role_str = role.as_str().to_string();
-    let sha = head_sha.to_string();
-    let p = config.db_path.clone();
-    let strikes = tokio::task::spawn_blocking(move || -> i64 {
-        quorum_core::db::open(&p)
-            .ok()
-            .and_then(|mut conn| {
-                quorum_core::provision_attempts::record_attempt(
-                    &mut conn, task_id, pr, &role_str, &sha,
-                )
-                .ok()
-            })
-            .unwrap_or(0)
-    })
-    .await
-    .unwrap_or(0);
-    log(&format!(
-        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-         for task #{task_id} PR #{pr}: {reason}",
-        role.as_str().to_uppercase()
-    ));
-    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-        log(&format!(
-            "REVIEWER PROVISION EXHAUSTED: task #{task_id} will be parked on the next \
-             provisioning scan after {strikes} consecutive {} failures for PR #{pr}",
-            role.as_str().to_uppercase()
-        ));
-    }
-}
-
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -7647,20 +7723,16 @@ async fn provision_reviewer(
         None
     };
     if let Some(recovery) = &recovery {
-        if let Err(error) = require_configured_provider(
+        if let Err(error) = require_configured_reviewer_provider(
             config,
             recovery.kind,
             &format!("interrupted {} reviewer", role.as_str().to_uppercase()),
         ) {
-            record_reviewer_provision_failure(
-                config,
-                worker.task_id,
-                pr,
-                role,
-                head_sha,
-                &error.to_string(),
-            )
-            .await;
+            record_reviewer_provision_failure(config, worker.task_id, pr, role, head_sha).await;
+            log(&format!(
+                "{}: refusing interrupted reviewer recovery: {error}",
+                role.as_str().to_uppercase()
+            ));
             return Ok(());
         }
     }
@@ -7870,8 +7942,13 @@ async fn provision_reviewer(
                 recovery.thread_id.clone(),
             )
         } else {
-            let reviewer_model = if config.provider_explicit {
-                config.review_model.clone()
+            let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
+                config.provider_explicit,
+                config.review_model_explicit,
+                &config.review_model,
+                &config.review_effort,
+            ) {
+                model.to_string()
             } else {
                 let p = config.db_path.clone();
                 let tid = worker.task_id;
@@ -7886,8 +7963,13 @@ async fn provision_reviewer(
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
             };
             let kind = resolve_provider(&reviewer_model)?;
-            let effort = if config.provider_explicit {
-                config.review_effort.clone()
+            let effort = if let Some((_, effort)) = configured_reviewer_selection(
+                config.provider_explicit,
+                config.review_model_explicit,
+                &config.review_model,
+                &config.review_effort,
+            ) {
+                effort.to_string()
             } else {
                 config.effort.clone()
             };
@@ -7947,6 +8029,7 @@ async fn provision_reviewer(
         ("QUORUM_AGENT".into(), reviewer_name.clone()),
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
+    let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let spawn_result = if let Some(thread_id) = reviewer_thread_id.as_deref() {
         codex_agent::CodexProc::spawn_resume(
             thread_id,
@@ -7956,7 +8039,7 @@ async fn provision_reviewer(
             &wt_path,
             &prompt,
             &reviewer_env,
-            config.agent_bin.as_deref(),
+            reviewer_agent_bin,
         )
         .map(runner::RunnerProc::Codex)
     } else {
@@ -7966,7 +8049,7 @@ async fn provision_reviewer(
             &reviewer_effort,
             &session_id,
             &wt_path,
-            config.agent_bin.as_deref(),
+            reviewer_agent_bin,
             config.bare_agent,
             reviewer_env,
             config.allowed_tools.as_deref(),
@@ -12366,6 +12449,138 @@ mod tests {
                 .find(|pair| pair[0] == "--model")
                 .map(|pair| pair[1].as_str()),
             Some("gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn cross_provider_reviewer_recovery_keeps_persisted_claude_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-restart.db");
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "cross-provider review",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "r1-claude",
+                "reviewer",
+                "claude-opus-4-8",
+                "high",
+                "claude",
+                11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    r#"{"codex_reviewer_r1_thread_id":"stale-codex-thread"}"#,
+                    task_id
+                ],
+            )
+            .unwrap();
+        }
+
+        let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+            .unwrap()
+            .expect("interrupted Claude reviewer");
+        assert_eq!(recovery.kind, runner::AgentKind::Claude);
+        assert_eq!(recovery.model, "claude-opus-4-8");
+        assert_eq!(
+            recovery.thread_id, None,
+            "a Claude recovery must ignore a stale Codex continuation ref"
+        );
+        assert!(
+            require_reviewer_provider(
+                true,
+                "claude-opus-4-8",
+                recovery.kind,
+                "interrupted R1 reviewer",
+            )
+            .is_ok(),
+            "cross-provider reviewer recovery must follow review_model"
+        );
+        assert!(
+            require_reviewer_provider(
+                true,
+                "gpt-5.6-terra",
+                recovery.kind,
+                "interrupted R1 reviewer",
+            )
+            .is_err(),
+            "a stale Claude recovery must not bypass a configured Codex reviewer"
+        );
+    }
+
+    #[test]
+    fn cross_provider_reviewer_uses_its_own_default_binary() {
+        use crate::serve_config::RunnerKind;
+
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Codex,
+                Some("/opt/codex"),
+                runner::AgentKind::Codex
+            ),
+            Some("/opt/codex")
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Codex,
+                Some("/opt/codex"),
+                runner::AgentKind::Claude
+            ),
+            None,
+            "a Claude reviewer must not receive the configured Codex executable"
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Claude,
+                Some("/opt/claude"),
+                runner::AgentKind::Codex
+            ),
+            None,
+            "a Codex reviewer must not receive the configured Claude executable"
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                false,
+                RunnerKind::Claude,
+                Some("/opt/test-agent"),
+                runner::AgentKind::Codex
+            ),
+            Some("/opt/test-agent"),
+            "legacy mixed-provider recovery preserves its configured runner override"
+        );
+    }
+
+    #[test]
+    fn explicit_review_model_without_provider_selects_its_model_and_effort() {
+        assert_eq!(
+            configured_reviewer_selection(false, true, "gpt-5.6-terra", "high",),
+            Some(("gpt-5.6-terra", "high")),
+            "an explicit review_model must not be ignored when provider is absent"
+        );
+        assert_eq!(
+            configured_reviewer_selection(false, false, "gpt-5.6-terra", "high"),
+            None,
+            "legacy configuration continues to use escalation"
         );
     }
 

@@ -1454,10 +1454,13 @@ classifier_effort = "medium"
 
 `provider` is optional. When absent, the legacy `agent` / `model` / `effort` configuration
 and Claude-compatible defaults remain available. When present, it is a fail-safe operating
-constraint: worker, R1, R2, live task classification, and post-merge review classification
-must all resolve to that provider. An explicit task model or `tier:` label for another
-provider is rejected rather than overriding the constraint, and spawn, retry, persistence,
-or recovery must never fall back to another provider.
+constraint for workers, live task classification, post-merge review classification, and
+collectors. `review_model` is the explicit exception: R1 and R2 resolve their runner from
+that model and may intentionally use the other supported provider. An explicit task model
+or `tier:` label for another worker provider is rejected rather than overriding the
+constraint. Reviewer spawn, retry, persistence, and recovery must instead remain bound to
+the configured reviewer model's provider; they must not fall back to a worker-provider CLI
+or resume a continuation belonging to another provider.
 
 The role model and effort fields are independently configurable. R1 and R2 use the explicit
 review selection instead of cross-provider strength inference. Every run persists the exact
