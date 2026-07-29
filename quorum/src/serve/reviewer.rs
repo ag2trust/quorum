@@ -37,9 +37,9 @@ pub struct ReviewerSpec {
 /// demanding speculative findings or an audit of unrelated code.
 const COMPLETE_REVIEW_CONTRACT: &str = "\
 ## Complete-review requirement\n\n\
-Complete the planned review before submitting a verdict. Finding one blocker never ends \
-review exploration: keep auditing the full current diff, surrounding code, and relevant \
-sibling and negative paths.\n\
+Complete the planned review before submitting a verdict. Coverage, not the number of \
+findings, determines when the review is complete: audit the full current diff, surrounding \
+code, and relevant sibling and negative paths. A complete review may have zero findings.\n\
 For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
 (for example, producers × success/error/shutdown) and audit every applicable cell together. \
 Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
@@ -275,21 +275,22 @@ pub fn build_r2_review_prompt_for_kind(
 
 fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
     format!(
-        "You are R2 reviewer {name}, an adversarial pre-merge second reviewer for \
+        "You are R2 reviewer {name}, an independent pre-merge second reviewer for \
          PR #{pr} opened by worker {worker}. R1 reviewer {r1} already approved this \
          PR.\n\n\
-         ## Adversarial mandate\n\n\
-         Your goal is to attempt to falsify the claim that this PR is safe to merge. \
-         Focus on: failure modes, invariant violations, concurrency hazards, negative \
+         ## Independent coverage focus\n\n\
+         Provide a fresh assessment of whether this PR is safe to merge, then check whether \
+         R1 left any material gaps, if any exist. Pay particular attention to failure modes, \
+         invariant violations, concurrency hazards, negative \
          paths, incomplete verification evidence, and interactions with code outside \
          the changed hunks.\n\n\
          ## Independent-first review\n\n\
          Review the full diff and surrounding code BEFORE reading R1's comments or \
          verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
          Only after your independent review, compare against R1's conclusion:\n\
-         1. Identify material issues R1 missed (false negatives).\n\
-         2. Disprove apparent concerns that surrounding code or tests already address \
-         (false positives you would have raised without checking).\n\n\
+         1. Identify any material gap R1 did not surface, if one exists.\n\
+         2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
+         and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
          Zero blocking findings is a valid outcome after a thorough review. Every \
          BLOCKING finding must cite a concrete code path (file:line or function) and \
@@ -366,21 +367,22 @@ pub struct R2ReviewSpec {
 
 pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
     format!(
-        "You are R2 reviewer {name}, an adversarial pre-merge second reviewer for \
+        "You are R2 reviewer {name}, an independent pre-merge second reviewer for \
          PR #{pr} opened by worker {worker}. R1 reviewer {r1} already approved this \
          PR.\n\n\
-         ## Adversarial mandate\n\n\
-         Your goal is to attempt to falsify the claim that this PR is safe to merge. \
-         Focus on: failure modes, invariant violations, concurrency hazards, negative \
+         ## Independent coverage focus\n\n\
+         Provide a fresh assessment of whether this PR is safe to merge, then check whether \
+         R1 left any material gaps, if any exist. Pay particular attention to failure modes, \
+         invariant violations, concurrency hazards, negative \
          paths, incomplete verification evidence, and interactions with code outside \
          the changed hunks.\n\n\
          ## Independent-first review\n\n\
          Review the full diff and surrounding code BEFORE reading R1's comments or \
          verdict. Form your own conclusions first to avoid anchoring on R1's judgment. \
          Only after your independent review, compare against R1's conclusion:\n\
-         1. Identify material issues R1 missed (false negatives).\n\
-         2. Disprove apparent concerns that surrounding code or tests already address \
-         (false positives you would have raised without checking).\n\n\
+         1. Identify any material gap R1 did not surface, if one exists.\n\
+         2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
+         and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
          Zero blocking findings is a valid outcome after a thorough review. Every \
          BLOCKING finding must cite a concrete code path (file:line or function) and \
@@ -885,8 +887,9 @@ mod tests {
                 "{name} must require completion before verdict"
             );
             assert!(
-                prompt.contains("Finding one blocker never ends review exploration"),
-                "{name} must continue after the first blocker"
+                prompt.contains("Coverage, not the number of findings")
+                    && prompt.contains("complete review may have zero findings"),
+                "{name} must define completion by coverage without a finding quota"
             );
             assert!(
                 prompt.contains("affected-path matrix/checklist"),
@@ -1291,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn r2_review_prompt_is_adversarial_and_evidence_bound() {
+    fn r2_review_prompt_is_independent_gap_focused_and_evidence_bound() {
         let spec = R2ReviewSpec {
             pr: 10,
             worker_agent: "W".into(),
@@ -1300,18 +1303,18 @@ mod tests {
         };
         let prompt = build_r2_review_prompt(&spec, "high");
         assert!(
-            prompt.contains("adversarial"),
-            "R2 prompt must carry the adversarial mandate"
+            !prompt.to_lowercase().contains("adversarial"),
+            "R2 prompt must not pressure the reviewer with adversarial framing"
         );
         assert!(
-            prompt.contains("falsify"),
-            "R2 prompt must instruct falsification of merge-safety claim"
+            !prompt.to_lowercase().contains("falsify"),
+            "R2 prompt must not create an implicit finding quota through falsification framing"
         );
         assert!(
             prompt.contains("failure modes")
                 && prompt.contains("invariant violation")
                 && prompt.contains("concurrency"),
-            "R2 prompt must specify adversarial focus areas"
+            "R2 prompt must specify high-risk coverage areas"
         );
         assert!(
             prompt.contains("BEFORE reading R1"),
@@ -1334,12 +1337,13 @@ mod tests {
             "R2 prompt must reject speculative/contrarian findings"
         );
         assert!(
-            prompt.contains("R1 missed"),
-            "R2 prompt must instruct identifying what R1 missed"
+            prompt.contains("material gap R1 did not surface") && prompt.contains("if one exists"),
+            "R2 prompt must check for R1 gaps without assuming one exists"
         );
         assert!(
-            prompt.contains("Disprove") || prompt.contains("false positive"),
-            "R2 prompt must instruct disproving apparent concerns already addressed"
+            prompt.contains("Agreement with R1")
+                && prompt.contains("no additional findings are both valid outcomes"),
+            "R2 prompt must explicitly permit agreement and zero additional findings"
         );
     }
 
@@ -1359,12 +1363,18 @@ mod tests {
         let r1 = build_review_prompt(&r1_spec, "high");
         let r2 = build_r2_review_prompt(&r2_spec, "high");
         assert!(
-            !r1.contains("adversarial") && r2.contains("adversarial"),
-            "only R2 should carry the adversarial mandate, not R1"
+            !r1.to_lowercase().contains("adversarial")
+                && !r2.to_lowercase().contains("adversarial"),
+            "neither review role should carry adversarial finding pressure"
         );
         assert!(
-            !r1.contains("falsify") && r2.contains("falsify"),
-            "only R2 should instruct falsification"
+            !r1.to_lowercase().contains("falsify") && !r2.to_lowercase().contains("falsify"),
+            "neither review role should imply a falsification quota"
+        );
+        assert!(
+            !r1.contains("material gap R1 did not surface")
+                && r2.contains("material gap R1 did not surface"),
+            "R2 remains distinct through its conditional R1-gap focus"
         );
         assert!(
             r1.contains("do not manufacture findings"),
@@ -1476,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_r2_follows_agents_md_and_is_adversarial() {
+    fn codex_r2_follows_agents_md_and_checks_r1_gaps_without_quota() {
         let spec = R2ReviewSpec {
             pr: 55,
             worker_agent: "W".into(),
@@ -1493,9 +1503,13 @@ mod tests {
             "Codex R2 prompt must follow AGENTS.md instructions"
         );
         assert!(
-            prompt.contains("adversarial"),
-            "Codex R2 prompt must carry the adversarial mandate"
+            !prompt.to_lowercase().contains("adversarial")
+                && !prompt.to_lowercase().contains("falsify"),
+            "Codex R2 prompt must avoid finding-pressure language"
         );
+        assert!(prompt.contains("material gap R1 did not surface"));
+        assert!(prompt.contains("if one exists"));
+        assert!(prompt.contains("Agreement with R1"));
         assert!(prompt.contains("R1 reviewer R1 already approved"));
         assert!(prompt.contains("--verdict approved"));
         assert!(prompt.contains("--verdict changes"));
