@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 33;
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -123,12 +123,7 @@ pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
 /// safe. Refuses (fails loud) if the DB was written by a newer binary.
 pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if current > SCHEMA_VERSION {
-        return Err(QuorumError::SchemaTooNew {
-            db: current,
-            bin: SCHEMA_VERSION,
-        });
-    }
+    ensure_schema_supported(current, SCHEMA_VERSION)?;
     if current == SCHEMA_VERSION {
         return Ok(MigrateResult {
             migrated_from: current,
@@ -472,6 +467,13 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // sampled R2 skip is merge-gate authority. Landing at v33 forces live
         // v32 databases through SCHEMA_SQL so the net-new table is present.
 
+        // v34 = durable per-invocation token usage (#229). Two net-new tables
+        // are created by SCHEMA_SQL: token_usage_runs stores the provider
+        // breakdown and token_usage_run_tasks maps batched classifier runs to
+        // every task they classified. Keeping this separate from agent_runs
+        // also represents collector/classifier invocations without synthetic
+        // managed-agent identities.
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -488,6 +490,16 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             Err(e)
         }
     }
+}
+
+fn ensure_schema_supported(db_version: i64, binary_version: i64) -> Result<()> {
+    if db_version > binary_version {
+        return Err(QuorumError::SchemaTooNew {
+            db: db_version,
+            bin: binary_version,
+        });
+    }
+    Ok(())
 }
 
 fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool> {
@@ -2088,5 +2100,64 @@ mod tests {
             n, 1,
             "r2_sampling_decisions table missing after v32→v33 migration"
         );
+    }
+
+    #[test]
+    fn migrates_v33_to_v34_preserving_existing_agent_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE agent_runs (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 task_id INTEGER NOT NULL,
+                 agent_name TEXT NOT NULL,
+                 role TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 effort TEXT NOT NULL,
+                 spawned_at INTEGER NOT NULL,
+                 ended_at INTEGER,
+                 end_reason TEXT,
+                 sub_role TEXT,
+                 provider TEXT
+             );
+             INSERT INTO agent_runs
+                 (task_id, agent_name, role, model, effort, spawned_at, provider)
+             VALUES (229, 'Beacon', 'worker', 'gpt-5.6-sol', 'high', 100, 'codex');
+             PRAGMA user_version = 33;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let run: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT agent_name, ended_at FROM agent_runs WHERE task_id=229",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(run, ("Beacon".to_string(), None));
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM token_usage_runs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "migration must not invent historical usage");
+    }
+
+    #[test]
+    fn v33_binary_refuses_resulting_v34_schema() {
+        assert!(matches!(
+            ensure_schema_supported(34, 33),
+            Err(QuorumError::SchemaTooNew { db: 34, bin: 33 })
+        ));
     }
 }

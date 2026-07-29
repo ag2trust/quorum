@@ -117,6 +117,11 @@ pub struct CollectionOutcome {
     pub error: Option<String>,
 }
 
+struct ClassifierTurnOutcome {
+    response: Result<String>,
+    usage: super::runner::TokenUsage,
+}
+
 /// Full pipeline: fetch inputs, spawn classifier, parse + store. On any failure
 /// the run record is stamped `failed` with the error text — never returns without
 /// having written the run row.
@@ -145,8 +150,17 @@ pub async fn run_collection_with_inputs(
     attempted_at: i64,
 ) -> Result<CollectionOutcome> {
     // 2) Spawn classifier + await bounded turn.
-    let response_text = match spawn_and_run_classifier(request, &inputs).await {
-        Ok(t) => t,
+    let turn = match spawn_and_run_classifier(request, &inputs).await {
+        Ok(turn) => turn,
+        Err(e) => {
+            let err_text = format!("collector classifier failed: {e}");
+            record_failure(request, &err_text, attempted_at).await;
+            return Err(QuorumError::Io(err_text));
+        }
+    };
+    record_token_usage(request, turn.usage).await;
+    let response_text = match turn.response {
+        Ok(response) => response,
         Err(e) => {
             let err_text = format!("collector classifier failed: {e}");
             record_failure(request, &err_text, attempted_at).await;
@@ -252,6 +266,52 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
         Ok(())
     })
     .await;
+}
+
+/// Best-effort instrumentation. Collection findings and lifecycle outcomes are
+/// already independent of this write; telemetry failure is logged and ignored.
+async fn record_token_usage(request: &CollectionRequest, usage: super::runner::TokenUsage) {
+    let db_path = request.db_path.clone();
+    let task_ids: Vec<i64> = request.task_id.into_iter().collect();
+    let pr_number = request.pr_number;
+    let provider = AgentKind::for_model(&request.collector_model)
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let model = request.collector_model.clone();
+    let effort = request.collector_effort.clone();
+    let usage = quorum_core::token_usage::TokenUsage {
+        uncached_input_tokens: usage.input_tokens as i64,
+        cached_input_tokens: usage.cached_input_tokens as i64,
+        cache_write_input_tokens: usage.cache_write_input_tokens as i64,
+        output_tokens: usage.output_tokens as i64,
+        reasoning_tokens: usage.reasoning_tokens as i64,
+    };
+    let outcome = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        quorum_core::token_usage::record(
+            &mut conn,
+            None,
+            "collector",
+            &task_ids,
+            Some(pr_number),
+            &provider,
+            &model,
+            &effort,
+            usage,
+            clock::now(),
+        )?;
+        Ok(())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("quorum collector: token usage write failed (ignored): {error}")
+        }
+        Err(error) => {
+            eprintln!("quorum collector: token usage join failed (ignored): {error}")
+        }
+    }
 }
 
 /// Deterministically fetch every input the classifier will read. Failures at
@@ -520,7 +580,7 @@ async fn run_gh_raw(
 async fn spawn_and_run_classifier(
     request: &CollectionRequest,
     inputs: &CollectorInputs,
-) -> Result<String> {
+) -> Result<ClassifierTurnOutcome> {
     let prompt = review_findings::build_collector_prompt(inputs);
     let kind = AgentKind::for_model(&request.collector_model)
         .map_err(|e| QuorumError::Io(format!("collector provider: {e}")))?;
@@ -560,6 +620,7 @@ async fn spawn_and_run_classifier(
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
+    let mut usage_total = super::runner::TokenUsage::default();
     let outcome: Result<String> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -572,9 +633,21 @@ async fn spawn_and_run_classifier(
             Ok(Some(raw)) => {
                 if kind == AgentKind::Claude {
                     if let Some(super::stream::Event::Result {
-                        result, is_error, ..
+                        result,
+                        usage,
+                        is_error,
+                        ..
                     }) = super::stream::parse_line(&raw)
                     {
+                        if let Some(usage) = usage {
+                            usage_total.saturating_add_assign(super::runner::TokenUsage {
+                                input_tokens: usage.input_tokens,
+                                cached_input_tokens: usage.cache_read_input_tokens,
+                                cache_write_input_tokens: usage.cache_creation_input_tokens,
+                                output_tokens: usage.output_tokens,
+                                reasoning_tokens: 0,
+                            });
+                        }
                         let text = super::stream::result_text(&result);
                         if is_error.unwrap_or(false) {
                             break Err(QuorumError::Io(format!(
@@ -595,10 +668,16 @@ async fn spawn_and_run_classifier(
                 for event in events {
                     match event {
                         AgentEvent::AssistantText { text } => response_text.push_str(&text),
-                        AgentEvent::TurnCompleted { .. } => {
+                        AgentEvent::TurnCompleted { usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             terminal = Some(Ok(response_text.clone()))
                         }
-                        AgentEvent::TurnFailed { message, .. } => {
+                        AgentEvent::TurnFailed { message, usage, .. } => {
+                            if let Some(usage) = usage {
+                                usage_total.saturating_add_assign(usage);
+                            }
                             terminal = Some(Err(QuorumError::Io(format!(
                                 "classifier returned an error: {message}"
                             ))))
@@ -629,7 +708,10 @@ async fn spawn_and_run_classifier(
     };
 
     proc.kill_and_reap().await;
-    outcome
+    Ok(ClassifierTurnOutcome {
+        response: outcome,
+        usage: usage_total,
+    })
 }
 
 /// Spawn a detached collection task from the daemon merge branch. Never awaits.
@@ -919,6 +1001,14 @@ mod tests {
         assert_eq!(findings[1].pushback_accepted, Some(true));
         assert_eq!(findings[1].evidence[0].kind, "issue_comment");
         assert_eq!(findings[1].evidence[0].id, 202);
+
+        let usage = quorum_core::token_usage::for_task(&conn, 7).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].purpose, "collector");
+        assert_eq!(usage[0].pr_number, Some(42));
+        assert_eq!(usage[0].usage.uncached_input_tokens, 500);
+        assert_eq!(usage[0].usage.cached_input_tokens, 0);
+        assert_eq!(usage[0].usage.output_tokens, 100);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -984,6 +1074,15 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(task_count, 1, "collector must not delete/modify tasks");
+
+        // The provider reported usage before its error result. Failed collection
+        // must retain that invocation's accounting just like a successful turn.
+        let usage = quorum_core::token_usage::for_task(&conn, 1).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].purpose, "collector");
+        assert_eq!(usage[0].pr_number, Some(88));
+        assert_eq!(usage[0].usage.uncached_input_tokens, 500);
+        assert_eq!(usage[0].usage.output_tokens, 100);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
