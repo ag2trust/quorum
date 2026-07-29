@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 33;
+pub const SCHEMA_VERSION: i64 = 34;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -471,6 +471,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // supplied and updated through agent-facing task commands, whereas a
         // sampled R2 skip is merge-gate authority. Landing at v33 forces live
         // v32 databases through SCHEMA_SQL so the net-new table is present.
+
+        // v34 = bounded REVIEWING status projection (#239). The partial index
+        // matches each durable status and newest-first order. Status reads at
+        // most REVIEWING_TASK_LIMIT candidates per status before merging, rather
+        // than sorting every historical review-only task. Bumping is required
+        // for live v33 databases, where SCHEMA_SQL would otherwise be skipped.
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -2087,6 +2093,78 @@ mod tests {
         assert_eq!(
             n, 1,
             "r2_sampling_decisions table missing after v32→v33 migration"
+        );
+    }
+
+    #[test]
+    fn migrates_v33_to_v34_adds_reviewing_newest_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0,
+                 created_by TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 refs TEXT
+             );
+             INSERT INTO tasks(title, status, created_by, created_at, updated_at)
+                 VALUES ('pre-v34', 'in-review', 'boss', 100, 100);
+             PRAGMA user_version = 33;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let c = open(&path).unwrap();
+        let version: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let index: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='index' AND name='tasks_reviewing_newest'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1, "v33 database must gain the REVIEWING index");
+
+        let plan = c
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, title, status, refs FROM (
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='in-review'
+                         ORDER BY updated_at DESC, id DESC LIMIT 20
+                     )
+                     UNION ALL
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='merging'
+                         ORDER BY updated_at DESC, id DESC LIMIT 20
+                     )
+                 )
+                 ORDER BY updated_at DESC, id DESC LIMIT 20",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert_eq!(
+            plan.matches("tasks_reviewing_newest").count(),
+            2,
+            "plan: {plan}"
         );
     }
 }
