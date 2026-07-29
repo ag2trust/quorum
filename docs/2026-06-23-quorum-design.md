@@ -517,7 +517,8 @@ only through an explicit outside request)
 - `VerdictApprove` → Merging · effects: MergePr
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
-- `VerdictChanges` (review_only=true) → Failed · effects: PostFindingsNote, ReleaseLease
+- `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
+  ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
 - `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
 - `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
@@ -544,8 +545,9 @@ only through an explicit outside request)
 - **Rework cap:** `REWORK_CAP = 3`. When `rework_round >= 3` and VerdictChanges fires,
   the task goes to Failed (not Rework).
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
-  with `review_only=true`. VerdictChanges on a review-only task goes to Failed (no worker
-  to rework).
+  with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
+  through to generic implementation-worker provisioning, because remediation must retain
+  the adopted PR target.
 - **Sticky InReview:** reviewer crash/expiry does NOT leave InReview — the task stays and a
   new reviewer is spawned. Prevents review tasks from reverting to Open.
 - **Resume semantics:** rework feeds a new turn to the existing worker (ResumeWorker);
@@ -910,21 +912,52 @@ prevents a restart from merging code the reviewer never saw.
 
 #### Actionable rework with no live worker
 
-When an actionable outcome (Failed checks, MergeConflict, retryable merge failure) fires
-VerdictChanges and the resulting status is `rework`, but no live worker exists for the
-task, the daemon spawns a **remediation worker** (`spawn_remediation_worker` in
-`serve/mod.rs`). The remediation worker:
+When an actionable outcome (Failed checks, MergeConflict, retryable merge failure, or a
+blocking review verdict) enters `rework`, but no live worker exists for the task, the daemon
+spawns a **remediation worker** (`spawn_remediation_worker` in `serve/mod.rs`). The
+remediation worker:
 
 - Gets the existing PR branch (resolved from GitHub via `resolve_pr_target`, which returns
   the authoritative head ref, SHA, and fork status; falls back to daemon branch convention
   when GitHub is unavailable)
 - Gets the blocking findings / merge error as its rework prompt
 - Is bounded by the same recovery policy as other workers (idle timeout, cost cap)
-- Counts toward the rework cap (`rework_round` was already incremented by lifecycle)
+- Counts toward the worker cap and rework cap (`rework_round` was already incremented by
+  lifecycle)
 
-If remediation worker provisioning fails (branch not found, worktree failure), the daemon
-fires `AgentFailed { reason: "no worker for rework" }` which transitions the task back
-to InReview (sticky) and re-spawns a reviewer on the next tick — not a silent strand.
+#### Workerless review-only Codex boundary
+
+A review-only/adopted PR has no original managed worker by construction. For Codex only,
+the daemon therefore permits a fresh `codex exec` remediation turn **only** when durable
+`agent_runs` show that the task has no original managed worker and the task remains
+`review_only`. This is not a fallback for an implementation task or a lost continuation:
+
+- Before the fresh turn, the daemon resolves and persists the PR target, provisions the
+  exact verified branch/SHA worktree, atomically claims the rework, and issues the
+  run-scoped worker capability.
+- On `thread.started`, the provider-issued thread ID is persisted in task refs before any
+  later turn can depend on it. A later remediation is an exact `codex exec resume` of that
+  ID with the persisted model, effort, prompt, PR target, and worker role.
+- If an original managed worker exists, a Codex remediation requires its exact persisted
+  continuation ID. Missing or malformed identity is a fail-closed provisioning failure;
+  Quorum never silently starts a fresh thread for that implementation task.
+- Once a workerless fresh remediation has been started, it has become a managed worker for
+  this purpose. A crash or shutdown before a durable thread ID exists is also fail-closed,
+  rather than authorizing a replacement fresh turn.
+
+Deterministic remediation provisioning/configuration failure (including branch, worktree,
+provider, or missing required continuation identity) releases the lease, persists the
+blocking feedback, and parks the task in `failed` with its `rework` resume marker. It does
+not emit `AgentFailed` back to `in-review`, so unchanged code cannot repeatedly consume
+reviewer slots or rework rounds. An owner may explicitly `task-retry`; review-only retries
+use the same persisted PR target and feedback through a dedicated reconciliation path, not
+generic worker provisioning, and that path may fill only the remaining `config.cap` worker
+slots in a tick.
+
+During controlled shutdown/drain no fresh remediation is started. A running fresh
+remediation is reaped through the normal worker cleanup path; its persisted thread ID
+supports exact continuation after restart. If no durable ID was observed, recovery remains
+fail-closed and leaves the parked task for explicit operator action.
 
 #### Code paths (current implementation references)
 
