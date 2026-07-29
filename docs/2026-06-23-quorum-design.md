@@ -654,10 +654,12 @@ coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
 error; values are never clamped. `r2_enabled = false` disables sampling, not the
 R2 safety gate, and therefore also leaves R2 mandatory.
 
-R2 is skipped when R1 approves after `rework_round` has reached `REWORK_CAP`.
-At that point no bounded rework round remains for an R2 changes verdict, so R1
-approval is the final review gate. The skip is recorded for that PR head through
-the same daemon-owned sampling-decision mechanism.
+R2 is skipped when R1 approves after `rework_round` has reached `REWORK_CAP`
+and that PR head has no prior decision. At that point no bounded rework round
+remains for an R2 changes verdict, so R1 approval is the final review gate. The
+skip is recorded for that PR head through the same daemon-owned sampling-decision
+mechanism. A prior decision requiring R2 remains authoritative if the branch
+later returns to that head.
 
 When R1 approves, Quorum records a sampling decision in a daemon-owned table,
 keyed by both PR number and head SHA; it is not task refs because task refs are
