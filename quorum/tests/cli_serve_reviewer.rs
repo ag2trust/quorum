@@ -625,6 +625,62 @@ fn configured_always_sample_still_blocks_merge_until_r2_approves() {
 }
 
 #[test]
+fn exhausted_rework_budget_skips_r2_even_when_sampling_requires_it() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    configure_r2_sampling(home.path(), 0, 1.0);
+    seed_task(home.path(), "exhausted rework budget");
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.execute(
+        "UPDATE tasks SET rework_round=?1 WHERE id=1",
+        [quorum_core::lifecycle::REWORK_CAP],
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut handle = ServeHandle::start(home.path(), repo_dir.path(), wt_base.path(), &names_file);
+    assert!(handle.wait_for("spawning agent", 15));
+    assert!(handle.wait_for("result", 15));
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    quorum_done(home.path(), &["--agent", &worker, "--pr", "1"]);
+    assert!(handle.wait_for("spawning reviewer", 15));
+    assert!(handle.wait_for("result", 15));
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("exhausted rework budget skipped R2", 15),
+        "{:?}",
+        handle.lines
+    );
+    assert!(handle.wait_for("merged", 15), "{:?}", handle.lines);
+    assert_eq!(r2_run_count(home.path(), 1), 0);
+    handle.stop();
+}
+
+#[test]
 fn changes_verdict_feeds_rework_to_same_warm_worker() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();

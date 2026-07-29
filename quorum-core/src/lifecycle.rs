@@ -156,7 +156,7 @@ impl fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
-pub const REWORK_CAP: u32 = 3;
+pub const REWORK_CAP: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match

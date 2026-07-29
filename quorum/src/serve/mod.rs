@@ -250,10 +250,26 @@ fn r2_required_for_head(
     pr_number: i64,
     head_sha: &str,
 ) -> bool {
-    quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)
-        .ok()
-        .flatten()
-        .unwrap_or(true)
+    // A head's durable decision is immutable, including after a force-push
+    // returns the PR to that head.  The exhausted-budget skip may establish a
+    // decision only for a previously unseen head; it must never weaken one
+    // already recorded as required.
+    match quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha) {
+        Ok(Some(required)) => return required,
+        // Missing state is the only case where the cap may establish a new
+        // R2 skip. An unreadable or task-mismatched decision fails closed.
+        Ok(None) => {}
+        Err(_) => return true,
+    }
+    if matches!(
+        tasks::get(conn, task_id),
+        Ok(Some(task))
+            if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP)
+    ) {
+        return false;
+    }
+    // Missing, unreadable, or task-mismatched state fails closed to R2.
+    true
 }
 
 struct R2SamplingPolicy {
@@ -274,15 +290,17 @@ fn decide_r2_requirement(
     head_sha: &str,
     policy: &R2SamplingPolicy,
 ) -> Result<bool> {
-    if tasks::get(conn, task_id)?.is_none() {
-        return Err(QuorumError::Io(format!(
-            "task #{task_id} disappeared while sampling R2"
-        )));
-    }
+    let task = tasks::get(conn, task_id)?
+        .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared while sampling R2")))?;
     if let Some(required) =
         quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)?
     {
         return Ok(required);
+    }
+    if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP) {
+        return quorum_core::review_audits::record_r2_requirement(
+            conn, task_id, pr_number, head_sha, false,
+        );
     }
 
     // `false` opts out of sampling, never out of the R2 gate itself.
@@ -3038,7 +3056,8 @@ async fn tick(
 
                         if !r2_required {
                             log(&format!(
-                                "R2 GATE: PR #{pr_num} — sampling skipped R2 for head {head_sha}; \
+                                "R2 GATE: PR #{pr_num} — sampling or exhausted rework budget \
+                                 skipped R2 for head {head_sha}; \
                                  proceeding with R1 approval"
                             ));
                         } else {
@@ -11797,6 +11816,71 @@ mod tests {
             Some("r2"),
             "force-pushing the prior required head back must still require R2"
         );
+    }
+
+    #[test]
+    fn exhausted_rework_budget_preserves_required_r2_for_returned_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "creator",
+            "sampled task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let policy = R2SamplingPolicy {
+            enabled: true,
+            target_per_stratum: 0,
+            steady_state_p: 0.0,
+            default_model: "model".into(),
+            default_effort: "high".into(),
+        };
+
+        // Head A was reviewed before rework exhausted the budget and durably
+        // required R2. Rework then consumes the final bounded round.
+        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 42, "head-a", true)
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET rework_round=?1 WHERE id=?2",
+            rusqlite::params![quorum_core::lifecycle::REWORK_CAP as i64, task_id],
+        )
+        .unwrap();
+
+        // The branch moves to new head B, which correctly receives the final
+        // round's recorded skip. It then force-pushes back to A and obtains a
+        // fresh R1 approval. The cap can establish a skip only for B; it
+        // cannot replace A's R2 gate.
+        assert!(!decide_r2_requirement(&mut conn, task_id, 42, "head-b", &policy).unwrap());
+        assert!(decide_r2_requirement(&mut conn, task_id, 42, "head-a", &policy).unwrap());
+        quorum_core::approvals::record(
+            &mut conn,
+            &quorum_core::approvals::Approval {
+                pr_number: 42,
+                review_role: "r1".into(),
+                task_id,
+                author: "worker".into(),
+                reviewer: "fresh-r1".into(),
+                verdict: "approved".into(),
+                blocking_count: 0,
+                approved_head_sha: "head-a".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next_needed_role(&conn, 42, "head-a").unwrap(), Some("r2"));
+
+        // Restart reconciliation reads the same immutable decision.
+        drop(conn);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(r2_required_for_head(&conn, task_id, 42, "head-a"));
+        assert_eq!(next_needed_role(&conn, 42, "head-a").unwrap(), Some("r2"));
     }
 
     /// A sampled-out head leaves no `r2` approval row. The provisioning
