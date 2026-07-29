@@ -422,6 +422,20 @@ impl Case {
         );
     }
 
+    fn retry_parked(&self) {
+        let output = Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", self.home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .args(["task-retry", "--task-id", "1", "--by", "operator"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "task-retry failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn approve_current_reviewer(&mut self, marker: &str) {
         self.handle.wait_for(marker);
         let reviewer = self.handle.agent_after(marker);
@@ -802,6 +816,7 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(refs["daemon_parked"], true);
     assert_eq!(refs["daemon_resume_status"], "rework");
+    assert_eq!(refs["remediation_feedback"], "still blocked");
     let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
     assert_eq!(
         runs.iter().filter(|run| run.role == "reviewer").count(),
@@ -821,6 +836,41 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
         .unwrap();
     assert_eq!(active_claims, 0, "parking releases the remediation claim");
     drop(conn);
+
+    // An explicit retry must be schedulable through the review-only
+    // remediation path, not generic worker provisioning (which would create
+    // a daemon branch rather than reuse the adopted PR branch).
+    write_dual_protocol_runner(case.home.path());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "review-pr-1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.retry_parked();
+    case.handle
+        .wait_for("durable review-only remediation retry: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
+    let remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {remediation} result"));
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.assignee.as_deref(), Some(remediation.as_str()));
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        runs.iter().filter(|run| run.role == "worker").count(),
+        1,
+        "one explicit retry must create exactly one remediation worker"
+    );
+    drop(conn);
+    case.done(&remediation, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
     case.handle.stop();
 }
 

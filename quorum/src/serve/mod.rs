@@ -1486,6 +1486,12 @@ fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// The remediation reconcilers run before Phase 6's ordinary worker-cap loop,
+/// so they must apply the same slot accounting themselves.
+fn available_worker_slots(cap: usize, active_workers: usize) -> usize {
+    cap.saturating_sub(active_workers)
+}
+
 fn retry_slot_rework_count(
     rework_round: i64,
     retry: Option<&CodexRetryTurn>,
@@ -2203,6 +2209,101 @@ async fn reconcile_ci_remediations(
                 )
                 .await;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Resume an owner-requested retry of a remediation that was parked before a
+/// worker process existed. Generic worker provisioning intentionally excludes
+/// review-only tasks because it would construct a daemon branch instead of the
+/// adopted PR branch. These retries must therefore reuse the verified PR
+/// worktree through `spawn_remediation_worker`.
+async fn reconcile_review_only_remediation_retries(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    draining: bool,
+) -> Result<()> {
+    if draining {
+        return Ok(());
+    }
+    let pending = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
+            let conn = quorum_core::db::open(&p)?;
+            Ok(tasks::list(&conn, Some("rework"), None, None)?
+                .into_iter()
+                .filter(|task| {
+                    task.review_only && daemon_rework_retry_requested(task.refs.as_deref())
+                })
+                .collect())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("review-only remediation scan join: {error}")))??
+    };
+
+    // This reconciler runs before Phase 6, whose ordinary worker loop enforces
+    // the cap. Limit this pre-Phase-6 path explicitly so a bulk retry cannot
+    // provision more workers or worktrees than the daemon owns slots for.
+    for task in pending {
+        if available_worker_slots(config.cap, workers.len()) == 0 {
+            break;
+        }
+        if workers.iter().any(|worker| worker.task_id == task.id) {
+            continue;
+        }
+        let Some(pr) = tasks::extract_pr_number(&task.refs) else {
+            park_task(
+                &config.db_path,
+                task.id,
+                "review-only remediation retry is missing its PR identity",
+                "rework",
+            )
+            .await;
+            continue;
+        };
+        let feedback = task
+            .refs
+            .as_deref()
+            .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+            .and_then(|refs| {
+                refs.get("remediation_feedback")
+                    .and_then(|feedback| feedback.as_str())
+                    .map(str::to_string)
+            });
+        let Some(feedback) = feedback.filter(|feedback| !feedback.trim().is_empty()) else {
+            park_task(
+                &config.db_path,
+                task.id,
+                &format!(
+                    "review-only remediation retry for PR #{pr} is missing persisted blocking feedback"
+                ),
+                "rework",
+            )
+            .await;
+            continue;
+        };
+
+        log(&format!(
+            "durable review-only remediation retry: provisioning task #{} on PR #{pr}",
+            task.id
+        ));
+        if !spawn_remediation_worker(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            lifetime_roster,
+            task.id,
+            pr,
+            &feedback,
+        )
+        .await
+        {
+            park_remediation_provision_failure(config, task.id, pr, &feedback).await;
         }
     }
     Ok(())
@@ -3447,6 +3548,7 @@ async fn tick(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -3720,6 +3822,7 @@ async fn tick(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -3927,6 +4030,7 @@ async fn tick(
                                                         config,
                                                         reviewer_task_id,
                                                         pr_num,
+                                                        &rework_msg,
                                                     )
                                                     .await;
                                                 }
@@ -4258,6 +4362,7 @@ async fn tick(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -4640,6 +4745,7 @@ async fn tick(
                                                             config,
                                                             reviewer_task_id,
                                                             pr_num,
+                                                            &rework_msg,
                                                         )
                                                         .await;
                                                     }
@@ -4897,6 +5003,7 @@ async fn tick(
                                             config,
                                             reviewer_task_id,
                                             rework_pr,
+                                            feedback,
                                         )
                                         .await;
                                     }
@@ -6527,6 +6634,15 @@ async fn tick(
     // failed-CI rework must retain its exact PR/head turn and can never fall
     // through to a fresh implementation prompt.
     reconcile_ci_remediations(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        lifetime_roster,
+        drain_state.draining,
+    )
+    .await?;
+    reconcile_review_only_remediation_retries(
         config,
         wt_mgr,
         name_pool,
@@ -9257,7 +9373,41 @@ async fn notify_provision_failure(
 /// task to `in-review` merely invites another reviewer to spend another
 /// rework round on the same unchanged PR.  Park the task instead; explicit
 /// retry remains the owner-controlled recovery path.
-async fn park_remediation_provision_failure(config: &ServeConfig, task_id: i64, pr: i64) {
+async fn park_remediation_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) {
+    // `task-retry` restores a parked rework task without the original reviewer
+    // process or mailbox row. Preserve the accepted blocking feedback so the
+    // replacement remediation turn remains tied to the unresolved finding.
+    let p = config.db_path.clone();
+    let feedback = feedback.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let Some(task) = tasks::get(&conn, task_id)? else {
+            return Ok(());
+        };
+        let mut refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(object) = refs.as_object_mut() else {
+            return Err(QuorumError::Io(
+                "remediation task refs must be a JSON object".into(),
+            ));
+        };
+        object.insert(
+            "remediation_feedback".into(),
+            serde_json::Value::String(feedback),
+        );
+        tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
+    })
+    .await;
     let reason = format!("remediation worker provisioning failed for PR #{pr}");
     park_task(&config.db_path, task_id, &reason, "rework").await;
     notify_provision_failure(
@@ -11141,6 +11291,14 @@ mod tests {
             worker_done_event(0, 419),
             Event::SignaledDone { .. }
         ));
+    }
+
+    #[test]
+    fn remediation_retry_slots_never_exceed_worker_cap() {
+        assert_eq!(available_worker_slots(3, 0), 3);
+        assert_eq!(available_worker_slots(3, 2), 1);
+        assert_eq!(available_worker_slots(3, 3), 0);
+        assert_eq!(available_worker_slots(3, 4), 0);
     }
 
     #[tokio::test]
