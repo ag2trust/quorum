@@ -49,7 +49,7 @@ Implementation is still needed:
 quorum task-create \
   --created-by <You> \
   --title "Implement <outcome>" \
-  --labels '["complexity:2"]' \
+  --labels '["type:implementation"]' \
   --body-stdin <<'EOF'
 Describe the desired outcome, constraints, and verification.
 EOF
@@ -62,7 +62,7 @@ quorum task-create \
   --created-by <You> \
   --title "Review and merge PR #N" \
   --review-pr <N> \
-  --labels '["complexity:1","type:review"]' \
+  --labels '["type:review"]' \
   --body-stdin <<'EOF'
 Review the existing implementation and drive it through merge.
 EOF
@@ -103,7 +103,7 @@ provisions a redundant worker that duplicates or conflicts with the external wor
      --created-by <You> \
      --title "Review and merge PR #M" \
      --review-pr <M> \
-     --labels '["complexity:1","type:review"]' \
+     --labels '["type:review"]' \
      --body-stdin <<'EOF'
    Implementation produced externally by <session/tool>. Review only.
    EOF
@@ -122,8 +122,10 @@ then-review-only protocol prevents this class of conflict.
 - `quorum task-update --status done` (lifecycle-only; set by the system after merge)
 - Claiming a task and performing its implementation outside the daemon's worktree
 
-For either path, include a clear body, `complexity:1-5`, and `--depends-on '[...]'` when
-work must wait. Use the shared rubric:
+For either path, include a clear body and `--depends-on '[...]'` when work must wait.
+Complexity, model tier, and effort are daemon-owned: task creators must not pass
+`complexity:*`, `tier:*`, or `effort:*` labels. The classifier assigns complexity using
+the shared rubric:
 
 - 1: Trivial — config tweak, typo fix, simple rename
 - 2: Simple — single-file change, clear spec; < 15 min agent work

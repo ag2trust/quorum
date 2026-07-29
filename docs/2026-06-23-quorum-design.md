@@ -1425,22 +1425,19 @@ Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
 Runner-specific configuration is scoped under `[claude]` or `[codex]`.
 
-**Per-run model selection (#194).** Each managed run resolves its provider from
-the task's model selection, not from a daemon-global runner kind:
+**Classifier-owned per-run model selection.** Task creators describe the outcome,
+constraints, and verification but have no routing authority. `task-create` rejects every
+`complexity:*`, `tier:*`, and `effort:*` label with usage exit 2. Existing stored routing
+labels are ignored.
 
-- A task with an explicit `tier:` label is validated at creation against one closed,
-  shared vocabulary and resolves to its exact full model ID: `sonnet-5` →
-  `claude-sonnet-5`, `opus-46` → `claude-opus-4-6`, `opus-47` →
-  `claude-opus-4-7`, `opus-48` → `claude-opus-4-8`, `luna` →
-  `gpt-5.6-luna`, `terra` → `gpt-5.6-terra`, and `sol` → `gpt-5.6-sol`.
-  Unknown non-empty tiers (including legacy `o3` and `o4-mini`) fail with usage
-  exit 2 instead of falling back. Empty `tier:` and `effort:` suffixes remain
-  compatible no-ops for existing stored labels. Only `effort:medium` and
-  `effort:high` are accepted; other non-empty effort labels fail with usage exit 2.
-  `resolve_provider` maps the resulting model to `AgentKind::Claude` (any
-  `claude-*` model) or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
-- A task with no explicit model selection uses the daemon's configured
-  `runner_kind` and `model`, preserving existing Claude-default behavior.
+- An open implementation task is not dispatchable until the daemon classifier has
+  persisted a valid `cx_est` from 1 through 5 in task refs. Missing, malformed, out-of-range,
+  timed-out, or failed classification never falls back to the daemon worker default.
+- The active daemon provider selects the corresponding model and effort from its five-level
+  routing ladder. Operator-owned `suggested_models` overrides and minimum model/effort
+  floors remain available; creators cannot lower or raise an individual task.
+- `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*` model)
+  or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - Reviewers continue to use the daemon's configured provider.
@@ -1499,11 +1496,12 @@ classifier_effort = "medium"
 and Claude-compatible defaults remain available. When present, it is a fail-safe operating
 constraint for workers, live task classification, post-merge review classification, and
 collectors. `review_model` is the explicit exception: R1 and R2 resolve their runner from
-that model and may intentionally use the other supported provider. An explicit task model
-or `tier:` label for another worker provider is rejected rather than overriding the
-constraint. Reviewer spawn, retry, persistence, and recovery must instead remain bound to
-the configured reviewer model's provider; they must not fall back to a worker-provider CLI
-or resume a continuation belonging to another provider.
+that model and may intentionally use the other supported provider. Classifier routing
+always stays within the configured worker provider; a cross-provider operator override is
+rejected rather than overriding the constraint. Reviewer spawn, retry, persistence, and
+recovery must instead remain bound to the configured reviewer model's provider; they must
+not fall back to a worker-provider CLI or resume a continuation belonging to another
+provider.
 
 The role model and effort fields are independently configurable. R1 and R2 use the explicit
 review selection instead of cross-provider strength inference. Every run persists the exact
@@ -1512,16 +1510,13 @@ attachment; recovery reuses those durable values. Unknown models, provider/model
 missing continuation metadata, and unavailable configured runners fail loudly and enter the
 existing bounded retry or parked-task path.
 
-The initial operational profile uses Codex `gpt-5.6-terra` at medium effort for workers,
-`gpt-5.6-luna` at medium effort for classifiers and defaulted collectors, and high effort
-for R1/R2. Complexity recommendations are provider-aware
-operational routing policy: Claude uses `sonnet-5`/`opus-46`/`opus-47`/`opus-48`, while Codex
-uses `luna`/`terra`/`sol`, each at medium or high effort only. The active daemon provider
-selects its own five-level ladder; `suggested_models` may explicitly override a level using
-only the closed task-tier vocabulary and medium/high effort. Task `tier:`/`effort:` labels
-still take precedence over worker defaults, and recommendations remain advisory. These
-ladders do not claim cross-vendor benchmark equivalence or establish a cross-vendor strength
-ordering.
+The classifier and defaulted collectors use Codex `gpt-5.6-luna` at medium effort, and
+R1/R2 retain their configured review selection. Worker routing is authoritative:
+complexities 1–5 map to `luna/high`, `terra/high`, `sol/medium`, `sol/high`, and `sol/high`.
+Claude retains its provider-specific five-level ladder. `suggested_models` may let an
+operator replace a level using only the closed task-tier vocabulary and medium/high effort.
+These ladders do not claim cross-vendor benchmark equivalence or establish a cross-vendor
+strength ordering.
 
 ### Verification gates
 

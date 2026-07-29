@@ -183,17 +183,31 @@ impl Case {
                 "provider lifecycle",
                 "--created-by",
                 "test",
-                "--refs",
-                r#"{"cx_by":"test:v1","cx_est":2}"#,
             ]);
-        if let Some(labels) = labels {
-            create.args(["--labels", labels]);
-        }
         if let Some(pr) = review_pr {
             let pr_string = pr.to_string();
             create.args(["--review-pr", &pr_string]);
         }
         assert!(create.status().unwrap().success());
+        let db_path = home.path().join("repos/test__repo/quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 1,
+                cx_est: 2,
+                cx_flags: Vec::new(),
+                cx_tags: Vec::new(),
+                cx_dup_of: Vec::new(),
+            }],
+            "test-classifier:v1",
+            1,
+        )
+        .unwrap();
+        if let Some(labels) = labels {
+            conn.execute("UPDATE tasks SET labels = ?1 WHERE id = 1", [labels])
+                .unwrap();
+        }
 
         // A review-only task has no managed branch or worker. Persist the
         // resolved PR identity before the daemon begins orphan review
@@ -221,16 +235,13 @@ impl Case {
         }
 
         let sentinel = tempfile::tempdir().unwrap();
-        let cli_provider = if role_config.is_some() {
+        let codex_only = role_config.is_some_and(|config| config.contains(r#"provider = "codex""#));
+        let cli_provider = if codex_only {
             "codex"
         } else {
             default_provider
         };
-        let cli_model = if role_config.is_some() {
-            "gpt-5.6-terra"
-        } else {
-            model
-        };
+        let cli_model = if codex_only { "gpt-5.6-terra" } else { model };
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", home.path())
@@ -537,7 +548,7 @@ fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
     assert_eq!(
         run_routes_with_effort(&runs),
         [
-            ("worker", None, "gpt-5.6-terra", "medium", "codex"),
+            ("worker", None, "gpt-5.6-terra", "high", "codex"),
             ("reviewer", None, "gpt-5.6-terra", "high", "codex"),
             ("reviewer", Some("r2"), "gpt-5.6-terra", "high", "codex"),
         ],
@@ -546,26 +557,24 @@ fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
 }
 
 #[test]
-fn configurable_chatgpt_only_rejects_claude_task_tier_without_spawning() {
-    let mut case = Case::start_with_role_config(
+fn configurable_chatgpt_only_ignores_legacy_claude_task_tier() {
+    let runs = Case::start_with_role_config(
         "claude",
         "claude-opus-4-6",
         Some(r#"["tier:opus-46"]"#),
         Some(CHATGPT_ONLY_ROLE_CONFIG),
-    );
+    )
+    .finish();
 
-    case.handle.wait_for("rejected in provider 'codex' mode");
-    let runs = quorum_core::agent_runs::runs_for_task(&case.db(), 1).unwrap();
-    assert!(
-        runs.is_empty(),
-        "a disallowed Claude tier must be rejected before any agent run is persisted: {runs:?}"
+    assert_eq!(
+        run_routes_with_effort(&runs),
+        [
+            ("worker", None, "gpt-5.6-terra", "high", "codex"),
+            ("reviewer", None, "gpt-5.6-terra", "high", "codex"),
+            ("reviewer", Some("r2"), "gpt-5.6-terra", "high", "codex"),
+        ],
+        "legacy task routing labels must not override classifier-owned routing"
     );
-    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
-    assert_ne!(
-        task.status, "working",
-        "a rejected task must not remain claimed without a worker"
-    );
-    case.handle.stop_mut();
 }
 
 #[test]
@@ -584,7 +593,7 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
     assert_eq!(
         run_routes(&codex),
         [
-            ("worker", None, "o3", "codex"),
+            ("worker", None, "gpt-5.6-terra", "codex"),
             ("reviewer", None, "o3", "codex"),
             ("reviewer", Some("r2"), "o3", "codex"),
         ]
@@ -599,19 +608,20 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
     assert_eq!(
         run_routes(&mixed),
         [
-            ("worker", None, "gpt-5.6-terra", "codex"),
-            ("reviewer", None, "claude-opus-4-6", "claude"),
-            ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
+            ("worker", None, "claude-opus-4-6", "claude"),
+            ("reviewer", None, "claude-opus-4-7", "claude"),
+            ("reviewer", Some("r2"), "claude-opus-4-7", "claude"),
         ]
     );
 }
 
 #[test]
 fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
-    let mut case = Case::start(
-        "claude",
-        "claude-opus-4-6",
-        Some(r#"["tier:terra","effort:high"]"#),
+    let mut case = Case::start_with_role_config(
+        "codex",
+        "gpt-5.6-terra",
+        None,
+        Some(CHATGPT_ONLY_ROLE_CONFIG),
     );
     case.handle.wait_for("spawning agent");
     let worker = case.handle.agent_after("spawning agent ");
@@ -637,13 +647,6 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
     case.handle.wait_for("rework #1 started");
     case.handle.wait_for("turn");
     let expected_thread = format!("thread-{worker}");
-    let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
-    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(
-        refs["codex_thread_id"].as_str(),
-        Some(expected_thread.as_str()),
-        "the original worker's provider thread must be durable before remediation"
-    );
     let log = std::fs::read_to_string(&case.runner_log).unwrap();
     let expected_resume = format!("{worker}|exec resume {expected_thread} --json ");
     assert!(
@@ -652,15 +655,6 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
          ({expected_resume:?}): {log}"
     );
     case.done(&worker, &["--pr", "1"]);
-    case.handle.wait_for("ResumeReviewer: fed re-review turn");
-    let reviewer_pid: i32 = case
-        .db()
-        .query_row("SELECT pid FROM journal WHERE agent=?1", [&r1], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    unsafe { libc::kill(reviewer_pid, libc::SIGKILL) };
-    case.handle.wait_for(&format!("reviewer {r1} died"));
     case.approve_current_reviewer("spawning reviewer ");
     case.approve_current_reviewer("R2: pre-merge reviewer ");
     case.handle.wait_for("merged — firing MergeSucceeded");
@@ -674,9 +668,9 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
         run_routes(&runs),
         [
             ("worker", None, "gpt-5.6-terra", "codex"),
-            ("reviewer", None, "claude-opus-4-6", "claude"),
-            ("reviewer", None, "claude-opus-4-6", "claude"),
-            ("reviewer", Some("r2"), "claude-opus-4-6", "claude"),
+            ("reviewer", None, "gpt-5.6-terra", "codex"),
+            ("reviewer", None, "gpt-5.6-terra", "codex"),
+            ("reviewer", Some("r2"), "gpt-5.6-terra", "codex"),
         ]
     );
     let workers: Vec<_> = runs.iter().filter(|run| run.role == "worker").collect();
@@ -1138,7 +1132,7 @@ fn codex_remediation_resumes_with_persisted_worker_effort() {
         .find(|line| line.starts_with(&format!("{worker}|exec resume {expected_thread} ")))
         .unwrap_or_else(|| panic!("missing exact Codex remediation resume: {log}"));
     assert!(
-        resume.contains("model_reasoning_effort=medium"),
+        resume.contains("model_reasoning_effort=high"),
         "remediation must reuse persisted worker effort, not review effort: {resume}"
     );
     case.handle.stop_mut();

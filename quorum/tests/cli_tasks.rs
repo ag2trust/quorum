@@ -525,13 +525,13 @@ fn match_label_end_to_end() {
             "--priority",
             "1",
             "--labels",
-            r#"["tier:opus-47"]"#,
+            r#"["component:api"]"#,
         ])
         .assert()
         .success();
 
     // --match-label restricts to the labeled task even though the other is higher-priority.
-    let claimed = common::claim_task_with_labels(home.path(), "A", &["tier:opus-47"], 3600);
+    let claimed = common::claim_task_with_labels(home.path(), "A", &["component:api"], 3600);
     assert!(claimed.is_some(), "label-matched claim should succeed");
     quorum(home.path())
         .args(["task-get", "--task-id", "2"])
@@ -540,7 +540,7 @@ fn match_label_end_to_end() {
         .stdout(predicates::str::contains("with-label"));
 
     // No more labeled tasks open → None.
-    let miss = common::claim_task_with_labels(home.path(), "B", &["tier:opus-47"], 3600);
+    let miss = common::claim_task_with_labels(home.path(), "B", &["component:api"], 3600);
     assert!(miss.is_none(), "no more labeled tasks open");
 }
 

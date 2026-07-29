@@ -51,10 +51,10 @@ pub const CLAUDE_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
 /// Codex default (level, model_id, effort) recommendations.
 /// This is Quorum's operational routing policy, not a cross-vendor benchmark.
 pub const CODEX_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
-    (1, "gpt-5.6-luna", "medium"),
-    (2, "gpt-5.6-terra", "medium"),
-    (3, "gpt-5.6-terra", "high"),
-    (4, "gpt-5.6-sol", "medium"),
+    (1, "gpt-5.6-luna", "high"),
+    (2, "gpt-5.6-terra", "high"),
+    (3, "gpt-5.6-sol", "medium"),
+    (4, "gpt-5.6-sol", "high"),
     (5, "gpt-5.6-sol", "high"),
 ];
 
@@ -145,10 +145,10 @@ mod tests {
         assert_eq!(
             CODEX_RECOMMENDATIONS,
             [
-                (1, "gpt-5.6-luna", "medium"),
-                (2, "gpt-5.6-terra", "medium"),
-                (3, "gpt-5.6-terra", "high"),
-                (4, "gpt-5.6-sol", "medium"),
+                (1, "gpt-5.6-luna", "high"),
+                (2, "gpt-5.6-terra", "high"),
+                (3, "gpt-5.6-sol", "medium"),
+                (4, "gpt-5.6-sol", "high"),
                 (5, "gpt-5.6-sol", "high"),
             ]
         );

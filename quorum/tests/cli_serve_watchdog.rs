@@ -256,6 +256,21 @@ fn seed_task(home: &std::path::Path, title: &str) {
         "task-create failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let db = home.join("repos").join("test__repo").join("quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: 1,
+            cx_est: 3,
+            cx_flags: Vec::new(),
+            cx_tags: Vec::new(),
+            cx_dup_of: Vec::new(),
+        }],
+        "test-classifier:v1",
+        1,
+    )
+    .unwrap();
 }
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {

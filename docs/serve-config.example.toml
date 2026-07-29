@@ -22,18 +22,18 @@ effort = "high"
 # names_file = "/home/user/.quorum/serve/names.txt"
 # agent_bin  = "claude"
 
-# ── complexity routing policy (advisory) ──────────────────────────────
+# ── classifier-owned complexity routing policy ───────────────────────
 # The active provider selects one built-in ladder. These are Quorum's
 # operational routing policy, not a cross-vendor benchmark.
 # Claude: 1=sonnet-5/medium, 2=opus-46/medium, 3=opus-46/high,
 #         4=opus-47/high, 5=opus-48/high
-# Codex:  1=luna/medium, 2=terra/medium, 3=terra/high,
-#         4=sol/medium, 5=sol/high
-# Explicit task tier:/effort: labels take precedence. Optional overrides must
-# use a closed tier (sonnet-5|opus-46|opus-47|opus-48|luna|terra|sol) and medium|high.
+# Codex:  1=luna/high, 2=terra/high, 3=sol/medium,
+#         4=sol/high, 5=sol/high
+# Task creators cannot override complexity, model, or effort. Optional operator
+# overrides must use a closed tier and medium|high.
 # [suggested_models]
-# "1" = "luna/medium"
-# "4" = "sol/medium"
+# "1" = "luna/high"
+# "4" = "sol/high"
 
 # ── cost ceilings ────────────────────────────────────────────────────
 # A turn longer than 45 min is almost certainly stuck; #56's auto-refeed
