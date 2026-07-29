@@ -2224,6 +2224,21 @@ pub fn list(
     Ok(tasks)
 }
 
+/// Bounded read-only task listing for pollers such as the local web dashboard.
+/// Unlike [`list`], this never materializes an unbounded historical task set.
+pub fn list_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM tasks ORDER BY updated_at DESC, id DESC LIMIT ?1"
+    ))?;
+    let mut tasks = stmt
+        .query_map(params![limit], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for task in &mut tasks {
+        task.ready = compute_ready(conn, &task.depends_on)?;
+    }
+    Ok(tasks)
+}
+
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Task>> {
     let mut task = conn
         .query_row(

@@ -124,7 +124,7 @@ INSPECT (read-only diagnostics — includes expired rows, retention caveats)
 
 OPS
   quorum status [--watch] [--json] [--agents]    # health snapshot; --agents = agent presence (online/offline)
-  quorum web [--port 8080] [--bind 127.0.0.1]    # read-only local dashboard
+  quorum web [--port 8080] [--log-dir <path>]    # loopback-only, read-only dashboard
   quorum perf [--json] [--all] [--by complexity|reviewer]
                                               # model × effort performance aggregates over terminal tasks.
                                               # Default: prospective-only (tasks completed after analytics rollout).

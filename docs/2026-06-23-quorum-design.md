@@ -1896,7 +1896,13 @@ changes.
   loud** (exit 3); `init` writes a default file.
 - **Orphan temp files** from a crash between writing `--body-file` and invoking `quorum` are
   the agent's responsibility.
-- **Out of scope (YAGNI, v1):** auth · multi-machine · web UI · daemon/HTTP/MCP server ·
+- **Local web dashboard:** `quorum web` is a separate, read-only loopback-only process,
+  never part of `serve`. It exposes no mutation endpoints and does not authenticate or
+  permit remote binding; remote delivery requires a separately designed secure transport.
+  Each request opens, reads, and closes SQLite before responding. Dashboard task and run
+  pages are bounded, stream reads are byte-capped, and `--log-dir` selects the daemon's
+  configured log root.
+- **Out of scope (YAGNI, v1):** auth · multi-machine · daemon/HTTP/MCP server ·
   message editing · threads beyond `topic` · PR/review mirroring · cross-repo bus ·
   presence-based claim eviction · arbitrary-byte (BLOB) payloads · **agent-name uniqueness
   enforcement** (v1 is caller-owned first-use-wins; same id silently merges — a v2 could

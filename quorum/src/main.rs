@@ -704,10 +704,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 Ok(0)
             }
         }
-        cli::Command::Web { port, bind } => {
+        cli::Command::Web {
+            port,
+            bind,
+            log_dir,
+        } => {
             web::serve(
                 paths::db_path()?,
-                paths::home_dir()?.join("logs"),
+                log_dir.unwrap_or(paths::home_dir()?.join("logs")),
                 &bind,
                 port,
                 load_cfg()?.online_window_secs,

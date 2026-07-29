@@ -148,6 +148,20 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
     Ok(runs)
 }
 
+/// Latest run identity for a task, without materializing its complete history.
+pub fn latest_for_task(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
+    conn.query_row(
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason
+         FROM agent_runs WHERE task_id = ?1 ORDER BY spawned_at DESC, id DESC LIMIT 1",
+        params![task_id],
+        |r| Ok(AgentRun {
+            id: r.get(0)?, agent: r.get(1)?, role: r.get(2)?, sub_role: r.get(3)?,
+            model: r.get(4)?, effort: r.get(5)?, provider: r.get(6)?, spawned_at: r.get(7)?,
+            ended_at: r.get(8)?, end_reason: r.get(9)?,
+        }),
+    ).optional().map_err(Into::into)
+}
+
 /// Close an open run row at teardown/terminal.
 pub fn close(conn: &Connection, run_id: i64, ended_at: i64, end_reason: &str) -> Result<()> {
     conn.execute(

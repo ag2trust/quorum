@@ -270,9 +270,12 @@ pub enum Command {
         /// TCP port for the dashboard.
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// Bind address. Use 0.0.0.0 only when remote access is intentional.
+        /// Loopback address (127.0.0.1 or ::1 only; remote serving is unsupported).
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
+        /// Session-log root. Defaults to ~/.quorum/logs; set this to the daemon's --log-dir.
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
     },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,

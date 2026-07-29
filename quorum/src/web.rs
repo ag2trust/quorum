@@ -22,6 +22,8 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
 const DEFAULT_STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 8 * 1024 * 1024;
+const DASHBOARD_TASK_LIMIT: i64 = 100;
+const RUN_DIR_SCAN_LIMIT: usize = 1_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -40,6 +42,7 @@ pub fn serve(
     let addr: SocketAddr = format!("{bind}:{port}").parse().map_err(|e| {
         quorum_core::error::QuorumError::Usage(format!("invalid --bind/--port: {e}"))
     })?;
+    validate_loopback(addr)?;
     let state = AppState {
         db_path,
         logs_root,
@@ -64,6 +67,15 @@ pub fn serve(
         })
 }
 
+fn validate_loopback(addr: SocketAddr) -> quorum_core::error::Result<()> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(quorum_core::error::QuorumError::Usage(
+        "quorum web is loopback-only; remote serving requires a separately designed authenticated transport".into(),
+    ))
+}
+
 async fn index() -> Html<&'static str> {
     Html(PAGE)
 }
@@ -82,7 +94,7 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
     let conn = quorum_core::db::open(&state.db_path)?;
     let mut snapshot = quorum_core::stats::stats(&conn, now, state.online_window)?;
     snapshot.daemon = quorum_core::daemon_lock::liveness(&conn, now, 30, super::pid_is_alive)?;
-    let tasks = quorum_core::tasks::list(&conn, None, None, None)?;
+    let tasks = quorum_core::tasks::list_limited(&conn, DASHBOARD_TASK_LIMIT)?;
     let roster = quorum_core::agents::roster(&conn, now, state.online_window)?;
     let events = quorum_core::events::list(&conn, 0, None, 30, now)?;
     let agents: Vec<Value> = roster
@@ -106,8 +118,12 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
         })
         .collect();
     let tasks: Vec<Value> = tasks.into_iter().map(|task| -> quorum_core::error::Result<Value> {
-        let run = quorum_core::agent_runs::runs_for_task(&conn, task.id)?.pop();
-        let (provider, model) = run.map(|r| (r.provider, Some(r.model))).unwrap_or((None, None));
+        // One bounded task page; ask SQLite for one latest row rather than loading each
+        // task's complete historical run list.
+        let run = quorum_core::agent_runs::latest_for_task(&conn, task.id)?;
+        let (provider, model) = run
+            .map(|run| (run.provider, Some(run.model)))
+            .unwrap_or((None, None));
         let pr = task.refs.as_deref().and_then(|refs| serde_json::from_str::<Value>(refs).ok())
             .and_then(|refs| refs.get("pr").and_then(Value::as_i64));
         Ok(json!({"id": task.id, "title": task.title, "state": task.status, "provider": provider,
@@ -140,7 +156,13 @@ async fn api_runs(State(state): State<AppState>, Query(query): Query<RunsQuery>)
 }
 
 fn list_runs(root: &FsPath, before: Option<i64>, limit: usize) -> std::io::Result<Vec<Value>> {
-    let mut dirs: Vec<(String, i64)> = fs::read_dir(root)?
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut dirs: Vec<(String, i64)> = entries
+        .take(RUN_DIR_SCAN_LIMIT)
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -250,6 +272,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_loopback_bind() {
+        assert!(validate_loopback("0.0.0.0:8080".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn page_never_interpolates_stored_values_as_html_or_inline_handlers() {
+        assert!(!PAGE.contains("innerHTML"));
+        assert!(!PAGE.contains(" onclick="));
+        assert!(PAGE.contains("textContent"));
+    }
+
+    #[test]
     fn stream_offsets_only_return_new_bytes() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("A-100");
@@ -285,5 +319,11 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+    }
+
+    #[test]
+    fn run_listing_is_empty_when_the_configured_root_is_absent() {
+        let root = tempfile::tempdir().unwrap().path().join("absent");
+        assert!(list_runs(&root, None, 50).unwrap().is_empty());
     }
 }
