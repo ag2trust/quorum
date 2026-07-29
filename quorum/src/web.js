@@ -1,8 +1,21 @@
 (() => {
   const MAX_RENDERED_TAIL_CHARS = 2 * 1024 * 1024;
+  const MAX_RENDERED_TAIL_ROWS = 2000;
+  const MAX_RENDERED_ROWS_PER_POLL = 2000;
   const MAX_EXPANDED_OUTPUT_CHARS = 200 * 1024;
   const MAX_NORMALIZED_EVENTS_PER_RECORD = 100;
   const ellipsize = (text, max = 90) => text.length > max ? text.slice(0, max - 1) + '…' : text;
+
+  // Row count, not character count, is the load-bearing bound: a producer shape whose rows
+  // render as empty text (`{"message":{"content":""}}`) costs zero chars and would otherwise
+  // accumulate forever. Bounding at the DOM-append boundary covers every shape, present and future.
+  const shouldTrim = (chars, rows) => chars > MAX_RENDERED_TAIL_CHARS || rows > MAX_RENDERED_TAIL_ROWS;
+
+  function capRows(rows, max = MAX_RENDERED_ROWS_PER_POLL) {
+    if (rows.length <= max) return rows;
+    const omitted = rows.length - max;
+    return [{kind: 'meta', title: `${omitted} earlier events omitted`, body: '', exit_code: null}, ...rows.slice(-max)];
+  }
 
   function stripShellWrapper(command) {
     const match = String(command || '').match(/^(?:\/bin\/(?:zsh|bash) -lc|sh -c) (["'])([\s\S]*)\1$/);
@@ -25,6 +38,13 @@
 
   function normalizeEvents(event) {
     const item = event && event.item;
+    // The matching `item.completed` supersedes it; rendering both duplicates every row.
+    if (event && event.type === 'item.started') return [];
+    if (event && event.type === 'item.completed' && item && item.type === 'file_change') {
+      const changes = Array.isArray(item.changes) ? item.changes : [];
+      const summary = changes.slice(0, 5).map(change => `${change.kind || 'change'} ${change.path || '?'}`).join(', ');
+      return [{kind: 'meta', title: `file change · ${ellipsize(summary || 'no paths', 90)}${changes.length > 5 ? ` (+${changes.length - 5} more)` : ''}`, body: '', exit_code: null}];
+    }
     if (event && event.type === 'item.completed' && item && item.type === 'agent_message') {
       return [{kind: 'message', title: 'Agent message', body: String(item.text || ''), exit_code: null}];
     }
@@ -82,7 +102,7 @@
     catch (_) { return normalizeEvents(null); }
   }
 
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, capRows, shouldTrim};
   if (typeof document === 'undefined') return;
 
   let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null;
@@ -95,7 +115,7 @@
   function age(seconds) { return seconds < 60 ? seconds + 's' : Math.floor(seconds / 60) + 'm'; }
   function relativeTime(epoch, now) { const seconds = Math.max(0, now - epoch); return seconds < 60 ? `${seconds}s ago` : seconds < 3600 ? `${Math.floor(seconds / 60)}m ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)}h ago` : `${Math.floor(seconds / 86400)}d ago`; }
   function timestamp(epoch) { return new Date(epoch * 1000).toLocaleString(); }
-  function trimStream() { while (renderedChars > MAX_RENDERED_TAIL_CHARS && $('stream').firstChild) { renderedChars -= $('stream').firstChild.textContent.length; $('stream').firstChild.remove(); } }
+  function trimStream() { const stream = $('stream'); while (shouldTrim(renderedChars, stream.childElementCount) && stream.firstChild) { renderedChars -= stream.firstChild.textContent.length; stream.firstChild.remove(); } }
   function exitBadge(code) { const badge = document.createElement('span'); badge.className = `badge ${code === 0 ? 'ok' : code == null ? '' : 'bad'}`; put(badge, code == null ? 'in progress' : `exit ${code}`); return badge; }
   function capOutput(output) { return output.length > MAX_EXPANDED_OUTPUT_CHARS ? output.slice(0, MAX_EXPANDED_OUTPUT_CHARS) + '\n… output truncated …' : output; }
   function renderEvent(event) {
@@ -107,7 +127,7 @@
     renderedChars += row.textContent.length; $('stream').append(row); trimStream();
   }
   function renderRaw() { $('rawStream').textContent = rawText.length > MAX_RENDERED_TAIL_CHARS ? rawText.slice(-MAX_RENDERED_TAIL_CHARS) : rawText; }
-  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); lines.forEach(line => parseEventLine(line).forEach(renderEvent)); if (rawMode) renderRaw(); }
+  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); capRows(lines.flatMap(line => parseEventLine(line))).forEach(renderEvent); if (rawMode) renderRaw(); }
   async function state() { if (document.hidden) return; const s = await fetch('/api/state').then(r => r.json()), counts = Object.fromEntries(s.counts.map(x => [x.status, x.count])); $('tiles').replaceChildren(); ['working', 'open', 'in-review', 'done'].forEach(key => { const tile = document.createElement('span'); tile.className = 'tile'; put(tile, key + '\n' + (counts[key] || 0)); $('tiles').append(tile); }); const tasks = $('tasks'); tasks.replaceChildren(); appendRow(tasks, ['State', 'Task', 'Provider/model', 'PR', 'Age'], true); s.tasks.forEach(x => { const pr = document.createElement('span'); if (x.pr) { const link = document.createElement('a'); link.href = 'https://github.com/ag2trust/quorum/pull/' + x.pr; put(link, '#' + x.pr); pr.append(link); } appendRow(tasks, [x.state, '#' + x.id + ' ' + x.title, (x.provider || 'pending') + ' ' + (x.model || ''), pr, age(x.age_secs)]); }); renderAgents(s.agents, s.now); $('alerts').textContent = JSON.stringify({alerts: s.alerts, errors: s.errors}, null, 2); }
   function renderAgents(agents, now) { const online = agents.filter(agent => agent.online), offline = agents.filter(agent => !agent.online); const render = (table, rows) => { table.replaceChildren(); appendRow(table, ['Agent', 'Task', 'Last seen'], true); rows.forEach(agent => { const seen = document.createElement('span'); put(seen, relativeTime(agent.last_seen, now)); seen.title = timestamp(agent.last_seen); appendRow(table, [agent.name, agent.task_held ? '#' + agent.task_held.id + ' ' + agent.task_held.title : '—', seen]); }); }; render($('agentTable'), online); render($('offlineAgentTable'), offline); $('offlineAgents').classList.toggle('hidden', !offline.length); put($('offlineAgents').querySelector('summary'), `${offline.length} offline`); }
   function duration(meta) { const start = meta.start_time, end = meta.end_time; return start && end ? age(Math.max(0, end - start)) : '—'; }

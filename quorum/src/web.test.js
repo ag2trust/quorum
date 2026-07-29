@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, capRows, shouldTrim} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -46,3 +46,26 @@ const denseAssistant = normalizeEvents({type: 'assistant', message: {content: Ar
 assert.equal(denseAssistant.length, MAX_NORMALIZED_EVENTS_PER_RECORD);
 assert.equal(denseAssistant.at(-1).kind, 'meta');
 assert.match(denseAssistant.at(-1).title, /901 assistant blocks omitted/);
+
+// `item.started` is superseded by its `item.completed`; rendering both duplicates every row.
+assert.equal(normalizeEvents({type: 'item.started', item: {id: 'item_0', type: 'command_execution'}}).length, 0);
+
+const fileChange = normalizeEvent({type: 'item.completed', item: {type: 'file_change', changes: [{kind: 'modify', path: 'src/web.rs'}]}});
+assert.equal(fileChange.kind, 'meta');
+assert.match(fileChange.title, /modify src\/web\.rs/);
+
+// Empty-bodied rows cost zero characters, so the tail bound must count rows as well —
+// otherwise a stream of `{"message":{"content":""}}` grows the DOM without limit.
+const emptyMessage = normalizeEvent({type: 'assistant', message: {content: ''}});
+assert.equal(emptyMessage.body, '');
+assert.equal(shouldTrim(0, MAX_RENDERED_TAIL_ROWS + 1), true);
+assert.equal(shouldTrim(0, MAX_RENDERED_TAIL_ROWS), false);
+
+const repeatedEmpties = Array.from({length: 50_000}, () => '{"type":"assistant","message":{"content":""}}').flatMap(parseEventLine);
+const capped = capRows(repeatedEmpties);
+assert.equal(capped.length, MAX_RENDERED_ROWS_PER_POLL + 1);
+assert.equal(capped[0].kind, 'meta');
+assert.match(capped[0].title, new RegExp(`${50_000 - MAX_RENDERED_ROWS_PER_POLL} earlier events omitted`));
+const underCap = capRows([{kind: 'message'}]);
+assert.equal(underCap.length, 1);
+assert.equal(underCap[0].kind, 'message');
