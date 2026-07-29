@@ -314,8 +314,6 @@ fn validate_labels(s: &str) -> Result<()> {
     })?;
     for label in &labels {
         if let Some(tier) = label.strip_prefix("tier:") {
-            // Empty tier labels are historical no-ops; retain that behavior so
-            // existing stored labels still use the daemon default.
             if !tier.is_empty() && crate::model_tiers::model_id_for_tier(tier).is_none() {
                 return Err(QuorumError::Usage(format!(
                     "invalid tier '{tier}' in --labels; only {} are accepted",
@@ -326,8 +324,7 @@ fn validate_labels(s: &str) -> Result<()> {
         if let Some(effort) = label.strip_prefix("effort:") {
             if !effort.is_empty() && !KNOWN_EFFORTS.contains(&effort) {
                 return Err(QuorumError::Usage(format!(
-                    "invalid effort '{effort}' in --labels; only {} are accepted \
-                     (serve rejects anything else at dispatch)",
+                    "invalid effort '{effort}' in --labels; only {} are accepted",
                     KNOWN_EFFORTS.join(", ")
                 )));
             }
@@ -343,6 +340,70 @@ fn validate_labels(s: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Reject task-creator attempts to control daemon-owned routing. Kept separate
+/// from structural label validation so migrations and internal compatibility
+/// tests can still read and seed historical rows containing these labels.
+pub fn validate_creator_labels(labels_json: Option<&str>) -> Result<()> {
+    let Some(labels_json) = labels_json else {
+        return Ok(());
+    };
+    let labels: Vec<String> = serde_json::from_str(labels_json).map_err(|e| {
+        QuorumError::Usage(format!("--labels must be a JSON array of strings: {e}"))
+    })?;
+    if let Some(label) = labels.iter().find(|label| {
+        ["tier:", "effort:", "complexity:"]
+            .iter()
+            .any(|prefix| label.starts_with(prefix))
+    }) {
+        return Err(QuorumError::Usage(format!(
+            "label '{label}' is daemon-owned; task creators may not set \
+             complexity, model tier, or effort"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
+    let Some(refs_json) = refs_json else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(refs_json)
+        .map_err(|e| QuorumError::Usage(format!("--refs must be a JSON object: {e}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| QuorumError::Usage("--refs must be a JSON object".into()))?;
+    if let Some(key) = object.keys().find(|key| key.starts_with("cx_")) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{key}' is classifier-owned; task creators may not set classification"
+        )));
+    }
+    Ok(())
+}
+
+fn preserve_classifier_refs(
+    existing: &Option<String>,
+    replacement: Option<&str>,
+) -> Option<String> {
+    let replacement = replacement?;
+    let mut next: serde_json::Value =
+        serde_json::from_str(replacement).unwrap_or_else(|_| serde_json::json!({}));
+    let Some(next_map) = next.as_object_mut() else {
+        return Some(replacement.to_string());
+    };
+    if let Some(existing_map) = existing
+        .as_deref()
+        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|value| value.as_object().cloned())
+    {
+        for key in ["cx_est", "cx_by", "cx_flags", "cx_tags", "cx_dup_of"] {
+            if let Some(value) = existing_map.get(key) {
+                next_map.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    Some(next.to_string())
 }
 
 pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<bool> {
@@ -1505,6 +1566,13 @@ pub fn update(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let existing_refs: Option<String> = tx
+        .query_row("SELECT refs FROM tasks WHERE id=?1", params![id], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .flatten();
+    let preserved_refs = preserve_classifier_refs(&existing_refs, fields.refs);
 
     let n = match fields.status {
         Some("open") => tx.execute(
@@ -1514,7 +1582,14 @@ pub fn update(
                     refs  = COALESCE(?4, refs),
                     updated_at = ?5
                  WHERE id=?1 AND assignee=?6 AND status='working'",
-            params![id, "open", fields.body, fields.refs, now, agent],
+            params![
+                id,
+                "open",
+                fields.body,
+                preserved_refs.as_deref(),
+                now,
+                agent
+            ],
         )?,
         Some("cancelled") => tx.execute(
             "UPDATE tasks SET
@@ -1524,7 +1599,14 @@ pub fn update(
                 updated_at = ?5
              WHERE id=?1 AND (created_by=?6 OR assignee=?6)
                    AND status NOT IN ('done', 'failed', 'cancelled')",
-            params![id, "cancelled", fields.body, fields.refs, now, agent],
+            params![
+                id,
+                "cancelled",
+                fields.body,
+                preserved_refs.as_deref(),
+                now,
+                agent
+            ],
         )?,
         _ => {
             let rows = tx.execute(
@@ -1534,7 +1616,14 @@ pub fn update(
                     refs     = COALESCE(?4, refs),
                     updated_at = ?5
                  WHERE id=?1 AND assignee=?6 AND status='working'",
-                params![id, fields.status, fields.body, fields.refs, now, agent],
+                params![
+                    id,
+                    fields.status,
+                    fields.body,
+                    preserved_refs.as_deref(),
+                    now,
+                    agent
+                ],
             )?;
             if rows == 0 && fields.status.is_none() {
                 tx.execute(
@@ -1543,7 +1632,7 @@ pub fn update(
                         refs     = COALESCE(?3, refs),
                         updated_at = ?4
                      WHERE id=?1 AND created_by=?5 AND assignee IS NULL AND status='open'",
-                    params![id, fields.body, fields.refs, now, agent],
+                    params![id, fields.body, preserved_refs.as_deref(), now, agent],
                 )?
             } else {
                 rows
@@ -4971,122 +5060,74 @@ mod tests {
     }
 
     #[test]
-    fn validate_labels_accepts_known_efforts() {
-        assert!(validate_labels(r#"["effort:medium"]"#).is_ok());
-        assert!(validate_labels(r#"["effort:high"]"#).is_ok());
-        assert!(validate_labels(r#"["tier:opus-46","effort:medium"]"#).is_ok());
-    }
-
-    #[test]
-    fn validate_labels_accepts_all_supported_tiers_with_both_efforts() {
-        for tier in crate::model_tiers::MODEL_TIERS {
-            for effort in KNOWN_EFFORTS {
-                let labels = format!(r#"["tier:{}","effort:{effort}"]"#, tier.tier);
-                assert!(validate_labels(&labels).is_ok(), "{labels}");
-            }
+    fn creator_label_validation_rejects_routing_authority() {
+        for label in [
+            "complexity:1",
+            "complexity:5",
+            "tier:luna",
+            "tier:sol",
+            "effort:medium",
+            "effort:high",
+        ] {
+            let labels = format!(r#"["type:bug","{label}"]"#);
+            let err = validate_creator_labels(Some(&labels)).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{label}");
+            assert!(
+                matches!(&err, QuorumError::Usage(m) if m.contains("daemon-owned")),
+                "task-create must reject {label}, got {err:?}"
+            );
         }
     }
 
     #[test]
-    fn create_rejects_legacy_and_unknown_tiers_before_enqueue() {
-        let (_d, mut c) = open_tmp();
-        for tier in ["o3", "o4-mini", "unknown"] {
-            let labels = format!(r#"["tier:{tier}"]"#);
-            let err = create(
-                &mut c,
-                "boss",
-                "bad-tier",
-                None,
-                0,
-                Some(&labels),
-                None,
-                None,
-                None,
-                1000,
-            )
-            .unwrap_err();
-            assert_eq!(err.exit_code(), 2, "{tier}");
-            assert!(matches!(err, QuorumError::Usage(_)), "{tier}: {err:?}");
-        }
-        let count: i64 = c
-            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "invalid tiers must not enqueue tasks");
-    }
-
-    #[test]
-    fn validate_labels_rejects_effort_low() {
-        let err = validate_labels(r#"["effort:low"]"#).unwrap_err();
+    fn validate_labels_accepts_non_routing_metadata() {
+        assert!(validate_labels(r#"["type:bug","area:lifecycle","priority:high"]"#).is_ok());
         assert!(
-            matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort 'low'")),
-            "got {err:?}"
+            validate_creator_labels(Some(r#"["type:bug","area:lifecycle","priority:high"]"#))
+                .is_ok()
         );
     }
 
     #[test]
-    fn validate_labels_rejects_effort_max() {
-        assert!(validate_labels(r#"["effort:max"]"#).is_err());
+    fn creator_refs_cannot_forge_classifier_authority() {
+        for refs in [
+            r#"{"cx_est":5}"#,
+            r#"{"cx_by":"creator"}"#,
+            r#"{"pr":42,"cx_flags":[]}"#,
+        ] {
+            let err = validate_creator_refs(Some(refs)).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(format!("{err}").contains("classifier-owned"));
+        }
+        assert!(validate_creator_refs(Some(r#"{"pr":42,"repo":"o/r"}"#)).is_ok());
     }
 
     #[test]
-    fn create_rejects_unsupported_efforts_at_task_create() {
+    fn metadata_update_preserves_classifier_refs() {
         let (_d, mut c) = open_tmp();
-        for effort in ["low", "max", "adaptive"] {
-            let labels = format!(r#"["effort:{effort}"]"#);
-            let err = create(
-                &mut c,
-                "boss",
-                "bad-effort",
-                None,
-                0,
-                Some(&labels),
-                None,
-                None,
-                None,
-                1000,
-            )
-            .unwrap_err();
-            assert_eq!(err.exit_code(), 2, "{effort}");
-            assert!(
-                matches!(&err, QuorumError::Usage(m) if m.contains("invalid effort")),
-                "task-create must reject effort:{effort}, got {err:?}"
-            );
-        }
-        let count: i64 = c
-            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "invalid efforts must not enqueue tasks");
-    }
-
-    #[test]
-    fn validate_labels_accepts_known_complexities() {
-        assert!(validate_labels(r#"["complexity:1"]"#).is_ok());
-        assert!(validate_labels(r#"["complexity:3"]"#).is_ok());
-        assert!(validate_labels(r#"["complexity:5"]"#).is_ok());
-        assert!(validate_labels(r#"["tier:opus-46","effort:medium","complexity:2"]"#).is_ok());
-    }
-
-    #[test]
-    fn validate_labels_rejects_invalid_complexity() {
-        let err = validate_labels(r#"["complexity:0"]"#).unwrap_err();
-        assert!(
-            matches!(&err, QuorumError::Usage(m) if m.contains("invalid complexity '0'")),
-            "got {err:?}"
-        );
-        assert!(validate_labels(r#"["complexity:6"]"#).is_err());
-        assert!(validate_labels(r#"["complexity:easy"]"#).is_err());
-    }
-
-    #[test]
-    fn validate_labels_error_uses_shared_rubric() {
-        let err = validate_labels(r#"["complexity:0"]"#).unwrap_err();
-        let msg = format!("{err}");
-        for (_level, _label, desc, _time) in &crate::complexity::RUBRIC {
-            assert!(
-                msg.contains(*desc),
-                "validation error missing rubric description: {desc}"
-            );
-        }
+        let id = create(
+            &mut c,
+            "boss",
+            "classified",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let fields = TaskUpdate {
+            refs: Some(r#"{"pr":42}"#),
+            ..Default::default()
+        };
+        let updated = update(&mut c, "boss", id, &fields, 1001).unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(updated.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 42);
+        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_by"], "classifier:v1");
     }
 
     // ── T6: lifecycle replay idempotency ──────────────────────────────────

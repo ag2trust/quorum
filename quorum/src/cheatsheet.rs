@@ -1,7 +1,6 @@
 //! One-call orientation for an agent: command list, the safe text pattern, and exit codes.
 
 pub fn cheatsheet() -> String {
-    let rubric = quorum_core::complexity::rubric_inline();
     let rubric_full = quorum_core::complexity::rubric_lines();
     let recommendations = quorum_core::complexity::all_recommendation_lines();
 
@@ -9,14 +8,15 @@ pub fn cheatsheet() -> String {
         r#"quorum — local agent coordination (by agents, for agents)
 
 TASKS (daemon-managed queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
-  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["x"]'] [--depends-on '[1,2]'] [--refs '{{"pr":N}}'] [--body-stdin]
-                                                               # --labels complexity:N (1-5): {rubric}
+  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["type:bug","area:store"]'] [--depends-on '[1,2]'] [--refs '{{"pr":N}}'] [--body-stdin]
+                                                               # complexity/model/effort are classifier-owned; creators may not
+                                                               # pass complexity:*, tier:*, or effort:* labels.
                                                                # --depends-on gates the claim: dependent stays unclaimable
                                                                # until every listed task is `closed` (#2 alignment).
                                                                # --refs: structured external-ref JSON (e.g. {{"pr":N}}) — load-bearing
                                                                # for review-loop traceability (#10 + creator monitor #62).
                                                                # Malformed JSON → exit 2 at create (never poisons reads).
-  quorum task-create  --created-by <id> --title <s> --review-pr <N> [--labels '["complexity:1","type:review"]'] [--body-stdin]
+  quorum task-create  --created-by <id> --title <s> --review-pr <N> [--labels '["type:review"]'] [--body-stdin]
                                                                # Existing PR: skip implementation and start in-review.
                                                                # No managed worker exists for requested changes or conflicts;
                                                                # the outside PR author remains responsible for updating the PR.
@@ -51,8 +51,8 @@ COMPLEXITY RUBRIC (used by classifier and for task-creation guidance)
 {recommendations}
   The active daemon provider selects its ladder; this is routing policy, not a cross-vendor benchmark.
   Daemon `suggested_models` config overrides the active provider's defaults when set.
-  Explicit tier:/effort: labels on a task take precedence over defaults.
-  Mismatch alerts are advisory — the daemon posts a note when actual < suggested.
+  Tasks remain undispatchable until classification succeeds. The classifier's
+  complexity selects model/effort from this table; operator floors may only raise it.
 
 SUBMIT (canonical hand-off — aliased as `done`, which is deprecated)
   quorum submit --agent <id> --pr <N>                                  # worker: signal task completion (PR posted)

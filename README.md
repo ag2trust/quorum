@@ -71,7 +71,7 @@ managed worker:
 quorum task-create \
   --created-by coordinator \
   --title "Add retry telemetry" \
-  --labels '["complexity:2"]' \
+  --labels '["type:observability","area:status"]' \
   --body-stdin <<'EOF'
 Record retry counts in the status JSON and cover the failure path.
 EOF
@@ -84,7 +84,7 @@ quorum task-create \
   --created-by coordinator \
   --title "Review and merge PR #412" \
   --review-pr 412 \
-  --labels '["complexity:1","type:review"]' \
+  --labels '["type:review"]' \
   --body-stdin <<'EOF'
 Review the existing PR and drive it through merge.
 EOF
@@ -94,6 +94,11 @@ A review-only task has no implementation worker. If review requests changes, the
 PR author must update the branch and create a new review request as needed; the task may
 fail because Quorum cannot assign rework. Merge conflicts likewise require the outside
 author to update the PR before review/merge can continue.
+
+Task creators describe scope and acceptance criteria but do not select complexity, model,
+or effort. The daemon classifies each task before dispatch and applies its configured
+provider's routing table. Labels beginning with `complexity:`, `tier:`, or `effort:` are
+rejected.
 
 ## Watch progress
 

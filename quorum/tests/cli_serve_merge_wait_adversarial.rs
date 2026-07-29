@@ -1446,7 +1446,7 @@ fn replacement_instant_death_stops_at_budget() {
             None,
             0,
             None,
-            None,
+            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
             None,
             None,
             now,

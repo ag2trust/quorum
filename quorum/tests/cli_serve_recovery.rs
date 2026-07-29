@@ -768,7 +768,16 @@ impl TestEnv {
         let mut conn = quorum_core::db::open(&self.db_path).unwrap();
         let now = quorum_core::clock::now();
         let id = quorum_core::tasks::create(
-            &mut conn, "test", title, None, 0, None, None, None, None, now,
+            &mut conn,
+            "test",
+            title,
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
+            None,
+            None,
+            now,
         )
         .unwrap();
         quorum_core::tasks::claim(&mut conn, agent, Some(id), &[], 86400, now).unwrap();
