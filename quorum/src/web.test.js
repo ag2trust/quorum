@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, shouldTrim} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -81,3 +81,15 @@ const denseCapped = normalizeTail(denseUnknowns, MAX_RENDERED_ROWS_PER_POLL, MAX
 assert.equal(parsedUnknowns, MAX_NORMALIZED_RECORDS_PER_POLL);
 assert.equal(denseCapped.length, MAX_RENDERED_ROWS_PER_POLL);
 assert.match(denseCapped[0].title, new RegExp(`${50_000 - (MAX_RENDERED_ROWS_PER_POLL - 1)} earlier events omitted`));
+
+let tailState = {};
+let tail = reassembleTail(tailState, [], '{"type":"assistant","message":{"content":"part', false);
+tailState = tail.state;
+assert.equal(tail.lines.length, 0);
+tail = reassembleTail(tailState, ['ial"}}'], null, false);
+assert.equal(tail.lines[0], '{"type":"assistant","message":{"content":"partial"}}');
+assert.equal(parseEventLine(tail.lines[0])[0].body, 'partial');
+
+tail = reassembleTail({}, ['truncated', '{"type":"assistant","message":{"content":"whole"}}'], null, true);
+assert.equal(tail.lines.length, 1);
+assert.equal(parseEventLine(tail.lines[0])[0].body, 'whole');

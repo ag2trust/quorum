@@ -295,11 +295,20 @@ fn stream_payload(
     let read = file.read(&mut bytes).map_err(StreamError::Io)?;
     bytes.truncate(read);
     let next = start + read as u64;
-    let lines = String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    Ok(json!({"lines": lines, "next_offset": next, "eof": next >= len}))
+    let text = String::from_utf8_lossy(&bytes);
+    let mut chunks = text.split('\n').map(str::to_owned).collect::<Vec<_>>();
+    let partial = if bytes.ends_with(b"\n") {
+        chunks.pop();
+        None
+    } else {
+        chunks.pop()
+    };
+    // The initial tail can begin in the middle of a record. The client discards that
+    // first completed fragment before it begins retaining suffixes for later requests.
+    Ok(
+        json!({"lines": chunks, "partial": partial, "starts_mid_line": from.is_none() && start > 0,
+        "next_offset": next, "eof": next >= len}),
+    )
 }
 
 fn server_error(error: quorum_core::error::QuorumError) -> Response {
@@ -377,6 +386,39 @@ mod tests {
         let next = first["next_offset"].as_u64().unwrap();
         let second = stream_payload(root.path(), "A-100", Some(next), 20).unwrap();
         assert_eq!(second["lines"], json!(["two"]));
+    }
+
+    #[test]
+    fn stream_payload_keeps_a_record_spanning_the_byte_cap_as_a_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        let record = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(DEFAULT_STREAM_BYTES as usize + 128)
+        );
+        fs::write(dir.join("stream.jsonl"), &record).unwrap();
+
+        let first = stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES).unwrap();
+        assert_eq!(first["lines"], json!([]));
+        assert_eq!(
+            first["partial"].as_str().unwrap().len(),
+            DEFAULT_STREAM_BYTES as usize
+        );
+
+        let second = stream_payload(
+            root.path(),
+            "A-100",
+            first["next_offset"].as_u64(),
+            DEFAULT_STREAM_BYTES,
+        )
+        .unwrap();
+        let reassembled = format!(
+            "{}{}",
+            first["partial"].as_str().unwrap(),
+            second["lines"][0].as_str().unwrap()
+        );
+        assert_eq!(reassembled, record.trim_end());
     }
 
     #[test]

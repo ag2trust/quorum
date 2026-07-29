@@ -118,10 +118,22 @@
     catch (_) { return normalizeEvents(null); }
   }
 
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, shouldTrim};
+  function reassembleTail(state, lines, partial, startsMidLine = false) {
+    let {pending = '', discardLeading = startsMidLine} = state;
+    const complete = [];
+    for (const line of lines) {
+      if (discardLeading) { discardLeading = false; continue; }
+      complete.push(pending + line);
+      pending = '';
+    }
+    if (partial != null && !discardLeading) pending += partial;
+    return {lines: complete, state: {pending, discardLeading}};
+  }
+
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim};
   if (typeof document === 'undefined') return;
 
-  let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null;
+  let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {};
   const $ = id => document.getElementById(id);
   const put = (node, value) => { node.textContent = value ?? ''; return node; };
   const node = value => put(document.createTextNode(''), value);
@@ -143,7 +155,7 @@
     renderedChars += row.textContent.length; $('stream').append(row); trimStream();
   }
   function renderRaw() { $('rawStream').textContent = rawText.length > MAX_RENDERED_TAIL_CHARS ? rawText.slice(-MAX_RENDERED_TAIL_CHARS) : rawText; }
-  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); normalizeTail(lines).forEach(renderEvent); if (rawMode) renderRaw(); }
+  function appendTail(lines, partial, startsMidLine, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; tailState = {}; } const text = lines.join('\n') + (lines.length ? '\n' : '') + (partial || ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); const reassembled = reassembleTail(tailState, lines, partial, startsMidLine); tailState = reassembled.state; normalizeTail(reassembled.lines).forEach(renderEvent); if (rawMode) renderRaw(); }
   async function state() { if (document.hidden) return; const s = await fetch('/api/state').then(r => r.json()), counts = Object.fromEntries(s.counts.map(x => [x.status, x.count])); $('tiles').replaceChildren(); ['working', 'open', 'in-review', 'done'].forEach(key => { const tile = document.createElement('span'); tile.className = 'tile'; put(tile, key + '\n' + (counts[key] || 0)); $('tiles').append(tile); }); const tasks = $('tasks'); tasks.replaceChildren(); appendRow(tasks, ['State', 'Task', 'Provider/model', 'PR', 'Age'], true); s.tasks.forEach(x => { const pr = document.createElement('span'); if (x.pr) { const link = document.createElement('a'); link.href = 'https://github.com/ag2trust/quorum/pull/' + x.pr; put(link, '#' + x.pr); pr.append(link); } appendRow(tasks, [x.state, '#' + x.id + ' ' + x.title, (x.provider || 'pending') + ' ' + (x.model || ''), pr, age(x.age_secs)]); }); renderAgents(s.agents, s.now); $('alerts').textContent = JSON.stringify({alerts: s.alerts, errors: s.errors}, null, 2); }
   function renderAgents(agents, now) { const online = agents.filter(agent => agent.online), offline = agents.filter(agent => !agent.online); const render = (table, rows) => { table.replaceChildren(); appendRow(table, ['Agent', 'Task', 'Last seen'], true); rows.forEach(agent => { const seen = document.createElement('span'); put(seen, relativeTime(agent.last_seen, now)); seen.title = timestamp(agent.last_seen); appendRow(table, [agent.name, agent.task_held ? '#' + agent.task_held.id + ' ' + agent.task_held.title : '—', seen]); }); }; render($('agentTable'), online); render($('offlineAgentTable'), offline); $('offlineAgents').classList.toggle('hidden', !offline.length); put($('offlineAgents').querySelector('summary'), `${offline.length} offline`); }
   function duration(meta) { const start = meta.start_time, end = meta.end_time; return start && end ? age(Math.max(0, end - start)) : '—'; }
@@ -152,7 +164,7 @@
   let currentRunsBefore = null;
   async function runs(before = currentRunsBefore) { if (document.hidden) return; const suffix = before ? '?before=' + encodeURIComponent(before) : ''; const response = await fetch('/api/runs' + suffix).then(x => x.json()); renderRuns(response.runs, true); currentRunsBefore = before; runsBefore = response.next_before; $('moreRuns').classList.toggle('hidden', !runsBefore); }
   async function openDetail(dir, from) { openRun = dir; offset = from ?? null; rawText = ''; rawMode = false; put($('rawToggle'), 'Show raw'); $('rawStream').classList.add('hidden'); $('stream').classList.remove('hidden'); show('run'); put($('runTitle'), dir); await tail(); }
-  async function tail() { if (!openRun || paused || document.hidden) return; const url = '/api/runs/' + encodeURIComponent(openRun) + '/stream?max=2097152' + (offset !== null ? '&from=' + offset : ''); const response = await fetch(url).then(x => x.json()); appendTail(response.lines, offset === null); offset = response.next_offset; $('stream').scrollTop = $('stream').scrollHeight; }
+  async function tail() { if (!openRun || paused || document.hidden) return; const url = '/api/runs/' + encodeURIComponent(openRun) + '/stream?max=2097152' + (offset !== null ? '&from=' + offset : ''); const response = await fetch(url).then(x => x.json()); appendTail(response.lines, response.partial, response.starts_mid_line, offset === null); offset = response.next_offset; $('stream').scrollTop = $('stream').scrollHeight; }
   $('pause').onclick = () => { paused = !paused; put($('pause'), paused ? 'Resume tail' : 'Pause tail'); };
   $('start').onclick = event => { event.preventDefault(); openDetail(openRun, 0); };
   $('rawToggle').onclick = () => { rawMode = !rawMode; $('stream').classList.toggle('hidden', rawMode); $('rawStream').classList.toggle('hidden', !rawMode); put($('rawToggle'), rawMode ? 'Show rendered' : 'Show raw'); if (rawMode) renderRaw(); };
