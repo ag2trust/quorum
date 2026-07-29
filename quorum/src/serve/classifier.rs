@@ -134,6 +134,7 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                 if let Some(usage) = usage {
                     slot.usage.saturating_add_assign(super::runner::TokenUsage {
                         input_tokens: usage.input_tokens,
+                        uncached_input_tokens: usage.input_tokens,
                         cached_input_tokens: usage.cache_read_input_tokens,
                         cache_write_input_tokens: usage.cache_creation_input_tokens,
                         output_tokens: usage.output_tokens,

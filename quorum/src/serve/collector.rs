@@ -280,7 +280,7 @@ async fn record_token_usage(request: &CollectionRequest, usage: super::runner::T
     let model = request.collector_model.clone();
     let effort = request.collector_effort.clone();
     let usage = quorum_core::token_usage::TokenUsage {
-        uncached_input_tokens: usage.input_tokens as i64,
+        uncached_input_tokens: usage.uncached_input_tokens as i64,
         cached_input_tokens: usage.cached_input_tokens as i64,
         cache_write_input_tokens: usage.cache_write_input_tokens as i64,
         output_tokens: usage.output_tokens as i64,
@@ -642,6 +642,7 @@ async fn spawn_and_run_classifier(
                         if let Some(usage) = usage {
                             usage_total.saturating_add_assign(super::runner::TokenUsage {
                                 input_tokens: usage.input_tokens,
+                                uncached_input_tokens: usage.input_tokens,
                                 cached_input_tokens: usage.cache_read_input_tokens,
                                 cache_write_input_tokens: usage.cache_creation_input_tokens,
                                 output_tokens: usage.output_tokens,

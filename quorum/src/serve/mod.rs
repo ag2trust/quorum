@@ -898,7 +898,7 @@ fn managed_usage_record(slot: &SlotState, purpose: &str) -> ManagedUsageRecord {
 
 fn durable_token_usage(usage: runner::TokenUsage) -> quorum_core::token_usage::TokenUsage {
     quorum_core::token_usage::TokenUsage {
-        uncached_input_tokens: usage.input_tokens as i64,
+        uncached_input_tokens: usage.uncached_input_tokens as i64,
         cached_input_tokens: usage.cached_input_tokens as i64,
         cache_write_input_tokens: usage.cache_write_input_tokens as i64,
         output_tokens: usage.output_tokens as i64,
@@ -968,7 +968,7 @@ async fn record_classifier_usage_fields(
 ) {
     let p = db_path.to_path_buf();
     let usage = quorum_core::token_usage::TokenUsage {
-        uncached_input_tokens: usage.input_tokens as i64,
+        uncached_input_tokens: usage.uncached_input_tokens as i64,
         cached_input_tokens: usage.cached_input_tokens as i64,
         cache_write_input_tokens: usage.cache_write_input_tokens as i64,
         output_tokens: usage.output_tokens as i64,
@@ -11296,6 +11296,43 @@ mod tests {
         };
         let slot = make_dummy_slot();
         assert!(check_post_result_limits(&limits, 200, 500, None, 0.0, &slot).is_none());
+    }
+
+    #[test]
+    fn codex_cached_input_preserves_legacy_turn_and_task_token_limits() {
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":1376345,"cached_input_tokens":1294080,"cache_write_input_tokens":0,"output_tokens":6691,"reasoning_output_tokens":3518}}"#;
+        let events = runner::normalize_codex_line(line);
+        let usage = match events.as_slice() {
+            [runner::AgentEvent::TurnCompleted {
+                usage: Some(usage), ..
+            }] => *usage,
+            other => panic!("expected one completed event, got {other:?}"),
+        };
+        let live_tokens = usage.live_total_tokens() as i64;
+        assert_eq!(live_tokens, 1_383_036);
+
+        let slot = make_dummy_slot();
+        let turn_limit = CostLimits {
+            max_turn_tokens: Some(100_000),
+            ..Default::default()
+        };
+        assert!(
+            check_post_result_limits(&turn_limit, live_tokens, live_tokens, None, 0.0, &slot,)
+                .unwrap()
+                .to_string()
+                .contains("turn tokens 1383036")
+        );
+
+        let task_limit = CostLimits {
+            max_task_tokens: Some(100_000),
+            ..Default::default()
+        };
+        assert!(
+            check_post_result_limits(&task_limit, live_tokens, live_tokens, None, 0.0, &slot,)
+                .unwrap()
+                .to_string()
+                .contains("task tokens 1383036")
+        );
     }
 
     #[test]

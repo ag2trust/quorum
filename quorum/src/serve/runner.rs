@@ -300,9 +300,13 @@ pub enum ActivityKind {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
-    /// Provider-defined uncached input. Codex's inclusive input count is
-    /// normalized by subtracting cached input before it reaches this field.
+    /// Provider-reported input used by the established live gauge and token
+    /// caps. Codex reports an inclusive value here.
     pub input_tokens: u64,
+    /// Provider-defined uncached input retained for durable telemetry. Codex
+    /// reports inclusive input, so its normalizer subtracts cached input only
+    /// for this field.
+    pub uncached_input_tokens: u64,
     pub cached_input_tokens: u64,
     pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
@@ -310,15 +314,18 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Legacy live/cap measurement: uncached input plus output. Cache activity
-    /// is retained in the durable breakdown but must not change configured
-    /// token-limit behavior or the existing live gauge.
+    /// Established live/cap measurement. Cache activity is retained in the
+    /// durable breakdown but must not change configured token-limit behavior
+    /// or the existing live gauge.
     pub fn live_total_tokens(self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
     pub fn saturating_add_assign(&mut self, other: Self) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.uncached_input_tokens = self
+            .uncached_input_tokens
+            .saturating_add(other.uncached_input_tokens);
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(other.cached_input_tokens);
@@ -352,6 +359,7 @@ pub fn normalize_claude_line(raw: &str) -> Vec<AgentEvent> {
         } => {
             let tok = usage.map(|u| TokenUsage {
                 input_tokens: u.input_tokens,
+                uncached_input_tokens: u.input_tokens,
                 cached_input_tokens: u.cache_read_input_tokens,
                 cache_write_input_tokens: u.cache_creation_input_tokens,
                 output_tokens: u.output_tokens,
@@ -472,7 +480,8 @@ pub fn normalize_codex_line(raw: &str) -> Vec<AgentEvent> {
         }
         codex_stream::Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
             usage: usage.map(|usage| TokenUsage {
-                input_tokens: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+                input_tokens: usage.input_tokens,
+                uncached_input_tokens: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
                 cached_input_tokens: usage.cached_input_tokens,
                 cache_write_input_tokens: usage.cache_write_input_tokens,
                 output_tokens: usage.output_tokens,
@@ -559,6 +568,7 @@ mod tests {
             AgentEvent::TurnCompleted { usage, cost_usd } => {
                 let u = usage.unwrap();
                 assert_eq!(u.input_tokens, 100);
+                assert_eq!(u.uncached_input_tokens, 100);
                 assert_eq!(u.output_tokens, 50);
                 assert!((cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
             }
@@ -567,17 +577,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_observed_usage_keeps_cached_input_separate() {
+    fn codex_usage_preserves_legacy_live_meter_and_durable_cache_breakdown() {
         let line = r#"{"type":"turn.completed","usage":{"input_tokens":1376345,"cached_input_tokens":1294080,"cache_write_input_tokens":0,"output_tokens":6691,"reasoning_output_tokens":3518}}"#;
         let events = normalize_codex_line(line);
         match events.as_slice() {
             [AgentEvent::TurnCompleted {
                 usage: Some(usage), ..
             }] => {
-                assert_eq!(usage.input_tokens, 82_265);
+                assert_eq!(usage.input_tokens, 1_376_345);
+                assert_eq!(usage.uncached_input_tokens, 82_265);
                 assert_eq!(usage.cached_input_tokens, 1_294_080);
                 assert_eq!(usage.output_tokens, 6_691);
                 assert_eq!(usage.reasoning_tokens, 3_518);
+                assert_eq!(usage.live_total_tokens(), 1_383_036);
             }
             other => panic!("expected one completed event, got {other:?}"),
         }
@@ -592,6 +604,7 @@ mod tests {
                 usage: Some(usage), ..
             }] => {
                 assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.uncached_input_tokens, 100);
                 assert_eq!(usage.cached_input_tokens, 900);
                 assert_eq!(usage.cache_write_input_tokens, 50);
                 assert_eq!(usage.output_tokens, 25);
@@ -604,6 +617,7 @@ mod tests {
     fn live_total_excludes_durable_cache_breakdown() {
         let usage = TokenUsage {
             input_tokens: 100,
+            uncached_input_tokens: 100,
             cached_input_tokens: 900,
             cache_write_input_tokens: 50,
             output_tokens: 25,
