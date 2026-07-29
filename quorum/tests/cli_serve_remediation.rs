@@ -872,7 +872,7 @@ fn rework_cap_bounds_remediation_attempts() {
     let task_id = seed_in_review_task(home.path(), author, pr);
     create_pr_branch(repo_dir.path(), author, task_id);
 
-    // Set rework_round to the cap directly so the next VerdictChanges
+    // Set rework_round to the cap (3) directly so the next VerdictChanges
     // exceeds it and transitions to Failed.
     {
         let db_path = home
@@ -882,15 +882,12 @@ fn rework_cap_bounds_remediation_attempts() {
             .join("quorum.db");
         let conn = quorum_core::db::open(&db_path).unwrap();
         conn.execute(
-            "UPDATE tasks SET rework_round=?1 WHERE id=?2",
-            rusqlite::params![quorum_core::lifecycle::REWORK_CAP, task_id],
+            "UPDATE tasks SET rework_round=3 WHERE id=?1",
+            rusqlite::params![task_id],
         )
         .unwrap();
         let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
-        assert_eq!(
-            task.rework_round,
-            i64::from(quorum_core::lifecycle::REWORK_CAP)
-        );
+        assert_eq!(task.rework_round, 3);
     }
 
     let mut handle = ServeHandle::start(

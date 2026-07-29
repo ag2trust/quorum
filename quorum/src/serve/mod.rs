@@ -250,26 +250,10 @@ fn r2_required_for_head(
     pr_number: i64,
     head_sha: &str,
 ) -> bool {
-    // A head's durable decision is immutable, including after a force-push
-    // returns the PR to that head.  The exhausted-budget skip may establish a
-    // decision only for a previously unseen head; it must never weaken one
-    // already recorded as required.
-    match quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha) {
-        Ok(Some(required)) => return required,
-        // Missing state is the only case where the cap may establish a new
-        // R2 skip. An unreadable or task-mismatched decision fails closed.
-        Ok(None) => {}
-        Err(_) => return true,
-    }
-    if matches!(
-        tasks::get(conn, task_id),
-        Ok(Some(task))
-            if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP)
-    ) {
-        return false;
-    }
-    // Missing, unreadable, or task-mismatched state fails closed to R2.
-    true
+    quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)
+        .ok()
+        .flatten()
+        .unwrap_or(true)
 }
 
 struct R2SamplingPolicy {
@@ -290,17 +274,15 @@ fn decide_r2_requirement(
     head_sha: &str,
     policy: &R2SamplingPolicy,
 ) -> Result<bool> {
-    let task = tasks::get(conn, task_id)?
-        .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared while sampling R2")))?;
+    if tasks::get(conn, task_id)?.is_none() {
+        return Err(QuorumError::Io(format!(
+            "task #{task_id} disappeared while sampling R2"
+        )));
+    }
     if let Some(required) =
         quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)?
     {
         return Ok(required);
-    }
-    if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP) {
-        return quorum_core::review_audits::record_r2_requirement(
-            conn, task_id, pr_number, head_sha, false,
-        );
     }
 
     // `false` opts out of sampling, never out of the R2 gate itself.
@@ -2324,6 +2306,94 @@ async fn reconcile_remediation_retries(
     Ok(())
 }
 
+/// Reconcile a PR that reached `merging` after its reviewer has gone away.
+///
+/// A merge attempt is intentionally durable: the reviewer can be torn down
+/// between recording approval and observing the final GitHub mergeability
+/// result.  Do not let that leave a DIRTY PR classified as CI-pending.  The
+/// lifecycle transition is the serialization point; the remediation claim in
+/// `spawn_remediation_worker` then makes concurrent/restarted ticks harmless.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_orphaned_merge_conflicts(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    reviewers: &[SlotState],
+    lifetime_roster: &mut LifetimeRoster,
+    draining: bool,
+) -> Result<()> {
+    let pending = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(i64, i64)>> {
+            let conn = quorum_core::db::open(&p)?;
+            Ok(tasks::list(&conn, Some("merging"), None, None)?
+                .into_iter()
+                .filter_map(|task| tasks::extract_pr_number(&task.refs).map(|pr| (task.id, pr)))
+                .collect())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("orphan merge scan join: {error}")))??
+    };
+
+    for (task_id, pr) in pending {
+        if workers.iter().any(|worker| worker.task_id == task_id)
+            || reviewers.iter().any(|reviewer| reviewer.task_id == task_id)
+        {
+            continue;
+        }
+        let state = {
+            let executor = Arc::clone(&config.merge_executor);
+            let repo = config.repo_dir.clone();
+            tokio::task::spawn_blocking(move || executor.check_mergeability(pr, &repo))
+                .await
+                .unwrap_or(merge::MergeabilityState::Mergeable)
+        };
+        if state != merge::MergeabilityState::Conflicting {
+            continue;
+        }
+
+        log(&format!(
+            "orphan merging task #{task_id} PR #{pr} is CONFLICTING — firing MergeConflict"
+        ));
+        let transition =
+            fire_event(&config.db_path, "system", task_id, &Event::MergeConflict).await;
+        let Some(transition) = transition else {
+            continue;
+        };
+        if transition.task.status != "rework" || draining {
+            continue;
+        }
+        let feedback = format!(
+            "PR #{pr} has conflicts with {} (detected after merge reviewer teardown).\n\n\
+             Rebase on {}, resolve conflicts, and push again.",
+            config.base_branch, config.base_branch
+        );
+        if available_worker_slots(config.cap, workers.len()) == 0 {
+            log(&format!(
+                "orphan merge conflict task #{task_id}: worker cap reached; remediation remains queued"
+            ));
+            remember_remediation_feedback(&config.db_path, task_id, &feedback).await;
+            continue;
+        }
+        if !spawn_remediation_worker(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            lifetime_roster,
+            task_id,
+            pr,
+            &feedback,
+        )
+        .await
+        {
+            park_remediation_provision_failure(config, task_id, pr, &feedback).await;
+        }
+    }
+    Ok(())
+}
+
 async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -3056,8 +3126,7 @@ async fn tick(
 
                         if !r2_required {
                             log(&format!(
-                                "R2 GATE: PR #{pr_num} — sampling or exhausted rework budget \
-                                 skipped R2 for head {head_sha}; \
+                                "R2 GATE: PR #{pr_num} — sampling skipped R2 for head {head_sha}; \
                                  proceeding with R1 approval"
                             ));
                         } else {
@@ -3430,30 +3499,55 @@ async fn tick(
                         };
 
                         if review_only {
-                            // Review-only: the external author owns rebasing. Fire MergeFailed
-                            // (merging → in-review) and park as merge-blocked;
-                            // orphan handler retries when PR becomes MERGEABLE.
+                            // Review-only tasks are still daemon-owned while this
+                            // task is live.  They use the same remediation worker
+                            // as implementation tasks, on the persisted PR target.
                             log(&format!(
-                                "PR #{pr_num} is CONFLICTING (review-only) — firing MergeFailed"
+                                "PR #{pr_num} is CONFLICTING (review-only) — firing MergeConflict"
                             ));
-                            fire_event(
+                            let mc = fire_event(
                                 &db_path,
                                 "system",
                                 reviewer_task_id,
-                                &Event::MergeFailed {
-                                    reason: format!(
-                                        "PR #{pr_num} has conflicts with {}",
-                                        config.base_branch
-                                    ),
-                                },
+                                &Event::MergeConflict,
                             )
                             .await;
-                            log(&format!(
-                                "review-only task #{reviewer_task_id}: \
-                                 merge blocked (conflict) — parking, not failing"
-                            ));
-                            set_task_body(&db_path, reviewer_task_id, tasks::MERGE_BLOCKED_BODY)
-                                .await;
+                            if mc.is_some_and(|tr| tr.task.status == "rework") {
+                                let feedback = format!(
+                                    "PR #{pr_num} has conflicts with {}.\n\n\
+                                     Rebase on {}, resolve conflicts, and push again.",
+                                    config.base_branch, config.base_branch
+                                );
+                                if drain_state.draining
+                                    || available_worker_slots(config.cap, workers.len()) == 0
+                                {
+                                    remember_remediation_feedback(
+                                        &db_path,
+                                        reviewer_task_id,
+                                        &feedback,
+                                    )
+                                    .await;
+                                } else if !spawn_remediation_worker(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    workers,
+                                    lifetime_roster,
+                                    reviewer_task_id,
+                                    pr_num,
+                                    &feedback,
+                                )
+                                .await
+                                {
+                                    park_remediation_provision_failure(
+                                        config,
+                                        reviewer_task_id,
+                                        pr_num,
+                                        &feedback,
+                                    )
+                                    .await;
+                                }
+                            }
                             let r = reviewers.remove(ri);
                             teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:approved")
                                 .await;
@@ -6645,7 +6739,21 @@ async fn tick(
         }
     }
 
-    // ── Phase 5c: Recover durable failed-CI remediation ────────────────
+    // ── Phase 5c: Recover orphaned merge conflicts ─────────────────────
+    // This is outside the reviewer-provisioning gate so a drain can record
+    // the durable conflict transition without starting a new worker.
+    reconcile_orphaned_merge_conflicts(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        reviewers,
+        lifetime_roster,
+        drain_state.draining,
+    )
+    .await?;
+
+    // ── Phase 5d: Recover durable failed-CI remediation ────────────────
     // This scan is intentionally before generic worker provisioning:
     // failed-CI rework must retain its exact PR/head turn and can never fall
     // through to a fresh implementation prompt.
@@ -9384,21 +9492,9 @@ async fn notify_provision_failure(
     }
 }
 
-/// A remediation worker is the only actor that can resolve an accepted
-/// changes verdict.  If it cannot be provisioned, returning a review-only
-/// task to `in-review` merely invites another reviewer to spend another
-/// rework round on the same unchanged PR.  Park the task instead; explicit
-/// retry remains the owner-controlled recovery path.
-async fn park_remediation_provision_failure(
-    config: &ServeConfig,
-    task_id: i64,
-    pr: i64,
-    feedback: &str,
-) {
-    // `task-retry` restores a parked rework task without the original reviewer
-    // process or mailbox row. Preserve the accepted blocking feedback so the
-    // replacement remediation turn remains tied to the unresolved finding.
-    let p = config.db_path.clone();
+/// Persist feedback when a remediation must wait for worker capacity.
+async fn remember_remediation_feedback(db_path: &Path, task_id: i64, feedback: &str) {
+    let p = db_path.to_path_buf();
     let feedback = feedback.to_string();
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -9421,9 +9517,25 @@ async fn park_remediation_provision_failure(
             "remediation_feedback".into(),
             serde_json::Value::String(feedback),
         );
+        object.insert(
+            tasks::PARKED_REWORK_RETRY_REF.into(),
+            serde_json::Value::Bool(true),
+        );
         tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
     })
     .await;
+}
+
+async fn park_remediation_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) {
+    // `task-retry` restores a parked rework task without the original reviewer
+    // process or mailbox row. Preserve the accepted blocking feedback so the
+    // replacement remediation turn remains tied to the unresolved finding.
+    remember_remediation_feedback(&config.db_path, task_id, feedback).await;
     let reason = format!("remediation worker provisioning failed for PR #{pr}");
     park_task(&config.db_path, task_id, &reason, "rework").await;
     notify_provision_failure(
@@ -11174,6 +11286,42 @@ mod tests {
         assert!(codex_retry_turn(Some(refs)).is_none());
     }
 
+    #[tokio::test]
+    async fn deferred_remediation_is_durably_retryable_after_capacity_or_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deferred-remediation.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = tasks::create(
+                &mut conn,
+                "owner",
+                "conflict",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":478}"#),
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [id])
+                .unwrap();
+            id
+        };
+
+        remember_remediation_feedback(&db_path, task_id, "resolve the conflict").await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(daemon_rework_retry_requested(task.refs.as_deref()));
+        assert_eq!(
+            remediation_retry_feedback(task.refs.as_deref()).as_deref(),
+            Some("resolve the conflict")
+        );
+        assert_eq!(task.status, "rework");
+    }
+
     #[test]
     fn transport_refeed_does_not_erase_rework_feedback() {
         let feedback = "REVIEW FAILED — fix the stale approval bug";
@@ -11816,71 +11964,6 @@ mod tests {
             Some("r2"),
             "force-pushing the prior required head back must still require R2"
         );
-    }
-
-    #[test]
-    fn exhausted_rework_budget_preserves_required_r2_for_returned_head() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("q.db");
-        let mut conn = quorum_core::db::open(&db_path).unwrap();
-        let task_id = tasks::create(
-            &mut conn,
-            "creator",
-            "sampled task",
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-            100,
-        )
-        .unwrap();
-        let policy = R2SamplingPolicy {
-            enabled: true,
-            target_per_stratum: 0,
-            steady_state_p: 0.0,
-            default_model: "model".into(),
-            default_effort: "high".into(),
-        };
-
-        // Head A was reviewed before rework exhausted the budget and durably
-        // required R2. Rework then consumes the final bounded round.
-        quorum_core::review_audits::record_r2_requirement(&mut conn, task_id, 42, "head-a", true)
-            .unwrap();
-        conn.execute(
-            "UPDATE tasks SET rework_round=?1 WHERE id=?2",
-            rusqlite::params![quorum_core::lifecycle::REWORK_CAP as i64, task_id],
-        )
-        .unwrap();
-
-        // The branch moves to new head B, which correctly receives the final
-        // round's recorded skip. It then force-pushes back to A and obtains a
-        // fresh R1 approval. The cap can establish a skip only for B; it
-        // cannot replace A's R2 gate.
-        assert!(!decide_r2_requirement(&mut conn, task_id, 42, "head-b", &policy).unwrap());
-        assert!(decide_r2_requirement(&mut conn, task_id, 42, "head-a", &policy).unwrap());
-        quorum_core::approvals::record(
-            &mut conn,
-            &quorum_core::approvals::Approval {
-                pr_number: 42,
-                review_role: "r1".into(),
-                task_id,
-                author: "worker".into(),
-                reviewer: "fresh-r1".into(),
-                verdict: "approved".into(),
-                blocking_count: 0,
-                approved_head_sha: "head-a".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(next_needed_role(&conn, 42, "head-a").unwrap(), Some("r2"));
-
-        // Restart reconciliation reads the same immutable decision.
-        drop(conn);
-        let conn = quorum_core::db::open(&db_path).unwrap();
-        assert!(r2_required_for_head(&conn, task_id, 42, "head-a"));
-        assert_eq!(next_needed_role(&conn, 42, "head-a").unwrap(), Some("r2"));
     }
 
     /// A sampled-out head leaves no `r2` approval row. The provisioning
