@@ -1,6 +1,7 @@
 (() => {
   const MAX_RENDERED_TAIL_CHARS = 2 * 1024 * 1024;
   const MAX_EXPANDED_OUTPUT_CHARS = 200 * 1024;
+  const MAX_NORMALIZED_EVENTS_PER_RECORD = 100;
   const ellipsize = (text, max = 90) => text.length > max ? text.slice(0, max - 1) + '…' : text;
 
   function stripShellWrapper(command) {
@@ -42,11 +43,18 @@
         return [{kind: 'message', title: 'Assistant message', body: content, exit_code: null}];
       }
       const blocks = Array.isArray(content) ? content : [];
-      if (blocks.length) return blocks.map(part => {
+      if (blocks.length) {
+        const visible = blocks.slice(0, MAX_NORMALIZED_EVENTS_PER_RECORD);
+        const rows = visible.map(part => {
         if (part.type === 'text') return {kind: 'message', title: 'Assistant message', body: String(part.text || ''), exit_code: null};
         if (part.type === 'tool_use') return commandEvent(part.name, part.input);
         return {kind: 'unknown', title: `Unrecognized assistant block: ${part.type || 'unknown'}`, body: '', exit_code: null};
-      });
+        });
+        if (blocks.length > MAX_NORMALIZED_EVENTS_PER_RECORD) {
+          rows[MAX_NORMALIZED_EVENTS_PER_RECORD - 1] = {kind: 'meta', title: `${blocks.length - MAX_NORMALIZED_EVENTS_PER_RECORD + 1} assistant blocks omitted`, body: '', exit_code: null};
+        }
+        return rows;
+      }
     }
     if (event && event.type === 'tool_use') {
       return [commandEvent(event.name, event.input)];
@@ -74,7 +82,7 @@
     catch (_) { return normalizeEvents(null); }
   }
 
-  globalThis.QuorumWeb = {stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine};
   if (typeof document === 'undefined') return;
 
   let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null;

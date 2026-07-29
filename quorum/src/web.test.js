@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -41,3 +41,8 @@ const mixedAssistant = normalizeEvents({type: 'assistant', message: {content: [
 ]}});
 assert.equal(mixedAssistant.map(row => row.kind).join(','), 'message,command,command');
 assert.match(mixedAssistant[2].title, /Read/);
+
+const denseAssistant = normalizeEvents({type: 'assistant', message: {content: Array.from({length: 1_000}, () => ({}))}});
+assert.equal(denseAssistant.length, MAX_NORMALIZED_EVENTS_PER_RECORD);
+assert.equal(denseAssistant.at(-1).kind, 'meta');
+assert.match(denseAssistant.at(-1).title, /901 assistant blocks omitted/);
