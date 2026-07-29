@@ -102,8 +102,10 @@ Run the full project gate before `quorum submit`:
 rtk proxy ./preflight.sh
 ```
 
-The raw output must end in `PREFLIGHT: PASS` and appear under `## Verification` in the PR
-body. Never bypass the pre-push hook. For doc-only changes this gate still applies.
+Under `## Verification`, record the command, each gate's result, and the terminal
+`PREFLIGHT: PASS` line. Do not paste routine per-test output; link CI for the full machine
+log when available. Never bypass the pre-push hook. For doc-only changes this gate still
+applies.
 
 After pulling merged source, run `./dev-install.sh` to rebuild, install, verify required
 commands, and check schema compatibility. Use `scripts/serve-supervisor.sh` for supervised

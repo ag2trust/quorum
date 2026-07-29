@@ -3,9 +3,10 @@
 #
 # Models follow mechanical gates far more reliably than judgment prose: PRs #112
 # and #114 shipped CI-red (fmt/clippy) and cost ~5 reviewer sessions in one week.
-# Run this, paste its FULL output in the PR body under `## Verification`, and only
-# then mark the quorum task done. On agent machines run it as
-# `rtk proxy ./preflight.sh` so RTK doesn't compress the evidence (see CLAUDE.md).
+# Run this, record each gate result and the terminal PREFLIGHT line in the PR body
+# under `## Verification`, and only then submit the quorum task. Routine per-test
+# output belongs in CI logs rather than every author and reviewer prompt. On agent
+# machines use `rtk proxy ./preflight.sh` when complete local output is needed.
 #
 # Gates (in order, fail-fast):
 #   1. branch base   — HEAD is branched from origin/main, not another feature branch
