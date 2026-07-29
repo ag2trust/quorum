@@ -234,10 +234,11 @@ sessions in one week). The gate is mechanical, not judgment:
 rtk proxy ./preflight.sh    # branch-base check + fmt + clippy + test, fail-fast
 ```
 
-Paste the full output — it must end `PREFLIGHT: PASS` — in the PR body under
-`## Verification`. No green preflight → no `submit`. The pre-push hook (installed by
-`./dev-install.sh`) re-runs the cheap subset (`--quick`: branch base + fmt) on every
-push; never bypass it with `--no-verify`.
+No green preflight → no `submit`. Record a concise verification summary in the PR when
+useful, but a PR-body transcript is not a delivery gate: the daemon alone gates reviewer
+provisioning and merge on the applicable CI state. The pre-push hook (installed by
+`./dev-install.sh`) re-runs the cheap subset (`--quick`: branch base + fmt) on every push;
+never bypass it with `--no-verify`.
 
 ### 6. Test quality bar (authors write to it, reviewers enforce it)
 
