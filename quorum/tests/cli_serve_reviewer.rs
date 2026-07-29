@@ -39,6 +39,30 @@ fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> 
     false
 }
 
+fn wait_for_task_status(
+    home: &std::path::Path,
+    task_id: i64,
+    expected: &str,
+    timeout_secs: u64,
+) -> bool {
+    let db = home.join("repos/test__repo/quorum.db");
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if let Ok(conn) = rusqlite::Connection::open(&db) {
+            let status: Option<String> = conn
+                .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |r| {
+                    r.get(0)
+                })
+                .ok();
+            if status.as_deref() == Some(expected) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -1066,6 +1090,10 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
         handle.wait_for("rework", 15),
         "demoted verdict did not produce a rework turn. Lines: {:?}",
         handle.lines
+    );
+    assert!(
+        wait_for_task_status(home.path(), 1, "rework", 15),
+        "demoted verdict rework turn arrived before the task state transition"
     );
 
     while let Ok(line) = handle.rx.try_recv() {

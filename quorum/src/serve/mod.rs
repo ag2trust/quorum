@@ -321,6 +321,47 @@ fn is_provision_exhausted(
     Ok(attempts >= MAX_REVIEWER_PROVISION_STRIKES as i64)
 }
 
+/// Record a reviewer provisioning failure before returning to the daemon loop.
+/// Configuration/recovery mismatches must use this same bounded path as
+/// worktree and process failures; otherwise a stale persisted reviewer aborts
+/// every tick without ever parking the task.
+async fn record_reviewer_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    role: &ReviewRole,
+    head_sha: &str,
+) {
+    let role_str = role.as_str().to_string();
+    let sha = head_sha.to_string();
+    let strikes = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> i64 {
+            quorum_core::db::open(&p)
+                .ok()
+                .and_then(|mut conn| {
+                    quorum_core::provision_attempts::record_attempt(
+                        &mut conn, task_id, pr, &role_str, &sha,
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
+    };
+    log(&format!(
+        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} for task #{task_id} PR #{pr}",
+        role.as_str().to_uppercase()
+    ));
+    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
+        log(&format!(
+            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after {strikes} consecutive {} provision failures for PR #{pr}",
+            role.as_str().to_uppercase()
+        ));
+    }
+}
+
 /// Check whether total reviewer runs for a task exceed the safety cap.
 fn is_reviewer_cap_exceeded(conn: &quorum_core::Connection, task_id: i64) -> Result<bool> {
     let total = quorum_core::provision_attempts::total_reviewer_runs(conn, task_id)?;
@@ -512,6 +553,71 @@ fn require_configured_provider(
     require_provider_match(explicitly_configured_provider(config), actual, context)
 }
 
+/// Reviewer recovery is governed by the configured reviewer model, not the
+/// worker provider. This permits an intentional cross-provider reviewer while
+/// still refusing to revive a persisted reviewer from a different configuration.
+fn require_configured_reviewer_provider(
+    config: &ServeConfig,
+    actual: runner::AgentKind,
+    context: &str,
+) -> Result<()> {
+    require_reviewer_provider(
+        config.provider_explicit || config.review_model_explicit,
+        &config.review_model,
+        actual,
+        context,
+    )
+}
+
+fn require_reviewer_provider(
+    provider_explicit: bool,
+    review_model: &str,
+    actual: runner::AgentKind,
+    context: &str,
+) -> Result<()> {
+    let expected = provider_explicit
+        .then(|| resolve_provider(review_model))
+        .transpose()?;
+    require_provider_match(expected, actual, context)
+}
+
+/// `agent_bin` overrides the CLI for the configured worker provider. A reviewer
+/// may intentionally use the other provider, in which case it must use that
+/// provider's default executable rather than receiving incompatible flags.
+fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&str> {
+    agent_bin_for_runner(
+        config.provider_explicit || config.review_model_explicit,
+        config.runner_kind,
+        config.agent_bin.as_deref(),
+        kind,
+    )
+}
+
+fn agent_bin_for_runner(
+    provider_explicit: bool,
+    runner_kind: crate::serve_config::RunnerKind,
+    agent_bin: Option<&str>,
+    kind: runner::AgentKind,
+) -> Option<&str> {
+    if !provider_explicit {
+        return agent_bin;
+    }
+    let configured_kind = match runner_kind {
+        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
+        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+    };
+    (kind == configured_kind).then_some(agent_bin).flatten()
+}
+
+fn configured_reviewer_selection<'a>(
+    provider_explicit: bool,
+    review_model_explicit: bool,
+    review_model: &'a str,
+    review_effort: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    (provider_explicit || review_model_explicit).then_some((review_model, review_effort))
+}
+
 fn require_provider_match(
     expected: Option<runner::AgentKind>,
     actual: runner::AgentKind,
@@ -594,13 +700,20 @@ fn resolve_reviewer_recovery(
             run.model
         )));
     }
-    let thread_id = task_refs
-        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-        .and_then(|refs| {
-            refs.get(reviewer_thread_ref_key(is_r2))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        });
+    // Continuation IDs are Codex-specific. A task can retain an older Codex
+    // reviewer thread while a later Claude reviewer is interrupted; never let
+    // that stale ref select the Codex resume path for the Claude run.
+    let thread_id = (kind == runner::AgentKind::Codex)
+        .then(|| {
+            task_refs
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                .and_then(|refs| {
+                    refs.get(reviewer_thread_ref_key(is_r2))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .flatten();
     if kind == runner::AgentKind::Codex && thread_id.is_none() {
         return Err(QuorumError::Io(format!(
             "interrupted Codex reviewer run {} has no persisted {}",
@@ -936,6 +1049,7 @@ pub struct ServeConfig {
     pub model: String,
     pub effort: String,
     pub provider_explicit: bool,
+    pub review_model_explicit: bool,
     pub review_model: String,
     pub review_effort: String,
     pub classifier_model: String,
@@ -1370,6 +1484,28 @@ fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
                 .and_then(|value| value.as_bool())
         })
         .unwrap_or(false)
+}
+
+fn remediation_retry_feedback(refs: Option<&str>) -> Option<String> {
+    let refs = refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())?;
+    if !refs
+        .get(tasks::PARKED_REWORK_RETRY_REF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    refs.get("remediation_feedback")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+        .map(str::to_string)
+}
+
+/// The remediation reconcilers run before Phase 6's ordinary worker-cap loop,
+/// so they must apply the same slot accounting themselves.
+fn available_worker_slots(cap: usize, active_workers: usize) -> usize {
+    cap.saturating_sub(active_workers)
 }
 
 fn retry_slot_rework_count(
@@ -2089,6 +2225,82 @@ async fn reconcile_ci_remediations(
                 )
                 .await;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Resume an owner-requested retry of a remediation that was parked before a
+/// worker process existed. These retries must not fall through to generic
+/// worker provisioning: that path builds an initial-task prompt and, for
+/// Codex, may start a fresh thread. Reusing `spawn_remediation_worker` preserves
+/// the accepted blocker feedback, verified PR target, original provider/model,
+/// and exact continuation identity when an original worker exists.
+async fn reconcile_remediation_retries(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    draining: bool,
+) -> Result<()> {
+    if draining {
+        return Ok(());
+    }
+    let pending = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
+            let conn = quorum_core::db::open(&p)?;
+            Ok(tasks::list(&conn, Some("rework"), None, None)?
+                .into_iter()
+                .filter(|task| remediation_retry_feedback(task.refs.as_deref()).is_some())
+                .collect())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("review-only remediation scan join: {error}")))??
+    };
+
+    // This reconciler runs before Phase 6, whose ordinary worker loop enforces
+    // the cap. Limit this pre-Phase-6 path explicitly so a bulk retry cannot
+    // provision more workers or worktrees than the daemon owns slots for.
+    for task in pending {
+        if available_worker_slots(config.cap, workers.len()) == 0 {
+            break;
+        }
+        if workers.iter().any(|worker| worker.task_id == task.id) {
+            continue;
+        }
+        let Some(pr) = tasks::extract_pr_number(&task.refs) else {
+            park_task(
+                &config.db_path,
+                task.id,
+                "remediation retry is missing its PR identity",
+                "rework",
+            )
+            .await;
+            continue;
+        };
+        let Some(feedback) = remediation_retry_feedback(task.refs.as_deref()) else {
+            continue;
+        };
+
+        log(&format!(
+            "durable remediation retry: provisioning task #{} on PR #{pr}",
+            task.id
+        ));
+        if !spawn_remediation_worker(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            lifetime_roster,
+            task.id,
+            pr,
+            &feedback,
+        )
+        .await
+        {
+            park_remediation_provision_failure(config, task.id, pr, &feedback).await;
         }
     }
     Ok(())
@@ -3329,18 +3541,11 @@ async fn tick(
                                             )
                                             .await;
                                             if !spawn_ok {
-                                                log(&format!(
-                                                    "remediation worker spawn failed for task \
-                                                     #{reviewer_task_id} — firing AgentFailed"
-                                                ));
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
+                                                park_remediation_provision_failure(
+                                                    config,
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "remediation worker spawn failed"
-                                                            .into(),
-                                                    },
+                                                    pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -3610,18 +3815,11 @@ async fn tick(
                                             )
                                             .await;
                                             if !spawn_ok {
-                                                log(&format!(
-                                                    "remediation worker spawn failed for task \
-                                                     #{reviewer_task_id} — firing AgentFailed"
-                                                ));
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
+                                                park_remediation_provision_failure(
+                                                    config,
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "remediation worker spawn failed"
-                                                            .into(),
-                                                    },
+                                                    pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -3825,19 +4023,11 @@ async fn tick(
                                                 )
                                                 .await;
                                                 if !spawn_ok {
-                                                    log(&format!(
-                                                        "remediation worker spawn failed for task \
-                                                         #{reviewer_task_id} — firing AgentFailed"
-                                                    ));
-                                                    fire_event(
-                                                        &db_path,
-                                                        "daemon",
+                                                    park_remediation_provision_failure(
+                                                        config,
                                                         reviewer_task_id,
-                                                        &Event::AgentFailed {
-                                                            reason:
-                                                                "remediation worker spawn failed"
-                                                                    .into(),
-                                                        },
+                                                        pr_num,
+                                                        &rework_msg,
                                                     )
                                                     .await;
                                                 }
@@ -4165,18 +4355,11 @@ async fn tick(
                                             )
                                             .await;
                                             if !spawn_ok {
-                                                log(&format!(
-                                                    "remediation worker spawn failed for task \
-                                                     #{reviewer_task_id} — firing AgentFailed"
-                                                ));
-                                                fire_event(
-                                                    &db_path,
-                                                    "daemon",
+                                                park_remediation_provision_failure(
+                                                    config,
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "remediation worker spawn failed"
-                                                            .into(),
-                                                    },
+                                                    pr_num,
+                                                    &rework_msg,
                                                 )
                                                 .await;
                                             }
@@ -4555,17 +4738,11 @@ async fn tick(
                                                     )
                                                     .await;
                                                     if !spawn_ok {
-                                                        log(&format!(
-                                                            "remediation worker spawn failed for task \
-                                                             #{reviewer_task_id} — firing AgentFailed"
-                                                        ));
-                                                        fire_event(
-                                                            &db_path,
-                                                            "daemon",
+                                                        park_remediation_provision_failure(
+                                                            config,
                                                             reviewer_task_id,
-                                                            &Event::AgentFailed {
-                                                                reason: "remediation worker spawn failed".into(),
-                                                            },
+                                                            pr_num,
+                                                            &rework_msg,
                                                         )
                                                         .await;
                                                     }
@@ -4819,17 +4996,11 @@ async fn tick(
                                     )
                                     .await;
                                     if !spawn_ok {
-                                        log(&format!(
-                                            "remediation worker spawn failed for task \
-                                             #{reviewer_task_id} — firing AgentFailed"
-                                        ));
-                                        fire_event(
-                                            &db_path,
-                                            "daemon",
+                                        park_remediation_provision_failure(
+                                            config,
                                             reviewer_task_id,
-                                            &Event::AgentFailed {
-                                                reason: "remediation worker spawn failed".into(),
-                                            },
+                                            rework_pr,
+                                            feedback,
                                         )
                                         .await;
                                     }
@@ -6468,6 +6639,15 @@ async fn tick(
         drain_state.draining,
     )
     .await?;
+    reconcile_remediation_retries(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        lifetime_roster,
+        drain_state.draining,
+    )
+    .await?;
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
@@ -7257,9 +7437,23 @@ async fn codex_thread_id_from_refs(db_path: &std::path::Path, task_id: i64) -> O
 
 fn require_codex_remediation_thread(
     kind: runner::AgentKind,
+    review_only: bool,
+    has_original_worker: bool,
     thread_id: Option<String>,
 ) -> Result<Option<String>> {
-    if kind == runner::AgentKind::Codex && thread_id.is_none() {
+    // A managed Codex worker can only be resumed through its exact durable
+    // provider thread.  Review-only tasks are different: they deliberately
+    // have no managed worker run, so their first remediation is a fresh turn
+    // on the already verified PR worktree.  Once that turn emits and persists
+    // its thread ID, later remediation follows the normal exact continuation
+    // rule. Controlled shutdown treats the fresh turn as an ordinary worker:
+    // its capability is revoked and rework is retained; recovery resumes only
+    // after the thread ID is durable. A shutdown before that event therefore
+    // fails closed rather than creating a second fresh turn.
+    if kind == runner::AgentKind::Codex
+        && thread_id.is_none()
+        && (!review_only || has_original_worker)
+    {
         return Err(QuorumError::Io(
             "Codex remediation requires the original persisted thread_id".into(),
         ));
@@ -7519,44 +7713,6 @@ fn reviewer_name_exclusions(
     excluded
 }
 
-async fn record_reviewer_provision_failure(
-    config: &ServeConfig,
-    task_id: i64,
-    pr: i64,
-    role: &ReviewRole,
-    head_sha: &str,
-    reason: &str,
-) {
-    let role_str = role.as_str().to_string();
-    let sha = head_sha.to_string();
-    let p = config.db_path.clone();
-    let strikes = tokio::task::spawn_blocking(move || -> i64 {
-        quorum_core::db::open(&p)
-            .ok()
-            .and_then(|mut conn| {
-                quorum_core::provision_attempts::record_attempt(
-                    &mut conn, task_id, pr, &role_str, &sha,
-                )
-                .ok()
-            })
-            .unwrap_or(0)
-    })
-    .await
-    .unwrap_or(0);
-    log(&format!(
-        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} \
-         for task #{task_id} PR #{pr}: {reason}",
-        role.as_str().to_uppercase()
-    ));
-    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-        log(&format!(
-            "REVIEWER PROVISION EXHAUSTED: task #{task_id} will be parked on the next \
-             provisioning scan after {strikes} consecutive {} failures for PR #{pr}",
-            role.as_str().to_uppercase()
-        ));
-    }
-}
-
 /// Unified reviewer provisioning (#190). Replaces the separate
 /// `spawn_reviewer_for_worker` (R1) and `spawn_r2_reviewer` (R2) paths.
 /// Role, prompt, model policy, and audit recording are parameterized;
@@ -7647,20 +7803,16 @@ async fn provision_reviewer(
         None
     };
     if let Some(recovery) = &recovery {
-        if let Err(error) = require_configured_provider(
+        if let Err(error) = require_configured_reviewer_provider(
             config,
             recovery.kind,
             &format!("interrupted {} reviewer", role.as_str().to_uppercase()),
         ) {
-            record_reviewer_provision_failure(
-                config,
-                worker.task_id,
-                pr,
-                role,
-                head_sha,
-                &error.to_string(),
-            )
-            .await;
+            record_reviewer_provision_failure(config, worker.task_id, pr, role, head_sha).await;
+            log(&format!(
+                "{}: refusing interrupted reviewer recovery: {error}",
+                role.as_str().to_uppercase()
+            ));
             return Ok(());
         }
     }
@@ -7870,8 +8022,13 @@ async fn provision_reviewer(
                 recovery.thread_id.clone(),
             )
         } else {
-            let reviewer_model = if config.provider_explicit {
-                config.review_model.clone()
+            let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
+                config.provider_explicit,
+                config.review_model_explicit,
+                &config.review_model,
+                &config.review_effort,
+            ) {
+                model.to_string()
             } else {
                 let p = config.db_path.clone();
                 let tid = worker.task_id;
@@ -7886,8 +8043,13 @@ async fn provision_reviewer(
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
             };
             let kind = resolve_provider(&reviewer_model)?;
-            let effort = if config.provider_explicit {
-                config.review_effort.clone()
+            let effort = if let Some((_, effort)) = configured_reviewer_selection(
+                config.provider_explicit,
+                config.review_model_explicit,
+                &config.review_model,
+                &config.review_effort,
+            ) {
+                effort.to_string()
             } else {
                 config.effort.clone()
             };
@@ -7947,6 +8109,7 @@ async fn provision_reviewer(
         ("QUORUM_AGENT".into(), reviewer_name.clone()),
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
+    let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let spawn_result = if let Some(thread_id) = reviewer_thread_id.as_deref() {
         codex_agent::CodexProc::spawn_resume(
             thread_id,
@@ -7956,7 +8119,7 @@ async fn provision_reviewer(
             &wt_path,
             &prompt,
             &reviewer_env,
-            config.agent_bin.as_deref(),
+            reviewer_agent_bin,
         )
         .map(runner::RunnerProc::Codex)
     } else {
@@ -7966,7 +8129,7 @@ async fn provision_reviewer(
             &reviewer_effort,
             &session_id,
             &wt_path,
-            config.agent_bin.as_deref(),
+            reviewer_agent_bin,
             config.bare_agent,
             reviewer_env,
             config.allowed_tools.as_deref(),
@@ -9202,6 +9365,57 @@ async fn notify_provision_failure(
     }
 }
 
+/// A remediation worker is the only actor that can resolve an accepted
+/// changes verdict.  If it cannot be provisioned, returning a review-only
+/// task to `in-review` merely invites another reviewer to spend another
+/// rework round on the same unchanged PR.  Park the task instead; explicit
+/// retry remains the owner-controlled recovery path.
+async fn park_remediation_provision_failure(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) {
+    // `task-retry` restores a parked rework task without the original reviewer
+    // process or mailbox row. Preserve the accepted blocking feedback so the
+    // replacement remediation turn remains tied to the unresolved finding.
+    let p = config.db_path.clone();
+    let feedback = feedback.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let Some(task) = tasks::get(&conn, task_id)? else {
+            return Ok(());
+        };
+        let mut refs: serde_json::Value = task
+            .refs
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let Some(object) = refs.as_object_mut() else {
+            return Err(QuorumError::Io(
+                "remediation task refs must be a JSON object".into(),
+            ));
+        };
+        object.insert(
+            "remediation_feedback".into(),
+            serde_json::Value::String(feedback),
+        );
+        tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
+    })
+    .await;
+    let reason = format!("remediation worker provisioning failed for PR #{pr}");
+    park_task(&config.db_path, task_id, &reason, "rework").await;
+    notify_provision_failure(
+        &config.db_path,
+        task_id,
+        "remediation worker provisioning failed",
+        &format!("#{pr}"),
+    )
+    .await;
+}
+
 /// Check if a task's refs.repo mismatches all repos this daemon can provision from.
 /// Returns `Some(task_repo)` on mismatch, `None` if matching or unknown.
 fn check_repo_mismatch(
@@ -9754,7 +9968,7 @@ async fn spawn_remediation_worker(
     // Recover the original worker's provider and model from agent_runs so
     // remediation cannot silently switch providers (e.g. a legacy Codex task reworked
     // as Claude because the daemon default is Claude).
-    let (remediation_model, remediation_effort, remediation_kind) = {
+    let (remediation_model, remediation_effort, remediation_kind, has_original_worker) = {
         let p = db_path.clone();
         let tid = task_id;
         let cfg_model = config.model.clone();
@@ -9764,14 +9978,16 @@ async fn spawn_remediation_worker(
             let conn = quorum_core::db::open(&p)?;
             let provider = quorum_core::agent_runs::worker_provider(&conn, tid)?;
             let model = quorum_core::agent_runs::worker_model(&conn, tid)?;
-            let effort = quorum_core::agent_runs::runs_for_task(&conn, tid)?
+            let worker_runs = quorum_core::agent_runs::runs_for_task(&conn, tid)?;
+            let has_original_worker = worker_runs.iter().any(|run| run.role == "worker");
+            let effort = worker_runs
                 .into_iter()
                 .find(|run| run.role == "worker")
                 .map(|run| run.effort)
                 .unwrap_or(cfg_effort);
             let (model, kind) =
                 resolve_remediation_provider(provider.as_deref(), model, &cfg_model, cfg_kind)?;
-            Ok((model, effort, kind))
+            Ok((model, effort, kind, has_original_worker))
         })
         .await;
         match resolved {
@@ -9808,6 +10024,7 @@ async fn spawn_remediation_worker(
                     tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
                 })
                 .await;
+                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -9824,6 +10041,7 @@ async fn spawn_remediation_worker(
                     tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
                 })
                 .await;
+                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -9855,6 +10073,14 @@ async fn spawn_remediation_worker(
         )
         .await
         .ok();
+        let p = db_path.clone();
+        let name = agent_name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+        })
+        .await;
+        cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
         name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -9867,41 +10093,45 @@ async fn spawn_remediation_worker(
     } else {
         None
     };
-    let codex_thread_id =
-        match require_codex_remediation_thread(remediation_kind, recovered_thread_id) {
-            Ok(thread_id) => thread_id,
-            Err(error) => {
-                log(&format!(
+    let codex_thread_id = match require_codex_remediation_thread(
+        remediation_kind,
+        task_review_only,
+        has_original_worker,
+        recovered_thread_id,
+    ) {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            log(&format!(
                 "remediation: task #{task_id} has no persisted Codex thread_id — parking: {error}"
             ));
-                persist_codex_provider_block(
-                    db_path,
-                    task_id,
-                    "Codex remediation requires the original persisted thread_id",
-                    &CodexRetryTurn {
-                        model: remediation_model.clone(),
-                        effort: remediation_effort.clone(),
-                        prompt: prompt.clone(),
-                        turn_kind: "rework".into(),
-                        thread_id: None,
-                    },
-                )
-                .await
-                .ok();
-                let p = db_path.clone();
-                let name = agent_name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
-                })
-                .await;
-                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return false;
-            }
-        };
+            persist_codex_provider_block(
+                db_path,
+                task_id,
+                "Codex remediation requires the original persisted thread_id",
+                &CodexRetryTurn {
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
+                    prompt: prompt.clone(),
+                    turn_kind: "rework".into(),
+                    thread_id: None,
+                },
+            )
+            .await
+            .ok();
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+            })
+            .await;
+            cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
+            name_pool.release(&agent_name);
+            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            return false;
+        }
+    };
 
     let spawn_result: std::io::Result<runner::RunnerProc> = match remediation_kind {
         runner::AgentKind::Claude => agent::AgentProc::spawn(
@@ -9922,8 +10152,8 @@ async fn spawn_remediation_worker(
             config.agent_bin.as_deref(),
         )
         .map(runner::RunnerProc::Claude),
-        runner::AgentKind::Codex => if let Some(ref tid) = codex_thread_id {
-            codex_agent::CodexProc::spawn_resume(
+        runner::AgentKind::Codex => match codex_thread_id.as_deref() {
+            Some(tid) => codex_agent::CodexProc::spawn_resume(
                 tid,
                 &remediation_model,
                 &remediation_effort,
@@ -9932,9 +10162,18 @@ async fn spawn_remediation_worker(
                 &prompt,
                 &remediation_env,
                 config.agent_bin.as_deref(),
-            )
-        } else {
-            unreachable!("missing Codex remediation thread is parked before spawn")
+            ),
+            None => codex_agent::CodexProc::spawn(
+                &codex_agent::CodexSpec {
+                    model: remediation_model.clone(),
+                    effort: remediation_effort.clone(),
+                    sandbox: config.codex_sandbox.clone(),
+                    worktree: wt_path.clone(),
+                    prompt: prompt.clone(),
+                    env_vars: remediation_env.clone(),
+                },
+                config.agent_bin.as_deref(),
+            ),
         }
         .map(runner::RunnerProc::Codex),
     };
@@ -9957,6 +10196,7 @@ async fn spawn_remediation_worker(
                         })
                         .await;
                     }
+                    cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -10041,6 +10281,7 @@ async fn spawn_remediation_worker(
                 })
                 .await;
             }
+            cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
@@ -11047,6 +11288,14 @@ mod tests {
             worker_done_event(0, 419),
             Event::SignaledDone { .. }
         ));
+    }
+
+    #[test]
+    fn remediation_retry_slots_never_exceed_worker_cap() {
+        assert_eq!(available_worker_slots(3, 0), 3);
+        assert_eq!(available_worker_slots(3, 2), 1);
+        assert_eq!(available_worker_slots(3, 3), 0);
+        assert_eq!(available_worker_slots(3, 4), 0);
     }
 
     #[tokio::test]
@@ -12370,6 +12619,138 @@ mod tests {
     }
 
     #[test]
+    fn cross_provider_reviewer_recovery_keeps_persisted_claude_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-restart.db");
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "cross-provider review",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "r1-claude",
+                "reviewer",
+                "claude-opus-4-8",
+                "high",
+                "claude",
+                11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    r#"{"codex_reviewer_r1_thread_id":"stale-codex-thread"}"#,
+                    task_id
+                ],
+            )
+            .unwrap();
+        }
+
+        let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+            .unwrap()
+            .expect("interrupted Claude reviewer");
+        assert_eq!(recovery.kind, runner::AgentKind::Claude);
+        assert_eq!(recovery.model, "claude-opus-4-8");
+        assert_eq!(
+            recovery.thread_id, None,
+            "a Claude recovery must ignore a stale Codex continuation ref"
+        );
+        assert!(
+            require_reviewer_provider(
+                true,
+                "claude-opus-4-8",
+                recovery.kind,
+                "interrupted R1 reviewer",
+            )
+            .is_ok(),
+            "cross-provider reviewer recovery must follow review_model"
+        );
+        assert!(
+            require_reviewer_provider(
+                true,
+                "gpt-5.6-terra",
+                recovery.kind,
+                "interrupted R1 reviewer",
+            )
+            .is_err(),
+            "a stale Claude recovery must not bypass a configured Codex reviewer"
+        );
+    }
+
+    #[test]
+    fn cross_provider_reviewer_uses_its_own_default_binary() {
+        use crate::serve_config::RunnerKind;
+
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Codex,
+                Some("/opt/codex"),
+                runner::AgentKind::Codex
+            ),
+            Some("/opt/codex")
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Codex,
+                Some("/opt/codex"),
+                runner::AgentKind::Claude
+            ),
+            None,
+            "a Claude reviewer must not receive the configured Codex executable"
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                true,
+                RunnerKind::Claude,
+                Some("/opt/claude"),
+                runner::AgentKind::Codex
+            ),
+            None,
+            "a Codex reviewer must not receive the configured Claude executable"
+        );
+        assert_eq!(
+            agent_bin_for_runner(
+                false,
+                RunnerKind::Claude,
+                Some("/opt/test-agent"),
+                runner::AgentKind::Codex
+            ),
+            Some("/opt/test-agent"),
+            "legacy mixed-provider recovery preserves its configured runner override"
+        );
+    }
+
+    #[test]
+    fn explicit_review_model_without_provider_selects_its_model_and_effort() {
+        assert_eq!(
+            configured_reviewer_selection(false, true, "gpt-5.6-terra", "high",),
+            Some(("gpt-5.6-terra", "high")),
+            "an explicit review_model must not be ignored when provider is absent"
+        );
+        assert_eq!(
+            configured_reviewer_selection(false, false, "gpt-5.6-terra", "high"),
+            None,
+            "legacy configuration continues to use escalation"
+        );
+    }
+
+    #[test]
     fn recovery_rejects_unknown_or_mismatched_provider_metadata() {
         assert!(resolve_remediation_provider(
             Some("claude"),
@@ -12425,20 +12806,35 @@ mod tests {
     }
 
     #[test]
-    fn codex_remediation_requires_durable_thread_but_claude_does_not() {
+    fn codex_remediation_only_starts_fresh_for_workerless_review_only_tasks() {
         assert!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, None).is_err(),
-            "Codex remediation must never silently start a fresh thread"
+            require_codex_remediation_thread(runner::AgentKind::Codex, false, true, None).is_err(),
+            "implementation remediation must never silently start a fresh thread"
+        );
+        assert!(
+            require_codex_remediation_thread(runner::AgentKind::Codex, true, true, None).is_err(),
+            "a review-only task with a prior managed worker must keep exact continuation semantics"
         );
         assert_eq!(
-            require_codex_remediation_thread(runner::AgentKind::Claude, None).unwrap(),
+            require_codex_remediation_thread(runner::AgentKind::Codex, true, false, None).unwrap(),
+            None,
+            "a workerless review-only task may start its first Codex remediation turn fresh"
+        );
+        assert_eq!(
+            require_codex_remediation_thread(runner::AgentKind::Claude, false, false, None)
+                .unwrap(),
             None,
             "legacy Claude remediation does not require Codex thread metadata"
         );
         assert_eq!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, Some("thread-exact".into()))
-                .unwrap()
-                .as_deref(),
+            require_codex_remediation_thread(
+                runner::AgentKind::Codex,
+                true,
+                true,
+                Some("thread-exact".into()),
+            )
+            .unwrap()
+            .as_deref(),
             Some("thread-exact")
         );
     }

@@ -1,11 +1,11 @@
 #!/bin/sh
-# preflight.sh — hard mechanical gate before `task-update --status done`.
+# preflight.sh — hard mechanical author gate before `quorum submit`.
 #
 # Models follow mechanical gates far more reliably than judgment prose: PRs #112
 # and #114 shipped CI-red (fmt/clippy) and cost ~5 reviewer sessions in one week.
-# Run this, paste its FULL output in the PR body under `## Verification`, and only
-# then mark the quorum task done. On agent machines run it as
-# `rtk proxy ./preflight.sh` so RTK doesn't compress the evidence (see CLAUDE.md).
+# Run this before submitting the quorum task. The daemon owns CI gating; reviewers
+# do not enforce PR-body evidence formatting. On agent machines use
+# `rtk proxy ./preflight.sh` when complete local output is needed.
 #
 # Gates (in order, fail-fast):
 #   1. branch base   — HEAD is branched from origin/main, not another feature branch
@@ -73,7 +73,7 @@ cargo fmt --all -- --check || fail "cargo fmt"
 printf 'fmt OK\n'
 
 if [ "$QUICK" -eq 1 ]; then
-  printf '\nPREFLIGHT: PASS (quick — gates 1-2; run without --quick before task-update --status done)\n'
+  printf '\nPREFLIGHT: PASS (quick — gates 1-2; run without --quick before quorum submit)\n'
   exit 0
 fi
 
