@@ -4,7 +4,7 @@ const vm = require('node:vm');
 
 const context = {globalThis: {}};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {stripShellWrapper, commandSummary, normalizeEvent} = context.globalThis.QuorumWeb;
+const {stripShellWrapper, commandSummary, normalizeEvent, parseEventLine} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -17,4 +17,8 @@ assert.equal(codexCommand.title, 'pwd');
 assert.equal(codexCommand.exit_code, 0);
 assert.equal(normalizeEvent({type: 'item.completed', item: {type: 'agent_message', text: 'hello'}}).kind, 'message');
 assert.equal(normalizeEvent({type: 'assistant', message: {content: [{type: 'tool_use', name: 'Bash', input: {command: 'pwd'}}]}}).kind, 'command');
+const claudeString = normalizeEvent({type: 'assistant', message: {content: 'Claude prose'}});
+assert.equal(claudeString.kind, 'message');
+assert.equal(claudeString.body, 'Claude prose');
 assert.equal(normalizeEvent({type: 'future.event', payload: {}}).kind, 'unknown');
+assert.equal(parseEventLine('{"type":"item.completed"').kind, 'unknown');
