@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(first["lines"], json!([]));
         assert_eq!(
             first["partial"].as_str().unwrap().len(),
-            DEFAULT_STREAM_BYTES as usize
+            DEFAULT_STREAM_BYTES as usize * 2
         );
 
         let second = stream_payload(
