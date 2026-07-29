@@ -485,6 +485,33 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     })
 }
 
+/// Small, bounded pieces of the status snapshot used by the polling web dashboard.
+/// Keep this separate from [`stats`]: the terminal status command intentionally includes
+/// complete persistent collections, which are unsuitable for a request made every 2s.
+pub fn web_task_counts(conn: &Connection) -> Result<Vec<StatusCount>> {
+    let mut stmt = conn
+        .prepare("SELECT status, count(*) FROM tasks GROUP BY status ORDER BY status LIMIT 32")?;
+    let counts = stmt
+        .query_map([], |r| {
+            Ok(StatusCount {
+                status: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(counts)
+}
+
+/// The dashboard alert pane has the same bounded semantics as `status`.
+pub fn web_alerts(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
+    alert_messages(conn, now)
+}
+
+/// The dashboard error pane has the same bounded semantics as `status`.
+pub fn web_recent_errors(conn: &Connection, now: i64) -> Result<Vec<DedupedError>> {
+    Ok(deduped_errors(conn, now)?.0)
+}
+
 /// Per-online-agent view. Tier read from the stored `agents.tier` column (persisted on
 /// each `sync --match-label tier:*`); falls back to `unknown` when NULL.
 /// Sorted by tier ascending, then id ascending — deterministic so the watch loop's output

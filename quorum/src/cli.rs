@@ -265,6 +265,18 @@ pub enum Command {
         #[arg(long)]
         agents: bool,
     },
+    /// Serve the read-only local dashboard (binds to 127.0.0.1 by default).
+    Web {
+        /// TCP port for the dashboard.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Loopback address (127.0.0.1 or ::1 only; remote serving is unsupported).
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        /// Session-log root. Defaults to ~/.quorum/logs; set this to the daemon's --log-dir.
+        #[arg(long)]
+        log_dir: Option<PathBuf>,
+    },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
     /// EXPERIMENTAL (issue #101) — register a Claude session UUID → agent name
