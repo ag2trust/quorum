@@ -49,11 +49,10 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cache_read_input_tokens)
-            .saturating_add(self.cache_creation_input_tokens)
-            .saturating_add(self.output_tokens)
+    /// Legacy live display/cap measurement. Cache activity remains available
+    /// in the stream breakdown but does not change the established gauge.
+    pub fn live_total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 }
 

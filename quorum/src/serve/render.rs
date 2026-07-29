@@ -246,8 +246,9 @@ mod tests {
             result: json!({}),
             usage: Some(super::super::stream::Usage {
                 input_tokens: 200,
+                cache_read_input_tokens: 900,
+                cache_creation_input_tokens: 50,
                 output_tokens: 100,
-                ..Default::default()
             }),
             total_cost_usd: Some(0.05),
             num_turns: None,
@@ -256,6 +257,7 @@ mod tests {
         };
         let rendered = render_event(&event).unwrap();
         assert!(rendered.contains("300 tokens"));
+        assert!(!rendered.contains("1250 tokens"));
         assert!(rendered.contains("$0.0500"));
     }
 
