@@ -2361,7 +2361,7 @@ async fn reconcile_orphaned_merge_conflicts(
         let Some(transition) = transition else {
             continue;
         };
-        if transition.task.status != "rework" || draining {
+        if transition.task.status != "rework" {
             continue;
         }
         let feedback = format!(
@@ -2369,6 +2369,12 @@ async fn reconcile_orphaned_merge_conflicts(
              Rebase on {}, resolve conflicts, and push again.",
             config.base_branch, config.base_branch
         );
+        // A draining daemon may not spawn, but it must preserve the exact
+        // remediation turn before a restart recovers this rework task.
+        if draining {
+            remember_remediation_feedback(&config.db_path, task_id, &feedback).await;
+            continue;
+        }
         if available_worker_slots(config.cap, workers.len()) == 0 {
             log(&format!(
                 "orphan merge conflict task #{task_id}: worker cap reached; remediation remains queued"
