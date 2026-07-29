@@ -11,9 +11,11 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path as FsPath, PathBuf},
 };
 
@@ -23,7 +25,7 @@ const MAX_LIMIT: usize = 100;
 const DEFAULT_STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 const DASHBOARD_TASK_LIMIT: i64 = 100;
-const RUN_DIR_SCAN_LIMIT: usize = 1_000;
+const DASHBOARD_AGENT_LIMIT: i64 = 100;
 
 #[derive(Clone)]
 struct AppState {
@@ -39,9 +41,10 @@ pub fn serve(
     port: u16,
     online_window: i64,
 ) -> quorum_core::error::Result<()> {
-    let addr: SocketAddr = format!("{bind}:{port}").parse().map_err(|e| {
+    let ip: IpAddr = bind.parse().map_err(|e| {
         quorum_core::error::QuorumError::Usage(format!("invalid --bind/--port: {e}"))
     })?;
+    let addr = SocketAddr::new(ip, port);
     validate_loopback(addr)?;
     let state = AppState {
         db_path,
@@ -92,31 +95,15 @@ async fn api_state(State(state): State<AppState>) -> Response {
 fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
     let now = quorum_core::clock::now();
     let conn = quorum_core::db::open(&state.db_path)?;
-    let mut snapshot = quorum_core::stats::stats(&conn, now, state.online_window)?;
-    snapshot.daemon = quorum_core::daemon_lock::liveness(&conn, now, 30, super::pid_is_alive)?;
     let tasks = quorum_core::tasks::list_limited(&conn, DASHBOARD_TASK_LIMIT)?;
-    let roster = quorum_core::agents::roster(&conn, now, state.online_window)?;
+    let roster = quorum_core::agents::roster_limited(
+        &conn,
+        now,
+        state.online_window,
+        DASHBOARD_AGENT_LIMIT,
+    )?;
     let events = quorum_core::events::list(&conn, 0, None, 30, now)?;
-    let agents: Vec<Value> = roster
-        .into_iter()
-        .map(|agent| {
-            let held = snapshot
-                .agents
-                .iter()
-                .find(|a| a.id == agent.id)
-                .and_then(|a| a.current_task.as_ref())
-                .map(|task| json!({"id": task.id, "title": task.title}));
-            let run_dir = snapshot
-                .daemon_agents
-                .iter()
-                .find(|run| run.agent == agent.id)
-                .and_then(|run| run.log_dir.as_deref())
-                .and_then(|path| FsPath::new(path).file_name())
-                .and_then(|name| name.to_str());
-            json!({"name": agent.id, "last_seen": agent.last_seen, "online": agent.online,
-            "task_held": held, "run_dir": run_dir})
-        })
-        .collect();
+    let mut held_by_agent = std::collections::HashMap::new();
     let tasks: Vec<Value> = tasks.into_iter().map(|task| -> quorum_core::error::Result<Value> {
         // One bounded task page; ask SQLite for one latest row rather than loading each
         // task's complete historical run list.
@@ -124,64 +111,111 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
         let (provider, model) = run
             .map(|run| (run.provider, Some(run.model)))
             .unwrap_or((None, None));
+        if let Some(agent) = task.assignee.as_ref() {
+            held_by_agent.insert(agent.clone(), json!({"id": task.id, "title": task.title}));
+        }
         let pr = task.refs.as_deref().and_then(|refs| serde_json::from_str::<Value>(refs).ok())
             .and_then(|refs| refs.get("pr").and_then(Value::as_i64));
         Ok(json!({"id": task.id, "title": task.title, "state": task.status, "provider": provider,
             "model": model, "pr": pr, "age_secs": (now - task.created_at).max(0),
             "priority": task.priority, "labels": task.labels, "assignee": task.assignee, "ready": task.ready}))
     }).collect::<quorum_core::error::Result<_>>()?;
+    let agents: Vec<Value> = roster
+        .into_iter()
+        .map(|agent| {
+            json!({"name": agent.id, "last_seen": agent.last_seen, "online": agent.online,
+            "task_held": held_by_agent.get(&agent.id), "run_dir": Value::Null})
+        })
+        .collect();
+    let counts = quorum_core::stats::web_task_counts(&conn)?;
+    let alerts = quorum_core::stats::web_alerts(&conn, now)?;
+    let errors = quorum_core::stats::web_recent_errors(&conn, now)?;
     drop(conn);
     Ok(
-        json!({"now": now, "counts": snapshot.tasks, "tasks": tasks, "agents": agents,
-        "recent_events": events, "alerts": snapshot.alerts, "errors": snapshot.recent_errors,
-        "stats": snapshot}),
+        json!({"now": now, "counts": counts, "tasks": tasks, "agents": agents,
+        "recent_events": events, "alerts": alerts, "errors": errors}),
     )
 }
 
 #[derive(Deserialize)]
 struct RunsQuery {
-    before: Option<i64>,
+    before: Option<String>,
     limit: Option<usize>,
 }
 
 async fn api_runs(State(state): State<AppState>, Query(query): Query<RunsQuery>) -> Response {
     match list_runs(
         &state.logs_root,
-        query.before,
+        query.before.as_deref(),
         query.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT),
     ) {
-        Ok(runs) => Json(json!({"runs": runs})).into_response(),
+        Ok(page) => {
+            Json(json!({"runs": page.runs, "next_before": page.next_before})).into_response()
+        }
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
-fn list_runs(root: &FsPath, before: Option<i64>, limit: usize) -> std::io::Result<Vec<Value>> {
+struct RunPage {
+    runs: Vec<Value>,
+    next_before: Option<String>,
+}
+
+fn run_entry(name: String) -> Option<(i64, String)> {
+    let epoch = name.rsplit_once('-')?.1.parse::<i64>().ok()?;
+    Some((epoch, name))
+}
+
+fn list_runs(root: &FsPath, before: Option<&str>, limit: usize) -> std::io::Result<RunPage> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RunPage {
+                runs: Vec::new(),
+                next_before: None,
+            })
+        }
         Err(error) => return Err(error),
     };
-    let mut dirs: Vec<(String, i64)> = entries
-        .take(RUN_DIR_SCAN_LIMIT)
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            entry.file_type().ok()?.is_dir().then_some(())?;
-            let epoch = name.rsplit_once('-')?.1.parse::<i64>().ok()?;
-            (before.map(|b| epoch < b).unwrap_or(true)).then_some((name, epoch))
-        })
-        .collect();
-    dirs.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    dirs.into_iter()
+    let cursor = before.and_then(|value| run_entry(value.to_owned()));
+    // `read_dir` has no ordering guarantee. Scan names (never metadata) but retain only
+    // this page's newest candidates, so pagination is complete without unbounded memory.
+    let mut dirs: BinaryHeap<Reverse<(i64, String)>> = BinaryHeap::with_capacity(limit + 1);
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(entry) = run_entry(name) else {
+            continue;
+        };
+        if !cursor
+            .as_ref()
+            .map(|cursor| entry.cmp(cursor).is_lt())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        dirs.push(Reverse(entry));
+        if dirs.len() > limit {
+            dirs.pop();
+        }
+    }
+    let mut selected: Vec<_> = dirs.into_iter().map(|Reverse(entry)| entry).collect();
+    selected.sort_unstable_by(|a, b| b.cmp(a));
+    let next_before = selected.last().map(|(_, dir)| dir.clone());
+    let runs = selected
+        .into_iter()
         .take(limit)
-        .map(|(dir, epoch)| {
+        .map(|(epoch, dir)| {
             let meta = fs::read_to_string(root.join(&dir).join("meta.json"))
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                 .unwrap_or(Value::Null);
             Ok(json!({"dir": dir, "epoch": epoch, "meta": meta}))
         })
-        .collect()
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(RunPage { runs, next_before })
 }
 
 #[derive(Deserialize)]
@@ -277,10 +311,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_ipv6_loopback_bind() {
+        let ip: IpAddr = "::1".parse().unwrap();
+        assert!(validate_loopback(SocketAddr::new(ip, 8080)).is_ok());
+    }
+
+    #[test]
     fn page_never_interpolates_stored_values_as_html_or_inline_handlers() {
         assert!(!PAGE.contains("innerHTML"));
         assert!(!PAGE.contains(" onclick="));
         assert!(PAGE.contains("textContent"));
+        assert!(PAGE.contains("MAX_RENDERED_TAIL_CHARS"));
+        assert!(PAGE.contains("slice(-MAX_RENDERED_TAIL_CHARS)"));
     }
 
     #[test]
@@ -324,6 +366,30 @@ mod tests {
     #[test]
     fn run_listing_is_empty_when_the_configured_root_is_absent() {
         let root = tempfile::tempdir().unwrap().path().join("absent");
-        assert!(list_runs(&root, None, 50).unwrap().is_empty());
+        assert!(list_runs(&root, None, 50).unwrap().runs.is_empty());
+    }
+
+    #[test]
+    fn run_pages_are_chronological_and_cursor_complete() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["zeta-100", "alpha-300", "beta-200", "gamma-200"] {
+            fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        let first = list_runs(root.path(), None, 2).unwrap();
+        assert_eq!(first.runs[0]["dir"], "alpha-300");
+        assert_eq!(first.runs[1]["dir"], "gamma-200");
+        let second = list_runs(root.path(), first.next_before.as_deref(), 2).unwrap();
+        assert_eq!(second.runs[0]["dir"], "beta-200");
+        assert_eq!(second.runs[1]["dir"], "zeta-100");
+    }
+
+    #[test]
+    fn run_page_considers_entries_beyond_the_old_scan_cap() {
+        let root = tempfile::tempdir().unwrap();
+        for epoch in 0..1_002 {
+            fs::create_dir(root.path().join(format!("run-{epoch}"))).unwrap();
+        }
+        let page = list_runs(root.path(), None, 1).unwrap();
+        assert_eq!(page.runs[0]["dir"], "run-1001");
     }
 }
