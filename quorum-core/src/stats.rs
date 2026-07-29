@@ -21,6 +21,9 @@ pub const MSG_PREVIEW_CHARS: usize = 80;
 pub const DONE_STUCK_THRESHOLD_SECS: i64 = 30 * 60;
 /// Alerts older than this stay in the feed but no longer affect the status snapshot.
 pub const ALERT_WINDOW_SECS: i64 = 12 * 60 * 60;
+/// Durable post-submit tasks to surface in REVIEWING. Bounded so `status --watch`
+/// remains cheap if review-only tasks accumulate.
+pub const REVIEWING_TASK_LIMIT: i64 = 20;
 
 /// Sidecar file written by the daemon per agent slot — carries live progress
 /// stats that the status reader picks up without a DB schema change.
@@ -226,6 +229,18 @@ pub struct QueueTask {
     pub pr: Option<i64>,
 }
 
+/// A task in the post-submit review or merge band, shown in REVIEWING.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ReviewingTask {
+    pub id: i64,
+    pub title: String,
+    pub pr: Option<i64>,
+    /// The in-flight reviewer agent, if the daemon currently has one for this task.
+    pub reviewer: Option<String>,
+    /// `reviewing`, `awaiting reviewer`, or `merging`.
+    pub state: String,
+}
+
 /// Task pipeline row: `done` (awaiting review) + tasks closed/merged in the last hour (#204).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct PipelineTask {
@@ -341,6 +356,8 @@ pub struct Stats {
     pub daemon_agents: Vec<DaemonAgentView>,
     /// #204: individual claimable tasks for QUEUE section.
     pub queue_tasks: Vec<QueueTask>,
+    /// Tasks in the durable post-submit review/merge band.
+    pub reviewing: Vec<ReviewingTask>,
     /// #204: task pipeline view (all active + recently closed).
     pub pipeline: Vec<PipelineTask>,
     /// #204: deduped errors from last hour.
@@ -431,6 +448,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let activity = crate::activity::activity_summary(conn, now)?;
     let daemon_agents = daemon_agents_view(conn, now)?;
     let queue_tasks_list = queue_tasks(conn)?;
+    let reviewing = reviewing_tasks(conn, &daemon_agents)?;
     let pipeline = pipeline_tasks(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
@@ -471,6 +489,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         activity,
         daemon_agents,
         queue_tasks: queue_tasks_list,
+        reviewing,
         pipeline,
         recent_errors,
         older_errors_silenced,
@@ -1168,6 +1187,69 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
     let s = refs_json?;
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     v.get("pr")?.as_i64()
+}
+
+/// Tasks that have been submitted and still require review or merging.
+///
+/// This is derived from durable task state so CI waits and reviewer-spawn failures
+/// remain visible when no reviewer process is live.
+fn reviewing_tasks(
+    conn: &Connection,
+    daemon_agents: &[DaemonAgentView],
+) -> Result<Vec<ReviewingTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, status, refs FROM (
+             SELECT id, title, status, refs, updated_at FROM (
+                 SELECT id, title, status, refs, updated_at FROM tasks
+                 WHERE status='in-review'
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?1
+             )
+             UNION ALL
+             SELECT id, title, status, refs, updated_at FROM (
+                 SELECT id, title, status, refs, updated_at FROM tasks
+                 WHERE status='merging'
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?1
+             )
+         )
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![REVIEWING_TASK_LIMIT], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, title, status, refs)| {
+            let reviewer = daemon_agents
+                .iter()
+                .find(|agent| agent.role == "reviewer" && agent.task_id == Some(id))
+                .map(|agent| agent.agent.clone());
+            let state = if status == "merging" {
+                "merging".to_string()
+            } else if reviewer.is_some() {
+                "reviewing".to_string()
+            } else {
+                "awaiting reviewer".to_string()
+            };
+            ReviewingTask {
+                id,
+                title,
+                pr: extract_pr_from_refs(refs.as_deref()),
+                reviewer,
+                state,
+            }
+        })
+        .collect())
 }
 
 /// Task pipeline view: tasks in active lifecycle stages + recently done/closed (#204).
@@ -2754,6 +2836,194 @@ mod tests {
         let tasks = pipeline_tasks(&c, now).unwrap();
         assert_eq!(tasks.len(), 1, "only recently-done task should appear");
         assert_eq!(tasks[0].id, t_recent);
+    }
+
+    #[test]
+    fn reviewing_tasks_cover_post_submit_band_and_json() {
+        let (_d, mut c) = open_tmp();
+        let awaiting = crate::tasks::create(
+            &mut c,
+            "A",
+            "await reviewer",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let live = crate::tasks::create(
+            &mut c,
+            "A",
+            "live reviewer",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let merging = crate::tasks::create(
+            &mut c,
+            "A",
+            "merge pending",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='in-review', refs='{\"pr\":101}' WHERE id=?1",
+            params![awaiting],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='in-review', refs='{\"pr\":102}' WHERE id=?1",
+            params![live],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='merging', refs='{\"pr\":103}' WHERE id=?1",
+            params![merging],
+        )
+        .unwrap();
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(102),
+                rework_count: 0,
+            },
+        )
+        .unwrap();
+
+        let snapshot = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(snapshot.reviewing.len(), 3);
+        assert_eq!(
+            snapshot
+                .reviewing
+                .iter()
+                .find(|task| task.id == awaiting)
+                .unwrap()
+                .state,
+            "awaiting reviewer"
+        );
+        let live_row = snapshot
+            .reviewing
+            .iter()
+            .find(|task| task.id == live)
+            .unwrap();
+        assert_eq!(live_row.reviewer.as_deref(), Some("R1"));
+        assert_eq!(live_row.state, "reviewing");
+        assert_eq!(
+            snapshot
+                .reviewing
+                .iter()
+                .find(|task| task.id == merging)
+                .unwrap()
+                .state,
+            "merging"
+        );
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let rows = json["reviewing"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "status --json serializes the reviewing rows");
+        assert!(rows.iter().any(|row| {
+            row["id"] == awaiting
+                && row["state"] == "awaiting reviewer"
+                && row["reviewer"].is_null()
+        }));
+    }
+
+    #[test]
+    fn reviewing_tasks_limit_newest_rows_when_review_only_tasks_accumulate() {
+        let (_d, mut c) = open_tmp();
+        let mut ids = Vec::new();
+        for i in 0..=REVIEWING_TASK_LIMIT {
+            let id = crate::tasks::create(
+                &mut c,
+                "A",
+                &format!("review-only backlog {i}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100 + i,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', updated_at=?1 WHERE id=?2",
+                params![100 + i, id],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+
+        let snapshot = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(snapshot.reviewing.len() as i64, REVIEWING_TASK_LIMIT);
+        assert_eq!(snapshot.reviewing[0].id, *ids.last().unwrap());
+        assert!(
+            snapshot.reviewing.iter().all(|task| task.id != ids[0]),
+            "the oldest overflow row must not be materialized"
+        );
+    }
+
+    #[test]
+    fn reviewing_tasks_query_uses_indexed_bounded_candidates() {
+        let (_d, c) = open_tmp();
+        let plan = c
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, title, status, refs FROM (
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='in-review'
+                         ORDER BY updated_at DESC, id DESC LIMIT ?1
+                     )
+                     UNION ALL
+                     SELECT id, title, status, refs, updated_at FROM (
+                         SELECT id, title, status, refs, updated_at FROM tasks
+                         WHERE status='merging'
+                         ORDER BY updated_at DESC, id DESC LIMIT ?1
+                     )
+                 )
+                 ORDER BY updated_at DESC, id DESC LIMIT ?1",
+            )
+            .unwrap()
+            .query_map(params![REVIEWING_TASK_LIMIT], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("tasks_reviewing_newest"),
+            "REVIEWING must use its bounded newest-first index: {plan}"
+        );
+        assert!(
+            plan.matches("tasks_reviewing_newest").count() == 2,
+            "REVIEWING must use the index for each bounded status candidate set: {plan}"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
     AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DedupedError, HealthVerdict,
-    MergeBlockerView, PipelineTask, QueueTask, Stats,
+    MergeBlockerView, PipelineTask, QueueTask, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -135,7 +135,8 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_working(s, sty, w, width);
     render_queue(&s.queue_tasks, sty, w, width);
     render_blocked(&s.blocked, sty, w, width);
-    render_pipeline(&s.pipeline, &s.daemon_agents, sty, w, width);
+    render_reviewing(&s.reviewing, sty, w, width);
+    render_pipeline(&s.pipeline, sty, w, width);
     render_merge_wait(&s.merge_blockers, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
@@ -222,19 +223,13 @@ fn render_header(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
     };
     let _ = writeln!(w, " {daemon_line}");
 
-    let worker_task_ids: std::collections::HashSet<i64> = s
+    let working_count = s
         .daemon_agents
         .iter()
         .filter(|d| d.role == "worker")
         .filter_map(|d| d.task_id)
-        .collect();
-    let orphan_reviewers = s
-        .daemon_agents
-        .iter()
-        .filter(|d| d.role == "reviewer")
-        .filter(|d| d.task_id.is_none_or(|tid| !worker_task_ids.contains(&tid)))
-        .count();
-    let working_count = worker_task_ids.len() + orphan_reviewers;
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let queued = s.queue_tasks.len();
     let blocked = s.blocked.len();
     let merged_hr = s.throughput.closed_last_hour;
@@ -261,21 +256,7 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
         .filter(|d| d.role == "worker")
         .collect();
 
-    let reviewers: Vec<&DaemonAgentView> = s
-        .daemon_agents
-        .iter()
-        .filter(|d| d.role == "reviewer")
-        .collect();
-
-    let worker_task_ids: std::collections::HashSet<i64> =
-        workers.iter().filter_map(|d| d.task_id).collect();
-
-    let orphan_reviewers: Vec<&&DaemonAgentView> = reviewers
-        .iter()
-        .filter(|d| d.task_id.is_none_or(|tid| !worker_task_ids.contains(&tid)))
-        .collect();
-
-    if workers.is_empty() && orphan_reviewers.is_empty() {
+    if workers.is_empty() {
         let _ = writeln!(w, "  {}", sty.dim("(idle — no agents working)"));
         return;
     }
@@ -288,18 +269,6 @@ fn render_working(s: &Stats, sty: &Style, w: &mut dyn Write, width: usize) {
 
     for d in &workers {
         render_agent_row(d, sty, w);
-
-        if let Some(tid) = d.task_id {
-            for rev in &reviewers {
-                if rev.task_id == Some(tid) {
-                    render_reviewer_subrow(rev, sty, w);
-                }
-            }
-        }
-    }
-
-    for rev in &orphan_reviewers {
-        render_agent_row(rev, sty, w);
     }
 }
 
@@ -378,48 +347,6 @@ fn format_live_error(d: &DaemonAgentView, sty: &Style) -> String {
 
 const MAX_ERROR_RETRIES: u32 = 3;
 
-fn render_reviewer_subrow(rev: &DaemonAgentView, sty: &Style, w: &mut dyn Write) {
-    let rev_up = rev.uptime_secs.map(fmt_age).unwrap_or_else(|| {
-        rev.last_activity_age_secs
-            .map(fmt_age)
-            .unwrap_or_else(|| "—".to_string())
-    });
-    let rev_tok = fmt_tokens(rev.cost_tokens);
-    let role_label = if rev.sub_role.as_deref() == Some("r2") {
-        "r2 audit"
-    } else {
-        "reviewer"
-    };
-    let error_suffix = format_live_error(rev, sty);
-    let sub = if sty.color {
-        format!(
-            "    {} {}  {} · {} · {} · {} · {} · {} tok{}",
-            sty.dim("└"),
-            role_label,
-            rev.agent,
-            rev.provider.as_deref().unwrap_or("pending"),
-            rev.model.as_deref().unwrap_or("pending"),
-            rev.effort.as_deref().unwrap_or("pending"),
-            rev_up,
-            rev_tok,
-            error_suffix,
-        )
-    } else {
-        format!(
-            "    +- {}  {} · {} · {} · {} · {} · {} tok{}",
-            role_label,
-            rev.agent,
-            rev.provider.as_deref().unwrap_or("pending"),
-            rev.model.as_deref().unwrap_or("pending"),
-            rev.effort.as_deref().unwrap_or("pending"),
-            rev_up,
-            rev_tok,
-            error_suffix,
-        )
-    };
-    let _ = writeln!(w, "{sub}");
-}
-
 fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usize) {
     let _ = writeln!(w);
     let _ = writeln!(w, "{}", sty.section_rule("QUEUE", width));
@@ -447,6 +374,35 @@ fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usiz
             pr_str,
         );
         let _ = writeln!(w, "      {}", truncate(&q.title, width.saturating_sub(6)));
+    }
+}
+
+fn render_reviewing(reviewing: &[ReviewingTask], sty: &Style, w: &mut dyn Write, width: usize) {
+    if reviewing.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("REVIEWING", width));
+    let _ = writeln!(
+        w,
+        "  {:<6} {:<36} {:<7} {:<16} STATE",
+        "TASK", "TITLE", "PR", "REVIEWER"
+    );
+    for task in reviewing {
+        let pr = task
+            .pr
+            .map(|pr| format!("#{pr}"))
+            .unwrap_or_else(|| "—".to_string());
+        let reviewer = task.reviewer.as_deref().unwrap_or("—");
+        let _ = writeln!(
+            w,
+            "  #{:<5} {:<36} {:<7} {:<16} {}",
+            task.id,
+            truncate(&task.title, 36),
+            pr,
+            truncate(reviewer, 16),
+            task.state,
+        );
     }
 }
 
@@ -507,13 +463,7 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
     }
 }
 
-fn render_pipeline(
-    pipeline: &[PipelineTask],
-    daemon_agents: &[DaemonAgentView],
-    sty: &Style,
-    w: &mut dyn Write,
-    width: usize,
-) {
+fn render_pipeline(pipeline: &[PipelineTask], sty: &Style, w: &mut dyn Write, width: usize) {
     let _ = writeln!(w);
     let rule_suffix = if sty.color {
         sty.dim("  task → PR → state")
@@ -536,11 +486,7 @@ fn render_pipeline(
         "TASK", "PROVIDER", "MODEL", "EFF"
     );
     for p in pipeline {
-        let in_review = daemon_agents
-            .iter()
-            .any(|d| d.role == "reviewer" && d.task_id == Some(p.id));
-
-        let (icon, label) = pipeline_state(p, in_review, sty);
+        let (icon, label) = pipeline_state(p, sty);
         let pr_str =
             p.pr.map(|pr| format!("#{pr}"))
                 .unwrap_or_else(|| "—".to_string());
@@ -559,7 +505,7 @@ fn render_pipeline(
     }
 }
 
-fn pipeline_state(p: &PipelineTask, in_review: bool, sty: &Style) -> (String, String) {
+fn pipeline_state(p: &PipelineTask, sty: &Style) -> (String, String) {
     if p.status == "done" {
         let icon = if sty.color {
             sty.green("✅")
@@ -567,14 +513,6 @@ fn pipeline_state(p: &PipelineTask, in_review: bool, sty: &Style) -> (String, St
             "[merged]".to_string()
         };
         return (icon, "merged".to_string());
-    }
-    if in_review {
-        let icon = if sty.color {
-            "🔍".to_string()
-        } else {
-            "[review]".to_string()
-        };
-        return (icon, "in review".to_string());
     }
     let icon = if sty.color {
         "◐".to_string()
@@ -971,11 +909,11 @@ mod tests {
             pr: Some(42),
             blocked: false,
         };
-        let (icon, label) = pipeline_state(&done, false, &sty);
+        let (icon, label) = pipeline_state(&done, &sty);
         assert_eq!(icon, "[merged]");
         assert_eq!(label, "merged");
 
-        let in_review = PipelineTask {
+        let pending = PipelineTask {
             id: 4,
             title: "t".into(),
             provider: None,
@@ -985,38 +923,13 @@ mod tests {
             pr: Some(99),
             blocked: false,
         };
-        let (icon, _) = pipeline_state(&in_review, true, &sty);
-        assert_eq!(icon, "[review]");
+        let (icon, _) = pipeline_state(&pending, &sty);
+        assert_eq!(icon, "[working]");
     }
 
     #[test]
-    fn render_working_shows_reviewer_subrow() {
+    fn render_reviewing_shows_live_reviewer_outside_working() {
         let mut s = default_stats();
-        s.daemon_agents.push(DaemonAgentView {
-            agent: "W1".into(),
-            role: "worker".into(),
-            sub_role: None,
-            task_id: Some(10),
-            phase: "review".into(),
-            cost_tokens: 40000,
-            agent_state: None,
-            cost_usd: 0.71,
-            log_dir: None,
-            last_activity_age_secs: Some(3),
-            task_title: Some("parks reopenable".into()),
-            tier_eff: Some("opus46·md".into()),
-            provider: Some("claude".into()),
-            model: Some("claude-opus-4-6".into()),
-            effort: Some("medium".into()),
-            pr: Some(193),
-            rework_count: 0,
-            tool_count: 27,
-            now_label: Some("Bash: cargo test".into()),
-            events_per_min: Some(14.0),
-            uptime_secs: Some(240),
-            live_error_count: 0,
-            live_error_text: None,
-        });
         s.daemon_agents.push(DaemonAgentView {
             agent: "R1".into(),
             role: "reviewer".into(),
@@ -1042,31 +955,29 @@ mod tests {
             live_error_count: 0,
             live_error_text: None,
         });
+        s.reviewing.push(ReviewingTask {
+            id: 10,
+            title: "parks reopenable".into(),
+            pr: Some(193),
+            reviewer: Some("R1".into()),
+            state: "reviewing".into(),
+        });
         let sty = Style::plain();
         let mut buf = Vec::new();
         render_with_style(&s, &sty, &mut buf);
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("W1"), "worker should appear: {output}");
         assert!(
-            output.contains("reviewer"),
-            "reviewer subrow should appear: {output}"
+            output.contains("REVIEWING"),
+            "section should appear: {output}"
         );
         assert!(
             output.contains("R1"),
-            "reviewer name should appear: {output}"
+            "reviewer name should appear in REVIEWING: {output}"
         );
-
-        // Header "EFF" column must align with data "EFF" column
-        let header_line = output
-            .lines()
-            .find(|l| l.contains("EFF") && l.contains("TASK"))
-            .unwrap();
-        let data_line = output.lines().find(|l| l.contains("W1")).unwrap();
-        let header_eff_col = header_line.find("EFF").unwrap();
-        let data_eff_col = data_line.find("medium").unwrap();
         assert_eq!(
-            header_eff_col, data_eff_col,
-            "EFF header col ({header_eff_col}) must match data col ({data_eff_col})\nheader: {header_line}\n  data: {data_line}"
+            output.matches("R1").count(),
+            1,
+            "reviewer must not also appear in WORKING: {output}"
         );
     }
 
@@ -1113,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_reviewer_renders_as_working() {
+    fn reviewer_does_not_count_as_working() {
         let mut s = default_stats();
         s.daemon_agents.push(DaemonAgentView {
             agent: "R-solo".into(),
@@ -1145,126 +1056,55 @@ mod tests {
         render_with_style(&s, &sty, &mut buf);
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            !output.contains("no agents working"),
-            "orphan reviewer must not show idle: {output}"
+            output.contains("no agents working"),
+            "WORKING should be idle: {output}"
         );
         assert!(
-            output.contains("R-solo"),
-            "orphan reviewer agent name must appear: {output}"
-        );
-        assert!(
-            output.contains("#50"),
-            "orphan reviewer task id must appear: {output}"
-        );
-        assert!(
-            output.contains("1 working"),
-            "header must count orphan reviewer: {output}"
+            output.contains("0 working"),
+            "header must not count reviewer as working: {output}"
         );
     }
 
     #[test]
-    fn r2_reviewer_shows_marker() {
+    fn reviewing_section_is_suppressed_when_empty() {
         let mut s = default_stats();
-        // Active R2 pre-merge reviewer (sampled at R1 approval).
-        s.daemon_agents.push(DaemonAgentView {
-            agent: "Keel-8z3a".into(),
-            role: "reviewer".into(),
-            sub_role: Some("r2".into()),
-            task_id: Some(85),
-            phase: "reviewing".into(),
-            cost_tokens: 5000,
-            agent_state: None,
-            cost_usd: 0.06,
-            log_dir: None,
-            last_activity_age_secs: Some(10),
-            task_title: Some("merged task".into()),
-            tier_eff: Some("opus46·hi".into()),
+        s.queue_tasks.push(QueueTask {
+            id: 85,
+            title: "queued task".into(),
             provider: None,
             model: None,
             effort: None,
-            pr: Some(3667),
-            rework_count: 0,
-            tool_count: 3,
-            now_label: None,
-            events_per_min: Some(4.0),
-            uptime_secs: Some(60),
-            live_error_count: 0,
-            live_error_text: None,
+            tier_eff: "pending".into(),
+            priority: 0,
+            pr: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
         render_with_style(&s, &sty, &mut buf);
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("(r2)"),
-            "R2 reviewer must show (r2) marker: {output}"
-        );
-        assert!(
-            output.contains("Keel-8z3a"),
-            "R2 reviewer name must appear: {output}"
+            !output.contains("REVIEWING"),
+            "section should be hidden: {output}"
         );
     }
 
     #[test]
-    fn r2_reviewer_subrow_shows_r2_audit_label() {
+    fn reviewing_section_renders_merging_task() {
         let mut s = default_stats();
-        s.daemon_agents.push(DaemonAgentView {
-            agent: "W1".into(),
-            role: "worker".into(),
-            sub_role: None,
-            task_id: Some(10),
-            phase: "working".into(),
-            cost_tokens: 1000,
-            agent_state: None,
-            cost_usd: 0.01,
-            log_dir: None,
-            last_activity_age_secs: Some(5),
-            task_title: Some("task".into()),
-            tier_eff: None,
-            provider: None,
-            model: None,
-            effort: None,
-            pr: None,
-            rework_count: 0,
-            tool_count: 0,
-            now_label: None,
-            events_per_min: None,
-            uptime_secs: None,
-            live_error_count: 0,
-            live_error_text: None,
-        });
-        s.daemon_agents.push(DaemonAgentView {
-            agent: "R2-aud".into(),
-            role: "reviewer".into(),
-            sub_role: Some("r2".into()),
-            task_id: Some(10),
-            phase: "reviewing".into(),
-            cost_tokens: 2000,
-            agent_state: None,
-            cost_usd: 0.02,
-            log_dir: None,
-            last_activity_age_secs: Some(3),
-            task_title: None,
-            tier_eff: None,
-            provider: None,
-            model: None,
-            effort: None,
-            pr: None,
-            rework_count: 0,
-            tool_count: 1,
-            now_label: None,
-            events_per_min: None,
-            uptime_secs: Some(30),
-            live_error_count: 0,
-            live_error_text: None,
+        s.reviewing.push(ReviewingTask {
+            id: 10,
+            title: "merge approved PR".into(),
+            pr: Some(400),
+            reviewer: None,
+            state: "merging".into(),
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
         render_with_style(&s, &sty, &mut buf);
         let output = String::from_utf8(buf).unwrap();
         assert!(
-            output.contains("r2 audit"),
-            "R2 reviewer subrow must show 'r2 audit' label: {output}"
+            output.contains("merging"),
+            "merging state must render: {output}"
         );
     }
 
@@ -1626,33 +1466,8 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_subrow_error_visible() {
+    fn reviewer_is_rendered_in_reviewing_not_working() {
         let mut s = default_stats();
-        s.daemon_agents.push(DaemonAgentView {
-            agent: "W1".into(),
-            role: "worker".into(),
-            sub_role: None,
-            task_id: Some(10),
-            phase: "working".into(),
-            cost_tokens: 1000,
-            agent_state: None,
-            cost_usd: 0.01,
-            log_dir: None,
-            last_activity_age_secs: Some(5),
-            task_title: Some("task".into()),
-            tier_eff: None,
-            provider: None,
-            model: None,
-            effort: None,
-            pr: None,
-            rework_count: 0,
-            tool_count: 0,
-            now_label: None,
-            events_per_min: None,
-            uptime_secs: None,
-            live_error_count: 0,
-            live_error_text: None,
-        });
         s.daemon_agents.push(DaemonAgentView {
             agent: "R-err".into(),
             role: "reviewer".into(),
@@ -1678,18 +1493,25 @@ mod tests {
             live_error_count: 2,
             live_error_text: Some("rate limited".into()),
         });
+        s.reviewing.push(ReviewingTask {
+            id: 10,
+            title: "task".into(),
+            pr: None,
+            reviewer: Some("R-err".into()),
+            state: "reviewing".into(),
+        });
         let sty = Style::plain();
         let mut buf = Vec::new();
         render_with_style(&s, &sty, &mut buf);
         let output = String::from_utf8(buf).unwrap();
         let rev_line = output.lines().find(|l| l.contains("R-err")).unwrap();
         assert!(
-            rev_line.contains("ERR 2/3"),
-            "reviewer subrow error count must appear: {rev_line}"
+            rev_line.contains("reviewing"),
+            "reviewer must appear in REVIEWING: {rev_line}"
         );
         assert!(
-            rev_line.contains("rate limited"),
-            "reviewer subrow error text must appear: {rev_line}"
+            output.contains("no agents working"),
+            "reviewer must not keep WORKING active: {output}"
         );
     }
 
