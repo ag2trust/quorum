@@ -531,6 +531,12 @@ pub fn web_recent_errors(conn: &Connection, now: i64) -> Result<Vec<DedupedError
     Ok(deduped_errors(conn, now)?.0)
 }
 
+/// The dashboard's bounded live-agent view. Reuse the journal-backed projection
+/// from `quorum status` so both surfaces agree about current daemon work.
+pub fn web_daemon_agents(conn: &Connection, now: i64) -> Result<Vec<DaemonAgentView>> {
+    daemon_agents_view(conn, now)
+}
+
 /// Per-online-agent view. Tier read from the stored `agents.tier` column (persisted on
 /// each `sync --match-label tier:*`); falls back to `unknown` when NULL.
 /// Sorted by tier ascending, then id ascending — deterministic so the watch loop's output
