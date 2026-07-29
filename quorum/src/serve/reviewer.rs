@@ -32,6 +32,21 @@ pub struct ReviewerSpec {
     pub reviewer_name: String,
 }
 
+/// Reviewers must finish the planned audit for a SHA before their lifecycle
+/// verdict. This deliberately asks for coverage of related paths without
+/// demanding speculative findings or an audit of unrelated code.
+const COMPLETE_REVIEW_CONTRACT: &str = "\
+## Complete-review requirement\n\n\
+Complete the planned review before submitting a verdict. Finding one blocker never ends \
+review exploration: keep auditing the full current diff, surrounding code, and relevant \
+sibling and negative paths.\n\
+For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
+(for example, producers × success/error/shutdown) and audit every applicable cell together. \
+Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
+Before submitting, publish one complete PR review summary for this reviewed SHA, with inline \
+comments where needed, that reports the complete blocker and advisory set discovered. \
+`--blocking` must equal the complete BLOCKING count for that SHA.\n";
+
 pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
     format!(
         "You are reviewer agent {name}. Review PR #{pr} opened by worker {worker}.\n\n\
@@ -45,6 +60,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          valid outcome — do not manufacture findings to justify requesting changes. \
          Every BLOCKING finding must cite a concrete code path and explain a \
          reproducible or logically demonstrated failure.\n\n\
+         {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
@@ -97,6 +113,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         pr = spec.pr,
         worker = spec.worker_agent,
         effort = effort,
+        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
     )
 }
 
@@ -173,6 +190,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          valid outcome — do not manufacture findings to justify requesting changes. \
          Every BLOCKING finding must cite a concrete code path and explain a \
          reproducible or logically demonstrated failure.\n\n\
+         {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
@@ -225,6 +243,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         pr = spec.pr,
         worker = spec.worker_agent,
         effort = effort,
+        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
     )
 }
 
@@ -267,6 +286,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          Read the full PR diff and surrounding code (never the diff hunks alone), \
          check the repo CLAUDE.md/AGENTS.md invariants, and check the PR's \
          verification evidence. Review at effort level {effort}.\n\n\
+         {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
@@ -320,6 +340,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         r1 = spec.r1_reviewer,
         effort = effort,
+        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
     )
 }
 
@@ -359,6 +380,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          and surrounding code (never the diff hunks alone), check the repo CLAUDE.md \
          invariants, and check the PR's verification evidence — then apply the contract \
          below.\n\n\
+         {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
@@ -412,6 +434,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         r1 = spec.r1_reviewer,
         effort = effort,
+        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
     )
 }
 
@@ -498,6 +521,10 @@ pub fn build_rereview_turn(
          for the review methodology. If the builtin skill is unavailable, read the full \
          PR diff and surrounding code, check the repo CLAUDE.md invariants, and check \
          the PR's verification evidence.\n\n\
+         Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
+         full current diff and relevant sibling paths; do not narrowly inspect only the last \
+         remediation commit.\n\n\
+         {complete_review_contract}\n\
          The PR is the source of truth for this review:\n\
          - Read the prior review thread on the PR. For each earlier finding, resolve it on \
          the PR — mark it fixed, downgrade it, or reaffirm it — so a later reader can \
@@ -529,6 +556,7 @@ pub fn build_rereview_turn(
         worker = worker_agent,
         name = reviewer_name,
         pr = pr,
+        complete_review_contract = COMPLETE_REVIEW_CONTRACT,
     ))
 }
 
@@ -791,6 +819,79 @@ mod tests {
                     && prompt.contains("`PREFLIGHT: PASS`"),
                 "{name} must retain document-evidence review"
             );
+        }
+    }
+
+    #[test]
+    fn all_reviewer_prompt_builders_require_a_complete_review_per_sha() {
+        let r1_spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Reviewer-1".into(),
+            r2_name: "Reviewer-2".into(),
+        };
+        let prompts = [
+            ("Claude R1", build_review_prompt(&r1_spec, "high"), false),
+            (
+                "Codex R1",
+                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+                false,
+            ),
+            ("Claude R2", build_r2_review_prompt(&r2_spec, "high"), false),
+            (
+                "Codex R2",
+                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+                false,
+            ),
+            (
+                "re-review",
+                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+                true,
+            ),
+        ];
+
+        for (name, prompt, is_rereview) in prompts {
+            assert!(
+                prompt.contains("Complete the planned review before submitting a verdict"),
+                "{name} must require completion before verdict"
+            );
+            assert!(
+                prompt.contains("Finding one blocker never ends review exploration"),
+                "{name} must continue after the first blocker"
+            );
+            assert!(
+                prompt.contains("affected-path matrix/checklist"),
+                "{name} must require cross-cutting path coverage"
+            );
+            assert!(
+                prompt.contains("complete blocker and advisory set"),
+                "{name} must report the full finding set"
+            );
+            assert!(
+                prompt.contains("`--blocking` must equal the complete BLOCKING count"),
+                "{name} must attest the full blocker count"
+            );
+            assert!(
+                prompt.contains("unrelated code") && prompt.contains("speculative findings"),
+                "{name} must retain the bounded, evidence-based calibration"
+            );
+
+            if is_rereview {
+                assert!(
+                    prompt.contains("Verify prior fixes")
+                        && prompt.contains("full current diff and relevant sibling paths"),
+                    "{name} must verify prior fixes and re-audit the full current diff"
+                );
+                assert!(
+                    prompt.contains("do not narrowly inspect only the last remediation commit"),
+                    "{name} must not narrow re-review to the latest remediation"
+                );
+            }
         }
     }
 

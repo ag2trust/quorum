@@ -608,9 +608,17 @@ reviewer resolution of prior findings, and evidence. Quorum coordinates lifecycl
 provisioning, the final formal APPROVE, and merge — it does **not** proxy the review
 conversation. Concretely:
 
-- **Reviewer agents** post every blocking and advisory finding to the PR — inline
-  comments where a specific file/line applies, review summary comments for
-  cross-cutting findings — and respond to author pushback on the PR itself.
+- **Reviewer agents** complete their planned audit for the reviewed SHA before
+  submitting a verdict: discovering one blocker does not end exploration. They
+  post the complete discovered blocking and advisory set to one PR review
+  summary (with inline comments where a specific file/line applies), and the
+  `--blocking` count covers that complete blocker set. For cross-cutting work,
+  they derive a small affected-path matrix from the PR scope to check relevant
+  sibling and negative paths together; this does not require speculative
+  findings or exhaustive proof over unrelated code. Re-reviews verify prior
+  fixes and re-audit the full current diff and relevant sibling paths, rather
+  than only the most recent remediation commit. Reviewers respond to author
+  pushback on the PR itself.
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
