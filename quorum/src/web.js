@@ -2,6 +2,7 @@
   const MAX_RENDERED_TAIL_CHARS = 2 * 1024 * 1024;
   const MAX_RENDERED_TAIL_ROWS = 2000;
   const MAX_RENDERED_ROWS_PER_POLL = 2000;
+  const MAX_NORMALIZED_RECORDS_PER_POLL = 2000;
   const MAX_EXPANDED_OUTPUT_CHARS = 200 * 1024;
   const MAX_NORMALIZED_EVENTS_PER_RECORD = 100;
   const ellipsize = (text, max = 90) => text.length > max ? text.slice(0, max - 1) + '…' : text;
@@ -11,10 +12,25 @@
   // accumulate forever. Bounding at the DOM-append boundary covers every shape, present and future.
   const shouldTrim = (chars, rows) => chars > MAX_RENDERED_TAIL_CHARS || rows > MAX_RENDERED_TAIL_ROWS;
 
-  function capRows(rows, max = MAX_RENDERED_ROWS_PER_POLL) {
-    if (rows.length <= max) return rows;
-    const omitted = rows.length - max;
-    return [{kind: 'meta', title: `${omitted} earlier events omitted`, body: '', exit_code: null}, ...rows.slice(-max)];
+  // Walk newest-to-oldest so a dense bounded response shows its useful tail without first
+  // allocating a row for every JSONL record. One row is reserved for the omission marker.
+  function normalizeTail(lines, maxRows = MAX_RENDERED_ROWS_PER_POLL, maxRecords = MAX_NORMALIZED_RECORDS_PER_POLL, parseLine = parseEventLine) {
+    const groups = [];
+    let retainedRows = 0;
+    let index = lines.length - 1;
+    for (; index >= 0 && lines.length - 1 - index < maxRecords; index--) {
+      const rows = parseLine(lines[index]);
+      if (retainedRows + rows.length > maxRows - 1) break;
+      if (rows.length) {
+        groups.push(rows);
+        retainedRows += rows.length;
+      }
+    }
+    const omitted = index + 1;
+    const retained = groups.reverse().flat();
+    return omitted
+      ? [{kind: 'meta', title: `${omitted} earlier events omitted`, body: '', exit_code: null}, ...retained]
+      : retained;
   }
 
   function stripShellWrapper(command) {
@@ -102,7 +118,7 @@
     catch (_) { return normalizeEvents(null); }
   }
 
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, capRows, shouldTrim};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, shouldTrim};
   if (typeof document === 'undefined') return;
 
   let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null;
@@ -127,7 +143,7 @@
     renderedChars += row.textContent.length; $('stream').append(row); trimStream();
   }
   function renderRaw() { $('rawStream').textContent = rawText.length > MAX_RENDERED_TAIL_CHARS ? rawText.slice(-MAX_RENDERED_TAIL_CHARS) : rawText; }
-  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); capRows(lines.flatMap(line => parseEventLine(line))).forEach(renderEvent); if (rawMode) renderRaw(); }
+  function appendTail(lines, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; } const text = lines.join('\n') + (lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); normalizeTail(lines).forEach(renderEvent); if (rawMode) renderRaw(); }
   async function state() { if (document.hidden) return; const s = await fetch('/api/state').then(r => r.json()), counts = Object.fromEntries(s.counts.map(x => [x.status, x.count])); $('tiles').replaceChildren(); ['working', 'open', 'in-review', 'done'].forEach(key => { const tile = document.createElement('span'); tile.className = 'tile'; put(tile, key + '\n' + (counts[key] || 0)); $('tiles').append(tile); }); const tasks = $('tasks'); tasks.replaceChildren(); appendRow(tasks, ['State', 'Task', 'Provider/model', 'PR', 'Age'], true); s.tasks.forEach(x => { const pr = document.createElement('span'); if (x.pr) { const link = document.createElement('a'); link.href = 'https://github.com/ag2trust/quorum/pull/' + x.pr; put(link, '#' + x.pr); pr.append(link); } appendRow(tasks, [x.state, '#' + x.id + ' ' + x.title, (x.provider || 'pending') + ' ' + (x.model || ''), pr, age(x.age_secs)]); }); renderAgents(s.agents, s.now); $('alerts').textContent = JSON.stringify({alerts: s.alerts, errors: s.errors}, null, 2); }
   function renderAgents(agents, now) { const online = agents.filter(agent => agent.online), offline = agents.filter(agent => !agent.online); const render = (table, rows) => { table.replaceChildren(); appendRow(table, ['Agent', 'Task', 'Last seen'], true); rows.forEach(agent => { const seen = document.createElement('span'); put(seen, relativeTime(agent.last_seen, now)); seen.title = timestamp(agent.last_seen); appendRow(table, [agent.name, agent.task_held ? '#' + agent.task_held.id + ' ' + agent.task_held.title : '—', seen]); }); }; render($('agentTable'), online); render($('offlineAgentTable'), offline); $('offlineAgents').classList.toggle('hidden', !offline.length); put($('offlineAgents').querySelector('summary'), `${offline.length} offline`); }
   function duration(meta) { const start = meta.start_time, end = meta.end_time; return start && end ? age(Math.max(0, end - start)) : '—'; }
