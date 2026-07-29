@@ -297,6 +297,7 @@ mod tests {
             usage: Some(super::super::stream::Usage {
                 input_tokens: 200,
                 output_tokens: 100,
+                ..Default::default()
             }),
             total_cost_usd: Some(0.0123),
             num_turns: Some(1),

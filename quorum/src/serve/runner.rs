@@ -298,10 +298,35 @@ pub enum ActivityKind {
     ToolUse,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
+    /// Provider-defined uncached input. Codex's inclusive input count is
+    /// normalized by subtracting cached input before it reaches this field.
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.output_tokens)
+    }
+
+    pub fn saturating_add_assign(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(other.cached_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(other.cache_write_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
 }
 
 /// Normalize a raw Claude stream-json line into zero or more `AgentEvent`s.
@@ -326,7 +351,10 @@ pub fn normalize_claude_line(raw: &str) -> Vec<AgentEvent> {
         } => {
             let tok = usage.map(|u| TokenUsage {
                 input_tokens: u.input_tokens,
+                cached_input_tokens: u.cache_read_input_tokens,
+                cache_write_input_tokens: u.cache_creation_input_tokens,
                 output_tokens: u.output_tokens,
+                reasoning_tokens: 0,
             });
             if is_error.unwrap_or(false) {
                 let message = stream::result_text(&result);
@@ -443,8 +471,11 @@ pub fn normalize_codex_line(raw: &str) -> Vec<AgentEvent> {
         }
         codex_stream::Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
             usage: usage.map(|usage| TokenUsage {
-                input_tokens: usage.input_tokens,
+                input_tokens: usage.input_tokens.saturating_sub(usage.cached_input_tokens),
+                cached_input_tokens: usage.cached_input_tokens,
+                cache_write_input_tokens: usage.cache_write_input_tokens,
                 output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_output_tokens,
             }),
             cost_usd: None,
         }],
@@ -531,6 +562,40 @@ mod tests {
                 assert!((cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
             }
             other => panic!("expected TurnCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_observed_usage_keeps_cached_input_separate() {
+        let line = r#"{"type":"turn.completed","usage":{"input_tokens":1376345,"cached_input_tokens":1294080,"cache_write_input_tokens":0,"output_tokens":6691,"reasoning_output_tokens":3518}}"#;
+        let events = normalize_codex_line(line);
+        match events.as_slice() {
+            [AgentEvent::TurnCompleted {
+                usage: Some(usage), ..
+            }] => {
+                assert_eq!(usage.input_tokens, 82_265);
+                assert_eq!(usage.cached_input_tokens, 1_294_080);
+                assert_eq!(usage.output_tokens, 6_691);
+                assert_eq!(usage.reasoning_tokens, 3_518);
+            }
+            other => panic!("expected one completed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_usage_preserves_cache_read_and_creation_fields() {
+        let line = r#"{"type":"result","result":"done","usage":{"input_tokens":100,"cache_read_input_tokens":900,"cache_creation_input_tokens":50,"output_tokens":25}}"#;
+        let events = normalize_claude_line(line);
+        match events.as_slice() {
+            [AgentEvent::TurnCompleted {
+                usage: Some(usage), ..
+            }] => {
+                assert_eq!(usage.input_tokens, 100);
+                assert_eq!(usage.cached_input_tokens, 900);
+                assert_eq!(usage.cache_write_input_tokens, 50);
+                assert_eq!(usage.output_tokens, 25);
+            }
+            other => panic!("expected one completed event, got {other:?}"),
         }
     }
 

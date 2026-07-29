@@ -871,7 +871,52 @@ struct InterpretTickOutcome {
     just_dead_lettered: Option<(i64, i64, i64)>,
 }
 
+#[derive(Clone)]
+struct ManagedUsageRecord {
+    task_id: i64,
+    purpose: String,
+    pr_number: Option<i64>,
+    provider: String,
+    model: String,
+    effort: String,
+    usage: quorum_core::token_usage::TokenUsage,
+}
+
+fn managed_usage_record(slot: &SlotState, purpose: &str) -> ManagedUsageRecord {
+    ManagedUsageRecord {
+        task_id: slot.task_id,
+        purpose: purpose.to_string(),
+        pr_number: slot.pr,
+        provider: runner::AgentKind::for_model(&slot.model)
+            .map(|kind| kind.to_string())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        model: slot.model.clone(),
+        effort: slot.effort.clone(),
+        usage: durable_token_usage(slot.token_usage),
+    }
+}
+
+fn durable_token_usage(usage: runner::TokenUsage) -> quorum_core::token_usage::TokenUsage {
+    quorum_core::token_usage::TokenUsage {
+        uncached_input_tokens: usage.input_tokens as i64,
+        cached_input_tokens: usage.cached_input_tokens as i64,
+        cache_write_input_tokens: usage.cache_write_input_tokens as i64,
+        output_tokens: usage.output_tokens as i64,
+        reasoning_tokens: usage.reasoning_tokens as i64,
+    }
+}
+
+#[cfg(test)]
 async fn close_agent_run(db_path: &std::path::Path, run_id: Option<i64>, end_reason: &str) {
+    close_agent_run_with_usage(db_path, run_id, end_reason, None).await;
+}
+
+async fn close_agent_run_with_usage(
+    db_path: &std::path::Path,
+    run_id: Option<i64>,
+    end_reason: &str,
+    usage: Option<ManagedUsageRecord>,
+) {
     if let Some(rid) = run_id {
         let p = db_path.to_path_buf();
         let reason = end_reason.to_string();
@@ -879,10 +924,101 @@ async fn close_agent_run(db_path: &std::path::Path, run_id: Option<i64>, end_rea
             if let Ok(conn) = quorum_core::db::open(&p) {
                 let _ = quorum_core::agent_runs::close(&conn, rid, now_unix(), &reason);
             }
+            // Telemetry is deliberately a second, independent best-effort
+            // write. A schema/trigger/lock failure here cannot roll back run
+            // closure or any lifecycle transition.
+            if let Some(usage) = usage {
+                match quorum_core::db::open(&p) {
+                    Ok(mut conn) => {
+                        if let Err(error) = quorum_core::token_usage::record(
+                            &mut conn,
+                            Some(rid),
+                            &usage.purpose,
+                            &[usage.task_id],
+                            usage.pr_number,
+                            &usage.provider,
+                            &usage.model,
+                            &usage.effort,
+                            usage.usage,
+                            now_unix(),
+                        ) {
+                            log(&format!(
+                                "token usage write failed for agent_run #{rid} (ignored): {error}"
+                            ));
+                        }
+                    }
+                    Err(error) => log(&format!(
+                        "token usage DB open failed for agent_run #{rid} (ignored): {error}"
+                    )),
+                }
+            }
         })
         .await
         .ok();
     }
+}
+
+async fn record_classifier_usage_fields(
+    db_path: &std::path::Path,
+    task_ids: Vec<i64>,
+    provider: String,
+    model: String,
+    effort: String,
+    usage: runner::TokenUsage,
+) {
+    let p = db_path.to_path_buf();
+    let usage = quorum_core::token_usage::TokenUsage {
+        uncached_input_tokens: usage.input_tokens as i64,
+        cached_input_tokens: usage.cached_input_tokens as i64,
+        cache_write_input_tokens: usage.cache_write_input_tokens as i64,
+        output_tokens: usage.output_tokens as i64,
+        reasoning_tokens: usage.reasoning_tokens as i64,
+    };
+    let outcome = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        quorum_core::token_usage::record(
+            &mut conn,
+            None,
+            "classifier",
+            &task_ids,
+            None,
+            &provider,
+            &model,
+            &effort,
+            usage,
+            now_unix(),
+        )?;
+        Ok(())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "classifier token usage write failed (ignored): {error}"
+        )),
+        Err(error) => log(&format!(
+            "classifier token usage join failed (ignored): {error}"
+        )),
+    }
+}
+
+/// Reap a classifier without letting terminal provider output affect task
+/// lifecycle. Classifiers have no lifecycle authority, but a provider can
+/// emit its final usage event after the tick has decided to discard the slot.
+/// Normalize that unread output before the best-effort telemetry write.
+async fn teardown_classifier(db_path: &std::path::Path, mut slot: classifier::ClassifierSlot) {
+    let runner_kind = slot.proc.kind();
+    let terminal = slot.proc.kill_and_reap().await;
+    capture_terminal_usage(runner_kind, &terminal, &mut slot.usage);
+    record_classifier_usage_fields(
+        db_path,
+        slot.pending_task_ids,
+        slot.provider,
+        slot.model,
+        slot.effort,
+        slot.usage,
+    )
+    .await;
 }
 
 fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry {
@@ -1135,6 +1271,7 @@ pub(crate) struct SlotState {
     pr: Option<i64>,
     rework_count: u32,
     cost_tokens: i64,
+    token_usage: runner::TokenUsage,
     cost_usd: f64,
     task_started_at: std::time::Instant,
     turn_started_at: std::time::Instant,
@@ -2285,7 +2422,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
             log("daemon lock stolen — tearing down and exiting");
             if let Some(slot) = classifier_slot.take() {
-                let _terminal_output = slot.proc.kill_and_reap().await;
+                teardown_classifier(&config.db_path, slot).await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -2305,7 +2442,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("shutting down (signal, no in-flight agents)");
             }
             if let Some(slot) = classifier_slot.take() {
-                let _terminal_output = slot.proc.kill_and_reap().await;
+                teardown_classifier(&config.db_path, slot).await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -2328,7 +2465,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if !sentinel.exists() {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
-                    let _terminal_output = slot.proc.kill_and_reap().await;
+                    teardown_classifier(&config.db_path, slot).await;
                 }
                 for r in reviewers.drain(..) {
                     let _terminal_output = r.proc.kill_and_reap().await;
@@ -2383,7 +2520,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     "DRAIN: all agents finished (sha={sha}), exiting {exit}"
                 ));
                 if let Some(slot) = classifier_slot.take() {
-                    let _terminal_output = slot.proc.kill_and_reap().await;
+                    teardown_classifier(&config.db_path, slot).await;
                 }
                 return Ok(exit);
             }
@@ -2397,7 +2534,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     reviewers.len(),
                 ));
                 if let Some(slot) = classifier_slot.take() {
-                    let _terminal_output = slot.proc.kill_and_reap().await;
+                    teardown_classifier(&config.db_path, slot).await;
                 }
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
@@ -2464,7 +2601,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     // against a too-new schema); just reap the processes and release their
                     // names. Journal recovery reclaims the tasks on restart.
                     if let Some(slot) = classifier_slot.take() {
-                        let _terminal_output = slot.proc.kill_and_reap().await;
+                        teardown_classifier(&config.db_path, slot).await;
                     }
                     for r in reviewers.drain(..) {
                         let _terminal_output = r.proc.kill_and_reap().await;
@@ -6492,6 +6629,7 @@ async fn tick(
 
     // ── Phase 7: Task classifier ─────────────────────────────────────
     // 7a: Drain events from in-flight classifier.
+    let mut retire_classifier = false;
     if let Some(slot) = classifier_slot.as_mut() {
         // Check if the classifier process exited.
         let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
@@ -6522,7 +6660,7 @@ async fn tick(
                     }
                     *classifier_consec_errors = 0;
                     *classifier_backoff_until = None;
-                    *classifier_slot = None;
+                    retire_classifier = true;
                 }
                 classifier::ClassifierResult::Error(e) => {
                     if classifier::is_auth_error(&e) {
@@ -6542,7 +6680,7 @@ async fn tick(
                         "classifier: backoff {delay}s after {} consecutive error(s)",
                         *classifier_consec_errors
                     ));
-                    *classifier_slot = None;
+                    retire_classifier = true;
                 }
             }
         } else if exited {
@@ -6589,7 +6727,12 @@ async fn tick(
                     *classifier_consec_errors
                 ));
             }
-            *classifier_slot = None;
+            retire_classifier = true;
+        }
+    }
+    if retire_classifier {
+        if let Some(slot) = classifier_slot.take() {
+            teardown_classifier(&db_path, slot).await;
         }
     }
 
@@ -6650,6 +6793,7 @@ async fn tick(
                             );
                             if let Err(e) = slot.proc.feed_turn(&turn).await {
                                 log(&format!("classifier: feed_turn failed: {e}"));
+                                teardown_classifier(&db_path, slot).await;
                             } else {
                                 log(&format!("classifier: spawned for {} task(s)", tasks.len()));
                                 *classifier_slot = Some(slot);
@@ -7300,8 +7444,10 @@ async fn drain_events(
                     persist_codex_thread_id(db_path, slot.task_id, thread_id, ref_key).await;
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
-                    let turn_tokens =
-                        usage.map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
+                    let turn_tokens = usage.map_or(0, |u| u.total_tokens() as i64);
+                    if let Some(usage) = usage {
+                        slot.token_usage.saturating_add_assign(*usage);
+                    }
                     slot.cost_tokens += turn_tokens;
                     // cost_usd is session-cumulative (running total), not per-turn.
                     let prev_cost = slot.cost_usd;
@@ -7359,8 +7505,10 @@ async fn drain_events(
                     usage,
                     cost_usd,
                 } => {
-                    let turn_tokens =
-                        usage.map_or(0, |u| (u.input_tokens + u.output_tokens) as i64);
+                    let turn_tokens = usage.map_or(0, |u| u.total_tokens() as i64);
+                    if let Some(usage) = usage {
+                        slot.token_usage.saturating_add_assign(*usage);
+                    }
                     slot.cost_tokens += turn_tokens;
                     let prev_cost = slot.cost_usd;
                     if let Some(cost) = cost_usd {
@@ -7450,6 +7598,33 @@ fn persist_terminal_output(
             // Teardown output is diagnostic evidence only. It must not drive
             // lifecycle after the daemon has decided to stop the run.
             sl.log_raw_and_normalized(&line, &[]);
+        }
+    }
+}
+
+/// Retain usage from unread terminal stdout without allowing teardown output
+/// to drive lifecycle. A verdict mailbox row can be consumed before Phase 3
+/// drains the provider's final result, so teardown must account for that final
+/// turn before snapshotting durable usage.
+fn capture_terminal_usage(
+    kind: runner::AgentKind,
+    output: &[runner::CapturedOutput],
+    usage_total: &mut runner::TokenUsage,
+) {
+    for captured in output {
+        let runner::CapturedOutput::Stdout(raw_line) = captured else {
+            continue;
+        };
+        for event in runner::normalize_line(kind, raw_line) {
+            match event {
+                runner::AgentEvent::TurnCompleted {
+                    usage: Some(usage), ..
+                }
+                | runner::AgentEvent::TurnFailed {
+                    usage: Some(usage), ..
+                } => usage_total.saturating_add_assign(usage),
+                _ => {}
+            }
         }
     }
 }
@@ -8210,6 +8385,7 @@ async fn provision_reviewer(
                 pr: Some(pr),
                 rework_count: 0,
                 cost_tokens: 0,
+                token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -8820,6 +8996,7 @@ async fn spawn_worker(
                     daemon_rework_retry_requested(task.refs.as_deref()),
                 ),
                 cost_tokens: 0,
+                token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -9265,6 +9442,7 @@ async fn cleanup_slot_inner(
     delete_branch: bool,
     end_reason: &str,
 ) {
+    let mut usage = managed_usage_record(&state, "worker");
     log(&format!(
         "tearing down worker {} (task #{}{})",
         state.agent_name,
@@ -9276,12 +9454,15 @@ async fn cleanup_slot_inner(
         },
     ));
 
+    let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
+    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
     persist_terminal_output(&mut state.session_log, terminal);
+    usage.usage = durable_token_usage(state.token_usage);
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(finalize_verdict);
     }
-    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
+    close_agent_run_with_usage(&config.db_path, state.agent_run_id, end_reason, Some(usage)).await;
 
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
@@ -9321,6 +9502,7 @@ async fn teardown_worker_with_body(
     task_status: &str,
     body: Option<&str>,
 ) {
+    let mut usage = managed_usage_record(&state, "worker");
     log(&format!(
         "tearing down worker {} (task #{} -> {task_status})",
         state.agent_name, state.task_id
@@ -9331,8 +9513,11 @@ async fn teardown_worker_with_body(
     } else {
         None
     };
+    let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
+    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
     persist_terminal_output(&mut state.session_log, terminal);
+    usage.usage = durable_token_usage(state.token_usage);
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(verdict);
     }
@@ -9341,7 +9526,7 @@ async fn teardown_worker_with_body(
     } else {
         task_status
     };
-    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
+    close_agent_run_with_usage(&config.db_path, state.agent_run_id, end_reason, Some(usage)).await;
 
     // #130: revoke run capability
     if let Some(ref rid) = state.cap_run_id {
@@ -9413,14 +9598,18 @@ async fn teardown_reviewer(
     mut state: SlotState,
     end_reason: &str,
 ) {
+    let mut usage = managed_usage_record(&state, "reviewer");
     log(&format!("tearing down reviewer {}", state.agent_name));
 
+    let runner_kind = state.proc.kind();
     let terminal = state.proc.kill_and_reap().await;
+    capture_terminal_usage(runner_kind, &terminal, &mut state.token_usage);
     persist_terminal_output(&mut state.session_log, terminal);
+    usage.usage = durable_token_usage(state.token_usage);
     if let Some(ref mut sl) = state.session_log {
         sl.finalize(None);
     }
-    close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
+    close_agent_run_with_usage(&config.db_path, state.agent_run_id, end_reason, Some(usage)).await;
 
     // #130: revoke run capability
     if let Some(ref rid) = state.cap_run_id {
@@ -10004,6 +10193,7 @@ async fn spawn_remediation_worker(
                 pr: Some(pr),
                 rework_count: 1,
                 cost_tokens: 0,
+                token_usage: runner::TokenUsage::default(),
                 cost_usd: 0.0,
                 task_started_at: now_instant,
                 turn_started_at: now_instant,
@@ -10841,6 +11031,11 @@ mod tests {
             pr: None,
             rework_count: 0,
             cost_tokens: 500,
+            token_usage: runner::TokenUsage {
+                input_tokens: 400,
+                output_tokens: 100,
+                ..Default::default()
+            },
             cost_usd: 0.01,
             task_started_at: now,
             turn_started_at: now,
@@ -13472,5 +13667,323 @@ mod tests {
         assert!(!transcript.contains("must-not-complete"));
         assert!(!transcript.contains("provider warning"));
         assert!(!transcript.contains("42"));
+    }
+
+    async fn classifier_slot_with_terminal_output(
+        pending_task_ids: Vec<i64>,
+        terminal_output: &str,
+    ) -> classifier::ClassifierSlot {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '%s\\n' \"$1\"; sleep 60")
+            .arg("classifier-test")
+            .arg(terminal_output)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        classifier::ClassifierSlot {
+            proc: runner::RunnerProc::Claude(agent::AgentProc::from_parts(child, stdin, reader)),
+            pending_task_ids,
+            response_text: String::new(),
+            provider: "claude".into(),
+            model: "claude-haiku-4-5-20251001".into(),
+            effort: "low".into(),
+            usage: runner::TokenUsage::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn classifier_teardown_persists_terminal_usage_without_mutating_task_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("classifier-terminal-usage.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "classifier telemetry",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap()
+        };
+        let slot = classifier_slot_with_terminal_output(
+            vec![task_id],
+            r#"{"type":"result","result":"done","usage":{"input_tokens":104,"cache_read_input_tokens":64,"output_tokens":7}}"#,
+        )
+        .await;
+
+        teardown_classifier(&db_path, slot).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let rows = quorum_core::token_usage::for_task(&conn, task_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].purpose, "classifier");
+        assert_eq!(rows[0].usage.uncached_input_tokens, 104);
+        assert_eq!(rows[0].usage.cached_input_tokens, 64);
+        assert_eq!(rows[0].usage.output_tokens, 7);
+        assert_eq!(rows[0].usage.reasoning_tokens, 0);
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "open",
+            "classifier teardown must not advance task lifecycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn classifier_teardown_usage_failure_is_lifecycle_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("classifier-usage-failure.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "classifier telemetry failure",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_classifier_usage
+                 BEFORE INSERT ON token_usage_runs
+                 BEGIN SELECT RAISE(ABORT, 'forced telemetry failure'); END;",
+            )
+            .unwrap();
+            task_id
+        };
+        let slot = classifier_slot_with_terminal_output(
+            vec![task_id],
+            r#"{"type":"result","result":"done","usage":{"input_tokens":10,"output_tokens":1}}"#,
+        )
+        .await;
+
+        teardown_classifier(&db_path, slot).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(quorum_core::token_usage::for_task(&conn, task_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "open",
+            "telemetry failure must not turn a classifier shutdown into lifecycle work"
+        );
+    }
+
+    #[tokio::test]
+    async fn verdict_before_terminal_output_persists_approving_turn_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("terminal-reviewer-usage.db");
+        let (task_id, run_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "terminal reviewer usage",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "worker", Some(task_id), &[], 3600, 11).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "worker",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                12,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "reviewer".into(),
+                },
+                13,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "reviewer",
+                "reviewer",
+                "gpt-5.6-sol",
+                "high",
+                "codex",
+                13,
+            )
+            .unwrap();
+            tasks::apply_event(&mut conn, "reviewer", task_id, &Event::VerdictApprove, 14).unwrap();
+            (task_id, run_id)
+        };
+
+        // The verdict has already transitioned the task before Phase 3 sees
+        // the provider's terminal line. Teardown receives this line from
+        // kill_and_reap and must retain its usage without replaying lifecycle.
+        let mut token_usage = runner::TokenUsage::default();
+        let terminal = vec![runner::CapturedOutput::Stdout(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1376345,"cached_input_tokens":1294080,"cache_write_input_tokens":0,"output_tokens":6691,"reasoning_output_tokens":3518}}"#
+                .into(),
+        )];
+        capture_terminal_usage(runner::AgentKind::Codex, &terminal, &mut token_usage);
+        let usage = ManagedUsageRecord {
+            task_id,
+            purpose: "reviewer".into(),
+            pr_number: Some(464),
+            provider: "codex".into(),
+            model: "gpt-5.6-sol".into(),
+            effort: "high".into(),
+            usage: durable_token_usage(token_usage),
+        };
+        close_agent_run_with_usage(&db_path, Some(run_id), "verdict:approved", Some(usage)).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "merging",
+            "terminal output must not drive lifecycle"
+        );
+        let rows = quorum_core::token_usage::for_task(&conn, task_id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].purpose, "reviewer");
+        assert_eq!(rows[0].usage.uncached_input_tokens, 82_265);
+        assert_eq!(rows[0].usage.cached_input_tokens, 1_294_080);
+        assert_eq!(rows[0].usage.output_tokens, 6_691);
+        assert_eq!(rows[0].usage.reasoning_tokens, 3_518);
+    }
+
+    #[tokio::test]
+    async fn token_write_failure_cannot_undo_verdict_or_run_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("usage-failure.db");
+        let run_id;
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "telemetry",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "worker", Some(task_id), &[], 3600, 11).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "worker",
+                task_id,
+                &Event::SignaledDone { pr: "450".into() },
+                12,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "reviewer".into(),
+                },
+                13,
+            )
+            .unwrap();
+            run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "reviewer",
+                "reviewer",
+                "gpt-5.6-sol",
+                "high",
+                "codex",
+                13,
+            )
+            .unwrap();
+            tasks::apply_event(&mut conn, "reviewer", task_id, &Event::VerdictApprove, 14).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_token_usage
+                 BEFORE INSERT ON token_usage_runs
+                 BEGIN SELECT RAISE(ABORT, 'forced telemetry failure'); END;",
+            )
+            .unwrap();
+        }
+
+        close_agent_run_with_usage(
+            &db_path,
+            Some(run_id),
+            "verdict:approved",
+            Some(ManagedUsageRecord {
+                task_id,
+                purpose: "reviewer".into(),
+                pr_number: Some(450),
+                provider: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+                effort: "high".into(),
+                usage: quorum_core::token_usage::TokenUsage {
+                    uncached_input_tokens: 82_265,
+                    cached_input_tokens: 1_294_080,
+                    output_tokens: 6_691,
+                    reasoning_tokens: 3_518,
+                    ..Default::default()
+                },
+            }),
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "merging"
+        );
+        let ended: (i64, String) = conn
+            .query_row(
+                "SELECT ended_at, end_reason FROM agent_runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ended.1, "verdict:approved");
+        assert!(quorum_core::token_usage::for_task(&conn, task_id)
+            .unwrap()
+            .is_empty());
     }
 }

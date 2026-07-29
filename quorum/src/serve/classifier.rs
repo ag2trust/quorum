@@ -20,6 +20,10 @@ pub struct ClassifierSlot {
     pub proc: RunnerProc,
     pub pending_task_ids: Vec<i64>,
     pub response_text: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub usage: super::runner::TokenUsage,
 }
 
 /// Build the spec for a classifier agent. `bare` must follow the daemon's
@@ -86,6 +90,10 @@ pub fn spawn_classifier_configured(
         proc,
         pending_task_ids,
         response_text: String::new(),
+        provider: kind.to_string(),
+        model: model.to_string(),
+        effort: effort.to_string(),
+        usage: super::runner::TokenUsage::default(),
     })
 }
 
@@ -116,10 +124,22 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
     {
         if slot.proc.kind() == AgentKind::Claude {
             if let Some(super::stream::Event::Result {
-                result, is_error, ..
+                result,
+                usage,
+                is_error,
+                ..
             }) = super::stream::parse_line(&raw)
             {
                 let text = super::stream::result_text(&result);
+                if let Some(usage) = usage {
+                    slot.usage.saturating_add_assign(super::runner::TokenUsage {
+                        input_tokens: usage.input_tokens,
+                        cached_input_tokens: usage.cache_read_input_tokens,
+                        cache_write_input_tokens: usage.cache_creation_input_tokens,
+                        output_tokens: usage.output_tokens,
+                        reasoning_tokens: 0,
+                    });
+                }
                 if is_error.unwrap_or(false) {
                     let detail = if text.is_empty() {
                         "classifier agent returned an error".into()
@@ -140,7 +160,10 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
         };
         for event in events {
             match event {
-                AgentEvent::TurnFailed { message, .. } => {
+                AgentEvent::TurnFailed { message, usage, .. } => {
+                    if let Some(usage) = usage {
+                        slot.usage.saturating_add_assign(usage);
+                    }
                     let detail = if message.is_empty() {
                         "classifier agent returned an error".into()
                     } else {
@@ -148,7 +171,10 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                     };
                     return Some(ClassifierResult::Error(detail));
                 }
-                AgentEvent::TurnCompleted { .. } => {
+                AgentEvent::TurnCompleted { usage, .. } => {
+                    if let Some(usage) = usage {
+                        slot.usage.saturating_add_assign(usage);
+                    }
                     return Some(ClassifierResult::Done(slot.response_text.clone()));
                 }
                 AgentEvent::AssistantText { text } => {
@@ -293,6 +319,64 @@ mod tests {
         assert!(args.contains("exec --json"), "{args}");
         assert!(args.contains("--model gpt-5.6-terra"), "{args}");
         assert!(args.contains("-c model_reasoning_effort=medium"), "{args}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_classifier_run_is_durably_attributable_to_batch_tasks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("q.db");
+        let _ = quorum_core::db::open(&db_path).unwrap();
+        let runner = temp.path().join("codex");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"classifier-thread\"}'\n\
+             printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"id\":\"m1\",\"text\":\"{\\\"tasks\\\":[]}\"}}'\n\
+             printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1376345,\"cached_input_tokens\":1294080,\"cache_write_input_tokens\":0,\"output_tokens\":6691,\"reasoning_output_tokens\":3518}}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tasks = vec![
+            TaskForClassification {
+                id: 7,
+                title: "one".into(),
+                body: None,
+            },
+            TaskForClassification {
+                id: 8,
+                title: "two".into(),
+                body: None,
+            },
+        ];
+        let mut slot = spawn_classifier_configured(
+            &tasks,
+            &[],
+            temp.path(),
+            runner.to_str(),
+            false,
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+            "recommendations",
+        )
+        .unwrap();
+        let result = drain_classifier_events(&mut slot).await;
+        assert!(matches!(result, Some(ClassifierResult::Done(_))));
+        super::super::teardown_classifier(&db_path, slot).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        for task_id in [7, 8] {
+            let usage = quorum_core::token_usage::for_task(&conn, task_id).unwrap();
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0].purpose, "classifier");
+            assert_eq!(usage[0].usage.uncached_input_tokens, 82_265);
+            assert_eq!(usage[0].usage.cached_input_tokens, 1_294_080);
+            assert_eq!(usage[0].usage.reasoning_tokens, 3_518);
+        }
     }
 
     #[test]

@@ -11,6 +11,9 @@ use rusqlite::{params, Connection};
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// Durable token telemetry is retained after task reclamation, then physically swept.
+pub const TOKEN_USAGE_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
 /// Max rows reclaimed per table by an opportunistic sweep-on-write.
 pub const SWEEP_LIMIT: usize = 100;
 
@@ -108,6 +111,53 @@ fn delete_bounded(conn: &Connection, table: &str, now: i64, limit: usize) -> Res
     Ok(())
 }
 
+pub(crate) fn sweep_token_usage_on_write(conn: &Connection, now: i64) -> Result<()> {
+    delete_token_usage_bounded(conn, now, SWEEP_LIMIT)
+}
+
+fn delete_token_usage_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    let cutoff = now.saturating_sub(TOKEN_USAGE_RETENTION_SECS);
+    // Delete mappings first because v1 intentionally has no foreign keys. Repeating the
+    // identical ordered parent selection keeps both statements on the same bounded batch.
+    conn.execute(
+        "DELETE FROM token_usage_run_tasks
+         WHERE run_id IN (
+             SELECT id FROM token_usage_runs
+             WHERE recorded_at <= ?1
+             ORDER BY id
+             LIMIT ?2
+         )",
+        params![cutoff, limit as i64],
+    )?;
+    conn.execute(
+        "DELETE FROM token_usage_runs
+         WHERE id IN (
+             SELECT id FROM token_usage_runs
+             WHERE recorded_at <= ?1
+             ORDER BY id
+             LIMIT ?2
+         )",
+        params![cutoff, limit as i64],
+    )?;
+    Ok(())
+}
+
+fn delete_all_expired_token_usage(conn: &Connection, now: i64) -> Result<()> {
+    let cutoff = now.saturating_sub(TOKEN_USAGE_RETENTION_SECS);
+    conn.execute(
+        "DELETE FROM token_usage_run_tasks
+         WHERE run_id IN (
+             SELECT id FROM token_usage_runs WHERE recorded_at <= ?1
+         )",
+        params![cutoff],
+    )?;
+    conn.execute(
+        "DELETE FROM token_usage_runs WHERE recorded_at <= ?1",
+        params![cutoff],
+    )?;
+    Ok(())
+}
+
 /// Park open tasks whose dependencies cannot currently be satisfied: every dep is terminal
 /// (done/failed/cancelled) but at least one is failed or cancelled. They stay excluded from
 /// provisioning until an explicit retry, without losing their dependency context.
@@ -190,6 +240,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "activity_events", now, limit)?;
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
+    delete_token_usage_bounded(conn, now, limit)?;
     conn.execute(
         "DELETE FROM tasks WHERE rowid IN \
          (SELECT rowid FROM tasks WHERE status='done' AND updated_at < ?1 LIMIT ?2)",
@@ -220,6 +271,7 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         "DELETE FROM task_messages WHERE expires_at <= ?1",
         params![now],
     )?;
+    delete_all_expired_token_usage(conn, now)?;
     conn.execute(
         "DELETE FROM tasks WHERE status='done' AND updated_at < ?1",
         params![now - DONE_TASK_TTL_SECS],
@@ -236,6 +288,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
         (dir, c)
+    }
+
+    fn record_usage(conn: &mut Connection, task_id: i64, recorded_at: i64) -> i64 {
+        crate::token_usage::record(
+            conn,
+            None,
+            "classifier",
+            &[task_id],
+            None,
+            "claude",
+            "haiku",
+            "low",
+            crate::token_usage::TokenUsage::default(),
+            recorded_at,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn token_usage_retention_is_bounded_and_explicit_sweep_finishes_backlog() {
+        let (_d, mut c) = open_tmp();
+        let now = 10_000_000;
+        let cutoff = now - TOKEN_USAGE_RETENTION_SECS;
+        let expired = [
+            record_usage(&mut c, 1, cutoff - 2),
+            record_usage(&mut c, 2, cutoff - 1),
+            record_usage(&mut c, 3, cutoff),
+        ];
+        let live = record_usage(&mut c, 4, cutoff + 1);
+
+        sweep_on_write(&c, now, 2).unwrap();
+
+        let remaining_runs: Vec<i64> = c
+            .prepare("SELECT id FROM token_usage_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining_runs, [expired[2], live]);
+        let remaining_mappings: Vec<i64> = c
+            .prepare("SELECT run_id FROM token_usage_run_tasks ORDER BY run_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            remaining_mappings,
+            [expired[2], live],
+            "bounded sweep must delete mappings for exactly the reclaimed run batch"
+        );
+
+        sweep_all(&c, now).unwrap();
+
+        let remaining_runs: Vec<i64> = c
+            .prepare("SELECT id FROM token_usage_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining_runs, [live]);
+        let remaining_mappings: Vec<i64> = c
+            .prepare("SELECT run_id FROM token_usage_run_tasks ORDER BY run_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining_mappings, [live]);
+    }
+
+    #[test]
+    fn token_usage_outlives_completed_task_sweep() {
+        let (_d, mut c) = open_tmp();
+        let now = 10_000_000;
+        let task_finished_at = now - (8 * 24 * 3600);
+        let task_id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "measured task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            task_finished_at,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1 WHERE id=?2",
+            params![task_finished_at, task_id],
+        )
+        .unwrap();
+        record_usage(&mut c, task_id, task_finished_at);
+
+        sweep_on_write(&c, now, SWEEP_LIMIT).unwrap();
+
+        assert!(crate::tasks::get(&c, task_id).unwrap().is_none());
+        let stored = crate::token_usage::for_task(&c, task_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].task_ids, [task_id]);
     }
 
     #[test]
