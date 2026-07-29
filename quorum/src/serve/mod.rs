@@ -250,6 +250,13 @@ fn r2_required_for_head(
     pr_number: i64,
     head_sha: &str,
 ) -> bool {
+    if matches!(
+        tasks::get(conn, task_id),
+        Ok(Some(task))
+            if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP)
+    ) {
+        return false;
+    }
     quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)
         .ok()
         .flatten()
@@ -274,10 +281,16 @@ fn decide_r2_requirement(
     head_sha: &str,
     policy: &R2SamplingPolicy,
 ) -> Result<bool> {
-    if tasks::get(conn, task_id)?.is_none() {
-        return Err(QuorumError::Io(format!(
-            "task #{task_id} disappeared while sampling R2"
-        )));
+    let task = tasks::get(conn, task_id)?
+        .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared while sampling R2")))?;
+    if task.rework_round >= i64::from(quorum_core::lifecycle::REWORK_CAP) {
+        if quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)?.is_none()
+        {
+            quorum_core::review_audits::record_r2_requirement(
+                conn, task_id, pr_number, head_sha, false,
+            )?;
+        }
+        return Ok(false);
     }
     if let Some(required) =
         quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha)?
@@ -3038,7 +3051,8 @@ async fn tick(
 
                         if !r2_required {
                             log(&format!(
-                                "R2 GATE: PR #{pr_num} — sampling skipped R2 for head {head_sha}; \
+                                "R2 GATE: PR #{pr_num} — sampling or exhausted rework budget \
+                                 skipped R2 for head {head_sha}; \
                                  proceeding with R1 approval"
                             ));
                         } else {
