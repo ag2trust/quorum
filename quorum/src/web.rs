@@ -20,6 +20,7 @@ use std::{
 };
 
 const PAGE: &str = include_str!("web.html");
+const CLIENT: &str = include_str!("web.js");
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
 const DEFAULT_STREAM_BYTES: u64 = 2 * 1024 * 1024;
@@ -53,6 +54,7 @@ pub fn serve(
     };
     let app = Router::new()
         .route("/", get(index))
+        .route("/web.js", get(client))
         .route("/api/state", get(api_state))
         .route("/api/runs", get(api_runs))
         .route("/api/runs/:dir/stream", get(api_stream))
@@ -81,6 +83,17 @@ fn validate_loopback(addr: SocketAddr) -> quorum_core::error::Result<()> {
 
 async fn index() -> Html<&'static str> {
     Html(PAGE)
+}
+
+async fn client() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        CLIENT,
+    )
+        .into_response()
 }
 
 async fn api_state(State(state): State<AppState>) -> Response {
@@ -320,9 +333,24 @@ mod tests {
     fn page_never_interpolates_stored_values_as_html_or_inline_handlers() {
         assert!(!PAGE.contains("innerHTML"));
         assert!(!PAGE.contains(" onclick="));
-        assert!(PAGE.contains("textContent"));
-        assert!(PAGE.contains("MAX_RENDERED_TAIL_CHARS"));
-        assert!(PAGE.contains("slice(-MAX_RENDERED_TAIL_CHARS)"));
+        assert!(!CLIENT.contains("innerHTML"));
+        assert!(CLIENT.contains("textContent"));
+        assert!(CLIENT.contains("MAX_RENDERED_TAIL_CHARS"));
+        assert!(CLIENT.contains("slice(-MAX_RENDERED_TAIL_CHARS)"));
+    }
+
+    #[test]
+    fn client_pure_functions_pass_their_node_tests() {
+        let output = std::process::Command::new("node")
+            .arg("quorum/src/web.test.js")
+            .current_dir(env!("CARGO_MANIFEST_DIR").rsplit_once('/').unwrap().0)
+            .output()
+            .expect("node is required to run the web client unit tests");
+        assert!(
+            output.status.success(),
+            "web client tests failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
