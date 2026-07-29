@@ -290,6 +290,18 @@ fn stream_payload(
     let start = from
         .unwrap_or_else(|| len.saturating_sub(DEFAULT_STREAM_BYTES))
         .min(len);
+    // A nonzero initial offset is not necessarily in the middle of a record: it can
+    // land immediately after a newline. Only discard the first chunk when the byte
+    // before the tail window proves it is a fragment.
+    let starts_mid_line = if from.is_none() && start > 0 {
+        file.seek(SeekFrom::Start(start - 1))
+            .map_err(StreamError::Io)?;
+        let mut previous = [0_u8; 1];
+        file.read_exact(&mut previous).map_err(StreamError::Io)?;
+        previous[0] != b'\n'
+    } else {
+        false
+    };
     file.seek(SeekFrom::Start(start)).map_err(StreamError::Io)?;
     let mut bytes = vec![0; max as usize];
     let read = file.read(&mut bytes).map_err(StreamError::Io)?;
@@ -305,7 +317,7 @@ fn stream_payload(
     // The initial tail can begin in the middle of a record. The client discards that
     // first completed fragment before it begins retaining suffixes for later requests.
     Ok(
-        json!({"lines": chunks.into_iter().map(hex_bytes).collect::<Vec<_>>(), "partial": partial, "starts_mid_line": from.is_none() && start > 0,
+        json!({"lines": chunks.into_iter().map(hex_bytes).collect::<Vec<_>>(), "partial": partial, "starts_mid_line": starts_mid_line,
         "next_offset": next, "eof": next >= len}),
     )
 }
@@ -428,6 +440,26 @@ mod tests {
             second["lines"][0].as_str().unwrap()
         );
         assert_eq!(reassembled, hex_bytes(record.trim_end().as_bytes()));
+    }
+
+    #[test]
+    fn initial_tail_at_a_record_boundary_keeps_its_first_record() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        let record = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(DEFAULT_STREAM_BYTES as usize - 46)
+        );
+        assert_eq!(record.len(), DEFAULT_STREAM_BYTES as usize);
+        fs::write(dir.join("stream.jsonl"), format!("discarded\n{record}")).unwrap();
+
+        let tail = stream_payload(root.path(), "A-100", None, DEFAULT_STREAM_BYTES).unwrap();
+        assert_eq!(tail["starts_mid_line"], json!(false));
+        assert_eq!(
+            tail["lines"],
+            json!([hex_bytes(record.trim_end().as_bytes())])
+        );
     }
 
     #[test]
