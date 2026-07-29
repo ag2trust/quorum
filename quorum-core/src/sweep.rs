@@ -111,7 +111,6 @@ fn delete_reclaimable_task_rows_bounded(conn: &Connection, now: i64, limit: usiz
         "approvals",
         "reviewer_provision_attempts",
         "pr_targets",
-        "review_interpret_jobs",
     ] {
         let sql = format!(
             "DELETE FROM {table} WHERE rowid IN \
@@ -139,9 +138,10 @@ fn delete_reclaimable_task_rows_bounded(conn: &Connection, now: i64, limit: usiz
     Ok(())
 }
 
-/// Remove bounded, already-orphaned operational rows left by older sweep versions. Analytics
-/// records intentionally do not participate: review audits/findings and run capabilities remain
-/// useful after task reclamation.
+/// Remove bounded, already-orphaned operational rows left by older sweep versions. Durable
+/// analytics and dead-letter evidence intentionally do not participate: review audits/findings,
+/// run capabilities, and capped review-interpret jobs remain operator-visible after task
+/// reclamation.
 fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<()> {
     for table in [
         "agent_runs",
@@ -152,7 +152,6 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
         "approvals",
         "reviewer_provision_attempts",
         "pr_targets",
-        "review_interpret_jobs",
     ] {
         let sql = format!(
             "DELETE FROM {table} WHERE rowid IN \
@@ -195,7 +194,6 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
             AND NOT EXISTS (SELECT 1 FROM approvals x WHERE x.task_id=t.id)
             AND NOT EXISTS (SELECT 1 FROM reviewer_provision_attempts x WHERE x.task_id=t.id)
             AND NOT EXISTS (SELECT 1 FROM pr_targets x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM review_interpret_jobs x WHERE x.task_id=t.id)
           LIMIT ?2)",
         params![now - DONE_TASK_TTL_SECS, limit as i64],
     )?;
@@ -515,6 +513,56 @@ mod tests {
             audit_count, 1,
             "audit history must survive task reclamation"
         );
+    }
+
+    fn dead_lettered_interpret_job_for_reclaimable_task(c: &mut Connection) -> (i64, i64) {
+        let task_id = reclaimable_task(c, "dead-lettered interpretation");
+        let pr_number = 99_001;
+        crate::review_interpret_jobs::enqueue(c, pr_number, task_id, None, "v1").unwrap();
+        for _ in 0..crate::review_interpret_jobs::MAX_ATTEMPTS {
+            crate::review_interpret_jobs::mark_error(c, pr_number, "collector failed").unwrap();
+        }
+        (task_id, pr_number)
+    }
+
+    fn assert_dead_letter_survives_task_reclamation(c: &Connection, task_id: i64, pr_number: i64) {
+        let task_count: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [task_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            task_count, 0,
+            "the expired done task must still be reclaimable"
+        );
+        let dead = crate::review_interpret_jobs::over_cap(c).unwrap();
+        assert_eq!(
+            dead.len(),
+            1,
+            "dead letter must remain operator-visible after task sweep"
+        );
+        assert_eq!(dead[0].pr_number, pr_number);
+        assert_eq!(dead[0].last_error.as_deref(), Some("collector failed"));
+    }
+
+    #[test]
+    fn sweep_on_write_retains_dead_lettered_interpret_jobs_after_task_reclamation() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, pr_number) = dead_lettered_interpret_job_for_reclaimable_task(&mut c);
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+
+        assert_dead_letter_survives_task_reclamation(&c, task_id, pr_number);
+    }
+
+    #[test]
+    fn sweep_all_retains_dead_lettered_interpret_jobs_after_task_reclamation() {
+        let (_d, mut c) = open_tmp();
+        let (task_id, pr_number) = dead_lettered_interpret_job_for_reclaimable_task(&mut c);
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        assert_dead_letter_survives_task_reclamation(&c, task_id, pr_number);
     }
 
     #[test]
