@@ -708,11 +708,45 @@ async fn spawn_and_run_classifier(
         }
     };
 
-    proc.kill_and_reap().await;
-    Ok(ClassifierTurnOutcome {
-        response: outcome,
-        usage: usage_total,
-    })
+    // The timeout can win just as the provider writes its terminal event. Reap
+    // drains that unread stdout, so retain any usage it carries without
+    // changing the already-decided collection outcome.
+    let terminal = proc.kill_and_reap().await;
+    Ok(finalize_classifier_turn(
+        kind,
+        terminal,
+        outcome,
+        usage_total,
+    ))
+}
+
+/// Finish a classifier turn after reaping its process. Terminal output is
+/// lifecycle-inert for collectors, but its usage is still durable telemetry.
+fn finalize_classifier_turn(
+    kind: AgentKind,
+    terminal: Vec<super::runner::CapturedOutput>,
+    response: Result<String>,
+    mut usage: super::runner::TokenUsage,
+) -> ClassifierTurnOutcome {
+    for captured in terminal {
+        let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
+            continue;
+        };
+        for event in super::runner::normalize_line(kind, &raw_line) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(terminal_usage),
+                    ..
+                }
+                | AgentEvent::TurnFailed {
+                    usage: Some(terminal_usage),
+                    ..
+                } => usage.saturating_add_assign(terminal_usage),
+                _ => {}
+            }
+        }
+    }
+    ClassifierTurnOutcome { response, usage }
 }
 
 /// Spawn a detached collection task from the daemon merge branch. Never awaits.
@@ -883,6 +917,37 @@ mod tests {
         let run = review_findings::get_run(&conn, 44).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.collector_model, "unknown-provider-model");
+    }
+
+    #[test]
+    fn timeout_reap_retains_unread_terminal_codex_usage() {
+        // The timeout path has already decided the collection failed when the
+        // process reap drains this last provider line. It must remain a timeout
+        // while retaining the usage that otherwise would be lost at the
+        // cancellation boundary.
+        let timeout_error = QuorumError::Io("classifier timeout for PR #464".into());
+        let turn = finalize_classifier_turn(
+            AgentKind::Codex,
+            vec![super::super::runner::CapturedOutput::Stdout(
+                r#"{"type":"turn.completed","usage":{"input_tokens":900,"cached_input_tokens":700,"cache_write_input_tokens":10,"output_tokens":40,"reasoning_output_tokens":30}}"#
+                    .into(),
+            )],
+            Err(timeout_error),
+            super::super::runner::TokenUsage::default(),
+        );
+
+        assert!(
+            turn.response
+                .unwrap_err()
+                .to_string()
+                .contains("classifier timeout for PR #464"),
+            "reaped terminal output must not turn a timeout into success"
+        );
+        assert_eq!(turn.usage.uncached_input_tokens, 200);
+        assert_eq!(turn.usage.cached_input_tokens, 700);
+        assert_eq!(turn.usage.cache_write_input_tokens, 10);
+        assert_eq!(turn.usage.output_tokens, 40);
+        assert_eq!(turn.usage.reasoning_tokens, 30);
     }
 
     #[tokio::test]
