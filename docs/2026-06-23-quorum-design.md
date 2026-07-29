@@ -517,7 +517,8 @@ only through an explicit outside request)
 - `VerdictApprove` → Merging · effects: MergePr
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
-- `VerdictChanges` (review_only=true) → Failed · effects: PostFindingsNote, ReleaseLease
+- `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
+  ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
 - `VerdictChanges` (rework_round ≥ REWORK_CAP) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
 - `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer

@@ -1486,6 +1486,22 @@ fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn remediation_retry_feedback(refs: Option<&str>) -> Option<String> {
+    let refs = refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())?;
+    if !refs
+        .get(tasks::PARKED_REWORK_RETRY_REF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    refs.get("remediation_feedback")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|feedback| !feedback.is_empty())
+        .map(str::to_string)
+}
+
 /// The remediation reconcilers run before Phase 6's ordinary worker-cap loop,
 /// so they must apply the same slot accounting themselves.
 fn available_worker_slots(cap: usize, active_workers: usize) -> usize {
@@ -2215,11 +2231,12 @@ async fn reconcile_ci_remediations(
 }
 
 /// Resume an owner-requested retry of a remediation that was parked before a
-/// worker process existed. Generic worker provisioning intentionally excludes
-/// review-only tasks because it would construct a daemon branch instead of the
-/// adopted PR branch. These retries must therefore reuse the verified PR
-/// worktree through `spawn_remediation_worker`.
-async fn reconcile_review_only_remediation_retries(
+/// worker process existed. These retries must not fall through to generic
+/// worker provisioning: that path builds an initial-task prompt and, for
+/// Codex, may start a fresh thread. Reusing `spawn_remediation_worker` preserves
+/// the accepted blocker feedback, verified PR target, original provider/model,
+/// and exact continuation identity when an original worker exists.
+async fn reconcile_remediation_retries(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
@@ -2236,9 +2253,7 @@ async fn reconcile_review_only_remediation_retries(
             let conn = quorum_core::db::open(&p)?;
             Ok(tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
-                .filter(|task| {
-                    task.review_only && daemon_rework_retry_requested(task.refs.as_deref())
-                })
+                .filter(|task| remediation_retry_feedback(task.refs.as_deref()).is_some())
                 .collect())
         })
         .await
@@ -2259,36 +2274,18 @@ async fn reconcile_review_only_remediation_retries(
             park_task(
                 &config.db_path,
                 task.id,
-                "review-only remediation retry is missing its PR identity",
+                "remediation retry is missing its PR identity",
                 "rework",
             )
             .await;
             continue;
         };
-        let feedback = task
-            .refs
-            .as_deref()
-            .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-            .and_then(|refs| {
-                refs.get("remediation_feedback")
-                    .and_then(|feedback| feedback.as_str())
-                    .map(str::to_string)
-            });
-        let Some(feedback) = feedback.filter(|feedback| !feedback.trim().is_empty()) else {
-            park_task(
-                &config.db_path,
-                task.id,
-                &format!(
-                    "review-only remediation retry for PR #{pr} is missing persisted blocking feedback"
-                ),
-                "rework",
-            )
-            .await;
+        let Some(feedback) = remediation_retry_feedback(task.refs.as_deref()) else {
             continue;
         };
 
         log(&format!(
-            "durable review-only remediation retry: provisioning task #{} on PR #{pr}",
+            "durable remediation retry: provisioning task #{} on PR #{pr}",
             task.id
         ));
         if !spawn_remediation_worker(
@@ -6642,7 +6639,7 @@ async fn tick(
         drain_state.draining,
     )
     .await?;
-    reconcile_review_only_remediation_retries(
+    reconcile_remediation_retries(
         config,
         wt_mgr,
         name_pool,

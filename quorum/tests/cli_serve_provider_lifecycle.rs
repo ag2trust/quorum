@@ -311,6 +311,15 @@ impl Case {
         role_config: Option<&str>,
     ) {
         self.handle.stop_mut();
+        self.restart_after_stop(default_provider, model, role_config);
+    }
+
+    fn restart_after_stop(
+        &mut self,
+        default_provider: &str,
+        model: &str,
+        role_config: Option<&str>,
+    ) {
         let names = self.home.path().join("names.txt");
         let runner = self.home.path().join("dual-runner.sh");
         let config_path = role_config.map(|contents| {
@@ -853,7 +862,7 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
         .success());
     case.retry_parked();
     case.handle
-        .wait_for("durable review-only remediation retry: provisioning task #1");
+        .wait_for("durable remediation retry: provisioning task #1");
     case.handle.wait_for("spawning remediation worker ");
     let remediation = case.handle.agent_after("spawning remediation worker ");
     case.handle
@@ -870,6 +879,113 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
     );
     drop(conn);
     case.done(&remediation, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
+    case.handle.stop();
+}
+
+#[test]
+fn remediation_retry_for_implementation_task_preserves_feedback_and_codex_thread() {
+    let mut case = Case::start("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("spawning agent ");
+    let original_worker = case.handle.agent_after("spawning agent ");
+    case.handle
+        .wait_for(&format!("worker {original_worker} result"));
+    let original_thread = format!("thread-{original_worker}");
+    case.done(&original_worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // A daemon restart drops the submitted worker slot while recovering the
+    // durable reviewer. The subsequent changes verdict must therefore create
+    // a replacement remediation worker rather than feed a live worker.
+    case.handle.stop_mut();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.restart_after_stop("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // Force the replacement remediation process spawn to fail after the
+    // original worker and its exact Codex thread have been persisted.
+    std::fs::remove_file(case.home.path().join("dual-runner.sh")).unwrap();
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "preserve this exact blocker",
+        ],
+    );
+    case.handle.wait_for("PARKED: task #1");
+    std::thread::sleep(Duration::from_millis(250));
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["remediation_feedback"], "preserve this exact blocker");
+    assert_eq!(refs["codex_thread_id"], original_thread);
+    drop(conn);
+
+    write_dual_protocol_runner(case.home.path());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.retry_parked();
+    case.handle
+        .wait_for("durable remediation retry: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
+    let replacement = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {replacement} result"));
+
+    let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let resume_prefix = format!("{replacement}|exec resume {original_thread} --json ");
+    let resume = log
+        .lines()
+        .find(|line| line.starts_with(&resume_prefix))
+        .unwrap_or_else(|| panic!("replacement must resume the original thread: {log}"));
+    assert!(
+        log.contains("preserve this exact blocker"),
+        "replacement prompt must contain the accepted reviewer feedback: {log}"
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line.starts_with(&format!("{replacement}|exec --json "))),
+        "implementation remediation must not start a fresh Codex thread: {log}"
+    );
+    assert!(
+        !resume.contains(&format!("You are agent {replacement}.")),
+        "replacement must not receive the initial-task prompt: {resume}"
+    );
+
+    case.done(&replacement, &["--pr", "1"]);
     case.handle.wait_for("lifecycle: task #1 -> in-review");
     case.handle.stop();
 }
