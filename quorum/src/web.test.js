@@ -2,9 +2,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-const context = {globalThis: {}};
+const context = {globalThis: {}, TextDecoder};
 vm.runInNewContext(fs.readFileSync('quorum/src/web.js', 'utf8'), context);
-const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim} = context.globalThis.QuorumWeb;
+const {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim} = context.globalThis.QuorumWeb;
 
 assert.equal(stripShellWrapper('/bin/zsh -lc "git status"'), 'git status');
 assert.equal(stripShellWrapper("/bin/zsh -lc 'git status'"), 'git status');
@@ -83,13 +83,17 @@ assert.equal(denseCapped.length, MAX_RENDERED_ROWS_PER_POLL);
 assert.match(denseCapped[0].title, new RegExp(`${50_000 - (MAX_RENDERED_ROWS_PER_POLL - 1)} earlier events omitted`));
 
 let tailState = {};
-let tail = reassembleTail(tailState, [], '{"type":"assistant","message":{"content":"part', false);
+let tail = reassembleTail(tailState, [], '7b2274797065223a22617373697374616e74222c226d657373616765223a7b22636f6e74656e74223a2270617274', false);
 tailState = tail.state;
 assert.equal(tail.lines.length, 0);
-tail = reassembleTail(tailState, ['ial"}}'], null, false);
+tail = reassembleTail(tailState, ['69616c227d7d'], null, false);
 assert.equal(tail.lines[0], '{"type":"assistant","message":{"content":"partial"}}');
 assert.equal(parseEventLine(tail.lines[0])[0].body, 'partial');
 
-tail = reassembleTail({}, ['truncated', '{"type":"assistant","message":{"content":"whole"}}'], null, true);
+tail = reassembleTail({}, ['7472756e6361746564', '7b2274797065223a22617373697374616e74222c226d657373616765223a7b22636f6e74656e74223a2277686f6c65227d7d'], null, true);
 assert.equal(tail.lines.length, 1);
 assert.equal(parseEventLine(tail.lines[0])[0].body, 'whole');
+
+tail = reassembleTail({}, [], '61'.repeat(MAX_PENDING_STREAM_BYTES + 1), false);
+assert.equal(tail.state.pending.length, 0);
+assert.equal(tail.state.discardLeading, true);

@@ -295,20 +295,29 @@ fn stream_payload(
     let read = file.read(&mut bytes).map_err(StreamError::Io)?;
     bytes.truncate(read);
     let next = start + read as u64;
-    let text = String::from_utf8_lossy(&bytes);
-    let mut chunks = text.split('\n').map(str::to_owned).collect::<Vec<_>>();
+    let mut chunks = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
     let partial = if bytes.ends_with(b"\n") {
         chunks.pop();
         None
     } else {
-        chunks.pop()
+        chunks.pop().map(hex_bytes)
     };
     // The initial tail can begin in the middle of a record. The client discards that
     // first completed fragment before it begins retaining suffixes for later requests.
     Ok(
-        json!({"lines": chunks, "partial": partial, "starts_mid_line": from.is_none() && start > 0,
+        json!({"lines": chunks.into_iter().map(hex_bytes).collect::<Vec<_>>(), "partial": partial, "starts_mid_line": from.is_none() && start > 0,
         "next_offset": next, "eof": next >= len}),
     )
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 15) as usize] as char);
+    }
+    encoded
 }
 
 fn server_error(error: quorum_core::error::QuorumError) -> Response {
@@ -385,7 +394,7 @@ mod tests {
         let first = stream_payload(root.path(), "A-100", Some(0), 4).unwrap();
         let next = first["next_offset"].as_u64().unwrap();
         let second = stream_payload(root.path(), "A-100", Some(next), 20).unwrap();
-        assert_eq!(second["lines"], json!(["two"]));
+        assert_eq!(second["lines"], json!(["74776f"]));
     }
 
     #[test]
@@ -418,7 +427,7 @@ mod tests {
             first["partial"].as_str().unwrap(),
             second["lines"][0].as_str().unwrap()
         );
-        assert_eq!(reassembled, record.trim_end());
+        assert_eq!(reassembled, hex_bytes(record.trim_end().as_bytes()));
     }
 
     #[test]

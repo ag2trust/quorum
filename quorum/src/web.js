@@ -3,6 +3,7 @@
   const MAX_RENDERED_TAIL_ROWS = 2000;
   const MAX_RENDERED_ROWS_PER_POLL = 2000;
   const MAX_NORMALIZED_RECORDS_PER_POLL = 2000;
+  const MAX_PENDING_STREAM_BYTES = 8 * 1024 * 1024;
   const MAX_EXPANDED_OUTPUT_CHARS = 200 * 1024;
   const MAX_NORMALIZED_EVENTS_PER_RECORD = 100;
   const ellipsize = (text, max = 90) => text.length > max ? text.slice(0, max - 1) + '…' : text;
@@ -118,22 +119,25 @@
     catch (_) { return normalizeEvents(null); }
   }
 
+  function hexBytes(hex) { const bytes = new Uint8Array(hex.length / 2); for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16); return bytes; }
+  function joinBytes(left, right) { const joined = new Uint8Array(left.length + right.length); joined.set(left); joined.set(right, left.length); return joined; }
   function reassembleTail(state, lines, partial, startsMidLine = false) {
-    let {pending = '', discardLeading = startsMidLine} = state;
+    let {pending = new Uint8Array(), discardLeading = startsMidLine} = state;
     const complete = [];
     for (const line of lines) {
       if (discardLeading) { discardLeading = false; continue; }
-      complete.push(pending + line);
-      pending = '';
+      complete.push(new TextDecoder('utf-8', {fatal: true}).decode(joinBytes(pending, hexBytes(line))));
+      pending = new Uint8Array();
     }
-    if (partial != null && !discardLeading) pending += partial;
+    if (partial != null && !discardLeading) pending = joinBytes(pending, hexBytes(partial));
+    if (pending.length > MAX_PENDING_STREAM_BYTES) { pending = new Uint8Array(); discardLeading = true; }
     return {lines: complete, state: {pending, discardLeading}};
   }
 
-  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim};
+  globalThis.QuorumWeb = {MAX_NORMALIZED_EVENTS_PER_RECORD, MAX_RENDERED_TAIL_ROWS, MAX_RENDERED_ROWS_PER_POLL, MAX_NORMALIZED_RECORDS_PER_POLL, MAX_PENDING_STREAM_BYTES, stripShellWrapper, commandSummary, normalizeEvent, normalizeEvents, parseEventLine, normalizeTail, reassembleTail, shouldTrim};
   if (typeof document === 'undefined') return;
 
-  let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {};
+  let openRun = null, offset = null, paused = false, rawMode = false, rawText = '', renderedChars = 0, runsBefore = null, tailState = {}, tailInFlight = false, tailEpoch = 0;
   const $ = id => document.getElementById(id);
   const put = (node, value) => { node.textContent = value ?? ''; return node; };
   const node = value => put(document.createTextNode(''), value);
@@ -155,20 +159,21 @@
     renderedChars += row.textContent.length; $('stream').append(row); trimStream();
   }
   function renderRaw() { $('rawStream').textContent = rawText.length > MAX_RENDERED_TAIL_CHARS ? rawText.slice(-MAX_RENDERED_TAIL_CHARS) : rawText; }
-  function appendTail(lines, partial, startsMidLine, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; tailState = {}; } const text = lines.join('\n') + (lines.length ? '\n' : '') + (partial || ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); const reassembled = reassembleTail(tailState, lines, partial, startsMidLine); tailState = reassembled.state; normalizeTail(reassembled.lines).forEach(renderEvent); if (rawMode) renderRaw(); }
+  function appendTail(lines, partial, startsMidLine, replace) { if (replace) { $('stream').replaceChildren(); renderedChars = 0; rawText = ''; tailState = {}; } const reassembled = reassembleTail(tailState, lines, partial, startsMidLine); tailState = reassembled.state; const text = reassembled.lines.join('\n') + (reassembled.lines.length ? '\n' : ''); rawText = (rawText + text).slice(-MAX_RENDERED_TAIL_CHARS); normalizeTail(reassembled.lines).forEach(renderEvent); if (rawMode) renderRaw(); }
   async function state() { if (document.hidden) return; const s = await fetch('/api/state').then(r => r.json()), counts = Object.fromEntries(s.counts.map(x => [x.status, x.count])); $('tiles').replaceChildren(); ['working', 'open', 'in-review', 'done'].forEach(key => { const tile = document.createElement('span'); tile.className = 'tile'; put(tile, key + '\n' + (counts[key] || 0)); $('tiles').append(tile); }); const tasks = $('tasks'); tasks.replaceChildren(); appendRow(tasks, ['State', 'Task', 'Provider/model', 'PR', 'Age'], true); s.tasks.forEach(x => { const pr = document.createElement('span'); if (x.pr) { const link = document.createElement('a'); link.href = 'https://github.com/ag2trust/quorum/pull/' + x.pr; put(link, '#' + x.pr); pr.append(link); } appendRow(tasks, [x.state, '#' + x.id + ' ' + x.title, (x.provider || 'pending') + ' ' + (x.model || ''), pr, age(x.age_secs)]); }); renderAgents(s.agents, s.now); $('alerts').textContent = JSON.stringify({alerts: s.alerts, errors: s.errors}, null, 2); }
   function renderAgents(agents, now) { const online = agents.filter(agent => agent.online), offline = agents.filter(agent => !agent.online); const render = (table, rows) => { table.replaceChildren(); appendRow(table, ['Agent', 'Task', 'Last seen'], true); rows.forEach(agent => { const seen = document.createElement('span'); put(seen, relativeTime(agent.last_seen, now)); seen.title = timestamp(agent.last_seen); appendRow(table, [agent.name, agent.task_held ? '#' + agent.task_held.id + ' ' + agent.task_held.title : '—', seen]); }); }; render($('agentTable'), online); render($('offlineAgentTable'), offline); $('offlineAgents').classList.toggle('hidden', !offline.length); put($('offlineAgents').querySelector('summary'), `${offline.length} offline`); }
   function duration(meta) { const start = meta.start_time, end = meta.end_time; return start && end ? age(Math.max(0, end - start)) : '—'; }
   function runTokens(meta) { return meta.cost_tokens == null ? '—' : Number(meta.cost_tokens).toLocaleString(); }
   function renderRuns(items, replace) { const table = $('runs'); if (replace) { table.replaceChildren(); appendRow(table, ['Agent', 'Role', 'Task', 'Duration', 'Final phase', 'Verdict', 'Tokens'], true); } items.forEach(run => { const meta = run.meta || {}, tr = appendRow(table, [meta.agent || '—', meta.role || '—', meta.task_id == null ? '—' : '#' + meta.task_id, duration(meta), meta.final_phase || '—', meta.verdict || '—', runTokens(meta)]); tr.className = 'clickable'; tr.dataset.runDir = run.dir; tr.addEventListener('click', () => openDetail(run.dir)); }); }
   let currentRunsBefore = null;
-  async function runs(before = currentRunsBefore) { if (document.hidden) return; const suffix = before ? '?before=' + encodeURIComponent(before) : ''; const response = await fetch('/api/runs' + suffix).then(x => x.json()); renderRuns(response.runs, true); currentRunsBefore = before; runsBefore = response.next_before; $('moreRuns').classList.toggle('hidden', !runsBefore); }
-  async function openDetail(dir, from) { openRun = dir; offset = from ?? null; rawText = ''; rawMode = false; put($('rawToggle'), 'Show raw'); $('rawStream').classList.add('hidden'); $('stream').classList.remove('hidden'); show('run'); put($('runTitle'), dir); await tail(); }
-  async function tail() { if (!openRun || paused || document.hidden) return; const url = '/api/runs/' + encodeURIComponent(openRun) + '/stream?max=2097152' + (offset !== null ? '&from=' + offset : ''); const response = await fetch(url).then(x => x.json()); appendTail(response.lines, response.partial, response.starts_mid_line, offset === null); offset = response.next_offset; $('stream').scrollTop = $('stream').scrollHeight; }
+  async function runs(before = currentRunsBefore) { if (document.hidden) return; const suffix = before ? '?before=' + encodeURIComponent(before) : ''; const response = await fetch('/api/runs' + suffix).then(x => x.json()); renderRuns(response.runs, true); currentRunsBefore = before; runsBefore = response.next_before; $('moreRuns').classList.toggle('hidden', !runsBefore); $('newestRuns').classList.toggle('hidden', !currentRunsBefore); }
+  async function openDetail(dir, from) { tailEpoch++; openRun = dir; offset = from ?? null; rawText = ''; rawMode = false; put($('rawToggle'), 'Show raw'); $('rawStream').classList.add('hidden'); $('stream').classList.remove('hidden'); show('run'); put($('runTitle'), dir); await tail(); }
+  async function tail() { if (!openRun || paused || document.hidden || tailInFlight) return; tailInFlight = true; const epoch = tailEpoch, run = openRun, from = offset; try { const url = '/api/runs/' + encodeURIComponent(run) + '/stream?max=2097152' + (from !== null ? '&from=' + from : ''); const response = await fetch(url).then(x => x.json()); if (epoch !== tailEpoch || run !== openRun) return; appendTail(response.lines, response.partial, response.starts_mid_line, from === null); offset = response.next_offset; $('stream').scrollTop = $('stream').scrollHeight; } finally { tailInFlight = false; } }
   $('pause').onclick = () => { paused = !paused; put($('pause'), paused ? 'Resume tail' : 'Pause tail'); };
   $('start').onclick = event => { event.preventDefault(); openDetail(openRun, 0); };
   $('rawToggle').onclick = () => { rawMode = !rawMode; $('stream').classList.toggle('hidden', rawMode); $('rawStream').classList.toggle('hidden', !rawMode); put($('rawToggle'), rawMode ? 'Show rendered' : 'Show raw'); if (rawMode) renderRaw(); };
   $('moreRuns').onclick = () => runs(runsBefore);
+  $('newestRuns').onclick = () => runs(null);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { state(); runs(); tail(); } });
   state(); runs(); setInterval(state, 2000); setInterval(() => runs(), 5000); setInterval(tail, 1000);
 })();
