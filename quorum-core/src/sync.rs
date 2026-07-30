@@ -698,7 +698,9 @@ fn next_task_view(
     ))";
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
-         WHERE status = 'open' AND {DEP_READY_CLAUSE}"
+         WHERE status = 'open'
+           AND COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+           AND {DEP_READY_CLAUSE}"
     );
     if !match_labels.is_empty() {
         use std::fmt::Write as _;

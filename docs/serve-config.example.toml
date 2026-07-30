@@ -27,8 +27,10 @@ effort = "high"
 # operational routing policy, not a cross-vendor benchmark.
 # Claude: 1=sonnet-5/medium, 2=opus-46/medium, 3=opus-46/high,
 #         4=opus-47/high, 5=opus-48/high
-# Codex:  1=luna/high, 2=terra/high, 3=sol/medium,
+# Codex:  1=luna/high, 2=terra/high, 3=terra/high,
 #         4=sol/high, 5=sol/high
+# Complexity 5 is recommendation metadata only: the daemon durably parks
+# category-5 tasks instead of dispatching them.
 # Task creators cannot override complexity, model, or effort. Optional operator
 # overrides must use a closed tier and medium|high.
 # [suggested_models]

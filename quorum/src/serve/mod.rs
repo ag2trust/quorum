@@ -2730,6 +2730,24 @@ async fn tick(
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
+    // Category-5 work is outside automatic-dispatch policy. Reconcile rows
+    // written by older daemons before any mailbox recovery or provisioning
+    // path can regain authority.
+    {
+        let p = db_path.clone();
+        let parked = tokio::task::spawn_blocking(move || -> Result<usize> {
+            let mut conn = quorum_core::db::open(&p)?;
+            quorum_core::tasks::park_classified_complexity_five(&mut conn, now_unix())
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
+        if parked > 0 {
+            log(&format!(
+                "policy: parked {parked} complexity-5 task(s); split or rescope before creating replacement tasks"
+            ));
+        }
+    }
+
     // ── Phase 1: Poll mailbox ───────────────────────────────────────────
     let mailbox_rows = {
         let p = db_path.clone();
@@ -10840,7 +10858,7 @@ mod tests {
         let expected = [
             (1, "gpt-5.6-luna", "high"),
             (2, "gpt-5.6-terra", "high"),
-            (3, "gpt-5.6-sol", "medium"),
+            (3, "gpt-5.6-terra", "high"),
             (4, "gpt-5.6-sol", "high"),
             (5, "gpt-5.6-sol", "high"),
         ];
@@ -10903,7 +10921,7 @@ mod tests {
         let expected = [
             (1, "gpt-5.6-luna", "high"),
             (2, "gpt-5.6-terra", "high"),
-            (3, "gpt-5.6-sol", "medium"),
+            (3, "gpt-5.6-terra", "high"),
             (4, "gpt-5.6-sol", "high"),
             (5, "gpt-5.6-sol", "high"),
         ];

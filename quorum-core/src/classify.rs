@@ -167,6 +167,9 @@ pub fn store_classifications(
                     params![result.task_id, now, note],
                 )?;
             }
+            if sanitized.cx_est == 5 {
+                crate::tasks::park_complexity_five_tx(&tx, result.task_id, now)?;
+            }
         }
     }
 
@@ -323,6 +326,7 @@ fn classifier_rubric(recommendations: &str) -> String {
 The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
+Level 5 is retained as classification context but is parked instead of dispatched.
 
 2. **cx_flags** (array of strings, may be empty): Shape-lint flags.
    - "oversized": Task looks like > ~30-45 min of agent work (complexity 4-5 with broad scope)
@@ -598,6 +602,71 @@ mod tests {
         assert_eq!(luna_by, "gpt-5.6-luna:v1");
         assert_eq!(terra_by, "gpt-5.6-terra:v1");
         assert_ne!(luna_by, terra_by);
+    }
+
+    #[test]
+    fn category_five_classification_atomically_parks_without_run_or_error() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Architectural task", 1);
+        let results = vec![TaskClassification {
+            task_id,
+            cx_est: 5,
+            cx_flags: vec!["oversized".into()],
+            cx_tags: vec!["kind:feature".into()],
+            cx_dup_of: vec![],
+        }];
+
+        assert_eq!(
+            store_classifications(&mut conn, &results, "gpt-5.6-luna:v1", 2_000_000).unwrap(),
+            1
+        );
+
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.assignee, None);
+        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_by"], "gpt-5.6-luna:v1");
+        assert_eq!(refs["daemon_parked"], true);
+        assert_eq!(refs["daemon_resume_status"], "open");
+        assert!(refs["daemon_parked_reason"]
+            .as_str()
+            .unwrap()
+            .contains("complexity 5"));
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
+                params![format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let errors: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        let parked_events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_parked' AND subject=?1",
+                params![format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0);
+        assert_eq!(runs, 0);
+        assert_eq!(errors, 0);
+        assert_eq!(parked_events, 1);
+        assert!(
+            crate::tasks::retry_parked(&mut conn, task_id, "operator", true, 2_000_001)
+                .unwrap()
+                .is_none(),
+            "unchanged category-5 task must not retry into a dispatch loop"
+        );
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub const CLAUDE_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
 pub const CODEX_RECOMMENDATIONS: [(u8, &str, &str); 5] = [
     (1, "gpt-5.6-luna", "high"),
     (2, "gpt-5.6-terra", "high"),
-    (3, "gpt-5.6-sol", "medium"),
+    (3, "gpt-5.6-terra", "high"),
     (4, "gpt-5.6-sol", "high"),
     (5, "gpt-5.6-sol", "high"),
 ];
@@ -147,7 +147,7 @@ mod tests {
             [
                 (1, "gpt-5.6-luna", "high"),
                 (2, "gpt-5.6-terra", "high"),
-                (3, "gpt-5.6-sol", "medium"),
+                (3, "gpt-5.6-terra", "high"),
                 (4, "gpt-5.6-sol", "high"),
                 (5, "gpt-5.6-sol", "high"),
             ]
