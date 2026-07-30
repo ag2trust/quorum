@@ -85,6 +85,18 @@ impl ServeHandle {
         merge_cmd: &str,
         extra_args: &[&str],
     ) -> Self {
+        Self::start_with_env(home, repo, wt_base, names, merge_cmd, extra_args, &[])
+    }
+
+    fn start_with_env(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        merge_cmd: &str,
+        extra_args: &[&str],
+        extra_env: &[(String, String)],
+    ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let gh_shim = tempfile::tempdir().unwrap();
@@ -159,7 +171,8 @@ fi
             args.push(a.to_string());
         }
 
-        let mut child = Command::new(cargo_bin("quorum"))
+        let mut command = Command::new(cargo_bin("quorum"));
+        command
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .env("PATH", path)
@@ -167,9 +180,11 @@ fi
             .env("QUORUM_TEST_REPO", repo)
             .args(&args)
             .stderr(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::null());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
 
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = mpsc::channel::<String>();
@@ -234,6 +249,19 @@ fi
             self.lines.push(line);
         }
     }
+}
+
+/// Put an executable `gh` that always fails first on PATH. This makes the
+/// fallback deterministic even on machines with authenticated GitHub CLI
+/// credentials.
+fn gh_unavailable_path(home: &std::path::Path) -> String {
+    let bin = home.join("gh-unavailable-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{path}", bin.display())
 }
 
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
@@ -729,6 +757,146 @@ fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
     assert_eq!(intent.pr, pr);
     assert_eq!(intent.head_sha, staged_head);
     assert!(intent.feedback.contains("ci-test"));
+    handle.sigkill();
+}
+
+/// Regression: a failed remediation provisioning attempt must not overwrite
+/// the original managed worker identity. When GitHub is unavailable on the
+/// later attempt and no PR target was persisted, remediation must fetch the
+/// original PR branch rather than a branch derived from the first remediation
+/// agent name.
+#[test]
+fn remediation_retry_fetches_original_branch_when_github_is_unavailable() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let first_remediation = "FirstRemediation";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    stage_failed_ci_remediation(home.path(), repo_dir.path(), task_id, pr);
+
+    // Model a first provision attempt that acquired then released its lease.
+    // The second, durable CI remediation must still derive the PR branch from
+    // OrigWorker, not from FirstRemediation.
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut conn = quorum_core::db::open(&db_path).unwrap();
+    assert!(
+        quorum_core::pr_targets::get(&conn, task_id, pr)
+            .unwrap()
+            .is_none(),
+        "test requires no persisted authoritative PR target"
+    );
+    quorum_core::tasks::claim_remediation_rework(&mut conn, first_remediation, task_id, 3600, now)
+        .unwrap()
+        .expect("first remediation claim");
+    quorum_core::tasks::release_remediation_lease(&mut conn, first_remediation, task_id, now + 1)
+        .unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.author.as_deref(), Some(author));
+    drop(conn);
+
+    let path = gh_unavailable_path(home.path());
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+        &[("PATH".into(), path)],
+    );
+    assert!(
+        handle.wait_for("preserving exact CI remediation", 15),
+        "retry did not enter durable remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning remediation worker", 15),
+        "retry did not spawn remediation with GitHub unavailable: {:?}",
+        handle.lines
+    );
+    let agent = handle
+        .extract_agent_name("spawning remediation worker ")
+        .expect("remediation agent name");
+    assert!(
+        handle.wait_for("spawned for task", 15),
+        "retry did not finish provisioning: {:?}",
+        handle.lines
+    );
+
+    let expected_branch = format!("daemon/{}-t{task_id}", author.to_lowercase());
+    let wrong_branch = format!("daemon/{}-t{task_id}", first_remediation.to_lowercase());
+    let expected_ref = format!("refs/remotes/origin/{expected_branch}");
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &expected_ref,
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "offline retry must fetch the original managed PR branch"
+    );
+
+    let wt_path = wt_base.path().join(format!("{agent}-t{task_id}"));
+    let worktree = Command::new("git")
+        .args([
+            "-C",
+            &wt_path.to_string_lossy(),
+            "rev-parse",
+            "--is-inside-work-tree",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        worktree.status.success(),
+        "remediation worktree is unavailable"
+    );
+
+    // Negative: the first remediation agent has no managed PR branch, and an
+    // offline retry must not invent or fetch one under that agent's name.
+    let wrong_ref = format!("refs/remotes/origin/{wrong_branch}");
+    assert!(
+        !Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &wrong_ref,
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "offline retry must not fetch the prior remediation agent branch"
+    );
+
     handle.sigkill();
 }
 

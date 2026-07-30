@@ -10542,8 +10542,6 @@ async fn spawn_remediation_worker(
         return false;
     }
 
-    // Author was already set by claim_remediation_rework.
-
     // Inspection surfaces report the PR branch this run continues, not the
     // daemon's local checkout name.
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
