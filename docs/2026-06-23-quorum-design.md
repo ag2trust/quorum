@@ -1445,8 +1445,9 @@ labels are ignored.
   timed-out, or failed classification never falls back to the daemon worker default.
 - Persisting `cx_est=5` atomically parks the task in `failed` with the standard daemon
   parking refs, note, and `task_parked` event. No claim, run, or error row is created.
-  Startup reconciliation parks category-5 rows written by older daemons before recovery
-  or dispatch. Atomic claim predicates independently reject category 5. `task-retry`
+  Startup reconciliation parks category-5 rows written by older daemons in fixed-size,
+  ID-ordered batches before recovery or dispatch. Atomic claim predicates independently
+  reject category 5 while later ticks finish the backlog. `task-retry`
   returns a clean negative while `cx_est` remains 5, so the task cannot hot-loop; the
   operator must split or rescope the work into new tasks.
 - The active daemon provider selects the corresponding model and effort from its five-level

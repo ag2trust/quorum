@@ -2107,8 +2107,8 @@ pub(crate) fn park_complexity_five_tx(
 }
 
 /// Reconcile category-5 rows classified by an older daemon or changed while
-/// this daemon was stopped. Bounded only by the number of live category-5
-/// tasks; each task is terminally parked after one pass.
+/// this daemon was stopped. Each tick parks at most [`SWEEP_LIMIT`] rows in
+/// stable ID order, bounding the write transaction while guaranteeing progress.
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
@@ -2116,10 +2116,12 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
             "SELECT id FROM tasks
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
-               AND json_extract(refs, '$.cx_est')=5",
+               AND json_extract(refs, '$.cx_est')=5
+             ORDER BY id
+             LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map([], |row| row.get(0))?
+            .query_map(params![SWEEP_LIMIT as i64], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
@@ -7530,5 +7532,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, 1, "restart reconciliation must be idempotent");
+    }
+
+    #[test]
+    fn legacy_category_five_reconciliation_progresses_in_bounded_batches() {
+        let (_d, mut c) = open_tmp();
+        let total = SWEEP_LIMIT + 1;
+        for seq in 0..total {
+            let id = create(
+                &mut c,
+                "boss",
+                &format!("legacy category five {seq}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                1000 + seq as i64,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET refs=json_object('cx_est', 5, 'cx_by', 'legacy:v1')
+                 WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            park_classified_complexity_five(&mut c, 2000).unwrap(),
+            SWEEP_LIMIT
+        );
+        let still_live: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE status NOT IN ('done','failed','cancelled')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_live, 1, "one row must remain for the next tick");
+
+        assert_eq!(park_classified_complexity_five(&mut c, 2001).unwrap(), 1);
+        assert_eq!(park_classified_complexity_five(&mut c, 2002).unwrap(), 0);
+        let parked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks
+                 WHERE status='failed'
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   AND json_extract(refs, '$.cx_est')=5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_parked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, total as i64);
+        assert_eq!(
+            events, total as i64,
+            "repeated ticks must not duplicate audit events"
+        );
     }
 }
