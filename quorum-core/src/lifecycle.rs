@@ -333,14 +333,23 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         }
         (Status::Rework, Event::AgentFailed { reason }) => {
             if t.review_only {
+                // A lost remediation worker must not hand the task back to
+                // review: the replacement reviewer re-judges the unchanged PR
+                // head and its changes verdict burns a rework round with zero
+                // remediation applied. Park instead (Failed + daemon_parked
+                // refs, written by the storage layer); the daemon's head check
+                // resumes straight to in-review when the worker did push, and
+                // `task-retry` covers the rest.
                 Ok((
-                    Status::InReview,
+                    Status::Failed,
                     vec![
                         Effect::ReleaseLease,
                         Effect::NotifyOwner {
-                            reason: reason.clone(),
+                            reason: format!(
+                                "remediation worker lost ({reason}); parked — \
+                                 resume with `quorum task-retry`"
+                            ),
                         },
-                        Effect::SpawnReviewer,
                     ],
                 ))
             } else {
@@ -357,9 +366,17 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         }
         (Status::Rework, Event::LeaseExpired) => {
             if t.review_only {
+                // Same park-not-bounce contract as AgentFailed above.
                 Ok((
-                    Status::InReview,
-                    vec![Effect::ReleaseLease, Effect::SpawnReviewer],
+                    Status::Failed,
+                    vec![
+                        Effect::ReleaseLease,
+                        Effect::NotifyOwner {
+                            reason: "remediation lease expired; parked — \
+                                     resume with `quorum task-retry`"
+                                .into(),
+                        },
+                    ],
                 ))
             } else {
                 Ok((Status::Open, vec![Effect::ReleaseLease]))
@@ -997,7 +1014,9 @@ mod tests {
     }
 
     // ── Review-only rework recovery (table-driven) ─────────────────
-    // review_only tasks must recover to InReview; implementation tasks to Open.
+    // Implementation tasks recover to Open (worker requeue). review_only
+    // tasks park (Failed + daemon_parked refs): bouncing to InReview would
+    // re-review the unchanged PR head and burn a rework round per bounce.
 
     #[test]
     fn rework_recovery_destinations_by_review_only() {
@@ -1017,8 +1036,8 @@ mod tests {
             Case {
                 review_only: true,
                 event: Event::AgentFailed { reason: "x".into() },
-                expected_status: Status::InReview,
-                label: "review_only+AgentFailed→InReview",
+                expected_status: Status::Failed,
+                label: "review_only+AgentFailed→Failed(park)",
             },
             Case {
                 review_only: false,
@@ -1029,8 +1048,8 @@ mod tests {
             Case {
                 review_only: true,
                 event: Event::LeaseExpired,
-                expected_status: Status::InReview,
-                label: "review_only+LeaseExpired→InReview",
+                expected_status: Status::Failed,
+                label: "review_only+LeaseExpired→Failed(park)",
             },
         ];
         for case in &cases {
@@ -1044,38 +1063,45 @@ mod tests {
     }
 
     #[test]
-    fn rework_agent_failed_review_only_spawns_reviewer() {
+    fn rework_agent_failed_review_only_parks_without_reviewer() {
         let mut t = view(Status::Rework);
         t.review_only = true;
         t.pr = Some("42".into());
         t.author = Some("W1".into());
-        assert_ok(
+        let (status, effects) = transition(
             &t,
             &Event::AgentFailed {
                 reason: "crash".into(),
             },
-            Status::InReview,
-            &[
-                Effect::ReleaseLease,
-                Effect::NotifyOwner {
-                    reason: "crash".into(),
-                },
-                Effect::SpawnReviewer,
-            ],
+        )
+        .unwrap();
+        // Park, never bounce: a replacement reviewer on the unchanged head
+        // would burn a rework round with zero remediation applied.
+        assert_eq!(status, Status::Failed);
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(
+            !effects.contains(&Effect::SpawnReviewer),
+            "remediation death must not spawn a reviewer"
         );
+        assert!(
+            !effects.contains(&Effect::IncrementReworkRound),
+            "infra failure must not consume a rework round"
+        );
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyOwner { reason } if reason.contains("crash"))));
     }
 
     #[test]
-    fn rework_lease_expired_review_only_spawns_reviewer() {
+    fn rework_lease_expired_review_only_parks_without_reviewer() {
         let mut t = view(Status::Rework);
         t.review_only = true;
         t.pr = Some("42".into());
-        assert_ok(
-            &t,
-            &Event::LeaseExpired,
-            Status::InReview,
-            &[Effect::ReleaseLease, Effect::SpawnReviewer],
-        );
+        let (status, effects) = transition(&t, &Event::LeaseExpired).unwrap();
+        assert_eq!(status, Status::Failed);
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(!effects.contains(&Effect::SpawnReviewer));
+        assert!(!effects.contains(&Effect::IncrementReworkRound));
     }
 
     #[test]

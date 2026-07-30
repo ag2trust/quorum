@@ -959,7 +959,8 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
         task_id: Some(slot.task_id),
         session_id: slot.session_id.clone(),
         worktree: Some(slot.worktree_path.to_string_lossy().into()),
-        branch: Some(slot.branch.clone()),
+        // Inspection surfaces show the branch the work lands on.
+        branch: Some(slot.remote_branch.clone()),
         phase: phase.into(),
         cost_tokens: slot.cost_tokens,
         agent_state: slot.agent_state.clone(),
@@ -1198,7 +1199,14 @@ pub(crate) struct SlotState {
     model: String,
     effort: String,
     worktree_path: PathBuf,
+    /// Local branch checked out in this slot's worktree. The daemon owns this
+    /// name exclusively, so teardown may delete it.
     branch: String,
+    /// Remote branch this slot's work lands on (the PR head). Equals `branch`
+    /// for fresh workers and unused for reviewers; remediation workers diverge
+    /// because their local branch is namespaced to avoid colliding with a PR
+    /// head someone else already has checked out locally.
+    remote_branch: String,
     draining: bool,
     pr: Option<i64>,
     rework_count: u32,
@@ -2212,6 +2220,46 @@ async fn reconcile_remediation_retries(
     if draining {
         return Ok(());
     }
+    // Auto-retry daemon-caused parks first (drain/shutdown/restart-recovery
+    // teardown of a remediation worker, flagged at park time within the
+    // recovery budget): the daemon caused the park, so it owes the respawn —
+    // no `task-retry` demanded of the owner. `reset_recovery_budget=false`
+    // keeps the budget spent at park time, so a drain loop stays bounded.
+    // Genuine-failure parks never carry the flag and stay owner-gated.
+    {
+        let p = config.db_path.clone();
+        let unparked = tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let ids: Vec<i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM tasks
+                     WHERE status='failed'
+                       AND json_valid(refs)
+                       AND json_extract(refs, '$.daemon_parked')=1
+                       AND json_extract(refs, '$.daemon_rework_retry_requested')=1
+                     LIMIT 8",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut resumed = Vec::new();
+            for id in ids {
+                if tasks::retry_parked(&mut conn, id, "daemon", false, now_unix())?.is_some() {
+                    resumed.push(id);
+                }
+            }
+            Ok(resumed)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("auto-retry park scan join: {error}")))??;
+        for id in unparked {
+            log(&format!(
+                "auto-retrying daemon-caused remediation park for task #{id}"
+            ));
+        }
+    }
     let pending = {
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
@@ -3013,7 +3061,7 @@ async fn tick(
                             let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
                                 workers.iter().find(|w| w.task_id == reviewer_task_id)
                             {
-                                Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
+                                Some((w.agent_name.clone(), w.task_id, w.remote_branch.clone()))
                             } else {
                                 let db_branch = {
                                     let p = db_path.clone();
@@ -6620,6 +6668,7 @@ async fn tick(
         drain_state.draining,
     )
     .await?;
+    reconcile_parked_head_checks(config, drain_state.draining).await?;
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
@@ -7678,8 +7727,8 @@ fn write_live_sidecar(slot: &SlotState) {
 }
 
 /// A minimal view of the reviewer's counterpart — the agent whose PR is
-/// under review. `branch` is a hint for logging; provisioning resolves the
-/// authoritative ref from GitHub (#189).
+/// under review. `branch` is the counterpart's REMOTE branch, used only as a
+/// fetch fallback when GitHub cannot resolve the authoritative ref (#189).
 #[allow(dead_code)]
 struct ReviewCounterpart<'a> {
     agent_name: &'a str,
@@ -7692,7 +7741,7 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
         Self {
             agent_name: &w.agent_name,
             task_id: w.task_id,
-            branch: &w.branch,
+            branch: &w.remote_branch,
         }
     }
 }
@@ -7909,7 +7958,21 @@ async fn provision_reviewer(
     };
     let provision_ok = match provision_result {
         Ok(_) => match wt_mgr.verify_head_sha(&wt_path, head_sha).await {
-            Ok(()) => true,
+            // Reviewers read code and post GitHub comments — they never push.
+            // Defense in depth, not an authority boundary (an explicit remote
+            // URL or `gh` still works); a failed lockout means a broken
+            // assumption about the worktree, so abort rather than proceed.
+            Ok(()) => match wt_mgr.disable_push(&wt_path).await {
+                Ok(()) => true,
+                Err(e) => {
+                    log(&format!(
+                        "reviewer push lockout failed for PR #{pr}: {e} — tearing down worktree"
+                    ));
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    false
+                }
+            },
             Err(e) => {
                 log(&format!(
                     "reviewer worktree does not match gated HEAD for PR #{pr}: {e}"
@@ -8369,6 +8432,9 @@ async fn provision_reviewer(
                 model: reviewer_model,
                 effort: reviewer_effort,
                 worktree_path: wt_path,
+                // Reviewers never push; the local review branch is the only
+                // branch identity they have.
+                remote_branch: branch.clone(),
                 branch,
                 draining: true,
                 pr: Some(pr),
@@ -8922,6 +8988,8 @@ async fn spawn_worker(
                 model: resolved_model,
                 effort: resolved_effort,
                 worktree_path: wt_path,
+                // A fresh worker pushes the branch it checked out.
+                remote_branch: branch.clone(),
                 branch,
                 draining: true,
                 pr: task
@@ -9331,32 +9399,7 @@ async fn park_remediation_provision_failure(
     // `task-retry` restores a parked rework task without the original reviewer
     // process or mailbox row. Preserve the accepted blocking feedback so the
     // replacement remediation turn remains tied to the unresolved finding.
-    let p = config.db_path.clone();
-    let feedback = feedback.to_string();
-    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&p)?;
-        let Some(task) = tasks::get(&conn, task_id)? else {
-            return Ok(());
-        };
-        let mut refs: serde_json::Value = task
-            .refs
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
-            .unwrap_or_else(|| serde_json::json!({}));
-        let Some(object) = refs.as_object_mut() else {
-            return Err(QuorumError::Io(
-                "remediation task refs must be a JSON object".into(),
-            ));
-        };
-        object.insert(
-            "remediation_feedback".into(),
-            serde_json::Value::String(feedback),
-        );
-        tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
-    })
-    .await;
+    persist_remediation_feedback(&config.db_path, task_id, feedback).await;
     let reason = format!("remediation worker provisioning failed for PR #{pr}");
     park_task(&config.db_path, task_id, &reason, "rework").await;
     notify_provision_failure(
@@ -9366,6 +9409,187 @@ async fn park_remediation_provision_failure(
         &format!("#{pr}"),
     )
     .await;
+}
+
+/// Parks older than this fall out of the head-check scan entirely: the PR is
+/// likely gone or the daemon was down for a long stretch, and `task-retry`
+/// remains the recovery path. Keeps dead rows from consuming a GitHub lookup
+/// every tick forever.
+const PARKED_HEAD_CHECK_MAX_AGE_SECS: i64 = 24 * 3600;
+/// A park younger than the remediation lease TTL is never settled as
+/// "unchanged": the dying worker's push can still be in flight, and settling
+/// early would strand delivered work behind a manual retry. A moved head
+/// settles immediately at any age.
+const PARKED_HEAD_CHECK_MIN_AGE_SECS: i64 = tasks::DEFAULT_LEASE_TTL_SECS;
+/// Head checks settled per tick — each costs one GitHub lookup.
+const PARKED_HEAD_CHECK_SCAN_LIMIT: i64 = 4;
+
+/// Settle one-shot head checks on remediation-death parks (D5b).
+///
+/// A remediation worker can push its fix and die before signaling
+/// `ReworkPushed`; the park that followed would then strand finished work
+/// behind a manual retry. Compare the PR head now against the head recorded
+/// at remediation spawn (`pr_targets.head_sha`):
+/// - moved → resume the task straight to `in-review` (any age) so the pushed
+///   head gets a fresh verdict. NOTE: a moved head proves a push happened,
+///   not that the remediation is complete — a WIP push gets its verdict from
+///   the reviewer, which is still strictly better than stranding it parked.
+/// - unchanged → settle (stay parked for `task-retry`) only once the park is
+///   older than the remediation lease TTL; younger parks stay pending so a
+///   slow in-flight push still gets rescued next tick.
+/// - unresolvable (gh error/rate limit) → NO settle, no writes; the marker
+///   stays pending and the age window bounds how long we keep trying.
+///
+/// The GitHub lookup runs with no DB transaction held.
+async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> Result<()> {
+    if draining {
+        return Ok(());
+    }
+    // (task_id, pr, spawn_head_sha, park_age_secs) for pending head checks.
+    type PendingHeadCheck = (i64, Option<i64>, Option<String>, i64);
+    let pending: Vec<PendingHeadCheck> = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<PendingHeadCheck>> {
+            let conn = quorum_core::db::open(&p)?;
+            let now = now_unix();
+            let mut stmt = conn.prepare(
+                "SELECT id, refs, ?1 - updated_at FROM tasks
+                 WHERE status='failed'
+                   AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   AND json_extract(refs, '$.daemon_parked_head_check')=1
+                   AND updated_at > ?1 - ?2
+                 LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    (
+                        now,
+                        PARKED_HEAD_CHECK_MAX_AGE_SECS,
+                        PARKED_HEAD_CHECK_SCAN_LIMIT,
+                    ),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, refs, age)| {
+                    // Baseline read is `pr_targets::get` on purpose: it must
+                    // NOT go through `resolve_or_load_pr_target`, which
+                    // upserts the current head and would silently destroy the
+                    // spawn-time baseline this comparison depends on.
+                    let pr = tasks::extract_pr_number(&refs);
+                    let spawn_sha = pr.and_then(|pr| {
+                        pr_targets::get(&conn, id, pr)
+                            .ok()
+                            .flatten()
+                            .map(|target| target.head_sha)
+                    });
+                    (id, pr, spawn_sha, age)
+                })
+                .collect())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("parked head-check scan join: {error}")))??
+    };
+
+    for (task_id, pr, spawn_sha, park_age) in pending {
+        let (Some(pr), Some(spawn_sha)) = (pr, spawn_sha) else {
+            // No PR identity or no spawn baseline: a comparison is impossible
+            // forever, so settle as parked rather than re-scan every tick.
+            let p = config.db_path.clone();
+            let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::resolve_parked_head_check(&mut conn, task_id, false, now_unix())
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("parked head-check settle join: {error}"))
+            })??;
+            if settled {
+                log(&format!(
+                    "head check: no PR baseline for task #{task_id} — settled, staying parked"
+                ));
+            }
+            continue;
+        };
+
+        // Same injectable seam as every other daemon head read (startup
+        // verdict recovery, CI gating): the harness's command executor
+        // answers with the local repo head, so both branches are testable.
+        let current = {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                .await
+                .ok()
+                .flatten()
+        };
+        let head_moved = match current {
+            Some(current_sha) => current_sha != spawn_sha,
+            None => {
+                // Transient lookup failure must not consume the one-shot
+                // marker — leave it pending; the age window bounds retries.
+                log(&format!(
+                    "head check: PR #{pr} unresolved for task #{task_id} — will retry"
+                ));
+                continue;
+            }
+        };
+        if !head_moved && park_age < PARKED_HEAD_CHECK_MIN_AGE_SECS {
+            // Unchanged but young: a slow in-flight push could still land.
+            continue;
+        }
+
+        let p = config.db_path.clone();
+        let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::resolve_parked_head_check(&mut conn, task_id, head_moved, now_unix())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("parked head-check settle join: {error}")))??;
+        // Logged after the settle commits so observers (and tests) never see
+        // the outcome line while the marker is still pending.
+        if settled && head_moved {
+            log(&format!(
+                "head check: task #{task_id} head advanced before worker death — resumed to in-review"
+            ));
+        } else if settled {
+            log(&format!(
+                "head check settled for task #{task_id} — staying parked"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Atomically persist the round's blocking feedback and log on failure — this
+/// write is the recovery backbone: after any park, the durable-retry
+/// reconciler can only rebuild the remediation turn from this key.
+async fn persist_remediation_feedback(db_path: &std::path::Path, task_id: i64, feedback: &str) {
+    let p = db_path.to_path_buf();
+    let feedback = feedback.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = quorum_core::db::open(&p)?;
+        tasks::set_remediation_feedback(&conn, task_id, &feedback, now_unix())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "FAILED to persist remediation feedback for task #{task_id}: {error} — \
+             a park before the next successful write cannot rebuild the remediation turn"
+        )),
+        Err(error) => log(&format!(
+            "FAILED to persist remediation feedback for task #{task_id} (join): {error}"
+        )),
+    }
 }
 
 /// Check if a task's refs.repo mismatches all repos this daemon can provision from.
@@ -9783,17 +10007,27 @@ async fn spawn_remediation_worker(
         .await;
     }
 
+    // Persist the round's blocking feedback before the worker runs. A worker
+    // that dies at runtime parks (D5b), and the durable-retry reconciler can
+    // only respawn remediation when `remediation_feedback` survived the slot.
+    persist_remediation_feedback(db_path, task_id, feedback).await;
+
     log(&format!(
         "spawning remediation worker {} for task #{task_id} PR #{pr}",
         agent_name
     ));
 
     let session_id = agent::new_session_id();
-    let branch = pr_target
+    // The remote branch is a push target, not a local checkout: a PR head may
+    // legitimately be checked out in someone else's worktree, and git forbids
+    // one branch in two worktrees. The daemon checks out a run-unique local
+    // name and configures push upstream to the PR head instead.
+    let remote_branch = pr_target
         .as_ref()
         .map(|t| t.head_ref.clone())
         .or_else(|| fallback_branch.clone())
         .unwrap();
+    let branch = reviewer::remediation_branch(&agent_name, task_id);
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", agent_name, task_id));
@@ -9801,9 +10035,15 @@ async fn spawn_remediation_worker(
     let task_repo_dir = &config.repo_dir;
     let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
         let result = if target.is_fork {
-            wt_mgr
-                .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
-                .await
+            // A fork head ref names a branch in the FORK, not in origin, and
+            // the daemon holds no fork credentials — there is nowhere for the
+            // agent to push. Configuring an origin upstream would aim a bare
+            // `git push` at a same-named origin branch (`main`, for a typical
+            // fork PR). Fail closed and let the provision-strike path park.
+            Err(format!(
+                "fork PR: no pushable remote for head '{}' — remediation cannot push to the fork",
+                target.head_ref
+            ))
         } else {
             wt_mgr
                 .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
@@ -9812,24 +10052,46 @@ async fn spawn_remediation_worker(
         (result, Some(target.head_sha.as_str()))
     } else {
         let result = wt_mgr
-            .fetch_and_provision(task_repo_dir, &branch, &wt_path, &branch)
+            .fetch_and_provision(task_repo_dir, &branch, &wt_path, &remote_branch)
             .await;
         (result, None)
     };
     let provision_ok = match provision_result {
         Ok(_) => {
-            if let Some(expected_sha) = sha_to_verify {
-                wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok()
-            } else {
-                true
-            }
+            let head_ok = match sha_to_verify {
+                Some(expected_sha) => wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok(),
+                None => true,
+            };
+            // Fail closed: without upstream tracking the agent's plain
+            // `git push` would create a stray remote branch and never update
+            // the PR.
+            head_ok
+                && match wt_mgr
+                    .configure_push_upstream(&wt_path, &branch, &remote_branch)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log(&format!(
+                            "remediation: push upstream config failed for PR #{pr}: {e}"
+                        ));
+                        false
+                    }
+                }
         }
-        Err(_) => false,
+        Err(e) => {
+            log(&format!(
+                "remediation: worktree provision failed for PR #{pr}: {e}"
+            ));
+            false
+        }
     };
     if !provision_ok {
         log(&format!(
             "remediation: worktree provision failed for PR #{pr} — giving up"
         ));
+        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+        wt_mgr.delete_branch(task_repo_dir, &branch).await;
         // Release the lease installed by claim_remediation_rework.
         {
             let p = db_path.clone();
@@ -9847,6 +10109,8 @@ async fn spawn_remediation_worker(
 
     // Author was already set by claim_remediation_rework.
 
+    // Inspection surfaces report the PR branch this run continues, not the
+    // daemon's local checkout name.
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
@@ -9854,7 +10118,7 @@ async fn spawn_remediation_worker(
             "worker",
             Some(task_id),
             &session_id,
-            &branch,
+            &remote_branch,
             now_unix(),
         )
         .ok()
@@ -9869,7 +10133,7 @@ async fn spawn_remediation_worker(
             task_id: Some(task_id),
             session_id: session_id.clone(),
             worktree: Some(wt_path.to_string_lossy().into()),
-            branch: Some(branch.clone()),
+            branch: Some(remote_branch.clone()),
             phase: "working".into(),
             cost_tokens: 0,
             agent_state: None,
@@ -10192,6 +10456,7 @@ async fn spawn_remediation_worker(
                 effort: remediation_effort.clone(),
                 worktree_path: wt_path,
                 branch,
+                remote_branch,
                 draining: true,
                 pr: Some(pr),
                 rework_count: 1,
@@ -10785,6 +11050,7 @@ mod tests {
             effort: "high".into(),
             worktree_path: PathBuf::from("/tmp/test"),
             branch: "test-branch".into(),
+            remote_branch: "test-branch".into(),
             draining: false,
             pr: None,
             rework_count: 0,

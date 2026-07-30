@@ -527,6 +527,14 @@ only through an explicit outside request)
 **From Rework:**
 - `ReworkPushed` → InReview · effects: ResumeReviewer
 - `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
+- `AgentFailed` / `LeaseExpired` (review_only=true) → Failed (parked, resume `rework`) ·
+  effects: ReleaseLease, NotifyOwner. A lost remediation worker must not hand the
+  unchanged PR head back to a fresh reviewer — that changes verdict would burn a rework
+  round with zero remediation applied. The park carries a one-shot head check: if the
+  daemon later observes the PR head moved past the spawn-time
+  `pr_targets.head_sha` (the worker pushed, then died before signaling), it resumes the
+  task straight to `in-review`; otherwise the task stays parked for `task-retry`. The
+  lapsed-lease sweep applies the same park instead of reclaiming to `in-review`.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From Merging:**
@@ -543,7 +551,9 @@ only through an explicit outside request)
 - **Author/reviewer separation:** ReviewerAttached is rejected if the agent is the author.
   The daemon enforces #206: the deliverer (who signaled `submit`) cannot review.
 - **Rework cap:** `REWORK_CAP = 5`. When `rework_round >= 5` and VerdictChanges fires,
-  the task goes to Failed (not Rework).
+  the task goes to Failed (not Rework). Rounds are consumed only by review verdicts,
+  CI failures, and merge conflicts on delivered work — never by infrastructure
+  failures (provisioning, worker death, lease lapse), which park the task instead.
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
   with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
   through to generic implementation-worker provisioning, because remediation must retain
