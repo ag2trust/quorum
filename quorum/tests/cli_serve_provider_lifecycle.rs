@@ -844,12 +844,15 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
     // remediation path, not generic worker provisioning (which would create
     // a daemon branch rather than reuse the adopted PR branch).
     write_dual_protocol_runner(case.home.path());
+    // The failed remediation attempt only owned its namespaced local branch —
+    // the adopted PR branch must survive untouched.
     assert!(Command::new("git")
         .args([
             "-C",
             &case._repo.path().to_string_lossy(),
-            "branch",
-            "review-pr-1",
+            "rev-parse",
+            "--verify",
+            "refs/heads/review-pr-1",
         ])
         .status()
         .unwrap()
