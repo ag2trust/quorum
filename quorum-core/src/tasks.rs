@@ -708,9 +708,11 @@ pub fn claim_provider_retry_rework(
 
 /// Daemon-private: atomically claim a rework task for a remediation worker.
 /// Verifies the task is still in `rework`, installs the remediation assignee
-/// and a live lease, then sweeps only after the lease exists. Returns `None`
-/// if the task left rework or another remediation agent already holds the
-/// claim (partial unique index is the race authority).
+/// and a live lease, then sweeps only after the lease exists. The original
+/// author is retained: it is the durable identity of the managed PR branch
+/// when GitHub target resolution is unavailable. Returns `None` if the task
+/// left rework or another remediation agent already holds the claim (partial
+/// unique index is the race authority).
 pub fn claim_remediation_rework(
     conn: &mut Connection,
     agent: &str,
@@ -761,7 +763,7 @@ pub fn claim_remediation_rework(
     }
 
     tx.execute(
-        "UPDATE tasks SET assignee=?1, author=?1, updated_at=?2 WHERE id=?3",
+        "UPDATE tasks SET assignee=?1, updated_at=?2 WHERE id=?3",
         params![agent, now, id],
     )?;
     crate::events::emit(
@@ -6821,7 +6823,7 @@ mod tests {
     // ── claim_remediation_rework (#199) ─────────────────────────────────────
 
     #[test]
-    fn remediation_claim_installs_lease_and_sets_author() {
+    fn remediation_claim_installs_lease_and_preserves_original_author() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
@@ -6856,7 +6858,11 @@ mod tests {
         let t = claimed.unwrap();
         assert_eq!(t.status, "rework");
         assert_eq!(t.assignee.as_deref(), Some("REM1"));
-        assert_eq!(t.author.as_deref(), Some("REM1"));
+        assert_eq!(
+            t.author.as_deref(),
+            Some("W1"),
+            "original author identifies the managed PR branch across remediation retries"
+        );
         assert!(has_live_lease(&c, id, 1400));
 
         // Lease survives sweep.
