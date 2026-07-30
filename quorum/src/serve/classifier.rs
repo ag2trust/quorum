@@ -20,6 +20,8 @@ pub struct ClassifierSlot {
     pub proc: RunnerProc,
     pub pending_task_ids: Vec<i64>,
     pub response_text: String,
+    /// Keep the empty classifier-only workspace alive for the whole turn.
+    pub isolation_dir: Option<tempfile::TempDir>,
 }
 
 /// Build the spec for a classifier agent. `bare` must follow the daemon's
@@ -61,17 +63,19 @@ pub fn spawn_classifier_configured(
 ) -> std::io::Result<ClassifierSlot> {
     let kind = classifier_kind(model)?;
     let pending_task_ids = tasks.iter().map(|t| t.id).collect();
+    let mut isolation_dir = None;
     let proc = match kind {
         AgentKind::Claude => {
             let spec = classifier_spec_for(repo_dir, bare, model, effort);
             AgentProc::spawn(&spec, agent_bin).map(RunnerProc::Claude)?
         }
         AgentKind::Codex => {
+            let dir = tempfile::tempdir()?;
             let spec = CodexSpec {
                 model: model.to_string(),
                 effort: effort.to_string(),
                 sandbox: codex_sandbox.to_string(),
-                worktree: repo_dir.to_path_buf(),
+                worktree: dir.path().to_path_buf(),
                 prompt: classify::build_prompt_with_recommendations(
                     tasks,
                     dup_context,
@@ -79,13 +83,17 @@ pub fn spawn_classifier_configured(
                 ),
                 env_vars: vec![],
             };
-            CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)?
+            isolation_dir = Some(dir);
+            // Classifiers receive all permitted context in their prompt and
+            // must not inherit the worker's sandbox-bypass launch mode.
+            CodexProc::spawn_restricted(&spec, agent_bin).map(RunnerProc::Codex)?
         }
     };
     Ok(ClassifierSlot {
         proc,
         pending_task_ids,
         response_text: String::new(),
+        isolation_dir,
     })
 }
 
@@ -273,6 +281,8 @@ mod tests {
             id: 7,
             title: "classify me".into(),
             body: None,
+            dependencies: vec![],
+            recovery_notes: vec![],
         }];
         let mut slot = spawn_classifier_configured(
             &tasks,
@@ -315,7 +325,7 @@ mod tests {
 
     #[test]
     fn parse_response_valid() {
-        let text = r#"{"tasks": [{"task_id": 1, "cx_est": 3, "cx_flags": [], "cx_tags": [], "cx_dup_of": []}]}"#;
+        let text = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null, "duplicate_of": []}]}"#;
         let results = parse_response(text).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].task_id, 1);

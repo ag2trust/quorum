@@ -200,9 +200,10 @@ impl Case {
             &[quorum_core::classify::TaskClassification {
                 task_id: 1,
                 cx_est: 2,
-                cx_flags: Vec::new(),
-                cx_tags: Vec::new(),
-                cx_dup_of: Vec::new(),
+                size: "S".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: Vec::new(),
             }],
             "test-classifier:v1",
             1,

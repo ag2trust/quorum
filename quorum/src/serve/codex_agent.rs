@@ -80,6 +80,54 @@ pub struct CodexProc {
 }
 
 impl CodexProc {
+    /// Restricted single-turn mode for classifiers.  It deliberately omits the
+    /// normal worker escape hatch that disables Codex sandbox/approval policy.
+    pub fn spawn_restricted(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
+        let bin = codex_bin.unwrap_or("codex");
+        let args = vec![
+            "exec".into(),
+            "--json".into(),
+            "--model".into(),
+            spec.model.clone(),
+            "-c".into(),
+            format!("model_reasoning_effort={}", spec.effort),
+            "-s".into(),
+            "read-only".into(),
+            "-C".into(),
+            spec.worktree.display().to_string(),
+            "--skip-git-repo-check".into(),
+            "--ignore-user-config".into(),
+            spec.prompt.clone(),
+        ];
+        let mut cmd = Command::new(bin);
+        cmd.args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(&spec.worktree);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let reader = BufReader::new(child.stdout.take().expect("stdout was piped")).lines();
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        Ok(Self {
+            child,
+            reader,
+            diagnostics,
+            stderr_task,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_resume(
         thread_id: &str,

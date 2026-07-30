@@ -69,8 +69,8 @@ fn emit_result(turn: u32, cumulative_cost: f64, is_error: bool) {
     io::stdout().flush().ok();
 }
 
-/// Answer a classifier prompt: one classification per `### Task #<id>`
-/// occurrence, tagged `area:fake-bare` / `area:fake-nobare` per --bare.
+/// Answer a classifier prompt: one classification per `### Task #<id>`.
+/// Test-only size variation records whether --bare reached the process.
 /// The JSON goes in the Result event's `result` field — the daemon's drain
 /// replaces accumulated assistant text with a non-empty result text.
 fn emit_classifier_result(line: &str, bare: bool) {
@@ -81,20 +81,16 @@ fn emit_classifier_result(line: &str, bare: bool) {
             ids.push(id);
         }
     }
-    let tag = if bare {
-        "area:fake-bare"
-    } else {
-        "area:fake-nobare"
-    };
     let tasks: Vec<serde_json::Value> = ids
         .iter()
         .map(|id| {
             serde_json::json!({
                 "task_id": id,
-                "cx_est": 2,
-                "cx_flags": [],
-                "cx_tags": [tag],
-                "cx_dup_of": [],
+                "complexity": 2,
+                "size": if bare { "M" } else { "S" },
+                "ready": true,
+                "not_ready_reason": null,
+                "duplicate_of": [],
             })
         })
         .collect();
@@ -242,11 +238,7 @@ fn main() {
         turn += 1;
 
         // Classifier turn: respond with valid classification JSON for every
-        // `### Task #<id>` in the prompt. The cx_tags marker encodes whether
-        // this process was spawned with --bare, so serve e2e tests can assert
-        // the daemon threads its bare_agent config into classifier spawns
-        // (2026-07-10 live incident: hardcoded bare broke auth on
-        // subscription-login machines).
+        // `### Task #<id>` in the prompt.
         if line.contains("You are a task classifier") {
             emit_classifier_result(&line, bare);
             continue;

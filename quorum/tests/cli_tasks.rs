@@ -465,6 +465,23 @@ fn concurrent_task_claim_one_winner() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 1,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "test:v2",
+            now,
+        )
+        .unwrap();
+    }
 
     let handles: Vec<_> = (0..12)
         .map(|i| {
@@ -566,6 +583,23 @@ fn concurrent_match_label_claim_one_winner() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 1,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "test:v2",
+            now,
+        )
+        .unwrap();
+    }
 
     let handles: Vec<_> = (0..12)
         .map(|i| {

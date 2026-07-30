@@ -49,6 +49,7 @@ fn sync_returns_next_task_when_agent_idle() {
         ])
         .assert()
         .success();
+    common::classify_open_tasks(home.path());
     let out = quorum(home.path())
         .args(["sync", "--agent", "A"])
         .output()
@@ -125,6 +126,7 @@ fn sync_match_label_restricts_next_task() {
         ])
         .assert()
         .success();
+    common::classify_open_tasks(home.path());
     // Without filter: high-prio wins.
     let unfiltered = quorum(home.path())
         .args(["sync", "--agent", "A"])

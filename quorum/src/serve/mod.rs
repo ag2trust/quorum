@@ -12052,6 +12052,13 @@ mod tests {
             &mut conn, "owner", "retry", None, 0, None, None, None, None, 10,
         )
         .unwrap();
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_by":"test:v2"}"#,
+            10,
+        )
+        .unwrap();
         tasks::claim(&mut conn, "worker", Some(task_id), &[], 3600, 11).unwrap();
         tasks::apply_event(
             &mut conn,
@@ -14403,7 +14410,9 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"branch":"daemon/spool-t1"}"#),
+            Some(
+                r#"{"branch":"daemon/spool-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_by":"test:v2"}"#,
+            ),
             None,
             None,
             now,
@@ -14808,6 +14817,13 @@ mod tests {
             None,
             None,
             None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_by":"test:v2"}"#,
             now,
         )
         .unwrap();

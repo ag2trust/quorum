@@ -1,6 +1,5 @@
-//! Task classifier — authoritative complexity scoring plus shape-lint flags,
-//! type tags, and duplicate-of hints. `cx_est` gates worker dispatch and selects
-//! model/effort; the remaining outputs are observational metadata.
+//! Task classifier — authoritative complexity, execution size, readiness, and
+//! duplicate hints.  A complete classification gates worker dispatch.
 
 use crate::complexity;
 use crate::db::begin_immediate;
@@ -12,13 +11,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClassification {
     pub task_id: i64,
+    #[serde(rename = "complexity", alias = "cx_est")]
     pub cx_est: i64,
+    pub size: String,
+    pub ready: bool,
     #[serde(default)]
-    pub cx_flags: Vec<String>,
-    #[serde(default)]
-    pub cx_tags: Vec<String>,
-    #[serde(default)]
-    pub cx_dup_of: Vec<i64>,
+    pub not_ready_reason: Option<String>,
+    #[serde(default, alias = "cx_dup_of")]
+    pub duplicate_of: Vec<i64>,
 }
 
 /// Batch response from the classifier agent.
@@ -33,18 +33,11 @@ pub struct TaskForClassification {
     pub id: i64,
     pub title: String,
     pub body: Option<String>,
+    pub dependencies: Vec<String>,
+    pub recovery_notes: Vec<String>,
 }
 
-const VALID_FLAGS: &[&str] = &["oversized", "underspecified"];
-const VALID_KINDS: &[&str] = &[
-    "kind:bug",
-    "kind:feature",
-    "kind:test",
-    "kind:docs",
-    "kind:refactor",
-    "kind:infra",
-    "kind:chore",
-];
+const VALID_SIZES: &[&str] = &["S", "M", "L", "XL"];
 
 /// Query open/working/terminal tasks that have no `cx_est` in refs.
 /// Terminal tasks are included so the classifier catches them within one tick
@@ -52,9 +45,11 @@ const VALID_KINDS: &[&str] = &[
 pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, body FROM tasks
-         WHERE status IN ('open', 'working', 'in-review', 'rework', 'merging',
-                          'done', 'failed', 'cancelled')
-         AND (refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL)",
+         WHERE (status IN ('open', 'working', 'in-review', 'rework', 'merging')
+                OR (status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1))
+         AND (refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL
+              OR json_extract(refs, '$.cx_size') IS NULL
+              OR json_extract(refs, '$.cx_ready') IS NULL)",
     )?;
     let tasks = stmt
         .query_map([], |row| {
@@ -62,10 +57,57 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
                 id: row.get(0)?,
                 title: row.get(1)?,
                 body: row.get(2)?,
+                dependencies: vec![],
+                recovery_notes: vec![],
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(tasks)
+    tasks
+        .into_iter()
+        .map(|task| enrich_task(conn, task))
+        .collect()
+}
+
+/// Add only bounded coordination context.  This deliberately reads task rows and
+/// durable notes, never repository contents or external state.
+fn enrich_task(
+    conn: &Connection,
+    mut task: TaskForClassification,
+) -> Result<TaskForClassification> {
+    let deps: Option<String> = conn.query_row(
+        "SELECT depends_on FROM tasks WHERE id=?1",
+        params![task.id],
+        |r| r.get(0),
+    )?;
+    if let Some(deps) = deps {
+        let mut stmt = conn.prepare("SELECT id, title, status FROM tasks WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY id LIMIT 8")?;
+        task.dependencies = stmt
+            .query_map(params![deps], |r| {
+                Ok(format!(
+                    "#{} {} ({})",
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    let mut stmt =
+        conn.prepare("SELECT body FROM task_notes WHERE task_id=?1 ORDER BY id DESC LIMIT 4")?;
+    task.recovery_notes = stmt
+        .query_map(params![task.id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|s| truncate(&s, 600))
+        .collect();
+    Ok(task)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!("{}…", s.chars().take(max).collect::<String>())
 }
 
 /// Check whether a specific task lacks cx_est in refs.
@@ -80,6 +122,8 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
                 id: row.get(0)?,
                 title: row.get(1)?,
                 body: row.get(2)?,
+                dependencies: vec![],
+                recovery_notes: vec![],
             })
         },
     )
@@ -100,6 +144,8 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
                 id: row.get(0)?,
                 title: row.get(1)?,
                 body: row.get(2)?,
+                dependencies: vec![],
+                recovery_notes: vec![],
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -119,6 +165,8 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
                 id: row.get(0)?,
                 title: row.get(1)?,
                 body: row.get(2)?,
+                dependencies: vec![],
+                recovery_notes: vec![],
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -136,7 +184,7 @@ pub fn store_classifications(
     let mut stored = 0;
 
     for result in results {
-        if result.cx_est < 1 || result.cx_est > 5 {
+        if !valid(result) {
             continue;
         }
 
@@ -160,15 +208,17 @@ pub fn store_classifications(
         if n > 0 {
             stored += 1;
 
-            if !sanitized.cx_flags.is_empty() || !sanitized.cx_dup_of.is_empty() {
+            if !sanitized.duplicate_of.is_empty() || !sanitized.ready {
                 let note = build_classifier_note(&sanitized);
                 tx.execute(
                     "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'classifier', ?3)",
                     params![result.task_id, now, note],
                 )?;
             }
-            if sanitized.cx_est == 5 {
-                crate::tasks::park_complexity_five_tx(&tx, result.task_id, now)?;
+            if let Some(reason) = parking_reason(&sanitized) {
+                crate::tasks::park_classified_task_tx(&tx, result.task_id, reason, now)?;
+            } else {
+                crate::tasks::restore_classified_task_tx(&tx, result.task_id, now)?;
             }
         }
     }
@@ -181,20 +231,45 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
     TaskClassification {
         task_id: result.task_id,
         cx_est: result.cx_est.clamp(1, 5),
-        cx_flags: result
-            .cx_flags
-            .iter()
-            .filter(|f| VALID_FLAGS.contains(&f.as_str()))
-            .cloned()
-            .collect(),
-        cx_tags: result
-            .cx_tags
-            .iter()
-            .filter(|t| VALID_KINDS.contains(&t.as_str()) || t.starts_with("area:"))
-            .cloned()
-            .collect(),
-        cx_dup_of: result.cx_dup_of.clone(),
+        size: result.size.clone(),
+        ready: result.ready,
+        not_ready_reason: result
+            .not_ready_reason
+            .as_ref()
+            .map(|s| s.trim().to_string()),
+        duplicate_of: result.duplicate_of.clone(),
     }
+}
+
+fn valid(result: &TaskClassification) -> bool {
+    (1..=5).contains(&result.cx_est)
+        && VALID_SIZES.contains(&result.size.as_str())
+        && if result.ready {
+            result
+                .not_ready_reason
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+        } else {
+            result
+                .not_ready_reason
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty())
+        }
+}
+
+fn parking_reason(result: &TaskClassification) -> Option<&str> {
+    if !result.ready {
+        return result.not_ready_reason.as_deref();
+    }
+    if result.size == "XL" {
+        return Some(
+            "execution size XL exceeds automatic dispatch policy; split or rescope into new tasks",
+        );
+    }
+    if result.cx_est == 5 && result.size == "L" {
+        return Some("complexity 5 with size L exceeds automatic dispatch policy; split or rescope into new tasks");
+    }
+    None
 }
 
 fn merge_cx_into_refs(
@@ -211,16 +286,19 @@ fn merge_cx_into_refs(
 
     let map = obj.as_object_mut().unwrap();
     map.insert("cx_est".into(), serde_json::json!(result.cx_est));
+    map.insert("cx_size".into(), serde_json::json!(result.size));
+    map.insert("cx_ready".into(), serde_json::json!(result.ready));
+    map.insert(
+        "cx_not_ready_reason".into(),
+        serde_json::json!(result.not_ready_reason),
+    );
     map.insert("cx_by".into(), serde_json::json!(version));
-
-    if !result.cx_flags.is_empty() {
-        map.insert("cx_flags".into(), serde_json::json!(result.cx_flags));
-    }
-    if !result.cx_tags.is_empty() {
-        map.insert("cx_tags".into(), serde_json::json!(result.cx_tags));
-    }
-    if !result.cx_dup_of.is_empty() {
-        map.insert("cx_dup_of".into(), serde_json::json!(result.cx_dup_of));
+    map.remove("cx_flags");
+    map.remove("cx_tags");
+    if !result.duplicate_of.is_empty() {
+        map.insert("cx_dup_of".into(), serde_json::json!(result.duplicate_of));
+    } else {
+        map.remove("cx_dup_of");
     }
 
     obj.to_string()
@@ -229,18 +307,22 @@ fn merge_cx_into_refs(
 fn build_classifier_note(result: &TaskClassification) -> String {
     let mut parts = Vec::new();
 
-    for flag in &result.cx_flags {
-        match flag.as_str() {
-            "oversized" => parts.push("oversized — looks > ~30-45 min of agent work".to_string()),
-            "underspecified" => {
-                parts.push("underspecified — no acceptance criteria / ambiguous scope".to_string())
-            }
-            other => parts.push(other.to_string()),
-        }
+    if !result.ready {
+        parts.push(format!(
+            "not ready — {}",
+            result
+                .not_ready_reason
+                .as_deref()
+                .unwrap_or("missing reason")
+        ));
     }
 
-    if !result.cx_dup_of.is_empty() {
-        let ids: Vec<String> = result.cx_dup_of.iter().map(|id| format!("#{id}")).collect();
+    if !result.duplicate_of.is_empty() {
+        let ids: Vec<String> = result
+            .duplicate_of
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect();
         parts.push(format!("possible duplicate of {}", ids.join(", ")));
     }
 
@@ -286,6 +368,18 @@ pub fn build_prompt_with_recommendations(
             prompt.push_str(&format!("**Body:**\n{truncated}\n"));
         }
         prompt.push('\n');
+        if !t.dependencies.is_empty() {
+            prompt.push_str(&format!(
+                "**Dependencies:** {}\n",
+                t.dependencies.join("; ")
+            ));
+        }
+        if !t.recovery_notes.is_empty() {
+            prompt.push_str(&format!(
+                "**Recovery context:** {}\n",
+                t.recovery_notes.join("\n")
+            ));
+        }
     }
 
     if !dup_context.is_empty() {
@@ -320,28 +414,20 @@ fn classifier_rubric(recommendations: &str) -> String {
     format!(
         r#"You are a task classifier for an AI agent coordination system. For each task, produce:
 
-1. **cx_est** (integer 1-5): Complexity estimate based on the task description AS WRITTEN at creation time.
+1. **complexity** (integer 1-5): difficulty of the hardest reasoning/implementation problem, independent of volume.
 {rubric_lines}
 
 The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
-Level 5 is retained as classification context but is parked instead of dispatched.
+2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time.
+3. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. If false, provide a concrete **not_ready_reason**; if true, it must be null.
+4. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
 
-2. **cx_flags** (array of strings, may be empty): Shape-lint flags.
-   - "oversized": Task looks like > ~30-45 min of agent work (complexity 4-5 with broad scope)
-   - "underspecified": No acceptance criteria, ambiguous scope, or missing file pointers
-
-3. **cx_tags** (array of strings, may be empty): Normalized type/area tags.
-   - Kind (pick one): "kind:bug", "kind:feature", "kind:test", "kind:docs", "kind:refactor", "kind:infra", "kind:chore"
-   - Area (optional, pick relevant): "area:<component>" where component matches the codebase area (e.g. "area:daemon", "area:cli", "area:store", "area:lifecycle")
-
-4. **cx_dup_of** (array of task IDs, may be empty): IDs of other open/working tasks this one substantially overlaps with. Only flag genuine duplicates, not related tasks.
-
-Score based ONLY on the task description — never on execution outcomes, diffs, or agent performance.
+You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
 
 Output format (JSON array wrapped in an object):
-{{"tasks": [{{"task_id": 1, "cx_est": 3, "cx_flags": [], "cx_tags": ["kind:feature", "area:daemon"], "cx_dup_of": []}}]}}"#
+{{"tasks": [{{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
     )
 }
 
@@ -351,39 +437,39 @@ Output format (JSON array wrapped in an object):
 /// by the model that actually produced it. `v1` distinguishes this prompt and
 /// parser contract from future revisions.
 pub fn classifier_provenance(model: &str) -> String {
-    format!("{model}:v1")
+    format!("{model}:v2")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn classified(task_id: i64, cx_est: i64) -> TaskClassification {
+        TaskClassification {
+            task_id,
+            cx_est,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }
+    }
+
     #[test]
     fn merge_cx_into_empty_refs() {
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 3,
-            cx_flags: vec!["oversized".into()],
-            cx_tags: vec!["kind:feature".into()],
-            cx_dup_of: vec![],
-        };
+        let result = classified(1, 3);
         let refs = merge_cx_into_refs(&None, &result, "haiku-45:v1");
         let v: serde_json::Value = serde_json::from_str(&refs).unwrap();
         assert_eq!(v["cx_est"], 3);
         assert_eq!(v["cx_by"], "haiku-45:v1");
-        assert_eq!(v["cx_flags"][0], "oversized");
+        assert_eq!(v["cx_size"], "M");
+        assert_eq!(v["cx_ready"], true);
     }
 
     #[test]
     fn merge_cx_preserves_existing_pr() {
         let existing = Some(r#"{"pr":42}"#.to_string());
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 2,
-            cx_flags: vec![],
-            cx_tags: vec![],
-            cx_dup_of: vec![],
-        };
+        let result = classified(1, 2);
         let refs = merge_cx_into_refs(&existing, &result, "haiku-45:v1");
         let v: serde_json::Value = serde_json::from_str(&refs).unwrap();
         assert_eq!(v["pr"], 42);
@@ -392,55 +478,41 @@ mod tests {
 
     #[test]
     fn classifier_provenance_identifies_the_model() {
-        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v1");
-        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v1");
+        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v2");
+        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v2");
     }
 
     #[test]
-    fn sanitize_strips_invalid_flags() {
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 3,
-            cx_flags: vec!["oversized".into(), "bogus".into()],
-            cx_tags: vec!["kind:feature".into(), "invalid".into()],
-            cx_dup_of: vec![],
-        };
+    fn sanitize_trims_not_ready_reason() {
+        let mut result = classified(1, 3);
+        result.ready = false;
+        result.not_ready_reason = Some("  outcome ambiguous  ".into());
         let clean = sanitize(&result);
-        assert_eq!(clean.cx_flags, vec!["oversized"]);
-        assert_eq!(clean.cx_tags, vec!["kind:feature"]);
+        assert_eq!(clean.not_ready_reason.as_deref(), Some("outcome ambiguous"));
     }
 
     #[test]
     fn sanitize_clamps_cx_est() {
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 7,
-            cx_flags: vec![],
-            cx_tags: vec![],
-            cx_dup_of: vec![],
-        };
+        let result = classified(1, 7);
         let clean = sanitize(&result);
         assert_eq!(clean.cx_est, 5);
     }
 
     #[test]
-    fn build_classifier_note_flags_and_dups() {
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 3,
-            cx_flags: vec!["underspecified".into()],
-            cx_tags: vec![],
-            cx_dup_of: vec![47, 48],
-        };
+    fn build_classifier_note_readiness_and_dups() {
+        let mut result = classified(1, 3);
+        result.ready = false;
+        result.not_ready_reason = Some("expected outcome missing".into());
+        result.duplicate_of = vec![47, 48];
         let note = build_classifier_note(&result);
-        assert!(note.contains("underspecified"));
+        assert!(note.contains("not ready"));
         assert!(note.contains("#47"));
         assert!(note.contains("#48"));
     }
 
     #[test]
     fn parse_classifier_response() {
-        let json = r#"{"tasks": [{"task_id": 1, "cx_est": 3, "cx_flags": ["oversized"], "cx_tags": ["kind:feature"], "cx_dup_of": []}]}"#;
+        let json = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size":"M", "ready":true, "not_ready_reason":null, "duplicate_of":[]}]}"#;
         let resp: ClassifierResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.tasks.len(), 1);
         assert_eq!(resp.tasks[0].cx_est, 3);
@@ -452,11 +524,15 @@ mod tests {
             id: 1,
             title: "Fix bug".into(),
             body: Some("Fix the thing".into()),
+            dependencies: vec![],
+            recovery_notes: vec![],
         }];
         let ctx = vec![TaskForClassification {
             id: 2,
             title: "Other task".into(),
             body: Some("Do something".into()),
+            dependencies: vec![],
+            recovery_notes: vec![],
         }];
         let prompt = build_prompt(&tasks, &ctx);
         assert!(prompt.contains("Task #1"));
@@ -478,29 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_flags_and_dups_produce_no_note() {
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 3,
-            cx_flags: vec![],
-            cx_tags: vec!["kind:feature".into()],
-            cx_dup_of: vec![],
-        };
-        // No note should be generated — flags and dups are empty
-        assert!(result.cx_flags.is_empty() && result.cx_dup_of.is_empty());
+    fn ready_without_dups_produces_no_note() {
+        let result = classified(1, 3);
+        assert!(result.ready && result.duplicate_of.is_empty());
     }
 
     #[test]
-    fn area_tags_pass_sanitization() {
-        let result = TaskClassification {
-            task_id: 1,
-            cx_est: 3,
-            cx_flags: vec![],
-            cx_tags: vec!["area:daemon".into(), "area:cli".into()],
-            cx_dup_of: vec![],
-        };
-        let clean = sanitize(&result);
-        assert_eq!(clean.cx_tags, vec!["area:daemon", "area:cli"]);
+    fn invalid_readiness_contract_is_rejected() {
+        let mut result = classified(1, 3);
+        result.ready = false;
+        assert!(!valid(&result));
     }
 
     fn open_tmp() -> (tempfile::TempDir, rusqlite::Connection) {
@@ -535,13 +598,7 @@ mod tests {
         assert_eq!(unclassified.len(), 1);
         assert_eq!(unclassified[0].id, task_id);
 
-        let results = vec![TaskClassification {
-            task_id,
-            cx_est: 3,
-            cx_flags: vec!["oversized".into()],
-            cx_tags: vec!["kind:feature".into()],
-            cx_dup_of: vec![],
-        }];
+        let results = vec![classified(task_id, 3)];
         let stored = store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
         assert_eq!(stored, 1);
 
@@ -552,13 +609,13 @@ mod tests {
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["cx_est"], 3);
         assert_eq!(refs["cx_by"], "haiku-45:v1");
+        assert_eq!(refs["cx_size"], "M");
 
         let notes = crate::tasks::get_with_notes(&conn, task_id)
             .unwrap()
             .unwrap()
             .notes;
-        assert_eq!(notes.len(), 1);
-        assert!(notes[0].body.contains("oversized"));
+        assert_eq!(notes.len(), 0);
     }
 
     #[test]
@@ -566,15 +623,7 @@ mod tests {
         let (_dir, mut conn) = open_tmp();
         let luna_task = create_task(&mut conn, "Luna task", 1);
         let terra_task = create_task(&mut conn, "Terra task", 2);
-        let result = |task_id| {
-            vec![TaskClassification {
-                task_id,
-                cx_est: 2,
-                cx_flags: vec![],
-                cx_tags: vec![],
-                cx_dup_of: vec![],
-            }]
-        };
+        let result = |task_id| vec![classified(task_id, 2)];
 
         store_classifications(
             &mut conn,
@@ -599,8 +648,8 @@ mod tests {
         };
         let luna_by = cx_by(luna_task);
         let terra_by = cx_by(terra_task);
-        assert_eq!(luna_by, "gpt-5.6-luna:v1");
-        assert_eq!(terra_by, "gpt-5.6-terra:v1");
+        assert_eq!(luna_by, "gpt-5.6-luna:v2");
+        assert_eq!(terra_by, "gpt-5.6-terra:v2");
         assert_ne!(luna_by, terra_by);
     }
 
@@ -608,16 +657,12 @@ mod tests {
     fn category_five_classification_atomically_parks_without_run_or_error() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "Architectural task", 1);
-        let results = vec![TaskClassification {
-            task_id,
-            cx_est: 5,
-            cx_flags: vec!["oversized".into()],
-            cx_tags: vec!["kind:feature".into()],
-            cx_dup_of: vec![],
-        }];
+        let mut parked = classified(task_id, 5);
+        parked.size = "L".into();
+        let results = vec![parked];
 
         assert_eq!(
-            store_classifications(&mut conn, &results, "gpt-5.6-luna:v1", 2_000_000).unwrap(),
+            store_classifications(&mut conn, &results, "gpt-5.6-luna:v2", 2_000_000).unwrap(),
             1
         );
 
@@ -626,7 +671,7 @@ mod tests {
         assert_eq!(task.status, "failed");
         assert_eq!(task.assignee, None);
         assert_eq!(refs["cx_est"], 5);
-        assert_eq!(refs["cx_by"], "gpt-5.6-luna:v1");
+        assert_eq!(refs["cx_by"], "gpt-5.6-luna:v2");
         assert_eq!(refs["daemon_parked"], true);
         assert_eq!(refs["daemon_resume_status"], "open");
         assert!(refs["daemon_parked_reason"]
@@ -679,13 +724,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = vec![TaskClassification {
-            task_id,
-            cx_est: 2,
-            cx_flags: vec![],
-            cx_tags: vec![],
-            cx_dup_of: vec![],
-        }];
+        let results = vec![classified(task_id, 2)];
         store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
 
         let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
@@ -699,13 +738,7 @@ mod tests {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "Task", 1);
 
-        let results = vec![TaskClassification {
-            task_id,
-            cx_est: 0,
-            cx_flags: vec![],
-            cx_tags: vec![],
-            cx_dup_of: vec![],
-        }];
+        let results = vec![classified(task_id, 0)];
         let stored = store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
         assert_eq!(stored, 0);
 
@@ -718,13 +751,7 @@ mod tests {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "Clean task", 1);
 
-        let results = vec![TaskClassification {
-            task_id,
-            cx_est: 2,
-            cx_flags: vec![],
-            cx_tags: vec!["kind:bug".into()],
-            cx_dup_of: vec![],
-        }];
+        let results = vec![classified(task_id, 2)];
         store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
 
         let notes = crate::tasks::get_with_notes(&conn, task_id)
@@ -740,13 +767,9 @@ mod tests {
         let t1 = create_task(&mut conn, "Task A", 1);
         let t2 = create_task(&mut conn, "Task B", 2);
 
-        let results = vec![TaskClassification {
-            task_id: t1,
-            cx_est: 3,
-            cx_flags: vec![],
-            cx_tags: vec![],
-            cx_dup_of: vec![t2],
-        }];
+        let mut dup = classified(t1, 3);
+        dup.duplicate_of = vec![t2];
+        let results = vec![dup];
         store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
 
         let notes = crate::tasks::get_with_notes(&conn, t1)
@@ -764,17 +787,51 @@ mod tests {
         let _t2 = create_task(&mut conn, "Done task", 2);
 
         // Classify t1 only
-        let results = vec![TaskClassification {
-            task_id: t1,
-            cx_est: 2,
-            cx_flags: vec![],
-            cx_tags: vec![],
-            cx_dup_of: vec![],
-        }];
+        let results = vec![classified(t1, 2)];
         store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
 
         let missing = tasks_missing_cx_all(&conn).unwrap();
         assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn atomic_claim_gate_requires_complete_dispatchable_classification() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "gated", 1);
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 10)
+                .unwrap()
+                .is_none()
+        );
+        let mut allowed = classified(task_id, 5);
+        allowed.size = "M".into();
+        store_classifications(&mut conn, &[allowed], "test:v2", 11).unwrap();
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 12)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn retry_requests_reclassification_and_dispatchable_result_restores_status() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "rescope", 1);
+        let mut parked = classified(task_id, 5);
+        parked.size = "L".into();
+        store_classifications(&mut conn, &[parked], "test:v2", 10).unwrap();
+        assert!(
+            crate::tasks::retry_parked(&mut conn, task_id, "owner", true, 11)
+                .unwrap()
+                .is_none()
+        );
+        assert!(unclassified_tasks(&conn)
+            .unwrap()
+            .iter()
+            .any(|t| t.id == task_id));
+        store_classifications(&mut conn, &[classified(task_id, 5)], "test:v2", 12).unwrap();
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
     }
 
     #[test]
@@ -799,5 +856,44 @@ mod tests {
                 "skill file missing rubric description: {desc}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod redesigned_tests {
+    use super::*;
+
+    fn result(cx_est: i64, size: &str, ready: bool, reason: Option<&str>) -> TaskClassification {
+        TaskClassification {
+            task_id: 1,
+            cx_est,
+            size: size.into(),
+            ready,
+            not_ready_reason: reason.map(str::to_string),
+            duplicate_of: vec![],
+        }
+    }
+
+    #[test]
+    fn readiness_reason_and_size_are_strict() {
+        assert!(valid(&result(4, "M", true, None)));
+        assert!(valid(&result(4, "M", false, Some("outcome is ambiguous"))));
+        assert!(!valid(&result(4, "M", false, None)));
+        assert!(!valid(&result(4, "bad", true, None)));
+    }
+
+    #[test]
+    fn policy_allows_focused_complexity_five() {
+        assert!(parking_reason(&result(5, "S", true, None)).is_none());
+        assert!(parking_reason(&result(5, "M", true, None)).is_none());
+        assert!(parking_reason(&result(5, "L", true, None)).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None)).is_some());
+    }
+
+    #[test]
+    fn prompt_is_closed_book_and_permissive() {
+        let p = classifier_rubric("");
+        assert!(p.contains("closed-book"));
+        assert!(p.contains("Never reject merely because files"));
     }
 }

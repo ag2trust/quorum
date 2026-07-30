@@ -1547,6 +1547,33 @@ mod tests {
         (dir, c)
     }
 
+    fn ready_claim(
+        c: &mut Connection,
+        agent: &str,
+        task_id: Option<i64>,
+        labels: &[&str],
+        ttl: i64,
+        now: i64,
+    ) -> Result<Option<crate::tasks::Task>> {
+        let ids = task_id.into_iter().collect::<Vec<_>>();
+        for id in ids {
+            crate::classify::store_classifications(
+                c,
+                &[crate::classify::TaskClassification {
+                    task_id: id,
+                    cx_est: 3,
+                    size: "M".into(),
+                    ready: true,
+                    not_ready_reason: None,
+                    duplicate_of: vec![],
+                }],
+                "unit-test:v2",
+                now,
+            )?;
+        }
+        crate::tasks::claim(c, agent, task_id, labels, ttl, now)
+    }
+
     #[test]
     fn legacy_null_run_provider_displays_as_claude_live_and_pipeline() {
         let (_d, mut c) = open_tmp();
@@ -1666,7 +1693,7 @@ mod tests {
             100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Worker", Some(tid), &[], 3600, 100).unwrap();
+        ready_claim(&mut c, "Worker", Some(tid), &[], 3600, 100).unwrap();
         crate::agents::set_tier(&c, "Worker", Some("tier:opus-46")).unwrap();
         // now=2000: both agents last_seen=100 (1900s stale > 900 window).
         // "boss" has no claims → offline. "Worker" holds task claim (expires 3700 > 2000) → online.
@@ -1742,8 +1769,8 @@ mod tests {
             100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t46), &[], 1000, 100).unwrap();
-        crate::tasks::claim(&mut c, "Bob", Some(t47), &[], 1000, 100).unwrap();
+        ready_claim(&mut c, "Alice", Some(t46), &[], 1000, 100).unwrap();
+        ready_claim(&mut c, "Bob", Some(t47), &[], 1000, 100).unwrap();
         // Persist tiers on the agent rows (as sync would do).
         crate::agents::set_tier(&c, "Alice", Some("tier:opus-46")).unwrap();
         crate::agents::set_tier(&c, "Bob", Some("tier:opus-47")).unwrap();
@@ -1974,7 +2001,10 @@ mod tests {
     // ── Agent load score (#95 Phase 1) ─────────────────────────────────
 
     fn make_task(c: &mut Connection, title: &str, now: i64) -> i64 {
-        crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, now).unwrap()
+        let id =
+            crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, now).unwrap();
+        c.execute("UPDATE tasks SET refs=json_object('cx_est',3,'cx_size','M','cx_ready',true,'cx_by','test:v2') WHERE id=?1", [id]).unwrap();
+        id
     }
 
     /// Drive one task through claim → done as `agent`, preserving assignee for
@@ -1982,7 +2012,7 @@ mod tests {
     /// (close_after_merge, close_manual) clear assignee — a separate issue (#114 note).
     fn complete_task_as(c: &mut Connection, agent: &str, claim_ts: i64, done_ts: i64) -> i64 {
         let id = make_task(c, &format!("t-{claim_ts}"), claim_ts - 1);
-        crate::tasks::claim(c, agent, Some(id), &[], 3600, claim_ts).unwrap();
+        ready_claim(c, agent, Some(id), &[], 3600, claim_ts).unwrap();
         c.execute(
             "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
             rusqlite::params![id, done_ts],
@@ -2062,7 +2092,7 @@ mod tests {
         let t3_open =
             crate::tasks::create(&mut c, "boss", "t3", None, 0, None, None, None, None, 300)
                 .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 1000, 400).unwrap();
+        ready_claim(&mut c, "Alice", Some(t1), &[], 1000, 400).unwrap();
         crate::tasks::apply_event(
             &mut c,
             "Alice",
@@ -2071,7 +2101,7 @@ mod tests {
             400,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Bob", Some(t2), &[], 1000, 500).unwrap();
+        ready_claim(&mut c, "Bob", Some(t2), &[], 1000, 500).unwrap();
         crate::tasks::apply_event(
             &mut c,
             "Bob",
@@ -2138,7 +2168,7 @@ mod tests {
             &mut c, "boss", "stuck", None, 0, None, None, None, None, 100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t), &[], 10000, 100).unwrap();
+        ready_claim(&mut c, "Alice", Some(t), &[], 10000, 100).unwrap();
         crate::tasks::apply_event(
             &mut c,
             "Alice",
@@ -2282,7 +2312,7 @@ mod tests {
             100,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
+        ready_claim(&mut c, "Alice", Some(t1), &[], 10000, 100).unwrap();
         crate::tasks::close_after_merge(&mut c, t1, "merged", 100).unwrap();
 
         let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
@@ -2408,7 +2438,7 @@ mod tests {
         )
         .unwrap();
         // Cancel the dep
-        crate::tasks::claim(&mut c, "W", Some(dep), &[], 10000, 100).unwrap();
+        ready_claim(&mut c, "W", Some(dep), &[], 10000, 100).unwrap();
         crate::tasks::update(
             &mut c,
             "W",

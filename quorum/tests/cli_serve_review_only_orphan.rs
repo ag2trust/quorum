@@ -334,7 +334,7 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    quorum_core::tasks::create(
+    let id = quorum_core::tasks::create(
         &mut conn,
         "TestCreator",
         "Review-only orphan regression task",
@@ -346,7 +346,22 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
         Some(pr),
         now,
     )
-    .unwrap()
+    .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
+        now,
+    )
+    .unwrap();
+    id
 }
 
 /// Seed an in-review task with a known author (daemon can derive branch).
@@ -368,6 +383,20 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
         None,
         None,
         None,
+        now,
+    )
+    .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
         now,
     )
     .unwrap();

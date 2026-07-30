@@ -399,6 +399,24 @@ mod tests {
         (dir, c)
     }
 
+    fn ready_claim(c: &mut Connection, agent: &str, task_id: i64, ttl: i64, now: i64) {
+        crate::classify::store_classifications(
+            c,
+            &[crate::classify::TaskClassification {
+                task_id,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "unit-test:v2",
+            now,
+        )
+        .unwrap();
+        crate::tasks::claim(c, agent, Some(task_id), &[], ttl, now).unwrap();
+    }
+
     #[test]
     fn sweep_removes_expired_keeps_live() {
         let (_d, c) = open_tmp();
@@ -635,7 +653,7 @@ mod tests {
         // A claimed task with a short lease (dead at 1100).
         let id = crate::tasks::create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000)
             .unwrap();
-        crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+        ready_claim(&mut c, "A", id, 100, 1000);
         // Before expiry: reaper leaves it alone.
         reap_lapsed_tasks(&c, 1050, SWEEP_LIMIT).unwrap();
         assert_eq!(
@@ -742,7 +760,7 @@ mod tests {
             // agent per task, each lease lapses independently at TTL=100 → all 5 lapse
             // at now=1100 as the reaper test expects.
             let agent = format!("A{i}");
-            crate::tasks::claim(&mut c, &agent, Some(id), &[], 100, 1000).unwrap();
+            ready_claim(&mut c, &agent, id, 100, 1000);
             ids.push(id);
         }
         // All 5 leases lapse at 1100. Reap with limit=2: only 2 reaped.
@@ -1066,7 +1084,7 @@ mod tests {
                     1000,
                 )
                 .unwrap();
-                crate::tasks::claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+                ready_claim(&mut c, "W1", id, 100, 1000);
                 id
             };
             // Ensure a claim exists that will lapse
@@ -1331,7 +1349,7 @@ mod tests {
             &mut c, "boss", "impl", None, 0, None, None, None, None, 1000,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "A", Some(id), &[], 100, 1000).unwrap();
+        ready_claim(&mut c, "A", id, 100, 1000);
         assert_eq!(
             crate::tasks::get(&c, id).unwrap().unwrap().status,
             "working"
@@ -1378,7 +1396,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let id = crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000)
             .unwrap();
-        crate::tasks::claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+        ready_claim(&mut c, "W1", id, 100, 1000);
 
         // Simulate VerdictChanges: status=rework, lease released, updated_at=1300.
         c.execute(
@@ -1409,7 +1427,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let id = crate::tasks::create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000)
             .unwrap();
-        crate::tasks::claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+        ready_claim(&mut c, "W1", id, 100, 1000);
 
         // Expire the lease and keep status=working, updated_at recent.
         c.execute(
@@ -1444,7 +1462,7 @@ mod tests {
             1000,
         )
         .unwrap();
-        crate::tasks::claim(&mut c, "W1", Some(id), &[], 100, 1000).unwrap();
+        ready_claim(&mut c, "W1", id, 100, 1000);
         crate::tasks::apply_event(
             &mut c,
             "W1",

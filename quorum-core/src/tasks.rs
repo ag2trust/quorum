@@ -401,7 +401,14 @@ fn preserve_classifier_refs(
         .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
         .and_then(|value| value.as_object().cloned())
     {
-        for key in ["cx_est", "cx_by", "cx_flags", "cx_tags", "cx_dup_of"] {
+        for key in [
+            "cx_est",
+            "cx_size",
+            "cx_ready",
+            "cx_not_ready_reason",
+            "cx_by",
+            "cx_dup_of",
+        ] {
             if let Some(value) = existing_map.get(key) {
                 next_map.insert(key.to_string(), value.clone());
             }
@@ -572,7 +579,10 @@ pub fn claim(
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3
-                       AND COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+                       AND json_valid(refs) AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+                       AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+                       AND json_extract(refs, '$.cx_ready')=1
+                       AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                        AND (
                          (status='open' AND {DEP_READY_CLAUSE})
                          OR (status='in-review' AND reviewer IS NULL \
@@ -587,7 +597,10 @@ pub fn claim(
         None => {
             let mut selector = format!(
                 "SELECT id FROM tasks
-                 WHERE COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+                 WHERE json_valid(refs) AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+                   AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+                   AND json_extract(refs, '$.cx_ready')=1
+                   AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                    AND (
                     (status='open' AND {DEP_READY_CLAUSE})
                     OR (status='in-review' AND reviewer IS NULL \
@@ -670,7 +683,10 @@ pub fn claim_provider_retry_rework(
     let updated = tx.execute(
         "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
-           AND COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+           AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+           AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+           AND json_extract(refs, '$.cx_ready')=1
+           AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
            AND json_valid(refs)
            AND (
                json_type(refs, '$.codex_retry_requested')='true'
@@ -734,15 +750,19 @@ pub fn claim_remediation_rework(
         })
         .optional()?;
 
-    let complexity_five: bool = tx.query_row(
+    let policy_parked: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM tasks
-             WHERE id=?1 AND json_valid(refs) AND json_extract(refs, '$.cx_est')=5
+             WHERE id=?1 AND (NOT json_valid(refs)
+                 OR json_extract(refs, '$.cx_ready') IS NOT 1
+                 OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L')
+                 OR COALESCE(json_extract(refs, '$.cx_est'), 0) NOT BETWEEN 1 AND 5
+                 OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L'))
          )",
         params![id],
         |row| row.get(0),
     )?;
-    if status.as_deref() != Some("rework") || complexity_five {
+    if status.as_deref() != Some("rework") || policy_parked {
         crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
         tx.commit()?;
         return Ok(None);
@@ -1805,6 +1825,13 @@ pub fn update(
 /// the normal agent-scoped update path.
 pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) -> Result<()> {
     let tx = begin_immediate(conn)?;
+    let existing: Option<String> = tx
+        .query_row("SELECT refs FROM tasks WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+    let refs = preserve_classifier_refs(&existing, Some(refs)).unwrap_or_else(|| refs.to_string());
     tx.execute(
         "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs, now],
@@ -2110,8 +2137,112 @@ fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Res
 pub const COMPLEXITY_FIVE_PARK_REASON: &str =
     "complexity 5 exceeds automatic dispatch policy; split or rescope into a new task";
 
+/// Classification policy is intentionally separate from model routing: difficult
+/// focused work may run, while unready or compound work is parked.
+pub fn classification_is_dispatchable(refs: &Option<String>) -> bool {
+    let Some(refs) = refs else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs) else {
+        return false;
+    };
+    let Some(cx) = v.get("cx_est").and_then(|v| v.as_i64()) else {
+        return false;
+    };
+    let Some(size) = v.get("cx_size").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    ready && (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L") && !(cx == 5 && size == "L")
+}
+
+pub(crate) fn park_classified_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<bool> {
+    let current: Option<(String, Option<String>)> = tx.query_row(
+        "SELECT status, refs FROM tasks WHERE id=?1 AND status NOT IN ('done','failed','cancelled')",
+        params![id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((status, refs)) = current else {
+        return Ok(false);
+    };
+    let effective_reason = if reason == "classification outside automatic dispatch policy" {
+        refs.as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|v| v.get("cx_ready").and_then(|b| b.as_bool()) == Some(false))
+            .and_then(|v| {
+                v.get("cx_not_ready_reason")
+                    .and_then(|s| s.as_str())
+                    .map(|s| format!("task is not ready: {s}"))
+            })
+            .unwrap_or_else(|| reason.to_string())
+    } else {
+        reason.to_string()
+    };
+    let resume_status = match status.as_str() {
+        "working" | "claimed" => "open",
+        "merging" => "in-review",
+        other => other,
+    };
+    let refs = set_parked_refs(refs.as_deref(), &effective_reason, resume_status)?;
+    tx.execute(
+        "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    deactivate_lease(tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, format!("parked: {effective_reason}")],
+    )?;
+    crate::events::emit(tx, "task_parked", &lease_target(id), &effective_reason, now)?;
+    Ok(true)
+}
+
+/// A newly complete, dispatchable classification may replace an older policy
+/// park.  Restore only the status captured by that same park, inside the
+/// classification write transaction.
+pub(crate) fn restore_classified_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    now: i64,
+) -> Result<bool> {
+    let row: Option<(String, Option<String>)> = tx.query_row(
+        "SELECT status, refs FROM tasks WHERE id=?1 AND status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1",
+        params![id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional()?;
+    let Some((_status, refs)) = row else {
+        return Ok(false);
+    };
+    let Some(mut value) = refs.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return Ok(false);
+    };
+    let resume = value
+        .get(PARKED_RESUME_STATUS_REF)
+        .and_then(|v| v.as_str())
+        .unwrap_or("open")
+        .to_string();
+    if !matches!(resume.as_str(), "open" | "rework" | "in-review" | "merging") {
+        return Ok(false);
+    }
+    let obj = value.as_object_mut().expect("refs object");
+    obj.remove(PARKED_REF);
+    obj.remove(PARKED_REASON_REF);
+    obj.remove(PARKED_RESUME_STATUS_REF);
+    tx.execute(
+        "UPDATE tasks SET status=?2, refs=?3, updated_at=?4 WHERE id=?1",
+        params![id, resume, value.to_string(), now],
+    )?;
+    tx.execute("INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'classifier', 'classification now dispatchable; restored from policy park')", params![id, now])?;
+    Ok(true)
+}
+
 /// Park a classified category-5 task inside the caller's write transaction.
 /// Classification and policy enforcement therefore become visible atomically.
+#[allow(dead_code)] // compatibility helper retained for older callers/tests
 pub(crate) fn park_complexity_five_tx(
     tx: &rusqlite::Transaction<'_>,
     id: i64,
@@ -2167,7 +2298,9 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
             "SELECT id FROM tasks
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
-               AND json_extract(refs, '$.cx_est')=5
+               AND (json_extract(refs, '$.cx_ready')!=1
+                    OR json_extract(refs, '$.cx_size')='XL'
+                    OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L'))
              ORDER BY id
              LIMIT ?1",
         )?;
@@ -2178,7 +2311,12 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
     };
     let mut parked = 0;
     for id in ids {
-        parked += usize::from(park_complexity_five_tx(&tx, id, now)?);
+        parked += usize::from(park_classified_task_tx(
+            &tx,
+            id,
+            "classification outside automatic dispatch policy",
+            now,
+        )?);
     }
     tx.commit()?;
     Ok(parked)
@@ -2318,11 +2456,19 @@ pub fn retry_parked(
         return Ok(None);
     };
     let policy_parked: bool = tx.query_row(
-        "SELECT COALESCE(json_extract(refs, '$.cx_est'), 0)=5 FROM tasks WHERE id=?1",
+        "SELECT COALESCE(json_valid(refs) AND (json_extract(refs, '$.cx_ready')!=1
+             OR json_extract(refs, '$.cx_size')='XL'
+             OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')), 0) FROM tasks WHERE id=?1",
         params![id],
         |row| row.get(0),
     )?;
     if policy_parked {
+        // Retry of a policy park is a request to estimate remaining work.  Keep
+        // the durable park/resume context but make it a classifier candidate.
+        tx.execute(
+            "UPDATE tasks SET refs=json_remove(refs, '$.cx_est', '$.cx_size', '$.cx_ready', '$.cx_not_ready_reason', '$.cx_by'), updated_at=?2 WHERE id=?1",
+            params![id, now],
+        )?;
         tx.commit()?;
         return Ok(None);
     }
@@ -2806,6 +2952,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = crate::db::open(&dir.path().join("q.db")).unwrap();
         (dir, c)
+    }
+
+    /// Most lifecycle tests exercise work after the daemon has classified a
+    /// task.  Keep that precondition explicit in one fixture wrapper; tests of
+    /// classifier authority/absence call `super::create` directly.
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        conn: &mut Connection,
+        created_by: &str,
+        title: &str,
+        body: Option<&str>,
+        priority: i64,
+        labels: Option<&str>,
+        refs: Option<&str>,
+        depends_on: Option<&str>,
+        review_pr: Option<i64>,
+        now: i64,
+    ) -> Result<i64> {
+        let mut value = refs
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let map = value.as_object_mut().expect("test refs object");
+        map.entry("cx_est").or_insert_with(|| serde_json::json!(3));
+        map.entry("cx_size")
+            .or_insert_with(|| serde_json::json!("M"));
+        map.entry("cx_ready")
+            .or_insert_with(|| serde_json::json!(true));
+        map.entry("cx_by")
+            .or_insert_with(|| serde_json::json!("test:v2"));
+        let refs = value.to_string();
+        super::create(
+            conn,
+            created_by,
+            title,
+            body,
+            priority,
+            labels,
+            Some(&refs),
+            depends_on,
+            review_pr,
+            now,
+        )
     }
 
     #[test]
@@ -5467,7 +5655,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.body.as_deref(), Some("new body"));
-        assert_eq!(t.refs.as_deref(), Some(r#"{"pr":42}"#));
+        let refs: serde_json::Value = serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 42);
+        assert_eq!(refs["cx_est"], 3);
         assert_eq!(t.status, "working");
     }
 
@@ -6934,7 +7124,9 @@ mod tests {
         // Daemon-authoritative refs update succeeds.
         update_refs_daemon(&mut conn, id, r#"{"thread":"abc"}"#, now).unwrap();
         let t = get(&conn, id).unwrap().unwrap();
-        assert_eq!(t.refs.as_deref(), Some(r#"{"thread":"abc"}"#));
+        let refs: serde_json::Value = serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["thread"], "abc");
+        assert_eq!(refs["cx_est"], 3);
     }
 
     #[test]
@@ -7644,7 +7836,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET refs=json_object('cx_est', 5, 'cx_by', 'legacy:v1') WHERE id=?1",
+            "UPDATE tasks SET refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
             params![id],
         )
         .unwrap();
@@ -7691,7 +7883,7 @@ mod tests {
             .unwrap();
             c.execute(
                 "UPDATE tasks
-                 SET refs=json_object('cx_est', 5, 'cx_by', 'legacy:v1')
+                 SET refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
                  WHERE id=?1",
                 params![id],
             )
