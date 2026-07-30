@@ -142,23 +142,27 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Make task-scoped reachability pins match durable publication intents.
+    /// Make one bounded batch of task-scoped reachability pins match durable
+    /// publication intents.
     ///
-    /// The database is authoritative. Missing/mismatched pins are restored to
-    /// the intent SHA, while pins without a retained intent are deleted with an
-    /// exact-old-SHA guard. This closes both sides of daemon crash windows.
+    /// The caller supplies a cursor-bounded database batch. Missing/mismatched
+    /// pins are restored to the intent SHA, while pins without a retained
+    /// intent are deleted with an exact-old-SHA guard. Passing exact ref
+    /// patterns keeps Git output bounded by the batch size.
     pub async fn reconcile_publication_sources(
         &self,
         repo_dir: &Path,
-        expected: &HashMap<i64, String>,
+        expected: &HashMap<i64, Option<String>>,
     ) -> Result<PublicationRefReconcileResult, String> {
+        if expected.is_empty() {
+            return Ok(PublicationRefReconcileResult::default());
+        }
         let _guard = self.lock.lock().await;
         let mut list = self.git_cmd(repo_dir);
-        list.args([
-            "for-each-ref",
-            "--format=%(refname) %(objectname)",
-            "refs/quorum-publication/",
-        ]);
+        list.args(["for-each-ref", "--format=%(refname) %(objectname)"]);
+        for &task_id in expected.keys() {
+            list.arg(Self::publication_ref(task_id));
+        }
         let listed = run_git(list, self.local_timeout, "git list publication sources").await?;
         if !listed.status.success() {
             return Err(format!(
@@ -168,23 +172,44 @@ impl WorktreeManager {
         }
 
         let mut actual = HashMap::new();
-        let prefix = "refs/quorum-publication/task-";
         for line in String::from_utf8_lossy(&listed.stdout).lines() {
             let Some((refname, sha)) = line.split_once(' ') else {
                 return Err(format!("malformed publication ref listing: {line}"));
             };
             let task_id = refname
-                .strip_prefix(prefix)
+                .strip_prefix("refs/quorum-publication/task-")
                 .and_then(|id| id.parse::<i64>().ok())
-                .filter(|id| *id > 0);
-            actual.insert(refname.to_string(), (task_id, sha.to_string()));
+                .filter(|id| *id > 0)
+                .ok_or_else(|| format!("unexpected publication ref in bounded listing: {line}"))?;
+            actual.insert(task_id, sha.to_string());
         }
 
         let mut result = PublicationRefReconcileResult::default();
         for (&task_id, expected_sha) in expected {
             let refname = Self::publication_ref(task_id);
-            match actual.remove(&refname) {
-                Some((_, actual_sha)) if actual_sha == *expected_sha => {
+            let current = actual.remove(&task_id);
+            let Some(expected_sha) = expected_sha else {
+                if let Some(actual_sha) = current {
+                    let mut delete = self.git_cmd(repo_dir);
+                    delete.args(["update-ref", "-d", &refname, &actual_sha]);
+                    let deleted = run_git(
+                        delete,
+                        self.local_timeout,
+                        "git retire orphan publication source",
+                    )
+                    .await?;
+                    if !deleted.status.success() {
+                        return Err(format!(
+                            "cannot retire orphan publication source {refname}: {}",
+                            String::from_utf8_lossy(&deleted.stderr)
+                        ));
+                    }
+                    result.retired += 1;
+                }
+                continue;
+            };
+            match current {
+                Some(actual_sha) if actual_sha == *expected_sha => {
                     result.kept += 1;
                 }
                 current => {
@@ -209,8 +234,7 @@ impl WorktreeManager {
                     }
 
                     let old_sha = current
-                        .as_ref()
-                        .map(|(_, sha)| sha.as_str())
+                        .as_deref()
                         .unwrap_or("0000000000000000000000000000000000000000");
                     let mut update = self.git_cmd(repo_dir);
                     update.args(["update-ref", &refname, expected_sha, old_sha]);
@@ -226,24 +250,6 @@ impl WorktreeManager {
                     result.restored += 1;
                 }
             }
-        }
-
-        for (refname, (_, actual_sha)) in actual {
-            let mut delete = self.git_cmd(repo_dir);
-            delete.args(["update-ref", "-d", &refname, &actual_sha]);
-            let deleted = run_git(
-                delete,
-                self.local_timeout,
-                "git retire orphan publication source",
-            )
-            .await?;
-            if !deleted.status.success() {
-                return Err(format!(
-                    "cannot retire orphan publication source {refname}: {}",
-                    String::from_utf8_lossy(&deleted.stderr)
-                ));
-            }
-            result.retired += 1;
         }
         Ok(result)
     }
@@ -1757,9 +1763,10 @@ mod tests {
             .unwrap();
 
         let expected = HashMap::from([
-            (1, expected_sha.clone()),
-            (2, expected_sha.clone()),
-            (4, expected_sha.clone()),
+            (1, Some(expected_sha.clone())),
+            (2, Some(expected_sha.clone())),
+            (3, None),
+            (4, Some(expected_sha.clone())),
         ]);
         let outcome = mgr
             .reconcile_publication_sources(&repo, &expected)

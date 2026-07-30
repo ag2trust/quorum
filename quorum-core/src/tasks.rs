@@ -1878,7 +1878,11 @@ fn classify_managed_exit_tx(
             (
                 matches!(status.as_str(), "working" | "rework")
                     && (assignee.as_deref() == Some(agent) || has_capability),
-                "verdict IS NULL AND pr IS NOT NULL",
+                // Initial daemon-owned publication deliberately submits without
+                // a PR; the daemon resolves/creates it after consuming the row.
+                // Ownership is checked before a consumed outcome can count, so
+                // an earlier round still cannot hide a current worker failure.
+                "verdict IS NULL",
             )
         }
         ManagedRunRole::Reviewer => (
@@ -2558,6 +2562,55 @@ pub fn list(
     Ok(tasks)
 }
 
+/// Minimal, cursor-bounded input for publication-ref reconciliation.
+///
+/// Tasks never expire, so every daemon-created task-scoped ref has a task row.
+/// Walking IDs newest-first lets the daemon reconcile current publication
+/// intents and terminal/no-intent orphans without materializing task bodies,
+/// notes, dependency readiness, or the unbounded historical task set.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PublicationSourceReconcileRow {
+    pub task_id: i64,
+    pub source_sha: Option<String>,
+}
+
+pub fn publication_source_reconcile_batch(
+    conn: &Connection,
+    before_task_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<PublicationSourceReconcileRow>> {
+    if limit <= 0 {
+        return Err(QuorumError::Usage(
+            "publication reconciliation limit must be positive".into(),
+        ));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id,
+                CASE WHEN status NOT IN ('done', 'cancelled')
+                           AND json_valid(COALESCE(refs, '{}'))
+                  THEN CASE
+                    WHEN json_type(refs, '$.daemon_publication.local_sha')='text'
+                    THEN json_extract(refs, '$.daemon_publication.local_sha')
+                    ELSE NULL
+                  END
+                  ELSE NULL
+                END
+         FROM tasks
+         WHERE (?1 IS NULL OR id < ?1)
+         ORDER BY id DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(params![before_task_id, limit], |row| {
+            Ok(PublicationSourceReconcileRow {
+                task_id: row.get(0)?,
+                source_sha: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// Bounded read-only task listing for pollers such as the local web dashboard.
 /// Unlike [`list`], this never materializes an unbounded historical task set.
 pub fn list_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
@@ -2811,7 +2864,7 @@ mod tests {
                 agent: "worker".into(),
                 kind: crate::mailbox::MailboxKind::Done,
                 task_id: Some(task_id),
-                pr: Some(42),
+                pr: None,
                 verdict: None,
                 feedback: None,
                 note: None,
@@ -3504,6 +3557,43 @@ mod tests {
     }
 
     #[test]
+    fn managed_worker_exit_with_null_pr_submission_stays_pending() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+
+        let disposition = dispose_managed_exit(
+            &mut c,
+            ManagedRunRole::Worker,
+            "worker",
+            id,
+            "status 0",
+            1001,
+        )
+        .unwrap();
+        assert!(matches!(
+            disposition,
+            ManagedExitDisposition::OutcomePending
+        ));
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+    }
+
+    #[test]
     fn managed_reviewer_exit_with_pending_verdict_retains_review_phase() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
@@ -3630,7 +3720,7 @@ mod tests {
                 agent: "worker".into(),
                 kind: crate::mailbox::MailboxKind::Done,
                 task_id: Some(id),
-                pr: Some(42),
+                pr: None,
                 verdict: None,
                 feedback: None,
                 note: None,

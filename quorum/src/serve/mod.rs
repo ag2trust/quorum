@@ -570,32 +570,34 @@ fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent>
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
-fn retained_publication_sources(task_rows: &[tasks::Task]) -> HashMap<i64, String> {
-    task_rows
-        .iter()
-        // Failed publication is parked and retryable. Only truly terminal
-        // lifecycle states must relinquish reachability.
-        .filter(|task| !matches!(task.status.as_str(), "done" | "cancelled"))
-        .filter_map(|task| {
-            publication_intent_from_refs(task.refs.as_deref())
-                .map(|intent| (task.id, intent.local_sha))
-        })
-        .collect()
-}
-
 async fn reconcile_publication_source_refs(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
-) -> std::result::Result<(), String> {
+    before_task_id: Option<i64>,
+) -> std::result::Result<Option<i64>, String> {
     let db_path = config.db_path.clone();
-    let expected = tokio::task::spawn_blocking(move || -> Result<HashMap<i64, String>> {
-        let conn = quorum_core::db::open(&db_path)?;
-        let task_rows = tasks::list(&conn, None, None, None)?;
-        Ok(retained_publication_sources(&task_rows))
-    })
+    let rows = tokio::task::spawn_blocking(
+        move || -> Result<Vec<tasks::PublicationSourceReconcileRow>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            tasks::publication_source_reconcile_batch(
+                &conn,
+                before_task_id,
+                PUBLICATION_REF_RECONCILE_BATCH_SIZE,
+            )
+        },
+    )
     .await
     .map_err(|e| format!("publication ref reconciliation join failure: {e}"))?
     .map_err(|e| format!("publication ref reconciliation DB read failed: {e}"))?;
+    let next_cursor = if rows.len() == PUBLICATION_REF_RECONCILE_BATCH_SIZE as usize {
+        rows.last().map(|row| row.task_id)
+    } else {
+        None
+    };
+    let expected = rows
+        .into_iter()
+        .map(|row| (row.task_id, row.source_sha))
+        .collect();
     let outcome = wt_mgr
         .reconcile_publication_sources(&config.repo_dir, &expected)
         .await?;
@@ -605,7 +607,7 @@ async fn reconcile_publication_source_refs(
             outcome.kept, outcome.restored, outcome.retired
         ));
     }
-    Ok(())
+    Ok(next_cursor)
 }
 
 fn find_initial_pr(
@@ -1424,6 +1426,7 @@ pub const EXIT_SELF_UPDATE: i32 = 75;
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
 const DRIFT_CHECK_INTERVAL_SECS: u64 = 15 * 60;
 const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
+const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     log(&format!(
@@ -2823,6 +2826,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
     let mut last_publication_ref_reconcile: Option<std::time::Instant> = None;
+    let mut publication_ref_reconcile_cursor: Option<i64> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
@@ -2877,10 +2881,15 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     if let Err(e) = recovery::recover(config, &wt_mgr).await {
         log(&format!("recovery failed: {e} — starting fresh"));
     }
-    if let Err(e) = reconcile_publication_source_refs(config, &wt_mgr).await {
-        log(&format!(
+    match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
+    {
+        Ok(next_cursor) => {
+            publication_ref_reconcile_cursor = next_cursor;
+            last_publication_ref_reconcile = Some(std::time::Instant::now());
+        }
+        Err(e) => log(&format!(
             "publication ref startup reconciliation failed: {e} — continuing"
-        ));
+        )),
     }
 
     // #127/#157: report dead-lettered interpret jobs at startup. Historical
@@ -3110,10 +3119,17 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         };
         if should_reconcile_publication_refs {
             last_publication_ref_reconcile = Some(std::time::Instant::now());
-            if let Err(e) = reconcile_publication_source_refs(config, &wt_mgr).await {
-                log(&format!(
+            match reconcile_publication_source_refs(
+                config,
+                &wt_mgr,
+                publication_ref_reconcile_cursor,
+            )
+            .await
+            {
+                Ok(next_cursor) => publication_ref_reconcile_cursor = next_cursor,
+                Err(e) => log(&format!(
                     "publication ref periodic reconciliation failed: {e} — continuing"
-                ));
+                )),
             }
         }
 
@@ -12978,7 +12994,7 @@ mod tests {
     }
 
     #[test]
-    fn publication_ref_retention_excludes_cancelled_and_completed_tasks() {
+    fn publication_ref_reconciliation_query_is_minimal_bounded_and_status_aware() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("publication-ref-retention.db");
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -13031,12 +13047,55 @@ mod tests {
         )
         .unwrap();
 
-        let rows = tasks::list(&conn, None, None, None).unwrap();
-        let retained = retained_publication_sources(&rows);
-        assert_eq!(retained.get(&ids[0]).map(String::as_str), Some("abc123"));
-        assert_eq!(retained.get(&ids[1]).map(String::as_str), Some("abc123"));
-        assert!(!retained.contains_key(&ids[2]));
-        assert!(!retained.contains_key(&ids[3]));
+        let rows = tasks::publication_source_reconcile_batch(&conn, None, 4).unwrap();
+        let retained: HashMap<_, _> = rows
+            .into_iter()
+            .map(|row| (row.task_id, row.source_sha))
+            .collect();
+        assert_eq!(
+            retained.get(&ids[0]).and_then(Option::as_deref),
+            Some("abc123")
+        );
+        assert_eq!(
+            retained.get(&ids[1]).and_then(Option::as_deref),
+            Some("abc123")
+        );
+        assert_eq!(retained.get(&ids[2]), Some(&None));
+        assert_eq!(retained.get(&ids[3]), Some(&None));
+
+        // Historical terminal growth cannot increase one polling pass: the
+        // query projects only id/SHA and stops exactly at its fixed limit.
+        for n in 0..100 {
+            let id = tasks::create(
+                &mut conn,
+                "owner",
+                &format!("historical-{n}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done' WHERE id=?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let first = tasks::publication_source_reconcile_batch(&conn, None, 7).unwrap();
+        assert_eq!(first.len(), 7);
+        assert!(first.iter().all(|row| row.source_sha.is_none()));
+        let second = tasks::publication_source_reconcile_batch(
+            &conn,
+            Some(first.last().unwrap().task_id),
+            7,
+        )
+        .unwrap();
+        assert_eq!(second.len(), 7);
+        assert!(second[0].task_id < first.last().unwrap().task_id);
     }
 
     #[test]
@@ -13953,7 +14012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_codex_with_pending_done_is_retained_without_retry_staging() {
+    async fn dead_codex_with_pending_null_pr_done_is_retained_without_retry_staging() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("done-pending.db");
         create_active_task(&db_path, "Spool", "working");
@@ -13965,7 +14024,7 @@ mod tests {
                     agent: "Spool".into(),
                     kind: mailbox::MailboxKind::Done,
                     task_id: Some(1),
-                    pr: Some(439),
+                    pr: None,
                     verdict: None,
                     feedback: None,
                     note: None,

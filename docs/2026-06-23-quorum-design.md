@@ -1359,7 +1359,9 @@ outcome failure, and `provider_blocked` only after durable Codex retry state is 
 This classification is intentionally independent of observation order. In particular,
 `submit → in-review → exit`, `submit → exit → in-review`, and
 `exit → late submission recovery` must converge on one lifecycle transition and one
-reviewer spawn; the same applies to R1/R2 verdicts and remediation submissions. Cleanup
+reviewer spawn. An initial worker's null-PR submission is a durable pending outcome
+because the daemon, not the worker, resolves or creates its PR; the same convergence
+applies to R1/R2 verdicts and remediation submissions. Cleanup
 must not emit a second `AgentFailed`, duplicate `task_in_review`/`task_rework`, release
 the new owner's lease, or classify exit status 0 as a crash merely because the
 turn-oriented provider process ended.
@@ -1413,10 +1415,11 @@ still replay the exact source even when their replacement worktree starts at ano
 `HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
 transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
 later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
-guard. Startup and bounded periodic reconciliation derive the retained pin set from
-non-terminal tasks with valid durable intents, restore missing or mismatched intent pins,
-and exact-SHA-delete orphaned or terminal-task pins. A retry from `pr_created` repeats the
-same authoritative branch/SHA/base validation before any push. Initial PR reconciliation
+guard. Startup and bounded periodic reconciliation walk minimal task-id/SHA projections
+in fixed cursor batches, restore missing or mismatched intent pins, and exact-SHA-delete
+no-intent or terminal-task pins without scanning the full task history or Git ref
+namespace in one pass. A retry from `pr_created` repeats the same authoritative
+branch/SHA/base validation before any push. Initial PR reconciliation
 also requires the PR base to equal the configured base branch. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish
 retry. This is protocol ownership plus a best-effort
