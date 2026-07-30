@@ -25,6 +25,10 @@ const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
 const DEFAULT_STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 8 * 1024 * 1024;
+// Keep the transport bounded by the same record budget the browser normalizer uses. The
+// first record is retained for a continuation from the preceding poll; the rest are the
+// newest suffix so an active stream remains useful when a byte window is dense.
+const MAX_STREAM_RECORDS: usize = 2_000;
 const DASHBOARD_TASK_LIMIT: i64 = 100;
 const DASHBOARD_AGENT_LIMIT: i64 = 100;
 
@@ -352,17 +356,42 @@ fn stream_payload(
     let read = file.read(&mut bytes).map_err(StreamError::Io)?;
     bytes.truncate(read);
     let next = start + read as u64;
-    let mut chunks = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    let partial = if bytes.ends_with(b"\n") {
-        chunks.pop();
-        None
+    let complete_records = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let partial = (!bytes.ends_with(b"\n")).then(|| {
+        let start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        hex_bytes(&bytes[start..])
+    });
+    let retained_start = if complete_records > MAX_STREAM_RECORDS {
+        let skipped = complete_records - MAX_STREAM_RECORDS + 1;
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(skipped - 1)
+            .map_or(0, |(index, _)| index + 1)
     } else {
-        chunks.pop().map(hex_bytes)
+        0
     };
+    let mut lines = Vec::with_capacity(complete_records.min(MAX_STREAM_RECORDS));
+    if complete_records > MAX_STREAM_RECORDS {
+        let first_end = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+        lines.push(hex_bytes(&bytes[..first_end]));
+    }
+    let mut line_start = retained_start;
+    for (index, byte) in bytes.iter().enumerate().skip(retained_start) {
+        if *byte == b'\n' {
+            lines.push(hex_bytes(&bytes[line_start..index]));
+            line_start = index + 1;
+        }
+    }
+    let omitted = complete_records.saturating_sub(lines.len());
     // The initial tail can begin in the middle of a record. The client discards that
     // first completed fragment before it begins retaining suffixes for later requests.
     Ok(
-        json!({"lines": chunks.into_iter().map(hex_bytes).collect::<Vec<_>>(), "partial": partial, "starts_mid_line": starts_mid_line,
+        json!({"lines": lines, "omitted": omitted, "partial": partial, "starts_mid_line": starts_mid_line,
         "next_offset": next, "eof": next >= len}),
     )
 }
@@ -510,6 +539,23 @@ mod tests {
             second["lines"][0].as_str().unwrap()
         );
         assert_eq!(reassembled, hex_bytes(record.trim_end().as_bytes()));
+    }
+
+    #[test]
+    fn stream_payload_bounds_dense_record_fanout_before_json() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        let record_count = MAX_STREAM_RECORDS * 3;
+        fs::write(dir.join("stream.jsonl"), "{}\n".repeat(record_count)).unwrap();
+
+        let payload = stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES).unwrap();
+        let lines = payload["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), MAX_STREAM_RECORDS);
+        assert_eq!(payload["omitted"], json!(record_count - MAX_STREAM_RECORDS));
+        assert_eq!(lines.first().unwrap(), "7b7d");
+        assert_eq!(lines.last().unwrap(), "7b7d");
+        assert_eq!(payload["next_offset"], json!((record_count * 3) as u64));
     }
 
     #[test]

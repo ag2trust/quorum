@@ -106,6 +106,12 @@ assert.equal(tail.lines.length, MAX_NORMALIZED_RECORDS_PER_POLL);
 assert.equal(tail.omitted, denseLines.length - MAX_NORMALIZED_RECORDS_PER_POLL);
 assert.equal(tail.lines[0], '{}');
 
+// The endpoint may already have dropped a dense prefix; its omission count must reach
+// the normalizer without expanding the retained transport suffix.
+tail = reassembleTail({}, denseLines.slice(-MAX_NORMALIZED_RECORDS_PER_POLL), null, false, 48_000);
+assert.equal(tail.lines.length, MAX_NORMALIZED_RECORDS_PER_POLL);
+assert.equal(tail.omitted, 48_000);
+
 // Explicit navigation always starts a new, live view; offset zero is a replacement,
 // not an append to a paused stream or its partial continuation.
 const detail = detailNavigationState('B-200', 0);
