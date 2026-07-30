@@ -849,6 +849,7 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
             "-C",
             &case._repo.path().to_string_lossy(),
             "branch",
+            "-f",
             "review-pr-1",
         ])
         .status()
