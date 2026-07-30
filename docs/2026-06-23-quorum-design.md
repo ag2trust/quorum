@@ -1413,9 +1413,13 @@ still replay the exact source even when their replacement worktree starts at ano
 `HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
 transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
 later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
-guard. Initial PR reconciliation also requires the PR base to equal the configured base
-branch. Rejected or ambiguous publication parks the task; persisted PR target data is
-never authority for a publish retry. This is protocol ownership plus a best-effort
+guard. Startup and bounded periodic reconciliation derive the retained pin set from
+non-terminal tasks with valid durable intents, restore missing or mismatched intent pins,
+and exact-SHA-delete orphaned or terminal-task pins. A retry from `pr_created` repeats the
+same authoritative branch/SHA/base validation before any push. Initial PR reconciliation
+also requires the PR base to equal the configured base branch. Rejected or ambiguous
+publication parks the task; persisted PR target data is never authority for a publish
+retry. This is protocol ownership plus a best-effort
 worktree `pushurl` lockout, not credential isolation: an agent holding the same GitHub
 credential can still bypass local Git configuration with an explicit URL or API.
 Enforcing physical write authority requires the separate D4 credential split and is not

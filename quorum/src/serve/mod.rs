@@ -557,17 +557,55 @@ async fn load_publication_intent(
         let Some(task) = tasks::get(&conn, task_id)? else {
             return Ok(None);
         };
-        let intent = task
-            .refs
-            .as_deref()
-            .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-            .and_then(|refs| refs.get("daemon_publication").cloned())
-            .and_then(|value| serde_json::from_value(value).ok());
-        Ok(intent)
+        Ok(publication_intent_from_refs(task.refs.as_deref()))
     })
     .await
     .map_err(|e| format!("publication intent read join failure: {e}"))?
     .map_err(|e| format!("publication intent read failed: {e}"))
+}
+
+fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent> {
+    refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| refs.get("daemon_publication").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn retained_publication_sources(task_rows: &[tasks::Task]) -> HashMap<i64, String> {
+    task_rows
+        .iter()
+        // Failed publication is parked and retryable. Only truly terminal
+        // lifecycle states must relinquish reachability.
+        .filter(|task| !matches!(task.status.as_str(), "done" | "cancelled"))
+        .filter_map(|task| {
+            publication_intent_from_refs(task.refs.as_deref())
+                .map(|intent| (task.id, intent.local_sha))
+        })
+        .collect()
+}
+
+async fn reconcile_publication_source_refs(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+) -> std::result::Result<(), String> {
+    let db_path = config.db_path.clone();
+    let expected = tokio::task::spawn_blocking(move || -> Result<HashMap<i64, String>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        let task_rows = tasks::list(&conn, None, None, None)?;
+        Ok(retained_publication_sources(&task_rows))
+    })
+    .await
+    .map_err(|e| format!("publication ref reconciliation join failure: {e}"))?
+    .map_err(|e| format!("publication ref reconciliation DB read failed: {e}"))?;
+    let outcome = wt_mgr
+        .reconcile_publication_sources(&config.repo_dir, &expected)
+        .await?;
+    if outcome.restored > 0 || outcome.retired > 0 {
+        log(&format!(
+            "publication refs reconciled (kept={}, restored={}, retired={})",
+            outcome.kept, outcome.restored, outcome.retired
+        ));
+    }
+    Ok(())
 }
 
 fn find_initial_pr(
@@ -641,6 +679,18 @@ fn validate_initial_pr_target(
     Ok(())
 }
 
+fn validate_pr_created_retry_target(
+    intent: &PublicationIntent,
+    target: &PrTarget,
+    base_branch: &str,
+) -> std::result::Result<bool, String> {
+    if intent.stage != "pr_created" {
+        return Ok(false);
+    }
+    validate_initial_pr_target(target, &intent.branch, &intent.local_sha, base_branch)?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_worker_completion(
     config: &ServeConfig,
@@ -685,6 +735,18 @@ async fn publish_worker_completion(
     if let Some(pr) = known_pr {
         let target = resolve_pr_target(pr, &config.repo_dir, Some(&config.repo))
             .ok_or_else(|| format!("cannot resolve live authoritative head for PR #{pr}"))?;
+        // `pr_created` means the daemon may have crashed (or validation may
+        // have failed) after recording the PR but before verifying its target.
+        // Re-run the complete initial branch/SHA/base check. Treating this as
+        // an established PR would otherwise push before validating its base.
+        if validate_pr_created_retry_target(&intent, &target, &config.base_branch)? {
+            intent.stage = "verified".into();
+            persist_publication_intent(&config.db_path, task_id, &intent).await?;
+            return Ok(PublishedCompletion {
+                pr,
+                source_sha: intent.local_sha,
+            });
+        }
         if target.is_fork {
             return Err(format!(
                 "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
@@ -1361,6 +1423,7 @@ pub const EXIT_SELF_UPDATE: i32 = 75;
 
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
 const DRIFT_CHECK_INTERVAL_SECS: u64 = 15 * 60;
+const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     log(&format!(
@@ -2759,6 +2822,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
+    let mut last_publication_ref_reconcile: Option<std::time::Instant> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
@@ -2812,6 +2876,11 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
     if let Err(e) = recovery::recover(config, &wt_mgr).await {
         log(&format!("recovery failed: {e} — starting fresh"));
+    }
+    if let Err(e) = reconcile_publication_source_refs(config, &wt_mgr).await {
+        log(&format!(
+            "publication ref startup reconciliation failed: {e} — continuing"
+        ));
     }
 
     // #127/#157: report dead-lettered interpret jobs at startup. Historical
@@ -3033,6 +3102,19 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             })
             .await
             .ok();
+        }
+
+        let should_reconcile_publication_refs = match last_publication_ref_reconcile {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= PUBLICATION_REF_RECONCILE_INTERVAL_SECS,
+        };
+        if should_reconcile_publication_refs {
+            last_publication_ref_reconcile = Some(std::time::Instant::now());
+            if let Err(e) = reconcile_publication_source_refs(config, &wt_mgr).await {
+                log(&format!(
+                    "publication ref periodic reconciliation failed: {e} — continuing"
+                ));
+            }
         }
 
         if let Err(e) = tick(
@@ -12866,6 +12948,95 @@ mod tests {
         let error = validate_initial_pr_target(&target, "daemon/worker-t1", "abc123", "main")
             .expect_err("wrong baseRefName must fail initial PR reconciliation");
         assert!(error.contains("base"));
+    }
+
+    #[test]
+    fn pr_created_retry_repeats_initial_target_validation() {
+        let intent = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "abc123".into(),
+            pr: Some(482),
+            stage: "pr_created".into(),
+        };
+        let wrong_base = PrTarget {
+            pr: 482,
+            head_ref: intent.branch.clone(),
+            head_sha: intent.local_sha.clone(),
+            is_fork: false,
+            base_ref: Some("release".into()),
+        };
+        let error = validate_pr_created_retry_target(&intent, &wrong_base, "main")
+            .expect_err("an unverified retry must fail closed on the wrong base");
+        assert!(error.contains("base"));
+
+        let mut established = intent;
+        established.stage = "verified".into();
+        assert!(
+            !validate_pr_created_retry_target(&established, &wrong_base, "main").unwrap(),
+            "only an unverified initial PR uses this retry path"
+        );
+    }
+
+    #[test]
+    fn publication_ref_retention_excludes_cancelled_and_completed_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("publication-ref-retention.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let mut ids = Vec::new();
+        for title in ["open", "failed", "cancelled", "done"] {
+            ids.push(
+                tasks::create(
+                    &mut conn,
+                    "owner",
+                    title,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    now_unix(),
+                )
+                .unwrap(),
+            );
+        }
+        let intent = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "abc123".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+        };
+        for id in &ids {
+            tasks::set_publication_intent(
+                &conn,
+                *id,
+                &serde_json::to_string(&intent).unwrap(),
+                now_unix(),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE tasks SET status='failed' WHERE id=?1",
+            rusqlite::params![ids[1]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![ids[2]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            rusqlite::params![ids[3]],
+        )
+        .unwrap();
+
+        let rows = tasks::list(&conn, None, None, None).unwrap();
+        let retained = retained_publication_sources(&rows);
+        assert_eq!(retained.get(&ids[0]).map(String::as_str), Some("abc123"));
+        assert_eq!(retained.get(&ids[1]).map(String::as_str), Some("abc123"));
+        assert!(!retained.contains_key(&ids[2]));
+        assert!(!retained.contains_key(&ids[3]));
     }
 
     #[test]

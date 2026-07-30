@@ -1,5 +1,6 @@
 //! Serialized git worktree operations for agent isolation.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
@@ -13,6 +14,13 @@ pub struct WorktreeManager {
     git_bin: PathBuf,
     fetch_timeout: Duration,
     local_timeout: Duration,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PublicationRefReconcileResult {
+    pub kept: usize,
+    pub restored: usize,
+    pub retired: usize,
 }
 
 /// Run a git subprocess with a bounded timeout. On timeout the child is killed
@@ -132,6 +140,112 @@ impl WorktreeManager {
             ));
         }
         Ok(())
+    }
+
+    /// Make task-scoped reachability pins match durable publication intents.
+    ///
+    /// The database is authoritative. Missing/mismatched pins are restored to
+    /// the intent SHA, while pins without a retained intent are deleted with an
+    /// exact-old-SHA guard. This closes both sides of daemon crash windows.
+    pub async fn reconcile_publication_sources(
+        &self,
+        repo_dir: &Path,
+        expected: &HashMap<i64, String>,
+    ) -> Result<PublicationRefReconcileResult, String> {
+        let _guard = self.lock.lock().await;
+        let mut list = self.git_cmd(repo_dir);
+        list.args([
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/quorum-publication/",
+        ]);
+        let listed = run_git(list, self.local_timeout, "git list publication sources").await?;
+        if !listed.status.success() {
+            return Err(format!(
+                "cannot list publication sources: {}",
+                String::from_utf8_lossy(&listed.stderr)
+            ));
+        }
+
+        let mut actual = HashMap::new();
+        let prefix = "refs/quorum-publication/task-";
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            let Some((refname, sha)) = line.split_once(' ') else {
+                return Err(format!("malformed publication ref listing: {line}"));
+            };
+            let task_id = refname
+                .strip_prefix(prefix)
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|id| *id > 0);
+            actual.insert(refname.to_string(), (task_id, sha.to_string()));
+        }
+
+        let mut result = PublicationRefReconcileResult::default();
+        for (&task_id, expected_sha) in expected {
+            let refname = Self::publication_ref(task_id);
+            match actual.remove(&refname) {
+                Some((_, actual_sha)) if actual_sha == *expected_sha => {
+                    result.kept += 1;
+                }
+                current => {
+                    let mut resolve = self.git_cmd(repo_dir);
+                    resolve.args([
+                        "rev-parse",
+                        "--verify",
+                        &format!("{expected_sha}^{{commit}}"),
+                    ]);
+                    let resolved = run_git(
+                        resolve,
+                        self.local_timeout,
+                        "git resolve publication intent source",
+                    )
+                    .await?;
+                    if !resolved.status.success()
+                        || String::from_utf8_lossy(&resolved.stdout).trim() != expected_sha
+                    {
+                        return Err(format!(
+                            "publication intent for task #{task_id} names unavailable commit {expected_sha}"
+                        ));
+                    }
+
+                    let old_sha = current
+                        .as_ref()
+                        .map(|(_, sha)| sha.as_str())
+                        .unwrap_or("0000000000000000000000000000000000000000");
+                    let mut update = self.git_cmd(repo_dir);
+                    update.args(["update-ref", &refname, expected_sha, old_sha]);
+                    let updated =
+                        run_git(update, self.local_timeout, "git restore publication source")
+                            .await?;
+                    if !updated.status.success() {
+                        return Err(format!(
+                            "cannot restore publication source for task #{task_id}: {}",
+                            String::from_utf8_lossy(&updated.stderr)
+                        ));
+                    }
+                    result.restored += 1;
+                }
+            }
+        }
+
+        for (refname, (_, actual_sha)) in actual {
+            let mut delete = self.git_cmd(repo_dir);
+            delete.args(["update-ref", "-d", &refname, &actual_sha]);
+            let deleted = run_git(
+                delete,
+                self.local_timeout,
+                "git retire orphan publication source",
+            )
+            .await?;
+            if !deleted.status.success() {
+                return Err(format!(
+                    "cannot retire orphan publication source {refname}: {}",
+                    String::from_utf8_lossy(&deleted.stderr)
+                ));
+            }
+            result.retired += 1;
+        }
+        Ok(result)
     }
 
     /// Build a daemon-only push command that bypasses the worktree's poisoned
@@ -1616,6 +1730,69 @@ mod tests {
             .status
             .success(),
             "retired publication source must not leak a permanent Git ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_ref_reconciliation_restores_intents_and_retires_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let mgr = WorktreeManager::new();
+        let expected_sha = git_rev_parse(&repo, "HEAD");
+        assert!(
+            git_output(&repo, &["commit", "--allow-empty", "-m", "other source"])
+                .status
+                .success()
+        );
+        let other_sha = git_rev_parse(&repo, "HEAD");
+
+        mgr.pin_publication_source(&repo, 1, &expected_sha)
+            .await
+            .unwrap();
+        mgr.pin_publication_source(&repo, 2, &other_sha)
+            .await
+            .unwrap();
+        mgr.pin_publication_source(&repo, 3, &other_sha)
+            .await
+            .unwrap();
+
+        let expected = HashMap::from([
+            (1, expected_sha.clone()),
+            (2, expected_sha.clone()),
+            (4, expected_sha.clone()),
+        ]);
+        let outcome = mgr
+            .reconcile_publication_sources(&repo, &expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PublicationRefReconcileResult {
+                kept: 1,
+                restored: 2,
+                retired: 1,
+            }
+        );
+        assert_eq!(
+            git_rev_parse(&repo, &WorktreeManager::publication_ref(1)),
+            expected_sha
+        );
+        assert_eq!(
+            git_rev_parse(&repo, &WorktreeManager::publication_ref(2)),
+            expected_sha
+        );
+        assert_eq!(
+            git_rev_parse(&repo, &WorktreeManager::publication_ref(4)),
+            expected_sha
+        );
+        assert!(
+            !git_output(
+                &repo,
+                &["show-ref", "--verify", &WorktreeManager::publication_ref(3),],
+            )
+            .status
+            .success(),
+            "a post-lifecycle or cancelled-task orphan must be retired"
         );
     }
 
