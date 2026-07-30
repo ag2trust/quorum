@@ -5,7 +5,10 @@
 //! 1. max-task-tokens: worker killed when cumulative tokens exceed ceiling
 //! 2. max-turn-tokens: worker killed when single-turn tokens exceed ceiling
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -51,11 +54,58 @@ fn init_git_repo(dir: &std::path::Path) {
         .unwrap();
 }
 
+fn create_gh_shim() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let shim = tempfile::tempdir().unwrap();
+    let state = shim.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let path = shim.path().join("gh");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2; head=""; base=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2
+    elif [ "$1" = "--base" ]; then base="$2"; shift 2
+    else shift; fi
+  done
+  [ "$base" = "main" ] || { printf 'unexpected base: %s\n' "$base" >&2; exit 1; }
+  pr="${head##*-t}"; printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2; head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"; else printf '[]\n'; fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"; branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  exit 1
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let search_path = format!(
+        "{}:{}",
+        shim.path().display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    (shim, state, search_path)
+}
+
 struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -80,6 +130,58 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  base=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2
+    elif [ "$1" = "--base" ]; then base="$2"; shift 2
+    else shift; fi
+  done
+  [ "$base" = "main" ] || { printf 'unexpected base: %s\n' "$base" >&2; exit 1; }
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
@@ -110,6 +212,9 @@ impl ServeHandle {
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -132,6 +237,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -145,6 +251,7 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let (gh_shim, gh_state, path) = create_gh_shim();
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
@@ -175,6 +282,9 @@ impl ServeHandle {
         let mut cmd = Command::new(cargo_bin("quorum"));
         cmd.env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null());
@@ -199,6 +309,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -300,7 +411,19 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     };
     let run_id = resolve_run_id(home, agent, role);
     let mut cmd_args = vec!["done"];
-    cmd_args.extend_from_slice(args);
+    if role == "worker" {
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "--pr" {
+                index += 2;
+            } else {
+                cmd_args.push(args[index]);
+                index += 1;
+            }
+        }
+    } else {
+        cmd_args.extend_from_slice(args);
+    }
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
@@ -843,7 +966,7 @@ fn reviewer_ceiling_kills_reviewer_and_respawns() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
-    let marker_dir = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
 
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
@@ -855,24 +978,82 @@ fn reviewer_ceiling_kills_reviewer_and_respawns() {
         .status()
         .unwrap();
 
-    seed_task(home.path(), "Task for reviewer ceiling test");
+    let create = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-create",
+            "--title",
+            "Task for reviewer ceiling test",
+            "--created-by",
+            "TestCreator",
+            "--review-pr",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "task-create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
 
-    // Wrapper script: first invocation (worker) runs fake-agent normally;
-    // subsequent invocations (reviewers) set FAKE_AGENT_DELAY_SECS=4 so the
-    // reviewer hangs long enough to hit the 1s wall-clock ceiling.
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: 1,
+            cx_est: 3,
+            cx_flags: Vec::new(),
+            cx_tags: Vec::new(),
+            cx_dup_of: Vec::new(),
+        }],
+        "test-classifier:v1",
+        1,
+    )
+    .unwrap();
+    let head_sha = Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(head_sha.status.success());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "branch",
+            "review-pr-1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    quorum_core::pr_targets::upsert(
+        &mut conn,
+        1,
+        1,
+        "review-pr-1",
+        String::from_utf8_lossy(&head_sha.stdout).trim(),
+        false,
+    )
+    .unwrap();
+
+    // This review-only fixture starts directly in the reviewer phase, so the
+    // one-second ceiling measures reviewer runtime without worker/publication
+    // setup consuming the test's timing budget.
     let fake_agent = cargo_bin("fake-agent");
-    let wrapper = marker_dir.path().join("agent-wrapper.sh");
-    let marker = marker_dir.path().join("invoked");
+    let wrapper = wrapper_dir.path().join("agent-wrapper.sh");
     std::fs::write(
         &wrapper,
         format!(
             "#!/bin/bash\n\
-             if [ -f \"{marker}\" ]; then\n\
-               export FAKE_AGENT_DELAY_SECS=4\n\
-             fi\n\
-             touch \"{marker}\"\n\
+             export FAKE_AGENT_DELAY_SECS=4\n\
              exec \"{fake_agent}\" \"$@\"\n",
-            marker = marker.display(),
             fake_agent = fake_agent.display(),
         ),
     )
@@ -885,9 +1066,14 @@ fn reviewer_ceiling_kills_reviewer_and_respawns() {
 
     let sentinel = tempfile::tempdir().unwrap();
     let sentinel_path = sentinel.path().to_string_lossy().to_string();
+    let (gh_shim, gh_state, path) = create_gh_shim();
+    std::fs::write(gh_state.join("1"), "review-pr-1").unwrap();
     let mut child = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
+        .env("PATH", path)
+        .env("QUORUM_TEST_GH_STATE", &gh_state)
+        .env("QUORUM_TEST_REPO", repo_dir.path())
         .args([
             "serve",
             "--repo",
@@ -930,24 +1116,8 @@ fn reviewer_ceiling_kills_reviewer_and_respawns() {
         rx,
         lines: Vec::new(),
         _sentinel: Some(sentinel),
+        _gh_shim: Some(gh_shim),
     };
-
-    // Worker spawns (no delay on first invocation), emits result immediately.
-    assert!(
-        handle.wait_for("spawning agent", 15),
-        "worker not spawned. Lines: {:?}",
-        handle.lines
-    );
-    assert!(
-        handle.wait_for("result", 15),
-        "worker result not seen. Lines: {:?}",
-        handle.lines
-    );
-
-    let worker_name = handle.extract_agent_name("spawning agent ").unwrap();
-
-    // Worker signals done with PR → reviewer spawns.
-    quorum_done(home.path(), &["--agent", &worker_name, "--pr", "1"]);
 
     assert!(
         handle.wait_for("spawning reviewer", 15),

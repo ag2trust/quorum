@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+use std::{env, os::unix::fs::PermissionsExt};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -53,6 +54,7 @@ struct ServeHandle {
     lines: Vec<String>,
     /// #201: sentinel file whose presence keeps the serve process alive.
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -88,10 +90,61 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args([
                 "serve",
                 "--repo",
@@ -132,6 +185,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -489,28 +543,24 @@ fn one_worker_done_does_not_affect_other() {
     let worker_a = &agents[0];
     let worker_b = &agents[1];
 
-    // Worker A signals done (no PR — teardown as done).
+    // Worker A signals done. The daemon publishes its commit and advances only
+    // that task into review.
     quorum_done(home.path(), &["--agent", worker_a]);
 
-    // Wait for worker A teardown.
+    // A reviewer replaces worker A in the slot.
     assert!(
-        handle.wait_for("tearing down worker", 15),
-        "worker A teardown not seen. Lines: {:?}",
+        handle.wait_for("spawning reviewer", 15),
+        "worker A reviewer not seen. Lines: {:?}",
         handle.lines
     );
 
-    // Worker B should still be alive (no teardown for it).
-    handle.drain_available();
-    let b_teardowns = handle
-        .lines
-        .iter()
-        .filter(|l| l.contains("tearing down worker") && l.contains(worker_b))
-        .count();
+    // Worker B should still own its independent task.
     assert_eq!(
-        b_teardowns, 0,
-        "worker B should not be torn down when A completes. Lines: {:?}",
-        handle.lines
+        get_task_status(home.path(), 2),
+        "working",
+        "worker B task should remain working when A enters review"
     );
+    assert_ne!(worker_a, worker_b);
 
     handle.stop();
 }
@@ -606,14 +656,65 @@ fn freed_slot_picks_up_next_task() {
     let agents = handle.extract_all_agent_names("spawning agent ");
     let worker_a = &agents[0];
 
-    // Worker A signals done (no PR — simple teardown).
+    // Worker A signals done; daemon publication advances it to review.
     quorum_done(home.path(), &["--agent", worker_a]);
 
-    // Worker A should be torn down and a third worker spawned.
+    // Complete A's reviewer turn so the lifecycle slot is actually free.
     assert!(
-        handle.wait_for("tearing down worker", 15),
-        "worker A teardown not seen. Lines: {:?}",
+        handle.wait_for("spawning reviewer", 15),
+        "worker A reviewer not seen. Lines: {:?}",
         handle.lines
+    );
+    let reviewer = handle
+        .extract_all_agent_names("spawning reviewer ")
+        .into_iter()
+        .next()
+        .expect("reviewer name");
+    assert!(
+        handle.wait_for(&format!("reviewer {reviewer} result"), 15),
+        "reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "R2 reviewer not seen. Lines: {:?}",
+        handle.lines
+    );
+    let r2_reviewer = handle
+        .extract_all_agent_names("R2: pre-merge reviewer ")
+        .into_iter()
+        .next()
+        .expect("R2 reviewer name");
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer result not seen. Lines: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2_reviewer,
+            "--pr",
+            "1",
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
     );
 
     // Third worker should spawn for Task C.
@@ -677,9 +778,10 @@ fn each_worker_gets_own_reviewer() {
 
     let agents = handle.extract_all_agent_names("spawning agent ");
 
-    // Both workers signal done with PRs.
-    quorum_done(home.path(), &["--agent", &agents[0], "--pr", "10"]);
-    quorum_done(home.path(), &["--agent", &agents[1], "--pr", "20"]);
+    // Initial workers commit and signal only; the daemon publishes and creates
+    // one PR per task through the GitHub boundary.
+    quorum_done(home.path(), &["--agent", &agents[0]]);
+    quorum_done(home.path(), &["--agent", &agents[1]]);
 
     // Wait for two reviewers to spawn.
     assert!(

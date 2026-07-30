@@ -1,6 +1,9 @@
 //! Deterministic production-path coverage for mixed provider lifecycle routing.
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -123,6 +126,7 @@ struct Case {
     home: tempfile::TempDir,
     _repo: tempfile::TempDir,
     _worktrees: tempfile::TempDir,
+    gh_shim: tempfile::TempDir,
     runner_log: std::path::PathBuf,
     handle: ServeHandle,
 }
@@ -234,6 +238,60 @@ impl Case {
                 .unwrap();
         }
 
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        if let Some(pr) = review_pr {
+            std::fs::write(gh_state.join(pr.to_string()), format!("review-pr-{pr}")).unwrap();
+        }
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
+  if [ -z "$sha" ]; then
+    sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  fi
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let sentinel = tempfile::tempdir().unwrap();
         let codex_only = role_config.is_some_and(|config| config.contains(r#"provider = "codex""#));
         let cli_provider = if codex_only {
@@ -247,6 +305,9 @@ impl Case {
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &runner_log)
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo.path())
             .args([
                 "serve",
                 "--repo",
@@ -297,6 +358,7 @@ impl Case {
             home,
             _repo: repo,
             _worktrees: worktrees,
+            gh_shim,
             runner_log,
             handle: ServeHandle {
                 child,
@@ -354,6 +416,16 @@ impl Case {
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &self.runner_log)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.gh_shim.path().display(),
+                    env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("QUORUM_TEST_GH_STATE", self.gh_shim.path().join("state"))
+            .env("QUORUM_TEST_REPO", self._repo.path())
             .args([
                 "serve",
                 "--repo",
@@ -428,12 +500,23 @@ impl Case {
             }
         };
         let mut command = Command::new(cargo_bin("quorum"));
+        let mut done_args = Vec::new();
+        let worker_has_bound_pr = args.contains(&"--verdict");
+        let mut index = 0;
+        while index < args.len() {
+            if !worker_has_bound_pr && args[index] == "--pr" {
+                index += 2;
+            } else {
+                done_args.push(args[index]);
+                index += 1;
+            }
+        }
         command
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("QUORUM_RUN_ID", run_id)
             .args(["done", "--agent", agent])
-            .args(args);
+            .args(done_args);
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -1075,6 +1158,16 @@ exit 1
     // seeded spawn baseline. Restore a healthy runner first so the reviewer
     // the resume triggers can actually run.
     write_dual_protocol_runner(case.home.path());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "checkout",
+            "review-pr-1",
+        ])
+        .status()
+        .unwrap()
+        .success());
     assert!(Command::new("git")
         .args([
             "-C",

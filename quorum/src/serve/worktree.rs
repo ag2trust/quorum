@@ -1,12 +1,16 @@
 //! Serialized git worktree operations for agent isolation.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_PIPE_LIMIT: usize = 1024 * 1024;
 
 pub struct WorktreeManager {
     lock: Mutex<()>,
@@ -15,20 +19,155 @@ pub struct WorktreeManager {
     local_timeout: Duration,
 }
 
-/// Run a git subprocess with a bounded timeout. On timeout the child is killed
-/// via `kill_on_drop` (SIGKILL) before this function returns, so the caller's
-/// mutex guard remains held until the child is dead.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PublicationRefReconcileResult {
+    pub kept: usize,
+    pub restored: usize,
+    pub retired: usize,
+}
+
+struct GitPipeOutput {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+async fn drain_git_pipe<R>(
+    mut pipe: R,
+    limit: usize,
+    pipe_name: &'static str,
+    overflow_tx: tokio::sync::mpsc::Sender<&'static str>,
+) -> std::io::Result<GitPipeOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut exceeded_limit = false;
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < count && !exceeded_limit {
+            exceeded_limit = true;
+            let _ = overflow_tx.try_send(pipe_name);
+        }
+    }
+    Ok(GitPipeOutput {
+        bytes,
+        exceeded_limit,
+    })
+}
+
+/// Run a git subprocess with fixed output bounds and cancellation-safe process
+/// ownership. A timeout or output overflow explicitly kills and reaps the
+/// child; kill-on-drop covers daemon shutdown while the command is live.
 async fn run_git(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    cmd.kill_on_drop(true);
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("{label}: {e}")),
-        Err(_) => Err(format!("{label}: timed out after {}s", timeout.as_secs())),
+    run_git_with_limit(cmd, timeout, GIT_PIPE_LIMIT, label).await
+}
+
+async fn run_git_with_limit(
+    mut cmd: Command,
+    timeout: Duration,
+    pipe_limit: usize,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}: stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}: stderr pipe unavailable"))?;
+    let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
+    let mut stdout_reader = tokio::spawn(drain_git_pipe(
+        stdout,
+        pipe_limit,
+        "stdout",
+        overflow_tx.clone(),
+    ));
+    let mut stderr_reader = tokio::spawn(drain_git_pipe(stderr, pipe_limit, "stderr", overflow_tx));
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let status = tokio::select! {
+        result = child.wait() => match result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill().await;
+                stdout_reader.abort();
+                stderr_reader.abort();
+                return Err(format!("{label}: {error}"));
+            }
+        },
+        Some(pipe_name) = overflow_rx.recv() => {
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: {pipe_name} exceeded {pipe_limit}-byte limit and kill/reap failed: {error}"
+                ),
+                None => format!("{label}: {pipe_name} exceeded {pipe_limit}-byte limit"),
+            });
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: timed out after {}s and kill/reap failed: {error}",
+                    timeout.as_secs()
+                ),
+                None => format!("{label}: timed out after {}s", timeout.as_secs()),
+            });
+        }
+    };
+
+    let readers = async {
+        let stdout = (&mut stdout_reader)
+            .await
+            .map_err(|error| format!("{label}: stdout join: {error}"))?
+            .map_err(|error| format!("{label}: stdout read: {error}"))?;
+        let stderr = (&mut stderr_reader)
+            .await
+            .map_err(|error| format!("{label}: stderr join: {error}"))?
+            .map_err(|error| format!("{label}: stderr read: {error}"))?;
+        Ok::<_, String>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout_at(deadline, readers).await {
+        Ok(result) => result?,
+        Err(_) => {
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(format!(
+                "{label}: output collection timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+    };
+    if stdout.exceeded_limit {
+        return Err(format!("{label}: stdout exceeded {pipe_limit}-byte limit"));
     }
+    if stderr.exceeded_limit {
+        return Err(format!("{label}: stderr exceeded {pipe_limit}-byte limit"));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
 }
 
 impl WorktreeManager {
@@ -55,6 +194,226 @@ impl WorktreeManager {
         let mut cmd = Command::new(&self.git_bin);
         cmd.arg("-C").arg(repo_dir);
         cmd
+    }
+
+    fn publication_ref(task_id: i64) -> String {
+        format!("refs/quorum-publication/task-{task_id}")
+    }
+
+    /// Pin the immutable source commit named by a durable publication intent.
+    ///
+    /// Publication failures tear down run-local worktrees and branches. This
+    /// daemon-owned ref keeps the exact object reachable across that cleanup,
+    /// including when a remediation retry receives a different local branch.
+    pub async fn pin_publication_source(
+        &self,
+        repo_dir: &Path,
+        task_id: i64,
+        source_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let publication_ref = Self::publication_ref(task_id);
+
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", &format!("{source_sha}^{{commit}}")]);
+        let resolved = run_git(
+            resolve,
+            self.local_timeout,
+            "git rev-parse publication source",
+        )
+        .await?;
+        let resolved_sha = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if !resolved.status.success() || resolved_sha != source_sha {
+            return Err(format!(
+                "publication source {source_sha} is not an exact local commit"
+            ));
+        }
+
+        let mut update = self.git_cmd(repo_dir);
+        update.args(["update-ref", &publication_ref, source_sha]);
+        let updated = run_git(
+            update,
+            self.local_timeout,
+            "git update-ref publication source",
+        )
+        .await?;
+        if !updated.status.success() {
+            return Err(format!(
+                "cannot pin publication source {source_sha}: {}",
+                String::from_utf8_lossy(&updated.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retire a publication pin only when it still names the completed source.
+    /// A mismatched ref is left intact and logged by the best-effort caller.
+    pub async fn retire_publication_source(
+        &self,
+        repo_dir: &Path,
+        task_id: i64,
+        source_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let publication_ref = Self::publication_ref(task_id);
+        let mut delete = self.git_cmd(repo_dir);
+        delete.args(["update-ref", "-d", &publication_ref, source_sha]);
+        let deleted = run_git(
+            delete,
+            self.local_timeout,
+            "git update-ref retire publication source",
+        )
+        .await?;
+        if !deleted.status.success() {
+            return Err(format!(
+                "cannot retire publication source {source_sha}: {}",
+                String::from_utf8_lossy(&deleted.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Make one bounded batch of task-scoped reachability pins match durable
+    /// publication intents.
+    ///
+    /// The caller supplies a cursor-bounded database batch. Missing/mismatched
+    /// pins are restored to the intent SHA, while pins without a retained
+    /// intent are deleted with an exact-old-SHA guard. Passing exact ref
+    /// patterns keeps Git output bounded by the batch size.
+    pub async fn reconcile_publication_sources(
+        &self,
+        repo_dir: &Path,
+        expected: &HashMap<i64, Option<String>>,
+    ) -> Result<PublicationRefReconcileResult, String> {
+        if expected.is_empty() {
+            return Ok(PublicationRefReconcileResult::default());
+        }
+        let _guard = self.lock.lock().await;
+        let mut list = self.git_cmd(repo_dir);
+        list.args(["for-each-ref", "--format=%(refname) %(objectname)"]);
+        for &task_id in expected.keys() {
+            list.arg(Self::publication_ref(task_id));
+        }
+        let listed = run_git(list, self.local_timeout, "git list publication sources").await?;
+        if !listed.status.success() {
+            return Err(format!(
+                "cannot list publication sources: {}",
+                String::from_utf8_lossy(&listed.stderr)
+            ));
+        }
+
+        let mut actual = HashMap::new();
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            let Some((refname, sha)) = line.split_once(' ') else {
+                return Err(format!("malformed publication ref listing: {line}"));
+            };
+            let task_id = refname
+                .strip_prefix("refs/quorum-publication/task-")
+                .and_then(|id| id.parse::<i64>().ok())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| format!("unexpected publication ref in bounded listing: {line}"))?;
+            actual.insert(task_id, sha.to_string());
+        }
+
+        let mut result = PublicationRefReconcileResult::default();
+        for (&task_id, expected_sha) in expected {
+            let refname = Self::publication_ref(task_id);
+            let current = actual.remove(&task_id);
+            let Some(expected_sha) = expected_sha else {
+                if let Some(actual_sha) = current {
+                    let mut delete = self.git_cmd(repo_dir);
+                    delete.args(["update-ref", "-d", &refname, &actual_sha]);
+                    let deleted = run_git(
+                        delete,
+                        self.local_timeout,
+                        "git retire orphan publication source",
+                    )
+                    .await?;
+                    if !deleted.status.success() {
+                        return Err(format!(
+                            "cannot retire orphan publication source {refname}: {}",
+                            String::from_utf8_lossy(&deleted.stderr)
+                        ));
+                    }
+                    result.retired += 1;
+                }
+                continue;
+            };
+            match current {
+                Some(actual_sha) if actual_sha == *expected_sha => {
+                    result.kept += 1;
+                }
+                current => {
+                    let mut resolve = self.git_cmd(repo_dir);
+                    resolve.args([
+                        "rev-parse",
+                        "--verify",
+                        &format!("{expected_sha}^{{commit}}"),
+                    ]);
+                    let resolved = run_git(
+                        resolve,
+                        self.local_timeout,
+                        "git resolve publication intent source",
+                    )
+                    .await?;
+                    if !resolved.status.success()
+                        || String::from_utf8_lossy(&resolved.stdout).trim() != expected_sha
+                    {
+                        return Err(format!(
+                            "publication intent for task #{task_id} names unavailable commit {expected_sha}"
+                        ));
+                    }
+
+                    let old_sha = current
+                        .as_deref()
+                        .unwrap_or("0000000000000000000000000000000000000000");
+                    let mut update = self.git_cmd(repo_dir);
+                    update.args(["update-ref", &refname, expected_sha, old_sha]);
+                    let updated =
+                        run_git(update, self.local_timeout, "git restore publication source")
+                            .await?;
+                    if !updated.status.success() {
+                        return Err(format!(
+                            "cannot restore publication source for task #{task_id}: {}",
+                            String::from_utf8_lossy(&updated.stderr)
+                        ));
+                    }
+                    result.restored += 1;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Build a daemon-only push command that bypasses the worktree's poisoned
+    /// `pushurl`. Managed agents' ordinary pushes hit that best-effort lockout;
+    /// the daemon obtains the normal fetch URL for its explicit protocol push.
+    /// This is not credential isolation: D4 must enforce that separately.
+    /// Caller MUST hold `self.lock`.
+    async fn daemon_push_cmd(
+        &self,
+        worktree_dir: &Path,
+        refspec: &str,
+        lease: &str,
+    ) -> Result<Command, String> {
+        let mut get_url = self.git_cmd(worktree_dir);
+        get_url.args(["remote", "get-url", "origin"]);
+        let url = run_git(get_url, self.local_timeout, "git remote get-url origin").await?;
+        if !url.status.success() {
+            return Err(format!(
+                "git remote get-url origin failed: {}",
+                String::from_utf8_lossy(&url.stderr)
+            ));
+        }
+        let push_url = String::from_utf8_lossy(&url.stdout).trim().to_string();
+        if push_url.is_empty() {
+            return Err("git remote get-url origin returned an empty URL".into());
+        }
+        let mut push = Command::new(&self.git_bin);
+        push.arg("-C")
+            .arg(worktree_dir)
+            .args(["push", &push_url, lease, refspec]);
+        Ok(push)
     }
 
     /// Check if a local branch exists. Caller MUST hold `self.lock`.
@@ -265,23 +624,6 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Remove an optional setting from the shared repository config.
-    /// Caller MUST hold `self.lock`.
-    async fn unset_local_config(&self, dir: &Path, key: &str) -> Result<(), String> {
-        let mut cmd = Command::new(&self.git_bin);
-        cmd.arg("-C")
-            .arg(dir)
-            .args(["config", "--local", "--unset-all", key]);
-        let out = run_git(cmd, self.local_timeout, "git config --local --unset-all").await?;
-        match out.status.code() {
-            Some(0 | 5) => Ok(()),
-            _ => Err(format!(
-                "git config --local --unset-all {key} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )),
-        }
-    }
-
     /// Enable per-worktree config, which is a prerequisite for every
     /// `git config --worktree` write below.
     ///
@@ -353,69 +695,6 @@ impl WorktreeManager {
             .await
     }
 
-    /// Point a plain `git push` inside `worktree_dir` at `remote_branch`.
-    ///
-    /// The daemon owns run-unique local branch names, so a remote branch name
-    /// (e.g. a PR head) is a push target only, never a local checkout. The
-    /// agent pushes with no refspec and lands on the PR branch.
-    ///
-    /// `remote_branch` MUST be a branch on `origin`: this hardcodes
-    /// `branch.<local>.remote = origin`, so a fork PR head (a name in the fork,
-    /// not in `origin`) must never be passed here.
-    ///
-    /// All push routing is worktree-scoped: repo-scoped values would leak into
-    /// the user's shared checkout and persist after the run-unique local branch
-    /// is deleted. Also mutates the shared repo config via
-    /// [`Self::enable_worktree_config`].
-    pub async fn configure_push_upstream(
-        &self,
-        worktree_dir: &Path,
-        local_branch: &str,
-        remote_branch: &str,
-    ) -> Result<(), String> {
-        let _guard = self.lock.lock().await;
-        self.enable_worktree_config(worktree_dir).await?;
-        self.set_config(worktree_dir, &["--worktree", "push.default", "upstream"])
-            .await?;
-        // Covers `git push origin` too, which consults the remote's refspec
-        // before push.default.
-        self.set_config(
-            worktree_dir,
-            &[
-                "--worktree",
-                "remote.origin.push",
-                &format!("HEAD:refs/heads/{remote_branch}"),
-            ],
-        )
-        .await?;
-        // `git worktree add -b` may create common branch tracking config
-        // according to the user's branch.autoSetupMerge setting. Remove it
-        // before installing daemon-owned, worktree-local routing.
-        self.unset_local_config(worktree_dir, &format!("branch.{local_branch}.remote"))
-            .await?;
-        self.unset_local_config(worktree_dir, &format!("branch.{local_branch}.merge"))
-            .await?;
-        self.set_config(
-            worktree_dir,
-            &[
-                "--worktree",
-                &format!("branch.{local_branch}.remote"),
-                "origin",
-            ],
-        )
-        .await?;
-        self.set_config(
-            worktree_dir,
-            &[
-                "--worktree",
-                &format!("branch.{local_branch}.merge"),
-                &format!("refs/heads/{remote_branch}"),
-            ],
-        )
-        .await?;
-        Ok(())
-    }
-
     /// Make an unqualified push from `worktree_dir` fail. Reviewers read code
     /// and post GitHub comments; they never push. Worktree-scoped so the shared
     /// checkout and every other worktree keep their real push URL.
@@ -462,6 +741,206 @@ impl WorktreeManager {
             ));
         }
         Ok(())
+    }
+
+    pub async fn head_sha(&self, worktree_dir: &Path) -> Result<String, String> {
+        let mut cmd = self.git_cmd(worktree_dir);
+        cmd.args(["rev-parse", "HEAD"]);
+        let out = run_git(cmd, self.local_timeout, "git rev-parse HEAD").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git rev-parse HEAD failed in {}: {}",
+                worktree_dir.display(),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if sha.is_empty() {
+            return Err("git rev-parse HEAD returned an empty SHA".into());
+        }
+        Ok(sha)
+    }
+
+    /// Publish the worktree's exact current commit to an already-authoritative
+    /// same-repository PR head, then prove the remote accepted that commit.
+    ///
+    /// The expected SHA comes from a live PR lookup. We fetch and compare it
+    /// immediately before the push so a stale or retargeted PR head is never
+    /// overwritten. A rejected push is followed by a best-effort refetch for
+    /// diagnostics; callers must park rather than transition lifecycle.
+    pub async fn push_to_pr_head(
+        &self,
+        worktree_dir: &Path,
+        remote_branch: &str,
+        expected_remote_sha: &str,
+        source_sha: &str,
+    ) -> Result<String, String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{remote_branch}");
+
+        let mut fetch = self.git_cmd(worktree_dir);
+        fetch.args(["fetch", "origin", &remote_ref]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch PR head").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                String::from_utf8_lossy(&fetched.stderr)
+            ));
+        }
+
+        let mut remote_sha = self.git_cmd(worktree_dir);
+        remote_sha.args(["rev-parse", "FETCH_HEAD"]);
+        let remote = run_git(remote_sha, self.local_timeout, "git rev-parse FETCH_HEAD").await?;
+        if !remote.status.success() {
+            return Err(format!(
+                "git rev-parse FETCH_HEAD failed: {}",
+                String::from_utf8_lossy(&remote.stderr)
+            ));
+        }
+        let actual_remote_sha = String::from_utf8_lossy(&remote.stdout).trim().to_string();
+        if actual_remote_sha != expected_remote_sha {
+            return Err(format!(
+                "PR head changed before daemon push: expected {expected_remote_sha}, got {actual_remote_sha}"
+            ));
+        }
+
+        let mut resolve_source = self.git_cmd(worktree_dir);
+        resolve_source.args(["rev-parse", "--verify", &format!("{source_sha}^{{commit}}")]);
+        let source = run_git(
+            resolve_source,
+            self.local_timeout,
+            "git rev-parse publication source",
+        )
+        .await?;
+        if !source.status.success() {
+            return Err(format!(
+                "publication source {source_sha} is not a local commit: {}",
+                String::from_utf8_lossy(&source.stderr)
+            ));
+        }
+        let resolved_source = String::from_utf8_lossy(&source.stdout).trim().to_string();
+        if resolved_source != source_sha {
+            return Err(format!(
+                "publication source did not resolve exactly: expected {source_sha}, got {resolved_source}"
+            ));
+        }
+
+        let refspec = format!("{source_sha}:{remote_ref}");
+        let lease = format!("--force-with-lease={remote_ref}:{expected_remote_sha}");
+        let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        let pushed = run_git(push, self.fetch_timeout, "git push PR head").await?;
+        if !pushed.status.success() {
+            let mut refresh = self.git_cmd(worktree_dir);
+            refresh.args(["fetch", "origin", &remote_ref]);
+            let _ = run_git(refresh, self.fetch_timeout, "git refetch rejected PR push").await;
+            return Err(format!(
+                "daemon push to {remote_ref} rejected: {}",
+                String::from_utf8_lossy(&pushed.stderr)
+            ));
+        }
+
+        let mut verify = self.git_cmd(worktree_dir);
+        verify.args(["ls-remote", "--exit-code", "origin", &remote_ref]);
+        let verified = run_git(verify, self.fetch_timeout, "git ls-remote PR head").await?;
+        if !verified.status.success() {
+            return Err(format!(
+                "cannot verify daemon push to {remote_ref}: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            ));
+        }
+        let verified_stdout = String::from_utf8_lossy(&verified.stdout);
+        let verified_sha = verified_stdout
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if verified_sha != source_sha {
+            return Err(format!(
+                "daemon push verification mismatch for {remote_ref}: expected {source_sha}, got {verified_sha}"
+            ));
+        }
+        Ok(source_sha.to_string())
+    }
+
+    /// Publish a new daemon-owned branch and verify its remote SHA. This is
+    /// only for the first delivery, before a PR exists and therefore before a
+    /// PR head can become authoritative. Existing remote branches are
+    /// ambiguous and are rejected rather than overwritten.
+    pub async fn push_new_branch(
+        &self,
+        worktree_dir: &Path,
+        branch: &str,
+        source_sha: &str,
+    ) -> Result<String, String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{branch}");
+        let mut resolve_source = self.git_cmd(worktree_dir);
+        resolve_source.args(["rev-parse", "--verify", &format!("{source_sha}^{{commit}}")]);
+        let source = run_git(
+            resolve_source,
+            self.local_timeout,
+            "git rev-parse publication source",
+        )
+        .await?;
+        if !source.status.success() {
+            return Err(format!(
+                "publication source {source_sha} is not a local commit: {}",
+                String::from_utf8_lossy(&source.stderr)
+            ));
+        }
+        let resolved_source = String::from_utf8_lossy(&source.stdout).trim().to_string();
+        if resolved_source != source_sha {
+            return Err(format!(
+                "publication source did not resolve exactly: expected {source_sha}, got {resolved_source}"
+            ));
+        }
+
+        let mut existing = self.git_cmd(worktree_dir);
+        existing.args(["ls-remote", "origin", &remote_ref]);
+        let existing = run_git(existing, self.fetch_timeout, "git ls-remote new branch").await?;
+        if !existing.status.success() {
+            return Err(format!(
+                "cannot inspect new branch {remote_ref}: {}",
+                String::from_utf8_lossy(&existing.stderr)
+            ));
+        }
+        if !existing.stdout.is_empty() {
+            let existing_sha = String::from_utf8_lossy(&existing.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if existing_sha == source_sha {
+                return Ok(source_sha.to_string());
+            }
+            return Err(format!(
+                "remote branch {remote_ref} already exists at {existing_sha}; refusing ambiguous push"
+            ));
+        }
+
+        let refspec = format!("{source_sha}:{remote_ref}");
+        let lease = format!("--force-with-lease={remote_ref}:");
+        let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        let pushed = run_git(push, self.fetch_timeout, "git push new branch").await?;
+        if !pushed.status.success() {
+            return Err(format!(
+                "daemon push to new branch {remote_ref} rejected: {}",
+                String::from_utf8_lossy(&pushed.stderr)
+            ));
+        }
+        let mut verify = self.git_cmd(worktree_dir);
+        verify.args(["ls-remote", "--exit-code", "origin", &remote_ref]);
+        let verified = run_git(verify, self.fetch_timeout, "git ls-remote new branch").await?;
+        let verified_stdout = String::from_utf8_lossy(&verified.stdout);
+        let verified_sha = verified_stdout
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if !verified.status.success() || verified_sha != source_sha {
+            return Err(format!(
+                "daemon push verification mismatch for new branch {remote_ref}: expected {source_sha}, got {verified_sha}"
+            ));
+        }
+        Ok(source_sha.to_string())
     }
 
     pub async fn gc_orphaned(
@@ -955,11 +1434,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_git_timeout_kills_and_returns() {
-        // Directly test run_git: a `sleep 3600` must not block beyond the timeout.
-        // If kill_on_drop failed, this call would hang for an hour.
-        let mut cmd = Command::new("sleep");
-        cmd.arg("3600");
+    async fn run_git_timeout_kills_reaps_and_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 3600"])
+            .env("PID_FILE", &pid_file);
 
         let start = std::time::Instant::now();
         let result = run_git(cmd, Duration::from_millis(300), "sleep").await;
@@ -969,6 +1449,51 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "run_git should return on timeout, took {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "timed-out git subprocess {pid:?} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_bounds_continuous_stdout_and_stderr_and_reaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo $$ > \"$PID_FILE\"; while :; do printf 0123456789; printf abcdefghij >&2; done",
+        ])
+        .env("PID_FILE", &pid_file);
+
+        let start = std::time::Instant::now();
+        let error = run_git_with_limit(cmd, Duration::from_secs(5), 4096, "noisy git")
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            error.contains("exceeded 4096-byte limit"),
+            "unexpected output-limit error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "output limit should stop the child promptly, took {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "overproducing git subprocess {pid:?} was not reaped"
         );
     }
 
@@ -1242,10 +1767,389 @@ mod tests {
         mgr.delete_branch(&repo, local_branch).await;
     }
 
-    /// A plain `git push` from a remediation worktree must land on the PR's
-    /// remote branch, not on the namespaced local name.
     #[tokio::test]
-    async fn configure_push_upstream_pushes_to_pr_head() {
+    async fn daemon_push_to_pr_head_rejects_stale_authoritative_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/stale-pr";
+        let remote_tip = push_branch(&repo, pr_head);
+        let mgr = WorktreeManager::new();
+        let wt_path = tmp.path().join("remediation-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Brass-t10", &wt_path, pr_head)
+            .await
+            .expect("provision");
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "fix"])
+                .status
+                .success()
+        );
+        let source_sha = git_rev_parse(&wt_path, "HEAD");
+
+        let result = mgr
+            .push_to_pr_head(&wt_path, pr_head, "not-the-authoritative-sha", &source_sha)
+            .await;
+        assert!(
+            result.is_err(),
+            "stale PR head must fail closed: {result:?}"
+        );
+        assert_eq!(
+            git_rev_parse(&bare, pr_head),
+            remote_tip,
+            "a rejected daemon push must leave the remote PR head unchanged"
+        );
+
+        mgr.remove(&repo, &wt_path).await.ok();
+        mgr.delete_branch(&repo, "remediation/Brass-t10").await;
+    }
+
+    #[tokio::test]
+    async fn daemon_push_uses_durable_source_when_head_mutates_after_intent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/source-sha";
+        let remote_tip = push_branch(&repo, pr_head);
+        let mgr = WorktreeManager::new();
+        let wt_path = tmp.path().join("remediation-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Source-t14", &wt_path, pr_head)
+            .await
+            .expect("provision");
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "intent A"])
+                .status
+                .success()
+        );
+        let intent_sha = git_rev_parse(&wt_path, "HEAD");
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "later B"])
+                .status
+                .success()
+        );
+        let mutable_head = git_rev_parse(&wt_path, "HEAD");
+        assert_ne!(intent_sha, mutable_head);
+
+        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha)
+            .await
+            .expect("exact durable source must publish");
+        assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
+        assert_ne!(git_rev_parse(&bare, pr_head), mutable_head);
+    }
+
+    /// Regression for PR #483 remediation review: a publication failure may
+    /// remove the source worktree/branch before an operator retries the parked
+    /// task. The retry can use a different run-local remediation branch, but
+    /// it must still publish intent A rather than its replacement HEAD B.
+    #[tokio::test]
+    async fn publication_pin_replays_exact_source_after_branch_cleanup_and_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/publication-retry";
+        let remote_tip = push_branch(&repo, pr_head);
+        let mgr = WorktreeManager::new();
+
+        let first_wt = tmp.path().join("first-remediation");
+        let first_branch = "remediation/First-t263";
+        mgr.fetch_and_provision(&repo, first_branch, &first_wt, pr_head)
+            .await
+            .expect("first remediation provision");
+        assert!(
+            git_output(&first_wt, &["commit", "--allow-empty", "-m", "intent A"])
+                .status
+                .success()
+        );
+        let intent_sha = git_rev_parse(&first_wt, "HEAD");
+        mgr.pin_publication_source(&first_wt, 263, &intent_sha)
+            .await
+            .expect("pin exact publication source before remote operations");
+
+        // Publication parks and normal slot cleanup removes all run-local
+        // reachability. Only the daemon-owned pin is allowed to retain A.
+        mgr.remove(&repo, &first_wt)
+            .await
+            .expect("remove first worktree");
+        mgr.delete_branch(&repo, first_branch).await;
+        assert!(!git_output(
+            &repo,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{first_branch}")
+            ]
+        )
+        .status
+        .success());
+
+        let retry_wt = tmp.path().join("retry-remediation");
+        let retry_branch = "remediation/Retry-t263";
+        mgr.fetch_and_provision(&repo, retry_branch, &retry_wt, pr_head)
+            .await
+            .expect("replacement remediation provision");
+        assert!(git_output(
+            &retry_wt,
+            &["commit", "--allow-empty", "-m", "replacement HEAD B"]
+        )
+        .status
+        .success());
+        let replacement_head = git_rev_parse(&retry_wt, "HEAD");
+        assert_ne!(replacement_head, intent_sha);
+
+        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha)
+            .await
+            .expect("task retry must replay the durable intent source");
+        assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
+        assert_ne!(git_rev_parse(&bare, pr_head), replacement_head);
+
+        mgr.retire_publication_source(&repo, 263, &intent_sha)
+            .await
+            .expect("successful lifecycle handoff retires the pin");
+        assert!(
+            !git_output(
+                &repo,
+                &[
+                    "show-ref",
+                    "--verify",
+                    &WorktreeManager::publication_ref(263),
+                ],
+            )
+            .status
+            .success(),
+            "retired publication source must not leak a permanent Git ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_ref_reconciliation_restores_intents_and_retires_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _) = init_repo_with_bare_remote(tmp.path());
+        let mgr = WorktreeManager::new();
+        let expected_sha = git_rev_parse(&repo, "HEAD");
+        assert!(
+            git_output(&repo, &["commit", "--allow-empty", "-m", "other source"])
+                .status
+                .success()
+        );
+        let other_sha = git_rev_parse(&repo, "HEAD");
+
+        mgr.pin_publication_source(&repo, 1, &expected_sha)
+            .await
+            .unwrap();
+        mgr.pin_publication_source(&repo, 2, &other_sha)
+            .await
+            .unwrap();
+        mgr.pin_publication_source(&repo, 3, &other_sha)
+            .await
+            .unwrap();
+
+        let expected = HashMap::from([
+            (1, Some(expected_sha.clone())),
+            (2, Some(expected_sha.clone())),
+            (3, None),
+            (4, Some(expected_sha.clone())),
+        ]);
+        let outcome = mgr
+            .reconcile_publication_sources(&repo, &expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PublicationRefReconcileResult {
+                kept: 1,
+                restored: 2,
+                retired: 1,
+            }
+        );
+        assert_eq!(
+            git_rev_parse(&repo, &WorktreeManager::publication_ref(1)),
+            expected_sha
+        );
+        assert_eq!(
+            git_rev_parse(&repo, &WorktreeManager::publication_ref(2)),
+            expected_sha
+        );
+        assert_eq!(
+            git_rev_parse(&repo, &WorktreeManager::publication_ref(4)),
+            expected_sha
+        );
+        assert!(
+            !git_output(
+                &repo,
+                &["show-ref", "--verify", &WorktreeManager::publication_ref(3),],
+            )
+            .status
+            .success(),
+            "a post-lifecycle or cancelled-task orphan must be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_with_lease_rejects_writer_racing_between_fetch_and_push() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/raced-pr";
+        let remote_tip = push_branch(&repo, pr_head);
+        let wt_path = tmp.path().join("remediation-wt");
+        WorktreeManager::new()
+            .fetch_and_provision(&repo, "remediation/Rivet-t11", &wt_path, pr_head)
+            .await
+            .expect("provision");
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "daemon fix"])
+                .status
+                .success()
+        );
+
+        let rival = tmp.path().join("rival");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &rival.to_string_lossy()])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        git_output(&rival, &["config", "user.email", "rival@example.com"]);
+        git_output(&rival, &["config", "user.name", "Rival"]);
+        git_output(&rival, &["checkout", pr_head]);
+        assert!(
+            git_output(&rival, &["commit", "--allow-empty", "-m", "racing writer"])
+                .status
+                .success()
+        );
+        let rival_sha = git_rev_parse(&rival, "HEAD");
+
+        let real_git = String::from_utf8_lossy(
+            &StdCommand::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let shim = tmp.path().join("git-race");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" push \"*) \"{real_git}\" -C \"{}\" push origin HEAD:refs/heads/{pr_head} >/dev/null 2>&1 ;; esac\nexec \"{real_git}\" \"$@\"\n",
+                rival.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mgr =
+            WorktreeManager::with_config(shim, Duration::from_secs(10), Duration::from_secs(10));
+        let source_sha = git_rev_parse(&wt_path, "HEAD");
+        let result = mgr
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha)
+            .await;
+        assert!(result.is_err(), "racing writer must defeat the lease");
+        assert_eq!(
+            git_rev_parse(&bare, pr_head),
+            rival_sha,
+            "failed daemon push must preserve the racing writer's commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_lease_rejects_writer_racing_to_create_initial_branch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let branch = "daemon/new-t12";
+        let wt_path = tmp.path().join("worker-wt");
+        WorktreeManager::new()
+            .provision(&repo, branch, &wt_path, "origin/main")
+            .await
+            .expect("provision");
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "daemon work"])
+                .status
+                .success()
+        );
+
+        let rival = tmp.path().join("rival");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &rival.to_string_lossy()])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        git_output(&rival, &["config", "user.email", "rival@example.com"]);
+        git_output(&rival, &["config", "user.name", "Rival"]);
+        assert!(
+            git_output(&rival, &["commit", "--allow-empty", "-m", "claim branch"])
+                .status
+                .success()
+        );
+        let rival_sha = git_rev_parse(&rival, "HEAD");
+        let real_git = String::from_utf8_lossy(
+            &StdCommand::new("sh")
+                .args(["-c", "command -v git"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let shim = tmp.path().join("git-zero-race");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" push \"*) \"{real_git}\" -C \"{}\" push origin HEAD:refs/heads/{branch} >/dev/null 2>&1 ;; esac\nexec \"{real_git}\" \"$@\"\n",
+                rival.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mgr =
+            WorktreeManager::with_config(shim, Duration::from_secs(10), Duration::from_secs(10));
+        let source_sha = git_rev_parse(&wt_path, "HEAD");
+        let result = mgr.push_new_branch(&wt_path, branch, &source_sha).await;
+        assert!(
+            result.is_err(),
+            "racing branch creation must defeat zero lease"
+        );
+        assert_eq!(git_rev_parse(&bare, branch), rival_sha);
+    }
+
+    #[tokio::test]
+    async fn initial_push_reconciles_crash_after_remote_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let branch = "daemon/crash-window-t13";
+        let wt_path = tmp.path().join("worker-wt");
+        let mgr = WorktreeManager::new();
+        mgr.provision(&repo, branch, &wt_path, "origin/main")
+            .await
+            .expect("provision");
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "work"])
+                .status
+                .success()
+        );
+        let local_sha = git_rev_parse(&wt_path, "HEAD");
+        assert_eq!(
+            mgr.push_new_branch(&wt_path, branch, &local_sha)
+                .await
+                .unwrap(),
+            local_sha
+        );
+        // Simulate restart after the remote accepted the push but before the
+        // daemon persisted the "pushed" stage.
+        assert_eq!(
+            mgr.push_new_branch(&wt_path, branch, &local_sha)
+                .await
+                .unwrap(),
+            local_sha
+        );
+        assert_eq!(git_rev_parse(&bare, branch), local_sha);
+    }
+
+    /// The protocol reserves publication for the daemon and best-effort blocks
+    /// ordinary agent pushes; credential enforcement is the separate D4 boundary.
+    #[tokio::test]
+    async fn daemon_push_to_pr_head_updates_only_authoritative_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, bare) = init_repo_with_bare_remote(tmp.path());
         let pr_head = "fix/upstream-pr";
@@ -1257,77 +2161,10 @@ mod tests {
         mgr.fetch_and_provision(&repo, local_branch, &wt_path, pr_head)
             .await
             .expect("provision");
-        mgr.configure_push_upstream(&wt_path, local_branch, pr_head)
+        mgr.disable_push(&wt_path)
             .await
-            .expect("configure push upstream");
+            .expect("disable agent push");
 
-        // Config is worktree-scoped so it cannot leak into the shared checkout.
-        let repo_push_default = git_output(&repo, &["config", "--get", "push.default"]).stdout;
-        assert!(
-            String::from_utf8_lossy(&repo_push_default)
-                .trim()
-                .is_empty(),
-            "push.default must not be set repo-wide"
-        );
-        let common_dir =
-            String::from_utf8_lossy(&git_output(&repo, &["rev-parse", "--git-common-dir"]).stdout)
-                .trim()
-                .to_string();
-        let common_config = repo.join(common_dir).join("config");
-        for key in [
-            format!("branch.{local_branch}.remote"),
-            format!("branch.{local_branch}.merge"),
-        ] {
-            assert!(
-                !git_output(
-                    &repo,
-                    &[
-                        "config",
-                        "--file",
-                        &common_config.to_string_lossy(),
-                        "--get",
-                        &key
-                    ]
-                )
-                .status
-                .success(),
-                "{key} must not be set repo-wide"
-            );
-        }
-        assert_eq!(
-            String::from_utf8_lossy(
-                &git_output(
-                    &wt_path,
-                    &[
-                        "config",
-                        "--worktree",
-                        "--get",
-                        &format!("branch.{local_branch}.remote")
-                    ]
-                )
-                .stdout
-            )
-            .trim(),
-            "origin"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(
-                &git_output(
-                    &wt_path,
-                    &[
-                        "config",
-                        "--worktree",
-                        "--get",
-                        &format!("branch.{local_branch}.merge")
-                    ]
-                )
-                .stdout
-            )
-            .trim(),
-            format!("refs/heads/{pr_head}")
-        );
-
-        // Real push with no refspec.
         assert!(
             git_output(
                 &wt_path,
@@ -1341,35 +2178,21 @@ mod tests {
         assert_ne!(new_tip, remote_tip);
         let push = git_output(&wt_path, &["push"]);
         assert!(
-            push.status.success(),
-            "plain git push must succeed: {}",
+            !push.status.success(),
+            "agent plain git push must fail: {}",
             String::from_utf8_lossy(&push.stderr)
         );
+
+        let pushed = mgr
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip)
+            .await
+            .expect("daemon push must succeed");
+        assert_eq!(pushed, new_tip);
 
         assert_eq!(
             git_rev_parse(&bare, pr_head),
             new_tip,
-            "push must advance the PR head branch on the remote"
-        );
-
-        // `git push origin` (explicit remote, still no -u and no refspec) must
-        // land on the PR branch too.
-        assert!(
-            git_output(&wt_path, &["commit", "--allow-empty", "-m", "second fix"])
-                .status
-                .success()
-        );
-        let second_tip = git_rev_parse(&wt_path, "HEAD");
-        let push_origin = git_output(&wt_path, &["push", "origin"]);
-        assert!(
-            push_origin.status.success(),
-            "git push origin must succeed: {}",
-            String::from_utf8_lossy(&push_origin.stderr)
-        );
-        assert_eq!(
-            git_rev_parse(&bare, pr_head),
-            second_tip,
-            "git push origin must advance the PR head branch"
+            "daemon push must advance the PR head branch"
         );
 
         assert!(
@@ -1408,9 +2231,7 @@ mod tests {
             .expect("provision");
         git_output(&repo, &["config", "core.worktree", &repo.to_string_lossy()]);
 
-        let result = mgr
-            .configure_push_upstream(&wt_path, local_branch, pr_head)
-            .await;
+        let result = mgr.disable_push(&wt_path).await;
         assert!(result.is_err(), "must refuse, got {result:?}");
         assert!(
             !git_output(&repo, &["config", "--get", "extensions.worktreeConfig"])
@@ -1448,9 +2269,7 @@ mod tests {
             .expect("provision");
         git_output(&repo, &["config", "core.worktree", "false"]);
 
-        let result = mgr
-            .configure_push_upstream(&wt_path, local_branch, pr_head)
-            .await;
+        let result = mgr.disable_push(&wt_path).await;
         assert!(result.is_err(), "must refuse, got {result:?}");
         assert!(
             !git_output(&repo, &["config", "--get", "extensions.worktreeConfig"])
@@ -1489,7 +2308,7 @@ mod tests {
                 .expect("provision");
             git_output(&repo, &["config", "core.bare", falseish]);
 
-            mgr.configure_push_upstream(&wt_path, local_branch, pr_head)
+            mgr.disable_push(&wt_path)
                 .await
                 .unwrap_or_else(|e| panic!("core.bare={falseish} must be accepted: {e}"));
 

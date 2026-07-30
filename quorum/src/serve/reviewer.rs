@@ -477,8 +477,8 @@ pub fn build_worker_prompt(
          {body}\n\n\
          {working_style}{budget}\n\n\
          When your work is complete:\n\
-         1. Push your branch and open a PR with: gh pr create\n\
-         2. Signal completion with the PR number: quorum submit --agent {agent} --pr <PR_NUMBER>\n\
+         1. Commit your work. Do NOT push or open a PR; the daemon publishes and verifies it.\n\
+         2. Signal completion: quorum submit --agent {agent}\n\
          3. Post progress notes by writing text to a temp file, then: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         agent = agent_name,
@@ -571,7 +571,7 @@ pub fn build_rework_prompt(
          full context, inline anchors, and any advisory notes.\n\n\
          Reviewer feedback summary:\n{feedback}\n\n\
          The PR is the source of truth for this review — address findings there:\n\
-         - For each blocking finding, either fix it and push, or, if you disagree, reply \
+         - For each blocking finding, either fix it and commit, or, if you disagree, reply \
          to the finding on the PR with concrete evidence (a citation, a test result, a \
          rationale). Do NOT silently ignore a finding — an unanswered blocker will still \
          block the next review.\n\
@@ -579,7 +579,7 @@ pub fn build_rework_prompt(
          it was fixed, accepted, overridden with evidence, or unaddressed. That trail lives \
          on the PR, not in this turn.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
-         After fixing and pushing:\n\
+         After fixing and committing (do not push):\n\
          1. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
          2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\
@@ -630,20 +630,18 @@ pub fn build_remediation_turn(
          ## Instructions\n\
          You are fixing an EXISTING PR — do NOT open a new one and do NOT run `gh pr create`.\n\n\
          ## Publishing your fix\n\
-         Your worktree is at the PR head on the daemon-owned local branch `{local_branch}`, \
-         NOT on the PR branch itself. Its upstream is already configured to the PR branch, so \
-         publish with a bare `git push` and nothing else. Never `git push -u`, never name a \
-         remote, branch, or refspec: `-u` would silently retarget your pushes away from the PR, \
-         so the PR would stop receiving your fixes while every push still reported success.\n\n\
+         Your worktree is on the daemon-owned local branch `{local_branch}`. Commit your fix, \
+         but do NOT push, name a remote/refspec, or open a PR. The daemon publishes the exact \
+         committed SHA to the authoritative PR head and verifies it before re-review.\n\n\
          The PR is the source of truth for this review — address findings there:\n\
-         - For each blocking finding, either fix it and push, or, if you disagree, reply \
+         - For each blocking finding, either fix it and commit, or, if you disagree, reply \
          to the finding on the PR with concrete evidence (a citation, a test result, a \
          rationale). Do NOT silently ignore a finding — an unanswered blocker will still \
          block the next review.\n\
          - The final PR history must let a later reader determine, for each finding, whether \
          it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
-         After fixing and pushing:\n\
+         After fixing and committing (do not push):\n\
          1. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
          2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\
@@ -994,11 +992,10 @@ mod tests {
         );
     }
 
-    /// The daemon checks out a namespaced local branch and preconfigures its
-    /// upstream, so the prompt must name that branch and forbid the push forms
-    /// that would silently retarget away from the PR.
+    /// The daemon checks out a namespaced local branch and owns publication,
+    /// so the remediation prompt must require commit-only delivery.
     #[test]
-    fn remediation_turn_teaches_bare_push_on_namespaced_branch() {
+    fn remediation_turn_forbids_agent_push_on_namespaced_branch() {
         let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
         assert!(
             turn.contains(&remediation_branch("W-1", 42)),
@@ -1009,8 +1006,8 @@ mod tests {
             "remediation turn must not claim the PR branch itself is checked out"
         );
         assert!(
-            turn.contains("bare `git push`") && turn.contains("Never `git push -u`"),
-            "remediation turn must teach a bare push and forbid -u: {turn}"
+            turn.contains("do NOT push") && turn.contains("authoritative PR head"),
+            "remediation turn must reserve publication for the daemon: {turn}"
         );
         assert!(
             turn.contains("gh pr create"),
@@ -1140,12 +1137,12 @@ mod tests {
             "worker template must state the budget ceiling when configured"
         );
         assert!(
-            turn.contains("gh pr create"),
-            "worker template must instruct agent to open a PR"
+            turn.contains("Do NOT push or open a PR"),
+            "worker template must reserve push and PR creation for the daemon"
         );
         assert!(
-            turn.contains("quorum submit --agent W-1 --pr"),
-            "worker template must instruct agent to signal done with PR number"
+            turn.contains("quorum submit --agent W-1"),
+            "worker template must instruct agent to signal completion"
         );
         assert!(
             turn.contains("quorum task-update --task-id 42 --agent W-1 --note-file"),

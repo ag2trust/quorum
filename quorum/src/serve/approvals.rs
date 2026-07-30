@@ -364,12 +364,6 @@ async fn merge_approved(
         return Ok(false);
     }
 
-    log(&format!(
-        "approval-recovery: PR #{pr} merged from durable approval — closing task #{} \
-         (reviewer {})",
-        appr.task_id, appr.reviewer
-    ));
-
     let p = db_path.to_path_buf();
     let task_id = appr.task_id;
     let reviewer = appr.reviewer.clone();
@@ -392,6 +386,12 @@ async fn merge_approved(
         Ok(())
     })
     .await?;
+
+    log(&format!(
+        "approval-recovery: PR #{pr} merged from durable approval — closed task #{} \
+         (reviewer {})",
+        appr.task_id, appr.reviewer
+    ));
 
     Ok(true)
 }

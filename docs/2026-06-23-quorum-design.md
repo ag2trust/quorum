@@ -38,7 +38,7 @@ supported coding CLI runners as managed workers and reviewers inside this lifecy
 accepted task
   → isolated worktree and branch
   → coding worker
-  → pushed pull request
+  → daemon-published and verified pull request
   → required checks
   → independent R1 review
   → independent R2 review focused on any material gaps left by R1
@@ -1359,7 +1359,9 @@ outcome failure, and `provider_blocked` only after durable Codex retry state is 
 This classification is intentionally independent of observation order. In particular,
 `submit → in-review → exit`, `submit → exit → in-review`, and
 `exit → late submission recovery` must converge on one lifecycle transition and one
-reviewer spawn; the same applies to R1/R2 verdicts and remediation submissions. Cleanup
+reviewer spawn. An initial worker's null-PR submission is a durable pending outcome
+because the daemon, not the worker, resolves or creates its PR; the same convergence
+applies to R1/R2 verdicts and remediation submissions. Cleanup
 must not emit a second `AgentFailed`, duplicate `task_in_review`/`task_rework`, release
 the new owner's lease, or classify exit status 0 as a crash merely because the
 turn-oriented provider process ended.
@@ -1394,9 +1396,44 @@ Prompts are the common Git delivery contract plus a worker/R1/R2 role contract p
 small runner note. Complete task and verdict contracts remain inline; provider skills
 are supplemental methodology, never lifecycle dependencies.
 
-Workers must work only on the assigned task, branch, and worktree; implement and
-verify the outcome; push and open or update the PR; signal through `quorum submit`;
-and never merge or mark the task done.
+Workers must work only on the assigned task, branch, and worktree; implement, verify,
+and commit the outcome; signal through `quorum submit`; and never push, open or update
+a PR, merge, or mark the task done. The daemon publishes the exact committed SHA with
+an explicit refspec. For an existing same-repository PR it durably copies the
+spawn-time PR head into the publication intent, resolves the live authoritative target,
+and pushes only when the live head still equals that immutable baseline. A live head
+already equal to the exact source is the idempotent post-push crash case; any third SHA
+parks instead of being adopted as a new lease expectation. The push uses
+`--force-with-lease=<head-ref>:<spawn-head>` and rejects any stale, fork, unavailable,
+lease-rejected, or post-push SHA mismatch; only after verification may it transition
+lifecycle. All publication-owned GitHub subprocesses have kill-and-reap timeouts and
+fixed stdout/stderr byte limits so a hung or continuously verbose CLI cannot pin the
+daemon tick, shutdown, or memory; exceeding either limit kills and reaps the child. For
+an initial delivery it verifies
+the new daemon branch under a zero/nonexistent lease, creates the PR, and verifies the PR
+binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
+verified` stages are durable task metadata. Startup recovery reuses an identical remote
+branch and a single existing PR, then folds the exact mailbox row only after verification.
+The publisher takes the intent's immutable source SHA and uses that object in the refspec;
+a later mutable worktree `HEAD` cannot change what is published. Before persisting the
+intent, the daemon pins that SHA under a task-scoped local Git ref, so parking may safely
+remove a failed run's worktree and run-local branch; `task-retry` and remediation retries
+still replay the exact source even when their replacement worktree starts at another
+`HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
+transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
+later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
+guard. Startup and bounded periodic reconciliation walk minimal task-id/SHA projections
+in fixed cursor batches, restore missing or mismatched intent pins, and exact-SHA-delete
+no-intent or terminal-task pins without scanning the full task history or Git ref
+namespace in one pass. A retry from `pr_created` repeats the same authoritative
+branch/SHA/base validation before any push. Initial PR reconciliation
+also requires the PR base to equal the configured base branch. Rejected or ambiguous
+publication parks the task; persisted PR target data is never authority for a publish
+retry. This is protocol ownership plus a best-effort
+worktree `pushurl` lockout, not credential isolation: an agent holding the same GitHub
+credential can still bypass local Git configuration with an explicit URL or API.
+Enforcing physical write authority requires the separate D4 credential split and is not
+claimed here.
 
 Reviewers must inspect the full diff and relevant surrounding behavior, follow
 repository instructions, classify BLOCKING and advisory findings, put authoritative

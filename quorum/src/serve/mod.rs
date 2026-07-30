@@ -34,7 +34,10 @@ use quorum_core::tasks;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use worktree::WorktreeManager;
 
 const MAX_POISON_STRIKES: u32 = 3;
@@ -42,6 +45,8 @@ const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
+const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 enum ReviewRole {
@@ -422,29 +427,26 @@ struct PrTarget {
     head_ref: String,
     head_sha: String,
     is_fork: bool,
+    base_ref: Option<String>,
 }
 
-fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
+fn pr_target_args(pr: i64, gh_repo: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "pr".to_string(),
         "view".to_string(),
         pr.to_string(),
         "--json".to_string(),
-        "headRefName,headRefOid,isCrossRepository".to_string(),
+        "headRefName,headRefOid,isCrossRepository,baseRefName".to_string(),
     ];
     if let Some(repo) = gh_repo {
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .current_dir(repo_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    args
+}
+
+fn parse_pr_target(pr: i64, stdout: &[u8]) -> Option<PrTarget> {
+    let json: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let head_ref = json.get("headRefName")?.as_str()?.to_string();
     let head_sha = json.get("headRefOid")?.as_str()?.to_string();
     let is_fork = json
@@ -459,6 +461,611 @@ fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<
         head_ref,
         head_sha,
         is_fork,
+        base_ref: json
+            .get("baseRefName")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+    })
+}
+
+fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
+    let args = pr_target_args(pr, gh_repo);
+    let output = std::process::Command::new("gh")
+        .args(&args)
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_pr_target(pr, &output.stdout)
+}
+
+/// Run one publication-owned GitHub command with cancellation-safe process
+/// ownership. A timeout explicitly kills and reaps the child; kill-on-drop
+/// covers daemon shutdown or future cancellation while the command is live.
+async fn run_publication_gh_command(
+    command: tokio::process::Command,
+    timeout: Duration,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    run_publication_gh_command_with_limit(command, timeout, PUBLICATION_GH_PIPE_LIMIT, label).await
+}
+
+struct PublicationPipeOutput {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+async fn drain_publication_pipe<R>(
+    mut pipe: R,
+    limit: usize,
+    pipe_name: &'static str,
+    overflow_tx: tokio::sync::mpsc::Sender<&'static str>,
+) -> std::io::Result<PublicationPipeOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut exceeded_limit = false;
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < count && !exceeded_limit {
+            exceeded_limit = true;
+            let _ = overflow_tx.try_send(pipe_name);
+        }
+    }
+    Ok(PublicationPipeOutput {
+        bytes,
+        exceeded_limit,
+    })
+}
+
+async fn run_publication_gh_command_with_limit(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+    pipe_limit: usize,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}: stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}: stderr pipe unavailable"))?;
+    let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
+    let mut stdout_reader = tokio::spawn(drain_publication_pipe(
+        stdout,
+        pipe_limit,
+        "stdout",
+        overflow_tx.clone(),
+    ));
+    let mut stderr_reader = tokio::spawn(drain_publication_pipe(
+        stderr,
+        pipe_limit,
+        "stderr",
+        overflow_tx,
+    ));
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let status = tokio::select! {
+        result = child.wait() => match result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill().await;
+                stdout_reader.abort();
+                stderr_reader.abort();
+                return Err(format!("{label}: {error}"));
+            }
+        },
+        Some(pipe_name) = overflow_rx.recv() => {
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: {pipe_name} exceeded {pipe_limit}-byte limit and kill/reap failed: {error}"
+                ),
+                None => format!("{label}: {pipe_name} exceeded {pipe_limit}-byte limit"),
+            });
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            // `kill` waits for process exit, so the child is reaped before the
+            // daemon resumes this tick or begins shutdown cleanup.
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: timed out after {}s and kill/reap failed: {error}",
+                    timeout.as_secs()
+                ),
+                None => format!("{label}: timed out after {}s", timeout.as_secs()),
+            });
+        }
+    };
+    let readers = async {
+        let stdout = (&mut stdout_reader)
+            .await
+            .map_err(|error| format!("{label}: stdout join: {error}"))?
+            .map_err(|error| format!("{label}: stdout read: {error}"))?;
+        let stderr = (&mut stderr_reader)
+            .await
+            .map_err(|error| format!("{label}: stderr join: {error}"))?
+            .map_err(|error| format!("{label}: stderr read: {error}"))?;
+        Ok::<_, String>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout_at(deadline, readers).await {
+        Ok(result) => result?,
+        Err(_) => {
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(format!(
+                "{label}: output collection timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+    };
+    if stdout.exceeded_limit {
+        return Err(format!("{label}: stdout exceeded {pipe_limit}-byte limit"));
+    }
+    if stderr.exceeded_limit {
+        return Err(format!("{label}: stderr exceeded {pipe_limit}-byte limit"));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+async fn run_publication_gh(
+    args: &[String],
+    repo_dir: &Path,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let mut command = tokio::process::Command::new("gh");
+    command.args(args).current_dir(repo_dir);
+    run_publication_gh_command(command, PUBLICATION_GH_TIMEOUT, label).await
+}
+
+async fn resolve_publication_pr_target(
+    pr: i64,
+    repo_dir: &Path,
+    gh_repo: Option<&str>,
+) -> std::result::Result<PrTarget, String> {
+    let args = pr_target_args(pr, gh_repo);
+    let output = run_publication_gh(&args, repo_dir, "gh pr view").await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_pr_target(pr, &output.stdout)
+        .ok_or_else(|| format!("gh pr view returned an invalid target for PR #{pr}"))
+}
+
+fn parse_created_pr_number(stdout: &[u8]) -> Option<i64> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let url = stdout
+        .split_whitespace()
+        .find(|token| token.contains("/pull/"))?;
+    url.rsplit('/').next()?.parse().ok()
+}
+
+/// Create the initial PR only after the daemon has published and verified the
+/// new daemon-owned branch. Existing PRs never take this path.
+async fn create_initial_pr(
+    repo_dir: &Path,
+    repo: &str,
+    base_branch: &str,
+    branch: &str,
+    task_id: i64,
+    title: &str,
+) -> std::result::Result<i64, String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--head".to_string(),
+        branch.to_string(),
+        "--base".to_string(),
+        base_branch.to_string(),
+        "--title".to_string(),
+        format!("Task #{task_id}: {title}"),
+        "--body".to_string(),
+        format!("Daemon-owned delivery for task #{task_id}."),
+    ];
+    if !repo.is_empty() {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    let output = run_publication_gh(&args, repo_dir, "gh pr create").await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_created_pr_number(&output.stdout)
+        .ok_or_else(|| "gh pr create succeeded but did not return a pull-request URL".to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PublicationIntent {
+    branch: String,
+    local_sha: String,
+    pr: Option<i64>,
+    stage: String,
+    #[serde(default)]
+    expected_remote_sha: Option<String>,
+}
+
+#[derive(Debug)]
+struct PublishedCompletion {
+    pr: i64,
+    source_sha: String,
+}
+
+async fn persist_publication_intent(
+    db_path: &Path,
+    task_id: i64,
+    intent: &PublicationIntent,
+) -> std::result::Result<(), String> {
+    let p = db_path.to_path_buf();
+    let json =
+        serde_json::to_string(intent).map_err(|e| format!("publication intent JSON: {e}"))?;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = quorum_core::db::open(&p)?;
+        tasks::set_publication_intent(&conn, task_id, &json, now_unix())
+    })
+    .await
+    .map_err(|e| format!("publication intent join failure: {e}"))?
+    .map_err(|e| format!("publication intent persistence failed: {e}"))
+}
+
+async fn load_publication_intent(
+    db_path: &Path,
+    task_id: i64,
+) -> std::result::Result<Option<PublicationIntent>, String> {
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Option<PublicationIntent>> {
+        let conn = quorum_core::db::open(&p)?;
+        let Some(task) = tasks::get(&conn, task_id)? else {
+            return Ok(None);
+        };
+        Ok(publication_intent_from_refs(task.refs.as_deref()))
+    })
+    .await
+    .map_err(|e| format!("publication intent read join failure: {e}"))?
+    .map_err(|e| format!("publication intent read failed: {e}"))
+}
+
+fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent> {
+    refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| refs.get("daemon_publication").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+async fn reconcile_publication_source_refs(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    before_task_id: Option<i64>,
+) -> std::result::Result<Option<i64>, String> {
+    let db_path = config.db_path.clone();
+    let rows = tokio::task::spawn_blocking(
+        move || -> Result<Vec<tasks::PublicationSourceReconcileRow>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            tasks::publication_source_reconcile_batch(
+                &conn,
+                before_task_id,
+                PUBLICATION_REF_RECONCILE_BATCH_SIZE,
+            )
+        },
+    )
+    .await
+    .map_err(|e| format!("publication ref reconciliation join failure: {e}"))?
+    .map_err(|e| format!("publication ref reconciliation DB read failed: {e}"))?;
+    let next_cursor = if rows.len() == PUBLICATION_REF_RECONCILE_BATCH_SIZE as usize {
+        rows.last().map(|row| row.task_id)
+    } else {
+        None
+    };
+    let expected = rows
+        .into_iter()
+        .map(|row| (row.task_id, row.source_sha))
+        .collect();
+    let outcome = wt_mgr
+        .reconcile_publication_sources(&config.repo_dir, &expected)
+        .await?;
+    if outcome.restored > 0 || outcome.retired > 0 {
+        log(&format!(
+            "publication refs reconciled (kept={}, restored={}, retired={})",
+            outcome.kept, outcome.restored, outcome.retired
+        ));
+    }
+    Ok(next_cursor)
+}
+
+async fn find_initial_pr(
+    repo_dir: &Path,
+    repo: &str,
+    branch: &str,
+) -> std::result::Result<Option<i64>, String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "list".to_string(),
+        "--state".to_string(),
+        "all".to_string(),
+        "--head".to_string(),
+        branch.to_string(),
+        "--limit".to_string(),
+        "2".to_string(),
+        "--json".to_string(),
+        "number,state".to_string(),
+    ];
+    if !repo.is_empty() {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
+    let output = run_publication_gh(&args, repo_dir, "gh pr list").await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_initial_pr_list(&output.stdout, branch)
+}
+
+fn parse_initial_pr_list(stdout: &[u8], branch: &str) -> std::result::Result<Option<i64>, String> {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(stdout).map_err(|e| format!("gh pr list JSON: {e}"))?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] if row.get("state").and_then(|v| v.as_str()) == Some("OPEN") => {
+            Ok(row.get("number").and_then(|v| v.as_i64()))
+        }
+        [_] => Err(format!(
+            "existing PR for daemon branch {branch} is not open"
+        )),
+        _ => Err(format!(
+            "multiple open PRs found for daemon branch {branch}; publication is ambiguous"
+        )),
+    }
+}
+
+fn validate_initial_pr_target(
+    target: &PrTarget,
+    branch: &str,
+    pushed_sha: &str,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    if target.is_fork
+        || target.head_ref != branch
+        || target.head_sha != pushed_sha
+        || target.base_ref.as_deref() != Some(base_branch)
+    {
+        return Err(format!(
+            "new PR #{} did not bind to daemon branch/SHA/base (head {} at {}, base {:?})",
+            target.pr, target.head_ref, target.head_sha, target.base_ref
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pr_created_retry_target(
+    intent: &PublicationIntent,
+    target: &PrTarget,
+    base_branch: &str,
+) -> std::result::Result<bool, String> {
+    if intent.stage != "pr_created" {
+        return Ok(false);
+    }
+    validate_initial_pr_target(target, &intent.branch, &intent.local_sha, base_branch)?;
+    Ok(true)
+}
+
+async fn load_publication_pr_baseline(
+    db_path: &Path,
+    task_id: i64,
+    pr: i64,
+) -> std::result::Result<Option<quorum_core::pr_targets::PersistedPrTarget>, String> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&db_path)?;
+        pr_targets::get(&conn, task_id, pr)
+    })
+    .await
+    .map_err(|error| format!("publication PR baseline join failure: {error}"))?
+    .map_err(|error| format!("publication PR baseline read failed: {error}"))
+}
+
+/// Return the immutable lease baseline when a push is required. A live head
+/// already at the source is the idempotent post-push crash case.
+fn existing_pr_lease_baseline<'a>(
+    intent: &'a PublicationIntent,
+    target: &PrTarget,
+) -> std::result::Result<Option<&'a str>, String> {
+    if target.is_fork {
+        return Err(format!(
+            "PR #{} is a fork head; daemon has no supported safe push mechanism",
+            target.pr
+        ));
+    }
+    if target.head_ref != intent.branch {
+        return Err(format!(
+            "PR #{} head branch changed: expected {}, got {}",
+            target.pr, intent.branch, target.head_ref
+        ));
+    }
+    if target.head_sha == intent.local_sha {
+        return Ok(None);
+    }
+    let expected = intent.expected_remote_sha.as_deref().ok_or_else(|| {
+        format!(
+            "publication intent for PR #{} has no durable spawn-time head baseline",
+            target.pr
+        )
+    })?;
+    if target.head_sha != expected {
+        return Err(format!(
+            "PR #{} head moved outside publication lease: expected {} or already-published {}, got {}",
+            target.pr, expected, intent.local_sha, target.head_sha
+        ));
+    }
+    Ok(Some(expected))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_worker_completion(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    task_id: i64,
+    worktree: &Path,
+    branch: &str,
+    known_pr: Option<i64>,
+) -> std::result::Result<PublishedCompletion, String> {
+    let prior = load_publication_intent(&config.db_path, task_id).await?;
+    if let Some(prior) = &prior {
+        if prior.branch != branch {
+            return Err(format!(
+                "durable publication branch mismatch: recorded {}, current {}",
+                prior.branch, branch
+            ));
+        }
+        if known_pr.is_some() && prior.pr.is_some() && known_pr != prior.pr {
+            return Err("durable publication PR conflicts with current task PR".into());
+        }
+    }
+    let local_sha = match &prior {
+        Some(intent) => intent.local_sha.clone(),
+        None => wt_mgr.head_sha(worktree).await?,
+    };
+    // Pin before persisting a new intent. A crash between these operations can
+    // leave only a harmless local ref; the unsafe inverse would persist an
+    // intent whose source can be collected during worktree/branch cleanup.
+    wt_mgr
+        .pin_publication_source(worktree, task_id, &local_sha)
+        .await?;
+    let known_pr = known_pr.or_else(|| prior.as_ref().and_then(|intent| intent.pr));
+    let expected_remote_sha = match (&prior, known_pr) {
+        (Some(intent), _) => intent.expected_remote_sha.clone(),
+        (None, Some(pr)) => {
+            let baseline = load_publication_pr_baseline(&config.db_path, task_id, pr).await?;
+            if let Some(baseline) = baseline {
+                if baseline.is_fork || baseline.head_ref != branch {
+                    return Err(format!(
+                        "spawn-time PR target for task #{task_id} does not match publish branch {branch}"
+                    ));
+                }
+                Some(baseline.head_sha)
+            } else {
+                // Legacy initial-delivery crash windows may have reached the
+                // PR without a pr_targets row. Missing authority can only
+                // recover if the live head is already the exact source; the
+                // lease decision below rejects every other remote SHA.
+                None
+            }
+        }
+        (None, None) => None,
+    };
+    let mut intent = prior.unwrap_or(PublicationIntent {
+        branch: branch.to_string(),
+        local_sha: local_sha.clone(),
+        pr: known_pr,
+        stage: "intent".into(),
+        expected_remote_sha,
+    });
+    intent.pr = known_pr;
+    persist_publication_intent(&config.db_path, task_id, &intent).await?;
+
+    if let Some(pr) = known_pr {
+        let target =
+            resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+        // `pr_created` means the daemon may have crashed (or validation may
+        // have failed) after recording the PR but before verifying its target.
+        // Re-run the complete initial branch/SHA/base check. Treating this as
+        // an established PR would otherwise push before validating its base.
+        if validate_pr_created_retry_target(&intent, &target, &config.base_branch)? {
+            intent.stage = "verified".into();
+            persist_publication_intent(&config.db_path, task_id, &intent).await?;
+            return Ok(PublishedCompletion {
+                pr,
+                source_sha: intent.local_sha,
+            });
+        }
+        let Some(expected_remote_sha) = existing_pr_lease_baseline(&intent, &target)? else {
+            intent.stage = "verified".into();
+            persist_publication_intent(&config.db_path, task_id, &intent).await?;
+            return Ok(PublishedCompletion {
+                pr,
+                source_sha: intent.local_sha,
+            });
+        };
+        wt_mgr
+            .push_to_pr_head(
+                worktree,
+                &target.head_ref,
+                expected_remote_sha,
+                &intent.local_sha,
+            )
+            .await?;
+        intent.stage = "verified".into();
+        intent.branch = target.head_ref;
+        persist_publication_intent(&config.db_path, task_id, &intent).await?;
+        return Ok(PublishedCompletion {
+            pr,
+            source_sha: intent.local_sha,
+        });
+    }
+
+    let pushed_sha = wt_mgr
+        .push_new_branch(worktree, branch, &intent.local_sha)
+        .await?;
+    intent.stage = "pushed".into();
+    persist_publication_intent(&config.db_path, task_id, &intent).await?;
+
+    let pr = match find_initial_pr(&config.repo_dir, &config.repo, branch).await? {
+        Some(pr) => pr,
+        None => {
+            create_initial_pr(
+                &config.repo_dir,
+                &config.repo,
+                &config.base_branch,
+                branch,
+                task_id,
+                &format!("task {task_id}"),
+            )
+            .await?
+        }
+    };
+    intent.pr = Some(pr);
+    intent.stage = "pr_created".into();
+    persist_publication_intent(&config.db_path, task_id, &intent).await?;
+
+    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+    validate_initial_pr_target(&target, branch, &pushed_sha, &config.base_branch)?;
+    intent.stage = "verified".into();
+    persist_publication_intent(&config.db_path, task_id, &intent).await?;
+    Ok(PublishedCompletion {
+        pr,
+        source_sha: intent.local_sha,
     })
 }
 
@@ -538,6 +1145,7 @@ fn resolve_or_load_pr_target(
         head_ref: stored.head_ref,
         head_sha: stored.head_sha,
         is_fork: stored.is_fork,
+        base_ref: None,
     })
 }
 
@@ -1075,6 +1683,8 @@ pub const EXIT_SELF_UPDATE: i32 = 75;
 
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
 const DRIFT_CHECK_INTERVAL_SECS: u64 = 15 * 60;
+const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
+const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     log(&format!(
@@ -1279,8 +1889,9 @@ async fn recover_late_worker_done_atomic(
     db_path: &Path,
     mailbox_id: i64,
     row: &mailbox::MailboxRow,
+    published_pr: Option<i64>,
 ) -> Result<bool> {
-    let (Some(task_id), Some(pr)) = (row.task_id, row.pr) else {
+    let (Some(task_id), Some(pr)) = (row.task_id, published_pr.or(row.pr)) else {
         return Ok(false);
     };
     if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
@@ -1314,10 +1925,104 @@ async fn recover_late_worker_done(db_path: &Path, row: &mailbox::MailboxRow) -> 
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
-    recover_late_worker_done_atomic(db_path, mailbox_id, &row).await
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row, row.pr).await
+}
+
+#[cfg(test)]
+async fn fold_late_worker_done_after_publication(
+    db_path: &Path,
+    row: &mailbox::MailboxRow,
+    published_pr: i64,
+) -> Result<bool> {
+    let p = db_path.to_path_buf();
+    let row = row.clone();
+    let row_for_append = row.clone();
+    let mailbox_id = tokio::task::spawn_blocking(move || -> Result<i64> {
+        let mut conn = quorum_core::db::open(&p)?;
+        mailbox::append(&mut conn, &row_for_append)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late worker test mailbox join: {error}")))??;
+    recover_late_worker_done_atomic(db_path, mailbox_id, &row, Some(published_pr)).await
+}
+
+async fn recover_late_worker_done_with_publication(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    mailbox_id: i64,
+    row: &mailbox::MailboxRow,
+) -> Result<bool> {
+    let Some(task_id) = row.task_id else {
+        return Ok(false);
+    };
+    if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
+        return Ok(false);
+    }
+    let p = config.db_path.clone();
+    let agent = row.agent.clone();
+    let entry = tokio::task::spawn_blocking(move || -> Result<Option<JournalEntry>> {
+        let conn = quorum_core::db::open(&p)?;
+        Ok(journal::list_in_flight(&conn)?.into_iter().find(|entry| {
+            entry.agent == agent
+                && entry.role == "worker"
+                && entry.task_id == Some(task_id)
+                && entry.worktree.is_some()
+                && entry.branch.is_some()
+        }))
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late worker journal lookup join: {error}")))??;
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+    let worktree = PathBuf::from(entry.worktree.as_deref().unwrap_or_default());
+    let branch = entry.branch.as_deref().unwrap_or_default();
+    let known_pr = match (row.pr, entry.pr) {
+        (Some(signaled), Some(expected)) if signaled == expected => Some(expected),
+        (Some(_), _) => return Ok(false),
+        (None, expected) => expected,
+    };
+    let published =
+        match publish_worker_completion(config, wt_mgr, task_id, &worktree, branch, known_pr).await
+        {
+            Ok(published) => published,
+            Err(error) => {
+                log(&format!(
+                    "late worker publication failed for task #{task_id}: {error}"
+                ));
+                let resume_status = if entry.rework_count > 0 {
+                    "rework"
+                } else {
+                    "open"
+                };
+                park_task(
+                    &config.db_path,
+                    task_id,
+                    &format!("restart publication reconciliation failed: {error}"),
+                    resume_status,
+                )
+                .await;
+                return Ok(false);
+            }
+        };
+    let folded =
+        recover_late_worker_done_atomic(&config.db_path, mailbox_id, row, Some(published.pr))
+            .await?;
+    if folded {
+        if let Err(error) = wt_mgr
+            .retire_publication_source(&config.repo_dir, task_id, &published.source_sha)
+            .await
+        {
+            log(&format!(
+                "publication source cleanup failed for task #{task_id}: {error}"
+            ));
+        }
+    }
+    Ok(folded)
 }
 
 async fn recover_late_worker_completions(config: &ServeConfig) -> Result<()> {
+    let wt_mgr = WorktreeManager::new();
     let p = config.db_path.clone();
     let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, mailbox::MailboxRow)>> {
         let conn = quorum_core::db::open(&p)?;
@@ -1326,7 +2031,7 @@ async fn recover_late_worker_completions(config: &ServeConfig) -> Result<()> {
     .await
     .map_err(|error| QuorumError::Io(format!("late worker poll join: {error}")))??;
     for (mailbox_id, row) in rows {
-        if recover_late_worker_done_atomic(&config.db_path, mailbox_id, &row).await? {
+        if recover_late_worker_done_with_publication(config, &wt_mgr, mailbox_id, &row).await? {
             log(&format!(
                 "startup worker recovery: folded {} completion for task {:?}",
                 row.agent, row.task_id
@@ -2378,6 +3083,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
+    let mut last_publication_ref_reconcile: Option<std::time::Instant> = None;
+    let mut publication_ref_reconcile_cursor: Option<i64> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
@@ -2431,6 +3138,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
     if let Err(e) = recovery::recover(config, &wt_mgr).await {
         log(&format!("recovery failed: {e} — starting fresh"));
+    }
+    match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
+    {
+        Ok(next_cursor) => {
+            publication_ref_reconcile_cursor = next_cursor;
+            last_publication_ref_reconcile = Some(std::time::Instant::now());
+        }
+        Err(e) => log(&format!(
+            "publication ref startup reconciliation failed: {e} — continuing"
+        )),
     }
 
     // #127/#157: report dead-lettered interpret jobs at startup. Historical
@@ -2652,6 +3369,26 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             })
             .await
             .ok();
+        }
+
+        let should_reconcile_publication_refs = match last_publication_ref_reconcile {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= PUBLICATION_REF_RECONCILE_INTERVAL_SECS,
+        };
+        if should_reconcile_publication_refs {
+            last_publication_ref_reconcile = Some(std::time::Instant::now());
+            match reconcile_publication_source_refs(
+                config,
+                &wt_mgr,
+                publication_ref_reconcile_cursor,
+            )
+            .await
+            {
+                Ok(next_cursor) => publication_ref_reconcile_cursor = next_cursor,
+                Err(e) => log(&format!(
+                    "publication ref periodic reconciliation failed: {e} — continuing"
+                )),
+            }
         }
 
         if let Err(e) = tick(
@@ -5120,11 +5857,19 @@ async fn tick(
                 ));
             }
 
-            // #101: resolve PR — prefer explicit row.pr, fall back to
-            // task refs so a done-without-`--pr` doesn't silently close
-            // a task whose refs already carry a PR number.
-            let effective_pr = if row.pr.is_some() {
-                Ok(row.pr)
+            // A worker cannot select a PR head to publish to. An explicit PR
+            // signal is valid only when it matches the daemon-recorded PR for
+            // this slot; otherwise use task refs or create the initial PR.
+            let effective_pr = if let Some(signaled_pr) = row.pr {
+                match workers[wi].pr {
+                    Some(expected_pr) if expected_pr == signaled_pr => Ok(Some(signaled_pr)),
+                    Some(expected_pr) => Err(format!(
+                        "worker signaled PR #{signaled_pr}, but daemon recorded PR #{expected_pr}"
+                    )),
+                    None => Err(format!(
+                        "worker signaled unbound PR #{signaled_pr}; daemon creates initial PRs"
+                    )),
+                }
             } else {
                 let p = db_path.clone();
                 let tid = workers[wi].task_id;
@@ -5152,9 +5897,30 @@ async fn tick(
 
             // DB error during refs lookup — log loudly, leave mailbox row
             // unconsumed so next tick retries. Never fall through to direct-close.
-            let effective_pr = match effective_pr {
+            let mut effective_pr = match effective_pr {
                 Ok(pr) => pr,
                 Err(msg) => {
+                    if row.pr.is_some() {
+                        log(&format!(
+                            "daemon publish rejected for worker {}: {msg}",
+                            workers[wi].agent_name
+                        ));
+                        let w = workers.remove(wi);
+                        let resume_status = if w.rework_count > 0 { "rework" } else { "open" };
+                        park_task(
+                            &db_path,
+                            w.task_id,
+                            &format!("daemon-owned push rejected: {msg}"),
+                            resume_status,
+                        )
+                        .await;
+                        cleanup_slot(config, wt_mgr, name_pool, w, None, "daemon_push_rejected")
+                            .await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                        break;
+                    }
                     log(&format!(
                         "ERROR: refs backfill lookup failed for worker {} — \
                          skipping done processing (will retry): {msg}",
@@ -5164,11 +5930,44 @@ async fn tick(
                 }
             };
 
+            let published = publish_worker_completion(
+                config,
+                wt_mgr,
+                workers[wi].task_id,
+                &workers[wi].worktree_path,
+                &workers[wi].remote_branch,
+                effective_pr,
+            )
+            .await;
+            match published {
+                Ok(ref published) => effective_pr = Some(published.pr),
+                Err(ref error) => {
+                    log(&format!(
+                        "daemon publish rejected for worker {} task #{}: {error}",
+                        workers[wi].agent_name, workers[wi].task_id
+                    ));
+                    let w = workers.remove(wi);
+                    let resume_status = if w.rework_count > 0 { "rework" } else { "open" };
+                    park_task(
+                        &db_path,
+                        w.task_id,
+                        &format!("daemon-owned publication failed: {error}"),
+                        resume_status,
+                    )
+                    .await;
+                    cleanup_slot(config, wt_mgr, name_pool, w, None, "daemon_push_failed").await;
+                    if !consume_mailbox_row(&db_path, *id).await {
+                        break;
+                    }
+                    break;
+                }
+            }
+
             if let Some(pr) = effective_pr {
                 // Fire the appropriate lifecycle event based on whether
                 // this is the first done signal or a rework-pushed.
                 let event = worker_done_event(workers[wi].rework_count, pr);
-                let tr = fire_event_result(
+                let tr = fire_published_event_result(
                     &db_path,
                     &workers[wi].agent_name,
                     workers[wi].task_id,
@@ -5179,6 +5978,25 @@ async fn tick(
                 match tr {
                     Ok(tr) => {
                         workers[wi].pr = Some(pr);
+                        if let Ok(ref published) = published {
+                            // The lifecycle transaction above already retired
+                            // the durable intent. Retire the reachability pin
+                            // afterward; a crash here leaves only a harmless
+                            // local ref and cannot replay publication.
+                            if let Err(error) = wt_mgr
+                                .retire_publication_source(
+                                    &config.repo_dir,
+                                    workers[wi].task_id,
+                                    &published.source_sha,
+                                )
+                                .await
+                            {
+                                log(&format!(
+                                    "publication source cleanup failed for task #{}: {error}",
+                                    workers[wi].task_id
+                                ));
+                            }
+                        }
 
                         // Dispatch lifecycle effects.
                         for effect in &tr.effects {
@@ -5283,19 +6101,7 @@ async fn tick(
                     }
                 }
             } else {
-                // Done without PR — close directly (no review needed).
-                let w = workers.remove(wi);
-                let p = db_path.clone();
-                let task_id = w.task_id;
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    let now = now_unix();
-                    tasks::close_after_merge(&mut conn, task_id, "done without PR", now)?;
-                    Ok(())
-                })
-                .await
-                .ok();
-                cleanup_slot(config, wt_mgr, name_pool, w, Some("done"), "done").await;
+                unreachable!("initial daemon PR creation either succeeds or parks the worker");
             }
 
             if !consume_mailbox_row(&db_path, *id).await {
@@ -5311,7 +6117,7 @@ async fn tick(
         // reaped between the `quorum submit` write and this read (Phase 4b
         // runs after Phase 2 in the same tick): that signal is genuine, and
         // discarding it wedges the task in `working` forever.
-        if recover_late_worker_done_atomic(&db_path, *id, row).await? {
+        if recover_late_worker_done_with_publication(config, wt_mgr, *id, row).await? {
             break;
         }
         log(&format!(
@@ -8687,6 +9493,22 @@ async fn spawn_worker(
         }
     }
 
+    // Managed workers commit only. Keep ordinary push commands from escaping
+    // the daemon-owned publish boundary while preserving their read/fetch use.
+    if let Err(e) = wt_mgr.disable_push(&wt_path).await {
+        log(&format!("worker push lockout failed: {e}"));
+        let strikes = poison_tracker.record_strike(task.id);
+        if strikes >= MAX_POISON_STRIKES {
+            poison_task(&db_path, &agent_name, task.id, strikes).await;
+        } else {
+            release_task(&db_path, &agent_name, task.id).await;
+        }
+        name_pool.release(&agent_name);
+        wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+        wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+        return Ok(false);
+    }
+
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
@@ -9113,6 +9935,25 @@ async fn fire_event_result(
     task_id: i64,
     event: &Event,
 ) -> std::result::Result<tasks::TransitionResult, String> {
+    fire_event_result_inner(db_path, agent, task_id, event, false).await
+}
+
+async fn fire_published_event_result(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    event: &Event,
+) -> std::result::Result<tasks::TransitionResult, String> {
+    fire_event_result_inner(db_path, agent, task_id, event, true).await
+}
+
+async fn fire_event_result_inner(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    event: &Event,
+    published: bool,
+) -> std::result::Result<tasks::TransitionResult, String> {
     let p = db_path.to_path_buf();
     let a = agent.to_string();
     let ev = event.clone();
@@ -9120,7 +9961,11 @@ async fn fire_event_result(
     let result = tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
         let mut conn = quorum_core::db::open(&p)?;
         let now = now_unix();
-        tasks::apply_event(&mut conn, &a, task_id, &ev, now)
+        if published {
+            tasks::apply_published_worker_event(&mut conn, &a, task_id, &ev, now)
+        } else {
+            tasks::apply_event(&mut conn, &a, task_id, &ev, now)
+        }
     })
     .await;
 
@@ -10080,18 +10925,14 @@ async fn spawn_remediation_worker(
                 Some(expected_sha) => wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok(),
                 None => true,
             };
-            // Fail closed: without upstream tracking the agent's plain
-            // `git push` would create a stray remote branch and never update
-            // the PR.
+            // Workers commit only. The daemon owns the later explicit push to
+            // the PR head and verifies it before advancing lifecycle.
             head_ok
-                && match wt_mgr
-                    .configure_push_upstream(&wt_path, &branch, &remote_branch)
-                    .await
-                {
+                && match wt_mgr.disable_push(&wt_path).await {
                     Ok(()) => true,
                     Err(e) => {
                         log(&format!(
-                            "remediation: push upstream config failed for PR #{pr}: {e}"
+                            "remediation: push lockout failed for PR #{pr}: {e}"
                         ));
                         false
                     }
@@ -12281,22 +13122,7 @@ mod tests {
     // ── PrTarget / resolve_pr_target ─────────────────────────────────────
 
     fn parse_pr_target_json(pr: i64, json: &str) -> Option<PrTarget> {
-        let v: serde_json::Value = serde_json::from_str(json).ok()?;
-        let head_ref = v.get("headRefName")?.as_str()?.to_string();
-        let head_sha = v.get("headRefOid")?.as_str()?.to_string();
-        let is_fork = v
-            .get("isCrossRepository")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if head_ref.is_empty() || head_sha.is_empty() {
-            return None;
-        }
-        Some(PrTarget {
-            pr,
-            head_ref,
-            head_sha,
-            is_fork,
-        })
+        parse_pr_target(pr, json.as_bytes())
     }
 
     #[test]
@@ -12343,6 +13169,436 @@ mod tests {
         let t = parse_pr_target_json(3779, json).unwrap();
         assert_eq!(t.head_ref, "daemon/alloy-hvjv-t200");
         assert_eq!(t.head_sha, "deadbeef");
+    }
+
+    #[test]
+    fn created_pr_output_requires_pull_request_url() {
+        assert_eq!(
+            parse_created_pr_number(b"https://github.com/ag2trust/quorum/pull/482\n"),
+            Some(482)
+        );
+        assert_eq!(parse_created_pr_number(b"created successfully\n"), None);
+        assert_eq!(
+            parse_created_pr_number(b"https://github.com/x/y/issues/7\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn initial_pr_reconciliation_reuses_one_and_rejects_ambiguous_matches() {
+        assert_eq!(
+            parse_initial_pr_list(br#"[{"number":482,"state":"OPEN"}]"#, "daemon/worker-t1")
+                .unwrap(),
+            Some(482)
+        );
+        assert_eq!(
+            parse_initial_pr_list(b"[]", "daemon/worker-t1").unwrap(),
+            None
+        );
+        assert!(
+            parse_initial_pr_list(
+                br#"[{"number":482,"state":"OPEN"},{"number":483,"state":"OPEN"}]"#,
+                "daemon/worker-t1"
+            )
+            .is_err(),
+            "restart recovery must not guess between duplicate PRs"
+        );
+        assert!(
+            parse_initial_pr_list(br#"[{"number":482,"state":"CLOSED"}]"#, "daemon/worker-t1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn initial_pr_reconciliation_rejects_mismatched_base_branch() {
+        let target = PrTarget {
+            pr: 482,
+            head_ref: "daemon/worker-t1".into(),
+            head_sha: "abc123".into(),
+            is_fork: false,
+            base_ref: Some("release".into()),
+        };
+        let error = validate_initial_pr_target(&target, "daemon/worker-t1", "abc123", "main")
+            .expect_err("wrong baseRefName must fail initial PR reconciliation");
+        assert!(error.contains("base"));
+    }
+
+    #[test]
+    fn pr_created_retry_repeats_initial_target_validation() {
+        let intent = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "abc123".into(),
+            pr: Some(482),
+            stage: "pr_created".into(),
+            expected_remote_sha: None,
+        };
+        let wrong_base = PrTarget {
+            pr: 482,
+            head_ref: intent.branch.clone(),
+            head_sha: intent.local_sha.clone(),
+            is_fork: false,
+            base_ref: Some("release".into()),
+        };
+        let error = validate_pr_created_retry_target(&intent, &wrong_base, "main")
+            .expect_err("an unverified retry must fail closed on the wrong base");
+        assert!(error.contains("base"));
+
+        let mut established = intent;
+        established.stage = "verified".into();
+        assert!(
+            !validate_pr_created_retry_target(&established, &wrong_base, "main").unwrap(),
+            "only an unverified initial PR uses this retry path"
+        );
+    }
+
+    #[test]
+    fn established_pr_lease_never_adopts_a_late_remote_head() {
+        let intent = PublicationIntent {
+            branch: "external/pr-head".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        let mut target = PrTarget {
+            pr: 482,
+            head_ref: intent.branch.clone(),
+            head_sha: "spawn-x".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+        };
+        assert_eq!(
+            existing_pr_lease_baseline(&intent, &target).unwrap(),
+            Some("spawn-x")
+        );
+
+        target.head_sha = "source-a".into();
+        assert_eq!(
+            existing_pr_lease_baseline(&intent, &target).unwrap(),
+            None,
+            "a crash after the exact source landed must recover idempotently"
+        );
+        let mut legacy_intent = intent.clone();
+        legacy_intent.expected_remote_sha = None;
+        assert_eq!(
+            existing_pr_lease_baseline(&legacy_intent, &target).unwrap(),
+            None,
+            "missing historical baseline is safe only when the source already landed"
+        );
+
+        target.head_sha = "unrelated-b".into();
+        let error = existing_pr_lease_baseline(&intent, &target)
+            .expect_err("a pre-resolution or retry-window writer must be preserved");
+        assert!(error.contains("outside publication lease"));
+        assert!(existing_pr_lease_baseline(&legacy_intent, &target)
+            .unwrap_err()
+            .contains("no durable spawn-time"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_timeout_kills_and_reaps_hung_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "printf '%s' \"$$\" > '{}'; exec sleep 3600",
+                pid_path.display()
+            ),
+        ]);
+        let started = std::time::Instant::now();
+        let error = run_publication_gh_command(command, Duration::from_millis(100), "gh pr view")
+            .await
+            .expect_err("hung GitHub process must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let still_alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!still_alive, "timed-out GitHub child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_output_limits_kill_and_reap_overproducing_children() {
+        let dir = tempfile::tempdir().unwrap();
+        for (pipe_name, redirect) in [("stdout", ""), ("stderr", ">&2")] {
+            let pid_path = dir.path().join(format!("{pipe_name}-pid"));
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!(
+                    "printf '%s' \"$$\" > '{}'; exec yes x {redirect}",
+                    pid_path.display()
+                ),
+            ]);
+            let started = std::time::Instant::now();
+            let error = run_publication_gh_command_with_limit(
+                command,
+                Duration::from_secs(5),
+                4096,
+                "gh pr view",
+            )
+            .await
+            .expect_err("an overproducing GitHub process must fail");
+            assert!(
+                error.contains(&format!("{pipe_name} exceeded 4096-byte limit")),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.len() < 256,
+                "oversized subprocess output escaped into the error"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            let pid = std::fs::read_to_string(pid_path).unwrap();
+            let still_alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(
+                !still_alive,
+                "overproducing GitHub {pipe_name} child was not reaped"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_ref_reconciliation_query_is_minimal_bounded_and_status_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("publication-ref-retention.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let mut ids = Vec::new();
+        for title in ["open", "failed", "cancelled", "done"] {
+            ids.push(
+                tasks::create(
+                    &mut conn,
+                    "owner",
+                    title,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    now_unix(),
+                )
+                .unwrap(),
+            );
+        }
+        let intent = PublicationIntent {
+            branch: "daemon/worker-t1".into(),
+            local_sha: "abc123".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            expected_remote_sha: Some("baseline".into()),
+        };
+        for id in &ids {
+            tasks::set_publication_intent(
+                &conn,
+                *id,
+                &serde_json::to_string(&intent).unwrap(),
+                now_unix(),
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE tasks SET status='failed' WHERE id=?1",
+            rusqlite::params![ids[1]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![ids[2]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            rusqlite::params![ids[3]],
+        )
+        .unwrap();
+
+        let rows = tasks::publication_source_reconcile_batch(&conn, None, 4).unwrap();
+        let retained: HashMap<_, _> = rows
+            .into_iter()
+            .map(|row| (row.task_id, row.source_sha))
+            .collect();
+        assert_eq!(
+            retained.get(&ids[0]).and_then(Option::as_deref),
+            Some("abc123")
+        );
+        assert_eq!(
+            retained.get(&ids[1]).and_then(Option::as_deref),
+            Some("abc123")
+        );
+        assert_eq!(retained.get(&ids[2]), Some(&None));
+        assert_eq!(retained.get(&ids[3]), Some(&None));
+
+        // Historical terminal growth cannot increase one polling pass: the
+        // query projects only id/SHA and stops exactly at its fixed limit.
+        for n in 0..100 {
+            let id = tasks::create(
+                &mut conn,
+                "owner",
+                &format!("historical-{n}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done' WHERE id=?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        let first = tasks::publication_source_reconcile_batch(&conn, None, 7).unwrap();
+        assert_eq!(first.len(), 7);
+        assert!(first.iter().all(|row| row.source_sha.is_none()));
+        let second = tasks::publication_source_reconcile_batch(
+            &conn,
+            Some(first.last().unwrap().task_id),
+            7,
+        )
+        .unwrap();
+        assert_eq!(second.len(), 7);
+        assert!(second[0].task_id < first.last().unwrap().task_id);
+    }
+
+    #[test]
+    fn publication_intent_survives_each_restart_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("publication-intent.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let id = tasks::create(
+            &mut conn,
+            "owner",
+            "publish",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        for (stage, pr) in [
+            ("intent", None),
+            ("pushed", None),
+            ("pr_created", Some(482)),
+            ("verified", Some(482)),
+        ] {
+            let intent = PublicationIntent {
+                branch: "daemon/worker-t1".into(),
+                local_sha: "abc123".into(),
+                pr,
+                stage: stage.into(),
+                expected_remote_sha: None,
+            };
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::set_publication_intent(
+                &conn,
+                id,
+                &serde_json::to_string(&intent).unwrap(),
+                now_unix(),
+            )
+            .unwrap();
+            drop(conn);
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, id).unwrap().unwrap();
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs["daemon_publication"]["stage"], stage);
+            assert_eq!(refs["daemon_publication"]["pr"].as_i64(), pr);
+        }
+
+        let established = PublicationIntent {
+            branch: "external/pr-head".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&established).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        let recovered = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(
+            recovered.expected_remote_sha.as_deref(),
+            Some("spawn-x"),
+            "retry must retain the original round's lease baseline"
+        );
+    }
+
+    #[test]
+    fn published_lifecycle_atomically_retires_intent_before_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("published-transition.db");
+        let id = working_task(&db_path, "Publisher", None);
+        let intent = PublicationIntent {
+            branch: "daemon/publisher-t1".into(),
+            local_sha: "sha-a".into(),
+            pr: Some(482),
+            stage: "verified".into(),
+            expected_remote_sha: Some("sha-x".into()),
+        };
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&intent).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::apply_published_worker_event(
+            &mut conn,
+            "Publisher",
+            id,
+            &Event::SignaledDone { pr: "482".into() },
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn); // crash/restart boundary immediately after commit
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(
+            refs.get("daemon_publication").is_none(),
+            "committed lifecycle must not leave stale SHA A for later rework"
+        );
+        assert_eq!(task.status, "in-review");
     }
 
     // ── resolve_or_load_pr_target (persisted fallback) ───────────────────
@@ -13166,7 +14422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_codex_with_pending_done_is_retained_without_retry_staging() {
+    async fn dead_codex_with_pending_null_pr_done_is_retained_without_retry_staging() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("done-pending.db");
         create_active_task(&db_path, "Spool", "working");
@@ -13178,7 +14434,7 @@ mod tests {
                     agent: "Spool".into(),
                     kind: mailbox::MailboxKind::Done,
                     task_id: Some(1),
-                    pr: Some(439),
+                    pr: None,
                     verdict: None,
                     feedback: None,
                     note: None,
@@ -13691,6 +14947,25 @@ mod tests {
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(tasks::get(&conn, id).unwrap().unwrap().status, "working");
+    }
+
+    #[tokio::test]
+    async fn late_initial_done_transitions_only_after_daemon_supplies_published_pr() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("late-initial-published.db");
+        let id = working_task(&db_path, "Spool-9mti", None);
+        let row = done_row("Spool-9mti", Some(id), None);
+
+        assert!(
+            fold_late_worker_done_after_publication(&db_path, &row, 440)
+                .await
+                .unwrap(),
+            "daemon-verified publication must allow the null-PR signal to fold"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(440));
     }
 
     #[tokio::test]
