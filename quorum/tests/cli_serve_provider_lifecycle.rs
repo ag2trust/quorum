@@ -993,6 +993,7 @@ exit 1
             "-C",
             &case._repo.path().to_string_lossy(),
             "branch",
+            "-f",
             "review-pr-1",
         ])
         .status()

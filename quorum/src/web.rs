@@ -20,10 +20,15 @@ use std::{
 };
 
 const PAGE: &str = include_str!("web.html");
+const CLIENT: &str = include_str!("web.js");
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 100;
 const DEFAULT_STREAM_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STREAM_BYTES: u64 = 8 * 1024 * 1024;
+// Keep the transport bounded by the same record budget the browser normalizer uses. The
+// first record is retained for a continuation from the preceding poll; the rest are the
+// newest suffix so an active stream remains useful when a byte window is dense.
+const MAX_STREAM_RECORDS: usize = 2_000;
 const DASHBOARD_TASK_LIMIT: i64 = 100;
 const DASHBOARD_AGENT_LIMIT: i64 = 100;
 
@@ -53,6 +58,7 @@ pub fn serve(
     };
     let app = Router::new()
         .route("/", get(index))
+        .route("/web.js", get(client))
         .route("/api/state", get(api_state))
         .route("/api/runs", get(api_runs))
         .route("/api/runs/:dir/stream", get(api_stream))
@@ -82,6 +88,17 @@ fn validate_loopback(addr: SocketAddr) -> quorum_core::error::Result<()> {
 
 async fn index() -> Html<&'static str> {
     Html(PAGE)
+}
+
+async fn client() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        CLIENT,
+    )
+        .into_response()
 }
 
 async fn api_state(State(state): State<AppState>) -> Response {
@@ -207,7 +224,9 @@ fn list_runs(root: &FsPath, before: Option<&str>, limit: usize) -> std::io::Resu
     let cursor = before.and_then(|value| run_entry(value.to_owned()));
     // `read_dir` has no ordering guarantee. Scan names (never metadata) but retain only
     // this page's newest candidates, so pagination is complete without unbounded memory.
-    let mut dirs: BinaryHeap<Reverse<(i64, String)>> = BinaryHeap::with_capacity(limit + 1);
+    // Keep one extra candidate: its presence is what proves an older page exists, so the
+    // last real page reports `next_before: None` instead of pointing at an empty page.
+    let mut dirs: BinaryHeap<Reverse<(i64, String)>> = BinaryHeap::with_capacity(limit + 2);
     for entry in entries.filter_map(Result::ok) {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !entry.file_type().ok().is_some_and(|kind| kind.is_dir()) {
@@ -224,16 +243,19 @@ fn list_runs(root: &FsPath, before: Option<&str>, limit: usize) -> std::io::Resu
             continue;
         }
         dirs.push(Reverse(entry));
-        if dirs.len() > limit {
+        if dirs.len() > limit + 1 {
             dirs.pop();
         }
     }
     let mut selected: Vec<_> = dirs.into_iter().map(|Reverse(entry)| entry).collect();
     selected.sort_unstable_by(|a, b| b.cmp(a));
-    let next_before = selected.last().map(|(_, dir)| dir.clone());
+    let has_older = selected.len() > limit;
+    selected.truncate(limit);
+    let next_before = has_older
+        .then(|| selected.last().map(|(_, dir)| dir.clone()))
+        .flatten();
     let runs = selected
         .into_iter()
-        .take(limit)
         .map(|(epoch, dir)| {
             let meta = fs::read_to_string(root.join(&dir).join("meta.json"))
                 .ok()
@@ -317,16 +339,71 @@ fn stream_payload(
     let start = from
         .unwrap_or_else(|| len.saturating_sub(DEFAULT_STREAM_BYTES))
         .min(len);
+    // A nonzero initial offset is not necessarily in the middle of a record: it can
+    // land immediately after a newline. Only discard the first chunk when the byte
+    // before the tail window proves it is a fragment.
+    let starts_mid_line = if from.is_none() && start > 0 {
+        file.seek(SeekFrom::Start(start - 1))
+            .map_err(StreamError::Io)?;
+        let mut previous = [0_u8; 1];
+        file.read_exact(&mut previous).map_err(StreamError::Io)?;
+        previous[0] != b'\n'
+    } else {
+        false
+    };
     file.seek(SeekFrom::Start(start)).map_err(StreamError::Io)?;
     let mut bytes = vec![0; max as usize];
     let read = file.read(&mut bytes).map_err(StreamError::Io)?;
     bytes.truncate(read);
     let next = start + read as u64;
-    let lines = String::from_utf8_lossy(&bytes)
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    Ok(json!({"lines": lines, "next_offset": next, "eof": next >= len}))
+    let complete_records = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let partial = (!bytes.ends_with(b"\n")).then(|| {
+        let start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        hex_bytes(&bytes[start..])
+    });
+    let retained_start = if complete_records > MAX_STREAM_RECORDS {
+        let skipped = complete_records - MAX_STREAM_RECORDS + 1;
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(skipped - 1)
+            .map_or(0, |(index, _)| index + 1)
+    } else {
+        0
+    };
+    let mut lines = Vec::with_capacity(complete_records.min(MAX_STREAM_RECORDS));
+    if complete_records > MAX_STREAM_RECORDS {
+        let first_end = bytes.iter().position(|byte| *byte == b'\n').unwrap();
+        lines.push(hex_bytes(&bytes[..first_end]));
+    }
+    let mut line_start = retained_start;
+    for (index, byte) in bytes.iter().enumerate().skip(retained_start) {
+        if *byte == b'\n' {
+            lines.push(hex_bytes(&bytes[line_start..index]));
+            line_start = index + 1;
+        }
+    }
+    let omitted = complete_records.saturating_sub(lines.len());
+    // The initial tail can begin in the middle of a record. The client discards that
+    // first completed fragment before it begins retaining suffixes for later requests.
+    Ok(
+        json!({"lines": lines, "omitted": omitted, "partial": partial, "starts_mid_line": starts_mid_line,
+        "next_offset": next, "eof": next >= len}),
+    )
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 15) as usize] as char);
+    }
+    encoded
 }
 
 fn text_payload(
@@ -390,9 +467,33 @@ mod tests {
     fn page_never_interpolates_stored_values_as_html_or_inline_handlers() {
         assert!(!PAGE.contains("innerHTML"));
         assert!(!PAGE.contains(" onclick="));
-        assert!(PAGE.contains("textContent"));
-        assert!(PAGE.contains("MAX_RENDERED_TAIL_CHARS"));
-        assert!(PAGE.contains("slice(-MAX_RENDERED_TAIL_CHARS)"));
+        assert!(!CLIENT.contains("innerHTML"));
+        assert!(CLIENT.contains("textContent"));
+        assert!(CLIENT.contains("MAX_RENDERED_TAIL_CHARS"));
+        assert!(CLIENT.contains("slice(-MAX_RENDERED_TAIL_CHARS)"));
+    }
+
+    #[test]
+    fn client_pure_functions_pass_their_node_tests() {
+        // The documented workflow installs only Rust. Node is a bonus gate where it exists
+        // (CI has it), never a hard prerequisite of `cargo test`.
+        let output = match std::process::Command::new("node")
+            .arg("quorum/src/web.test.js")
+            .current_dir(env!("CARGO_MANIFEST_DIR").rsplit_once('/').unwrap().0)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping web client tests: node not installed");
+                return;
+            }
+            Err(error) => panic!("failed to run the web client tests: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "web client tests failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -404,7 +505,77 @@ mod tests {
         let first = stream_payload(root.path(), "A-100", Some(0), 4).unwrap();
         let next = first["next_offset"].as_u64().unwrap();
         let second = stream_payload(root.path(), "A-100", Some(next), 20).unwrap();
-        assert_eq!(second["lines"], json!(["two"]));
+        assert_eq!(second["lines"], json!(["74776f"]));
+    }
+
+    #[test]
+    fn stream_payload_keeps_a_record_spanning_the_byte_cap_as_a_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        let record = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(DEFAULT_STREAM_BYTES as usize + 128)
+        );
+        fs::write(dir.join("stream.jsonl"), &record).unwrap();
+
+        let first = stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES).unwrap();
+        assert_eq!(first["lines"], json!([]));
+        assert_eq!(
+            first["partial"].as_str().unwrap().len(),
+            DEFAULT_STREAM_BYTES as usize * 2
+        );
+
+        let second = stream_payload(
+            root.path(),
+            "A-100",
+            first["next_offset"].as_u64(),
+            DEFAULT_STREAM_BYTES,
+        )
+        .unwrap();
+        let reassembled = format!(
+            "{}{}",
+            first["partial"].as_str().unwrap(),
+            second["lines"][0].as_str().unwrap()
+        );
+        assert_eq!(reassembled, hex_bytes(record.trim_end().as_bytes()));
+    }
+
+    #[test]
+    fn stream_payload_bounds_dense_record_fanout_before_json() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        let record_count = MAX_STREAM_RECORDS * 3;
+        fs::write(dir.join("stream.jsonl"), "{}\n".repeat(record_count)).unwrap();
+
+        let payload = stream_payload(root.path(), "A-100", Some(0), DEFAULT_STREAM_BYTES).unwrap();
+        let lines = payload["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), MAX_STREAM_RECORDS);
+        assert_eq!(payload["omitted"], json!(record_count - MAX_STREAM_RECORDS));
+        assert_eq!(lines.first().unwrap(), "7b7d");
+        assert_eq!(lines.last().unwrap(), "7b7d");
+        assert_eq!(payload["next_offset"], json!((record_count * 3) as u64));
+    }
+
+    #[test]
+    fn initial_tail_at_a_record_boundary_keeps_its_first_record() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("A-100");
+        fs::create_dir(&dir).unwrap();
+        let record = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(DEFAULT_STREAM_BYTES as usize - 46)
+        );
+        assert_eq!(record.len(), DEFAULT_STREAM_BYTES as usize);
+        fs::write(dir.join("stream.jsonl"), format!("discarded\n{record}")).unwrap();
+
+        let tail = stream_payload(root.path(), "A-100", None, DEFAULT_STREAM_BYTES).unwrap();
+        assert_eq!(tail["starts_mid_line"], json!(false));
+        assert_eq!(
+            tail["lines"],
+            json!([hex_bytes(record.trim_end().as_bytes())])
+        );
     }
 
     #[test]
@@ -461,9 +632,24 @@ mod tests {
         let first = list_runs(root.path(), None, 2).unwrap();
         assert_eq!(first.runs[0]["dir"], "alpha-300");
         assert_eq!(first.runs[1]["dir"], "gamma-200");
+        assert_eq!(first.next_before.as_deref(), Some("gamma-200"));
         let second = list_runs(root.path(), first.next_before.as_deref(), 2).unwrap();
         assert_eq!(second.runs[0]["dir"], "beta-200");
         assert_eq!(second.runs[1]["dir"], "zeta-100");
+        // The final page must not advertise a cursor; following it lands on an empty page
+        // with no in-view route back to the newest runs.
+        assert_eq!(second.next_before, None);
+    }
+
+    #[test]
+    fn an_exactly_full_final_page_reports_no_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        for dir in ["alpha-300", "beta-200"] {
+            fs::create_dir(root.path().join(dir)).unwrap();
+        }
+        let page = list_runs(root.path(), None, 2).unwrap();
+        assert_eq!(page.runs.len(), 2);
+        assert_eq!(page.next_before, None);
     }
 
     #[test]
