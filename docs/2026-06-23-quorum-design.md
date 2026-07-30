@@ -1406,8 +1406,10 @@ already equal to the exact source is the idempotent post-push crash case; any th
 parks instead of being adopted as a new lease expectation. The push uses
 `--force-with-lease=<head-ref>:<spawn-head>` and rejects any stale, fork, unavailable,
 lease-rejected, or post-push SHA mismatch; only after verification may it transition
-lifecycle. All publication-owned GitHub subprocesses have kill-and-reap timeouts so a
-hung CLI cannot pin the daemon tick or shutdown. For an initial delivery it verifies
+lifecycle. All publication-owned GitHub subprocesses have kill-and-reap timeouts and
+fixed stdout/stderr byte limits so a hung or continuously verbose CLI cannot pin the
+daemon tick, shutdown, or memory; exceeding either limit kills and reaps the child. For
+an initial delivery it verifies
 the new daemon branch under a zero/nonexistent lease, creates the PR, and verifies the PR
 binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
 verified` stages are durable task metadata. Startup recovery reuses an identical remote

@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use worktree::WorktreeManager;
 
 const MAX_POISON_STRIKES: u32 = 3;
@@ -46,6 +46,7 @@ const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
+const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 enum ReviewRole {
@@ -484,8 +485,52 @@ fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<
 /// ownership. A timeout explicitly kills and reaps the child; kill-on-drop
 /// covers daemon shutdown or future cancellation while the command is live.
 async fn run_publication_gh_command(
+    command: tokio::process::Command,
+    timeout: Duration,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    run_publication_gh_command_with_limit(command, timeout, PUBLICATION_GH_PIPE_LIMIT, label).await
+}
+
+struct PublicationPipeOutput {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+async fn drain_publication_pipe<R>(
+    mut pipe: R,
+    limit: usize,
+    pipe_name: &'static str,
+    overflow_tx: tokio::sync::mpsc::Sender<&'static str>,
+) -> std::io::Result<PublicationPipeOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut exceeded_limit = false;
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < count && !exceeded_limit {
+            exceeded_limit = true;
+            let _ = overflow_tx.try_send(pipe_name);
+        }
+    }
+    Ok(PublicationPipeOutput {
+        bytes,
+        exceeded_limit,
+    })
+}
+
+async fn run_publication_gh_command_with_limit(
     mut command: tokio::process::Command,
     timeout: Duration,
+    pipe_limit: usize,
     label: &str,
 ) -> std::result::Result<std::process::Output, String> {
     command
@@ -495,33 +540,51 @@ async fn run_publication_gh_command(
     let mut child = command
         .spawn()
         .map_err(|error| format!("{label}: {error}"))?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .ok_or_else(|| format!("{label}: stdout pipe unavailable"))?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .ok_or_else(|| format!("{label}: stderr pipe unavailable"))?;
-    let mut stdout_reader = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
-    let mut stderr_reader = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
-    });
+    let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
+    let mut stdout_reader = tokio::spawn(drain_publication_pipe(
+        stdout,
+        pipe_limit,
+        "stdout",
+        overflow_tx.clone(),
+    ));
+    let mut stderr_reader = tokio::spawn(drain_publication_pipe(
+        stderr,
+        pipe_limit,
+        "stderr",
+        overflow_tx,
+    ));
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let _ = child.kill().await;
+    let status = tokio::select! {
+        result = child.wait() => match result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill().await;
+                stdout_reader.abort();
+                stderr_reader.abort();
+                return Err(format!("{label}: {error}"));
+            }
+        },
+        Some(pipe_name) = overflow_rx.recv() => {
+            let kill_error = child.kill().await.err();
             stdout_reader.abort();
             stderr_reader.abort();
-            return Err(format!("{label}: {error}"));
-        }
-        Err(_) => {
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: {pipe_name} exceeded {pipe_limit}-byte limit and kill/reap failed: {error}"
+                ),
+                None => format!("{label}: {pipe_name} exceeded {pipe_limit}-byte limit"),
+            });
+        },
+        _ = tokio::time::sleep_until(deadline) => {
             // `kill` waits for process exit, so the child is reaped before the
             // daemon resumes this tick or begins shutdown cleanup.
             let kill_error = child.kill().await.err();
@@ -558,10 +621,16 @@ async fn run_publication_gh_command(
             ));
         }
     };
+    if stdout.exceeded_limit {
+        return Err(format!("{label}: stdout exceeded {pipe_limit}-byte limit"));
+    }
+    if stderr.exceeded_limit {
+        return Err(format!("{label}: stderr exceeded {pipe_limit}-byte limit"));
+    }
     Ok(std::process::Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
     })
 }
 
@@ -13237,6 +13306,54 @@ mod tests {
             .unwrap()
             .success();
         assert!(!still_alive, "timed-out GitHub child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_output_limits_kill_and_reap_overproducing_children() {
+        let dir = tempfile::tempdir().unwrap();
+        for (pipe_name, redirect) in [("stdout", ""), ("stderr", ">&2")] {
+            let pid_path = dir.path().join(format!("{pipe_name}-pid"));
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args([
+                "-c",
+                &format!(
+                    "printf '%s' \"$$\" > '{}'; exec yes x {redirect}",
+                    pid_path.display()
+                ),
+            ]);
+            let started = std::time::Instant::now();
+            let error = run_publication_gh_command_with_limit(
+                command,
+                Duration::from_secs(5),
+                4096,
+                "gh pr view",
+            )
+            .await
+            .expect_err("an overproducing GitHub process must fail");
+            assert!(
+                error.contains(&format!("{pipe_name} exceeded 4096-byte limit")),
+                "unexpected error: {error}"
+            );
+            assert!(
+                error.len() < 256,
+                "oversized subprocess output escaped into the error"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            let pid = std::fs::read_to_string(pid_path).unwrap();
+            let still_alive = std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            assert!(
+                !still_alive,
+                "overproducing GitHub {pipe_name} child was not reaped"
+            );
+        }
     }
 
     #[test]
