@@ -115,28 +115,22 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
             )?;
             continue;
         }
-        if *review_only {
-            // Review-only tasks recover to in-review so Phase 5b can reattach a reviewer.
-            // Clear reviewer so the orphan detector sees it as unattended.
-            conn.execute(
-                "UPDATE tasks SET status='in-review', assignee=NULL, reviewer=NULL, updated_at=?1 WHERE id=?2",
-                params![now, id],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1 WHERE id=?2",
-                params![now, id],
-            )?;
-        }
+        // Only implementation tasks reach here: review_only tasks are never
+        // `working` (they enter the lifecycle at in-review), so the park
+        // branch above already consumed every review_only row this query can
+        // return.
+        conn.execute(
+            "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1 WHERE id=?2",
+            params![now, id],
+        )?;
         // Clear any lingering (now-expired) lease row so the next claim starts clean.
         conn.execute(
             "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
             params![target],
         )?;
-        let dest = if *review_only { "in-review" } else { "open" };
         let body = match prev {
-            Some(a) => format!("reclaimed from {a} ({reason}) → {dest}"),
-            None => format!("reclaimed ({reason}) → {dest}"),
+            Some(a) => format!("reclaimed from {a} ({reason}) → open"),
+            None => format!("reclaimed ({reason}) → open"),
         };
         crate::events::emit(conn, "task_reclaimed", &target, &body, now)?;
     }
@@ -1183,7 +1177,7 @@ mod tests {
             "owner alert with retry hint missing"
         );
         // Explicit retry resumes the remediation flow with the round intact.
-        let resumed = crate::tasks::retry_parked(&mut c, id, "boss", 1200)
+        let resumed = crate::tasks::retry_parked(&mut c, id, "boss", true, 1200)
             .unwrap()
             .unwrap();
         assert_eq!(resumed.status, "rework");

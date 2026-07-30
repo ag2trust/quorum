@@ -2212,6 +2212,46 @@ async fn reconcile_remediation_retries(
     if draining {
         return Ok(());
     }
+    // Auto-retry daemon-caused parks first (drain/shutdown/restart-recovery
+    // teardown of a remediation worker, flagged at park time within the
+    // recovery budget): the daemon caused the park, so it owes the respawn —
+    // no `task-retry` demanded of the owner. `reset_recovery_budget=false`
+    // keeps the budget spent at park time, so a drain loop stays bounded.
+    // Genuine-failure parks never carry the flag and stay owner-gated.
+    {
+        let p = config.db_path.clone();
+        let unparked = tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let ids: Vec<i64> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM tasks
+                     WHERE status='failed'
+                       AND json_valid(refs)
+                       AND json_extract(refs, '$.daemon_parked')=1
+                       AND json_extract(refs, '$.daemon_rework_retry_requested')=1
+                     LIMIT 8",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut resumed = Vec::new();
+            for id in ids {
+                if tasks::retry_parked(&mut conn, id, "daemon", false, now_unix())?.is_some() {
+                    resumed.push(id);
+                }
+            }
+            Ok(resumed)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("auto-retry park scan join: {error}")))??;
+        for id in unparked {
+            log(&format!(
+                "auto-retrying daemon-caused remediation park for task #{id}"
+            ));
+        }
+    }
     let pending = {
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
@@ -9332,32 +9372,7 @@ async fn park_remediation_provision_failure(
     // `task-retry` restores a parked rework task without the original reviewer
     // process or mailbox row. Preserve the accepted blocking feedback so the
     // replacement remediation turn remains tied to the unresolved finding.
-    let p = config.db_path.clone();
-    let feedback = feedback.to_string();
-    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = quorum_core::db::open(&p)?;
-        let Some(task) = tasks::get(&conn, task_id)? else {
-            return Ok(());
-        };
-        let mut refs: serde_json::Value = task
-            .refs
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
-            .unwrap_or_else(|| serde_json::json!({}));
-        let Some(object) = refs.as_object_mut() else {
-            return Err(QuorumError::Io(
-                "remediation task refs must be a JSON object".into(),
-            ));
-        };
-        object.insert(
-            "remediation_feedback".into(),
-            serde_json::Value::String(feedback),
-        );
-        tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
-    })
-    .await;
+    persist_remediation_feedback(&config.db_path, task_id, feedback).await;
     let reason = format!("remediation worker provisioning failed for PR #{pr}");
     park_task(&config.db_path, task_id, &reason, "rework").await;
     notify_provision_failure(
@@ -9369,42 +9384,79 @@ async fn park_remediation_provision_failure(
     .await;
 }
 
+/// Parks older than this fall out of the head-check scan entirely: the PR is
+/// likely gone or the daemon was down for a long stretch, and `task-retry`
+/// remains the recovery path. Keeps dead rows from consuming a GitHub lookup
+/// every tick forever.
+const PARKED_HEAD_CHECK_MAX_AGE_SECS: i64 = 24 * 3600;
+/// A park younger than the remediation lease TTL is never settled as
+/// "unchanged": the dying worker's push can still be in flight, and settling
+/// early would strand delivered work behind a manual retry. A moved head
+/// settles immediately at any age.
+const PARKED_HEAD_CHECK_MIN_AGE_SECS: i64 = tasks::DEFAULT_LEASE_TTL_SECS;
+/// Head checks settled per tick — each costs one GitHub lookup.
+const PARKED_HEAD_CHECK_SCAN_LIMIT: i64 = 4;
+
 /// Settle one-shot head checks on remediation-death parks (D5b).
 ///
 /// A remediation worker can push its fix and die before signaling
 /// `ReworkPushed`; the park that followed would then strand finished work
 /// behind a manual retry. Compare the PR head now against the head recorded
-/// at remediation spawn (`pr_targets.head_sha`): moved → resume the task
-/// straight to `in-review` so the pushed head gets a fresh verdict; unchanged
-/// or unresolvable → clear the marker and leave the task parked for
-/// `task-retry`. Each park costs at most one GitHub lookup — the marker is
-/// settled exactly once, and the GitHub call runs with no DB transaction held.
+/// at remediation spawn (`pr_targets.head_sha`):
+/// - moved → resume the task straight to `in-review` (any age) so the pushed
+///   head gets a fresh verdict. NOTE: a moved head proves a push happened,
+///   not that the remediation is complete — a WIP push gets its verdict from
+///   the reviewer, which is still strictly better than stranding it parked.
+/// - unchanged → settle (stay parked for `task-retry`) only once the park is
+///   older than the remediation lease TTL; younger parks stay pending so a
+///   slow in-flight push still gets rescued next tick.
+/// - unresolvable (gh error/rate limit) → NO settle, no writes; the marker
+///   stays pending and the age window bounds how long we keep trying.
+///
+/// The GitHub lookup runs with no DB transaction held.
 async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> Result<()> {
     if draining {
         return Ok(());
     }
-    // (task_id, pr, spawn_head_sha) for parks still owing their head check.
-    type PendingHeadCheck = (i64, Option<i64>, Option<String>);
+    // (task_id, pr, spawn_head_sha, park_age_secs) for pending head checks.
+    type PendingHeadCheck = (i64, Option<i64>, Option<String>, i64);
     let pending: Vec<PendingHeadCheck> = {
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<PendingHeadCheck>> {
             let conn = quorum_core::db::open(&p)?;
+            let now = now_unix();
             let mut stmt = conn.prepare(
-                "SELECT id, refs FROM tasks
+                "SELECT id, refs, ?1 - updated_at FROM tasks
                  WHERE status='failed'
                    AND json_valid(refs)
                    AND json_extract(refs, '$.daemon_parked')=1
                    AND json_extract(refs, '$.daemon_parked_head_check')=1
-                 LIMIT 4",
+                   AND updated_at > ?1 - ?2
+                 LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-                })?
+                .query_map(
+                    (
+                        now,
+                        PARKED_HEAD_CHECK_MAX_AGE_SECS,
+                        PARKED_HEAD_CHECK_SCAN_LIMIT,
+                    ),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows
                 .into_iter()
-                .map(|(id, refs)| {
+                .map(|(id, refs, age)| {
+                    // Baseline read is `pr_targets::get` on purpose: it must
+                    // NOT go through `resolve_or_load_pr_target`, which
+                    // upserts the current head and would silently destroy the
+                    // spawn-time baseline this comparison depends on.
                     let pr = tasks::extract_pr_number(&refs);
                     let spawn_sha = pr.and_then(|pr| {
                         pr_targets::get(&conn, id, pr)
@@ -9412,7 +9464,7 @@ async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> R
                             .flatten()
                             .map(|target| target.head_sha)
                     });
-                    (id, pr, spawn_sha)
+                    (id, pr, spawn_sha, age)
                 })
                 .collect())
         })
@@ -9420,39 +9472,53 @@ async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> R
         .map_err(|error| QuorumError::Io(format!("parked head-check scan join: {error}")))??
     };
 
-    for (task_id, pr, spawn_sha) in pending {
-        let head_moved = match (pr, spawn_sha) {
-            (Some(pr), Some(spawn_sha)) => {
-                let repo_dir = config.repo_dir.clone();
-                let gh_repo = config.repo.clone();
-                let current = tokio::task::spawn_blocking(move || {
-                    let gh_repo = if gh_repo.is_empty() {
-                        None
-                    } else {
-                        Some(gh_repo.as_str())
-                    };
-                    resolve_pr_target(pr, &repo_dir, gh_repo)
-                })
+    for (task_id, pr, spawn_sha, park_age) in pending {
+        let (Some(pr), Some(spawn_sha)) = (pr, spawn_sha) else {
+            // No PR identity or no spawn baseline: a comparison is impossible
+            // forever, so settle as parked rather than re-scan every tick.
+            let p = config.db_path.clone();
+            let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::resolve_parked_head_check(&mut conn, task_id, false, now_unix())
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("parked head-check settle join: {error}"))
+            })??;
+            if settled {
+                log(&format!(
+                    "head check: no PR baseline for task #{task_id} — settled, staying parked"
+                ));
+            }
+            continue;
+        };
+
+        // Same injectable seam as every other daemon head read (startup
+        // verdict recovery, CI gating): the harness's command executor
+        // answers with the local repo head, so both branches are testable.
+        let current = {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
                 .await
                 .ok()
-                .flatten();
-                match current {
-                    Some(target) => target.head_sha != spawn_sha,
-                    None => {
-                        log(&format!(
-                            "head check: PR #{pr} unresolved for task #{task_id}"
-                        ));
-                        false
-                    }
-                }
-            }
-            _ => {
+                .flatten()
+        };
+        let head_moved = match current {
+            Some(current_sha) => current_sha != spawn_sha,
+            None => {
+                // Transient lookup failure must not consume the one-shot
+                // marker — leave it pending; the age window bounds retries.
                 log(&format!(
-                    "head check: no PR target recorded for task #{task_id}"
+                    "head check: PR #{pr} unresolved for task #{task_id} — will retry"
                 ));
-                false
+                continue;
             }
         };
+        if !head_moved && park_age < PARKED_HEAD_CHECK_MIN_AGE_SECS {
+            // Unchanged but young: a slow in-flight push could still land.
+            continue;
+        }
 
         let p = config.db_path.clone();
         let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
@@ -9474,6 +9540,29 @@ async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> R
         }
     }
     Ok(())
+}
+
+/// Atomically persist the round's blocking feedback and log on failure — this
+/// write is the recovery backbone: after any park, the durable-retry
+/// reconciler can only rebuild the remediation turn from this key.
+async fn persist_remediation_feedback(db_path: &std::path::Path, task_id: i64, feedback: &str) {
+    let p = db_path.to_path_buf();
+    let feedback = feedback.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = quorum_core::db::open(&p)?;
+        tasks::set_remediation_feedback(&conn, task_id, &feedback, now_unix())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "FAILED to persist remediation feedback for task #{task_id}: {error} — \
+             a park before the next successful write cannot rebuild the remediation turn"
+        )),
+        Err(error) => log(&format!(
+            "FAILED to persist remediation feedback for task #{task_id} (join): {error}"
+        )),
+    }
 }
 
 /// Check if a task's refs.repo mismatches all repos this daemon can provision from.
@@ -9894,34 +9983,7 @@ async fn spawn_remediation_worker(
     // Persist the round's blocking feedback before the worker runs. A worker
     // that dies at runtime parks (D5b), and the durable-retry reconciler can
     // only respawn remediation when `remediation_feedback` survived the slot.
-    {
-        let p = db_path.clone();
-        let feedback = feedback.to_string();
-        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            let Some(task) = tasks::get(&conn, task_id)? else {
-                return Ok(());
-            };
-            let mut refs: serde_json::Value = task
-                .refs
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
-                .unwrap_or_else(|| serde_json::json!({}));
-            let Some(object) = refs.as_object_mut() else {
-                return Err(QuorumError::Io(
-                    "remediation task refs must be a JSON object".into(),
-                ));
-            };
-            object.insert(
-                "remediation_feedback".into(),
-                serde_json::Value::String(feedback),
-            );
-            tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
-        })
-        .await;
-    }
+    persist_remediation_feedback(db_path, task_id, feedback).await;
 
     log(&format!(
         "spawning remediation worker {} for task #{task_id} PR #{pr}",

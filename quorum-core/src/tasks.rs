@@ -1355,7 +1355,7 @@ where
             Event::SignaledDone { .. }
         ) | (Status::Rework, Status::InReview, Event::ReworkPushed)
     );
-    let recovery_attempts = if reset_recovery {
+    let mut recovery_attempts = if reset_recovery {
         0
     } else if is_crash_recovery && new_status == Status::Open {
         task.recovery_attempts + 1
@@ -1385,16 +1385,40 @@ where
     // head burns a rework round with zero remediation applied). Write the
     // durable park markers plus the one-shot head-check flag so the daemon can
     // resume straight to in-review when the dead worker did push a new head.
+    //
+    // Parks the daemon itself caused (drain, shutdown teardown, restart
+    // recovery) additionally carry the auto-retry flag, bounded by the same
+    // recovery budget as crash requeues: the worker did nothing wrong, so the
+    // daemon owes it a respawn instead of demanding `task-retry` for an event
+    // it caused. Genuine failures (crash, error retries, watchdog, zombie,
+    // lease expiry) stay owner-gated.
     let is_remediation_death_park = task.review_only
         && status == Status::Rework
         && new_status == Status::Failed
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
+    let auto_retry_park = is_remediation_death_park
+        && daemon_caused_failure(failure_cause)
+        && task.recovery_attempts < MAX_RECOVERY_ATTEMPTS;
     if is_remediation_death_park {
-        refs = Some(set_parked_refs_with_head_check(
-            refs.as_deref(),
-            failure_cause,
-            "rework",
-        )?);
+        let parked = set_parked_refs_with_head_check(refs.as_deref(), failure_cause, "rework")?;
+        refs = Some(if auto_retry_park {
+            let mut value: serde_json::Value = serde_json::from_str(&parked)
+                .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?;
+            value
+                .as_object_mut()
+                .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?
+                .insert(
+                    PARKED_REWORK_RETRY_REF.into(),
+                    serde_json::Value::Bool(true),
+                );
+            // Each daemon-caused respawn spends recovery budget; the flag
+            // stops being set once the budget is gone, so a drain/restart
+            // loop can never respawn remediation unboundedly.
+            recovery_attempts = task.recovery_attempts + 1;
+            value.to_string()
+        } else {
+            parked
+        });
     }
 
     for eff in &effects {
@@ -2017,6 +2041,19 @@ fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Res
     serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
 }
 
+/// AgentFailed reasons the daemon itself caused. Matched against the exact
+/// strings fed by the daemon's teardown paths: Phase 4a drain
+/// ("daemon draining"), shutdown worker teardown
+/// ("worker teardown (shutdown/cleanup)"), and startup recovery
+/// ("daemon restart recovery (<status> task)"). Keep in sync with
+/// quorum/src/serve — these are the only sites that feed daemon-caused
+/// AgentFailed events into rework tasks.
+fn daemon_caused_failure(reason: &str) -> bool {
+    reason == "daemon draining"
+        || reason == "worker teardown (shutdown/cleanup)"
+        || reason.starts_with("daemon restart recovery")
+}
+
 /// Park markers plus the one-shot head-check flag for a remediation-death
 /// park (the daemon owes the task exactly one PR-head comparison).
 pub(crate) fn set_parked_refs_with_head_check(
@@ -2085,9 +2122,40 @@ pub fn park(
     Ok(Some(task))
 }
 
+/// Atomically persist the round's blocking feedback on a remediation task.
+/// Single-statement `json_set` — never read-modify-write — so a concurrent
+/// park (sweep or apply_event) can't be overwritten by a stale refs snapshot.
+/// This write is the recovery backbone: after any park, the durable-retry
+/// reconciler can only rebuild the remediation turn from this key.
+pub fn set_remediation_feedback(
+    conn: &Connection,
+    id: i64,
+    feedback: &str,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET refs = json_set(COALESCE(refs, '{}'), '$.remediation_feedback', ?2),
+             updated_at = ?3
+         WHERE id = ?1",
+        params![id, feedback, now],
+    )?;
+    Ok(())
+}
+
 /// Explicitly resume the same task after an automatic park. PR, branch,
 /// dependency, approval, author, and rework context remain untouched.
-pub fn retry_parked(conn: &mut Connection, id: i64, by: &str, now: i64) -> Result<Option<Task>> {
+///
+/// `reset_recovery_budget`: true for an explicit owner `task-retry` (fresh
+/// budget); false for daemon-initiated auto-retries, whose respawns must
+/// stay bounded by the recovery budget spent at park time.
+pub fn retry_parked(
+    conn: &mut Connection,
+    id: i64,
+    by: &str,
+    reset_recovery_budget: bool,
+    now: i64,
+) -> Result<Option<Task>> {
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
@@ -2126,7 +2194,7 @@ pub fn retry_parked(conn: &mut Connection, id: i64, by: &str, now: i64) -> Resul
         "UPDATE tasks
          SET status=?2,
              assignee=NULL,
-             recovery_attempts=0,
+             recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
              refs=CASE WHEN ?4='rework'
                   THEN json_set(
                       json_remove(
@@ -2150,7 +2218,13 @@ pub fn retry_parked(conn: &mut Connection, id: i64, by: &str, now: i64) -> Resul
              END,
              updated_at=?3
          WHERE id=?1",
-        params![id, restored_status, now, resume_status],
+        params![
+            id,
+            restored_status,
+            now,
+            resume_status,
+            reset_recovery_budget
+        ],
     )?;
     deactivate_lease(&tx, id, now)?;
     crate::events::emit(
@@ -4251,7 +4325,9 @@ mod tests {
             Err(QuorumError::NotHolder)
         ));
         // Resume preserves the cancelled dependency and remains gated.
-        let resumed = retry_parked(&mut c, child, "boss", 1004).unwrap().unwrap();
+        let resumed = retry_parked(&mut c, child, "boss", true, 1004)
+            .unwrap()
+            .unwrap();
         assert_eq!(resumed.status, "open");
         assert!(!resumed.ready);
         assert!(claim(&mut c, "A", Some(child), &[], TTL, 1005)
@@ -4295,7 +4371,9 @@ mod tests {
         assert!(updated.ready);
         assert_eq!(updated.depends_on.as_deref(), Some("[]"));
         assert_eq!(updated.status, "failed");
-        let resumed = retry_parked(&mut c, child, "boss", 1003).unwrap().unwrap();
+        let resumed = retry_parked(&mut c, child, "boss", true, 1003)
+            .unwrap()
+            .unwrap();
         assert_eq!(resumed.status, "open");
         // Now claimable
         let t = claim(&mut c, "A", Some(child), &[], TTL, 1004)
@@ -4848,6 +4926,10 @@ mod tests {
         assert_eq!(refs[PARKED_REF], true);
         assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
         assert_eq!(refs[PARKED_HEAD_CHECK_REF], true);
+        assert!(
+            refs.get(PARKED_REWORK_RETRY_REF).is_none(),
+            "a genuine crash park must stay owner-gated — no auto-retry flag"
+        );
         let active_claims: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
@@ -4933,7 +5015,9 @@ mod tests {
         assert!(!resolve_parked_head_check(&mut c, id, false, 1005).unwrap());
 
         // Explicit retry resumes the remediation flow.
-        let resumed = retry_parked(&mut c, id, "boss", 1006).unwrap().unwrap();
+        let resumed = retry_parked(&mut c, id, "boss", true, 1006)
+            .unwrap()
+            .unwrap();
         assert_eq!(resumed.status, "rework");
         let refs: serde_json::Value =
             serde_json::from_str(resumed.refs.as_deref().unwrap()).unwrap();
@@ -4951,6 +5035,99 @@ mod tests {
         assert!(!resolve_parked_head_check(&mut c, id, true, 1004).unwrap());
         let task = get(&c, id).unwrap().unwrap();
         assert_eq!(task.status, "failed", "park untouched");
+    }
+
+    #[test]
+    fn daemon_caused_park_sets_auto_retry_flag_within_budget() {
+        // Drain/shutdown/restart-recovery parks auto-retry: the daemon caused
+        // the death, so it owes the respawn. Budget spent per auto-retry park.
+        let (_d, mut c) = open_tmp();
+        let id = review_only_task_in_rework(&mut c);
+
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::AgentFailed {
+                reason: "daemon draining".into(),
+            },
+            1003,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[PARKED_REF], true);
+        assert_eq!(
+            refs[PARKED_REWORK_RETRY_REF], true,
+            "daemon-caused park must carry the auto-retry flag"
+        );
+        assert_eq!(
+            r.task.recovery_attempts, 1,
+            "each auto-retry park spends recovery budget"
+        );
+
+        // Daemon auto-retry preserves the budget (reset_recovery_budget=false)…
+        let resumed = retry_parked(&mut c, id, "daemon", false, 1004)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, "rework");
+        assert_eq!(
+            resumed.recovery_attempts, 1,
+            "daemon retry must not refill the budget"
+        );
+        // …while an owner retry resets it.
+        apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::AgentFailed {
+                reason: "daemon draining".into(),
+            },
+            1005,
+        )
+        .unwrap();
+        let resumed = retry_parked(&mut c, id, "boss", true, 1006)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resumed.recovery_attempts, 0,
+            "owner retry refills the budget"
+        );
+    }
+
+    #[test]
+    fn daemon_caused_park_stops_flagging_past_recovery_budget() {
+        let (_d, mut c) = open_tmp();
+        let id = review_only_task_in_rework(&mut c);
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=?1 WHERE id=?2",
+            params![MAX_RECOVERY_ATTEMPTS, id],
+        )
+        .unwrap();
+
+        let r = apply_event(
+            &mut c,
+            "system",
+            id,
+            &Event::AgentFailed {
+                reason: "daemon draining".into(),
+            },
+            1003,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "failed", "still parks");
+        let refs: serde_json::Value =
+            serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[PARKED_REF], true);
+        assert!(
+            refs.get(PARKED_REWORK_RETRY_REF).is_none(),
+            "exhausted budget must stop the auto-retry flag — owner-gated from here"
+        );
+        assert_eq!(
+            r.task.recovery_attempts, MAX_RECOVERY_ATTEMPTS,
+            "no budget spend without a flag"
+        );
     }
 
     #[test]
@@ -6330,7 +6507,7 @@ mod tests {
         assert_eq!(refs["branch"], "feature/x");
         assert_eq!(refs["daemon_parked_reason"], "reviewer repo mismatch");
 
-        let retried = retry_parked(&mut conn, task_id, "operator", 13)
+        let retried = retry_parked(&mut conn, task_id, "operator", true, 13)
             .unwrap()
             .unwrap();
         assert_eq!(retried.status, "in-review");
@@ -6379,7 +6556,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let retried = retry_parked(&mut conn, task_id, "operator", 12)
+        let retried = retry_parked(&mut conn, task_id, "operator", true, 12)
             .unwrap()
             .unwrap();
         assert_eq!(retried.status, "rework");
@@ -6432,7 +6609,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let retried = retry_parked(&mut conn, task_id, "operator", 12)
+        let retried = retry_parked(&mut conn, task_id, "operator", true, 12)
             .unwrap()
             .unwrap();
         assert_eq!(retried.status, "in-review");
@@ -6472,7 +6649,7 @@ mod tests {
             "parked dependency task must not be provisioned"
         );
 
-        let retried = retry_parked(&mut conn, child, "operator", 14)
+        let retried = retry_parked(&mut conn, child, "operator", true, 14)
             .unwrap()
             .unwrap();
         assert_eq!(retried.status, "open");
