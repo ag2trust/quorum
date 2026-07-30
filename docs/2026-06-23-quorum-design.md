@@ -38,7 +38,7 @@ supported coding CLI runners as managed workers and reviewers inside this lifecy
 accepted task
   → isolated worktree and branch
   → coding worker
-  → pushed pull request
+  → daemon-published and verified pull request
   → required checks
   → independent R1 review
   → independent R2 review focused on any material gaps left by R1
@@ -1394,9 +1394,27 @@ Prompts are the common Git delivery contract plus a worker/R1/R2 role contract p
 small runner note. Complete task and verdict contracts remain inline; provider skills
 are supplemental methodology, never lifecycle dependencies.
 
-Workers must work only on the assigned task, branch, and worktree; implement and
-verify the outcome; push and open or update the PR; signal through `quorum submit`;
-and never merge or mark the task done.
+Workers must work only on the assigned task, branch, and worktree; implement, verify,
+and commit the outcome; signal through `quorum submit`; and never push, open or update
+a PR, merge, or mark the task done. The daemon publishes the exact committed SHA with
+an explicit refspec. For an existing same-repository PR it first resolves the live
+authoritative head, pushes with `--force-with-lease=<head-ref>:<resolved-sha>`, and
+rejects any stale, fork, unavailable, lease-rejected, or post-push SHA mismatch;
+only after verification may it transition lifecycle. For an initial delivery it verifies
+the new daemon branch under a zero/nonexistent lease, creates the PR, and verifies the PR
+binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
+verified` stages are durable task metadata. Startup recovery reuses an identical remote
+branch and a single existing PR, then folds the exact mailbox row only after verification.
+The publisher takes the intent's immutable source SHA and uses that object in the refspec;
+a later mutable worktree `HEAD` cannot change what is published. Successful worker
+lifecycle transitions retire the intent in the same SQLite transaction, including the
+late-mailbox fold, so a restart cannot carry SHA A into a later SHA B rework round. Initial
+PR reconciliation also requires the PR base to equal the configured base branch.
+Rejected or ambiguous publication parks the task; persisted PR target data is never
+authority for a publish retry. This is protocol ownership plus a best-effort worktree
+`pushurl` lockout, not credential isolation: an agent holding the same GitHub credential
+can still bypass local Git configuration with an explicit URL or API. Enforcing physical
+write authority requires the separate D4 credential split and is not claimed here.
 
 Reviewers must inspect the full diff and relevant surrounding behavior, follow
 repository instructions, classify BLOCKING and advisory findings, put authoritative

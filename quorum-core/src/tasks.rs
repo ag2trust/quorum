@@ -860,6 +860,27 @@ pub fn apply_event(
     apply_event_tx(tx, agent, id, event, now, |_| Ok(()))
 }
 
+/// Apply a daemon-verified worker publication and retire its durable intent in
+/// the same transaction as the lifecycle transition.
+pub fn apply_published_worker_event(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+) -> Result<TransitionResult> {
+    let tx = begin_immediate(conn)?;
+    apply_event_tx(tx, agent, id, event, now, |tx| {
+        tx.execute(
+            "UPDATE tasks
+             SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
+             WHERE id=?1",
+            params![id],
+        )?;
+        Ok(())
+    })
+}
+
 /// Atomically enter rework for failed pre-review CI and persist the exact
 /// remediation intent that restart recovery must replay on the same PR/head.
 pub fn apply_checks_failed_with_remediation(
@@ -1037,7 +1058,8 @@ pub fn recover_late_worker_completion(
              JOIN journal j ON j.agent=m.agent AND j.role='worker'
                            AND j.task_id=m.task_id
              WHERE m.id=?1 AND m.consumed_at IS NULL AND m.kind='done'
-               AND m.verdict IS NULL AND m.agent=?2 AND m.task_id=?3 AND m.pr=?4
+               AND m.verdict IS NULL AND m.agent=?2 AND m.task_id=?3
+               AND (m.pr=?4 OR m.pr IS NULL)
                AND t.status IN ('working','rework') AND t.assignee=m.agent
                AND (json_extract(t.refs, '$.pr') IS NULL
                     OR json_extract(t.refs, '$.pr')=?4)
@@ -1060,6 +1082,12 @@ pub fn recover_late_worker_completion(
         Event::SignaledDone { pr: pr.to_string() }
     };
     apply_event_tx(tx, agent, task_id, &event, now, |tx| {
+        tx.execute(
+            "UPDATE tasks
+             SET refs=json_remove(COALESCE(refs, '{}'), '$.daemon_publication')
+             WHERE id=?1",
+            params![task_id],
+        )?;
         consume_late_mailbox(tx, mailbox_id, now)
     })
     .map(|_| true)
@@ -1767,6 +1795,25 @@ pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) 
         params![id, refs, now],
     )?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Persist daemon-owned publication progress without replacing unrelated refs.
+/// The JSON payload is validated by SQLite and survives daemon restarts between
+/// remote push, PR creation, verification, and lifecycle transition.
+pub fn set_publication_intent(
+    conn: &Connection,
+    id: i64,
+    intent_json: &str,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET refs=json_set(COALESCE(refs, '{}'), '$.daemon_publication', json(?2)),
+             updated_at=?3
+         WHERE id=?1",
+        params![id, intent_json, now],
+    )?;
     Ok(())
 }
 

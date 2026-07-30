@@ -4,7 +4,10 @@
 //! (other-repo merge does NOT trigger drain), drain timeout path,
 //! queued tasks survive restart, and T3: drain timeout with merge-in-progress.
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -55,6 +58,7 @@ struct ServeHandle {
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -80,6 +84,54 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    printf '[{"number":%s,"state":"OPEN"}]\n' "$pr"
+  else
+    printf '[]\n'
+  fi
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut args: Vec<String> = vec![
             "serve",
@@ -110,6 +162,9 @@ impl ServeHandle {
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -132,6 +187,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -306,8 +362,8 @@ fn self_repo_merge_drains_and_exits_75() {
         handle.lines
     );
 
-    // Agent done with a PR → triggers reviewer spawn → reviewer approves → merge → drain
-    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
+    // Agent commits and signals; the daemon publishes and creates the PR.
+    quorum_done(home.path(), &["--agent", &agent_name]);
 
     // Wait for reviewer to be spawned
     assert!(
@@ -334,7 +390,7 @@ fn self_repo_merge_drains_and_exits_75() {
             "--agent",
             &reviewer_name,
             "--pr",
-            "42",
+            "1",
             "--verdict",
             "approved",
             "--blocking",
@@ -367,7 +423,7 @@ fn self_repo_merge_drains_and_exits_75() {
             "--agent",
             &r2_name,
             "--pr",
-            "42",
+            "1",
             "--verdict",
             "approved",
             "--blocking",
@@ -449,7 +505,7 @@ fn other_repo_merge_does_not_drain() {
         handle.lines
     );
 
-    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "99"]);
+    quorum_done(home.path(), &["--agent", &agent_name]);
 
     // #75: cross-repo tasks are detected and parked immediately — no reviewer
     // spawn, no drain.
@@ -649,7 +705,7 @@ fn drain_timeout_honored_during_merge_checks() {
         handle.lines
     );
 
-    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
+    quorum_done(home.path(), &["--agent", &agent_name]);
 
     assert!(
         handle.wait_for("spawning reviewer", 15),
@@ -674,7 +730,7 @@ fn drain_timeout_honored_during_merge_checks() {
             "--agent",
             &reviewer_name,
             "--pr",
-            "42",
+            "1",
             "--verdict",
             "approved",
             "--blocking",
@@ -707,7 +763,7 @@ fn drain_timeout_honored_during_merge_checks() {
             "--agent",
             &r2_name,
             "--pr",
-            "42",
+            "1",
             "--verdict",
             "approved",
             "--blocking",
@@ -818,7 +874,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
         handle.lines
     );
 
-    quorum_done(home.path(), &["--agent", &agent_name, "--pr", "42"]);
+    quorum_done(home.path(), &["--agent", &agent_name]);
 
     assert!(
         handle.wait_for("spawning reviewer", 15),
@@ -843,7 +899,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
             "--agent",
             &reviewer_name,
             "--pr",
-            "42",
+            "1",
             "--verdict",
             "approved",
             "--blocking",
@@ -876,7 +932,7 @@ fn pending_checks_timeout_without_drain_enters_merge_wait() {
             "--agent",
             &r2_name,
             "--pr",
-            "42",
+            "1",
             "--verdict",
             "approved",
             "--blocking",

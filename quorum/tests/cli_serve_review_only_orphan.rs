@@ -17,7 +17,10 @@
 //! - No errors rows from normal operation
 //! - ReworkPushed is never rejected
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -75,6 +78,7 @@ struct ServeHandle {
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -100,6 +104,34 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr list" ]; then
+  printf '[]\n'
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  branch="daemon/origworker-t1"
+  sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
+  if [ -z "$sha" ]; then sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"; fi
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
@@ -130,6 +162,8 @@ impl ServeHandle {
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_REPO", repo)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -152,6 +186,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -217,7 +252,19 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     };
     let run_id = resolve_run_id(home, agent, role);
     let mut cmd_args = vec!["done"];
-    cmd_args.extend_from_slice(args);
+    if role == "worker" {
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "--pr" {
+                index += 2;
+            } else {
+                cmd_args.push(args[index]);
+                index += 1;
+            }
+        }
+    } else {
+        cmd_args.extend_from_slice(args);
+    }
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
@@ -725,6 +772,25 @@ fn review_only_orphan_full_lifecycle() {
     let pr: i64 = 42;
     let task_id = seed_in_review_task(home.path(), author, pr);
     create_author_branch(repo_dir.path(), author, task_id);
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    {
+        let mut conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+        quorum_core::pr_targets::upsert(&mut conn, task_id, pr, &branch, head_sha.trim(), false)
+            .unwrap();
+    }
 
     let task = get_task(home.path(), task_id);
     assert_eq!(task.status, "in-review", "task must start in-review");

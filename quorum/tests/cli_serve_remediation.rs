@@ -7,7 +7,10 @@
 //! When the reviewer approves and merge handling encounters a failure, the
 //! daemon must spawn a remediation worker instead of firing AgentFailed.
 
+use std::env;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -58,6 +61,7 @@ struct ServeHandle {
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: Option<tempfile::TempDir>,
+    _gh_shim: Option<tempfile::TempDir>,
 }
 
 impl Drop for ServeHandle {
@@ -83,6 +87,51 @@ impl ServeHandle {
     ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
+        let gh_shim = tempfile::tempdir().unwrap();
+        let gh_state = gh_shim.path().join("state");
+        std::fs::create_dir_all(&gh_state).unwrap();
+        let gh_path = gh_shim.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-} ${2:-}"
+if [ "$cmd" = "pr create" ]; then
+  shift 2
+  head=""
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--head" ]; then head="$2"; shift 2; else shift; fi
+  done
+  pr="${head##*-t}"
+  printf '%s' "$head" > "$QUORUM_TEST_GH_STATE/$pr"
+  printf 'https://github.com/test/repo/pull/%s\n' "$pr"
+elif [ "$cmd" = "pr list" ]; then
+  printf '[]\n'
+elif [ "$cmd" = "pr view" ]; then
+  pr="$3"
+  if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
+    branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
+  else
+    branch="daemon/origworker-t$pr"
+  fi
+  sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
+  if [ -z "$sha" ]; then
+    sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
+  fi
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+else
+  printf 'unsupported gh invocation: %s\n' "$*" >&2
+  exit 1
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            gh_shim.path().display(),
+            env::var("PATH").unwrap_or_default()
+        );
         let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
@@ -113,6 +162,9 @@ impl ServeHandle {
         let mut child = Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
+            .env("PATH", path)
+            .env("QUORUM_TEST_GH_STATE", &gh_state)
+            .env("QUORUM_TEST_REPO", repo)
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -135,6 +187,7 @@ impl ServeHandle {
             rx,
             lines: Vec::new(),
             _sentinel: Some(sentinel),
+            _gh_shim: Some(gh_shim),
         }
     }
 
@@ -367,6 +420,26 @@ fn failed_checks_absent_worker_spawns_remediation() {
     let pr: i64 = 1;
     let task_id = seed_in_review_task(home.path(), author, pr);
     create_pr_branch(repo_dir.path(), author, task_id);
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    {
+        let mut conn =
+            quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+        let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+        quorum_core::pr_targets::upsert(&mut conn, task_id, pr, &branch, head_sha.trim(), false)
+            .unwrap();
+    }
 
     // Start daemon with failing checks command.
     let mut handle = ServeHandle::start(
@@ -563,13 +636,13 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
     );
     assert_eq!(
         git(&["config", "--get", "push.default"]),
-        "upstream",
-        "push.default must resolve to upstream inside the worktree"
+        "",
+        "remediation workers must not receive agent-side push defaults"
     );
     assert_eq!(
         git(&["config", "--get", "remote.origin.push"]),
-        format!("HEAD:refs/heads/{pr_branch}"),
-        "`git push origin` must target the PR branch"
+        "",
+        "remediation workers must not receive agent-side push refspecs"
     );
     // The external checkout is untouched.
     assert_eq!(
@@ -846,6 +919,26 @@ fn remediation_worker_resubmits_same_pr() {
     let pr: i64 = 1;
     let task_id = seed_in_review_task(home.path(), author, pr);
     create_pr_branch(repo_dir.path(), author, task_id);
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    {
+        let mut conn =
+            quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+        let branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+        quorum_core::pr_targets::upsert(&mut conn, task_id, pr, &branch, head_sha.trim(), false)
+            .unwrap();
+    }
 
     // Reviewer gives changes verdict directly (no merge-checks path).
     let mut handle = ServeHandle::start(
@@ -982,11 +1075,8 @@ fn remediation_worker_resubmits_same_pr() {
         handle.lines
     );
 
-    // Remediation worker submits the same PR.
-    quorum_done(
-        home.path(),
-        &["--agent", &remediation_name, "--pr", &pr.to_string()],
-    );
+    // Remediation worker commits and signals; the daemon updates the same PR.
+    quorum_done(home.path(), &["--agent", &remediation_name]);
 
     // Task should transition back to in-review (rework pushed).
     assert!(
