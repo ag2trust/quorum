@@ -1406,15 +1406,20 @@ binds that exact branch/SHA. Publication intent and the `intent → pushed → p
 verified` stages are durable task metadata. Startup recovery reuses an identical remote
 branch and a single existing PR, then folds the exact mailbox row only after verification.
 The publisher takes the intent's immutable source SHA and uses that object in the refspec;
-a later mutable worktree `HEAD` cannot change what is published. Successful worker
-lifecycle transitions retire the intent in the same SQLite transaction, including the
-late-mailbox fold, so a restart cannot carry SHA A into a later SHA B rework round. Initial
-PR reconciliation also requires the PR base to equal the configured base branch.
-Rejected or ambiguous publication parks the task; persisted PR target data is never
-authority for a publish retry. This is protocol ownership plus a best-effort worktree
-`pushurl` lockout, not credential isolation: an agent holding the same GitHub credential
-can still bypass local Git configuration with an explicit URL or API. Enforcing physical
-write authority requires the separate D4 credential split and is not claimed here.
+a later mutable worktree `HEAD` cannot change what is published. Before persisting the
+intent, the daemon pins that SHA under a task-scoped local Git ref, so parking may safely
+remove a failed run's worktree and run-local branch; `task-retry` and remediation retries
+still replay the exact source even when their replacement worktree starts at another
+`HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
+transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
+later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
+guard. Initial PR reconciliation also requires the PR base to equal the configured base
+branch. Rejected or ambiguous publication parks the task; persisted PR target data is
+never authority for a publish retry. This is protocol ownership plus a best-effort
+worktree `pushurl` lockout, not credential isolation: an agent holding the same GitHub
+credential can still bypass local Git configuration with an explicit URL or API.
+Enforcing physical write authority requires the separate D4 credential split and is not
+claimed here.
 
 Reviewers must inspect the full diff and relevant surrounding behavior, follow
 repository instructions, classify BLOCKING and advisory findings, put authoritative

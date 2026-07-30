@@ -57,6 +57,83 @@ impl WorktreeManager {
         cmd
     }
 
+    fn publication_ref(task_id: i64) -> String {
+        format!("refs/quorum-publication/task-{task_id}")
+    }
+
+    /// Pin the immutable source commit named by a durable publication intent.
+    ///
+    /// Publication failures tear down run-local worktrees and branches. This
+    /// daemon-owned ref keeps the exact object reachable across that cleanup,
+    /// including when a remediation retry receives a different local branch.
+    pub async fn pin_publication_source(
+        &self,
+        repo_dir: &Path,
+        task_id: i64,
+        source_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let publication_ref = Self::publication_ref(task_id);
+
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", &format!("{source_sha}^{{commit}}")]);
+        let resolved = run_git(
+            resolve,
+            self.local_timeout,
+            "git rev-parse publication source",
+        )
+        .await?;
+        let resolved_sha = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if !resolved.status.success() || resolved_sha != source_sha {
+            return Err(format!(
+                "publication source {source_sha} is not an exact local commit"
+            ));
+        }
+
+        let mut update = self.git_cmd(repo_dir);
+        update.args(["update-ref", &publication_ref, source_sha]);
+        let updated = run_git(
+            update,
+            self.local_timeout,
+            "git update-ref publication source",
+        )
+        .await?;
+        if !updated.status.success() {
+            return Err(format!(
+                "cannot pin publication source {source_sha}: {}",
+                String::from_utf8_lossy(&updated.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Retire a publication pin only when it still names the completed source.
+    /// A mismatched ref is left intact and logged by the best-effort caller.
+    pub async fn retire_publication_source(
+        &self,
+        repo_dir: &Path,
+        task_id: i64,
+        source_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let publication_ref = Self::publication_ref(task_id);
+        let mut delete = self.git_cmd(repo_dir);
+        delete.args(["update-ref", "-d", &publication_ref, source_sha]);
+        let deleted = run_git(
+            delete,
+            self.local_timeout,
+            "git update-ref retire publication source",
+        )
+        .await?;
+        if !deleted.status.success() {
+            return Err(format!(
+                "cannot retire publication source {source_sha}: {}",
+                String::from_utf8_lossy(&deleted.stderr)
+            ));
+        }
+        Ok(())
+    }
+
     /// Build a daemon-only push command that bypasses the worktree's poisoned
     /// `pushurl`. Managed agents' ordinary pushes hit that best-effort lockout;
     /// the daemon obtains the normal fetch URL for its explicit protocol push.
@@ -1458,6 +1535,88 @@ mod tests {
             .expect("exact durable source must publish");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
         assert_ne!(git_rev_parse(&bare, pr_head), mutable_head);
+    }
+
+    /// Regression for PR #483 remediation review: a publication failure may
+    /// remove the source worktree/branch before an operator retries the parked
+    /// task. The retry can use a different run-local remediation branch, but
+    /// it must still publish intent A rather than its replacement HEAD B.
+    #[tokio::test]
+    async fn publication_pin_replays_exact_source_after_branch_cleanup_and_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/publication-retry";
+        let remote_tip = push_branch(&repo, pr_head);
+        let mgr = WorktreeManager::new();
+
+        let first_wt = tmp.path().join("first-remediation");
+        let first_branch = "remediation/First-t263";
+        mgr.fetch_and_provision(&repo, first_branch, &first_wt, pr_head)
+            .await
+            .expect("first remediation provision");
+        assert!(
+            git_output(&first_wt, &["commit", "--allow-empty", "-m", "intent A"])
+                .status
+                .success()
+        );
+        let intent_sha = git_rev_parse(&first_wt, "HEAD");
+        mgr.pin_publication_source(&first_wt, 263, &intent_sha)
+            .await
+            .expect("pin exact publication source before remote operations");
+
+        // Publication parks and normal slot cleanup removes all run-local
+        // reachability. Only the daemon-owned pin is allowed to retain A.
+        mgr.remove(&repo, &first_wt)
+            .await
+            .expect("remove first worktree");
+        mgr.delete_branch(&repo, first_branch).await;
+        assert!(!git_output(
+            &repo,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{first_branch}")
+            ]
+        )
+        .status
+        .success());
+
+        let retry_wt = tmp.path().join("retry-remediation");
+        let retry_branch = "remediation/Retry-t263";
+        mgr.fetch_and_provision(&repo, retry_branch, &retry_wt, pr_head)
+            .await
+            .expect("replacement remediation provision");
+        assert!(git_output(
+            &retry_wt,
+            &["commit", "--allow-empty", "-m", "replacement HEAD B"]
+        )
+        .status
+        .success());
+        let replacement_head = git_rev_parse(&retry_wt, "HEAD");
+        assert_ne!(replacement_head, intent_sha);
+
+        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha)
+            .await
+            .expect("task retry must replay the durable intent source");
+        assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
+        assert_ne!(git_rev_parse(&bare, pr_head), replacement_head);
+
+        mgr.retire_publication_source(&repo, 263, &intent_sha)
+            .await
+            .expect("successful lifecycle handoff retires the pin");
+        assert!(
+            !git_output(
+                &repo,
+                &[
+                    "show-ref",
+                    "--verify",
+                    &WorktreeManager::publication_ref(263),
+                ],
+            )
+            .status
+            .success(),
+            "retired publication source must not leak a permanent Git ref"
+        );
     }
 
     #[tokio::test]

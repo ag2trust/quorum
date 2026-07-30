@@ -524,6 +524,12 @@ struct PublicationIntent {
     stage: String,
 }
 
+#[derive(Debug)]
+struct PublishedCompletion {
+    pr: i64,
+    source_sha: String,
+}
+
 async fn persist_publication_intent(
     db_path: &Path,
     task_id: i64,
@@ -643,20 +649,29 @@ async fn publish_worker_completion(
     worktree: &Path,
     branch: &str,
     known_pr: Option<i64>,
-) -> std::result::Result<i64, String> {
-    let local_sha = wt_mgr.head_sha(worktree).await?;
+) -> std::result::Result<PublishedCompletion, String> {
     let prior = load_publication_intent(&config.db_path, task_id).await?;
     if let Some(prior) = &prior {
-        if prior.branch != branch || prior.local_sha != local_sha {
+        if prior.branch != branch {
             return Err(format!(
-                "durable publication intent mismatch: recorded {} at {}, current {} at {}",
-                prior.branch, prior.local_sha, branch, local_sha
+                "durable publication branch mismatch: recorded {}, current {}",
+                prior.branch, branch
             ));
         }
         if known_pr.is_some() && prior.pr.is_some() && known_pr != prior.pr {
             return Err("durable publication PR conflicts with current task PR".into());
         }
     }
+    let local_sha = match &prior {
+        Some(intent) => intent.local_sha.clone(),
+        None => wt_mgr.head_sha(worktree).await?,
+    };
+    // Pin before persisting a new intent. A crash between these operations can
+    // leave only a harmless local ref; the unsafe inverse would persist an
+    // intent whose source can be collected during worktree/branch cleanup.
+    wt_mgr
+        .pin_publication_source(worktree, task_id, &local_sha)
+        .await?;
     let known_pr = known_pr.or_else(|| prior.as_ref().and_then(|intent| intent.pr));
     let mut intent = prior.unwrap_or(PublicationIntent {
         branch: branch.to_string(),
@@ -686,7 +701,10 @@ async fn publish_worker_completion(
         intent.stage = "verified".into();
         intent.branch = target.head_ref;
         persist_publication_intent(&config.db_path, task_id, &intent).await?;
-        return Ok(pr);
+        return Ok(PublishedCompletion {
+            pr,
+            source_sha: intent.local_sha,
+        });
     }
 
     let pushed_sha = wt_mgr
@@ -723,7 +741,10 @@ async fn publish_worker_completion(
     validate_initial_pr_target(&target, branch, &pushed_sha, &config.base_branch)?;
     intent.stage = "verified".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
-    Ok(pr)
+    Ok(PublishedCompletion {
+        pr,
+        source_sha: intent.local_sha,
+    })
 }
 
 fn log(msg: &str) {
@@ -1637,10 +1658,10 @@ async fn recover_late_worker_done_with_publication(
         (Some(_), _) => return Ok(false),
         (None, expected) => expected,
     };
-    let published_pr =
+    let published =
         match publish_worker_completion(config, wt_mgr, task_id, &worktree, branch, known_pr).await
         {
-            Ok(pr) => pr,
+            Ok(published) => published,
             Err(error) => {
                 log(&format!(
                     "late worker publication failed for task #{task_id}: {error}"
@@ -1661,8 +1682,18 @@ async fn recover_late_worker_done_with_publication(
             }
         };
     let folded =
-        recover_late_worker_done_atomic(&config.db_path, mailbox_id, row, Some(published_pr))
+        recover_late_worker_done_atomic(&config.db_path, mailbox_id, row, Some(published.pr))
             .await?;
+    if folded {
+        if let Err(error) = wt_mgr
+            .retire_publication_source(&config.repo_dir, task_id, &published.source_sha)
+            .await
+        {
+            log(&format!(
+                "publication source cleanup failed for task #{task_id}: {error}"
+            ));
+        }
+    }
     Ok(folded)
 }
 
@@ -5535,8 +5566,8 @@ async fn tick(
             )
             .await;
             match published {
-                Ok(pr) => effective_pr = Some(pr),
-                Err(error) => {
+                Ok(ref published) => effective_pr = Some(published.pr),
+                Err(ref error) => {
                     log(&format!(
                         "daemon publish rejected for worker {} task #{}: {error}",
                         workers[wi].agent_name, workers[wi].task_id
@@ -5573,6 +5604,25 @@ async fn tick(
                 match tr {
                     Ok(tr) => {
                         workers[wi].pr = Some(pr);
+                        if let Ok(ref published) = published {
+                            // The lifecycle transaction above already retired
+                            // the durable intent. Retire the reachability pin
+                            // afterward; a crash here leaves only a harmless
+                            // local ref and cannot replay publication.
+                            if let Err(error) = wt_mgr
+                                .retire_publication_source(
+                                    &config.repo_dir,
+                                    workers[wi].task_id,
+                                    &published.source_sha,
+                                )
+                                .await
+                            {
+                                log(&format!(
+                                    "publication source cleanup failed for task #{}: {error}",
+                                    workers[wi].task_id
+                                ));
+                            }
+                        }
 
                         // Dispatch lifecycle effects.
                         for effect in &tr.effects {
