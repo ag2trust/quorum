@@ -683,15 +683,18 @@ pub fn claim_provider_retry_rework(
     let updated = tx.execute(
         "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
-           AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
-           AND json_extract(refs, '$.cx_size') IN ('S','M','L')
-           AND json_extract(refs, '$.cx_ready')=1
-           AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
-           AND json_valid(refs)
-           AND (
-               json_type(refs, '$.codex_retry_requested')='true'
-               OR json_type(refs, '$.daemon_rework_retry_requested')='true'
-           )",
+           AND CASE WHEN json_valid(refs) THEN
+               json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+               AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+               AND json_extract(refs, '$.cx_ready')=1
+               AND NOT (json_extract(refs, '$.cx_est')=5
+                        AND json_extract(refs, '$.cx_size')='L')
+               AND (
+                   json_type(refs, '$.codex_retry_requested')='true'
+                   OR json_type(refs, '$.daemon_rework_retry_requested')='true'
+               )
+               ELSE 0
+           END",
         params![agent, now, id],
     )?;
     let mut task = if updated == 1 {
@@ -2466,7 +2469,7 @@ pub fn retry_parked(
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
         tx.execute(
-            "UPDATE tasks SET refs=json_remove(refs, '$.cx_est', '$.cx_size', '$.cx_ready', '$.cx_not_ready_reason', '$.cx_by'), updated_at=?2 WHERE id=?1",
+            "UPDATE tasks SET refs=json_remove(refs, '$.cx_est', '$.cx_size', '$.cx_ready', '$.cx_not_ready_reason', '$.cx_by', '$.cx_dup_of'), updated_at=?2 WHERE id=?1",
             params![id, now],
         )?;
         tx.commit()?;
@@ -7008,6 +7011,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(active_claims, 1);
+    }
+
+    #[test]
+    fn provider_retry_with_malformed_refs_is_a_clean_negative() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework', refs='{' WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        assert!(
+            claim_provider_retry_rework(&mut conn, "replacement", task_id, TTL, 11)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(get(&conn, task_id).unwrap().unwrap().assignee, None);
     }
 
     #[test]

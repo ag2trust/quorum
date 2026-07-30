@@ -39,17 +39,20 @@ pub struct TaskForClassification {
 
 const VALID_SIZES: &[&str] = &["S", "M", "L", "XL"];
 
-/// Query open/working/terminal tasks that have no `cx_est` in refs.
-/// Terminal tasks are included so the classifier catches them within one tick
-/// of reaching done/failed/cancelled (terminal fallback).
+/// Query active tasks and policy-parked tasks whose v2 classification is
+/// incomplete. Malformed legacy refs are candidates rather than a query error.
 pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, body FROM tasks
          WHERE (status IN ('open', 'working', 'in-review', 'rework', 'merging')
-                OR (status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1))
-         AND (refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL
-              OR json_extract(refs, '$.cx_size') IS NULL
-              OR json_extract(refs, '$.cx_ready') IS NULL)",
+                OR CASE WHEN status='failed' AND json_valid(refs)
+                        THEN json_extract(refs, '$.daemon_parked')=1
+                        ELSE 0 END)
+         AND CASE WHEN refs IS NULL OR NOT json_valid(refs) THEN 1
+                  ELSE (json_extract(refs, '$.cx_est') IS NULL
+                        OR json_extract(refs, '$.cx_size') IS NULL
+                        OR json_extract(refs, '$.cx_ready') IS NULL)
+             END",
     )?;
     let tasks = stmt
         .query_map([], |row| {
@@ -434,8 +437,8 @@ Output format (JSON array wrapped in an object):
 /// Stable classifier provenance string for `cx_by`.
 ///
 /// The model is part of the identifier so classification quality can be grouped
-/// by the model that actually produced it. `v1` distinguishes this prompt and
-/// parser contract from future revisions.
+/// by the model that actually produced it. `v2` identifies the explicit
+/// complexity/size/readiness contract.
 pub fn classifier_provenance(model: &str) -> String {
     format!("{model}:v2")
 }
@@ -616,6 +619,20 @@ mod tests {
             .unwrap()
             .notes;
         assert_eq!(notes.len(), 0);
+    }
+
+    #[test]
+    fn malformed_refs_remain_classifiable() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Legacy malformed refs", 1);
+        conn.execute("UPDATE tasks SET refs='{' WHERE id=?1", params![task_id])
+            .unwrap();
+
+        let unclassified = unclassified_tasks(&conn).unwrap();
+        assert_eq!(
+            unclassified.iter().map(|task| task.id).collect::<Vec<_>>(),
+            [task_id]
+        );
     }
 
     #[test]
@@ -819,12 +836,32 @@ mod tests {
         let task_id = create_task(&mut conn, "rescope", 1);
         let mut parked = classified(task_id, 5);
         parked.size = "L".into();
+        parked.duplicate_of = vec![99];
         store_classifications(&mut conn, &[parked], "test:v2", 10).unwrap();
         assert!(
             crate::tasks::retry_parked(&mut conn, task_id, "owner", true, 11)
                 .unwrap()
                 .is_none()
         );
+        let retry_refs = crate::tasks::get(&conn, task_id)
+            .unwrap()
+            .unwrap()
+            .refs
+            .unwrap();
+        let retry_refs: serde_json::Value = serde_json::from_str(&retry_refs).unwrap();
+        for key in [
+            "cx_est",
+            "cx_size",
+            "cx_ready",
+            "cx_not_ready_reason",
+            "cx_by",
+            "cx_dup_of",
+        ] {
+            assert!(
+                retry_refs.get(key).is_none(),
+                "retry left stale classifier field {key}"
+            );
+        }
         assert!(unclassified_tasks(&conn)
             .unwrap()
             .iter()

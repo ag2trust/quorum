@@ -1477,11 +1477,11 @@ constraints, and verification but have no routing authority. `task-create` rejec
 `complexity:*`, `tier:*`, and `effort:*` label with usage exit 2. Existing stored routing
 labels are ignored.
 
-- An open implementation task is not dispatchable until the daemon classifier has
-  persisted valid `cx_est` (1–5), `cx_size` (`S`, `M`, `L`, or `XL`), and `cx_ready`
-  fields in task refs. A false readiness result carries a concrete
-  `cx_not_ready_reason`; missing or malformed classification never falls back to a worker
-  default.
+- No managed worker or reviewer is dispatchable until the daemon classifier has persisted
+  valid `cx_est` (1–5), `cx_size` (`S`, `M`, `L`, or `XL`), and `cx_ready` fields in task
+  refs. A false readiness result carries a concrete `cx_not_ready_reason`; missing,
+  partial, or malformed classification never falls back to worker or reviewer
+  provisioning.
 - The classifier is closed-book: it receives bounded task/dependency/recovery context but
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to

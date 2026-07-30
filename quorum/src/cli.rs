@@ -512,11 +512,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Classify tasks: assign complexity scores, shape-lint flags, type tags,
-    /// and duplicate-of hints. Primarily driven by the daemon; this command is
-    /// for manual backfill of historical tasks.
+    /// Classify tasks: assign complexity, size, readiness, readiness reason,
+    /// and duplicate candidates. Primarily driven by the daemon; this command
+    /// is for manual backfill of historical tasks.
     Classify {
-        /// Backfill all tasks (any status) that lack a complexity score.
+        /// Backfill all tasks (any status) that lack a complete classification.
         #[arg(long)]
         backfill: bool,
         /// Override the agent binary (default: "claude").

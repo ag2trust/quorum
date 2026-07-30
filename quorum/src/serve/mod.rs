@@ -3467,9 +3467,8 @@ async fn tick(
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
-    // Category-5 work is outside automatic-dispatch policy. Reconcile rows
-    // written by older daemons before any mailbox recovery or provisioning
-    // path can regain authority.
+    // Reconcile policy-blocked classifications written by older daemons before
+    // any mailbox recovery or provisioning path can regain authority.
     {
         let p = db_path.clone();
         let parked = tokio::task::spawn_blocking(move || -> Result<usize> {
@@ -3480,7 +3479,7 @@ async fn tick(
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
         if parked > 0 {
             log(&format!(
-                "policy: parked {parked} complexity-5 task(s); split or rescope before creating replacement tasks"
+                "policy: parked {parked} task(s) outside automatic dispatch policy; clarify, split, or rescope before retrying"
             ));
         }
     }
@@ -7213,9 +7212,9 @@ async fn tick(
             .unwrap_or_default()
         };
         for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
-            if classifier_complexity(task_refs).is_none() {
+            if !tasks::classification_is_dispatchable(task_refs) {
                 log(&format!(
-                    "task #{task_id} PR #{pr}: awaiting classifier-owned complexity before review dispatch"
+                    "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
                 ));
                 continue;
             }
@@ -7673,7 +7672,6 @@ async fn tick(
                 match classifier::spawn_classifier_configured(
                     &tasks,
                     &dup_context,
-                    &config.repo_dir,
                     config.agent_bin.as_deref(),
                     config.bare_agent,
                     &config.classifier_model,
@@ -8605,6 +8603,30 @@ async fn provision_reviewer(
     head_sha: &str,
     recover_interrupted: bool,
 ) -> Result<()> {
+    // Defense in depth for every reviewer path (worker handoff, orphan
+    // recovery, and R2): incomplete legacy refs and policy-park
+    // classifications cannot acquire a reviewer identity or process.
+    let classification_dispatchable = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = quorum_core::db::open(&db_path)?;
+            Ok(tasks::get(&conn, task_id)?
+                .is_some_and(|task| tasks::classification_is_dispatchable(&task.refs)))
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+    };
+    if !classification_dispatchable {
+        log(&format!(
+            "{}: task #{} PR #{pr} lacks a complete dispatchable classification — \
+             reviewer not acquired or spawned",
+            role.as_str().to_uppercase(),
+            worker.task_id,
+        ));
+        return Ok(());
+    }
+
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
     // acquiring a name or creating reviewer resources.
