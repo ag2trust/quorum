@@ -98,7 +98,9 @@ author to update the PR before review/merge can continue.
 Task creators describe scope and acceptance criteria but do not select complexity, model,
 or effort. The daemon classifies each task before dispatch and applies its configured
 provider's routing table. Labels beginning with `complexity:`, `tier:`, or `effort:` are
-rejected.
+rejected. Complexity-5 tasks are classified and then durably parked without an agent run;
+split or rescope them into smaller replacement tasks. Retrying the unchanged parked task
+is a clean negative.
 
 ## Watch progress
 

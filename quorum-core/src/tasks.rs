@@ -571,7 +571,9 @@ pub fn claim(
                         author = CASE WHEN status='open' AND author IS NULL THEN ?1 ELSE author END,
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
-                     WHERE id = ?3 AND (
+                     WHERE id = ?3
+                       AND COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+                       AND (
                          (status='open' AND {DEP_READY_CLAUSE})
                          OR (status='in-review' AND reviewer IS NULL \
                              AND (author IS NULL OR author != ?1))
@@ -584,7 +586,9 @@ pub fn claim(
             .optional()?,
         None => {
             let mut selector = format!(
-                "SELECT id FROM tasks WHERE (
+                "SELECT id FROM tasks
+                 WHERE COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+                   AND (
                     (status='open' AND {DEP_READY_CLAUSE})
                     OR (status='in-review' AND reviewer IS NULL \
                         AND (author IS NULL OR author != ?1))
@@ -666,6 +670,7 @@ pub fn claim_provider_retry_rework(
     let updated = tx.execute(
         "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
+           AND COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
            AND json_valid(refs)
            AND (
                json_type(refs, '$.codex_retry_requested')='true'
@@ -729,7 +734,15 @@ pub fn claim_remediation_rework(
         })
         .optional()?;
 
-    if status.as_deref() != Some("rework") {
+    let complexity_five: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks
+             WHERE id=?1 AND json_valid(refs) AND json_extract(refs, '$.cx_est')=5
+         )",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if status.as_deref() != Some("rework") || complexity_five {
         crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
         tx.commit()?;
         return Ok(None);
@@ -2043,6 +2056,81 @@ fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Res
     serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
 }
 
+pub const COMPLEXITY_FIVE_PARK_REASON: &str =
+    "complexity 5 exceeds automatic dispatch policy; split or rescope into a new task";
+
+/// Park a classified category-5 task inside the caller's write transaction.
+/// Classification and policy enforcement therefore become visible atomically.
+pub(crate) fn park_complexity_five_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    now: i64,
+) -> Result<bool> {
+    let current: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT status, refs FROM tasks
+             WHERE id=?1
+               AND status NOT IN ('done','failed','cancelled')
+               AND json_valid(refs)
+               AND json_extract(refs, '$.cx_est')=5",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((status, refs)) = current else {
+        return Ok(false);
+    };
+    let resume_status = match status.as_str() {
+        "working" | "claimed" => "open",
+        "merging" => "in-review",
+        other => other,
+    };
+    let refs = set_parked_refs(refs.as_deref(), COMPLEXITY_FIVE_PARK_REASON, resume_status)?;
+    tx.execute(
+        "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    deactivate_lease(tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, format!("parked: {COMPLEXITY_FIVE_PARK_REASON}")],
+    )?;
+    crate::events::emit(
+        tx,
+        "task_parked",
+        &lease_target(id),
+        COMPLEXITY_FIVE_PARK_REASON,
+        now,
+    )?;
+    Ok(true)
+}
+
+/// Reconcile category-5 rows classified by an older daemon or changed while
+/// this daemon was stopped. Bounded only by the number of live category-5
+/// tasks; each task is terminally parked after one pass.
+pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM tasks
+             WHERE status NOT IN ('done','failed','cancelled')
+               AND json_valid(refs)
+               AND json_extract(refs, '$.cx_est')=5",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let mut parked = 0;
+    for id in ids {
+        parked += usize::from(park_complexity_five_tx(&tx, id, now)?);
+    }
+    tx.commit()?;
+    Ok(parked)
+}
+
 /// AgentFailed reasons the daemon itself caused. Matched against the exact
 /// strings fed by the daemon's teardown paths: Phase 4a drain
 /// ("daemon draining"), shutdown worker teardown
@@ -2176,6 +2264,15 @@ pub fn retry_parked(
         tx.commit()?;
         return Ok(None);
     };
+    let policy_parked: bool = tx.query_row(
+        "SELECT COALESCE(json_extract(refs, '$.cx_est'), 0)=5 FROM tasks WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if policy_parked {
+        tx.commit()?;
+        return Ok(None);
+    }
     if !matches!(
         resume_status.as_str(),
         "open" | "rework" | "in-review" | "merging"
@@ -7389,5 +7486,49 @@ mod tests {
             None,
             "successful rework submission must consume durable CI intent"
         );
+    }
+
+    #[test]
+    fn legacy_category_five_is_unclaimable_then_reconciled_once() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "legacy category five",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET refs=json_object('cx_est', 5, 'cx_by', 'legacy:v1') WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        assert!(claim(&mut c, "worker", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .is_none());
+        assert_eq!(park_classified_complexity_five(&mut c, 1002).unwrap(), 1);
+        assert_eq!(park_classified_complexity_five(&mut c, 1003).unwrap(), 0);
+
+        let task = get(&c, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_by"], "legacy:v1");
+        assert_eq!(refs["daemon_parked"], true);
+        let events: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_parked' AND subject=?1",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1, "restart reconciliation must be idempotent");
     }
 }
