@@ -1071,6 +1071,17 @@ exit 1
 
     // Explicit retry resumes the remediation flow (not generic provisioning).
     write_dual_protocol_runner(case.home.path());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "review-pr-1",
+        ])
+        .status()
+        .unwrap()
+        .success());
     case.retry_parked();
     case.handle
         .wait_for("durable remediation retry: provisioning task #1");
