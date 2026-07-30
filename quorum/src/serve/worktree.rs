@@ -265,27 +265,87 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Remove an optional setting from the shared repository config.
+    /// Caller MUST hold `self.lock`.
+    async fn unset_local_config(&self, dir: &Path, key: &str) -> Result<(), String> {
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.arg("-C")
+            .arg(dir)
+            .args(["config", "--local", "--unset-all", key]);
+        let out = run_git(cmd, self.local_timeout, "git config --local --unset-all").await?;
+        match out.status.code() {
+            Some(0 | 5) => Ok(()),
+            _ => Err(format!(
+                "git config --local --unset-all {key} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )),
+        }
+    }
+
     /// Enable per-worktree config, which is a prerequisite for every
     /// `git config --worktree` write below.
     ///
     /// NOTE: this mutates the SHARED repository config permanently
     /// (`extensions.worktreeConfig` lives in the common config, not a worktree
     /// one). Git then reads `core.bare` / `core.worktree` from the common
-    /// config for every worktree, so refuse when either is set rather than
-    /// changing how the user's checkout resolves its work tree.
+    /// config for every worktree, so refuse when `core.worktree` is present or
+    /// `core.bare` is true rather than changing how the user's checkout
+    /// resolves its work tree.
     /// Caller MUST hold `self.lock`.
     async fn enable_worktree_config(&self, worktree_dir: &Path) -> Result<(), String> {
-        for key in ["core.bare", "core.worktree"] {
-            let mut cmd = Command::new(&self.git_bin);
-            cmd.arg("-C")
-                .arg(worktree_dir)
-                .args(["config", "--get", key]);
-            let out = run_git(cmd, self.local_timeout, "git config --get").await?;
-            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !value.is_empty() && value != "false" {
+        let mut worktree_cmd = Command::new(&self.git_bin);
+        worktree_cmd
+            .arg("-C")
+            .arg(worktree_dir)
+            .args(["config", "--get", "core.worktree"]);
+        let worktree = run_git(
+            worktree_cmd,
+            self.local_timeout,
+            "git config --get core.worktree",
+        )
+        .await?;
+        match worktree.status.code() {
+            Some(0) => {
+                let value = String::from_utf8_lossy(&worktree.stdout).trim().to_string();
                 return Err(format!(
-                    "refusing to enable extensions.worktreeConfig: {key}={value} is set \
+                    "refusing to enable extensions.worktreeConfig: core.worktree={value} is set \
                      in the shared repo config"
+                ));
+            }
+            Some(1) => {}
+            _ => {
+                return Err(format!(
+                    "git config --get core.worktree failed: {}",
+                    String::from_utf8_lossy(&worktree.stderr)
+                ));
+            }
+        }
+
+        let mut bare_cmd = Command::new(&self.git_bin);
+        bare_cmd
+            .arg("-C")
+            .arg(worktree_dir)
+            .args(["config", "--bool", "--get", "core.bare"]);
+        let bare = run_git(
+            bare_cmd,
+            self.local_timeout,
+            "git config --bool --get core.bare",
+        )
+        .await?;
+        match bare.status.code() {
+            Some(0) if String::from_utf8_lossy(&bare.stdout).trim() == "false" => {}
+            Some(0) => {
+                return Err(
+                    "refusing to enable extensions.worktreeConfig: core.bare=true is set \
+                     in the shared repo config"
+                        .to_string(),
+                );
+            }
+            Some(1) => {}
+            _ => {
+                return Err(format!(
+                    "git config --bool --get core.bare failed: {}",
+                    String::from_utf8_lossy(&bare.stderr)
                 ));
             }
         }
@@ -303,11 +363,10 @@ impl WorktreeManager {
     /// `branch.<local>.remote = origin`, so a fork PR head (a name in the fork,
     /// not in `origin`) must never be passed here.
     ///
-    /// `push.default` and the push refspec are worktree-scoped: repo-scoped
-    /// values would leak into the user's shared checkout, which the daemon does
-    /// not own. The `branch.<local>.*` keys are repo-scoped, which is safe
-    /// because the local branch name is unique to this run. Also mutates the
-    /// shared repo config via [`Self::enable_worktree_config`].
+    /// All push routing is worktree-scoped: repo-scoped values would leak into
+    /// the user's shared checkout and persist after the run-unique local branch
+    /// is deleted. Also mutates the shared repo config via
+    /// [`Self::enable_worktree_config`].
     pub async fn configure_push_upstream(
         &self,
         worktree_dir: &Path,
@@ -329,14 +388,26 @@ impl WorktreeManager {
             ],
         )
         .await?;
+        // `git worktree add -b` may create common branch tracking config
+        // according to the user's branch.autoSetupMerge setting. Remove it
+        // before installing daemon-owned, worktree-local routing.
+        self.unset_local_config(worktree_dir, &format!("branch.{local_branch}.remote"))
+            .await?;
+        self.unset_local_config(worktree_dir, &format!("branch.{local_branch}.merge"))
+            .await?;
         self.set_config(
             worktree_dir,
-            &[&format!("branch.{local_branch}.remote"), "origin"],
+            &[
+                "--worktree",
+                &format!("branch.{local_branch}.remote"),
+                "origin",
+            ],
         )
         .await?;
         self.set_config(
             worktree_dir,
             &[
+                "--worktree",
                 &format!("branch.{local_branch}.merge"),
                 &format!("refs/heads/{remote_branch}"),
             ],
@@ -1198,6 +1269,63 @@ mod tests {
                 .is_empty(),
             "push.default must not be set repo-wide"
         );
+        let common_dir =
+            String::from_utf8_lossy(&git_output(&repo, &["rev-parse", "--git-common-dir"]).stdout)
+                .trim()
+                .to_string();
+        let common_config = repo.join(common_dir).join("config");
+        for key in [
+            format!("branch.{local_branch}.remote"),
+            format!("branch.{local_branch}.merge"),
+        ] {
+            assert!(
+                !git_output(
+                    &repo,
+                    &[
+                        "config",
+                        "--file",
+                        &common_config.to_string_lossy(),
+                        "--get",
+                        &key
+                    ]
+                )
+                .status
+                .success(),
+                "{key} must not be set repo-wide"
+            );
+        }
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(
+                    &wt_path,
+                    &[
+                        "config",
+                        "--worktree",
+                        "--get",
+                        &format!("branch.{local_branch}.remote")
+                    ]
+                )
+                .stdout
+            )
+            .trim(),
+            "origin"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(
+                    &wt_path,
+                    &[
+                        "config",
+                        "--worktree",
+                        "--get",
+                        &format!("branch.{local_branch}.merge")
+                    ]
+                )
+                .stdout
+            )
+            .trim(),
+            format!("refs/heads/{pr_head}")
+        );
 
         // Real push with no refspec.
         assert!(
@@ -1291,8 +1419,83 @@ mod tests {
             "refusal must not have enabled the extension"
         );
 
+        StdCommand::new("git")
+            .args([
+                "config",
+                "--file",
+                &repo.join(".git/config").to_string_lossy(),
+                "--unset",
+                "core.worktree",
+            ])
+            .output()
+            .unwrap();
         mgr.remove(&repo, &wt_path).await.ok();
         mgr.delete_branch(&repo, local_branch).await;
+    }
+
+    #[tokio::test]
+    async fn worktree_config_refuses_when_core_worktree_is_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/core-worktree-false";
+        push_branch(&repo, pr_head);
+
+        let mgr = WorktreeManager::new();
+        let local_branch = "remediation/quill-t4";
+        let wt_path = tmp.path().join("remediation-wt");
+        mgr.fetch_and_provision(&repo, local_branch, &wt_path, pr_head)
+            .await
+            .expect("provision");
+        git_output(&repo, &["config", "core.worktree", "false"]);
+
+        let result = mgr
+            .configure_push_upstream(&wt_path, local_branch, pr_head)
+            .await;
+        assert!(result.is_err(), "must refuse, got {result:?}");
+        assert!(
+            !git_output(&repo, &["config", "--get", "extensions.worktreeConfig"])
+                .status
+                .success(),
+            "refusal must not have enabled the extension"
+        );
+
+        StdCommand::new("git")
+            .args([
+                "config",
+                "--file",
+                &repo.join(".git/config").to_string_lossy(),
+                "--unset",
+                "core.worktree",
+            ])
+            .output()
+            .unwrap();
+        mgr.remove(&repo, &wt_path).await.ok();
+        mgr.delete_branch(&repo, local_branch).await;
+    }
+
+    #[tokio::test]
+    async fn worktree_config_accepts_falseish_core_bare() {
+        for falseish in ["false", "0", "no", "off"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+            let pr_head = "fix/core-bare-false";
+            push_branch(&repo, pr_head);
+
+            let mgr = WorktreeManager::new();
+            let local_branch = "remediation/quill-t5";
+            let wt_path = tmp.path().join("remediation-wt");
+            mgr.fetch_and_provision(&repo, local_branch, &wt_path, pr_head)
+                .await
+                .expect("provision");
+            git_output(&repo, &["config", "core.bare", falseish]);
+
+            mgr.configure_push_upstream(&wt_path, local_branch, pr_head)
+                .await
+                .unwrap_or_else(|e| panic!("core.bare={falseish} must be accepted: {e}"));
+
+            mgr.remove(&repo, &wt_path).await.ok();
+            mgr.delete_branch(&repo, local_branch).await;
+        }
     }
 
     /// Reviewers read and comment; they never push. The lockout must block
