@@ -250,6 +250,77 @@ impl WorktreeManager {
         Ok(wt_path)
     }
 
+    /// Write one git config setting inside `dir`. Caller MUST hold `self.lock`.
+    async fn set_config(&self, dir: &Path, args: &[&str]) -> Result<(), String> {
+        let mut cmd = Command::new(&self.git_bin);
+        cmd.arg("-C").arg(dir).arg("config").args(args);
+        let out = run_git(cmd, self.local_timeout, "git config").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git config {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Point a plain `git push` inside `worktree_dir` at `remote_branch`.
+    ///
+    /// The daemon owns run-unique local branch names, so a remote branch name
+    /// (e.g. a PR head) is a push target only, never a local checkout. The
+    /// agent pushes with no refspec and lands on the PR branch.
+    ///
+    /// `push.default` is worktree-scoped: a repo-scoped value would leak into
+    /// the user's shared checkout, which the daemon does not own. The
+    /// `branch.<local>.*` keys are repo-scoped, which is safe because the local
+    /// branch name is unique to this run.
+    pub async fn configure_push_upstream(
+        &self,
+        worktree_dir: &Path,
+        local_branch: &str,
+        remote_branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        self.set_config(worktree_dir, &["extensions.worktreeConfig", "true"])
+            .await?;
+        self.set_config(worktree_dir, &["--worktree", "push.default", "upstream"])
+            .await?;
+        self.set_config(
+            worktree_dir,
+            &[&format!("branch.{local_branch}.remote"), "origin"],
+        )
+        .await?;
+        self.set_config(
+            worktree_dir,
+            &[
+                &format!("branch.{local_branch}.merge"),
+                &format!("refs/heads/{remote_branch}"),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Make every push from `worktree_dir` fail. Reviewers read code and post
+    /// GitHub comments; they never push. Worktree-scoped so the shared checkout
+    /// and every other worktree keep their real push URL.
+    pub async fn disable_push(&self, worktree_dir: &Path) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        self.set_config(worktree_dir, &["extensions.worktreeConfig", "true"])
+            .await?;
+        self.set_config(
+            worktree_dir,
+            &[
+                "--worktree",
+                "remote.origin.pushurl",
+                "push-disabled://daemon-owns-push",
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Verify that a worktree HEAD matches an expected SHA. Does not take the
     /// serialization lock — this is a read-only check on the worktree dir.
     pub async fn verify_head_sha(
@@ -931,6 +1002,246 @@ mod tests {
         );
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    /// Repo with a real bare `origin` remote and `main` pushed. Returns
+    /// (repo dir, bare remote dir) inside `base`.
+    fn init_repo_with_bare_remote(base: &Path) -> (PathBuf, PathBuf) {
+        let bare = base.join("origin.git");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "--bare", "-b", "main", &bare.to_string_lossy()])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git init --bare failed"
+        );
+        init_git_repo(&repo);
+        let d = repo.to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["-C", &d, "remote", "add", "origin", &bare.to_string_lossy()])
+            .status()
+            .unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["-C", &d, "push", "origin", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "push main failed"
+        );
+        (repo, bare)
+    }
+
+    /// Create `branch` in the repo with one commit and push it to origin,
+    /// leaving the repo back on `main`. Returns the pushed tip SHA.
+    fn push_branch(repo: &Path, branch: &str) -> String {
+        let d = repo.to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", branch])
+            .output()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "pr work"])
+            .output()
+            .unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["-C", &d, "push", "origin", branch])
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "push {branch} failed"
+        );
+        let tip = git_rev_parse(repo, branch);
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .output()
+            .unwrap();
+        tip
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = StdCommand::new("git");
+        cmd.arg("-C").arg(dir).args(args);
+        cmd.output().unwrap()
+    }
+
+    /// Regression (2026-07-29 mass rework burn): a PR head branch held in
+    /// someone else's worktree must not block remediation provisioning. The
+    /// daemon checks out a run-unique local name and only fetches the PR head.
+    #[tokio::test]
+    async fn remediation_provisions_while_pr_head_held_by_other_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/some-pr-branch";
+        let remote_tip = push_branch(&repo, pr_head);
+
+        // An external worktree (a human's checkout) holds the PR head branch.
+        let external_wt = tmp.path().join("human-wt");
+        assert!(
+            git_output(
+                &repo,
+                &["worktree", "add", &external_wt.to_string_lossy(), pr_head],
+            )
+            .status
+            .success(),
+            "external worktree add failed"
+        );
+
+        let mgr = WorktreeManager::new();
+        let local_branch = "remediation/Alloy-t235";
+        let wt_path = tmp.path().join("remediation-wt");
+        let result = mgr
+            .fetch_and_provision(&repo, local_branch, &wt_path, pr_head)
+            .await;
+        assert!(
+            result.is_ok(),
+            "remediation provisioning must not collide with an externally \
+             held PR head: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            git_rev_parse(&wt_path, "HEAD"),
+            remote_tip,
+            "remediation worktree must sit at the PR head tip"
+        );
+        let current = String::from_utf8_lossy(
+            &git_output(&wt_path, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(
+            current, local_branch,
+            "remediation worktree must check out the namespaced local branch"
+        );
+
+        mgr.remove(&repo, &wt_path).await.ok();
+        mgr.delete_branch(&repo, local_branch).await;
+    }
+
+    /// A plain `git push` from a remediation worktree must land on the PR's
+    /// remote branch, not on the namespaced local name.
+    #[tokio::test]
+    async fn configure_push_upstream_pushes_to_pr_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/upstream-pr";
+        let remote_tip = push_branch(&repo, pr_head);
+
+        let mgr = WorktreeManager::new();
+        let local_branch = "remediation/Bolt-t9";
+        let wt_path = tmp.path().join("remediation-wt");
+        mgr.fetch_and_provision(&repo, local_branch, &wt_path, pr_head)
+            .await
+            .expect("provision");
+        mgr.configure_push_upstream(&wt_path, local_branch, pr_head)
+            .await
+            .expect("configure push upstream");
+
+        // Config is worktree-scoped so it cannot leak into the shared checkout.
+        let repo_push_default = git_output(&repo, &["config", "--get", "push.default"]).stdout;
+        assert!(
+            String::from_utf8_lossy(&repo_push_default)
+                .trim()
+                .is_empty(),
+            "push.default must not be set repo-wide"
+        );
+
+        // Real push with no refspec.
+        assert!(
+            git_output(
+                &wt_path,
+                &["commit", "--allow-empty", "-m", "remediation fix"]
+            )
+            .status
+            .success(),
+            "commit in remediation worktree failed"
+        );
+        let new_tip = git_rev_parse(&wt_path, "HEAD");
+        assert_ne!(new_tip, remote_tip);
+        let push = git_output(&wt_path, &["push"]);
+        assert!(
+            push.status.success(),
+            "plain git push must succeed: {}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+
+        assert_eq!(
+            git_rev_parse(&bare, pr_head),
+            new_tip,
+            "push must advance the PR head branch on the remote"
+        );
+        assert!(
+            !git_output(
+                &bare,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{local_branch}")
+                ]
+            )
+            .status
+            .success(),
+            "push must NOT create a remote branch for the local namespaced name"
+        );
+
+        mgr.remove(&repo, &wt_path).await.ok();
+        mgr.delete_branch(&repo, local_branch).await;
+    }
+
+    /// Reviewers read and comment; they never push. The lockout must block
+    /// pushes while leaving fetch working.
+    #[tokio::test]
+    async fn disable_push_blocks_reviewer_pushes_but_not_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/reviewed-pr";
+        push_branch(&repo, pr_head);
+
+        let mgr = WorktreeManager::new();
+        let review_branch = "review/pr-7-Lever";
+        let wt_path = tmp.path().join("reviewer-wt");
+        mgr.fetch_and_provision(&repo, review_branch, &wt_path, pr_head)
+            .await
+            .expect("provision");
+        mgr.disable_push(&wt_path).await.expect("disable push");
+
+        assert!(git_output(
+            &wt_path,
+            &["commit", "--allow-empty", "-m", "reviewer edit"]
+        )
+        .status
+        .success());
+        let push = git_output(&wt_path, &["push", "origin", "HEAD:refs/heads/whatever"]);
+        assert!(
+            !push.status.success(),
+            "reviewer push must fail, got success: {}",
+            String::from_utf8_lossy(&push.stdout)
+        );
+
+        let fetch = git_output(&wt_path, &["fetch", "origin", pr_head]);
+        assert!(
+            fetch.status.success(),
+            "reviewer fetch must still work: {}",
+            String::from_utf8_lossy(&fetch.stderr)
+        );
+
+        // The lockout is worktree-scoped: the shared checkout can still push.
+        assert!(
+            git_output(&repo, &["config", "--get", "remote.origin.pushurl"])
+                .stdout
+                .is_empty(),
+            "pushurl must not be set repo-wide"
+        );
+
+        mgr.remove(&repo, &wt_path).await.ok();
+        mgr.delete_branch(&repo, review_branch).await;
     }
 
     #[tokio::test]

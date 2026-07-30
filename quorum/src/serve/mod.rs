@@ -959,7 +959,8 @@ fn slot_journal_entry(slot: &SlotState, role: &str, phase: &str) -> JournalEntry
         task_id: Some(slot.task_id),
         session_id: slot.session_id.clone(),
         worktree: Some(slot.worktree_path.to_string_lossy().into()),
-        branch: Some(slot.branch.clone()),
+        // Inspection surfaces show the branch the work lands on.
+        branch: Some(slot.remote_branch.clone()),
         phase: phase.into(),
         cost_tokens: slot.cost_tokens,
         agent_state: slot.agent_state.clone(),
@@ -1198,7 +1199,14 @@ pub(crate) struct SlotState {
     model: String,
     effort: String,
     worktree_path: PathBuf,
+    /// Local branch checked out in this slot's worktree. The daemon owns this
+    /// name exclusively, so teardown may delete it.
     branch: String,
+    /// Remote branch this slot's work lands on (the PR head). Equals `branch`
+    /// for fresh workers and unused for reviewers; remediation workers diverge
+    /// because their local branch is namespaced to avoid colliding with a PR
+    /// head someone else already has checked out locally.
+    remote_branch: String,
     draining: bool,
     pr: Option<i64>,
     rework_count: u32,
@@ -3013,7 +3021,7 @@ async fn tick(
                             let worker_cp_owned: Option<(String, i64, String)> = if let Some(w) =
                                 workers.iter().find(|w| w.task_id == reviewer_task_id)
                             {
-                                Some((w.agent_name.clone(), w.task_id, w.branch.clone()))
+                                Some((w.agent_name.clone(), w.task_id, w.remote_branch.clone()))
                             } else {
                                 let db_branch = {
                                     let p = db_path.clone();
@@ -7678,8 +7686,8 @@ fn write_live_sidecar(slot: &SlotState) {
 }
 
 /// A minimal view of the reviewer's counterpart — the agent whose PR is
-/// under review. `branch` is a hint for logging; provisioning resolves the
-/// authoritative ref from GitHub (#189).
+/// under review. `branch` is the counterpart's REMOTE branch, used only as a
+/// fetch fallback when GitHub cannot resolve the authoritative ref (#189).
 #[allow(dead_code)]
 struct ReviewCounterpart<'a> {
     agent_name: &'a str,
@@ -7692,7 +7700,7 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
         Self {
             agent_name: &w.agent_name,
             task_id: w.task_id,
-            branch: &w.branch,
+            branch: &w.remote_branch,
         }
     }
 }
@@ -7909,7 +7917,20 @@ async fn provision_reviewer(
     };
     let provision_ok = match provision_result {
         Ok(_) => match wt_mgr.verify_head_sha(&wt_path, head_sha).await {
-            Ok(()) => true,
+            // Reviewers read code and post GitHub comments — they never push.
+            // Fail closed: a reviewer worktree that can still push is authority
+            // the daemon did not intend to grant.
+            Ok(()) => match wt_mgr.disable_push(&wt_path).await {
+                Ok(()) => true,
+                Err(e) => {
+                    log(&format!(
+                        "reviewer push lockout failed for PR #{pr}: {e} — tearing down worktree"
+                    ));
+                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                    false
+                }
+            },
             Err(e) => {
                 log(&format!(
                     "reviewer worktree does not match gated HEAD for PR #{pr}: {e}"
@@ -8369,6 +8390,9 @@ async fn provision_reviewer(
                 model: reviewer_model,
                 effort: reviewer_effort,
                 worktree_path: wt_path,
+                // Reviewers never push; the local review branch is the only
+                // branch identity they have.
+                remote_branch: branch.clone(),
                 branch,
                 draining: true,
                 pr: Some(pr),
@@ -8922,6 +8946,8 @@ async fn spawn_worker(
                 model: resolved_model,
                 effort: resolved_effort,
                 worktree_path: wt_path,
+                // A fresh worker pushes the branch it checked out.
+                remote_branch: branch.clone(),
                 branch,
                 draining: true,
                 pr: task
@@ -9789,11 +9815,16 @@ async fn spawn_remediation_worker(
     ));
 
     let session_id = agent::new_session_id();
-    let branch = pr_target
+    // The remote branch is a push target, not a local checkout: a PR head may
+    // legitimately be checked out in someone else's worktree, and git forbids
+    // one branch in two worktrees. The daemon checks out a run-unique local
+    // name and configures push upstream to the PR head instead.
+    let remote_branch = pr_target
         .as_ref()
         .map(|t| t.head_ref.clone())
         .or_else(|| fallback_branch.clone())
         .unwrap();
+    let branch = format!("remediation/{agent_name}-t{task_id}");
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", agent_name, task_id));
@@ -9812,24 +9843,46 @@ async fn spawn_remediation_worker(
         (result, Some(target.head_sha.as_str()))
     } else {
         let result = wt_mgr
-            .fetch_and_provision(task_repo_dir, &branch, &wt_path, &branch)
+            .fetch_and_provision(task_repo_dir, &branch, &wt_path, &remote_branch)
             .await;
         (result, None)
     };
     let provision_ok = match provision_result {
         Ok(_) => {
-            if let Some(expected_sha) = sha_to_verify {
-                wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok()
-            } else {
-                true
-            }
+            let head_ok = match sha_to_verify {
+                Some(expected_sha) => wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok(),
+                None => true,
+            };
+            // Fail closed: without upstream tracking the agent's plain
+            // `git push` would create a stray remote branch and never update
+            // the PR.
+            head_ok
+                && match wt_mgr
+                    .configure_push_upstream(&wt_path, &branch, &remote_branch)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log(&format!(
+                            "remediation: push upstream config failed for PR #{pr}: {e}"
+                        ));
+                        false
+                    }
+                }
         }
-        Err(_) => false,
+        Err(e) => {
+            log(&format!(
+                "remediation: worktree provision failed for PR #{pr}: {e}"
+            ));
+            false
+        }
     };
     if !provision_ok {
         log(&format!(
             "remediation: worktree provision failed for PR #{pr} — giving up"
         ));
+        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+        wt_mgr.delete_branch(task_repo_dir, &branch).await;
         // Release the lease installed by claim_remediation_rework.
         {
             let p = db_path.clone();
@@ -9847,6 +9900,8 @@ async fn spawn_remediation_worker(
 
     // Author was already set by claim_remediation_rework.
 
+    // Inspection surfaces report the PR branch this run continues, not the
+    // daemon's local checkout name.
     let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
@@ -9854,7 +9909,7 @@ async fn spawn_remediation_worker(
             "worker",
             Some(task_id),
             &session_id,
-            &branch,
+            &remote_branch,
             now_unix(),
         )
         .ok()
@@ -9869,7 +9924,7 @@ async fn spawn_remediation_worker(
             task_id: Some(task_id),
             session_id: session_id.clone(),
             worktree: Some(wt_path.to_string_lossy().into()),
-            branch: Some(branch.clone()),
+            branch: Some(remote_branch.clone()),
             phase: "working".into(),
             cost_tokens: 0,
             agent_state: None,
@@ -10192,6 +10247,7 @@ async fn spawn_remediation_worker(
                 effort: remediation_effort.clone(),
                 worktree_path: wt_path,
                 branch,
+                remote_branch,
                 draining: true,
                 pr: Some(pr),
                 rework_count: 1,
@@ -10785,6 +10841,7 @@ mod tests {
             effort: "high".into(),
             worktree_path: PathBuf::from("/tmp/test"),
             branch: "test-branch".into(),
+            remote_branch: "test-branch".into(),
             draining: false,
             pr: None,
             rework_count: 0,

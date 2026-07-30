@@ -442,6 +442,152 @@ fn failed_checks_absent_worker_spawns_remediation() {
     handle.sigkill();
 }
 
+/// Regression (2026-07-29): a PR head branch checked out in an unrelated
+/// worktree (a human's `~/dev/*-wt/...`) used to make remediation provisioning
+/// fail instantly with "branch collision", burning rework rounds without ever
+/// running a remediation agent. The daemon must check out a run-unique local
+/// branch and only fetch the PR head.
+#[test]
+fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    // Outside wt_base so daemon GC never touches it.
+    let external_wt = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let pr: i64 = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let pr_branch = format!("daemon/{}-t{}", author.to_lowercase(), task_id);
+
+    // Someone else holds the PR branch checked out locally.
+    let held = external_wt.path().join("human-checkout");
+    let add = Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "worktree",
+            "add",
+            &held.to_string_lossy(),
+            &pr_branch,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "external worktree add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[
+            "--merge-checks-cmd",
+            "printf 'failed\\nci-test'",
+            "--merge-checks-timeout-secs",
+            "10",
+            "--merge-checks-poll-secs",
+            "1",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "recovery did not complete. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning remediation worker", 30),
+        "remediation worker was not spawned. Lines: {:?}",
+        handle.lines
+    );
+    let agent = handle
+        .extract_agent_name("spawning remediation worker ")
+        .expect("remediation agent name");
+    assert!(
+        handle.wait_for("spawned for task", 20),
+        "remediation worker never finished provisioning. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|l| l.contains("provision failed") || l.contains("branch collision")),
+        "provisioning must not collide with the externally held PR branch. Lines: {:?}",
+        handle.lines
+    );
+
+    // State, not logs: the remediation worktree exists on a namespaced local
+    // branch whose upstream is the PR branch on origin.
+    let wt_path = wt_base.path().join(format!("{agent}-t{task_id}"));
+    assert!(
+        wt_path.is_dir(),
+        "remediation worktree missing at {}",
+        wt_path.display()
+    );
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&wt_path)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let local_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+    assert_eq!(
+        local_branch,
+        format!("remediation/{agent}-t{task_id}"),
+        "remediation worktree must use a daemon-owned local branch name"
+    );
+    assert_eq!(
+        git(&["config", "--get", &format!("branch.{local_branch}.merge")]),
+        format!("refs/heads/{pr_branch}"),
+        "plain `git push` must target the PR branch"
+    );
+    assert_eq!(
+        git(&["config", "--get", "push.default"]),
+        "upstream",
+        "push.default must resolve to upstream inside the worktree"
+    );
+    // The external checkout is untouched.
+    assert_eq!(
+        String::from_utf8_lossy(
+            &Command::new("git")
+                .args([
+                    "-C",
+                    &held.to_string_lossy(),
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "HEAD"
+                ])
+                .output()
+                .unwrap()
+                .stdout
+        )
+        .trim(),
+        pr_branch
+    );
+
+    handle.sigkill();
+}
+
 #[test]
 fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
     let home = tempfile::tempdir().unwrap();
