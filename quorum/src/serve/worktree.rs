@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_PIPE_LIMIT: usize = 1024 * 1024;
 
 pub struct WorktreeManager {
     lock: Mutex<()>,
@@ -23,20 +26,148 @@ pub struct PublicationRefReconcileResult {
     pub retired: usize,
 }
 
-/// Run a git subprocess with a bounded timeout. On timeout the child is killed
-/// via `kill_on_drop` (SIGKILL) before this function returns, so the caller's
-/// mutex guard remains held until the child is dead.
+struct GitPipeOutput {
+    bytes: Vec<u8>,
+    exceeded_limit: bool,
+}
+
+async fn drain_git_pipe<R>(
+    mut pipe: R,
+    limit: usize,
+    pipe_name: &'static str,
+    overflow_tx: tokio::sync::mpsc::Sender<&'static str>,
+) -> std::io::Result<GitPipeOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0_u8; 8192];
+    let mut exceeded_limit = false;
+    loop {
+        let count = pipe.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let retained = count.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        if retained < count && !exceeded_limit {
+            exceeded_limit = true;
+            let _ = overflow_tx.try_send(pipe_name);
+        }
+    }
+    Ok(GitPipeOutput {
+        bytes,
+        exceeded_limit,
+    })
+}
+
+/// Run a git subprocess with fixed output bounds and cancellation-safe process
+/// ownership. A timeout or output overflow explicitly kills and reaps the
+/// child; kill-on-drop covers daemon shutdown while the command is live.
 async fn run_git(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    cmd.kill_on_drop(true);
-    match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(e)) => Err(format!("{label}: {e}")),
-        Err(_) => Err(format!("{label}: timed out after {}s", timeout.as_secs())),
+    run_git_with_limit(cmd, timeout, GIT_PIPE_LIMIT, label).await
+}
+
+async fn run_git_with_limit(
+    mut cmd: Command,
+    timeout: Duration,
+    pipe_limit: usize,
+    label: &str,
+) -> Result<std::process::Output, String> {
+    cmd.kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}: stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}: stderr pipe unavailable"))?;
+    let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
+    let mut stdout_reader = tokio::spawn(drain_git_pipe(
+        stdout,
+        pipe_limit,
+        "stdout",
+        overflow_tx.clone(),
+    ));
+    let mut stderr_reader = tokio::spawn(drain_git_pipe(stderr, pipe_limit, "stderr", overflow_tx));
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let status = tokio::select! {
+        result = child.wait() => match result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill().await;
+                stdout_reader.abort();
+                stderr_reader.abort();
+                return Err(format!("{label}: {error}"));
+            }
+        },
+        Some(pipe_name) = overflow_rx.recv() => {
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: {pipe_name} exceeded {pipe_limit}-byte limit and kill/reap failed: {error}"
+                ),
+                None => format!("{label}: {pipe_name} exceeded {pipe_limit}-byte limit"),
+            });
+        },
+        _ = tokio::time::sleep_until(deadline) => {
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: timed out after {}s and kill/reap failed: {error}",
+                    timeout.as_secs()
+                ),
+                None => format!("{label}: timed out after {}s", timeout.as_secs()),
+            });
+        }
+    };
+
+    let readers = async {
+        let stdout = (&mut stdout_reader)
+            .await
+            .map_err(|error| format!("{label}: stdout join: {error}"))?
+            .map_err(|error| format!("{label}: stdout read: {error}"))?;
+        let stderr = (&mut stderr_reader)
+            .await
+            .map_err(|error| format!("{label}: stderr join: {error}"))?
+            .map_err(|error| format!("{label}: stderr read: {error}"))?;
+        Ok::<_, String>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout_at(deadline, readers).await {
+        Ok(result) => result?,
+        Err(_) => {
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(format!(
+                "{label}: output collection timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+    };
+    if stdout.exceeded_limit {
+        return Err(format!("{label}: stdout exceeded {pipe_limit}-byte limit"));
     }
+    if stderr.exceeded_limit {
+        return Err(format!("{label}: stderr exceeded {pipe_limit}-byte limit"));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
 }
 
 impl WorktreeManager {
@@ -1303,11 +1434,12 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_git_timeout_kills_and_returns() {
-        // Directly test run_git: a `sleep 3600` must not block beyond the timeout.
-        // If kill_on_drop failed, this call would hang for an hour.
-        let mut cmd = Command::new("sleep");
-        cmd.arg("3600");
+    async fn run_git_timeout_kills_reaps_and_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 3600"])
+            .env("PID_FILE", &pid_file);
 
         let start = std::time::Instant::now();
         let result = run_git(cmd, Duration::from_millis(300), "sleep").await;
@@ -1317,6 +1449,51 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "run_git should return on timeout, took {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "timed-out git subprocess {pid:?} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_bounds_continuous_stdout_and_stderr_and_reaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo $$ > \"$PID_FILE\"; while :; do printf 0123456789; printf abcdefghij >&2; done",
+        ])
+        .env("PID_FILE", &pid_file);
+
+        let start = std::time::Instant::now();
+        let error = run_git_with_limit(cmd, Duration::from_secs(5), 4096, "noisy git")
+            .await
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            error.contains("exceeded 4096-byte limit"),
+            "unexpected output-limit error: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "output limit should stop the child promptly, took {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "overproducing git subprocess {pid:?} was not reaped"
         );
     }
 
