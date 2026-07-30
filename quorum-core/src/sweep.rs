@@ -24,11 +24,13 @@ pub const REWORK_PROVISIONING_GRACE_SECS: i64 = 60;
 /// lease on `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed`
 /// event per task to the event log.
 pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    // (id, assignee, review_only, had_any_lease_ever)
-    let lapsed: Vec<(i64, Option<String>, bool, bool)> = {
+    // (id, assignee, status, review_only, had_any_lease_ever, refs)
+    #[allow(clippy::type_complexity)]
+    let lapsed: Vec<(i64, Option<String>, String, bool, bool, Option<String>)> = {
         let mut stmt = conn.prepare(
-            "SELECT t.id, t.assignee, t.review_only,
-                    EXISTS(SELECT 1 FROM claims c WHERE c.target = 'task#' || t.id) AS had_lease
+            "SELECT t.id, t.assignee, t.status, t.review_only,
+                    EXISTS(SELECT 1 FROM claims c WHERE c.target = 'task#' || t.id) AS had_lease,
+                    t.refs
              FROM tasks t
              WHERE t.status IN ('working', 'rework') AND NOT EXISTS (
                  SELECT 1 FROM claims c
@@ -55,16 +57,64 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
-                        r.get::<_, i64>(2)? != 0,
+                        r.get(2)?,
                         r.get::<_, i64>(3)? != 0,
+                        r.get::<_, i64>(4)? != 0,
+                        r.get(5)?,
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    for (id, prev, review_only, had_lease) in &lapsed {
+    for (id, prev, status, review_only, had_lease, refs) in &lapsed {
         let target = format!("task#{id}");
+        let reason = if *had_lease {
+            "lease lapsed"
+        } else {
+            "no lease installed"
+        };
+        if *review_only && status == "rework" {
+            // A lapsed remediation lease must not hand the task back to
+            // review: the replacement reviewer re-judges the unchanged PR
+            // head and its changes verdict burns a rework round with zero
+            // remediation applied. Park instead (same contract as the
+            // lifecycle layer); the daemon's head check resumes straight to
+            // in-review when the dead worker did push, and `task-retry`
+            // covers the rest.
+            let park_reason = format!("remediation {reason}");
+            let parked_refs = crate::tasks::set_parked_refs_with_head_check(
+                refs.as_deref(),
+                &park_reason,
+                "rework",
+            )?;
+            conn.execute(
+                "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
+                params![id, parked_refs, now],
+            )?;
+            conn.execute(
+                "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
+                params![id, now, format!("parked: {park_reason}")],
+            )?;
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
+                params![target],
+            )?;
+            crate::events::emit(conn, "task_parked", &target, &park_reason, now)?;
+            // Failures are loud: alert the owner like Effect::NotifyOwner does.
+            conn.execute(
+                "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+                 VALUES (?1, 'daemon', ?2, 'alert', ?3, ?4, ?5, 'owner')",
+                params![
+                    now,
+                    crate::feed::DEFAULT_TOPIC,
+                    format!("task #{id}: {park_reason}; parked — resume with `quorum task-retry`"),
+                    format!("task:{id}"),
+                    now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+                ],
+            )?;
+            continue;
+        }
         if *review_only {
             // Review-only tasks recover to in-review so Phase 5b can reattach a reviewer.
             // Clear reviewer so the orphan detector sees it as unattended.
@@ -84,11 +134,6 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
             params![target],
         )?;
         let dest = if *review_only { "in-review" } else { "open" };
-        let reason = if *had_lease {
-            "lease lapsed"
-        } else {
-            "no lease installed"
-        };
         let body = match prev {
             Some(a) => format!("reclaimed from {a} ({reason}) → {dest}"),
             None => format!("reclaimed ({reason}) → {dest}"),
@@ -956,8 +1001,9 @@ mod tests {
 
     #[test]
     fn reaper_review_only_and_impl_destinations() {
-        // Table-driven: review_only tasks recover to in-review,
-        // implementation tasks recover to open.
+        // Table-driven: implementation tasks recover to open; review_only
+        // rework parks (failed + daemon_parked) — bouncing to in-review would
+        // re-review the unchanged PR head and burn a rework round per bounce.
         struct Case {
             review_only: bool,
             expected_status: &'static str,
@@ -971,8 +1017,8 @@ mod tests {
             },
             Case {
                 review_only: true,
-                expected_status: "in-review",
-                label: "review_only→in-review",
+                expected_status: "failed",
+                label: "review_only rework→parked",
             },
         ];
         for case in &cases {
@@ -1034,32 +1080,57 @@ mod tests {
                 case.label
             );
 
-            // Event body reports actual destination
             let target = format!("task#{id}");
             let evs = crate::events::list(&c, 0, Some(&target), 10, 1100).unwrap();
-            let body = &evs
-                .iter()
-                .find(|e| e.kind == "task_reclaimed")
-                .expect("task_reclaimed event missing")
-                .body;
-            assert!(
-                body.contains(case.expected_status),
-                "{}: event body must report '{}'",
-                case.label,
-                case.expected_status
-            );
-            assert!(
-                body.contains("lease lapsed"),
-                "{}: event body must say 'lease lapsed'",
-                case.label
-            );
+            if case.review_only {
+                // Parked, never reclaimed: durable markers + one-shot head
+                // check + task_parked event + loud owner alert.
+                let refs: serde_json::Value =
+                    serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
+                assert_eq!(refs["daemon_parked"], true, "{}", case.label);
+                assert_eq!(refs["daemon_resume_status"], "rework", "{}", case.label);
+                assert_eq!(refs["daemon_parked_head_check"], true, "{}", case.label);
+                let parked = &evs
+                    .iter()
+                    .find(|e| e.kind == "task_parked")
+                    .expect("task_parked event missing")
+                    .body;
+                assert!(
+                    parked.contains("lease lapsed"),
+                    "{}: park event must say 'lease lapsed', got: {parked}",
+                    case.label
+                );
+                assert!(
+                    !evs.iter().any(|e| e.kind == "task_reclaimed"),
+                    "{}: parked task must not also emit task_reclaimed",
+                    case.label
+                );
+            } else {
+                let body = &evs
+                    .iter()
+                    .find(|e| e.kind == "task_reclaimed")
+                    .expect("task_reclaimed event missing")
+                    .body;
+                assert!(
+                    body.contains(case.expected_status),
+                    "{}: event body must report '{}'",
+                    case.label,
+                    case.expected_status
+                );
+                assert!(
+                    body.contains("lease lapsed"),
+                    "{}: event body must say 'lease lapsed'",
+                    case.label
+                );
+            }
         }
     }
 
     #[test]
-    fn reaper_review_only_clears_reviewer_for_phase_5b() {
-        // Phase 5b reattaches reviewers to orphan in-review tasks with no live
-        // worker/reviewer. Clearing reviewer=NULL is required for that detection.
+    fn reaper_review_only_rework_park_preserves_round_and_alerts_owner() {
+        // A lapsed remediation lease parks (never bounces to review): the
+        // round budget is untouched, provenance survives for `task-retry`,
+        // and the failure is loud (owner alert).
         let (_d, mut c) = open_tmp();
         let id = crate::tasks::create(
             &mut c,
@@ -1075,7 +1146,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET status='rework', assignee='W1', reviewer='R1' WHERE id=?1",
+            "UPDATE tasks SET status='rework', assignee='W1', reviewer='R1', rework_round=2 WHERE id=?1",
             params![id],
         )
         .unwrap();
@@ -1088,14 +1159,35 @@ mod tests {
 
         reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
         let t = crate::tasks::get(&c, id).unwrap().unwrap();
-        assert_eq!(t.status, "in-review");
-        assert!(
-            t.reviewer.is_none(),
-            "reviewer must be cleared so Phase 5b can reattach"
-        );
-        // PR, author provenance, and rework_round are preserved
+        assert_eq!(t.status, "failed");
         assert!(t.review_only, "review_only flag must be preserved");
-        assert_eq!(t.rework_round, 0, "rework_round must be preserved");
+        assert_eq!(
+            t.rework_round, 2,
+            "infra failure must not consume a rework round"
+        );
+        assert!(t.assignee.is_none(), "assignee cleared by the park");
+        let active_claims: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                params![format!("task#{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0, "lapsed lease deactivated");
+        // Loud failure: owner alert with the retry hint.
+        let msgs = crate::feed::peek(&c, None, None, 10, 1100).unwrap();
+        assert!(
+            msgs.iter().any(|m| m.kind == "alert"
+                && m.recipient.as_deref() == Some("owner")
+                && m.body.contains("task-retry")),
+            "owner alert with retry hint missing"
+        );
+        // Explicit retry resumes the remediation flow with the round intact.
+        let resumed = crate::tasks::retry_parked(&mut c, id, "boss", 1200)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, "rework");
+        assert_eq!(resumed.rework_round, 2);
     }
 
     #[test]

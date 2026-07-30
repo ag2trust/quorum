@@ -919,10 +919,11 @@ fn review_only_orphan_full_lifecycle() {
     );
 }
 
-/// Negative: verify the reaper sends review-only rework to in-review (not open)
-/// when the lease has truly expired (no remediation worker, long past grace).
+/// Negative: an expired remediation lease parks the review-only task (never
+/// bounces to in-review) — a replacement reviewer on the unchanged PR head
+/// would burn a rework round with zero remediation applied (D5b).
 #[test]
-fn review_only_rework_expired_lease_recovers_to_in_review() {
+fn review_only_rework_expired_lease_parks_for_retry() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
 
@@ -990,34 +991,39 @@ fn review_only_rework_expired_lease_recovers_to_in_review() {
         quorum_core::sweep::reap_lapsed_tasks(&conn, now, 100).unwrap();
     }
 
-    // Verify: must be in-review, not open.
+    // Verify: parked (failed + daemon_parked, resume rework), never in-review.
     let task = get_task(home.path(), task_id);
     assert_eq!(
-        task.status, "in-review",
-        "expired-lease review-only rework must recover to in-review, got: {}",
+        task.status, "failed",
+        "expired-lease review-only rework must park, got: {}",
         task.status
     );
-    assert!(
-        task.reviewer.is_none(),
-        "reviewer must be cleared for Phase 5b to detect the orphan"
+    assert_eq!(
+        task.rework_round, 1,
+        "infra failure must not consume a rework round"
+    );
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+    assert_eq!(refs["daemon_resume_status"], "rework");
+    assert_eq!(
+        refs["daemon_parked_head_check"], true,
+        "park owes exactly one PR-head check"
     );
 
-    // Check the event says "→ in-review", not "→ open".
     let events = events_for_task(home.path(), task_id);
-    let reclaim = events
+    let parked = events
         .iter()
-        .find(|(k, _)| k == "task_reclaimed")
+        .find(|(k, _)| k == "task_parked")
         .map(|(_, b)| b.clone());
-    assert!(reclaim.is_some(), "reaper must emit task_reclaimed event");
+    assert!(parked.is_some(), "reaper must emit task_parked event");
     assert!(
-        reclaim.as_ref().unwrap().contains("→ in-review"),
-        "reclaim event must say '→ in-review', got: {:?}",
-        reclaim
+        parked.as_ref().unwrap().contains("lease lapsed"),
+        "park event must say 'lease lapsed' (not 'no lease installed'), got: {:?}",
+        parked
     );
     assert!(
-        reclaim.as_ref().unwrap().contains("lease lapsed"),
-        "reclaim event must say 'lease lapsed' (not 'no lease installed'), got: {:?}",
-        reclaim
+        !events.iter().any(|(k, _)| k == "task_reclaimed"),
+        "parked task must not also emit task_reclaimed"
     );
 }
 

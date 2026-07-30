@@ -6620,6 +6620,7 @@ async fn tick(
         drain_state.draining,
     )
     .await?;
+    reconcile_parked_head_checks(config, drain_state.draining).await?;
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
@@ -9368,6 +9369,113 @@ async fn park_remediation_provision_failure(
     .await;
 }
 
+/// Settle one-shot head checks on remediation-death parks (D5b).
+///
+/// A remediation worker can push its fix and die before signaling
+/// `ReworkPushed`; the park that followed would then strand finished work
+/// behind a manual retry. Compare the PR head now against the head recorded
+/// at remediation spawn (`pr_targets.head_sha`): moved → resume the task
+/// straight to `in-review` so the pushed head gets a fresh verdict; unchanged
+/// or unresolvable → clear the marker and leave the task parked for
+/// `task-retry`. Each park costs at most one GitHub lookup — the marker is
+/// settled exactly once, and the GitHub call runs with no DB transaction held.
+async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> Result<()> {
+    if draining {
+        return Ok(());
+    }
+    // (task_id, pr, spawn_head_sha) for parks still owing their head check.
+    type PendingHeadCheck = (i64, Option<i64>, Option<String>);
+    let pending: Vec<PendingHeadCheck> = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<PendingHeadCheck>> {
+            let conn = quorum_core::db::open(&p)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, refs FROM tasks
+                 WHERE status='failed'
+                   AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_parked')=1
+                   AND json_extract(refs, '$.daemon_parked_head_check')=1
+                 LIMIT 4",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows
+                .into_iter()
+                .map(|(id, refs)| {
+                    let pr = tasks::extract_pr_number(&refs);
+                    let spawn_sha = pr.and_then(|pr| {
+                        pr_targets::get(&conn, id, pr)
+                            .ok()
+                            .flatten()
+                            .map(|target| target.head_sha)
+                    });
+                    (id, pr, spawn_sha)
+                })
+                .collect())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("parked head-check scan join: {error}")))??
+    };
+
+    for (task_id, pr, spawn_sha) in pending {
+        let head_moved = match (pr, spawn_sha) {
+            (Some(pr), Some(spawn_sha)) => {
+                let repo_dir = config.repo_dir.clone();
+                let gh_repo = config.repo.clone();
+                let current = tokio::task::spawn_blocking(move || {
+                    let gh_repo = if gh_repo.is_empty() {
+                        None
+                    } else {
+                        Some(gh_repo.as_str())
+                    };
+                    resolve_pr_target(pr, &repo_dir, gh_repo)
+                })
+                .await
+                .ok()
+                .flatten();
+                match current {
+                    Some(target) => target.head_sha != spawn_sha,
+                    None => {
+                        log(&format!(
+                            "head check: PR #{pr} unresolved for task #{task_id}"
+                        ));
+                        false
+                    }
+                }
+            }
+            _ => {
+                log(&format!(
+                    "head check: no PR target recorded for task #{task_id}"
+                ));
+                false
+            }
+        };
+
+        let p = config.db_path.clone();
+        let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::resolve_parked_head_check(&mut conn, task_id, head_moved, now_unix())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("parked head-check settle join: {error}")))??;
+        // Logged after the settle commits so observers (and tests) never see
+        // the outcome line while the marker is still pending.
+        if settled && head_moved {
+            log(&format!(
+                "head check: task #{task_id} head advanced before worker death — resumed to in-review"
+            ));
+        } else if settled {
+            log(&format!(
+                "head check settled for task #{task_id} — staying parked"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Check if a task's refs.repo mismatches all repos this daemon can provision from.
 /// Returns `Some(task_repo)` on mismatch, `None` if matching or unknown.
 fn check_repo_mismatch(
@@ -9779,6 +9887,38 @@ async fn spawn_remediation_worker(
         let _ = tokio::task::spawn_blocking(move || -> Result<usize> {
             let mut conn = quorum_core::db::open(&p)?;
             mailbox::consume_all_for_agent(&mut conn, &name)
+        })
+        .await;
+    }
+
+    // Persist the round's blocking feedback before the worker runs. A worker
+    // that dies at runtime parks (D5b), and the durable-retry reconciler can
+    // only respawn remediation when `remediation_feedback` survived the slot.
+    {
+        let p = db_path.clone();
+        let feedback = feedback.to_string();
+        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let Some(task) = tasks::get(&conn, task_id)? else {
+                return Ok(());
+            };
+            let mut refs: serde_json::Value = task
+                .refs
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?
+                .unwrap_or_else(|| serde_json::json!({}));
+            let Some(object) = refs.as_object_mut() else {
+                return Err(QuorumError::Io(
+                    "remediation task refs must be a JSON object".into(),
+                ));
+            };
+            object.insert(
+                "remediation_feedback".into(),
+                serde_json::Value::String(feedback),
+            );
+            tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())
         })
         .await;
     }
