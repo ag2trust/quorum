@@ -34,7 +34,10 @@ use quorum_core::tasks;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use worktree::WorktreeManager;
 
 const MAX_POISON_STRIKES: u32 = 3;
@@ -42,6 +45,7 @@ const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 enum ReviewRole {
@@ -425,7 +429,7 @@ struct PrTarget {
     base_ref: Option<String>,
 }
 
-fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
+fn pr_target_args(pr: i64, gh_repo: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "pr".to_string(),
         "view".to_string(),
@@ -437,15 +441,11 @@ fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .current_dir(repo_dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    args
+}
+
+fn parse_pr_target(pr: i64, stdout: &[u8]) -> Option<PrTarget> {
+    let json: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let head_ref = json.get("headRefName")?.as_str()?.to_string();
     let head_sha = json.get("headRefOid")?.as_str()?.to_string();
     let is_fork = json
@@ -467,6 +467,131 @@ fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<
     })
 }
 
+fn resolve_pr_target(pr: i64, repo_dir: &Path, gh_repo: Option<&str>) -> Option<PrTarget> {
+    let args = pr_target_args(pr, gh_repo);
+    let output = std::process::Command::new("gh")
+        .args(&args)
+        .current_dir(repo_dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_pr_target(pr, &output.stdout)
+}
+
+/// Run one publication-owned GitHub command with cancellation-safe process
+/// ownership. A timeout explicitly kills and reaps the child; kill-on-drop
+/// covers daemon shutdown or future cancellation while the command is live.
+async fn run_publication_gh_command(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label}: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label}: stdout pipe unavailable"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label}: stderr pipe unavailable"))?;
+    let mut stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let mut stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(format!("{label}: {error}"));
+        }
+        Err(_) => {
+            // `kill` waits for process exit, so the child is reaped before the
+            // daemon resumes this tick or begins shutdown cleanup.
+            let kill_error = child.kill().await.err();
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(match kill_error {
+                Some(error) => format!(
+                    "{label}: timed out after {}s and kill/reap failed: {error}",
+                    timeout.as_secs()
+                ),
+                None => format!("{label}: timed out after {}s", timeout.as_secs()),
+            });
+        }
+    };
+    let readers = async {
+        let stdout = (&mut stdout_reader)
+            .await
+            .map_err(|error| format!("{label}: stdout join: {error}"))?
+            .map_err(|error| format!("{label}: stdout read: {error}"))?;
+        let stderr = (&mut stderr_reader)
+            .await
+            .map_err(|error| format!("{label}: stderr join: {error}"))?
+            .map_err(|error| format!("{label}: stderr read: {error}"))?;
+        Ok::<_, String>((stdout, stderr))
+    };
+    let (stdout, stderr) = match tokio::time::timeout_at(deadline, readers).await {
+        Ok(result) => result?,
+        Err(_) => {
+            stdout_reader.abort();
+            stderr_reader.abort();
+            return Err(format!(
+                "{label}: output collection timed out after {}s",
+                timeout.as_secs()
+            ));
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn run_publication_gh(
+    args: &[String],
+    repo_dir: &Path,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let mut command = tokio::process::Command::new("gh");
+    command.args(args).current_dir(repo_dir);
+    run_publication_gh_command(command, PUBLICATION_GH_TIMEOUT, label).await
+}
+
+async fn resolve_publication_pr_target(
+    pr: i64,
+    repo_dir: &Path,
+    gh_repo: Option<&str>,
+) -> std::result::Result<PrTarget, String> {
+    let args = pr_target_args(pr, gh_repo);
+    let output = run_publication_gh(&args, repo_dir, "gh pr view").await?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_pr_target(pr, &output.stdout)
+        .ok_or_else(|| format!("gh pr view returned an invalid target for PR #{pr}"))
+}
+
 fn parse_created_pr_number(stdout: &[u8]) -> Option<i64> {
     let stdout = String::from_utf8_lossy(stdout);
     let url = stdout
@@ -477,7 +602,7 @@ fn parse_created_pr_number(stdout: &[u8]) -> Option<i64> {
 
 /// Create the initial PR only after the daemon has published and verified the
 /// new daemon-owned branch. Existing PRs never take this path.
-fn create_initial_pr(
+async fn create_initial_pr(
     repo_dir: &Path,
     repo: &str,
     base_branch: &str,
@@ -501,11 +626,7 @@ fn create_initial_pr(
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .current_dir(repo_dir)
-        .output()
-        .map_err(|e| format!("gh pr create: {e}"))?;
+    let output = run_publication_gh(&args, repo_dir, "gh pr create").await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr create failed: {}",
@@ -522,6 +643,8 @@ struct PublicationIntent {
     local_sha: String,
     pr: Option<i64>,
     stage: String,
+    #[serde(default)]
+    expected_remote_sha: Option<String>,
 }
 
 #[derive(Debug)]
@@ -610,7 +733,7 @@ async fn reconcile_publication_source_refs(
     Ok(next_cursor)
 }
 
-fn find_initial_pr(
+async fn find_initial_pr(
     repo_dir: &Path,
     repo: &str,
     branch: &str,
@@ -631,11 +754,7 @@ fn find_initial_pr(
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
-    let output = std::process::Command::new("gh")
-        .args(&args)
-        .current_dir(repo_dir)
-        .output()
-        .map_err(|e| format!("gh pr list: {e}"))?;
+    let output = run_publication_gh(&args, repo_dir, "gh pr list").await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr list failed: {}",
@@ -693,6 +812,57 @@ fn validate_pr_created_retry_target(
     Ok(true)
 }
 
+async fn load_publication_pr_baseline(
+    db_path: &Path,
+    task_id: i64,
+    pr: i64,
+) -> std::result::Result<Option<quorum_core::pr_targets::PersistedPrTarget>, String> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&db_path)?;
+        pr_targets::get(&conn, task_id, pr)
+    })
+    .await
+    .map_err(|error| format!("publication PR baseline join failure: {error}"))?
+    .map_err(|error| format!("publication PR baseline read failed: {error}"))
+}
+
+/// Return the immutable lease baseline when a push is required. A live head
+/// already at the source is the idempotent post-push crash case.
+fn existing_pr_lease_baseline<'a>(
+    intent: &'a PublicationIntent,
+    target: &PrTarget,
+) -> std::result::Result<Option<&'a str>, String> {
+    if target.is_fork {
+        return Err(format!(
+            "PR #{} is a fork head; daemon has no supported safe push mechanism",
+            target.pr
+        ));
+    }
+    if target.head_ref != intent.branch {
+        return Err(format!(
+            "PR #{} head branch changed: expected {}, got {}",
+            target.pr, intent.branch, target.head_ref
+        ));
+    }
+    if target.head_sha == intent.local_sha {
+        return Ok(None);
+    }
+    let expected = intent.expected_remote_sha.as_deref().ok_or_else(|| {
+        format!(
+            "publication intent for PR #{} has no durable spawn-time head baseline",
+            target.pr
+        )
+    })?;
+    if target.head_sha != expected {
+        return Err(format!(
+            "PR #{} head moved outside publication lease: expected {} or already-published {}, got {}",
+            target.pr, expected, intent.local_sha, target.head_sha
+        ));
+    }
+    Ok(Some(expected))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_worker_completion(
     config: &ServeConfig,
@@ -725,18 +895,40 @@ async fn publish_worker_completion(
         .pin_publication_source(worktree, task_id, &local_sha)
         .await?;
     let known_pr = known_pr.or_else(|| prior.as_ref().and_then(|intent| intent.pr));
+    let expected_remote_sha = match (&prior, known_pr) {
+        (Some(intent), _) => intent.expected_remote_sha.clone(),
+        (None, Some(pr)) => {
+            let baseline = load_publication_pr_baseline(&config.db_path, task_id, pr).await?;
+            if let Some(baseline) = baseline {
+                if baseline.is_fork || baseline.head_ref != branch {
+                    return Err(format!(
+                        "spawn-time PR target for task #{task_id} does not match publish branch {branch}"
+                    ));
+                }
+                Some(baseline.head_sha)
+            } else {
+                // Legacy initial-delivery crash windows may have reached the
+                // PR without a pr_targets row. Missing authority can only
+                // recover if the live head is already the exact source; the
+                // lease decision below rejects every other remote SHA.
+                None
+            }
+        }
+        (None, None) => None,
+    };
     let mut intent = prior.unwrap_or(PublicationIntent {
         branch: branch.to_string(),
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
+        expected_remote_sha,
     });
     intent.pr = known_pr;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
     if let Some(pr) = known_pr {
-        let target = resolve_pr_target(pr, &config.repo_dir, Some(&config.repo))
-            .ok_or_else(|| format!("cannot resolve live authoritative head for PR #{pr}"))?;
+        let target =
+            resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
         // `pr_created` means the daemon may have crashed (or validation may
         // have failed) after recording the PR but before verifying its target.
         // Re-run the complete initial branch/SHA/base check. Treating this as
@@ -749,16 +941,19 @@ async fn publish_worker_completion(
                 source_sha: intent.local_sha,
             });
         }
-        if target.is_fork {
-            return Err(format!(
-                "PR #{pr} is a fork head; daemon has no supported safe push mechanism"
-            ));
-        }
+        let Some(expected_remote_sha) = existing_pr_lease_baseline(&intent, &target)? else {
+            intent.stage = "verified".into();
+            persist_publication_intent(&config.db_path, task_id, &intent).await?;
+            return Ok(PublishedCompletion {
+                pr,
+                source_sha: intent.local_sha,
+            });
+        };
         wt_mgr
             .push_to_pr_head(
                 worktree,
                 &target.head_ref,
-                &target.head_sha,
+                expected_remote_sha,
                 &intent.local_sha,
             )
             .await?;
@@ -777,31 +972,25 @@ async fn publish_worker_completion(
     intent.stage = "pushed".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
-    let repo_dir = config.repo_dir.clone();
-    let repo = config.repo.clone();
-    let base_branch = config.base_branch.clone();
-    let branch_owned = branch.to_string();
-    let pr = tokio::task::spawn_blocking(move || {
-        match find_initial_pr(&repo_dir, &repo, &branch_owned)? {
-            Some(pr) => Ok(pr),
-            None => create_initial_pr(
-                &repo_dir,
-                &repo,
-                &base_branch,
-                &branch_owned,
+    let pr = match find_initial_pr(&config.repo_dir, &config.repo, branch).await? {
+        Some(pr) => pr,
+        None => {
+            create_initial_pr(
+                &config.repo_dir,
+                &config.repo,
+                &config.base_branch,
+                branch,
                 task_id,
                 &format!("task {task_id}"),
-            ),
+            )
+            .await?
         }
-    })
-    .await
-    .map_err(|e| format!("initial PR reconciliation join failure: {e}"))??;
+    };
     intent.pr = Some(pr);
     intent.stage = "pr_created".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
-    let target = resolve_pr_target(pr, &config.repo_dir, Some(&config.repo))
-        .ok_or_else(|| format!("cannot resolve live authoritative head for new PR #{pr}"))?;
+    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
     validate_initial_pr_target(&target, branch, &pushed_sha, &config.base_branch)?;
     intent.stage = "verified".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
@@ -12846,26 +13035,7 @@ mod tests {
     // ── PrTarget / resolve_pr_target ─────────────────────────────────────
 
     fn parse_pr_target_json(pr: i64, json: &str) -> Option<PrTarget> {
-        let v: serde_json::Value = serde_json::from_str(json).ok()?;
-        let head_ref = v.get("headRefName")?.as_str()?.to_string();
-        let head_sha = v.get("headRefOid")?.as_str()?.to_string();
-        let is_fork = v
-            .get("isCrossRepository")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if head_ref.is_empty() || head_sha.is_empty() {
-            return None;
-        }
-        Some(PrTarget {
-            pr,
-            head_ref,
-            head_sha,
-            is_fork,
-            base_ref: v
-                .get("baseRefName")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-        })
+        parse_pr_target(pr, json.as_bytes())
     }
 
     #[test]
@@ -12973,6 +13143,7 @@ mod tests {
             local_sha: "abc123".into(),
             pr: Some(482),
             stage: "pr_created".into(),
+            expected_remote_sha: None,
         };
         let wrong_base = PrTarget {
             pr: 482,
@@ -12991,6 +13162,81 @@ mod tests {
             !validate_pr_created_retry_target(&established, &wrong_base, "main").unwrap(),
             "only an unverified initial PR uses this retry path"
         );
+    }
+
+    #[test]
+    fn established_pr_lease_never_adopts_a_late_remote_head() {
+        let intent = PublicationIntent {
+            branch: "external/pr-head".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        let mut target = PrTarget {
+            pr: 482,
+            head_ref: intent.branch.clone(),
+            head_sha: "spawn-x".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+        };
+        assert_eq!(
+            existing_pr_lease_baseline(&intent, &target).unwrap(),
+            Some("spawn-x")
+        );
+
+        target.head_sha = "source-a".into();
+        assert_eq!(
+            existing_pr_lease_baseline(&intent, &target).unwrap(),
+            None,
+            "a crash after the exact source landed must recover idempotently"
+        );
+        let mut legacy_intent = intent.clone();
+        legacy_intent.expected_remote_sha = None;
+        assert_eq!(
+            existing_pr_lease_baseline(&legacy_intent, &target).unwrap(),
+            None,
+            "missing historical baseline is safe only when the source already landed"
+        );
+
+        target.head_sha = "unrelated-b".into();
+        let error = existing_pr_lease_baseline(&intent, &target)
+            .expect_err("a pre-resolution or retry-window writer must be preserved");
+        assert!(error.contains("outside publication lease"));
+        assert!(existing_pr_lease_baseline(&legacy_intent, &target)
+            .unwrap_err()
+            .contains("no durable spawn-time"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_timeout_kills_and_reaps_hung_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            &format!(
+                "printf '%s' \"$$\" > '{}'; exec sleep 3600",
+                pid_path.display()
+            ),
+        ]);
+        let started = std::time::Instant::now();
+        let error = run_publication_gh_command(command, Duration::from_millis(100), "gh pr view")
+            .await
+            .expect_err("hung GitHub process must time out");
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let pid = std::fs::read_to_string(pid_path).unwrap();
+        let still_alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!still_alive, "timed-out GitHub child was not reaped");
     }
 
     #[test]
@@ -13021,6 +13267,7 @@ mod tests {
             local_sha: "abc123".into(),
             pr: Some(482),
             stage: "intent".into(),
+            expected_remote_sha: Some("baseline".into()),
         };
         for id in &ids {
             tasks::set_publication_intent(
@@ -13129,6 +13376,7 @@ mod tests {
                 local_sha: "abc123".into(),
                 pr,
                 stage: stage.into(),
+                expected_remote_sha: None,
             };
             let conn = quorum_core::db::open(&db_path).unwrap();
             tasks::set_publication_intent(
@@ -13147,6 +13395,32 @@ mod tests {
             assert_eq!(refs["daemon_publication"]["stage"], stage);
             assert_eq!(refs["daemon_publication"]["pr"].as_i64(), pr);
         }
+
+        let established = PublicationIntent {
+            branch: "external/pr-head".into(),
+            local_sha: "source-a".into(),
+            pr: Some(482),
+            stage: "intent".into(),
+            expected_remote_sha: Some("spawn-x".into()),
+        };
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        tasks::set_publication_intent(
+            &conn,
+            id,
+            &serde_json::to_string(&established).unwrap(),
+            now_unix(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, id).unwrap().unwrap();
+        let recovered = publication_intent_from_refs(task.refs.as_deref()).unwrap();
+        assert_eq!(
+            recovered.expected_remote_sha.as_deref(),
+            Some("spawn-x"),
+            "retry must retain the original round's lease baseline"
+        );
     }
 
     #[test]
@@ -13159,6 +13433,7 @@ mod tests {
             local_sha: "sha-a".into(),
             pr: Some(482),
             stage: "verified".into(),
+            expected_remote_sha: Some("sha-x".into()),
         };
         let conn = quorum_core::db::open(&db_path).unwrap();
         tasks::set_publication_intent(

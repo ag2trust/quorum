@@ -1399,10 +1399,15 @@ are supplemental methodology, never lifecycle dependencies.
 Workers must work only on the assigned task, branch, and worktree; implement, verify,
 and commit the outcome; signal through `quorum submit`; and never push, open or update
 a PR, merge, or mark the task done. The daemon publishes the exact committed SHA with
-an explicit refspec. For an existing same-repository PR it first resolves the live
-authoritative head, pushes with `--force-with-lease=<head-ref>:<resolved-sha>`, and
-rejects any stale, fork, unavailable, lease-rejected, or post-push SHA mismatch;
-only after verification may it transition lifecycle. For an initial delivery it verifies
+an explicit refspec. For an existing same-repository PR it durably copies the
+spawn-time PR head into the publication intent, resolves the live authoritative target,
+and pushes only when the live head still equals that immutable baseline. A live head
+already equal to the exact source is the idempotent post-push crash case; any third SHA
+parks instead of being adopted as a new lease expectation. The push uses
+`--force-with-lease=<head-ref>:<spawn-head>` and rejects any stale, fork, unavailable,
+lease-rejected, or post-push SHA mismatch; only after verification may it transition
+lifecycle. All publication-owned GitHub subprocesses have kill-and-reap timeouts so a
+hung CLI cannot pin the daemon tick or shutdown. For an initial delivery it verifies
 the new daemon branch under a zero/nonexistent lease, creates the PR, and verifies the PR
 binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
 verified` stages are durable task metadata. Startup recovery reuses an identical remote
