@@ -24,6 +24,20 @@ pub const REWORK_PROVISIONING_GRACE_SECS: i64 = 60;
 /// lease on `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed`
 /// event per task to the event log.
 pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    // sweep_on_write and sweep_all already call us inside their write
+    // transaction. Direct callers do not, so own an IMMEDIATE transaction in
+    // that case: parking a review-only remediation updates the task, note,
+    // lease, event, and owner alert as one indivisible state change.
+    if conn.is_autocommit() {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        reap_lapsed_tasks_in_tx(&tx, now, limit)?;
+        tx.commit()?;
+        return Ok(());
+    }
+    reap_lapsed_tasks_in_tx(conn, now, limit)
+}
+
+fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // (id, assignee, status, review_only, had_any_lease_ever, refs)
     #[allow(clippy::type_complexity)]
     let lapsed: Vec<(i64, Option<String>, String, bool, bool, Option<String>)> = {
@@ -1182,6 +1196,98 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.status, "rework");
         assert_eq!(resumed.rework_round, 2);
+    }
+
+    #[test]
+    fn reaper_review_only_park_rolls_back_every_write_on_alert_failure() {
+        let (_d, mut c) = open_tmp();
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "review task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(42),
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks
+             SET status='rework', assignee='W1', reviewer='R1', rework_round=2
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let target = format!("task#{id}");
+        c.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active)
+             VALUES (?1, 'W1', 1000, 1050, 1)",
+            params![target],
+        )
+        .unwrap();
+        let refs_before = crate::tasks::get(&c, id).unwrap().unwrap().refs;
+        let notes_before: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events_before: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The alert is the final write in the park sequence. Force it to fail
+        // so the test proves all earlier task/note/claim/event writes roll back.
+        c.execute_batch(
+            "CREATE TRIGGER fail_owner_alert
+             BEFORE INSERT ON messages
+             WHEN NEW.kind='alert' AND NEW.recipient='owner'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected owner alert failure');
+             END;",
+        )
+        .unwrap();
+
+        let error = reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap_err();
+        assert!(
+            error.to_string().contains("injected owner alert failure"),
+            "unexpected error: {error}"
+        );
+        let task = crate::tasks::get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.assignee.as_deref(), Some("W1"));
+        assert_eq!(task.refs, refs_before);
+        let active_claims: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 1, "lease deactivation must roll back");
+        let notes_after: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes_after, notes_before, "park note must roll back");
+        let events_after: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_after, events_before, "park event must roll back");
     }
 
     #[test]
