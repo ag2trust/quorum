@@ -130,6 +130,13 @@ pub fn reviewer_branch(pr: i64, reviewer_name: &str) -> String {
     format!("review/pr-{}-{}", pr, reviewer_name.to_lowercase())
 }
 
+/// Local branch a remediation worktree checks out. Run-unique and
+/// daemon-owned: a PR head may already be checked out elsewhere, and git
+/// forbids one branch in two worktrees.
+pub fn remediation_branch(agent_name: &str, task_id: i64) -> String {
+    format!("remediation/{}-t{}", agent_name.to_lowercase(), task_id)
+}
+
 /// Spawn a reviewer as Claude or Codex based on the resolved model.
 /// `prompt` is the full review prompt text; for Claude it is fed via stdin,
 /// for Codex it is passed as a CLI argument.
@@ -621,8 +628,13 @@ pub fn build_remediation_turn(
          ## Task context\n{body}\n\n\
          ## Blocking findings from the reviewer\n{feedback}\n\n\
          ## Instructions\n\
-         You are fixing an EXISTING PR — do NOT open a new one. The PR branch is already \
-         checked out in your worktree.\n\n\
+         You are fixing an EXISTING PR — do NOT open a new one and do NOT run `gh pr create`.\n\n\
+         ## Publishing your fix\n\
+         Your worktree is at the PR head on the daemon-owned local branch `{local_branch}`, \
+         NOT on the PR branch itself. Its upstream is already configured to the PR branch, so \
+         publish with a bare `git push` and nothing else. Never `git push -u`, never name a \
+         remote, branch, or refspec: `-u` would silently retarget your pushes away from the PR, \
+         so the PR would stop receiving your fixes while every push still reported success.\n\n\
          The PR is the source of truth for this review — address findings there:\n\
          - For each blocking finding, either fix it and push, or, if you disagree, reply \
          to the finding on the PR with concrete evidence (a citation, a test result, a \
@@ -639,6 +651,7 @@ pub fn build_remediation_turn(
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         agent = agent_name,
         pr = pr,
+        local_branch = remediation_branch(agent_name, task_id),
         body = if task_body.is_empty() { "(no task body)" } else { task_body },
         feedback = feedback,
         task_id = task_id,
@@ -978,6 +991,30 @@ mod tests {
         assert!(
             !turn.contains("PREFLIGHT: PASS") && !turn.contains("./preflight.sh"),
             "remediation template must not require Quorum-specific preflight"
+        );
+    }
+
+    /// The daemon checks out a namespaced local branch and preconfigures its
+    /// upstream, so the prompt must name that branch and forbid the push forms
+    /// that would silently retarget away from the PR.
+    #[test]
+    fn remediation_turn_teaches_bare_push_on_namespaced_branch() {
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        assert!(
+            turn.contains(&remediation_branch("W-1", 42)),
+            "remediation turn must name the local branch it checked out: {turn}"
+        );
+        assert!(
+            !turn.contains("The PR branch is already checked out"),
+            "remediation turn must not claim the PR branch itself is checked out"
+        );
+        assert!(
+            turn.contains("bare `git push`") && turn.contains("Never `git push -u`"),
+            "remediation turn must teach a bare push and forbid -u: {turn}"
+        );
+        assert!(
+            turn.contains("gh pr create"),
+            "remediation turn must forbid opening a new PR explicitly"
         );
     }
 

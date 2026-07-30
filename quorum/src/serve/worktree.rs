@@ -265,16 +265,49 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Enable per-worktree config, which is a prerequisite for every
+    /// `git config --worktree` write below.
+    ///
+    /// NOTE: this mutates the SHARED repository config permanently
+    /// (`extensions.worktreeConfig` lives in the common config, not a worktree
+    /// one). Git then reads `core.bare` / `core.worktree` from the common
+    /// config for every worktree, so refuse when either is set rather than
+    /// changing how the user's checkout resolves its work tree.
+    /// Caller MUST hold `self.lock`.
+    async fn enable_worktree_config(&self, worktree_dir: &Path) -> Result<(), String> {
+        for key in ["core.bare", "core.worktree"] {
+            let mut cmd = Command::new(&self.git_bin);
+            cmd.arg("-C")
+                .arg(worktree_dir)
+                .args(["config", "--get", key]);
+            let out = run_git(cmd, self.local_timeout, "git config --get").await?;
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !value.is_empty() && value != "false" {
+                return Err(format!(
+                    "refusing to enable extensions.worktreeConfig: {key}={value} is set \
+                     in the shared repo config"
+                ));
+            }
+        }
+        self.set_config(worktree_dir, &["extensions.worktreeConfig", "true"])
+            .await
+    }
+
     /// Point a plain `git push` inside `worktree_dir` at `remote_branch`.
     ///
     /// The daemon owns run-unique local branch names, so a remote branch name
     /// (e.g. a PR head) is a push target only, never a local checkout. The
     /// agent pushes with no refspec and lands on the PR branch.
     ///
-    /// `push.default` is worktree-scoped: a repo-scoped value would leak into
-    /// the user's shared checkout, which the daemon does not own. The
-    /// `branch.<local>.*` keys are repo-scoped, which is safe because the local
-    /// branch name is unique to this run.
+    /// `remote_branch` MUST be a branch on `origin`: this hardcodes
+    /// `branch.<local>.remote = origin`, so a fork PR head (a name in the fork,
+    /// not in `origin`) must never be passed here.
+    ///
+    /// `push.default` and the push refspec are worktree-scoped: repo-scoped
+    /// values would leak into the user's shared checkout, which the daemon does
+    /// not own. The `branch.<local>.*` keys are repo-scoped, which is safe
+    /// because the local branch name is unique to this run. Also mutates the
+    /// shared repo config via [`Self::enable_worktree_config`].
     pub async fn configure_push_upstream(
         &self,
         worktree_dir: &Path,
@@ -282,10 +315,20 @@ impl WorktreeManager {
         remote_branch: &str,
     ) -> Result<(), String> {
         let _guard = self.lock.lock().await;
-        self.set_config(worktree_dir, &["extensions.worktreeConfig", "true"])
-            .await?;
+        self.enable_worktree_config(worktree_dir).await?;
         self.set_config(worktree_dir, &["--worktree", "push.default", "upstream"])
             .await?;
+        // Covers `git push origin` too, which consults the remote's refspec
+        // before push.default.
+        self.set_config(
+            worktree_dir,
+            &[
+                "--worktree",
+                "remote.origin.push",
+                &format!("HEAD:refs/heads/{remote_branch}"),
+            ],
+        )
+        .await?;
         self.set_config(
             worktree_dir,
             &[&format!("branch.{local_branch}.remote"), "origin"],
@@ -302,13 +345,16 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// Make every push from `worktree_dir` fail. Reviewers read code and post
-    /// GitHub comments; they never push. Worktree-scoped so the shared checkout
-    /// and every other worktree keep their real push URL.
+    /// Make an unqualified push from `worktree_dir` fail. Reviewers read code
+    /// and post GitHub comments; they never push. Worktree-scoped so the shared
+    /// checkout and every other worktree keep their real push URL.
+    ///
+    /// Defense in depth, not an authority boundary: an agent that types a full
+    /// remote URL, or uses `gh`, can still write. Also mutates the shared repo
+    /// config via [`Self::enable_worktree_config`].
     pub async fn disable_push(&self, worktree_dir: &Path) -> Result<(), String> {
         let _guard = self.lock.lock().await;
-        self.set_config(worktree_dir, &["extensions.worktreeConfig", "true"])
-            .await?;
+        self.enable_worktree_config(worktree_dir).await?;
         self.set_config(
             worktree_dir,
             &[
@@ -1177,6 +1223,27 @@ mod tests {
             new_tip,
             "push must advance the PR head branch on the remote"
         );
+
+        // `git push origin` (explicit remote, still no -u and no refspec) must
+        // land on the PR branch too.
+        assert!(
+            git_output(&wt_path, &["commit", "--allow-empty", "-m", "second fix"])
+                .status
+                .success()
+        );
+        let second_tip = git_rev_parse(&wt_path, "HEAD");
+        let push_origin = git_output(&wt_path, &["push", "origin"]);
+        assert!(
+            push_origin.status.success(),
+            "git push origin must succeed: {}",
+            String::from_utf8_lossy(&push_origin.stderr)
+        );
+        assert_eq!(
+            git_rev_parse(&bare, pr_head),
+            second_tip,
+            "git push origin must advance the PR head branch"
+        );
+
         assert!(
             !git_output(
                 &bare,
@@ -1189,6 +1256,39 @@ mod tests {
             .status
             .success(),
             "push must NOT create a remote branch for the local namespaced name"
+        );
+
+        mgr.remove(&repo, &wt_path).await.ok();
+        mgr.delete_branch(&repo, local_branch).await;
+    }
+
+    /// The shared repo config must not be reconfigured when `core.bare` or
+    /// `core.worktree` is already set — enabling per-worktree config changes
+    /// how git resolves those keys for every worktree.
+    #[tokio::test]
+    async fn worktree_config_refuses_when_core_worktree_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/core-worktree";
+        push_branch(&repo, pr_head);
+
+        let mgr = WorktreeManager::new();
+        let local_branch = "remediation/quill-t3";
+        let wt_path = tmp.path().join("remediation-wt");
+        mgr.fetch_and_provision(&repo, local_branch, &wt_path, pr_head)
+            .await
+            .expect("provision");
+        git_output(&repo, &["config", "core.worktree", &repo.to_string_lossy()]);
+
+        let result = mgr
+            .configure_push_upstream(&wt_path, local_branch, pr_head)
+            .await;
+        assert!(result.is_err(), "must refuse, got {result:?}");
+        assert!(
+            !git_output(&repo, &["config", "--get", "extensions.worktreeConfig"])
+                .status
+                .success(),
+            "refusal must not have enabled the extension"
         );
 
         mgr.remove(&repo, &wt_path).await.ok();

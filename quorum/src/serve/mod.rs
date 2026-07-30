@@ -7918,8 +7918,9 @@ async fn provision_reviewer(
     let provision_ok = match provision_result {
         Ok(_) => match wt_mgr.verify_head_sha(&wt_path, head_sha).await {
             // Reviewers read code and post GitHub comments — they never push.
-            // Fail closed: a reviewer worktree that can still push is authority
-            // the daemon did not intend to grant.
+            // Defense in depth, not an authority boundary (an explicit remote
+            // URL or `gh` still works); a failed lockout means a broken
+            // assumption about the worktree, so abort rather than proceed.
             Ok(()) => match wt_mgr.disable_push(&wt_path).await {
                 Ok(()) => true,
                 Err(e) => {
@@ -9824,7 +9825,7 @@ async fn spawn_remediation_worker(
         .map(|t| t.head_ref.clone())
         .or_else(|| fallback_branch.clone())
         .unwrap();
-    let branch = format!("remediation/{agent_name}-t{task_id}");
+    let branch = reviewer::remediation_branch(&agent_name, task_id);
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", agent_name, task_id));
@@ -9832,9 +9833,15 @@ async fn spawn_remediation_worker(
     let task_repo_dir = &config.repo_dir;
     let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
         let result = if target.is_fork {
-            wt_mgr
-                .fetch_pr_and_provision(task_repo_dir, &branch, &wt_path, target.pr)
-                .await
+            // A fork head ref names a branch in the FORK, not in origin, and
+            // the daemon holds no fork credentials — there is nowhere for the
+            // agent to push. Configuring an origin upstream would aim a bare
+            // `git push` at a same-named origin branch (`main`, for a typical
+            // fork PR). Fail closed and let the provision-strike path park.
+            Err(format!(
+                "fork PR: no pushable remote for head '{}' — remediation cannot push to the fork",
+                target.head_ref
+            ))
         } else {
             wt_mgr
                 .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)

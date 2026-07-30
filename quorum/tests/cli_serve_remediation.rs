@@ -553,7 +553,7 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
     let local_branch = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
     assert_eq!(
         local_branch,
-        format!("remediation/{agent}-t{task_id}"),
+        format!("remediation/{}-t{task_id}", agent.to_lowercase()),
         "remediation worktree must use a daemon-owned local branch name"
     );
     assert_eq!(
@@ -565,6 +565,11 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         git(&["config", "--get", "push.default"]),
         "upstream",
         "push.default must resolve to upstream inside the worktree"
+    );
+    assert_eq!(
+        git(&["config", "--get", "remote.origin.push"]),
+        format!("HEAD:refs/heads/{pr_branch}"),
+        "`git push origin` must target the PR branch"
     );
     // The external checkout is untouched.
     assert_eq!(
@@ -651,6 +656,106 @@ fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
     assert_eq!(intent.pr, pr);
     assert_eq!(intent.head_sha, staged_head);
     assert!(intent.feedback.contains("ci-test"));
+    handle.sigkill();
+}
+
+/// A fork PR head names a branch in the fork, not in origin, and the daemon
+/// holds no fork credentials. Remediation must park instead of provisioning a
+/// worktree aimed at a same-named origin branch.
+#[test]
+fn fork_pr_remediation_parks_without_configuring_origin_upstream() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "ForkAuthor";
+    let pr: i64 = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    // The branch exists locally and on origin, so a collision is NOT the
+    // reason provisioning must fail — the fork guard is.
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let head_sha = stage_failed_ci_remediation(home.path(), repo_dir.path(), task_id, pr);
+    {
+        let db_path = home
+            .path()
+            .join("repos")
+            .join("test__repo")
+            .join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        // A fork PR whose head ref collides with a base-repo branch name.
+        quorum_core::pr_targets::upsert(&mut conn, task_id, pr, "main", &head_sha, true).unwrap();
+    }
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("fork PR: no pushable remote", 20),
+        "fork remediation was not refused. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("PARKED", 20),
+        "refused fork remediation did not park. Lines: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "failed", "fork remediation must park the task");
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+            rusqlite::params![format!("task:{task_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_claims, 0, "parking releases the remediation claim");
+    drop(conn);
+
+    // Nothing was configured to push at origin, and no worktree survives.
+    let upstream = Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "config",
+            "--get-regexp",
+            "^branch\\.remediation/",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !upstream.status.success(),
+        "fork remediation must not configure an origin upstream: {}",
+        String::from_utf8_lossy(&upstream.stdout)
+    );
+    assert_eq!(
+        std::fs::read_dir(wt_base.path()).unwrap().count(),
+        0,
+        "fork remediation must not leave a worktree behind"
+    );
+
     handle.sigkill();
 }
 
