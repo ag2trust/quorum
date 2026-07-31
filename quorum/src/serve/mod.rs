@@ -428,6 +428,7 @@ struct PrTarget {
     head_sha: String,
     is_fork: bool,
     base_ref: Option<String>,
+    state: Option<String>,
 }
 
 fn pr_target_args(pr: i64, gh_repo: Option<&str>) -> Vec<String> {
@@ -436,7 +437,7 @@ fn pr_target_args(pr: i64, gh_repo: Option<&str>) -> Vec<String> {
         "view".to_string(),
         pr.to_string(),
         "--json".to_string(),
-        "headRefName,headRefOid,isCrossRepository,baseRefName".to_string(),
+        "headRefName,headRefOid,isCrossRepository,baseRefName,state".to_string(),
     ];
     if let Some(repo) = gh_repo {
         args.push("--repo".to_string());
@@ -463,6 +464,10 @@ fn parse_pr_target(pr: i64, stdout: &[u8]) -> Option<PrTarget> {
         is_fork,
         base_ref: json
             .get("baseRefName")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        state: json
+            .get("state")
             .and_then(|value| value.as_str())
             .map(str::to_string),
     })
@@ -1146,7 +1151,106 @@ fn resolve_or_load_pr_target(
         head_sha: stored.head_sha,
         is_fork: stored.is_fork,
         base_ref: None,
+        state: None,
     })
+}
+
+/// Validate the live GitHub target before a continuation worker receives any
+/// repository authority. Unlike remediation recovery, initial continuation
+/// never falls back to a persisted or inferred branch.
+fn validate_continue_pr_target(
+    target: &PrTarget,
+    expected_pr: i64,
+    base_branch: &str,
+) -> std::result::Result<(), String> {
+    if target.pr != expected_pr {
+        return Err(format!(
+            "continue PR identity changed: expected #{expected_pr}, got #{}",
+            target.pr
+        ));
+    }
+    if target.state.as_deref() != Some("OPEN") {
+        return Err(format!("continue PR #{expected_pr} is not open"));
+    }
+    if target.is_fork {
+        return Err(format!(
+            "continue PR #{expected_pr} is cross-repository; no safe push target is available"
+        ));
+    }
+    if target.base_ref.as_deref() != Some(base_branch) {
+        return Err(format!(
+            "continue PR #{expected_pr} targets base {:?}, expected {base_branch}",
+            target.base_ref
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_and_persist_continue_pr_target(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+) -> std::result::Result<PrTarget, String> {
+    // GitHub resolution is deliberately complete before opening the SQLite
+    // write transaction below.
+    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+    validate_continue_pr_target(&target, pr, &config.base_branch)?;
+    let db_path = config.db_path.clone();
+    let persisted = target.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_continue_pr_baseline(&mut conn, task_id, &persisted)
+    })
+    .await
+    .map_err(|error| format!("continue PR target persistence join failure: {error}"))?
+    .map_err(|error| format!("continue PR target persistence failed: {error}"))?;
+    Ok(target)
+}
+
+fn persist_continue_pr_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    target: &PrTarget,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    if let Some(owner) = tasks::active_pr_owner_in(&tx, target.pr, Some(task_id))? {
+        return Err(QuorumError::Usage(format!(
+            "continue PR #{} is already owned by active task #{owner}",
+            target.pr
+        )));
+    }
+    if let Some(existing) = pr_targets::get(&tx, task_id, target.pr)? {
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || existing.head_sha != target.head_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "continue PR #{} moved after its durable baseline (expected {} at {}, got {} at {})",
+                target.pr,
+                existing.head_ref,
+                existing.head_sha,
+                target.head_ref,
+                target.head_sha
+            )));
+        }
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO pr_targets
+           (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            task_id,
+            target.pr,
+            &target.head_ref,
+            &target.head_sha,
+            target.is_fork as i64,
+            now_unix(),
+        ),
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn tier_to_model_id(tier: &str) -> Option<String> {
@@ -9485,30 +9589,81 @@ async fn spawn_worker(
 
     let worker_repo_dir = &config.repo_dir;
 
+    // A continuation assignment is bound to the live PR target resolved after
+    // the atomic claim. It must never inherit a stale refs.pr value or fall
+    // through to base-derived provisioning.
+    let continue_target = if let Some(pr) = task.continue_pr {
+        match resolve_and_persist_continue_pr_target(config, task.id, pr).await {
+            Ok(target) => Some(target),
+            Err(error) => {
+                let reason = format!("continue PR #{pr} provisioning rejected: {error}");
+                park_task(&db_path, task.id, &reason, "open").await;
+                name_pool.release(&agent_name);
+                return Ok(false);
+            }
+        }
+    } else {
+        None
+    };
+
     // Branch keyed to task + original author, not current assignee — a rework
     // re-claim by a different agent continues the original branch instead of
     // forking a duplicate PR (#340).
     let branch_agent = task.author.as_deref().unwrap_or(&agent_name);
     let session_id = agent::new_session_id();
-    let branch = format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id);
+    let branch = if continue_target.is_some() {
+        reviewer::remediation_branch(&agent_name, task.id)
+    } else {
+        format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id)
+    };
+    let remote_branch = continue_target
+        .as_ref()
+        .map(|target| target.head_ref.clone())
+        .unwrap_or_else(|| branch.clone());
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", branch_agent, task.id));
 
-    match wt_mgr
-        .provision(
-            worker_repo_dir,
-            &branch,
-            &wt_path,
-            &format!("origin/{}", config.base_branch),
-        )
-        .await
-    {
+    let provision_result = if let Some(target) = &continue_target {
+        wt_mgr
+            .fetch_and_provision(worker_repo_dir, &branch, &wt_path, &target.head_ref)
+            .await
+    } else {
+        wt_mgr
+            .provision(
+                worker_repo_dir,
+                &branch,
+                &wt_path,
+                &format!("origin/{}", config.base_branch),
+            )
+            .await
+    };
+    let provision_result = match (provision_result, continue_target.as_ref()) {
+        (Ok(path), Some(target)) => wt_mgr
+            .verify_head_sha(&wt_path, &target.head_sha)
+            .await
+            .map(|_| path),
+        (result, _) => result,
+    };
+    match provision_result {
         Ok(_) => {
             log(&format!("worktree provisioned at {}", wt_path.display()));
         }
         Err(e) => {
             log(&format!("worktree provision failed: {e}"));
+            if task.continue_pr.is_some() {
+                park_task(
+                    &db_path,
+                    task.id,
+                    &format!("continue PR worktree provisioning failed: {e}"),
+                    "open",
+                )
+                .await;
+                name_pool.release(&agent_name);
+                wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+                return Ok(false);
+            }
             let strikes = poison_tracker.record_strike(task.id);
             if strikes >= MAX_POISON_STRIKES {
                 poison_task(&db_path, &agent_name, task.id, strikes).await;
@@ -9544,7 +9699,7 @@ async fn spawn_worker(
             "worker",
             Some(task.id),
             &session_id,
-            &branch,
+            &remote_branch,
             now_unix(),
         )
         .ok()
@@ -9558,7 +9713,7 @@ async fn spawn_worker(
         task_id: Some(task.id),
         session_id: session_id.clone(),
         worktree: Some(wt_path.to_string_lossy().into()),
-        branch: Some(branch.clone()),
+        branch: Some(remote_branch.clone()),
         phase: "working".into(),
         cost_tokens: 0,
         agent_state: None,
@@ -9567,7 +9722,7 @@ async fn spawn_worker(
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
         pid: None,
-        pr: None,
+        pr: task.continue_pr,
         rework_count: 0,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -9674,7 +9829,7 @@ async fn spawn_worker(
     ];
 
     let body = task.body.as_deref().unwrap_or(&task.title);
-    let prompt_text = retry_turn.as_ref().map_or_else(
+    let mut prompt_text = retry_turn.as_ref().map_or_else(
         || {
             reviewer::build_worker_prompt(
                 &agent_name,
@@ -9686,6 +9841,12 @@ async fn spawn_worker(
         },
         |retry| retry.prompt.clone(),
     );
+    if let Some(target) = &continue_target {
+        prompt_text.push_str(&format!(
+            "\n\nCONTINUATION SOURCE: Continue existing PR #{} from its verified head {} on branch '{}'. Commit changes in this worktree; the daemon alone publishes back to that PR.\n",
+            target.pr, target.head_sha, target.head_ref
+        ));
+    }
 
     let resolved_kind = resolve_worker_provider(&resolved_model)?;
 
@@ -9800,7 +9961,7 @@ async fn spawn_worker(
                     task_id: Some(task.id),
                     session_id: session_id.clone(),
                     worktree: Some(wt_path.to_string_lossy().into()),
-                    branch: Some(branch.clone()),
+                    branch: Some(remote_branch.clone()),
                     phase: "working".into(),
                     cost_tokens: 0,
                     agent_state: None,
@@ -9809,7 +9970,7 @@ async fn spawn_worker(
                         .as_ref()
                         .map(|l| l.dir().to_string_lossy().into()),
                     pid: spawn_pid,
-                    pr: None,
+                    pr: task.continue_pr,
                     rework_count: 0,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -9856,15 +10017,12 @@ async fn spawn_worker(
                 model: resolved_model,
                 effort: resolved_effort,
                 worktree_path: wt_path,
-                // A fresh worker pushes the branch it checked out.
-                remote_branch: branch.clone(),
+                // Continuation workers publish to the existing PR head while
+                // retaining a run-unique local checkout branch.
+                remote_branch: remote_branch.clone(),
                 branch,
                 draining: true,
-                pr: task
-                    .refs
-                    .as_deref()
-                    .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-                    .and_then(|refs| refs.get("pr").and_then(|pr| pr.as_i64())),
+                pr: task.continue_pr,
                 rework_count: retry_slot_rework_count(
                     task.rework_round,
                     retry_turn.as_ref(),
@@ -13252,10 +13410,112 @@ mod tests {
             head_sha: "abc123".into(),
             is_fork: false,
             base_ref: Some("release".into()),
+            state: Some("OPEN".into()),
         };
         let error = validate_initial_pr_target(&target, "daemon/worker-t1", "abc123", "main")
             .expect_err("wrong baseRefName must fail initial PR reconciliation");
         assert!(error.contains("base"));
+    }
+
+    #[test]
+    fn continue_pr_target_requires_open_same_repo_expected_base() {
+        let mut target = PrTarget {
+            pr: 19,
+            head_ref: "feature/existing".into(),
+            head_sha: "abc123".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        validate_continue_pr_target(&target, 19, "main").unwrap();
+
+        target.state = Some("CLOSED".into());
+        assert!(validate_continue_pr_target(&target, 19, "main")
+            .unwrap_err()
+            .contains("not open"));
+        target.state = Some("OPEN".into());
+
+        target.is_fork = true;
+        assert!(validate_continue_pr_target(&target, 19, "main")
+            .unwrap_err()
+            .contains("cross-repository"));
+        target.is_fork = false;
+
+        target.base_ref = Some("release".into());
+        assert!(validate_continue_pr_target(&target, 19, "main")
+            .unwrap_err()
+            .contains("expected main"));
+    }
+
+    #[test]
+    fn continue_pr_target_rejects_missing_live_state_and_wrong_identity() {
+        let mut target = PrTarget {
+            pr: 20,
+            head_ref: "feature/existing".into(),
+            head_sha: "abc123".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: None,
+        };
+        assert!(validate_continue_pr_target(&target, 20, "main")
+            .unwrap_err()
+            .contains("not open"));
+        target.state = Some("OPEN".into());
+        assert!(validate_continue_pr_target(&target, 19, "main")
+            .unwrap_err()
+            .contains("identity changed"));
+    }
+
+    #[test]
+    fn continue_pr_baseline_is_immutable_after_first_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let task_id = working_task(&db_path, "Continuer", None);
+        let original = PrTarget {
+            pr: 19,
+            head_ref: "feature/existing".into(),
+            head_sha: "sha-a".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        persist_continue_pr_baseline(&mut conn, task_id, &original).unwrap();
+        persist_continue_pr_baseline(&mut conn, task_id, &original).unwrap();
+
+        let mut moved = original.clone();
+        moved.head_sha = "sha-b".into();
+        let error = persist_continue_pr_baseline(&mut conn, task_id, &moved)
+            .expect_err("a later daemon tick must not adopt a moved PR head");
+        assert!(error.to_string().contains("durable baseline"));
+        let stored = pr_targets::get(&conn, task_id, 19).unwrap().unwrap();
+        assert_eq!(stored.head_ref, "feature/existing");
+        assert_eq!(stored.head_sha, "sha-a");
+    }
+
+    #[test]
+    fn continue_pr_baseline_rechecks_active_owner_in_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let continuing_task = working_task(&db_path, "Continuer", None);
+        let competing_task = working_task(&db_path, "Competitor", Some(r#"{"pr":19}"#));
+        let target = PrTarget {
+            pr: 19,
+            head_ref: "feature/existing".into(),
+            head_sha: "sha-a".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let error = persist_continue_pr_baseline(&mut conn, continuing_task, &target)
+            .expect_err("a concurrent active owner must prevent authority persistence");
+        assert!(error
+            .to_string()
+            .contains(&format!("task #{competing_task}")));
+        assert!(pr_targets::get(&conn, continuing_task, 19)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -13273,6 +13533,7 @@ mod tests {
             head_sha: intent.local_sha.clone(),
             is_fork: false,
             base_ref: Some("release".into()),
+            state: Some("OPEN".into()),
         };
         let error = validate_pr_created_retry_target(&intent, &wrong_base, "main")
             .expect_err("an unverified retry must fail closed on the wrong base");
@@ -13301,6 +13562,7 @@ mod tests {
             head_sha: "spawn-x".into(),
             is_fork: false,
             base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
         };
         assert_eq!(
             existing_pr_lease_baseline(&intent, &target).unwrap(),

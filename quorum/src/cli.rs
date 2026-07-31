@@ -53,7 +53,8 @@ pub enum Command {
         /// JSON array of labels, e.g. '["ui","p1"]'.
         #[arg(long)]
         labels: Option<String>,
-        /// JSON of external refs, e.g. '{"pr":2459}'.
+        /// JSON of non-authoritative external refs. PR association requires --review-pr or
+        /// --continue-pr; refs.pr is rejected.
         #[arg(long)]
         refs: Option<String>,
         /// JSON array of task ids this task depends on, e.g. '[1,3]'. Claim (auto-pick AND
@@ -62,8 +63,12 @@ pub enum Command {
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
         /// Create as a review-only task (starts in in-review). The PR number is stored in refs.pr.
-        #[arg(long = "review-pr")]
+        #[arg(long = "review-pr", conflicts_with = "continue_pr")]
         review_pr: Option<i64>,
+        /// Continue implementation from an existing PR. Starts as an open implementation task;
+        /// the daemon provisions the worker from this PR rather than the configured base.
+        #[arg(long = "continue-pr", conflicts_with = "review_pr")]
+        continue_pr: Option<i64>,
         #[arg(long = "body-stdin")]
         body_stdin: bool,
         #[arg(long = "body-file")]

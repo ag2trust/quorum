@@ -151,6 +151,7 @@ pub struct Task {
     pub rework_round: i64,
     pub review_only: bool,
     pub recovery_attempts: i64,
+    pub continue_pr: Option<i64>,
     pub ready: bool,
 }
 
@@ -168,6 +169,7 @@ pub struct TaskBrief {
     pub reviewer: Option<String>,
     pub rework_round: i64,
     pub recovery_attempts: i64,
+    pub continue_pr: Option<i64>,
 }
 
 impl From<&Task> for TaskBrief {
@@ -185,6 +187,7 @@ impl From<&Task> for TaskBrief {
             reviewer: t.reviewer.clone(),
             rework_round: t.rework_round,
             recovery_attempts: t.recovery_attempts,
+            continue_pr: t.continue_pr,
         }
     }
 }
@@ -195,6 +198,8 @@ pub struct TaskCompact {
     pub status: String,
     pub assignee: Option<String>,
     pub refs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continue_pr: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -218,6 +223,7 @@ impl From<&Task> for TaskCompact {
             status: t.status.clone(),
             assignee: t.assignee.clone(),
             refs: t.refs.clone(),
+            continue_pr: t.continue_pr,
             lease_expires_at: None,
             note_id: None,
             suggested_branch: None,
@@ -277,7 +283,7 @@ pub fn effect_name(e: &Effect) -> String {
 
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
-                    rework_round, review_only, recovery_attempts";
+                    rework_round, review_only, recovery_attempts, continue_pr";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -298,6 +304,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         rework_round: r.get(14)?,
         review_only: r.get::<_, i64>(15)? != 0,
         recovery_attempts: r.get(16)?,
+        continue_pr: r.get(17)?,
         ready: false,
     })
 }
@@ -384,6 +391,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key '{key}' is classifier-owned; task creators may not set classification"
         )));
     }
+    if object.contains_key("pr") {
+        return Err(QuorumError::Usage(
+            "refs key 'pr' is daemon-owned; use --review-pr or --continue-pr".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -402,7 +414,10 @@ fn preserve_classifier_refs(
         .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
         .and_then(|value| value.as_object().cloned())
     {
+        // PR association and classifier output are daemon-owned. Metadata replacement may
+        // add caller keys, but it cannot erase or rewrite these established values.
         for key in [
+            "pr",
             "cx_est",
             "cx_size",
             "cx_ready",
@@ -511,6 +526,36 @@ pub fn extract_repo(refs: &Option<String>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Return the nonterminal task currently associated with a PR, if any.
+///
+/// Continuation creation calls the transaction variant under `BEGIN IMMEDIATE`, making the
+/// check-and-insert atomic. Daemon paths that establish `refs.pr` later must use the same
+/// transaction helper before granting publication authority.
+pub fn active_pr_owner(conn: &Connection, pr: i64) -> Result<Option<i64>> {
+    active_pr_owner_in(conn, pr, None)
+}
+
+pub fn active_pr_owner_in(
+    conn: &Connection,
+    pr: i64,
+    excluding_task: Option<i64>,
+) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM tasks
+             WHERE status NOT IN ('done', 'failed', 'cancelled')
+               AND (?2 IS NULL OR id != ?2)
+               AND (continue_pr = ?1 OR (
+                    json_valid(COALESCE(refs, '{}'))
+                    AND (json_extract(refs, '$.pr') = ?1
+                         OR json_extract(refs, '$.pr') = CAST(?1 AS TEXT))))
+             ORDER BY id LIMIT 1",
+            params![pr, excluding_task],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 // ── create ────────────────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -526,6 +571,36 @@ pub fn create(
     review_pr: Option<i64>,
     now: i64,
 ) -> Result<i64> {
+    create_with_continue_pr(
+        conn, created_by, title, body, priority, labels, refs, depends_on, review_pr, None, now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_with_continue_pr(
+    conn: &mut Connection,
+    created_by: &str,
+    title: &str,
+    body: Option<&str>,
+    priority: i64,
+    labels: Option<&str>,
+    refs: Option<&str>,
+    depends_on: Option<&str>,
+    review_pr: Option<i64>,
+    continue_pr: Option<i64>,
+    now: i64,
+) -> Result<i64> {
+    if review_pr.is_some() && continue_pr.is_some() {
+        return Err(QuorumError::Usage(
+            "--review-pr and --continue-pr are mutually exclusive".into(),
+        ));
+    }
+    if review_pr.is_some_and(|pr| pr <= 0) {
+        return Err(QuorumError::Usage("--review-pr must be positive".into()));
+    }
+    if continue_pr.is_some_and(|pr| pr <= 0) {
+        return Err(QuorumError::Usage("--continue-pr must be positive".into()));
+    }
     if let Some(s) = depends_on {
         validate_depends_on(s)?;
     }
@@ -549,12 +624,19 @@ pub fn create(
         ("open", 0_i64, refs.map(|s| s.to_string()))
     };
     let tx = begin_immediate(conn)?;
+    if let Some(pr) = review_pr.or(continue_pr) {
+        if let Some(owner) = active_pr_owner_in(&tx, pr, None)? {
+            return Err(QuorumError::Usage(format!(
+                "PR #{pr} is already associated with active task #{owner}"
+            )));
+        }
+    }
     crate::agents::touch(&tx, created_by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.execute(
         "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
-         created_at, updated_at, refs, depends_on, review_only) \
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?8, ?9, ?10)",
+         created_at, updated_at, refs, depends_on, review_only, continue_pr) \
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?8, ?9, ?10, ?11)",
         params![
             title,
             body,
@@ -565,7 +647,8 @@ pub fn create(
             now,
             final_refs.as_deref(),
             depends_on,
-            review_only
+            review_only,
+            continue_pr
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -598,6 +681,15 @@ pub fn claim(
             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
         )
     ))";
+    const CONTINUE_PR_UNOWNED_CLAUSE: &str = "(continue_pr IS NULL OR NOT EXISTS (
+        SELECT 1 FROM tasks owner
+        WHERE owner.id != tasks.id
+          AND owner.status NOT IN ('done', 'failed', 'cancelled')
+          AND (owner.continue_pr = tasks.continue_pr OR (
+               json_valid(COALESCE(owner.refs, '{}'))
+               AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
+                    OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
+    ))";
 
     let mut task = match task_id {
         Some(id) => tx
@@ -618,6 +710,7 @@ pub fn claim(
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
+                       AND {CONTINUE_PR_UNOWNED_CLAUSE}
                        AND (
                          (status='open' AND {DEP_READY_CLAUSE})
                          OR (status='in-review' AND reviewer IS NULL \
@@ -640,6 +733,7 @@ pub fn claim(
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
+                   AND {CONTINUE_PR_UNOWNED_CLAUSE}
                    AND (
                     (status='open' AND {DEP_READY_CLAUSE})
                     OR (status='in-review' AND reviewer IS NULL \
@@ -4738,6 +4832,31 @@ mod tests {
     }
 
     #[test]
+    fn create_with_continue_pr_starts_open_without_forging_refs() {
+        let (_d, mut c) = open_tmp();
+        let id = super::create_with_continue_pr(
+            &mut c,
+            "boss",
+            "continue PR #50",
+            None,
+            100,
+            None,
+            Some(r#"{"ticket":"ABC-1"}"#),
+            None,
+            None,
+            Some(50),
+            1000,
+        )
+        .unwrap();
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert!(!task.review_only);
+        assert_eq!(task.continue_pr, Some(50));
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs, serde_json::json!({"ticket":"ABC-1"}));
+    }
+
+    #[test]
     fn review_only_verdict_changes_reworks() {
         // #159: review_only + changes → rework (remediation workers).
         let (_d, mut c) = open_tmp();
@@ -6175,17 +6294,19 @@ mod tests {
         for refs in [
             r#"{"cx_est":5}"#,
             r#"{"cx_by":"creator"}"#,
-            r#"{"pr":42,"cx_flags":[]}"#,
+            r#"{"ticket":"ABC","cx_flags":[]}"#,
         ] {
             let err = validate_creator_refs(Some(refs)).unwrap_err();
             assert_eq!(err.exit_code(), 2);
             assert!(format!("{err}").contains("classifier-owned"));
         }
-        assert!(validate_creator_refs(Some(r#"{"pr":42,"repo":"o/r"}"#)).is_ok());
+        let pr_err = validate_creator_refs(Some(r#"{"pr":42,"repo":"o/r"}"#)).unwrap_err();
+        assert!(format!("{pr_err}").contains("--continue-pr"));
+        assert!(validate_creator_refs(Some(r#"{"ticket":"ABC","repo":"o/r"}"#)).is_ok());
     }
 
     #[test]
-    fn metadata_update_preserves_classifier_refs() {
+    fn metadata_update_preserves_daemon_pr_and_classifier_refs() {
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
@@ -6201,13 +6322,14 @@ mod tests {
         )
         .unwrap();
         let fields = TaskUpdate {
-            refs: Some(r#"{"pr":42}"#),
+            refs: Some(r#"{"pr":42,"ticket":"ABC"}"#),
             ..Default::default()
         };
         let updated = update(&mut c, "boss", id, &fields, 1001).unwrap();
         let refs: serde_json::Value =
             serde_json::from_str(updated.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs["pr"], 42);
+        assert_eq!(refs["pr"], 41);
+        assert_eq!(refs["ticket"], "ABC");
         assert_eq!(refs["cx_est"], 5);
         assert_eq!(refs["cx_by"], "classifier:v1");
     }
