@@ -925,9 +925,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             blocking,
             run_id,
         } => {
-            if let Some(path) = feedback_file {
-                feedback = Some(input::read_text(input::TextSource::File(path))?);
-            }
             if let Some(ref v) = verdict {
                 match v.as_str() {
                     "approved" | "changes" => {}
@@ -937,6 +934,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         )));
                     }
                 }
+            }
+            if (feedback.is_some() || feedback_file.is_some())
+                && verdict.as_deref() != Some("changes")
+            {
+                return Err(QuorumError::Usage(
+                    "--feedback-file/--feedback requires --verdict changes".into(),
+                ));
+            }
+            if let Some(path) = feedback_file {
+                feedback = Some(input::read_text(input::TextSource::File(path))?);
             }
             verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
                 .map_err(QuorumError::Usage)?;

@@ -42,6 +42,14 @@ quorum task-create --created-by <You> --title "Review PR #N" --review-pr <N> --b
 do not select a PR workflow. The daemon chooses complexity, model, and effort; do not pass
 `complexity:*`, `tier:*`, or `effort:*` labels.
 
+The classifier uses this shared complexity rubric:
+
+- 1: Trivial — config tweak, typo fix, simple rename
+- 2: Simple — single-file change, clear spec
+- 3: Moderate — multi-file change, some design decisions
+- 4: Complex — cross-cutting change, multiple components
+- 5: Very complex — architectural change, new subsystem
+
 A review-only task has no implementation worker. If it receives a changes verdict, the
 task fails and the outside PR author remains responsible for updating the branch.
 

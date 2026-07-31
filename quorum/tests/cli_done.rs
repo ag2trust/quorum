@@ -259,6 +259,53 @@ fn submit_changes_without_feedback_is_refused() {
         .stderr(predicate::str::contains("--feedback"));
 }
 
+#[test]
+fn submit_feedback_file_requires_changes_verdict_before_file_io() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    let missing = home.path().join("missing-feedback.txt");
+
+    for verdict_args in [vec![], vec!["--verdict", "approved"]] {
+        let mut args = vec![
+            "submit",
+            "--agent",
+            "Reviewer-1",
+            "--feedback-file",
+            missing.to_str().unwrap(),
+        ];
+        args.extend(verdict_args);
+        quorum()
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--feedback-file/--feedback requires --verdict changes",
+            ))
+            .stderr(predicate::str::contains("failed to read").not());
+    }
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer-1",
+            "--verdict",
+            "invalid",
+            "--feedback-file",
+            missing.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--verdict must be 'approved' or 'changes'",
+        ))
+        .stderr(predicate::str::contains("failed to read").not());
+}
+
 // ---------------------------------------------------------------------------
 // submit — identity failures (exit 2)
 // ---------------------------------------------------------------------------
