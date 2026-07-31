@@ -7258,12 +7258,6 @@ async fn tick(
             .unwrap_or_default()
         };
         for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
-            if !tasks::classification_is_dispatchable(task_refs) {
-                log(&format!(
-                    "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
-                ));
-                continue;
-            }
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -7434,6 +7428,12 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
+                    if !tasks::classification_is_dispatchable(task_refs) {
+                        log(&format!(
+                            "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
+                        ));
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         let r1_info = {
                             let p = db_path.clone();

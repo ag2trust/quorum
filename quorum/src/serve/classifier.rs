@@ -551,6 +551,9 @@ mod tests {
 
         let invalid_ready = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": false, "not_ready_reason": "  "}]}"#;
         assert!(parse_validated_response(invalid_ready, &[1]).is_err());
+
+        let nul_reason = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": false, "not_ready_reason": "missing\u0000criteria"}]}"#;
+        assert!(parse_validated_response(nul_reason, &[1]).is_err());
     }
 
     #[test]

@@ -65,7 +65,8 @@ const INCOMPLETE_CLASSIFICATION_PREDICATE: &str = r#"
             OR
             (json_type(refs, '$.cx_ready') = 'false'
              AND json_type(refs, '$.cx_not_ready_reason') = 'text'
-             AND length(trim(json_extract(refs, '$.cx_not_ready_reason'))) > 0)
+             AND length(trim(json_extract(refs, '$.cx_not_ready_reason'))) > 0
+             AND instr(json_extract(refs, '$.cx_not_ready_reason'), char(0)) = 0)
         )
     ), 0)
     END
@@ -332,7 +333,7 @@ pub fn valid(result: &TaskClassification) -> bool {
             result
                 .not_ready_reason
                 .as_ref()
-                .is_some_and(|s| !s.trim().is_empty())
+                .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
         }
 }
 
@@ -694,6 +695,51 @@ mod tests {
         let mut result = classified(1, 3);
         result.ready = false;
         assert!(!valid(&result));
+    }
+
+    #[test]
+    fn nul_readiness_reason_is_rejected_without_persistence() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "NUL classifier output", 1);
+        let mut result = classified(task_id, 3);
+        result.ready = false;
+        result.not_ready_reason = Some("missing\0acceptance criteria".into());
+
+        assert!(!valid(&result));
+        assert!(validate_batch(std::slice::from_ref(&result), &[task_id]).is_err());
+        assert_eq!(
+            store_classifications(&mut conn, &[result], "test:v2", 2_000_000).unwrap(),
+            0,
+            "defensive persistence boundary must skip NUL-bearing output"
+        );
+        let task = crate::tasks::get_with_notes(&conn, task_id)
+            .unwrap()
+            .unwrap();
+        assert!(task.task.refs.is_none());
+        assert!(task.notes.is_empty());
+
+        let legacy_refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": false,
+            "cx_not_ready_reason": "missing\0acceptance criteria",
+            "cx_by": "legacy:v2"
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![task_id, legacy_refs],
+        )
+        .unwrap();
+        let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
+        assert!(!crate::tasks::classification_is_complete(&refs));
+        assert!(
+            unclassified_tasks(&conn)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == task_id),
+            "legacy NUL-bearing refs must be reclassified"
+        );
     }
 
     fn open_tmp() -> (tempfile::TempDir, rusqlite::Connection) {

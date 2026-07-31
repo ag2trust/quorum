@@ -2197,7 +2197,7 @@ pub fn classification_is_complete(refs: &Option<String>) -> bool {
     } else {
         v.get("cx_not_ready_reason")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|reason| !reason.trim().is_empty())
+            .is_some_and(|reason| !reason.trim().is_empty() && !reason.contains('\0'))
     };
     (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L" | "XL") && reason_is_valid
 }
