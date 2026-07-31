@@ -2549,11 +2549,36 @@ pub fn retry_parked(
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
         tx.execute(
-            "UPDATE tasks SET refs=json_remove(refs, '$.cx_est', '$.cx_size', '$.cx_ready', '$.cx_not_ready_reason', '$.cx_by', '$.cx_dup_of'), updated_at=?2 WHERE id=?1",
-            params![id, now],
+            "UPDATE tasks
+             SET refs=json_remove(
+                     refs,
+                     '$.cx_est',
+                     '$.cx_size',
+                     '$.cx_ready',
+                     '$.cx_not_ready_reason',
+                     '$.cx_by',
+                     '$.cx_dup_of'
+                 ),
+                 recovery_attempts=CASE WHEN ?3 THEN 0 ELSE recovery_attempts END,
+                 updated_at=?2
+             WHERE id=?1",
+            params![id, now, reset_recovery_budget],
         )?;
+        crate::events::emit(
+            &tx,
+            "task_retry",
+            &lease_target(id),
+            &format!("policy-parked task reclassification requested by {by}"),
+            now,
+        )?;
+        let mut task = tx.query_row(
+            &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+            params![id],
+            row_to_task,
+        )?;
+        task.ready = compute_ready(&tx, &task.depends_on)?;
         tx.commit()?;
-        return Ok(None);
+        return Ok(Some(task));
     }
     if !matches!(
         resume_status.as_str(),

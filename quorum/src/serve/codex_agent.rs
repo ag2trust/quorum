@@ -68,6 +68,28 @@ pub fn resume_args(thread_id: &str, model: &str, effort: &str, prompt: &str) -> 
     ]
 }
 
+/// Build the restricted single-turn argument list used by classifiers.
+///
+/// This must retain Codex's own read-only sandbox and omit the worker/reviewer
+/// approval-and-sandbox bypass.
+pub fn restricted_exec_args(spec: &CodexSpec) -> Vec<String> {
+    vec![
+        "exec".into(),
+        "--json".into(),
+        "--model".into(),
+        spec.model.clone(),
+        "-c".into(),
+        format!("model_reasoning_effort={}", spec.effort),
+        "-s".into(),
+        "read-only".into(),
+        "-C".into(),
+        spec.worktree.display().to_string(),
+        "--skip-git-repo-check".into(),
+        "--ignore-user-config".into(),
+        spec.prompt.clone(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Process wrapper
 // ---------------------------------------------------------------------------
@@ -84,24 +106,13 @@ impl CodexProc {
     /// normal worker escape hatch that disables Codex sandbox/approval policy.
     pub fn spawn_restricted(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
         let bin = codex_bin.unwrap_or("codex");
-        let args = vec![
-            "exec".into(),
-            "--json".into(),
-            "--model".into(),
-            spec.model.clone(),
-            "-c".into(),
-            format!("model_reasoning_effort={}", spec.effort),
-            "-s".into(),
-            "read-only".into(),
-            "-C".into(),
-            spec.worktree.display().to_string(),
-            "--skip-git-repo-check".into(),
-            "--ignore-user-config".into(),
-            spec.prompt.clone(),
-        ];
+        let args = restricted_exec_args(spec);
         let mut cmd = Command::new(bin);
-        cmd.args(&args)
-            .stdin(Stdio::null())
+        cmd.args(&args);
+        for (k, v) in &spec.env_vars {
+            cmd.env(k, v);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(&spec.worktree);
@@ -382,6 +393,30 @@ mod tests {
         assert_eq!(args[pos + 1], "model_reasoning_effort=high");
     }
 
+    #[test]
+    fn restricted_exec_args_pin_classifier_security_boundary() {
+        let args = restricted_exec_args(&test_spec());
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "--json",
+                "--model",
+                "o4-mini",
+                "-c",
+                "model_reasoning_effort=high",
+                "-s",
+                "read-only",
+                "-C",
+                "/tmp",
+                "--skip-git-repo-check",
+                "--ignore-user-config",
+                "say hello",
+            ]
+        );
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+    }
+
     // ── Pinned resume argument shape ─────────────────────────────────────
 
     #[test]
@@ -503,6 +538,36 @@ mod tests {
             event.is_some(),
             "codex exited without emitting any JSONL event — exec argument \
              surface was rejected at CLI validation (crash-loop class)"
+        );
+    }
+
+    /// Positive zero-token contract for the classifier-specific restricted
+    /// launch shape. An emitted JSONL event proves the real CLI accepted the
+    /// arguments before the blank auth environment stops useful work.
+    #[tokio::test]
+    async fn real_cli_accepts_restricted_classifier_args() {
+        if !codex_available() {
+            eprintln!("skipped: no codex binary on PATH");
+            return;
+        }
+        let codex_home = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let spec = CodexSpec {
+            model: "o4-mini".into(),
+            effort: "high".into(),
+            sandbox: "read-only".into(),
+            worktree: worktree.path().to_path_buf(),
+            prompt: "ping".into(),
+            env_vars: no_auth_env(codex_home.path()),
+        };
+        let mut proc = CodexProc::spawn_restricted(&spec, None).expect("spawn restricted codex");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("restricted codex produced no event within 60s");
+        let _terminal_output = proc.kill_and_reap().await;
+        assert!(
+            event.is_some(),
+            "codex exited without JSONL — restricted classifier arguments were rejected"
         );
     }
 

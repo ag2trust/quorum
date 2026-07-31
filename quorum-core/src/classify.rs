@@ -878,11 +878,31 @@ mod tests {
         assert_eq!(runs, 0);
         assert_eq!(errors, 0);
         assert_eq!(parked_events, 1);
+        let retried = crate::tasks::retry_parked(&mut conn, task_id, "operator", true, 2_000_001)
+            .unwrap()
+            .expect("policy retry must be accepted for reclassification");
+        assert_eq!(retried.status, "failed");
         assert!(
-            crate::tasks::retry_parked(&mut conn, task_id, "operator", true, 2_000_001)
+            unclassified_tasks(&conn)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == task_id),
+            "accepted retry must await a fresh classifier result"
+        );
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_002)
                 .unwrap()
                 .is_none(),
-            "unchanged category-5 task must not retry into a dispatch loop"
+            "awaiting reclassification must not enter worker dispatch"
+        );
+        assert_eq!(
+            store_classifications(&mut conn, &results, "gpt-5.6-luna:v2", 2_000_003).unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "failed",
+            "an unchanged category-5 result must remain policy-parked"
         );
     }
 
@@ -1021,16 +1041,17 @@ mod tests {
         let parked_refs: serde_json::Value =
             serde_json::from_str(parked_task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(parked_refs["classifier_policy_parked"], true);
-        assert!(
-            crate::tasks::retry_parked(&mut conn, task_id, "owner", true, 11)
-                .unwrap()
-                .is_none()
-        );
-        let retry_refs = crate::tasks::get(&conn, task_id)
+        conn.execute(
+            "UPDATE tasks SET recovery_attempts=3 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        let retry = crate::tasks::retry_parked(&mut conn, task_id, "owner", true, 11)
             .unwrap()
-            .unwrap()
-            .refs
-            .unwrap();
+            .expect("policy retry accepted while awaiting reclassification");
+        assert_eq!(retry.status, "failed");
+        assert_eq!(retry.recovery_attempts, 0);
+        let retry_refs = retry.refs.unwrap();
         let retry_refs: serde_json::Value = serde_json::from_str(&retry_refs).unwrap();
         assert_eq!(retry_refs["classifier_policy_parked"], true);
         for key in [
@@ -1050,6 +1071,15 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t.id == task_id));
+        let retry_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind='task_retry' AND subject=?1",
+                params![crate::tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_events, 1);
         store_classifications(&mut conn, &[classified(task_id, 5)], "test:v2", 12).unwrap();
         let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
         assert_eq!(task.status, "open");
