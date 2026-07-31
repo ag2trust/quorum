@@ -9923,6 +9923,7 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
             refs: None,
             verdict: None,
             depends_on: None,
+            expected_revision: None,
         };
         tasks::update(&mut conn, &a, task_id, &fields, now)?;
         Ok(())
