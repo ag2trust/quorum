@@ -1492,6 +1492,70 @@ Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
 Runner-specific configuration is scoped under `[claude]` or `[codex]`.
 
+### Bounded task decomposition
+
+An admission-ready implementation task classified size L or XL does not dispatch directly.
+After its dependencies are done, the daemon serializes decomposition per repository: it stops
+new managed delivery, lets active delivery finish, and plans against the resulting frozen base.
+S/M implementation tasks dispatch normally regardless of complexity. Review-only L/XL work is
+parked for external splitting.
+
+Planning uses the configured provider's fixed frontier model (Sol/high for Codex, Opus/high for
+Claude) with no downgrade. The planner receives a read-only repository view and bounded source
+context but no network, database, coordination command, or delivery authority. A separate
+planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
+blocker response. A valid concrete blocker parks the source immediately with no second opinion.
+
+A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
+task row is created, the complete proposal is validated for scope coverage, real delivery
+boundaries, references, cycles, and duplicates, then classified as one batch. Every child must be
+admission-ready, nonduplicate, and size S or M. Admission readiness means the scope is sufficiently
+clear for delivery; it is distinct from runtime readiness, which still requires dependencies to
+be done.
+
+Semantic proposal rejections and provider/protocol failures have independent caps of three per
+unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
+the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;
+only bounded structured attempts and final reasons are durable.
+
+One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task, classification,
+edge, membership/provenance row, source `planning -> decomposed` transition, and active-graph
+record. It then releases the freeze. Partial materialization is never visible. A partial unique
+index permits one materialized active or blocked graph per repository, and source uniqueness
+permits only one graph aggregate per source. Generated work is one level only and is immutable
+after materialization.
+
+Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
+Their atomic claim additionally requires an active decomposed source, done prerequisites, no
+failed sibling or graph blocker, and fewer than two active implementation siblings. Eligible graph
+children sort before unrelated new work, but reserve no idle capacity and never interrupt active
+unrelated work. Active siblings may finish after another child fails; no later child may start.
+
+A reviewer may submit a capability-bound, closed graph-blocker verdict for a decomposition defect.
+After validating the current run, head, membership, and evidence, the daemon atomically fails the
+affected child and blocks the graph without consuming ordinary rework. The source remains
+decomposed and the blocked graph remains active until source cancellation; recovery requires a
+replacement source, not automatic replanning after delivery has begun.
+
+The final child merge marks the source and graph done in the same transaction that marks that
+child done. Source dependents remain blocked until then. Cancelling a source atomically makes the
+graph non-runnable, cancels unfinished children, revokes authority, and records idempotent cleanup
+intents. The daemon then stops processes and closes/removes only unmerged, revocable artifacts.
+Lifecycle history, reviews, and merged delivery records remain. Direct child cancellation is
+rejected.
+
+Task revisions use compare-and-swap edits. An accepted pre-materialization edit invalidates
+pending classification/planning and restarts admission; stale/replayed edits do not count. The
+fourth accepted edit is rejected. Materialized source/child scope and graph dependencies cannot be
+edited. Daemon-owned lifecycle evidence remains writable.
+
+Decomposition reconciliation runs before ordinary recovery and provisioning. A durable freeze
+resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
+nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
+path, while any delivery evidence requires cancellation and replacement. Read-only status exposes
+bounded membership, edges, progress, attempts, provenance, and blockers. The complete storage,
+protocol, and recovery contract is in `docs/2026-07-31-task-decomposition-technical-spec.md`.
+
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
 constraints, and verification but have no routing authority. `task-create` rejects every
 `complexity:*`, `tier:*`, and `effort:*` label with usage exit 2. Existing stored routing

@@ -151,6 +151,8 @@ pub struct Task {
     pub rework_round: i64,
     pub review_only: bool,
     pub recovery_attempts: i64,
+    pub revision: i64,
+    pub edit_count: i64,
     pub continue_pr: Option<i64>,
     pub ready: bool,
 }
@@ -258,6 +260,8 @@ pub struct TaskUpdate<'a> {
     pub refs: Option<&'a str>,
     pub verdict: Option<&'a str>,
     pub depends_on: Option<&'a str>,
+    /// Required compare-and-swap token for externally editable task fields.
+    pub expected_revision: Option<i64>,
 }
 
 pub struct TransitionResult {
@@ -283,7 +287,7 @@ pub fn effect_name(e: &Effect) -> String {
 
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
-                    rework_round, review_only, recovery_attempts, continue_pr";
+                    rework_round, review_only, recovery_attempts, revision, edit_count, continue_pr";
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
@@ -304,7 +308,9 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         rework_round: r.get(14)?,
         review_only: r.get::<_, i64>(15)? != 0,
         recovery_attempts: r.get(16)?,
-        continue_pr: r.get(17)?,
+        revision: r.get(17)?,
+        edit_count: r.get(18)?,
+        continue_pr: r.get(19)?,
         ready: false,
     })
 }
@@ -1477,6 +1483,15 @@ where
     let status = task.status.parse::<Status>().map_err(QuorumError::Usage)?;
 
     match event {
+        Event::PlanningStarted
+        | Event::PlanMaterialized
+        | Event::PlanningBlocked { .. }
+        | Event::GraphCompleted => {
+            tx.commit()?;
+            return Err(QuorumError::Usage(
+                "decomposition lifecycle events require daemon authority".into(),
+            ));
+        }
         Event::SignaledDone { .. } | Event::ReworkPushed => {
             // Authorize by current assignee (fast path), then by active run
             // capability (handles replacement workers whose author field was
@@ -1814,6 +1829,21 @@ pub fn update(
     fields: &TaskUpdate,
     now: i64,
 ) -> Result<Task> {
+    struct EditableSnapshot {
+        body: Option<String>,
+        depends_on: Option<String>,
+        refs: Option<String>,
+        revision: i64,
+        edit_count: i64,
+    }
+
+    let edit_requested =
+        fields.body.is_some() || fields.refs.is_some() || fields.depends_on.is_some();
+    if edit_requested && fields.expected_revision.is_none() {
+        return Err(QuorumError::Usage(
+            "task edits require --expected-revision".into(),
+        ));
+    }
     if let Some(s) = fields.status {
         if !STATUSES.contains(&s) {
             return Err(QuorumError::Usage(format!("invalid status: {s}")));
@@ -1837,14 +1867,29 @@ pub fn update(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let existing: Option<(Option<String>, Option<String>, Option<String>)> = tx
+    let existing: Option<EditableSnapshot> = tx
         .query_row(
-            "SELECT body, depends_on, refs FROM tasks WHERE id=?1",
+            "SELECT body, depends_on, refs, revision, edit_count FROM tasks WHERE id=?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(EditableSnapshot {
+                    body: row.get(0)?,
+                    depends_on: row.get(1)?,
+                    refs: row.get(2)?,
+                    revision: row.get(3)?,
+                    edit_count: row.get(4)?,
+                })
+            },
         )
         .optional()?;
-    let (existing_body, existing_depends_on, existing_refs) = existing.unwrap_or_default();
+    let Some(existing) = existing else {
+        return Err(QuorumError::NotHolder);
+    };
+    let existing_body = existing.body;
+    let existing_depends_on = existing.depends_on;
+    let existing_refs = existing.refs;
+    let revision = existing.revision;
+    let edit_count = existing.edit_count;
     let classifier_input_changed = fields
         .body
         .is_some_and(|body| existing_body.as_deref() != Some(body))
@@ -1856,8 +1901,51 @@ pub fn update(
     } else {
         preserve_classifier_refs(&existing_refs, fields.refs)
     };
+    let edit_changed = fields
+        .body
+        .is_some_and(|body| existing_body.as_deref() != Some(body))
+        || fields
+            .depends_on
+            .is_some_and(|depends_on| existing_depends_on.as_deref() != Some(depends_on))
+        || (fields.refs.is_some() && preserved_refs != existing_refs);
 
-    let n = match fields.status {
+    if edit_requested
+        && (fields.expected_revision != Some(revision) || !edit_changed || edit_count >= 3)
+    {
+        return Err(QuorumError::NotHolder);
+    }
+
+    let generated_member: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)",
+        [id],
+        |row| row.get(0),
+    )?;
+    let graph_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions
+         WHERE source_task_id=?1 AND state NOT IN ('completed','cancelled'))",
+        [id],
+        |row| row.get(0),
+    )?;
+    if fields.status == Some("cancelled") && (generated_member || graph_source) {
+        return Err(QuorumError::Usage(
+            "decomposed tasks must be cancelled through graph cancellation".into(),
+        ));
+    }
+    if edit_requested
+        && (generated_member
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_decompositions
+                 WHERE source_task_id=?1 AND accepted_plan_revision IS NOT NULL)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?)
+    {
+        return Err(QuorumError::Usage(
+            "materialized decomposition tasks are immutable".into(),
+        ));
+    }
+
+    let mut n = match fields.status {
         Some("open") => tx.execute(
             "UPDATE tasks SET
                     status='open', assignee=NULL,
@@ -1914,7 +2002,8 @@ pub fn update(
                         body     = COALESCE(?2, body),
                         refs     = COALESCE(?3, refs),
                         updated_at = ?4
-                     WHERE id=?1 AND created_by=?5 AND assignee IS NULL AND status='open'",
+                     WHERE id=?1 AND created_by=?5 AND assignee IS NULL
+                       AND status IN ('open','planning')",
                     params![id, fields.body, preserved_refs.as_deref(), now, agent],
                 )?
             } else {
@@ -1922,6 +2011,22 @@ pub fn update(
             }
         }
     };
+    if n == 0 && edit_requested && graph_source && fields.status.is_none() {
+        n = tx.execute(
+            "UPDATE tasks SET body=COALESCE(?2,body),refs=COALESCE(?3,refs),
+                    depends_on=COALESCE(?4,depends_on),updated_at=?5
+             WHERE id=?1 AND created_by=?6 AND assignee IS NULL
+               AND status IN ('planning','failed')",
+            params![
+                id,
+                fields.body,
+                preserved_refs.as_deref(),
+                fields.depends_on,
+                now,
+                agent
+            ],
+        )?;
+    }
     if n == 0 && fields.depends_on.is_none() {
         tx.commit()?;
         return Err(QuorumError::NotHolder);
@@ -1944,6 +2049,44 @@ pub fn update(
         if dep_rows == 0 && n == 0 {
             tx.commit()?;
             return Err(QuorumError::NotHolder);
+        }
+    }
+
+    if edit_requested {
+        let revision_rows = tx.execute(
+            "UPDATE tasks SET revision=revision+1,edit_count=edit_count+1,updated_at=?3
+             WHERE id=?1 AND revision=?2 AND edit_count < 3",
+            params![id, revision, now],
+        )?;
+        if revision_rows != 1 {
+            return Err(QuorumError::NotHolder);
+        }
+        // An accepted edit before materialization cancels the pending admission
+        // aggregate and returns the new revision to ordinary classification.
+        if graph_source {
+            let graph_id: i64 = tx.query_row(
+                "SELECT id FROM task_decompositions WHERE source_task_id=?1
+                 AND accepted_plan_revision IS NULL AND active=0",
+                [id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "DELETE FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+            )?;
+            tx.execute(
+                "DELETE FROM decomposition_cleanup WHERE graph_id=?1",
+                [graph_id],
+            )?;
+            tx.execute(
+                "DELETE FROM task_graph_members WHERE graph_id=?1",
+                [graph_id],
+            )?;
+            tx.execute("DELETE FROM task_decompositions WHERE id=?1", [graph_id])?;
+            tx.execute(
+                "UPDATE tasks SET status='open',assignee=NULL WHERE id=?1",
+                [id],
+            )?;
         }
     }
 
@@ -4969,6 +5112,7 @@ mod tests {
             &TaskUpdate {
                 status: Some("cancelled"),
                 body: Some("daemon:parked:merge-blocked"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5078,6 +5222,7 @@ mod tests {
             child,
             &TaskUpdate {
                 depends_on: Some("[]"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1003,
@@ -5168,6 +5313,7 @@ mod tests {
             child,
             &TaskUpdate {
                 depends_on: Some("[]"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5199,6 +5345,7 @@ mod tests {
             id,
             &TaskUpdate {
                 depends_on: Some("[]"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5962,6 +6109,7 @@ mod tests {
             &TaskUpdate {
                 body: Some("new body"),
                 refs: Some(r#"{"pr":42}"#),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5998,6 +6146,7 @@ mod tests {
             id,
             &TaskUpdate {
                 body: Some("revised spec"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6032,6 +6181,7 @@ mod tests {
             id,
             &TaskUpdate {
                 body: Some("hijack"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6062,6 +6212,7 @@ mod tests {
             id,
             &TaskUpdate {
                 body: Some("nope"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6323,6 +6474,7 @@ mod tests {
         .unwrap();
         let fields = TaskUpdate {
             refs: Some(r#"{"pr":42,"ticket":"ABC"}"#),
+            expected_revision: Some(1),
             ..Default::default()
         };
         let updated = update(&mut c, "boss", id, &fields, 1001).unwrap();
@@ -8266,5 +8418,181 @@ mod tests {
             events, total as i64,
             "repeated ticks must not duplicate audit events"
         );
+    }
+
+    #[test]
+    fn external_edits_are_revision_bound_and_capped_without_counting_replays() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "owner", "editable", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+
+        for (revision, body) in [(1, "one"), (2, "two"), (3, "three")] {
+            let task = update(
+                &mut c,
+                "owner",
+                id,
+                &TaskUpdate {
+                    body: Some(body),
+                    expected_revision: Some(revision),
+                    ..Default::default()
+                },
+                10 + revision,
+            )
+            .unwrap();
+            assert_eq!(task.revision, revision + 1);
+            assert_eq!(task.edit_count, revision);
+        }
+
+        let replay = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("three"),
+                expected_revision: Some(3),
+                ..Default::default()
+            },
+            20,
+        );
+        assert!(matches!(replay, Err(QuorumError::NotHolder)));
+        let fourth = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("four"),
+                expected_revision: Some(4),
+                ..Default::default()
+            },
+            21,
+        );
+        assert!(matches!(fourth, Err(QuorumError::NotHolder)));
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.body.as_deref(), Some("three"));
+        assert_eq!((task.revision, task.edit_count), (4, 3));
+    }
+
+    #[test]
+    fn accepted_planning_edit_atomically_restarts_admission() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "owner", "large", None, 0, None, None, None, None, 1).unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: id,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        for now in 3..=5 {
+            crate::decomposition::record_attempt(
+                &mut c, graph, "proposal", "invalid", "retry", now,
+            )
+            .unwrap();
+        }
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "failed");
+
+        let task = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("clarified"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            (task.status.as_str(), task.revision, task.edit_count),
+            ("open", 2, 1)
+        );
+        let graphs: i64 = c
+            .query_row("SELECT count(*) FROM task_decompositions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let attempts: i64 = c
+            .query_row("SELECT count(*) FROM decomposition_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((graphs, attempts), (0, 0));
+    }
+
+    #[test]
+    fn generated_child_rejects_direct_cancel_and_scope_edit() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "owner", "large", None, 0, None, None, None, None, 1).unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        crate::decomposition::set_frozen_phase(
+            &mut c,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            3,
+        )
+        .unwrap();
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids =
+            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
+                .unwrap()
+                .unwrap();
+
+        assert!(update(
+            &mut c,
+            "owner",
+            ids[0],
+            &TaskUpdate {
+                status: Some("cancelled"),
+                ..Default::default()
+            },
+            5,
+        )
+        .is_err());
+        assert!(update(
+            &mut c,
+            "owner",
+            ids[0],
+            &TaskUpdate {
+                body: Some("changed"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            6,
+        )
+        .is_err());
+        assert_eq!(get(&c, ids[0]).unwrap().unwrap().status, "open");
     }
 }

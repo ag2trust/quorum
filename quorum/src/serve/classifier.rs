@@ -346,6 +346,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -401,6 +402,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -463,6 +465,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -484,9 +487,17 @@ mod tests {
             .feed_turn(&classifier_turn(&tasks, &[]))
             .await
             .unwrap();
-        let result = drain_classifier_events(&mut slot)
-            .await
-            .expect("terminal result");
+        // A saturated full-suite runner can delay the shell beyond one polling
+        // window. This test exercises terminal-result cleanup, so retry the
+        // bounded production poll instead of coupling it to scheduler latency.
+        let mut result = None;
+        for _ in 0..5 {
+            result = drain_classifier_events(&mut slot).await;
+            if result.is_some() {
+                break;
+            }
+        }
+        let result = result.expect("terminal result");
         assert!(matches!(result, ClassifierResult::Done(_)));
         assert_eq!(
             unsafe { libc::kill(pid, 0) },

@@ -101,6 +101,9 @@ pub enum Command {
         agent: String,
         #[arg(long = "task-id")]
         task_id: i64,
+        /// Current task revision. Required when changing body, refs, or dependencies.
+        #[arg(long = "expected-revision")]
+        expected_revision: Option<i64>,
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]

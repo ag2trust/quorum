@@ -1,0 +1,468 @@
+//! Bounded task-decomposition planner provider and protocol boundary.
+
+// This foundation module is exercised directly by its contract tests. The daemon coordinator
+// integration will consume the runtime API in the next implementation slice.
+#![allow(dead_code)]
+
+use super::agent::{self, AgentProc, AgentSpec};
+use super::codex_agent::{CodexProc, CodexSpec};
+use super::runner::{AgentEvent, AgentKind, RunnerProc};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::time::Duration;
+
+pub const CODEX_PLANNER_MODEL: &str = "gpt-5.6-sol";
+pub const CLAUDE_PLANNER_MODEL: &str = "claude-opus-4-6";
+pub const PLANNER_EFFORT: &str = "high";
+pub const PLANNER_TIMEOUT: Duration = Duration::from_secs(600);
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
+pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+const MAX_TEXT_BYTES: usize = 8 * 1024;
+const MAX_LIST_ITEMS: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
+pub enum PlannerResponse {
+    Plan {
+        tasks: Vec<ProposedTask>,
+    },
+    Blocker {
+        category: String,
+        evidence: Vec<String>,
+        required_decision: String,
+        why_no_safe_split: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedTask {
+    pub key: String,
+    pub title: String,
+    pub observable_outcome: String,
+    pub acceptance_criteria: Vec<String>,
+    pub source_constraints: Vec<String>,
+    pub verification_expectations: Vec<String>,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannerParseError {
+    Provider(String),
+    Semantic(String),
+}
+
+impl std::fmt::Display for PlannerParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(s) => write!(f, "provider failure: {s}"),
+            Self::Semantic(s) => write!(f, "semantic rejection: {s}"),
+        }
+    }
+}
+
+pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> {
+    if text.len() > MAX_RESPONSE_BYTES {
+        return Err(PlannerParseError::Provider(
+            "response exceeds 64 KiB".into(),
+        ));
+    }
+    let trimmed = text.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return Err(PlannerParseError::Provider(
+            "response must be exactly one JSON object without wrappers".into(),
+        ));
+    }
+    let response: PlannerResponse = serde_json::from_str(trimmed)
+        .map_err(|e| PlannerParseError::Provider(format!("invalid closed JSON: {e}")))?;
+    validate_semantics(&response)?;
+    Ok(response)
+}
+
+fn validate_semantics(response: &PlannerResponse) -> Result<(), PlannerParseError> {
+    match response {
+        PlannerResponse::Blocker {
+            category,
+            evidence,
+            required_decision,
+            why_no_safe_split,
+        } => {
+            const CATEGORIES: &[&str] = &[
+                "ambiguous_scope",
+                "missing_decision",
+                "external_constraint",
+                "no_safe_split",
+            ];
+            if !CATEGORIES.contains(&category.as_str()) {
+                return semantic("unsupported blocker category");
+            }
+            validate_list("blocker evidence", evidence, 1)?;
+            validate_text("required decision", required_decision)?;
+            validate_text("why no safe split", why_no_safe_split)?;
+        }
+        PlannerResponse::Plan { tasks } => {
+            if !(2..=8).contains(&tasks.len()) {
+                return semantic("plan must contain between 2 and 8 tasks");
+            }
+            let mut keys = HashSet::new();
+            for task in tasks {
+                validate_key(&task.key)?;
+                if !keys.insert(task.key.as_str()) {
+                    return semantic("task keys must be unique");
+                }
+                validate_text("title", &task.title)?;
+                validate_text("observable outcome", &task.observable_outcome)?;
+                validate_list("acceptance criteria", &task.acceptance_criteria, 1)?;
+                validate_list("source constraints", &task.source_constraints, 1)?;
+                validate_list(
+                    "verification expectations",
+                    &task.verification_expectations,
+                    1,
+                )?;
+                if task.prerequisites.len() > MAX_LIST_ITEMS {
+                    return semantic("too many prerequisites");
+                }
+            }
+            for task in tasks {
+                for prerequisite in &task.prerequisites {
+                    validate_text("prerequisite", prerequisite)?;
+                    if prerequisite == &task.key {
+                        return semantic("task cannot depend on itself");
+                    }
+                    if !keys.contains(prerequisite.as_str())
+                        && !valid_source_dependency(prerequisite)
+                    {
+                        return semantic("prerequisite must be a task key or source:<positive-id>");
+                    }
+                }
+            }
+            reject_cycles(tasks)?;
+        }
+    }
+    Ok(())
+}
+
+fn semantic<T>(message: &str) -> Result<T, PlannerParseError> {
+    Err(PlannerParseError::Semantic(message.into()))
+}
+
+fn validate_text(label: &str, value: &str) -> Result<(), PlannerParseError> {
+    if value.trim().is_empty() {
+        return semantic(&format!("{label} must not be empty"));
+    }
+    if value.len() > MAX_TEXT_BYTES {
+        return semantic(&format!("{label} exceeds {MAX_TEXT_BYTES} bytes"));
+    }
+    Ok(())
+}
+
+fn validate_list(label: &str, values: &[String], minimum: usize) -> Result<(), PlannerParseError> {
+    if values.len() < minimum || values.len() > MAX_LIST_ITEMS {
+        return semantic(&format!(
+            "{label} must contain {minimum}..={MAX_LIST_ITEMS} items"
+        ));
+    }
+    for value in values {
+        validate_text(label, value)?;
+    }
+    Ok(())
+}
+
+fn validate_key(key: &str) -> Result<(), PlannerParseError> {
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return semantic("task key must be 1-64 lowercase ASCII letters, digits, '-' or '_'");
+    }
+    Ok(())
+}
+
+fn valid_source_dependency(value: &str) -> bool {
+    value
+        .strip_prefix("source:")
+        .and_then(|id| id.parse::<i64>().ok())
+        .is_some_and(|id| id > 0)
+}
+
+fn reject_cycles(tasks: &[ProposedTask]) -> Result<(), PlannerParseError> {
+    let by_key: HashMap<&str, &ProposedTask> = tasks.iter().map(|t| (t.key.as_str(), t)).collect();
+    fn visit<'a>(
+        key: &'a str,
+        by_key: &HashMap<&'a str, &'a ProposedTask>,
+        visiting: &mut HashSet<&'a str>,
+        visited: &mut HashSet<&'a str>,
+    ) -> bool {
+        if visited.contains(key) {
+            return false;
+        }
+        if !visiting.insert(key) {
+            return true;
+        }
+        if let Some(task) = by_key.get(key) {
+            for dependency in &task.prerequisites {
+                if by_key.contains_key(dependency.as_str())
+                    && visit(dependency, by_key, visiting, visited)
+                {
+                    return true;
+                }
+            }
+        }
+        visiting.remove(key);
+        visited.insert(key);
+        false
+    }
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    if tasks
+        .iter()
+        .any(|task| visit(&task.key, &by_key, &mut visiting, &mut visited))
+    {
+        return semantic("plan contains a dependency cycle");
+    }
+    Ok(())
+}
+
+pub struct PlannerSlot {
+    pub proc: RunnerProc,
+    pub response_text: String,
+    started_at: tokio::time::Instant,
+    stdout_bytes: usize,
+}
+
+impl PlannerSlot {
+    pub async fn kill_and_reap(self) {
+        let _ = self.proc.kill_and_reap().await;
+    }
+}
+
+pub enum PlannerPoll {
+    Done(PlannerResponse),
+    ProviderFailed(String),
+    SemanticRejected(String),
+}
+
+/// Spawn only the provider selected by the configured runner. There is no
+/// fallback and model/effort are not caller-configurable.
+pub async fn spawn_planner(
+    provider: AgentKind,
+    repo: &Path,
+    prompt: &str,
+    bare: bool,
+    provider_bin: Option<&str>,
+) -> std::io::Result<PlannerSlot> {
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "planner prompt exceeds 128 KiB",
+        ));
+    }
+    let proc = match provider {
+        AgentKind::Codex => {
+            let spec = CodexSpec {
+                model: CODEX_PLANNER_MODEL.into(),
+                effort: PLANNER_EFFORT.into(),
+                sandbox: "read-only".into(),
+                worktree: repo.to_path_buf(),
+                prompt: prompt.into(),
+                env_vars: vec![],
+            };
+            CodexProc::spawn_planner(&spec, provider_bin).map(RunnerProc::Codex)?
+        }
+        AgentKind::Claude => {
+            let spec = AgentSpec {
+                kind: AgentKind::Claude,
+                model: CLAUDE_PLANNER_MODEL.into(),
+                effort: PLANNER_EFFORT.into(),
+                session_id: agent::new_session_id(),
+                worktree: repo.to_path_buf(),
+                bare,
+                allowed_tools: "Read,Glob,Grep".into(),
+                env_vars: vec![],
+            };
+            let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
+            proc.feed_turn(&agent::user_turn(prompt)).await?;
+            RunnerProc::Claude(proc)
+        }
+    };
+    Ok(PlannerSlot {
+        proc,
+        response_text: String::new(),
+        started_at: tokio::time::Instant::now(),
+        stdout_bytes: 0,
+    })
+}
+
+/// Drain a bounded amount of output. Timeout and output violations are
+/// provider failures; the caller must kill and reap the returned terminal slot.
+pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
+    if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
+        return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
+    }
+    let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
+    let poll_for = remaining.min(Duration::from_secs(2));
+    while let Ok(Some(raw)) = tokio::time::timeout(poll_for, slot.proc.next_raw_line()).await {
+        slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
+        if slot.stdout_bytes > MAX_STDOUT_BYTES {
+            return Some(PlannerPoll::ProviderFailed(
+                "planner stdout exceeded 256 KiB".into(),
+            ));
+        }
+        if slot.proc.kind() == AgentKind::Claude {
+            if let Some(super::stream::Event::Result {
+                result, is_error, ..
+            }) = super::stream::parse_line(&raw)
+            {
+                if is_error.unwrap_or(false) {
+                    return Some(PlannerPoll::ProviderFailed(
+                        "planner provider returned an error".into(),
+                    ));
+                }
+                let text = super::stream::result_text(&result);
+                if !text.is_empty() {
+                    slot.response_text = text;
+                }
+                return Some(parsed_poll(&slot.response_text));
+            }
+        }
+        for event in match slot.proc.kind() {
+            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
+            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
+        } {
+            match event {
+                AgentEvent::TurnFailed { .. } => {
+                    return Some(PlannerPoll::ProviderFailed(
+                        "planner provider turn failed".into(),
+                    ));
+                }
+                AgentEvent::TurnCompleted { .. } => {
+                    return Some(parsed_poll(&slot.response_text));
+                }
+                AgentEvent::AssistantText { text } => {
+                    if slot.response_text.len().saturating_add(text.len()) > MAX_RESPONSE_BYTES {
+                        return Some(PlannerPoll::ProviderFailed(
+                            "planner response exceeded 64 KiB".into(),
+                        ));
+                    }
+                    slot.response_text.push_str(&text);
+                }
+                _ => {}
+            }
+        }
+        if slot.started_at.elapsed() >= PLANNER_TIMEOUT {
+            return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
+        }
+    }
+    None
+}
+
+fn parsed_poll(text: &str) -> PlannerPoll {
+    match parse_response(text) {
+        Ok(response) => PlannerPoll::Done(response),
+        Err(PlannerParseError::Provider(error)) => PlannerPoll::ProviderFailed(error),
+        Err(PlannerParseError::Semantic(error)) => PlannerPoll::SemanticRejected(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "key": key,
+            "title": format!("Implement {key}"),
+            "observable_outcome": format!("{key} works"),
+            "acceptance_criteria": ["behavior is covered"],
+            "source_constraints": ["preserve atomicity"],
+            "verification_expectations": ["focused tests pass"],
+            "prerequisites": prerequisites,
+        })
+    }
+
+    #[test]
+    fn accepts_closed_plan_and_blocker() {
+        let plan = serde_json::json!({"outcome":"plan","tasks":[task("core", &[]), task("daemon", &["core", "source:7"])]});
+        assert!(matches!(
+            parse_response(&plan.to_string()),
+            Ok(PlannerResponse::Plan { .. })
+        ));
+        let blocker = serde_json::json!({
+            "outcome":"blocker", "category":"missing_decision", "evidence":["two incompatible outcomes are requested"],
+            "required_decision":"choose one outcome", "why_no_safe_split":"both children would mutate the same contract"
+        });
+        assert!(matches!(
+            parse_response(&blocker.to_string()),
+            Ok(PlannerResponse::Blocker { .. })
+        ));
+    }
+
+    #[test]
+    fn wrappers_unknown_fields_and_malformed_json_are_provider_failures() {
+        for value in [
+            "```json\n{}\n```".to_string(),
+            r#"{"outcome":"plan","tasks":[],"extra":true}"#.into(),
+            r#"{"outcome":"plan"} trailing"#.into(),
+        ] {
+            assert!(matches!(
+                parse_response(&value),
+                Err(PlannerParseError::Provider(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_blocker_and_invalid_graph_are_semantic_rejections() {
+        let blocker = r#"{"outcome":"blocker","category":"magic","evidence":[],"required_decision":"x","why_no_safe_split":"y"}"#;
+        assert!(matches!(
+            parse_response(blocker),
+            Err(PlannerParseError::Semantic(_))
+        ));
+        let cycle =
+            serde_json::json!({"outcome":"plan","tasks":[task("a", &["b"]),task("b", &["a"])]});
+        assert!(matches!(
+            parse_response(&cycle.to_string()),
+            Err(PlannerParseError::Semantic(_))
+        ));
+    }
+
+    #[test]
+    fn polling_result_preserves_independent_failure_budgets() {
+        assert!(matches!(
+            parsed_poll("not json"),
+            PlannerPoll::ProviderFailed(_)
+        ));
+        assert!(matches!(
+            parsed_poll(r#"{"outcome":"plan","tasks":[]}"#),
+            PlannerPoll::SemanticRejected(_)
+        ));
+    }
+
+    #[test]
+    fn provider_models_are_fixed_frontier_high() {
+        assert_eq!(CODEX_PLANNER_MODEL, "gpt-5.6-sol");
+        assert_eq!(CLAUDE_PLANNER_MODEL, "claude-opus-4-6");
+        assert_eq!(PLANNER_EFFORT, "high");
+    }
+
+    #[tokio::test]
+    async fn oversized_prompt_fails_before_provider_spawn() {
+        let prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let error = spawn_planner(
+            AgentKind::Codex,
+            Path::new("."),
+            &prompt,
+            false,
+            Some("provider-must-not-run"),
+        )
+        .await
+        .err()
+        .expect("oversized prompt must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}

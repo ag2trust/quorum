@@ -90,6 +90,26 @@ pub fn restricted_exec_args(spec: &CodexSpec) -> Vec<String> {
     ]
 }
 
+/// Planner-specific Codex arguments. This pins the provider's mechanism-level
+/// read-only sandbox and never includes the worker escape hatch.
+pub fn planner_exec_args(spec: &CodexSpec) -> Vec<String> {
+    vec![
+        "exec".into(),
+        "--json".into(),
+        "--model".into(),
+        spec.model.clone(),
+        "-c".into(),
+        format!("model_reasoning_effort={}", spec.effort),
+        "-s".into(),
+        "read-only".into(),
+        "-C".into(),
+        spec.worktree.display().to_string(),
+        "--skip-git-repo-check".into(),
+        "--ignore-user-config".into(),
+        spec.prompt.clone(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Process wrapper
 // ---------------------------------------------------------------------------
@@ -102,6 +122,43 @@ pub struct CodexProc {
 }
 
 impl CodexProc {
+    /// Read-only, single-turn planner boundary. Kept separate from worker
+    /// spawning so future worker flags cannot silently weaken planning.
+    pub fn spawn_planner(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
+        let bin = codex_bin.unwrap_or("codex");
+        let mut cmd = Command::new(bin);
+        cmd.args(planner_exec_args(spec));
+        for (k, v) in &spec.env_vars {
+            cmd.env(k, v);
+        }
+        strip_planner_coordination_env(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(&spec.worktree);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let reader = BufReader::new(child.stdout.take().expect("stdout was piped")).lines();
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        Ok(Self {
+            child,
+            reader,
+            diagnostics,
+            stderr_task,
+        })
+    }
+
     /// Restricted single-turn mode for classifiers.  It deliberately omits the
     /// normal worker escape hatch that disables Codex sandbox/approval policy.
     pub fn spawn_restricted(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -280,6 +337,19 @@ impl CodexProc {
     }
 }
 
+fn strip_planner_coordination_env(cmd: &mut Command) {
+    for name in [
+        "QUORUM_AGENT",
+        "QUORUM_HOME",
+        "QUORUM_REPO",
+        "QUORUM_RUN_ID",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ] {
+        cmd.env_remove(name);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -415,6 +485,21 @@ mod tests {
             ]
         );
         assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+    }
+
+    #[test]
+    fn planner_exec_args_pin_read_only_frontier_boundary() {
+        let mut spec = test_spec();
+        spec.model = "gpt-5.6-sol".into();
+        spec.effort = "high".into();
+        let args = planner_exec_args(&spec);
+        assert_eq!(args[3], "gpt-5.6-sol");
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
+        assert!(args.contains(&"--ignore-user-config".into()));
     }
 
     // ── Pinned resume argument shape ─────────────────────────────────────

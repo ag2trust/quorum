@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 34). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 36). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- dies and the task reopens; reset when the task reaches a meaningful lifecycle
     -- handoff (in-review via submit/rework-push). Cancels the task when exhausted.
     recovery_attempts INTEGER NOT NULL DEFAULT 0,
+    -- v35: optimistic concurrency authority for edits and planning input.
+    revision     INTEGER NOT NULL DEFAULT 1,
+    edit_count   INTEGER NOT NULL DEFAULT 0,
     -- v35: authoritative existing-PR implementation intent. Unlike refs.pr, this field is
     -- creator-selected only through --continue-pr and controls daemon provisioning.
     continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0)
@@ -91,6 +94,73 @@ CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC)
 -- REVIEWING_TASK_LIMIT-sized candidate sets are merged for global ordering.
 CREATE INDEX IF NOT EXISTS tasks_reviewing_newest
     ON tasks(status, updated_at DESC, id DESC);
+
+-- v35: one bounded decomposition aggregate per source task. `active` and
+-- `freeze_active` are explicit partial-index sentinels, never inferred from
+-- text state, so racing writers lose at SQLite's uniqueness boundary.
+CREATE TABLE IF NOT EXISTS task_decompositions (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_task_id          INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
+    state                   TEXT NOT NULL CHECK(state IN (
+                                'freeze-requested','draining','planning','validating',
+                                'preclassifying','provider-backoff','held','active',
+                                'blocked','completed','cancelled')),
+    active                  INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    freeze_active           INTEGER NOT NULL DEFAULT 0 CHECK(freeze_active IN (0,1)),
+    planned_source_revision INTEGER NOT NULL,
+    plan_revision           INTEGER NOT NULL DEFAULT 1,
+    proposal_attempts       INTEGER NOT NULL DEFAULT 0,
+    provider_failures       INTEGER NOT NULL DEFAULT 0,
+    planner_provider        TEXT,
+    planner_model           TEXT,
+    planner_session_id      TEXT,
+    frozen_base_sha         TEXT,
+    accepted_plan_revision  INTEGER,
+    hold_code               TEXT,
+    hold_summary            TEXT,
+    created_at              INTEGER NOT NULL,
+    updated_at              INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_graph
+    ON task_decompositions(active) WHERE active = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS one_planning_freeze
+    ON task_decompositions(freeze_active) WHERE freeze_active = 1;
+
+CREATE TABLE IF NOT EXISTS task_graph_members (
+    graph_id      INTEGER NOT NULL REFERENCES task_decompositions(id),
+    task_id       INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
+    local_key     TEXT NOT NULL,
+    plan_revision INTEGER NOT NULL,
+    active        INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    PRIMARY KEY (graph_id, plan_revision, local_key)
+);
+CREATE INDEX IF NOT EXISTS task_graph_members_graph_active
+    ON task_graph_members(graph_id, active);
+
+CREATE TABLE IF NOT EXISTS decomposition_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    graph_id         INTEGER NOT NULL REFERENCES task_decompositions(id),
+    source_revision  INTEGER NOT NULL,
+    kind             TEXT NOT NULL CHECK(kind IN ('proposal','provider','blocker','recovery')),
+    ordinal          INTEGER NOT NULL,
+    reason_code      TEXT NOT NULL,
+    summary          TEXT NOT NULL,
+    created_at       INTEGER NOT NULL,
+    UNIQUE (graph_id, source_revision, kind, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS decomposition_cleanup (
+    graph_id       INTEGER NOT NULL REFERENCES task_decompositions(id),
+    task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    artifact_kind  TEXT NOT NULL,
+    artifact_ref   TEXT NOT NULL,
+    state          TEXT NOT NULL DEFAULT 'pending'
+                       CHECK(state IN ('pending','complete','failed')),
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
+);
 
 CREATE TABLE IF NOT EXISTS errors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

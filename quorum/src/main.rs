@@ -485,6 +485,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::TaskUpdate {
             agent,
             task_id,
+            expected_revision,
             status,
             refs,
             body_stdin,
@@ -513,6 +514,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     refs: refs.as_deref(),
                     verdict: None,
                     depends_on: depends_on.as_deref(),
+                    expected_revision,
                 };
                 quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?
             } else {
