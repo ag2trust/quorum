@@ -49,6 +49,7 @@ pub struct CleanupIntent {
 pub struct GraphBlocker<'a> {
     pub task_id: i64,
     pub reviewer: &'a str,
+    pub run_id: &'a str,
     pub category: &'a str,
     pub violated_boundary: &'a str,
     pub evidence: &'a [String],
@@ -558,6 +559,20 @@ fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> R
 /// affected review authority. The graph remains active-but-blocked so the
 /// repository-wide active-graph exclusion remains authoritative.
 pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<bool> {
+    if [
+        blocker.reviewer,
+        blocker.run_id,
+        blocker.category,
+        blocker.violated_boundary,
+    ]
+    .iter()
+    .any(|text| text.contains('\0'))
+        || blocker.evidence.iter().any(|item| item.contains('\0'))
+    {
+        return Err(QuorumError::BadInput(
+            "embedded NUL in graph-blocker input".into(),
+        ));
+    }
     if blocker.category.trim().is_empty()
         || blocker.category.len() > 128
         || blocker.violated_boundary.trim().is_empty()
@@ -586,21 +601,39 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
     }
 
     let tx = begin_immediate(conn)?;
-    let graph: Option<(i64, i64)> = tx
+    let graph: Option<(i64, i64, i64)> = tx
         .query_row(
-            "SELECT d.id,d.planned_source_revision
+            "SELECT d.id,d.planned_source_revision,review_run.id
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
              JOIN tasks child ON child.id=m.task_id
              JOIN tasks source ON source.id=d.source_task_id
+             JOIN run_capabilities capability
+               ON capability.run_id=?3 AND capability.task_id=m.task_id
+              AND capability.agent=?2 AND capability.role='reviewer'
+              AND capability.revoked_at IS NULL
+             JOIN agent_runs review_run
+               ON review_run.task_id=m.task_id AND review_run.agent_name=?2
+              AND review_run.role='reviewer' AND review_run.ended_at IS NULL
              WHERE m.task_id=?1 AND m.active=1 AND d.state='active' AND d.active=1
                AND source.status='decomposed' AND child.status='in-review'
-               AND child.reviewer=?2",
-            params![blocker.task_id, blocker.reviewer],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+               AND child.reviewer=?2
+               AND capability.rowid=(
+                   SELECT current_capability.rowid FROM run_capabilities current_capability
+                   WHERE current_capability.task_id=m.task_id
+                     AND current_capability.role='reviewer'
+                   ORDER BY current_capability.created_at DESC,current_capability.rowid DESC
+                   LIMIT 1
+               )
+               AND review_run.id=(
+                   SELECT MAX(current_run.id) FROM agent_runs current_run
+                   WHERE current_run.task_id=m.task_id AND current_run.role='reviewer'
+               )",
+            params![blocker.task_id, blocker.reviewer, blocker.run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((graph_id, source_revision)) = graph else {
+    let Some((graph_id, source_revision, agent_run_id)) = graph else {
         tx.commit().map_err(map_sql_err)?;
         return Ok(false);
     };
@@ -632,11 +665,32 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
         "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
         [format!("task#{}", blocker.task_id)],
     )?;
-    tx.execute(
+    let revoked = tx.execute(
         "UPDATE run_capabilities SET revoked_at=?2
-         WHERE task_id=?1 AND role='reviewer' AND revoked_at IS NULL",
-        params![blocker.task_id, blocker.now],
+         WHERE run_id=?1 AND task_id=?3 AND agent=?4 AND role='reviewer'
+           AND revoked_at IS NULL",
+        params![
+            blocker.run_id,
+            blocker.now,
+            blocker.task_id,
+            blocker.reviewer
+        ],
     )?;
+    if revoked != 1 {
+        return Err(QuorumError::Io(
+            "reviewer capability changed during graph-blocker transaction".into(),
+        ));
+    }
+    let closed_run = tx.execute(
+        "UPDATE agent_runs SET ended_at=?2,end_reason='graph-blocker'
+         WHERE id=?1 AND ended_at IS NULL",
+        params![agent_run_id, blocker.now],
+    )?;
+    if closed_run != 1 {
+        return Err(QuorumError::Io(
+            "reviewer run changed during graph-blocker transaction".into(),
+        ));
+    }
     tx.execute(
         "UPDATE task_decompositions SET state='blocked',hold_code=?2,
              hold_summary=?3,updated_at=?4 WHERE id=?1 AND state='active' AND active=1",
@@ -816,6 +870,46 @@ mod tests {
             prerequisite_keys: deps.iter().map(|s| (*s).into()).collect(),
             source_dependency_ids: vec![],
         }
+    }
+
+    fn make_reviewable_graph(conn: &mut Connection) -> (i64, Vec<i64>) {
+        let graph = begin(conn);
+        let ids = materialize_graph(conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='in-review',reviewer='r',assignee='r' WHERE id=?1",
+            [ids[0]],
+        )
+        .unwrap();
+        (graph, ids)
+    }
+
+    fn add_reviewer_authority(
+        conn: &mut Connection,
+        task_id: i64,
+        agent: &str,
+        run_id: &str,
+        role: &str,
+        now: i64,
+    ) -> i64 {
+        let agent_run = crate::agent_runs::insert(
+            conn, task_id, agent, "reviewer", "model", "high", "codex", now,
+        )
+        .unwrap();
+        crate::capabilities::issue(conn, run_id, task_id, agent, role, now).unwrap();
+        agent_run
+    }
+
+    fn graph_mutation_state(conn: &Connection, graph: i64, child: i64) -> (String, String, i64) {
+        conn.query_row(
+            "SELECT d.state,t.status,
+                    (SELECT count(*) FROM decomposition_attempts a WHERE a.graph_id=d.id)
+             FROM task_decompositions d JOIN tasks t ON t.id=?2 WHERE d.id=?1",
+            params![graph, child],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1242,21 +1336,15 @@ mod tests {
     #[test]
     fn graph_blocker_is_atomic_and_stale_signal_is_clean() {
         let mut conn = setup();
-        let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
-        conn.execute(
-            "UPDATE tasks SET status='in-review',reviewer='r',assignee='r' WHERE id=?1",
-            [ids[0]],
-        )
-        .unwrap();
+        let (graph, ids) = make_reviewable_graph(&mut conn);
+        let agent_run = add_reviewer_authority(&mut conn, ids[0], "r", "review-run", "reviewer", 4);
         let evidence = vec!["diff moves sibling-owned schema work into this child".into()];
         assert!(block_graph(
             &mut conn,
             &GraphBlocker {
                 task_id: ids[0],
                 reviewer: "r",
+                run_id: "review-run",
                 category: "boundary-violation",
                 violated_boundary: "child must not absorb sibling scope",
                 evidence: &evidence,
@@ -1269,6 +1357,7 @@ mod tests {
             &GraphBlocker {
                 task_id: ids[0],
                 reviewer: "r",
+                run_id: "review-run",
                 category: "boundary-violation",
                 violated_boundary: "child must not absorb sibling scope",
                 evidence: &evidence,
@@ -1295,6 +1384,140 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let authority: (Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT c.revoked_at,r.ended_at,r.end_reason FROM run_capabilities c
+                 JOIN agent_runs r ON r.id=?2 WHERE c.run_id=?1",
+                params!["review-run", agent_run],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(authority, (Some(5), Some(5), Some("graph-blocker".into())));
+    }
+
+    #[test]
+    fn graph_blocker_rejects_unknown_revoked_wrong_and_superseded_runs_without_mutation() {
+        enum InvalidRun {
+            Unknown,
+            Revoked,
+            WrongRole,
+            WrongTask,
+            WrongAgent,
+            Superseded,
+        }
+        for case in [
+            InvalidRun::Unknown,
+            InvalidRun::Revoked,
+            InvalidRun::WrongRole,
+            InvalidRun::WrongTask,
+            InvalidRun::WrongAgent,
+            InvalidRun::Superseded,
+        ] {
+            let mut conn = setup();
+            let (graph, ids) = make_reviewable_graph(&mut conn);
+            let attempted_run = match case {
+                InvalidRun::Unknown => {
+                    crate::agent_runs::insert(
+                        &conn, ids[0], "r", "reviewer", "model", "high", "codex", 4,
+                    )
+                    .unwrap();
+                    "unknown"
+                }
+                InvalidRun::Revoked => {
+                    add_reviewer_authority(&mut conn, ids[0], "r", "revoked", "reviewer", 4);
+                    crate::capabilities::revoke(&mut conn, "revoked", 5).unwrap();
+                    "revoked"
+                }
+                InvalidRun::WrongRole => {
+                    add_reviewer_authority(&mut conn, ids[0], "r", "worker-run", "worker", 4);
+                    "worker-run"
+                }
+                InvalidRun::WrongTask => {
+                    crate::agent_runs::insert(
+                        &conn, ids[0], "r", "reviewer", "model", "high", "codex", 4,
+                    )
+                    .unwrap();
+                    crate::capabilities::issue(&mut conn, "other-task", ids[1], "r", "reviewer", 4)
+                        .unwrap();
+                    "other-task"
+                }
+                InvalidRun::WrongAgent => {
+                    crate::agent_runs::insert(
+                        &conn, ids[0], "r", "reviewer", "model", "high", "codex", 4,
+                    )
+                    .unwrap();
+                    crate::capabilities::issue(
+                        &mut conn,
+                        "other-agent",
+                        ids[0],
+                        "impostor",
+                        "reviewer",
+                        4,
+                    )
+                    .unwrap();
+                    "other-agent"
+                }
+                InvalidRun::Superseded => {
+                    add_reviewer_authority(&mut conn, ids[0], "r", "old-run", "reviewer", 4);
+                    add_reviewer_authority(&mut conn, ids[0], "r", "new-run", "reviewer", 5);
+                    "old-run"
+                }
+            };
+            let before = graph_mutation_state(&conn, graph, ids[0]);
+            let evidence = vec!["concrete repository evidence".into()];
+            assert!(!block_graph(
+                &mut conn,
+                &GraphBlocker {
+                    task_id: ids[0],
+                    reviewer: "r",
+                    run_id: attempted_run,
+                    category: "boundary-violation",
+                    violated_boundary: "assigned boundary",
+                    evidence: &evidence,
+                    now: 10,
+                }
+            )
+            .unwrap());
+            assert_eq!(graph_mutation_state(&conn, graph, ids[0]), before);
+        }
+    }
+
+    #[test]
+    fn graph_blocker_rejects_nul_in_every_text_field_without_mutation() {
+        for field in 0..5 {
+            let mut conn = setup();
+            let (graph, ids) = make_reviewable_graph(&mut conn);
+            add_reviewer_authority(&mut conn, ids[0], "r", "review-run", "reviewer", 4);
+            let mut reviewer = "r".to_string();
+            let mut run_id = "review-run".to_string();
+            let mut category = "boundary-violation".to_string();
+            let mut boundary = "assigned boundary".to_string();
+            let mut evidence = vec!["concrete repository evidence".to_string()];
+            match field {
+                0 => reviewer.push('\0'),
+                1 => run_id.push('\0'),
+                2 => category.push('\0'),
+                3 => boundary.push('\0'),
+                4 => evidence[0].push('\0'),
+                _ => unreachable!(),
+            }
+            let before = graph_mutation_state(&conn, graph, ids[0]);
+            let error = block_graph(
+                &mut conn,
+                &GraphBlocker {
+                    task_id: ids[0],
+                    reviewer: &reviewer,
+                    run_id: &run_id,
+                    category: &category,
+                    violated_boundary: &boundary,
+                    evidence: &evidence,
+                    now: 10,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, QuorumError::BadInput(_)));
+            assert_eq!(graph_mutation_state(&conn, graph, ids[0]), before);
+        }
     }
 
     #[test]
@@ -1382,5 +1605,104 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(winners, 2, "round {round}");
         }
+    }
+
+    /// Internal subprocess entrypoint for the process-level graph claim canary.
+    /// It is reachable only by re-executing this test binary with the private
+    /// environment tuple; no user-facing claim command is introduced.
+    #[test]
+    fn process_child_claim_helper() {
+        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_CLAIM_DB") else {
+            return;
+        };
+        let task_id: i64 = std::env::var("QUORUM_TEST_GRAPH_CLAIM_TASK")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let agent = std::env::var("QUORUM_TEST_GRAPH_CLAIM_AGENT").unwrap();
+        let ready_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_READY").unwrap();
+        let go_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_GO").unwrap();
+        let result_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_RESULT").unwrap();
+        std::fs::write(&ready_path, b"ready").unwrap();
+        for _ in 0..500 {
+            if std::path::Path::new(&go_path).exists() {
+                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
+                let won = crate::tasks::claim(&mut conn, &agent, Some(task_id), &[], 60, 10)
+                    .unwrap()
+                    .is_some();
+                std::fs::write(&result_path, if won { b"1" } else { b"0" }).unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for process claim barrier");
+    }
+
+    #[test]
+    fn real_process_child_claims_never_exceed_two() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("quorum.db");
+        let mut conn = crate::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[]), child("c", &[])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        drop(conn);
+
+        let go_path = dir.path().join("go");
+        let test_binary = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        let mut ready_paths = Vec::new();
+        let mut result_paths = Vec::new();
+        for (index, task_id) in ids.into_iter().enumerate() {
+            let ready_path = dir.path().join(format!("ready-{index}"));
+            let result_path = dir.path().join(format!("result-{index}"));
+            let child = Command::new(&test_binary)
+                .arg("--exact")
+                .arg("decomposition::tests::process_child_claim_helper")
+                .arg("--nocapture")
+                .env("QUORUM_TEST_GRAPH_CLAIM_DB", &db_path)
+                .env("QUORUM_TEST_GRAPH_CLAIM_TASK", task_id.to_string())
+                .env("QUORUM_TEST_GRAPH_CLAIM_AGENT", format!("process-{index}"))
+                .env("QUORUM_TEST_GRAPH_CLAIM_READY", &ready_path)
+                .env("QUORUM_TEST_GRAPH_CLAIM_GO", &go_path)
+                .env("QUORUM_TEST_GRAPH_CLAIM_RESULT", &result_path)
+                .spawn()
+                .unwrap();
+            children.push(child);
+            ready_paths.push(ready_path);
+            result_paths.push(result_path);
+        }
+        for _ in 0..500 {
+            if ready_paths.iter().all(|path| path.exists()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready_paths.iter().all(|path| path.exists()));
+        std::fs::write(&go_path, b"go").unwrap();
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let winners = result_paths
+            .iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .filter(|result| result == "1")
+            .count();
+        assert_eq!(winners, 2);
     }
 }
