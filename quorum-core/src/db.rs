@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 35;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -478,6 +478,13 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // than sorting every historical review-only task. Bumping is required
         // for live v33 databases, where SCHEMA_SQL would otherwise be skipped.
 
+        // v35 = authoritative existing-PR implementation intent. Nullable preserves every
+        // historical task as ordinary/review-only; the positive check is enforced for fresh
+        // databases and the CLI/core boundary validates writes on upgraded databases.
+        if current < 35 && !column_exists(conn, "tasks", "continue_pr")? {
+            conn.execute("ALTER TABLE tasks ADD COLUMN continue_pr INTEGER", [])?;
+        }
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -566,6 +573,49 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v34_migration_adds_nullable_continue_pr_without_reinterpreting_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v34.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                    created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                    sticky_until INTEGER, orig TEXT, author TEXT, reviewer TEXT,
+                    rework_round INTEGER NOT NULL DEFAULT 0,
+                    review_only INTEGER NOT NULL DEFAULT 0,
+                    recovery_attempts INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO tasks
+                    (title,status,created_by,created_at,updated_at,refs)
+                    VALUES ('historical','failed','boss',1,1,'{\"pr\":19}');
+                 PRAGMA user_version = 34;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let continue_pr: Option<i64> = conn
+            .query_row("SELECT continue_pr FROM tasks WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(continue_pr, None);
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "continue_pr").unwrap());
     }
 
     #[test]

@@ -95,6 +95,26 @@ PR author must update the branch and create a new review request as needed; the 
 fail because Quorum cannot assign rework. Merge conflicts likewise require the outside
 author to update the PR before review/merge can continue.
 
+If implementation must continue from an existing PR, use `--continue-pr` instead:
+
+```sh
+quorum task-create \
+  --created-by coordinator \
+  --title "Continue implementation of PR #412" \
+  --continue-pr 412 \
+  --labels '["type:implementation"]' \
+  --body-stdin <<'EOF'
+Finish the existing implementation and verify the complete result.
+EOF
+```
+
+`--continue-pr` creates an implementation task at the exact head of an open PR in the
+managed repository. The daemon publishes the worker's result back to that PR only while
+its recorded branch and head SHA still match; concurrent movement fails closed rather
+than silently falling back to a new branch or PR. `--continue-pr` and `--review-pr` are
+mutually exclusive. Generic task refs are metadata, not publication authority, and task
+creators must not supply `refs.pr` to emulate either mode.
+
 Task creators describe scope and acceptance criteria but do not select complexity, model,
 or effort. The daemon classifies each task before dispatch and applies its configured
 provider's routing table. Labels beginning with `complexity:`, `tier:`, or `effort:` are

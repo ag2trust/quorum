@@ -81,7 +81,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v29: durable crash-recovery budget. Incremented each time a managed worker
     -- dies and the task reopens; reset when the task reaches a meaningful lifecycle
     -- handoff (in-review via submit/rework-push). Cancels the task when exhausted.
-    recovery_attempts INTEGER NOT NULL DEFAULT 0
+    recovery_attempts INTEGER NOT NULL DEFAULT 0,
+    -- v35: authoritative existing-PR implementation intent. Unlike refs.pr, this field is
+    -- creator-selected only through --continue-pr and controls daemon provisioning.
+    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0)
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two

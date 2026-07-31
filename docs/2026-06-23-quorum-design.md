@@ -206,6 +206,8 @@ DEFAULT 0` is required — a NULL falls *out* of the partial index and silently 
 INTEGER NOT NULL DEFAULT 0 · `labels` TEXT (json) · `assignee` TEXT · `created_by` TEXT NOT
 NULL · `created_at` · `updated_at` · `refs` TEXT (json) · `author` TEXT · `reviewer` TEXT ·
 `rework_round` INTEGER NOT NULL DEFAULT 0 · `review_only` INTEGER NOT NULL DEFAULT 0 ·
+`continue_pr` INTEGER NULL (authoritative existing-PR implementation entry; never inferred
+from `refs.pr`) ·
 `depends_on` TEXT (json array of task IDs).
 
 ### `errors` — observable *abnormal* failures
@@ -296,10 +298,14 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-create --created-by <id> --title <s> [--priority N] [--labels <json>] [--depends-on <json>] (--body-stdin | --body-file <p> | --json-stdin)` → `{id}` (status: `open`)
 - `quorum task-create ... --review-pr <N>` → review-only task (status: `in-review`,
   `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
+- `quorum task-create ... --continue-pr <N>` → implementation task (status: `open`,
+  `continue_pr=N`) rooted at the exact head of an open same-repository PR. It follows the
+  normal worker/review/rework/merge lifecycle and publishes back to that PR under lease.
+  `--continue-pr` and `--review-pr` are mutually exclusive.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
-- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
+- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr`; that association is daemon-owned. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
   state except `done`/`cancelled` — `failed` is included, because a task whose PR landed
@@ -558,6 +564,20 @@ only through an explicit outside request)
   with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
   through to generic implementation-worker provisioning, because remediation must retain
   the adopted PR target.
+- **Existing-PR implementation entry:** `task-create --continue-pr N` creates an `open`
+  implementation intent and atomically rejects an already-owned PR. Before provisioning,
+  the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal
+  ownership, and persists its exact head branch and SHA. The worker starts from that commit,
+  and later publication targets only that branch under the recorded SHA lease. Ownership ambiguity, closure,
+  branch replacement, or SHA movement fails closed; Quorum neither rebases onto the new
+  head nor silently falls back to fresh implementation or a new PR. Existing same-task
+  rework continues through the established PR association and does not create a new entry.
+- **Entry authority:** task creators select exactly one of fresh implementation (neither
+  flag), review-only (`--review-pr`), or existing-PR implementation (`--continue-pr`).
+  They never choose a lifecycle status. Generic `refs.pr` is display/correlation metadata,
+  not Proposed Change ownership or publication authority, and creator-supplied `refs.pr`
+  is rejected. Only a successful daemon lifecycle transition may establish or update the
+  authoritative PR association.
 - **Sticky InReview:** reviewer crash/expiry does NOT leave InReview — the task stays and a
   new reviewer is spawned. Prevents review tasks from reverting to Open.
 - **Resume semantics:** rework feeds a new turn to the existing worker (ResumeWorker);
