@@ -4971,10 +4971,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed.status, "open");
-        // Now claimable
+        assert!(
+            !classification_is_complete(&resumed.refs),
+            "dependency edits must invalidate the old classifier envelope"
+        );
+        assert!(
+            claim(&mut c, "A", Some(child), &[], TTL, 1004)
+                .unwrap()
+                .is_none(),
+            "clearing dependencies does not bypass fresh classification"
+        );
+        crate::classify::store_classifications(
+            &mut c,
+            &[crate::classify::TaskClassification {
+                task_id: child,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "test:v2",
+            1004,
+        )
+        .unwrap();
+        // Fresh classification restores eligibility after the dependency edit.
         let t = claim(&mut c, "A", Some(child), &[], TTL, 1004)
             .unwrap()
-            .expect("child with cleared deps should be claimable");
+            .expect("freshly classified child with cleared deps should be claimable");
         assert_eq!(t.status, "working");
     }
 
