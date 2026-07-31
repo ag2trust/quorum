@@ -191,13 +191,15 @@ pub fn record_attempt(
     Ok(Some(ordinal))
 }
 
-/// Reacquire the freeze before retrying a provider failure. The partial unique
-/// index is the repository-wide race authority. `Ok(false)` is a normal loss.
+/// Reacquire the freeze before retrying a provider failure or resuming a
+/// recovery-reset aggregate. The partial unique index is the repository-wide
+/// race authority. `Ok(false)` is a normal loss.
 pub fn reacquire_freeze(conn: &mut Connection, graph_id: i64, now: i64) -> Result<bool> {
     let tx = begin_immediate(conn)?;
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='freeze-requested',freeze_active=1,updated_at=?2
-         WHERE id=?1 AND state='provider-backoff' AND active=0 AND freeze_active=0",
+         WHERE id=?1 AND state IN ('provider-backoff','freeze-requested')
+           AND active=0 AND freeze_active=0",
         params![graph_id, now],
     );
     if matches!(&changed, Err(error) if is_unique_constraint(error)) {
@@ -319,19 +321,30 @@ pub fn materialize_graph(
     }
 
     let tx = begin_immediate(conn)?;
-    let aggregate: Option<(i64, i64, i64, i64, String)> = tx
+    let aggregate: Option<(i64, i64, i64, i64, String, Option<String>)> = tx
         .query_row(
             "SELECT d.source_task_id,d.planned_source_revision,d.plan_revision,
-                    t.priority,t.created_by
+                    t.priority,t.created_by,t.depends_on
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.id=?1 AND d.state IN ('planning','validating','preclassifying')
                AND d.freeze_active=1 AND d.active=0 AND t.status='planning'
                AND t.revision=?2",
             params![graph_id, expected_source_revision],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((source_id, planned_revision, plan_revision, priority, creator)) = aggregate else {
+    let Some((source_id, planned_revision, plan_revision, priority, creator, source_depends_on)) =
+        aggregate
+    else {
         return Ok(None);
     };
     if planned_revision != expected_source_revision {
@@ -344,6 +357,34 @@ pub fn materialize_graph(
     )?;
     if existing_active {
         return Ok(None);
+    }
+    let source_dependencies: HashSet<i64> = source_depends_on
+        .as_deref()
+        .map(serde_json::from_str::<Vec<i64>>)
+        .transpose()
+        .map_err(|_| QuorumError::Usage("source task has invalid dependencies".into()))?
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    for dependency in children
+        .iter()
+        .flat_map(|child| child.source_dependency_ids.iter())
+    {
+        if !source_dependencies.contains(dependency) {
+            return Err(QuorumError::Usage(
+                "generated task dependency is not a source dependency".into(),
+            ));
+        }
+        let done: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND status='done')",
+            [dependency],
+            |r| r.get(0),
+        )?;
+        if !done {
+            return Err(QuorumError::Usage(
+                "generated source dependency is not done".into(),
+            ));
+        }
     }
 
     let mut ids = Vec::with_capacity(children.len());
@@ -731,6 +772,78 @@ mod tests {
     }
 
     #[test]
+    fn materialization_rejects_dependency_outside_source_and_rolls_back() {
+        let mut conn = setup();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('unrelated','done','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = begin(&mut conn);
+        let mut first = child("a", &[]);
+        first.source_dependency_ids = vec![2];
+
+        assert!(materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 4).is_err());
+        let children: i64 = conn
+            .query_row("SELECT count(*) FROM task_graph_members", [], |r| r.get(0))
+            .unwrap();
+        let tasks: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(children, 0);
+        assert_eq!(tasks, 2);
+    }
+
+    #[test]
+    fn materialization_accepts_done_source_dependency() {
+        let mut conn = setup();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('prerequisite','done','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET depends_on='[2]' WHERE id=1", [])
+            .unwrap();
+        let graph = begin(&mut conn);
+        let mut first = child("a", &[]);
+        first.source_dependency_ids = vec![2];
+
+        let ids = materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        let dependencies: String = conn
+            .query_row("SELECT depends_on FROM tasks WHERE id=?1", [ids[0]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(dependencies, "[2]");
+    }
+
+    #[test]
+    fn materialization_rejects_unfinished_source_dependency() {
+        let mut conn = setup();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('prerequisite','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET depends_on='[2]' WHERE id=1", [])
+            .unwrap();
+        let graph = begin(&mut conn);
+        let mut first = child("a", &[]);
+        first.source_dependency_ids = vec![2];
+
+        assert!(materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 4).is_err());
+        let children: i64 = conn
+            .query_row("SELECT count(*) FROM task_graph_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(children, 0);
+    }
+
+    #[test]
     fn blocker_does_not_consume_retry_budgets() {
         let mut conn = setup();
         let graph = begin(&mut conn);
@@ -847,5 +960,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("freeze-requested".into(), 2));
+    }
+
+    #[test]
+    fn recovery_reset_reacquires_freeze_and_can_materialize_again() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+
+        assert!(recovery_reset(&mut conn, graph, "inconsistent", 5).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 6).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 7).unwrap()
+        );
+        assert!(set_frozen_phase(&mut conn, graph, "planning", "preclassifying", None, 8).unwrap());
+        let replacement =
+            materialize_graph(&mut conn, graph, 1, &[child("c", &[]), child("d", &[])], 9)
+                .unwrap()
+                .unwrap();
+        assert_eq!(replacement.len(), 2);
+        let state: (String, i64, i64) = conn
+            .query_row(
+                "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, 0));
     }
 }
