@@ -1472,6 +1472,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     break;
                 }
                 let pending_task_ids: Vec<i64> = tasks.iter().map(|task| task.id).collect();
+                let pending_inputs = quorum_core::classify::classification_inputs(&tasks);
                 let recommendations = quorum_core::complexity::recommendation_lines(
                     quorum_core::complexity::RecommendationProvider::Claude,
                 );
@@ -1534,21 +1535,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
                 let stored = {
                     let mut conn = quorum_core::db::open(&db)?;
-                    quorum_core::classify::store_classifications(
+                    quorum_core::classify::store_classifications_for_inputs(
                         &mut conn,
                         &results,
+                        &pending_inputs,
                         &quorum_core::classify::classifier_provenance(
                             serve::classifier::CLASSIFIER_MODEL,
                         ),
                         quorum_core::clock::now(),
                     )?
                 };
-                if stored != pending_task_ids.len() {
-                    return Err(QuorumError::Io(format!(
-                        "classifier stored {stored} tasks for {} requested tasks",
-                        pending_task_ids.len()
-                    )));
-                }
                 total_stored += stored;
                 total_tasks += pending_task_ids.len();
             }

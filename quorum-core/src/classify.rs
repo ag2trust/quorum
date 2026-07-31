@@ -37,6 +37,32 @@ pub struct TaskForClassification {
     pub recovery_notes: Vec<String>,
 }
 
+/// An internally-derived identity for the exact bounded task input given to a
+/// classifier turn.  It deliberately does not come from the provider response:
+/// a result is useful only if this identity still matches inside the later
+/// persistence transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassificationInput {
+    pub task_id: i64,
+    fingerprint: String,
+}
+
+/// Snapshot classifier inputs before starting a provider turn.
+pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<ClassificationInput> {
+    tasks
+        .iter()
+        .map(|task| ClassificationInput {
+            task_id: task.id,
+            // `TaskForClassification` is a struct (not a map), so serde emits
+            // a stable field order.  Keep the entire bounded prompt input,
+            // including dependency titles/statuses and recovery notes, in the
+            // identity rather than relying on generic `updated_at`.
+            fingerprint: serde_json::to_string(task)
+                .expect("TaskForClassification always serializes"),
+        })
+        .collect()
+}
+
 const VALID_SIZES: &[&str] = &["S", "M", "L", "XL"];
 pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
 pub const DUP_CONTEXT_LIMIT: usize = 60;
@@ -193,6 +219,31 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
     .map_err(Into::into)
 }
 
+/// Read the exact bounded classifier input for one task, regardless of whether
+/// it is currently eligible.  Persistence uses this inside its write
+/// transaction to reject an input that changed while a provider turn ran.
+fn classifier_input_for_task(
+    conn: &Connection,
+    task_id: i64,
+) -> Result<Option<TaskForClassification>> {
+    let task = conn
+        .query_row(
+            "SELECT id, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks WHERE id=?1",
+            params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
+            |row| {
+                Ok(TaskForClassification {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    dependencies: vec![],
+                    recovery_notes: vec![],
+                })
+            },
+        )
+        .optional()?;
+    task.map(|task| enrich_task(conn, task)).transpose()
+}
+
 /// All open/working tasks (for dup-detection context).
 pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let mut stmt = conn.prepare(
@@ -263,22 +314,68 @@ pub fn store_classifications(
     classifier_provenance: &str,
     now: i64,
 ) -> Result<usize> {
+    let task_ids: Vec<i64> = results.iter().map(|result| result.task_id).collect();
+    let mut inputs = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        if let Some(input) = classifier_input_for_task(conn, task_id)? {
+            inputs.push(input);
+        }
+    }
+    let expected = classification_inputs(&inputs);
+    store_classifications_for_inputs(conn, results, &expected, classifier_provenance, now)
+}
+
+/// Store provider output only for inputs that still match the snapshot taken
+/// before the provider turn.  A stale output is an expected clean negative: it
+/// is not persisted, does not park/dispatch the changed task, and leaves that
+/// task eligible for the next classifier pass.  The incomplete-classification
+/// guard also makes the first accepted concurrent attempt win, so an older
+/// attempt cannot overwrite a newer accepted result.
+pub fn store_classifications_for_inputs(
+    conn: &mut Connection,
+    results: &[TaskClassification],
+    expected_inputs: &[ClassificationInput],
+    classifier_provenance: &str,
+    now: i64,
+) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let mut stored = 0;
+    let expected: std::collections::HashMap<i64, &str> = expected_inputs
+        .iter()
+        .map(|input| (input.task_id, input.fingerprint.as_str()))
+        .collect();
 
     for result in results {
         if !valid(result) {
             continue;
         }
 
-        let current_refs: Option<String> = tx
-            .query_row(
-                "SELECT refs FROM tasks WHERE id = ?1",
-                params![result.task_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
+        let Some(expected_fingerprint) = expected.get(&result.task_id) else {
+            continue;
+        };
+
+        // Do not overwrite a complete classification written by another
+        // concurrent attempt.  The predicate is deliberately evaluated in
+        // this same immediate transaction as the eventual UPDATE.
+        let eligibility_query =
+            format!("SELECT refs FROM tasks WHERE id=?1 AND {INCOMPLETE_CLASSIFICATION_PREDICATE}");
+        let current_refs: Option<Option<String>> = tx
+            .query_row(&eligibility_query, params![result.task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(current_refs) = current_refs else {
+            continue;
+        };
+
+        let Some(current_input) = classifier_input_for_task(&tx, result.task_id)? else {
+            continue;
+        };
+        if classification_inputs(std::slice::from_ref(&current_input))[0].fingerprint
+            != *expected_fingerprint
+        {
+            continue;
+        }
 
         let sanitized = sanitize(result);
         let new_refs = merge_cx_into_refs(&current_refs, &sanitized, classifier_provenance);
@@ -792,6 +889,244 @@ mod tests {
             .unwrap()
             .notes;
         assert_eq!(notes.len(), 0);
+    }
+
+    #[test]
+    fn stale_body_edit_result_is_not_persisted_or_dispatchable() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "body race", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+
+        crate::tasks::update(
+            &mut conn,
+            "test-agent",
+            task_id,
+            &crate::tasks::TaskUpdate {
+                body: Some("new requirements"),
+                ..Default::default()
+            },
+            2_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_002,
+            )
+            .unwrap(),
+            0
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(!crate::tasks::classification_is_complete(&task.refs));
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_003)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_dependency_edit_result_is_not_persisted() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "dependency", 1);
+        let task_id = create_task(&mut conn, "dependency race", 2);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        let dependencies = format!("[{dependency}]");
+
+        crate::tasks::update(
+            &mut conn,
+            "test-agent",
+            task_id,
+            &crate::tasks::TaskUpdate {
+                depends_on: Some(&dependencies),
+                ..Default::default()
+            },
+            2_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_002,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(unclassified_tasks(&conn)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == task_id));
+    }
+
+    #[test]
+    fn relevant_edit_invalidates_completed_classification() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "completed then edited", 1);
+        assert_eq!(
+            store_classifications(&mut conn, &[classified(task_id, 3)], "test:v2", 2_000_000)
+                .unwrap(),
+            1
+        );
+
+        crate::tasks::update(
+            &mut conn,
+            "test-agent",
+            task_id,
+            &crate::tasks::TaskUpdate {
+                body: Some("materially changed"),
+                ..Default::default()
+            },
+            2_000_001,
+        )
+        .unwrap();
+
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(!crate::tasks::classification_is_complete(&task.refs));
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_002)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unchanged_input_stores_normally_with_a_snapshot() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "unchanged", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_000,
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn older_concurrent_attempt_cannot_overwrite_newer_accepted_result() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "concurrent attempts", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        let newer = classified(task_id, 4);
+        let older = classified(task_id, 2);
+
+        assert_eq!(
+            store_classifications_for_inputs(&mut conn, &[newer], &pending, "newer:v2", 2_000_001,)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store_classifications_for_inputs(&mut conn, &[older], &pending, "older:v2", 2_000_002,)
+                .unwrap(),
+            0
+        );
+        let refs = crate::tasks::get(&conn, task_id)
+            .unwrap()
+            .unwrap()
+            .refs
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs["cx_est"], 4);
+        assert_eq!(refs["cx_by"], "newer:v2");
+    }
+
+    #[test]
+    fn concurrent_connections_preserve_newer_accepted_classification() {
+        use std::sync::{mpsc, Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let mut setup = crate::db::open(&db_path).unwrap();
+
+        // Repeat against independent SQLite connections: this is the storage
+        // race that the in-process ordering test above models more directly.
+        for round in 0..8 {
+            let task_id = create_task(&mut setup, "concurrent sqlite attempts", round + 1);
+            let pending = classification_inputs(
+                &task_missing_cx(&setup, task_id)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            );
+            let barrier = Arc::new(Barrier::new(2));
+            let (newer_done, older_wait) = mpsc::channel();
+            let newer_db = db_path.clone();
+            let newer_inputs = pending.clone();
+            let newer_barrier = Arc::clone(&barrier);
+            let newer = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&newer_db).unwrap();
+                newer_barrier.wait();
+                let stored = store_classifications_for_inputs(
+                    &mut conn,
+                    &[classified(task_id, 4)],
+                    &newer_inputs,
+                    "newer:v2",
+                    2_001_000 + round,
+                )
+                .unwrap();
+                newer_done.send(()).unwrap();
+                stored
+            });
+            let older_db = db_path.clone();
+            let older_inputs = pending;
+            let older = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&older_db).unwrap();
+                barrier.wait();
+                older_wait.recv().unwrap();
+                store_classifications_for_inputs(
+                    &mut conn,
+                    &[classified(task_id, 2)],
+                    &older_inputs,
+                    "older:v2",
+                    2_002_000 + round,
+                )
+                .unwrap()
+            });
+
+            assert_eq!(newer.join().unwrap(), 1);
+            assert_eq!(older.join().unwrap(), 0);
+            let refs = crate::tasks::get(&setup, task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .unwrap();
+            let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+            assert_eq!(refs["cx_est"], 4);
+            assert_eq!(refs["cx_by"], "newer:v2");
+        }
     }
 
     #[test]

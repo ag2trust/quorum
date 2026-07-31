@@ -2436,24 +2436,26 @@ async fn store_classifier_response(
     db_path: &Path,
     text: &str,
     pending_task_ids: &[i64],
+    pending_inputs: &[quorum_core::classify::ClassificationInput],
     classifier_model: &str,
 ) -> std::result::Result<usize, String> {
     let results = classifier::parse_validated_response(text, pending_task_ids)?;
-    let expected = pending_task_ids.len();
     let path = db_path.to_path_buf();
+    let pending_inputs = pending_inputs.to_vec();
     let version = quorum_core::classify::classifier_provenance(classifier_model);
     let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
         let mut conn = quorum_core::db::open(&path)?;
-        quorum_core::classify::store_classifications(&mut conn, &results, &version, now_unix())
+        quorum_core::classify::store_classifications_for_inputs(
+            &mut conn,
+            &results,
+            &pending_inputs,
+            &version,
+            now_unix(),
+        )
     })
     .await
     .map_err(|error| format!("classifier storage join failed: {error}"))?
     .map_err(|error| format!("classifier storage failed: {error}"))?;
-    if stored != expected {
-        return Err(format!(
-            "classifier stored {stored} tasks for {expected} requested tasks"
-        ));
-    }
     Ok(stored)
 }
 
@@ -7586,6 +7588,7 @@ async fn tick(
             .take()
             .expect("terminal classifier result requires an active slot");
         let pending_task_ids = slot.pending_task_ids.clone();
+        let pending_inputs = slot.pending_inputs.clone();
         slot.kill_and_reap().await;
 
         match result {
@@ -7594,6 +7597,7 @@ async fn tick(
                     &db_path,
                     &text,
                     &pending_task_ids,
+                    &pending_inputs,
                     &config.classifier_model,
                 )
                 .await

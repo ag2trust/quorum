@@ -19,6 +19,9 @@ pub fn classifier_kind(model: &str) -> std::io::Result<AgentKind> {
 pub struct ClassifierSlot {
     pub proc: RunnerProc,
     pub pending_task_ids: Vec<i64>,
+    /// Internally-derived identity of each exact input sent to this provider
+    /// turn.  Never accept a model-supplied revision/fingerprint.
+    pub pending_inputs: Vec<classify::ClassificationInput>,
     pub response_text: String,
     /// Keep the empty classifier-only workspace alive for the whole turn.
     pub isolation_dir: Option<tempfile::TempDir>,
@@ -92,6 +95,7 @@ pub fn spawn_classifier_configured(
     }
     let kind = classifier_kind(model)?;
     let pending_task_ids = tasks.iter().map(|t| t.id).collect();
+    let pending_inputs = classify::classification_inputs(tasks);
     let dir = tempfile::tempdir()?;
     let proc = match kind {
         AgentKind::Claude => {
@@ -123,6 +127,7 @@ pub fn spawn_classifier_configured(
     Ok(ClassifierSlot {
         proc,
         pending_task_ids,
+        pending_inputs,
         response_text: String::new(),
         isolation_dir: Some(dir),
     })

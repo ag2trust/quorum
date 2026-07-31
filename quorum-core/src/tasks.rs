@@ -418,6 +418,36 @@ fn preserve_classifier_refs(
     Some(next.to_string())
 }
 
+/// Remove the classifier-owned envelope while retaining unrelated caller and
+/// daemon metadata.  Task content and dependency edits change the classifier
+/// input, so this must happen in the same transaction as the edit; otherwise a
+/// completed result for the old input could authorize dispatch.
+fn invalidate_classifier_refs(
+    existing: &Option<String>,
+    replacement: Option<&str>,
+) -> Option<String> {
+    let refs = preserve_classifier_refs(existing, replacement).or_else(|| existing.clone())?;
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&refs) else {
+        return Some(refs);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Some(refs);
+    };
+    for key in [
+        "cx_est",
+        "cx_size",
+        "cx_ready",
+        "cx_not_ready_reason",
+        "cx_by",
+        "cx_dup_of",
+        "cx_flags",
+        "cx_tags",
+    ] {
+        object.remove(key);
+    }
+    Some(value.to_string())
+}
+
 pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<bool> {
     let Some(json) = depends_on.as_deref() else {
         return Ok(true);
@@ -1656,10 +1686,28 @@ fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
 // ── set_body (daemon post-event body annotation) ─────────────────────────────
 
 pub fn set_body(conn: &mut Connection, id: i64, body: &str, now: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE tasks SET body=?1, updated_at=?2 WHERE id=?3",
-        params![body, now, id],
+    let tx = begin_immediate(conn)?;
+    let current: Option<(Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT body, refs FROM tasks WHERE id=?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((existing_body, existing_refs)) = current else {
+        tx.commit()?;
+        return Ok(());
+    };
+    let refs = if existing_body.as_deref() == Some(body) {
+        existing_refs
+    } else {
+        invalidate_classifier_refs(&existing_refs, None)
+    };
+    tx.execute(
+        "UPDATE tasks SET body=?1, refs=?2, updated_at=?3 WHERE id=?4",
+        params![body, refs, now, id],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1695,13 +1743,25 @@ pub fn update(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let existing_refs: Option<String> = tx
-        .query_row("SELECT refs FROM tasks WHERE id=?1", params![id], |row| {
-            row.get(0)
-        })
-        .optional()?
-        .flatten();
-    let preserved_refs = preserve_classifier_refs(&existing_refs, fields.refs);
+    let existing: Option<(Option<String>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT body, depends_on, refs FROM tasks WHERE id=?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (existing_body, existing_depends_on, existing_refs) = existing.unwrap_or_default();
+    let classifier_input_changed = fields
+        .body
+        .is_some_and(|body| existing_body.as_deref() != Some(body))
+        || fields
+            .depends_on
+            .is_some_and(|depends_on| existing_depends_on.as_deref() != Some(depends_on));
+    let preserved_refs = if classifier_input_changed {
+        invalidate_classifier_refs(&existing_refs, fields.refs)
+    } else {
+        preserve_classifier_refs(&existing_refs, fields.refs)
+    };
 
     let n = match fields.status {
         Some("open") => tx.execute(
@@ -1775,8 +1835,8 @@ pub fn update(
 
     if let Some(dep_json) = fields.depends_on {
         let dep_rows = tx.execute(
-            "UPDATE tasks SET depends_on=?2, updated_at=?3
-             WHERE id=?1 AND (created_by=?4 OR assignee=?4)
+            "UPDATE tasks SET depends_on=?2, refs=COALESCE(?3, refs), updated_at=?4
+             WHERE id=?1 AND (created_by=?5 OR assignee=?5)
                    AND status NOT IN ('done', 'cancelled')
                    AND (
                        status != 'failed'
@@ -1785,7 +1845,7 @@ pub fn update(
                            AND json_extract(refs, '$.daemon_parked')=1
                        )
                    )",
-            params![id, dep_json, now, agent],
+            params![id, dep_json, preserved_refs.as_deref(), now, agent],
         )?;
         if dep_rows == 0 && n == 0 {
             tx.commit()?;
@@ -5748,7 +5808,7 @@ mod tests {
     // ── metadata update ─────────────────────────────────────────────────────
 
     #[test]
-    fn metadata_only_update() {
+    fn body_update_invalidates_classifier_refs_but_preserves_unrelated_refs() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
@@ -5767,7 +5827,9 @@ mod tests {
         assert_eq!(t.body.as_deref(), Some("new body"));
         let refs: serde_json::Value = serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 42);
-        assert_eq!(refs["cx_est"], 3);
+        assert!(refs.get("cx_est").is_none());
+        assert!(refs.get("cx_size").is_none());
+        assert!(refs.get("cx_ready").is_none());
         assert_eq!(t.status, "working");
     }
 
