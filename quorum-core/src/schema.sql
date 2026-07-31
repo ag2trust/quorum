@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 35). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 36). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -84,7 +84,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     recovery_attempts INTEGER NOT NULL DEFAULT 0,
     -- v35: optimistic concurrency authority for edits and planning input.
     revision     INTEGER NOT NULL DEFAULT 1,
-    edit_count   INTEGER NOT NULL DEFAULT 0
+    edit_count   INTEGER NOT NULL DEFAULT 0,
+    -- v35: authoritative existing-PR implementation intent. Unlike refs.pr, this field is
+    -- creator-selected only through --continue-pr and controls daemon provisioning.
+    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0)
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two

@@ -73,16 +73,41 @@ worker. The outside PR author remains responsible for pushes requested by review
 changes verdict fails the review-only task because Quorum has no managed worker to perform
 rework; a merge conflict may leave it waiting for the outside author to update the PR.
 
+Implementation must continue from the exact current head of an existing PR:
+
+```sh
+quorum task-create \
+  --created-by <You> \
+  --title "Continue implementation of PR #N" \
+  --continue-pr <N> \
+  --labels '["type:implementation"]' \
+  --body-stdin <<'EOF'
+Describe the remaining outcome, constraints, and verification.
+EOF
+```
+
+`--continue-pr` creates a normal implementation lifecycle rooted at an open PR in the
+managed repository. The daemon provisions from its exact recorded head and publishes back
+to the same PR under a lease. If ownership is ambiguous or the PR branch/head moves, the
+task fails closed; Quorum never silently starts from the base branch or creates a new PR.
+It is mutually exclusive with `--review-pr`.
+
 ## Task meanings — what each state implies
 
 | Task kind | What it means |
 |-----------|---------------|
-| **Implementation task** (no `--review-pr`) | The daemon owns code production: it provisions a worker, assigns a worktree and branch, and drives the submit/review/merge cycle. |
+| **Fresh implementation task** (neither PR flag) | The daemon owns code production: it provisions a worker from the configured base, assigns a worktree and branch, and drives the submit/review/merge cycle. |
 | **Review-only task** (`--review-pr N`) | Code already exists in PR #N. The daemon provisions only a reviewer; no worker is spawned. |
+| **Continue-PR task** (`--continue-pr N`) | More implementation is needed on PR #N. The daemon provisions a worker from its exact head and safely publishes back to the same PR. |
 | **Cancelled task** (`task-update --status cancelled`) | Quorum is no longer responsible for this outcome. No worker or reviewer will be provisioned. |
 
 These are mutually exclusive states of responsibility. A task does not change kind — if
 implementation moves elsewhere, cancel and replace (see below).
+
+Task creators choose an entry mode, never a lifecycle status. Generic `refs` remain
+non-authoritative metadata: creators must not supply `refs.pr`, and a PR reference never
+grants ownership or changes provisioning. Existing rework inside an established Quorum
+task is unchanged and continues through that task's persisted PR association.
 
 ## Transferring implementation responsibility outside Quorum
 
