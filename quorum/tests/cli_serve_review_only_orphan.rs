@@ -102,6 +102,27 @@ impl ServeHandle {
         merge_cmd: &str,
         extra_args: &[&str],
     ) -> Self {
+        let fake_agent = cargo_bin("fake-agent");
+        Self::start_with_agent_bin(
+            home,
+            repo,
+            wt_base,
+            names,
+            merge_cmd,
+            extra_args,
+            &fake_agent,
+        )
+    }
+
+    fn start_with_agent_bin(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        merge_cmd: &str,
+        extra_args: &[&str],
+        agent_bin: &std::path::Path,
+    ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let gh_shim = tempfile::tempdir().unwrap();
@@ -132,7 +153,6 @@ fi
             gh_shim.path().display(),
             env::var("PATH").unwrap_or_default()
         );
-        let fake_agent = cargo_bin("fake-agent");
         let mut args = vec![
             "serve",
             "--repo",
@@ -146,7 +166,7 @@ fi
             "--names-file",
             &names.to_string_lossy(),
             "--agent-bin",
-            &fake_agent.to_string_lossy(),
+            &agent_bin.to_string_lossy(),
             "--merge-cmd",
             merge_cmd,
             "--exit-when-gone",
@@ -334,7 +354,7 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    quorum_core::tasks::create(
+    let id = quorum_core::tasks::create(
         &mut conn,
         "TestCreator",
         "Review-only orphan regression task",
@@ -346,7 +366,22 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
         Some(pr),
         now,
     )
-    .unwrap()
+    .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
+        now,
+    )
+    .unwrap();
+    id
 }
 
 /// Seed an in-review task with a known author (daemon can derive branch).
@@ -368,6 +403,20 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
         None,
         None,
         None,
+        now,
+    )
+    .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
         now,
     )
     .unwrap();
@@ -408,6 +457,175 @@ fn record_closed_run(home: &std::path::Path, task_id: i64, agent: &str, role: &s
     )
     .unwrap();
     quorum_core::agent_runs::close(&conn, run_id, 101, "test teardown").unwrap();
+}
+
+#[test]
+fn orphan_reviewer_waits_for_complete_v2_classification() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET refs=json_object('pr', 42, 'cx_est', 3, 'cx_by', 'legacy:v1')
+             WHERE id=?1",
+            rusqlite::params![task_id],
+        )
+        .unwrap();
+    }
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "reviewer was not provisioned after reclassification: {:?}",
+        handle.lines
+    );
+
+    let gated = handle
+        .lines
+        .iter()
+        .position(|line| {
+            line.contains("awaiting complete dispatchable classification before review dispatch")
+        })
+        .expect("legacy partial classification was not gated");
+    let classified = handle
+        .lines
+        .iter()
+        .position(|line| line.contains("classifier: stored 1 classification"))
+        .expect("v2 classification was not persisted");
+    let spawned = handle
+        .lines
+        .iter()
+        .position(|line| line.contains("spawning reviewer"))
+        .expect("reviewer spawn log missing");
+    assert!(
+        gated < classified && classified < spawned,
+        "reviewer must not spawn before v2 classification: {:?}",
+        handle.lines
+    );
+
+    let task = get_task(home.path(), task_id);
+    let refs: serde_json::Value =
+        serde_json::from_str(task.refs.as_deref().expect("classified refs")).unwrap();
+    assert_eq!(refs["cx_by"], "claude-haiku-4-5-20251001:v2");
+    assert_eq!(refs["cx_size"], "S");
+    assert_eq!(refs["cx_ready"], true);
+    drop(handle);
+}
+
+#[test]
+fn terminal_orphan_pr_reconciliation_ignores_incomplete_classification() {
+    for (pr_state, expected_status, log_needle) in [
+        ("merged", "done", "already merged (orphan in-review)"),
+        (
+            "closed",
+            "failed",
+            "closed without merge (orphan in-review)",
+        ),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let wt_base = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+
+        Command::new(cargo_bin("quorum"))
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .arg("init")
+            .status()
+            .unwrap();
+
+        let author = "Worker";
+        let task_id = seed_in_review_task(home.path(), author, 42);
+        record_closed_run(home.path(), task_id, author, "worker");
+        {
+            let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET refs=json_object('pr', 42, 'cx_est', 3, 'cx_by', 'legacy:v1')
+                 WHERE id=?1",
+                rusqlite::params![task_id],
+            )
+            .unwrap();
+        }
+
+        let unavailable_dir = tempfile::tempdir().unwrap();
+        let unavailable_agent = unavailable_dir.path().join("unavailable-agent");
+        std::fs::write(&unavailable_agent, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&unavailable_agent, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let names = write_named_pool(home.path(), &["Reviewer".into()]);
+        let mergeability_cmd = format!("echo {pr_state}");
+        let extra_args = ["--merge-mergeability-cmd", mergeability_cmd.as_str()];
+        let mut handle = ServeHandle::start_with_agent_bin(
+            home.path(),
+            repo_dir.path(),
+            wt_base.path(),
+            &names,
+            "true",
+            &extra_args,
+            &unavailable_agent,
+        );
+
+        assert!(
+            handle.wait_for(log_needle, 15),
+            "terminal {pr_state} PR was not reconciled without classification: {:?}",
+            handle.lines
+        );
+        handle.drain_pending_lines();
+        assert!(
+            !handle
+                .lines
+                .iter()
+                .any(|line| line.contains("spawning reviewer")),
+            "terminal {pr_state} PR must not spawn a reviewer: {:?}",
+            handle.lines
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let task = loop {
+            let task = get_task(home.path(), task_id);
+            if task.status == expected_status {
+                break task;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal {pr_state} PR did not persist {expected_status}: {:?}",
+                handle.lines
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(task.status, expected_status);
+        let refs: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().expect("legacy refs retained")).unwrap();
+        assert!(
+            refs.get("cx_size").is_none(),
+            "test requires terminal reconciliation before unavailable classification"
+        );
+        drop(handle);
+    }
 }
 
 #[test]

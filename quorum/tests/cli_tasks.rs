@@ -127,6 +127,72 @@ fn normal_misses_do_not_log_errors() {
 }
 
 #[test]
+fn policy_park_task_retry_succeeds_audits_and_resets_recovery_budget() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "rescope policy-parked task",
+        ])
+        .assert()
+        .success();
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='failed',
+                 recovery_attempts=3,
+                 refs=json_object(
+                     'daemon_parked', json('true'),
+                     'daemon_resume_status', 'open',
+                     'classifier_policy_parked', json('true'),
+                     'cx_est', 5,
+                     'cx_size', 'L',
+                     'cx_ready', json('true'),
+                     'cx_not_ready_reason', json('null'),
+                     'cx_by', 'test:v2'
+                 )
+             WHERE id=1",
+            [],
+        )
+        .unwrap();
+    }
+
+    quorum(home.path())
+        .args(["task-retry", "--task-id", "1", "--by", "operator"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"failed\""))
+        .stdout(predicates::str::contains("classifier_policy_parked"))
+        .stdout(predicates::str::contains("cx_est").not());
+
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    assert_eq!(
+        task.recovery_attempts, 0,
+        "explicit retry must restore a fresh crash-recovery budget"
+    );
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["classifier_policy_parked"], true);
+    assert!(refs.get("cx_est").is_none());
+    let retry_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE kind='task_retry' AND subject='task#1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retry_events, 1);
+}
+
+#[test]
 fn release_then_reclaim_hands_off_task() {
     // Hand-off under the lease model: the holder releases (→ open), then another agent claims.
     let home = tempfile::tempdir().unwrap();
@@ -465,6 +531,23 @@ fn concurrent_task_claim_one_winner() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 1,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "test:v2",
+            now,
+        )
+        .unwrap();
+    }
 
     let handles: Vec<_> = (0..12)
         .map(|i| {
@@ -566,6 +649,23 @@ fn concurrent_match_label_claim_one_winner() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id: 1,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "test:v2",
+            now,
+        )
+        .unwrap();
+    }
 
     let handles: Vec<_> = (0..12)
         .map(|i| {

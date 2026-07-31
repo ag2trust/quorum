@@ -75,6 +75,20 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
             now - 1,
         )
         .unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "integration-test:v2",
+            now,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE tasks SET status='rework', assignee=NULL WHERE id=?1",
             rusqlite::params![task_id],

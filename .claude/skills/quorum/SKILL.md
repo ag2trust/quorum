@@ -128,10 +128,14 @@ Complexity, model tier, and effort are daemon-owned: task creators must not pass
 the shared rubric:
 
 - 1: Trivial — config tweak, typo fix, simple rename
-- 2: Simple — single-file change, clear spec; < 15 min agent work
-- 3: Moderate — multi-file change, some design decisions; 15-30 min
-- 4: Complex — cross-cutting change, multiple components; 30-60 min
-- 5: Very complex — architectural change, new subsystem; > 60 min
+- 2: Simple — single-file change, clear spec
+- 3: Moderate — multi-file change, some design decisions
+- 4: Complex — cross-cutting change, multiple components
+- 5: Very complex — architectural change, new subsystem
+
+Complexity measures the hardest reasoning or implementation problem, independent
+of execution volume or elapsed time. Execution surface is classified separately
+as S, M, L, or XL.
 
 ## Observe and communicate
 

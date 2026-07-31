@@ -55,6 +55,22 @@ pub fn user_turn(content: &str) -> String {
 
 impl AgentProc {
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, agent_bin, false)
+    }
+
+    /// Spawn a closed-book classifier while preserving the configured auth
+    /// path. Safe mode suppresses user/project customizations without the
+    /// credential restrictions of `--bare`; the empty tool surface prevents
+    /// the classifier from acquiring context beyond its supplied turn.
+    pub fn spawn_restricted(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, agent_bin, true)
+    }
+
+    fn spawn_configured(
+        spec: &AgentSpec,
+        agent_bin: Option<&str>,
+        restricted: bool,
+    ) -> std::io::Result<Self> {
         let bin = agent_bin.unwrap_or("claude");
         let mut cmd = Command::new(bin);
         cmd.arg("-p")
@@ -70,14 +86,22 @@ impl AgentProc {
 
         cmd.arg("--session-id").arg(&spec.session_id);
 
+        if restricted {
+            cmd.arg("--safe-mode")
+                .arg("--disable-slash-commands")
+                .arg("--tools")
+                .arg("")
+                .arg("--no-session-persistence");
+        } else {
+            cmd.arg("--add-dir").arg(&spec.worktree);
+        }
+
         // In dontAsk mode every tool call OUTSIDE the allowlist is auto-denied
-        // (there is no human to ask). Without --allowedTools the agent cannot
-        // edit files, run git/gh, or signal `quorum submit` — it stalls forever
-        // in awaiting-review (observed second live run). Same list the
-        // hand-run PoC loop used.
-        cmd.arg("--add-dir")
-            .arg(&spec.worktree)
-            .arg("--permission-mode")
+        // (there is no human to ask). Without --allowedTools a managed agent
+        // cannot edit files, run git/gh, or signal `quorum submit` — it stalls
+        // forever in awaiting-review (observed second live run). Restricted
+        // classifier spawns pass an empty list in addition to `--tools ""`.
+        cmd.arg("--permission-mode")
             .arg("dontAsk")
             .arg("--allowedTools")
             .arg(&spec.allowed_tools);
@@ -306,6 +330,31 @@ mod tests {
             event.is_some(),
             "claude exited without emitting any stream event — the AgentSpec \
              argument surface was rejected at CLI validation (crash-loop class)"
+        );
+    }
+
+    /// The closed-book Claude launch surface must remain accepted by the real
+    /// CLI while using normal (non-bare) auth semantics.
+    #[tokio::test]
+    async fn real_cli_accepts_restricted_classifier_spec_args() {
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = crate::serve::classifier::classifier_spec(tmp.path(), false);
+        spec.env_vars = no_auth_env(tmp.path());
+
+        let mut proc = AgentProc::spawn_restricted(&spec, None).expect("spawn claude");
+        proc.feed_turn(&user_turn("ping")).await.expect("feed turn");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("restricted claude produced no event within 60s — args may hang the CLI");
+        let _terminal_output = proc.kill_and_reap().await;
+        assert!(
+            event.is_some(),
+            "claude exited without emitting any stream event — the restricted \
+             classifier argument surface was rejected at CLI validation"
         );
     }
 

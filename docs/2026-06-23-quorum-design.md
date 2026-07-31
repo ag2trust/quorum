@@ -1477,16 +1477,20 @@ constraints, and verification but have no routing authority. `task-create` rejec
 `complexity:*`, `tier:*`, and `effort:*` label with usage exit 2. Existing stored routing
 labels are ignored.
 
-- An open implementation task is not dispatchable until the daemon classifier has
-  persisted a valid `cx_est` from 1 through 5 in task refs. Missing, malformed, out-of-range,
-  timed-out, or failed classification never falls back to the daemon worker default.
-- Persisting `cx_est=5` atomically parks the task in `failed` with the standard daemon
-  parking refs, note, and `task_parked` event. No claim, run, or error row is created.
-  Startup reconciliation parks category-5 rows written by older daemons in fixed-size,
-  ID-ordered batches before recovery or dispatch. Atomic claim predicates independently
-  reject category 5 while later ticks finish the backlog. `task-retry`
-  returns a clean negative while `cx_est` remains 5, so the task cannot hot-loop; the
-  operator must split or rescope the work into new tasks.
+- No managed worker or reviewer is dispatchable until the daemon classifier has persisted
+  valid `cx_est` (1–5), `cx_size` (`S`, `M`, `L`, or `XL`), and `cx_ready` fields in task
+  refs. A false readiness result carries a concrete `cx_not_ready_reason`; missing,
+  partial, or malformed classification never falls back to worker or reviewer
+  provisioning.
+- The classifier is closed-book: it receives bounded task/dependency/recovery context but
+  does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
+  repository discovery and bounded engineering choices are execution work, not a reason to
+  reject the task.
+- The daemon atomically parks a classification when it is not ready, size is `XL`, or it is
+  complexity 5 with size `L`. Complexity-5 `S` and `M` tasks remain dispatchable. Parking
+  writes the standard refs, note, and event with no claim, run, or error row; an explicit
+  retry requests reclassification of remaining work and a newly dispatchable result restores
+  the saved lifecycle status.
 - The active daemon provider selects the corresponding model and effort from its five-level
   routing ladder. Operator-owned `suggested_models` overrides and minimum model/effort
   floors remain available; creators cannot lower or raise an individual task.
@@ -1498,7 +1502,8 @@ labels are ignored.
 
 The built-in Codex recommendation ladder is `1=luna/high`, `2=terra/high`,
 `3=terra/high`, `4=sol/high`, `5=sol/high`. Level 5 remains in classifier guidance and
-stored context, but is outside automatic execution policy.
+stored context. Focused level-5 work sized `S` or `M` is dispatchable; level 5 with size
+`L` is outside automatic execution policy.
 
 Claude's Sonnet/Opus order is not a cross-runner abstraction. Replace shared rank
 inference with explicit per-role selections while preserving Claude defaults:

@@ -699,7 +699,14 @@ fn next_task_view(
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
          WHERE status = 'open'
-           AND COALESCE(json_extract(refs, '$.cx_est'), 0) != 5
+           AND json_valid(refs)
+           AND json_type(refs, '$.cx_est')='integer'
+           AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+           AND json_type(refs, '$.cx_size')='text'
+           AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+           AND json_type(refs, '$.cx_ready')='true'
+           AND json_type(refs, '$.cx_not_ready_reason')='null'
+           AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
            AND {DEP_READY_CLAUSE}"
     );
     if !match_labels.is_empty() {
@@ -943,10 +950,12 @@ mod tests {
         labels: Option<&str>,
         now: i64,
     ) -> i64 {
-        tasks::create(
+        let id = tasks::create(
             c, "boss", title, None, priority, labels, None, None, None, now,
         )
-        .unwrap()
+        .unwrap();
+        c.execute("UPDATE tasks SET refs=json_object('cx_est',3,'cx_size','M','cx_ready',json('true'),'cx_not_ready_reason',json('null'),'cx_by','test:v2') WHERE id=?1", [id]).unwrap();
+        id
     }
 
     // --- current_task XOR next_task ------------------------------------------------------
