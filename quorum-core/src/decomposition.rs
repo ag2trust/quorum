@@ -45,6 +45,16 @@ pub struct CleanupIntent {
     pub artifact_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBlocker<'a> {
+    pub task_id: i64,
+    pub reviewer: &'a str,
+    pub category: &'a str,
+    pub violated_boundary: &'a str,
+    pub evidence: &'a [String],
+    pub now: i64,
+}
+
 fn is_unique_constraint(error: &rusqlite::Error) -> bool {
     matches!(error, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
 }
@@ -544,6 +554,163 @@ fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> R
     Ok(())
 }
 
+/// Record a reviewer-confirmed decomposition defect and revoke only the
+/// affected review authority. The graph remains active-but-blocked so the
+/// repository-wide active-graph exclusion remains authoritative.
+pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<bool> {
+    if blocker.category.trim().is_empty()
+        || blocker.category.len() > 128
+        || blocker.violated_boundary.trim().is_empty()
+        || blocker.violated_boundary.len() > 1024
+        || blocker.evidence.is_empty()
+        || blocker.evidence.len() > 8
+        || blocker
+            .evidence
+            .iter()
+            .any(|item| item.trim().is_empty() || item.len() > 1024)
+    {
+        return Err(QuorumError::Usage(
+            "invalid bounded graph-blocker evidence".into(),
+        ));
+    }
+    let summary = serde_json::json!({
+        "affected_task": blocker.task_id,
+        "violated_boundary": blocker.violated_boundary,
+        "evidence": blocker.evidence,
+    })
+    .to_string();
+    if summary.len() > 8192 {
+        return Err(QuorumError::Usage(
+            "graph-blocker evidence exceeds bounded storage".into(),
+        ));
+    }
+
+    let tx = begin_immediate(conn)?;
+    let graph: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT d.id,d.planned_source_revision
+             FROM task_graph_members m
+             JOIN task_decompositions d ON d.id=m.graph_id
+             JOIN tasks child ON child.id=m.task_id
+             JOIN tasks source ON source.id=d.source_task_id
+             WHERE m.task_id=?1 AND m.active=1 AND d.state='active' AND d.active=1
+               AND source.status='decomposed' AND child.status='in-review'
+               AND child.reviewer=?2",
+            params![blocker.task_id, blocker.reviewer],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((graph_id, source_revision)) = graph else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    };
+    let ordinal: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(ordinal),0)+1 FROM decomposition_attempts
+         WHERE graph_id=?1 AND source_revision=?2 AND kind='blocker'",
+        params![graph_id, source_revision],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+             reason_code,summary,created_at)
+         VALUES (?1,?2,'blocker',?3,?4,?5,?6)",
+        params![
+            graph_id,
+            source_revision,
+            ordinal,
+            blocker.category,
+            summary,
+            blocker.now
+        ],
+    )?;
+    tx.execute(
+        "UPDATE tasks SET status='failed',assignee=NULL,reviewer=NULL,updated_at=?2
+         WHERE id=?1 AND status='in-review' AND reviewer=?3",
+        params![blocker.task_id, blocker.now, blocker.reviewer],
+    )?;
+    tx.execute(
+        "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
+        [format!("task#{}", blocker.task_id)],
+    )?;
+    tx.execute(
+        "UPDATE run_capabilities SET revoked_at=?2
+         WHERE task_id=?1 AND role='reviewer' AND revoked_at IS NULL",
+        params![blocker.task_id, blocker.now],
+    )?;
+    tx.execute(
+        "UPDATE task_decompositions SET state='blocked',hold_code=?2,
+             hold_summary=?3,updated_at=?4 WHERE id=?1 AND state='active' AND active=1",
+        params![graph_id, blocker.category, summary, blocker.now],
+    )?;
+    crate::events::emit(
+        &tx,
+        "task_graph_blocked",
+        &format!("task#{}", blocker.task_id),
+        &format!("graph blocked by {}", blocker.reviewer),
+        blocker.now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Fold graph completion into the transaction that marks a generated child
+/// done. This is deliberately transaction-scoped for the final-child race.
+pub(crate) fn complete_graph_if_final_child(
+    tx: &Transaction<'_>,
+    task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let graph: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT d.id,d.source_task_id
+             FROM task_graph_members m
+             JOIN task_decompositions d ON d.id=m.graph_id
+             WHERE m.task_id=?1 AND m.active=1 AND d.state='active' AND d.active=1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((graph_id, source_id)) = graph else {
+        return Ok(false);
+    };
+    let unfinished: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_graph_members m
+         JOIN tasks child ON child.id=m.task_id
+         WHERE m.graph_id=?1 AND m.active=1 AND child.status!='done')",
+        [graph_id],
+        |row| row.get(0),
+    )?;
+    if unfinished {
+        return Ok(false);
+    }
+    let graph_changed = tx.execute(
+        "UPDATE task_decompositions SET state='completed',active=0,freeze_active=0,updated_at=?2
+         WHERE id=?1 AND state='active' AND active=1",
+        params![graph_id, now],
+    )?;
+    if graph_changed != 1 {
+        return Ok(false);
+    }
+    let source_changed = tx.execute(
+        "UPDATE tasks SET status='done',assignee=NULL,updated_at=?2
+         WHERE id=?1 AND status='decomposed'",
+        params![source_id, now],
+    )?;
+    if source_changed != 1 {
+        return Err(QuorumError::Io(
+            "active graph lost decomposed source completion authority".into(),
+        ));
+    }
+    crate::events::emit(
+        tx,
+        "task_graph_completed",
+        &format!("task#{source_id}"),
+        "all generated children merged",
+        now,
+    )?;
+    Ok(true)
+}
+
 /// Fail-safe recovery reset. It is refused once any member has durable delivery
 /// evidence. History stays attached to the same aggregate and plan revision.
 pub fn recovery_reset(
@@ -989,5 +1156,231 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("active".into(), 1, 0));
+    }
+
+    #[test]
+    fn graph_children_preempt_unrelated_work_and_only_two_can_start() {
+        let mut conn = setup();
+        conn.execute("UPDATE tasks SET priority=1 WHERE id=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs)
+             VALUES ('urgent unrelated','open',99,'owner',1,1,?1)",
+            [child("unused", &[]).classification_refs],
+        )
+        .unwrap();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[]), child("c", &[])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+
+        let first = crate::tasks::claim(&mut conn, "w1", None, &[], 60, 5)
+            .unwrap()
+            .unwrap();
+        assert!(ids.contains(&first.id), "graph work must sort first");
+        let second = crate::tasks::claim(&mut conn, "w2", None, &[], 60, 6)
+            .unwrap()
+            .unwrap();
+        assert!(ids.contains(&second.id));
+        let third = crate::tasks::claim(&mut conn, "w3", None, &[], 60, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(third.title, "urgent unrelated");
+        assert_eq!(
+            ids.iter()
+                .filter(|id| {
+                    conn.query_row(
+                        "SELECT status='working' FROM tasks WHERE id=?1",
+                        [id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .unwrap()
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn failed_sibling_stops_new_implementation_claims() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[]), child("c", &[])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        crate::tasks::claim(&mut conn, "w1", Some(ids[0]), &[], 60, 5)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [ids[1]])
+            .unwrap();
+
+        assert!(
+            crate::tasks::claim(&mut conn, "w2", Some(ids[2]), &[], 60, 6)
+                .unwrap()
+                .is_none()
+        );
+        let first_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [ids[0]], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(first_status, "working", "active sibling keeps authority");
+    }
+
+    #[test]
+    fn graph_blocker_is_atomic_and_stale_signal_is_clean() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='in-review',reviewer='r',assignee='r' WHERE id=?1",
+            [ids[0]],
+        )
+        .unwrap();
+        let evidence = vec!["diff moves sibling-owned schema work into this child".into()];
+        assert!(block_graph(
+            &mut conn,
+            &GraphBlocker {
+                task_id: ids[0],
+                reviewer: "r",
+                category: "boundary-violation",
+                violated_boundary: "child must not absorb sibling scope",
+                evidence: &evidence,
+                now: 5,
+            }
+        )
+        .unwrap());
+        assert!(!block_graph(
+            &mut conn,
+            &GraphBlocker {
+                task_id: ids[0],
+                reviewer: "r",
+                category: "boundary-violation",
+                violated_boundary: "child must not absorb sibling scope",
+                evidence: &evidence,
+                now: 6,
+            }
+        )
+        .unwrap());
+        let state: (String, i64, String, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,source.status,child.status
+                 FROM task_decompositions d
+                 JOIN tasks source ON source.id=d.source_task_id
+                 JOIN tasks child ON child.id=?2 WHERE d.id=?1",
+                params![graph, ids[0]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("blocked".into(), 1, "decomposed".into(), "failed".into())
+        );
+        assert!(
+            crate::tasks::claim(&mut conn, "w", Some(ids[1]), &[], 60, 7)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn final_child_merge_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        assert!(crate::tasks::close_after_merge(&mut conn, ids[0], "merged", 5).unwrap());
+        let midway: (String, String) = conn
+            .query_row(
+                "SELECT d.state,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(midway, ("active".into(), "decomposed".into()));
+
+        assert!(crate::tasks::close_after_merge(&mut conn, ids[1], "merged", 6).unwrap());
+        let completed: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), 0, "done".into()));
+    }
+
+    #[test]
+    fn real_file_concurrent_child_claims_never_exceed_two() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("quorum.db");
+            let mut conn = crate::db::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin(&mut conn);
+            let ids = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), child("b", &[]), child("c", &[])],
+                4,
+            )
+            .unwrap()
+            .unwrap();
+            drop(conn);
+
+            let barrier = Arc::new(Barrier::new(3));
+            let handles: Vec<_> = ids
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let mut conn = crate::db::open(&path).unwrap();
+                        barrier.wait();
+                        crate::tasks::claim(
+                            &mut conn,
+                            &format!("w{index}"),
+                            Some(id),
+                            &[],
+                            60,
+                            10 + round,
+                        )
+                        .unwrap()
+                        .is_some()
+                    })
+                })
+                .collect();
+            let winners = handles
+                .into_iter()
+                .map(|handle| usize::from(handle.join().unwrap()))
+                .sum::<usize>();
+            assert_eq!(winners, 2, "round {round}");
+        }
     }
 }
