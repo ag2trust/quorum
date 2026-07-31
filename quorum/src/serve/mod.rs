@@ -14,6 +14,7 @@ pub mod collector;
 pub mod doctor;
 pub mod merge;
 pub mod names;
+pub mod planner;
 pub mod recovery;
 pub mod render;
 pub mod reviewer;
