@@ -8,23 +8,27 @@ pub fn cheatsheet() -> String {
         r#"quorum — local agent coordination (by agents, for agents)
 
 TASKS (daemon-managed queue) — lifecycle: open -> working -> in-review -> merging -> done (+ rework loop, terminal cancelled/failed)
-  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["type:bug","area:store"]'] [--depends-on '[1,2]'] [--refs '{{"pr":N}}'] [--body-stdin]
+  quorum task-create  --created-by <id> --title <s> [--priority N] [--labels '["type:bug","area:store"]'] [--depends-on '[1,2]'] [--refs '<json>'] [--body-stdin]
                                                                # complexity/model/effort are classifier-owned; creators may not
                                                                # pass complexity:*, tier:*, or effort:* labels.
                                                                # --depends-on gates the claim: dependent stays unclaimable
                                                                # until every listed task is `closed` (#2 alignment).
-                                                               # --refs: structured external-ref JSON (e.g. {{"pr":N}}) — load-bearing
-                                                               # for review-loop traceability (#10 + creator monitor #62).
+                                                               # --refs: non-authoritative external metadata; creators must not
+                                                               # supply refs.pr or use refs to select a PR entry mode.
                                                                # Malformed JSON → exit 2 at create (never poisons reads).
   quorum task-create  --created-by <id> --title <s> --review-pr <N> [--labels '["type:review"]'] [--body-stdin]
                                                                # Existing PR: skip implementation and start in-review.
                                                                # No managed worker exists for requested changes or conflicts;
                                                                # the outside PR author remains responsible for updating the PR.
-  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '{{"pr":N}}'] [--note-stdin]
+  quorum task-create  --created-by <id> --title <s> --continue-pr <N> [--labels '["type:implementation"]'] [--body-stdin]
+                                                               # Continue implementation from the exact open same-repo PR head.
+                                                               # Publishes back under lease; branch/SHA movement fails closed.
+                                                               # Mutually exclusive with --review-pr; never falls back or creates a PR.
+  quorum task-update  --agent <id> --task-id <n> [--status open|cancelled] [--refs '<json>'] [--note-stdin]
                                                                # --status open: compatibility release path; daemon owns normal assignment
                                                                # --status cancelled: creator OR assignee terminal won't-do
-                                                               # --refs: link PR ref, e.g. `--refs '{{"pr":2459}}'`
-                                                               #   surfaced through `log --refs pr#N` + task inspection.
+                                                               # --refs: non-authoritative metadata; refs.pr is daemon-owned
+                                                               # and cannot select, replace, or remove the task's PR.
                                                                # NOTE: `done` is lifecycle-only — use `quorum submit` or `quorum task-close`.
                                                                #   Verdict transitions are daemon-managed only (#130).
                                                                # --note-stdin / --note-file: append a breadcrumb (any agent, no guard)
@@ -156,6 +160,15 @@ mod tests {
         let help = cheatsheet();
         assert!(help.contains("--review-pr <N>"));
         assert!(help.contains("outside PR author remains responsible"));
+    }
+
+    #[test]
+    fn help_shows_continue_pr_intake_and_fail_closed_contract() {
+        let help = cheatsheet();
+        assert!(help.contains("--continue-pr <N>"));
+        assert!(help.contains("branch/SHA movement fails closed"));
+        assert!(help.contains("never falls back or creates a PR"));
+        assert!(help.contains("creators must not\n                                                               # supply refs.pr"));
     }
 
     #[test]

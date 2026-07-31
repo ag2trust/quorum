@@ -96,6 +96,206 @@ fn create_claim_update_flow() {
 }
 
 #[test]
+fn continue_pr_is_authoritative_and_exposed() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "continue existing work",
+            "--continue-pr",
+            "19",
+        ])
+        .assert()
+        .success();
+
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"status\":\"open\""))
+        .stdout(predicates::str::contains("\"review_only\":false"))
+        .stdout(predicates::str::contains("\"continue_pr\":19"));
+
+    quorum(home.path())
+        .args(["task-list", "--brief"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"continue_pr\":19"));
+}
+
+#[test]
+fn continue_pr_rejects_ambiguous_or_unauthorized_inputs() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "bad",
+            "--continue-pr",
+            "0",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--continue-pr must be positive"));
+
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "ambiguous",
+            "--continue-pr",
+            "19",
+            "--review-pr",
+            "19",
+        ])
+        .assert()
+        .code(2);
+
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "refs cannot grant authority",
+            "--refs",
+            r#"{"pr":19}"#,
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "use --review-pr or --continue-pr",
+        ));
+}
+
+#[test]
+fn continue_pr_rejects_a_second_active_owner_but_allows_terminal_history() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "first",
+            "--continue-pr",
+            "19",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "second",
+            "--continue-pr",
+            "19",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "PR #19 is already associated with active task #1",
+        ));
+
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "boss",
+            "--task-id",
+            "1",
+            "--status",
+            "cancelled",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "replacement",
+            "--continue-pr",
+            "19",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn concurrent_continue_pr_creation_has_one_owner() {
+    let binary = assert_cmd::cargo::cargo_bin("quorum");
+    for round in 0..16 {
+        let home = tempfile::tempdir().unwrap();
+        let mut first = std::process::Command::new(&binary);
+        first
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        first.args([
+            "task-create",
+            "--created-by",
+            "first",
+            "--title",
+            &format!("first-{round}"),
+            "--continue-pr",
+            "19",
+        ]);
+        let mut second = std::process::Command::new(&binary);
+        second
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        second.args([
+            "task-create",
+            "--created-by",
+            "second",
+            "--title",
+            &format!("second-{round}"),
+            "--continue-pr",
+            "19",
+        ]);
+
+        let first = first.spawn().unwrap();
+        let second = second.spawn().unwrap();
+        let first = first.wait_with_output().unwrap();
+        let second = second.wait_with_output().unwrap();
+        let success_count =
+            usize::from(first.status.success()) + usize::from(second.status.success());
+        assert_eq!(
+            success_count, 1,
+            "round {round}: exactly one process must own PR #19"
+        );
+        let loser = if first.status.success() {
+            &second
+        } else {
+            &first
+        };
+        assert_eq!(
+            loser.status.code(),
+            Some(2),
+            "round {round}: lost ownership race must be a usage failure"
+        );
+        assert!(
+            String::from_utf8_lossy(&loser.stderr).contains("already associated with active task"),
+            "round {round}: loser must explain the existing owner"
+        );
+    }
+}
+
+#[test]
 fn normal_misses_do_not_log_errors() {
     let home = tempfile::tempdir().unwrap();
     // claim with nothing open → None (no claimable task)
