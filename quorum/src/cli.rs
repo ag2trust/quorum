@@ -21,7 +21,7 @@ pub fn short_version() -> &'static str {
 #[command(
     name = "quorum",
     version = long_version(),
-    about = "Local agent coordination (by agents, for agents)",
+    about = "Local, daemon-managed coding agents",
     // We define our own `help` subcommand below (the agent cheat-sheet, recovery-safe).
     // Without this, clap auto-generates a generic `help` that would collide with ours.
     disable_help_subcommand = true
@@ -95,7 +95,7 @@ pub enum Command {
     /// have **no assignee guard** (any agent can leave one) and can be combined with the
     /// other field updates in the same call.
     ///
-    /// Verdict transitions are daemon-managed only — use `quorum submit --verdict` (#130).
+    /// Verdict transitions are daemon-managed only — use `quorum submit --verdict`.
     TaskUpdate {
         #[arg(long)]
         agent: String,
@@ -228,7 +228,7 @@ pub enum Command {
     },
     /// List every active stop (global and per-agent). Read-only.
     Stops,
-    /// Post a pinned standing notice (issue #78). Non-expiring, cursor-independent —
+    /// Post a pinned standing notice. Non-expiring and cursor-independent —
     /// surfaced in EVERY agent's `sync.pinned` until explicitly unpinned. Body (free
     /// text) via --body-stdin or --body-file.
     Pin {
@@ -284,7 +284,7 @@ pub enum Command {
     },
     /// Reclaim all expired rows and checkpoint the WAL.
     Sweep,
-    /// EXPERIMENTAL (issue #101) — register a Claude session UUID → agent name
+    /// EXPERIMENTAL — register a Claude session UUID → agent name
     /// for the optional PostToolUse activity hook. Stats-only; no workflow
     /// impact. Idempotent; re-register extends the session TTL (48h).
     SessionRegister {
@@ -293,7 +293,7 @@ pub enum Command {
         #[arg(long)]
         session: String,
     },
-    /// EXPERIMENTAL (issue #101) — record one tool-use event for the activity
+    /// EXPERIMENTAL — record one tool-use event for the activity
     /// stats surface. Resolves `--session` → agent name via the
     /// `session-register` mapping; fail-open (unregistered session is still
     /// recorded with `agent_name = NULL` → counted as "unknown" in stats).
@@ -351,11 +351,15 @@ pub enum Command {
         /// Review verdict: approved or changes.
         #[arg(long)]
         verdict: Option<String>,
-        /// Review feedback (required with --verdict changes — it becomes the
-        /// worker's rework instructions).
-        #[arg(long)]
+        /// Compatibility input for short review feedback. Prefer --feedback-file because
+        /// feedback becomes free-text rework instructions.
+        #[arg(long, conflicts_with = "feedback_file")]
         feedback: Option<String>,
-        /// Count of BLOCKING findings in your review (#206). `--verdict approved`
+        /// Read review feedback from a file. Required with --verdict changes unless the
+        /// compatibility --feedback flag is supplied.
+        #[arg(long = "feedback-file")]
+        feedback_file: Option<PathBuf>,
+        /// Count of BLOCKING findings in your review. `--verdict approved`
         /// requires `--blocking 0` — any blocking finding requires
         /// `--verdict changes`.
         #[arg(long)]
@@ -364,8 +368,8 @@ pub enum Command {
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
-    /// Launch the agent-manager daemon. Spawns and drives Claude Code agents as
-    /// persistent stdin-fed processes, polls the mailbox, and shuts down on Ctrl-C.
+    /// Launch the agent-manager daemon. Spawns and drives Claude or Codex agents,
+    /// polls their lifecycle signals, and shuts down on Ctrl-C.
     Serve {
         /// Path to a TOML config file. Default: ~/.quorum/serve/<owner>__<repo>.toml
         /// if present. CLI flags override config-file values.
@@ -607,7 +611,7 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Print a one-screen cheat-sheet of all commands (for agents to re-orient).
+    /// Print a short role-based workflow guide. Use `<command> --help` for exact flags.
     /// `help-agent` is kept as a back-compat alias.
     #[command(name = "help", alias = "help-agent")]
     Help,

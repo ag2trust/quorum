@@ -117,6 +117,47 @@ fn submit_with_changes_and_feedback() {
 }
 
 #[test]
+fn submit_with_changes_and_feedback_file() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-r2-file", 1, "Reviewer-2", "reviewer");
+    let feedback = home.path().join("feedback.txt");
+    std::fs::write(
+        &feedback,
+        "Fix the quoted `$value` handling\nand its negative path.",
+    )
+    .unwrap();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-r2-file")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer-2",
+            "--pr",
+            "60",
+            "--verdict",
+            "changes",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\":true"));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let rows = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.feedback.as_deref(),
+        Some("Fix the quoted `$value` handling\nand its negative path."),
+        "feedback-file text must reach the mailbox unchanged"
+    );
+}
+
+#[test]
 fn submit_explicit_run_id_flag_overrides_env() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());
@@ -216,6 +257,53 @@ fn submit_changes_without_feedback_is_refused() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--feedback"));
+}
+
+#[test]
+fn submit_feedback_file_requires_changes_verdict_before_file_io() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    let missing = home.path().join("missing-feedback.txt");
+
+    for verdict_args in [vec![], vec!["--verdict", "approved"]] {
+        let mut args = vec![
+            "submit",
+            "--agent",
+            "Reviewer-1",
+            "--feedback-file",
+            missing.to_str().unwrap(),
+        ];
+        args.extend(verdict_args);
+        quorum()
+            .env("QUORUM_HOME", home.path())
+            .env("QUORUM_REPO", "test/repo")
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--feedback-file/--feedback requires --verdict changes",
+            ))
+            .stderr(predicate::str::contains("failed to read").not());
+    }
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer-1",
+            "--verdict",
+            "invalid",
+            "--feedback-file",
+            missing.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--verdict must be 'approved' or 'changes'",
+        ))
+        .stderr(predicate::str::contains("failed to read").not());
 }
 
 // ---------------------------------------------------------------------------
