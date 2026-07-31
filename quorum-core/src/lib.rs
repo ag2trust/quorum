@@ -17,6 +17,7 @@ pub mod complexity;
 pub mod control;
 pub mod daemon_lock;
 pub mod db;
+pub mod decomposition;
 pub mod drift;
 pub mod errlog;
 pub mod error;

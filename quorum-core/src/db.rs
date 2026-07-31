@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 34;
+pub const SCHEMA_VERSION: i64 = 35;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -477,6 +477,25 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // most REVIEWING_TASK_LIMIT candidates per status before merging, rather
         // than sorting every historical review-only task. Bumping is required
         // for live v33 databases, where SCHEMA_SQL would otherwise be skipped.
+
+        // v35 = bounded task decomposition. The aggregate/member/attempt/cleanup
+        // tables are created by SCHEMA_SQL. Task revisions are additive so a
+        // populated database preserves every existing task at revision 1 with
+        // no accepted edits.
+        if current < 35 {
+            if !column_exists(conn, "tasks", "revision")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "tasks", "edit_count")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -2166,5 +2185,62 @@ mod tests {
             2,
             "plan: {plan}"
         );
+    }
+
+    #[test]
+    fn migrates_v34_to_v35_adds_decomposition_authority_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                 created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                 sticky_until INTEGER, orig TEXT, author TEXT, reviewer TEXT,
+                 rework_round INTEGER NOT NULL DEFAULT 0,
+                 review_only INTEGER NOT NULL DEFAULT 0,
+                 recovery_attempts INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('existing', 'open', 'owner', 100, 100);
+             PRAGMA user_version = 34;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let conn = open(&path).unwrap();
+        let task: (i64, i64) = conn
+            .query_row(
+                "SELECT revision,edit_count FROM tasks WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task, (1, 0));
+        for table in [
+            "task_decompositions",
+            "task_graph_members",
+            "decomposition_attempts",
+            "decomposition_cleanup",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "{table} missing after v34 migration");
+        }
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

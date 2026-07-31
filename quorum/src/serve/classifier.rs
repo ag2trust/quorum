@@ -346,6 +346,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -401,6 +402,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -463,6 +465,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],

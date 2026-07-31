@@ -31,6 +31,8 @@ pub struct ClassifierResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskForClassification {
     pub id: i64,
+    #[serde(skip)]
+    pub revision: i64,
     pub title: String,
     pub body: Option<String>,
     pub dependencies: Vec<String>,
@@ -44,6 +46,7 @@ pub struct TaskForClassification {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationInput {
     pub task_id: i64,
+    revision: i64,
     fingerprint: String,
 }
 
@@ -53,6 +56,7 @@ pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<Classificat
         .iter()
         .map(|task| ClassificationInput {
             task_id: task.id,
+            revision: task.revision,
             // `TaskForClassification` is a struct (not a map), so serde emits
             // a stable field order.  Keep the entire bounded prompt input,
             // including dependency titles/statuses and recovery notes, in the
@@ -102,7 +106,7 @@ const INCOMPLETE_CLASSIFICATION_PREDICATE: &str = r#"
 /// incomplete. Malformed legacy refs are candidates rather than a query error.
 pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let query = format!(
-        "SELECT id, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
+        "SELECT id, revision, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
          WHERE (status IN ('open', 'working', 'in-review', 'rework', 'merging')
                 OR CASE WHEN status='failed' AND json_valid(refs)
                         THEN json_extract(refs, '$.classifier_policy_parked')=1
@@ -122,8 +126,9 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
             |row| {
                 Ok(TaskForClassification {
                     id: row.get(0)?,
-                    title: row.get(1)?,
-                    body: row.get(2)?,
+                    revision: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
                 })
@@ -198,7 +203,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Check whether a specific task lacks cx_est in refs.
 pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskForClassification>> {
     let query = format!(
-        "SELECT id, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks
+        "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks
          WHERE id = ?1
          AND {INCOMPLETE_CLASSIFICATION_PREDICATE}"
     );
@@ -208,8 +213,9 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
         |row| {
             Ok(TaskForClassification {
                 id: row.get(0)?,
-                title: row.get(1)?,
-                body: row.get(2)?,
+                revision: row.get(1)?,
+                title: row.get(2)?,
+                body: row.get(3)?,
                 dependencies: vec![],
                 recovery_notes: vec![],
             })
@@ -228,13 +234,14 @@ fn classifier_input_for_task(
 ) -> Result<Option<TaskForClassification>> {
     let task = conn
         .query_row(
-            "SELECT id, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks WHERE id=?1",
+            "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks WHERE id=?1",
             params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
             |row| {
                 Ok(TaskForClassification {
                     id: row.get(0)?,
-                    title: row.get(1)?,
-                    body: row.get(2)?,
+                    revision: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
                 })
@@ -247,7 +254,7 @@ fn classifier_input_for_task(
 /// All open/working tasks (for dup-detection context).
 pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let mut stmt = conn.prepare(
-        "SELECT id, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
+        "SELECT id, revision, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
          WHERE status IN ('open', 'working')
          ORDER BY id
          LIMIT ?3",
@@ -262,8 +269,9 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
             |row| {
                 Ok(TaskForClassification {
                     id: row.get(0)?,
-                    title: row.get(1)?,
-                    body: row.get(2)?,
+                    revision: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
                 })
@@ -277,7 +285,7 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
 /// classification is incomplete or malformed — for `--backfill`.
 pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let query = format!(
-        "SELECT id, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
+        "SELECT id, revision, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
          WHERE {INCOMPLETE_CLASSIFICATION_PREDICATE}
          ORDER BY id
          LIMIT ?3"
@@ -293,8 +301,9 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
             |row| {
                 Ok(TaskForClassification {
                     id: row.get(0)?,
-                    title: row.get(1)?,
-                    body: row.get(2)?,
+                    revision: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
                     dependencies: vec![],
                     recovery_notes: vec![],
                 })
@@ -340,9 +349,9 @@ pub fn store_classifications_for_inputs(
 ) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let mut stored = 0;
-    let expected: std::collections::HashMap<i64, &str> = expected_inputs
+    let expected: std::collections::HashMap<i64, (i64, &str)> = expected_inputs
         .iter()
-        .map(|input| (input.task_id, input.fingerprint.as_str()))
+        .map(|input| (input.task_id, (input.revision, input.fingerprint.as_str())))
         .collect();
 
     for result in results {
@@ -350,7 +359,7 @@ pub fn store_classifications_for_inputs(
             continue;
         }
 
-        let Some(expected_fingerprint) = expected.get(&result.task_id) else {
+        let Some((expected_revision, expected_fingerprint)) = expected.get(&result.task_id) else {
             continue;
         };
 
@@ -381,8 +390,8 @@ pub fn store_classifications_for_inputs(
         let new_refs = merge_cx_into_refs(&current_refs, &sanitized, classifier_provenance);
 
         let n = tx.execute(
-            "UPDATE tasks SET refs = ?1, updated_at = ?2 WHERE id = ?3",
-            params![new_refs, now, result.task_id],
+            "UPDATE tasks SET refs = ?1, updated_at = ?2 WHERE id = ?3 AND revision = ?4",
+            params![new_refs, now, result.task_id, expected_revision],
         )?;
 
         if n > 0 {
@@ -750,6 +759,7 @@ mod tests {
     fn build_prompt_includes_tasks_and_context() {
         let tasks = vec![TaskForClassification {
             id: 1,
+            revision: 1,
             title: "Fix bug".into(),
             body: Some("Fix the thing".into()),
             dependencies: vec![],
@@ -757,6 +767,7 @@ mod tests {
         }];
         let ctx = vec![TaskForClassification {
             id: 2,
+            revision: 1,
             title: "Other task".into(),
             body: Some("Do something".into()),
             dependencies: vec![],
@@ -908,6 +919,7 @@ mod tests {
             task_id,
             &crate::tasks::TaskUpdate {
                 body: Some("new requirements"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             2_000_001,
@@ -953,6 +965,7 @@ mod tests {
             task_id,
             &crate::tasks::TaskUpdate {
                 depends_on: Some(&dependencies),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             2_000_001,
@@ -977,6 +990,46 @@ mod tests {
     }
 
     #[test]
+    fn revision_change_rejects_stale_result_when_prompt_input_is_unchanged() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "revision race", 1);
+        let pending = classification_inputs(
+            &task_missing_cx(&conn, task_id)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+        );
+        crate::tasks::update(
+            &mut conn,
+            "test-agent",
+            task_id,
+            &crate::tasks::TaskUpdate {
+                refs: Some(r#"{"external":true}"#),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            2_000_001,
+        )
+        .unwrap();
+
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &pending,
+                "test:v2",
+                2_000_002,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            crate::tasks::get(&conn, task_id).unwrap().unwrap().revision,
+            2
+        );
+    }
+
+    #[test]
     fn relevant_edit_invalidates_completed_classification() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "completed then edited", 1);
@@ -992,6 +1045,7 @@ mod tests {
             task_id,
             &crate::tasks::TaskUpdate {
                 body: Some("materially changed"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             2_000_001,
