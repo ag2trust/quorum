@@ -1383,6 +1383,15 @@ where
     let status = task.status.parse::<Status>().map_err(QuorumError::Usage)?;
 
     match event {
+        Event::PlanningStarted
+        | Event::PlanMaterialized
+        | Event::PlanningBlocked { .. }
+        | Event::GraphCompleted => {
+            tx.commit()?;
+            return Err(QuorumError::Usage(
+                "decomposition lifecycle events require daemon authority".into(),
+            ));
+        }
         Event::SignaledDone { .. } | Event::ReworkPushed => {
             // Authorize by current assignee (fast path), then by active run
             // capability (handles replacement workers whose author field was

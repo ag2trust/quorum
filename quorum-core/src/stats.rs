@@ -10,7 +10,7 @@
 //! - `throughput` — closed-last-hour + oldest-done-awaiting-review (catches review-loop stalls).
 
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// How many recent messages to surface on `status`. Bounded to keep the output cheap.
@@ -241,7 +241,7 @@ pub struct ReviewingTask {
     pub state: String,
 }
 
-/// Task pipeline row: `done` (awaiting review) + tasks closed/merged in the last hour (#204).
+/// Task pipeline row: active daemon-owned coordinators plus tasks merged in the last hour (#204).
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct PipelineTask {
     pub id: i64,
@@ -254,6 +254,37 @@ pub struct PipelineTask {
     pub status: String,
     pub pr: Option<i64>,
     pub blocked: bool,
+}
+
+/// Bounded child projection for the repository's current decomposition graph.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DecompositionMemberView {
+    pub task_id: i64,
+    pub local_key: String,
+    pub title: String,
+    pub status: String,
+    pub prerequisites: Vec<i64>,
+}
+
+/// Read-only projection of the single current decomposition graph.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DecompositionStatusView {
+    pub graph_id: i64,
+    pub source_task_id: i64,
+    pub source_title: String,
+    pub source_status: String,
+    pub graph_state: String,
+    pub proposal_attempts: i64,
+    pub provider_failures: i64,
+    pub planner_provider: Option<String>,
+    pub planner_model: Option<String>,
+    pub accepted_plan_revision: Option<i64>,
+    pub completed_children: i64,
+    pub total_children: i64,
+    pub child_statuses: Vec<StatusCount>,
+    pub failed_children: Vec<i64>,
+    pub reasons: Vec<String>,
+    pub members: Vec<DecompositionMemberView>,
 }
 
 /// Deduped error for the ERRORS section — groups repeated messages.
@@ -360,6 +391,8 @@ pub struct Stats {
     pub reviewing: Vec<ReviewingTask>,
     /// #204: task pipeline view (all active + recently closed).
     pub pipeline: Vec<PipelineTask>,
+    /// Current planning cycle or active/held decomposition graph, if any.
+    pub decomposition: Option<DecompositionStatusView>,
     /// #204: deduped errors from last hour.
     pub recent_errors: Vec<DedupedError>,
     /// #204: count of older errors silenced (>1h).
@@ -450,6 +483,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let queue_tasks_list = queue_tasks(conn)?;
     let reviewing = reviewing_tasks(conn, &daemon_agents)?;
     let pipeline = pipeline_tasks(conn, now)?;
+    let decomposition = decomposition_status(conn)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
@@ -491,6 +525,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         queue_tasks: queue_tasks_list,
         reviewing,
         pipeline,
+        decomposition,
         recent_errors,
         older_errors_silenced,
         health,
@@ -1258,13 +1293,16 @@ fn reviewing_tasks(
         .collect())
 }
 
-/// Task pipeline view: tasks in active lifecycle stages + recently done/closed (#204).
+/// Task pipeline view: daemon-owned source stages + recently done/closed (#204).
 /// Done/closed tasks are time-windowed to the last hour to avoid unbounded growth.
 /// Excludes `open` (already in QUEUE/BLOCKED), `cancelled`, and `parked`.
 fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let hour_ago = now - 3600;
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs, depends_on FROM tasks
+         WHERE status IN ('planning', 'decomposed')
+         UNION ALL
+         SELECT id, title, status, refs, depends_on FROM tasks
          WHERE status = 'done' AND updated_at > ?1
          UNION ALL
          SELECT id, title, status, refs, depends_on FROM tasks
@@ -1320,6 +1358,132 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
         });
     }
     Ok(result)
+}
+
+/// The schema guarantees at most one active graph/freeze. A held planning result is
+/// also useful owner-facing state, so fall back to the newest non-completed aggregate.
+fn decomposition_status(conn: &Connection) -> Result<Option<DecompositionStatusView>> {
+    let graph = conn
+        .query_row(
+            "SELECT d.id, d.source_task_id, t.title, t.status, d.state,
+                    d.proposal_attempts, d.provider_failures, d.planner_provider,
+                    d.planner_model, d.accepted_plan_revision, d.hold_summary
+             FROM task_decompositions d
+             JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.active=1 OR d.freeze_active=1
+                OR d.state NOT IN ('completed','cancelled')
+             ORDER BY (d.active=1 OR d.freeze_active=1) DESC, d.updated_at DESC, d.id DESC
+             LIMIT 1",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<i64>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        graph_id,
+        source_task_id,
+        source_title,
+        source_status,
+        graph_state,
+        proposal_attempts,
+        provider_failures,
+        planner_provider,
+        planner_model,
+        accepted_plan_revision,
+        hold_summary,
+    )) = graph
+    else {
+        return Ok(None);
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT m.task_id, m.local_key, t.title, t.status, t.depends_on
+         FROM task_graph_members m JOIN tasks t ON t.id=m.task_id
+         WHERE m.graph_id=?1 AND m.active=1
+         ORDER BY m.local_key, m.task_id",
+    )?;
+    let members = stmt
+        .query_map(params![graph_id], |r| {
+            let depends_on: Option<String> = r.get(4)?;
+            let prerequisites = depends_on
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<Vec<i64>>(json).ok())
+                .unwrap_or_default();
+            Ok(DecompositionMemberView {
+                task_id: r.get(0)?,
+                local_key: r.get(1)?,
+                title: r.get(2)?,
+                status: r.get(3)?,
+                prerequisites,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut counts = std::collections::BTreeMap::<String, i64>::new();
+    let mut failed_children = Vec::new();
+    let mut completed_children = 0;
+    for member in &members {
+        *counts.entry(member.status.clone()).or_default() += 1;
+        if member.status == "done" || member.status == "closed" {
+            completed_children += 1;
+        }
+        if member.status == "failed" || member.status == "cancelled" {
+            failed_children.push(member.task_id);
+        }
+    }
+    let child_statuses = counts
+        .into_iter()
+        .map(|(status, count)| StatusCount { status, count })
+        .collect();
+
+    // Keep reasons bounded independently of graph history. Summaries are already
+    // length-bounded at their write boundary; no prompt or transcript is selected.
+    let mut reasons = hold_summary.into_iter().collect::<Vec<_>>();
+    let mut reason_stmt = conn.prepare(
+        "SELECT summary FROM decomposition_attempts WHERE graph_id=?1
+         ORDER BY id DESC LIMIT 6",
+    )?;
+    for reason in reason_stmt
+        .query_map(params![graph_id], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    {
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons.truncate(6);
+
+    Ok(Some(DecompositionStatusView {
+        graph_id,
+        source_task_id,
+        source_title,
+        source_status,
+        graph_state,
+        proposal_attempts,
+        provider_failures,
+        planner_provider,
+        planner_model,
+        accepted_plan_revision,
+        completed_children,
+        total_children: members.len() as i64,
+        child_statuses,
+        failed_children,
+        reasons,
+        members,
+    }))
 }
 
 /// Resolve only an explicit task tier into a display identity. Queue/blocked status
@@ -2872,6 +3036,116 @@ mod tests {
         let tasks = pipeline_tasks(&c, now).unwrap();
         assert_eq!(tasks.len(), 1, "only recently-done task should appear");
         assert_eq!(tasks[0].id, t_recent);
+    }
+
+    #[test]
+    fn pipeline_tasks_always_surface_decomposition_sources() {
+        let (_d, mut c) = open_tmp();
+        let now = 10_000_i64;
+        let planning = crate::tasks::create(
+            &mut c, "A", "planning", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let decomposed = crate::tasks::create(
+            &mut c,
+            "A",
+            "decomposed",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='planning', updated_at=1 WHERE id=?1",
+            rusqlite::params![planning],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='decomposed', updated_at=1 WHERE id=?1",
+            rusqlite::params![decomposed],
+        )
+        .unwrap();
+
+        let tasks = pipeline_tasks(&c, now).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, planning);
+        assert_eq!(tasks[0].status, "planning");
+        assert_eq!(tasks[1].id, decomposed);
+        assert_eq!(tasks[1].status, "decomposed");
+    }
+
+    #[test]
+    fn decomposition_status_is_bounded_and_excludes_attempt_transcripts() {
+        let (_d, mut c) = open_tmp();
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let child_a =
+            crate::tasks::create(&mut c, "A", "child a", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let child_b = crate::tasks::create(
+            &mut c,
+            "A",
+            "child b",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{child_a}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='decomposed' WHERE id=?1",
+            params![source],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id=?1",
+            params![child_b],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions
+             (source_task_id,state,active,planned_source_revision,proposal_attempts,
+              provider_failures,planner_provider,planner_model,accepted_plan_revision,
+              hold_summary,created_at,updated_at)
+             VALUES (?1,'blocked',1,1,2,1,'codex','gpt-5.6-sol',3,'child failed',100,100)",
+            params![source],
+        )
+        .unwrap();
+        let graph_id = c.last_insert_rowid();
+        for (task_id, local_key) in [(child_a, "a"), (child_b, "b")] {
+            c.execute(
+                "INSERT INTO task_graph_members
+                 (graph_id,task_id,local_key,plan_revision) VALUES (?1,?2,?3,3)",
+                params![graph_id, task_id, local_key],
+            )
+            .unwrap();
+        }
+        for ordinal in 1..=8 {
+            c.execute(
+                "INSERT INTO decomposition_attempts
+                 (graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+                 VALUES (?1,1,'proposal',?2,'invalid',?3,100)",
+                params![graph_id, ordinal, format!("reason {ordinal}")],
+            )
+            .unwrap();
+        }
+
+        let graph = decomposition_status(&c).unwrap().unwrap();
+        assert_eq!(graph.source_task_id, source);
+        assert_eq!(graph.completed_children, 0);
+        assert_eq!(graph.total_children, 2);
+        assert_eq!(graph.failed_children, vec![child_b]);
+        assert_eq!(graph.members[1].prerequisites, vec![child_a]);
+        assert_eq!(graph.reasons.len(), 6, "owner-facing reasons stay bounded");
+        assert_eq!(graph.reasons[0], "child failed");
     }
 
     #[test]

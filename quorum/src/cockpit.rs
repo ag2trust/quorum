@@ -1,7 +1,7 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DedupedError, HealthVerdict,
-    MergeBlockerView, PipelineTask, QueueTask, ReviewingTask, Stats,
+    AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DecompositionStatusView,
+    DedupedError, HealthVerdict, MergeBlockerView, PipelineTask, QueueTask, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -137,6 +137,7 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_blocked(&s.blocked, sty, w, width);
     render_reviewing(&s.reviewing, sty, w, width);
     render_pipeline(&s.pipeline, sty, w, width);
+    render_decomposition(s.decomposition.as_ref(), sty, w, width);
     render_merge_wait(&s.merge_blockers, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
@@ -505,6 +506,72 @@ fn render_pipeline(pipeline: &[PipelineTask], sty: &Style, w: &mut dyn Write, wi
     }
 }
 
+fn render_decomposition(
+    graph: Option<&DecompositionStatusView>,
+    sty: &Style,
+    w: &mut dyn Write,
+    width: usize,
+) {
+    let Some(graph) = graph else {
+        return;
+    };
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("DECOMPOSITION", width));
+    let planner = match (&graph.planner_provider, &graph.planner_model) {
+        (Some(provider), Some(model)) => format!("{provider}/{model}"),
+        (Some(provider), None) => provider.clone(),
+        _ => "pending".to_string(),
+    };
+    let revision = graph
+        .accepted_plan_revision
+        .map(|revision| revision.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let _ = writeln!(
+        w,
+        "  source #{:<5} state={:<14} children={}/{} planner={} rev={}",
+        graph.source_task_id,
+        graph.graph_state,
+        graph.completed_children,
+        graph.total_children,
+        planner,
+        revision,
+    );
+    let _ = writeln!(
+        w,
+        "      {}",
+        truncate(&graph.source_title, width.saturating_sub(6))
+    );
+    let _ = writeln!(
+        w,
+        "      attempts proposal={}/3 provider={}/3",
+        graph.proposal_attempts, graph.provider_failures
+    );
+    for member in &graph.members {
+        let prerequisites = if member.prerequisites.is_empty() {
+            "—".to_string()
+        } else {
+            member
+                .prerequisites
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let _ = writeln!(
+            w,
+            "      #{:<5} {:<12} {:<12} deps {}",
+            member.task_id, member.local_key, member.status, prerequisites
+        );
+    }
+    for reason in &graph.reasons {
+        let _ = writeln!(
+            w,
+            "      blocker: {}",
+            truncate(reason, width.saturating_sub(15))
+        );
+    }
+}
+
 fn pipeline_state(p: &PipelineTask, sty: &Style) -> (String, String) {
     if p.status == "done" {
         let icon = if sty.color {
@@ -719,6 +786,44 @@ mod tests {
         assert!(output.contains("BLOCKED"));
         assert!(output.contains("PIPELINE"));
         assert!(output.contains("ERRORS"));
+    }
+
+    #[test]
+    fn decomposition_renders_bounded_graph_details() {
+        let mut s = default_stats();
+        s.decomposition = Some(DecompositionStatusView {
+            graph_id: 1,
+            source_task_id: 40,
+            source_title: "deliver the requested outcome".into(),
+            source_status: "decomposed".into(),
+            graph_state: "blocked".into(),
+            proposal_attempts: 2,
+            provider_failures: 1,
+            planner_provider: Some("codex".into()),
+            planner_model: Some("gpt-5.6-sol".into()),
+            accepted_plan_revision: Some(3),
+            completed_children: 1,
+            total_children: 2,
+            child_statuses: vec![],
+            failed_children: vec![42],
+            reasons: vec!["child failed review".into()],
+            members: vec![quorum_core::stats::DecompositionMemberView {
+                task_id: 42,
+                local_key: "api".into(),
+                title: "build API".into(),
+                status: "failed".into(),
+                prerequisites: vec![41],
+            }],
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("DECOMPOSITION"));
+        assert!(output.contains("source #40"));
+        assert!(output.contains("children=1/2"));
+        assert!(output.contains("proposal=2/3 provider=1/3"));
+        assert!(output.contains("#42") && output.contains("deps #41"));
+        assert!(output.contains("blocker: child failed review"));
     }
 
     #[test]
