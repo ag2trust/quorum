@@ -69,6 +69,7 @@ impl AgentProc {
     /// Spawn a read-only planning turn. Unlike the closed-book classifier,
     /// the planner may inspect the frozen repository, but cannot invoke Bash,
     /// write files, load customizations, or persist a provider session.
+    #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
     pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
         Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner)
     }

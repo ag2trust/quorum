@@ -1,5 +1,9 @@
 //! Bounded task-decomposition planner provider and protocol boundary.
 
+// This foundation module is exercised directly by its contract tests. The daemon coordinator
+// integration will consume the runtime API in the next implementation slice.
+#![allow(dead_code)]
+
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, RunnerProc};
@@ -61,7 +65,7 @@ impl std::fmt::Display for PlannerParseError {
 }
 
 pub fn parse_response(text: &str) -> Result<PlannerResponse, PlannerParseError> {
-    if text.as_bytes().len() > MAX_RESPONSE_BYTES {
+    if text.len() > MAX_RESPONSE_BYTES {
         return Err(PlannerParseError::Provider(
             "response exceeds 64 KiB".into(),
         ));
@@ -149,7 +153,7 @@ fn validate_text(label: &str, value: &str) -> Result<(), PlannerParseError> {
     if value.trim().is_empty() {
         return semantic(&format!("{label} must not be empty"));
     }
-    if value.as_bytes().len() > MAX_TEXT_BYTES {
+    if value.len() > MAX_TEXT_BYTES {
         return semantic(&format!("{label} exceeds {MAX_TEXT_BYTES} bytes"));
     }
     Ok(())
