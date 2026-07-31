@@ -38,21 +38,33 @@ git fetch origin --quiet || fail "git fetch origin"
 git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BASE_REF=origin/main
+case "$BRANCH" in
+  sync/develop-*)
+    git rev-parse --verify --quiet origin/develop >/dev/null \
+      || fail "origin/develop not found — integration gate cannot run"
+    git merge-base --is-ancestor origin/main HEAD \
+      || fail "integration branch does not contain current origin/main"
+    git merge-base --is-ancestor origin/develop HEAD \
+      || fail "integration branch does not contain current origin/develop"
+    BASE_REF=origin/develop
+    ;;
+esac
 if [ "$BRANCH" = "main" ]; then
   printf 'on main — nothing to compare, skipping\n'
 else
   # Every commit ahead of origin/main must be this PR's own work. Multiple
   # distinct Co-Authored-By sessions ahead of main means the branch was cut from
   # another feature branch (#114) — rebase onto origin/main before pushing.
-  printf 'commits ahead of origin/main:\n'
-  git log --oneline origin/main..HEAD
+  printf 'commits ahead of %s:\n' "$BASE_REF"
+  git log --oneline "$BASE_REF"..HEAD
   # Dedupe on the session-name token only ("Flint-r3 (Claude Opus 4.6) <...>" →
   # "Flint-r3") — trailer model-string formats vary within one session.
-  N_SESSIONS=$(git log origin/main..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
+  N_SESSIONS=$(git log "$BASE_REF"..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
     | sed '/^$/d' | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
   if [ "$N_SESSIONS" -gt 1 ]; then
     printf 'distinct co-author sessions ahead of origin/main:\n'
-    git log origin/main..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
+    git log "$BASE_REF"..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
       | sed '/^$/d' | awk '{print $1}' | sort -u
     fail "branch base: ${N_SESSIONS} sessions in origin/main..HEAD — branched from a feature branch? Rebase onto origin/main"
   fi
@@ -60,11 +72,11 @@ else
   # (convention-mandatory on every commit, CLAUDE.md §Engineering practices 1).
   # Trailer-less commits can't be attributed — surface that instead of implying
   # a clean pass.
-  N_AHEAD=$(git rev-list --count origin/main..HEAD)
+  N_AHEAD=$(git rev-list --count "$BASE_REF"..HEAD)
   if [ "$N_SESSIONS" -eq 0 ] && [ "$N_AHEAD" -gt 0 ]; then
     printf 'note: %s commit(s) ahead carry no Co-Authored-By trailer — sessions unattributable; eyeball the commit list above\n' "$N_AHEAD"
   fi
-  printf 'branch base OK (%s session(s) ahead of origin/main)\n' "$N_SESSIONS"
+  printf 'branch base OK (%s session(s) ahead of %s)\n' "$N_SESSIONS" "$BASE_REF"
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------
