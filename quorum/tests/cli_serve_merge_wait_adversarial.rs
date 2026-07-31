@@ -1539,7 +1539,7 @@ fn replacement_instant_death_stops_at_budget() {
             None,
             0,
             None,
-            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_by":"test-classifier:v2"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,

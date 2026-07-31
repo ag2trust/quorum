@@ -699,9 +699,13 @@ fn next_task_view(
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
          WHERE status = 'open'
-           AND json_valid(refs) AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+           AND json_valid(refs)
+           AND json_type(refs, '$.cx_est')='integer'
+           AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+           AND json_type(refs, '$.cx_size')='text'
            AND json_extract(refs, '$.cx_size') IN ('S','M','L')
-           AND json_extract(refs, '$.cx_ready')=1
+           AND json_type(refs, '$.cx_ready')='true'
+           AND json_type(refs, '$.cx_not_ready_reason')='null'
            AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
            AND {DEP_READY_CLAUSE}"
     );
@@ -950,7 +954,7 @@ mod tests {
             c, "boss", title, None, priority, labels, None, None, None, now,
         )
         .unwrap();
-        c.execute("UPDATE tasks SET refs=json_object('cx_est',3,'cx_size','M','cx_ready',true,'cx_by','test:v2') WHERE id=?1", [id]).unwrap();
+        c.execute("UPDATE tasks SET refs=json_object('cx_est',3,'cx_size','M','cx_ready',json('true'),'cx_not_ready_reason',json('null'),'cx_by','test:v2') WHERE id=?1", [id]).unwrap();
         id
     }
 

@@ -1448,112 +1448,112 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let db = paths::db_path()?;
-            let mut conn = quorum_core::db::open(&db)?;
-            let tasks = quorum_core::classify::tasks_missing_cx_all(&conn)?;
-            if tasks.is_empty() {
-                output::emit(
-                    &serde_json::json!({"classified": 0, "message": "all tasks already have cx_est"}),
-                );
-                return Ok(0);
-            }
-
-            let batch_size = 20;
             let mut total_stored = 0;
+            let mut total_tasks = 0;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;
 
-            for chunk in tasks.chunks(batch_size) {
-                let turn = serve::classifier::classifier_turn(chunk, &[]);
-                let spec = serve::classifier::classifier_spec(
-                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                    !no_bare_agent,
+            loop {
+                // The query itself is bounded. Re-open between batches so the
+                // provider call never keeps a SQLite connection or read
+                // transaction alive.
+                let tasks = {
+                    let conn = quorum_core::db::open(&db)?;
+                    quorum_core::classify::tasks_missing_cx_all(&conn)?
+                };
+                if tasks.is_empty() {
+                    break;
+                }
+                let pending_task_ids: Vec<i64> = tasks.iter().map(|task| task.id).collect();
+                let recommendations = quorum_core::complexity::recommendation_lines(
+                    quorum_core::complexity::RecommendationProvider::Claude,
                 );
 
-                let rt = tokio::runtime::Runtime::new()
-                    .map_err(|e| QuorumError::Io(format!("tokio runtime: {e}")))?;
+                let results = rt.block_on(async {
+                    let mut slot = serve::classifier::spawn_classifier_configured(
+                        &tasks,
+                        &[],
+                        agent_bin.as_deref(),
+                        !no_bare_agent,
+                        serve::classifier::CLASSIFIER_MODEL,
+                        serve::classifier::CLASSIFIER_EFFORT,
+                        "workspace-write",
+                        &recommendations,
+                    )
+                    .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
+                    let turn = serve::classifier::classifier_turn_with_recommendations(
+                        &tasks,
+                        &[],
+                        &recommendations,
+                    );
+                    if !slot.proc.is_codex() {
+                        slot.proc
+                            .feed_turn(&turn)
+                            .await
+                            .map_err(|e| QuorumError::Io(format!("feed classifier turn: {e}")))?;
+                    }
 
-                let stored = rt.block_on(async {
-                    let mut proc = serve::agent::AgentProc::spawn(&spec, agent_bin.as_deref())
-                        .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
-
-                    proc.feed_turn(&turn)
-                        .await
-                        .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
-
-                    let mut response_text = String::new();
-                    let timeout_dur = std::time::Duration::from_secs(120);
-                    let deadline = tokio::time::Instant::now() + timeout_dur;
-
-                    loop {
-                        let remaining = deadline - tokio::time::Instant::now();
-                        match tokio::time::timeout(remaining, proc.next_event()).await {
-                            Ok(Some(serve::stream::Event::Result {
-                                result, is_error, ..
-                            })) => {
-                                if is_error.unwrap_or(false) {
-                                    eprintln!(
-                                        "classifier error for batch starting at #{}",
-                                        chunk[0].id
-                                    );
-                                    break;
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                    let response = loop {
+                        if let Some(result) =
+                            serve::classifier::drain_classifier_events(&mut slot).await
+                        {
+                            break match result {
+                                serve::classifier::ClassifierResult::Done(text) => Ok(text),
+                                serve::classifier::ClassifierResult::Error(error) => {
+                                    Err(QuorumError::Io(error))
                                 }
-                                let text = result
-                                    .as_str()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| result.to_string());
-                                if !text.is_empty() {
-                                    response_text = text;
-                                }
-                                break;
-                            }
-                            Ok(Some(serve::stream::Event::Assistant { message })) => {
-                                if let Some(content) =
-                                    message.get("content").and_then(|c| c.as_str())
-                                {
-                                    response_text.push_str(content);
-                                }
-                            }
-                            Ok(Some(_)) => {}
-                            Ok(None) => break,
-                            Err(_) => {
-                                eprintln!(
-                                    "classifier timeout for batch starting at #{}",
-                                    chunk[0].id
-                                );
-                                break;
-                            }
+                            };
                         }
-                    }
-
-                    proc.kill_and_reap().await;
-
-                    if response_text.is_empty() {
-                        return Ok(0usize);
-                    }
-
-                    if let Some(results) = serve::classifier::parse_response(&response_text) {
-                        let now = quorum_core::clock::now();
-                        quorum_core::classify::store_classifications(
-                            &mut conn,
-                            &results,
-                            &quorum_core::classify::classifier_provenance(
-                                serve::classifier::CLASSIFIER_MODEL,
-                            ),
-                            now,
-                        )
-                    } else {
-                        eprintln!(
-                            "failed to parse classifier response for batch starting at #{}",
-                            chunk[0].id
-                        );
-                        Ok(0usize)
-                    }
+                        if matches!(slot.proc.try_wait(), Ok(Some(_))) {
+                            break if slot.response_text.is_empty() {
+                                Err(QuorumError::Io(
+                                    "classifier exited without a response".into(),
+                                ))
+                            } else {
+                                Ok(std::mem::take(&mut slot.response_text))
+                            };
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            break Err(QuorumError::Io("classifier timed out".into()));
+                        }
+                    };
+                    slot.proc.kill_and_reap().await;
+                    let response = response?;
+                    serve::classifier::parse_validated_response(&response, &pending_task_ids)
+                        .map_err(QuorumError::Io)
                 })?;
 
+                let stored = {
+                    let mut conn = quorum_core::db::open(&db)?;
+                    quorum_core::classify::store_classifications(
+                        &mut conn,
+                        &results,
+                        &quorum_core::classify::classifier_provenance(
+                            serve::classifier::CLASSIFIER_MODEL,
+                        ),
+                        quorum_core::clock::now(),
+                    )?
+                };
+                if stored != pending_task_ids.len() {
+                    return Err(QuorumError::Io(format!(
+                        "classifier stored {stored} tasks for {} requested tasks",
+                        pending_task_ids.len()
+                    )));
+                }
                 total_stored += stored;
+                total_tasks += pending_task_ids.len();
             }
 
             output::emit(&serde_json::json!({
                 "classified": total_stored,
-                "total_tasks": tasks.len(),
+                "total_tasks": total_tasks,
+                "message": if total_stored == 0 {
+                    "all tasks already have a complete v2 classification"
+                } else {
+                    "classification backfill complete"
+                },
             }));
             Ok(0)
         }

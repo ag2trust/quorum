@@ -1502,7 +1502,8 @@ labels are ignored.
 
 The built-in Codex recommendation ladder is `1=luna/high`, `2=terra/high`,
 `3=terra/high`, `4=sol/high`, `5=sol/high`. Level 5 remains in classifier guidance and
-stored context, but is outside automatic execution policy.
+stored context. Focused level-5 work sized `S` or `M` is dispatchable; level 5 with size
+`L` is outside automatic execution policy.
 
 Claude's Sonnet/Opus order is not a cross-runner abstraction. Replace shared rank
 inference with explicit per-role selections while preserving Claude defaults:

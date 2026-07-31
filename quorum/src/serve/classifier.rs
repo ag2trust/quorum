@@ -29,6 +29,7 @@ pub struct ClassifierSlot {
 /// using subscription auth a `--bare` agent has no credentials, so every
 /// classifier turn fails "Not logged in · Please run /login" and the daemon
 /// respawn-loops (observed live 2026-07-10, right after the session-id fix).
+#[allow(dead_code)] // retained for direct contract tests and compatibility callers
 pub fn classifier_spec(repo_dir: &Path, bare: bool) -> AgentSpec {
     classifier_spec_for(repo_dir, bare, CLASSIFIER_MODEL, CLASSIFIER_EFFORT)
 }
@@ -60,6 +61,26 @@ pub fn spawn_classifier_configured(
     codex_sandbox: &str,
     recommendations: &str,
 ) -> std::io::Result<ClassifierSlot> {
+    if tasks.len() > classify::CLASSIFICATION_BATCH_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "classifier batch has {} tasks; limit is {}",
+                tasks.len(),
+                classify::CLASSIFICATION_BATCH_LIMIT
+            ),
+        ));
+    }
+    if dup_context.len() > classify::DUP_CONTEXT_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "classifier duplicate context has {} tasks; limit is {}",
+                dup_context.len(),
+                classify::DUP_CONTEXT_LIMIT
+            ),
+        ));
+    }
     let kind = classifier_kind(model)?;
     let pending_task_ids = tasks.iter().map(|t| t.id).collect();
     let dir = tempfile::tempdir()?;
@@ -99,6 +120,7 @@ pub fn spawn_classifier_configured(
 }
 
 /// Build the user turn for the classifier prompt.
+#[allow(dead_code)] // default-provider convenience retained for compatibility
 pub fn classifier_turn(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
@@ -192,11 +214,41 @@ pub fn is_auth_error(text: &str) -> bool {
 }
 
 /// Parse the classifier response text into structured results.
+#[allow(dead_code)] // retained for parse-only compatibility tests; live paths validate batches
 pub fn parse_response(text: &str) -> Option<Vec<TaskClassification>> {
     // Try to find JSON in the response (model might wrap in markdown fences)
     let json_text = extract_json(text)?;
     let resp: ClassifierResponse = serde_json::from_str(json_text).ok()?;
     Some(resp.tasks)
+}
+
+/// Parse and validate one complete classifier batch. A syntactically valid
+/// response is still a provider failure unless it covers every requested task
+/// exactly once and every item satisfies the v2 contract.
+pub fn parse_validated_response(
+    text: &str,
+    expected_task_ids: &[i64],
+) -> std::result::Result<Vec<TaskClassification>, String> {
+    let json_text =
+        extract_json(text).ok_or_else(|| "classifier returned unparseable JSON".to_string())?;
+    let raw: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|error| format!("classifier returned invalid JSON: {error}"))?;
+    let raw_tasks = raw
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "classifier response is missing its tasks array".to_string())?;
+    if raw_tasks.iter().any(|task| {
+        !task
+            .as_object()
+            .is_some_and(|object| object.contains_key("not_ready_reason"))
+    }) {
+        return Err("classifier response item is missing not_ready_reason".into());
+    }
+    let resp: ClassifierResponse = serde_json::from_value(raw)
+        .map_err(|error| format!("classifier response has an invalid item: {error}"))?;
+    let results = resp.tasks;
+    classify::validate_batch(&results, expected_task_ids)?;
+    Ok(results)
 }
 
 fn extract_json(text: &str) -> Option<&str> {
@@ -408,6 +460,29 @@ mod tests {
     #[test]
     fn parse_response_invalid() {
         assert!(parse_response("not json at all").is_none());
+    }
+
+    #[test]
+    fn validated_response_requires_exact_unique_coverage() {
+        let valid = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null}]}"#;
+        assert!(parse_validated_response(valid, &[1]).is_ok());
+        assert!(parse_validated_response(valid, &[1, 2]).is_err());
+
+        let duplicate = r#"{"tasks": [
+            {"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null},
+            {"task_id": 1, "complexity": 3, "size": "M", "ready": true, "not_ready_reason": null}
+        ]}"#;
+        assert!(parse_validated_response(duplicate, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn validated_response_rejects_partial_item_contract() {
+        let missing_reason =
+            r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": true}]}"#;
+        assert!(parse_validated_response(missing_reason, &[1]).is_err());
+
+        let invalid_ready = r#"{"tasks": [{"task_id": 1, "complexity": 3, "size": "M", "ready": false, "not_ready_reason": "  "}]}"#;
+        assert!(parse_validated_response(invalid_ready, &[1]).is_err());
     }
 
     #[test]

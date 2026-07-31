@@ -6,6 +6,7 @@ use crate::db::begin_immediate;
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Per-task classification output from the classifier agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,7 +16,6 @@ pub struct TaskClassification {
     pub cx_est: i64,
     pub size: String,
     pub ready: bool,
-    #[serde(default)]
     pub not_ready_reason: Option<String>,
     #[serde(default, alias = "cx_dup_of")]
     pub duplicate_of: Vec<i64>,
@@ -38,32 +38,70 @@ pub struct TaskForClassification {
 }
 
 const VALID_SIZES: &[&str] = &["S", "M", "L", "XL"];
+pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
+pub const DUP_CONTEXT_LIMIT: usize = 60;
+const TITLE_CHAR_LIMIT: usize = 300;
+const BODY_CHAR_LIMIT: usize = 2_000;
+const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
+const DEPENDENCY_LIMIT: usize = 8;
+const RECOVERY_NOTE_CHAR_LIMIT: usize = 600;
+const RECOVERY_NOTE_LIMIT: usize = 4;
+const DUP_BODY_CHAR_LIMIT: usize = 200;
+
+/// SQL counterpart of [`crate::tasks::classification_is_complete`]. Keep this
+/// predicate strict: malformed and partial v2 refs must remain classifier
+/// candidates instead of becoming permanently undispatchable queue entries.
+const INCOMPLETE_CLASSIFICATION_PREDICATE: &str = r#"
+    CASE WHEN refs IS NULL OR NOT json_valid(refs) THEN 1
+    ELSE NOT COALESCE((
+        json_type(refs, '$.cx_est') = 'integer'
+        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+        AND json_type(refs, '$.cx_size') = 'text'
+        AND json_extract(refs, '$.cx_size') IN ('S', 'M', 'L', 'XL')
+        AND json_type(refs, '$.cx_ready') IN ('true', 'false')
+        AND (
+            (json_type(refs, '$.cx_ready') = 'true'
+             AND json_type(refs, '$.cx_not_ready_reason') = 'null')
+            OR
+            (json_type(refs, '$.cx_ready') = 'false'
+             AND json_type(refs, '$.cx_not_ready_reason') = 'text'
+             AND length(trim(json_extract(refs, '$.cx_not_ready_reason'))) > 0)
+        )
+    ), 0)
+    END
+"#;
 
 /// Query active tasks and policy-parked tasks whose v2 classification is
 /// incomplete. Malformed legacy refs are candidates rather than a query error.
 pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, body FROM tasks
+    let query = format!(
+        "SELECT id, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
          WHERE (status IN ('open', 'working', 'in-review', 'rework', 'merging')
                 OR CASE WHEN status='failed' AND json_valid(refs)
-                        THEN json_extract(refs, '$.daemon_parked')=1
+                        THEN json_extract(refs, '$.classifier_policy_parked')=1
                         ELSE 0 END)
-         AND CASE WHEN refs IS NULL OR NOT json_valid(refs) THEN 1
-                  ELSE (json_extract(refs, '$.cx_est') IS NULL
-                        OR json_extract(refs, '$.cx_size') IS NULL
-                        OR json_extract(refs, '$.cx_ready') IS NULL)
-             END",
-    )?;
+         AND {INCOMPLETE_CLASSIFICATION_PREDICATE}
+         ORDER BY id
+         LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&query)?;
     let tasks = stmt
-        .query_map([], |row| {
-            Ok(TaskForClassification {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                body: row.get(2)?,
-                dependencies: vec![],
-                recovery_notes: vec![],
-            })
-        })?
+        .query_map(
+            params![
+                TITLE_CHAR_LIMIT as i64,
+                BODY_CHAR_LIMIT as i64,
+                CLASSIFICATION_BATCH_LIMIT as i64
+            ],
+            |row| {
+                Ok(TaskForClassification {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    dependencies: vec![],
+                    recovery_notes: vec![],
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     tasks
         .into_iter()
@@ -83,26 +121,43 @@ fn enrich_task(
         |r| r.get(0),
     )?;
     if let Some(deps) = deps {
-        let mut stmt = conn.prepare("SELECT id, title, status FROM tasks WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY id LIMIT 8")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, substr(title, 1, ?2), status FROM tasks
+             WHERE id IN (SELECT value FROM json_each(?1))
+             ORDER BY id LIMIT ?3",
+        )?;
         task.dependencies = stmt
-            .query_map(params![deps], |r| {
-                Ok(format!(
-                    "#{} {} ({})",
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?
-                ))
-            })?
+            .query_map(
+                params![
+                    deps,
+                    DEPENDENCY_TITLE_CHAR_LIMIT as i64,
+                    DEPENDENCY_LIMIT as i64
+                ],
+                |r| {
+                    Ok(format!(
+                        "#{} {} ({})",
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?
+                    ))
+                },
+            )?
             .collect::<rusqlite::Result<_>>()?;
     }
-    let mut stmt =
-        conn.prepare("SELECT body FROM task_notes WHERE task_id=?1 ORDER BY id DESC LIMIT 4")?;
+    let mut stmt = conn.prepare(
+        "SELECT substr(body, 1, ?2) FROM task_notes
+         WHERE task_id=?1 ORDER BY id DESC LIMIT ?3",
+    )?;
     task.recovery_notes = stmt
-        .query_map(params![task.id], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|s| truncate(&s, 600))
-        .collect();
+        .query_map(
+            params![
+                task.id,
+                RECOVERY_NOTE_CHAR_LIMIT as i64,
+                RECOVERY_NOTE_LIMIT as i64
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(task)
 }
 
@@ -115,11 +170,14 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Check whether a specific task lacks cx_est in refs.
 pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskForClassification>> {
-    conn.query_row(
-        "SELECT id, title, body FROM tasks
+    let query = format!(
+        "SELECT id, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks
          WHERE id = ?1
-         AND (refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL)",
-        params![task_id],
+         AND {INCOMPLETE_CLASSIFICATION_PREDICATE}"
+    );
+    conn.query_row(
+        &query,
+        params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
         |row| {
             Ok(TaskForClassification {
                 id: row.get(0)?,
@@ -137,41 +195,59 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
 /// All open/working tasks (for dup-detection context).
 pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, body FROM tasks
+        "SELECT id, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
          WHERE status IN ('open', 'working')
-         ORDER BY id",
+         ORDER BY id
+         LIMIT ?3",
     )?;
     let tasks = stmt
-        .query_map([], |row| {
-            Ok(TaskForClassification {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                body: row.get(2)?,
-                dependencies: vec![],
-                recovery_notes: vec![],
-            })
-        })?
+        .query_map(
+            params![
+                TITLE_CHAR_LIMIT as i64,
+                DUP_BODY_CHAR_LIMIT as i64,
+                DUP_CONTEXT_LIMIT as i64
+            ],
+            |row| {
+                Ok(TaskForClassification {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    dependencies: vec![],
+                    recovery_notes: vec![],
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(tasks)
 }
 
-/// Query ALL tasks (any status) missing cx_est — for `--backfill`.
+/// Query one stable, bounded page of tasks in any status whose v2
+/// classification is incomplete or malformed — for `--backfill`.
 pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassification>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, body FROM tasks
-         WHERE refs IS NULL OR json_extract(refs, '$.cx_est') IS NULL
-         ORDER BY id",
-    )?;
+    let query = format!(
+        "SELECT id, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
+         WHERE {INCOMPLETE_CLASSIFICATION_PREDICATE}
+         ORDER BY id
+         LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&query)?;
     let tasks = stmt
-        .query_map([], |row| {
-            Ok(TaskForClassification {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                body: row.get(2)?,
-                dependencies: vec![],
-                recovery_notes: vec![],
-            })
-        })?
+        .query_map(
+            params![
+                TITLE_CHAR_LIMIT as i64,
+                BODY_CHAR_LIMIT as i64,
+                CLASSIFICATION_BATCH_LIMIT as i64
+            ],
+            |row| {
+                Ok(TaskForClassification {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    body: row.get(2)?,
+                    dependencies: vec![],
+                    recovery_notes: vec![],
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(tasks)
 }
@@ -244,20 +320,59 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
     }
 }
 
-fn valid(result: &TaskClassification) -> bool {
+pub fn valid(result: &TaskClassification) -> bool {
     (1..=5).contains(&result.cx_est)
         && VALID_SIZES.contains(&result.size.as_str())
         && if result.ready {
-            result
-                .not_ready_reason
-                .as_ref()
-                .is_none_or(|s| s.trim().is_empty())
+            result.not_ready_reason.is_none()
         } else {
             result
                 .not_ready_reason
                 .as_ref()
                 .is_some_and(|s| !s.trim().is_empty())
         }
+}
+
+/// Validate the semantic contract for one provider response before any result
+/// is committed. Coverage must be exact so missing, duplicate, unexpected, or
+/// malformed items enter provider backoff rather than being silently skipped.
+pub fn validate_batch(
+    results: &[TaskClassification],
+    expected_task_ids: &[i64],
+) -> std::result::Result<(), String> {
+    if results.len() != expected_task_ids.len() {
+        return Err(format!(
+            "classifier returned {} tasks for {} requested tasks",
+            results.len(),
+            expected_task_ids.len()
+        ));
+    }
+    let expected: HashSet<i64> = expected_task_ids.iter().copied().collect();
+    if expected.len() != expected_task_ids.len() {
+        return Err("classifier request contained duplicate task ids".into());
+    }
+    let mut seen = HashSet::with_capacity(results.len());
+    for result in results {
+        if !seen.insert(result.task_id) {
+            return Err(format!(
+                "classifier returned duplicate task #{}",
+                result.task_id
+            ));
+        }
+        if !expected.contains(&result.task_id) {
+            return Err(format!(
+                "classifier returned unexpected task #{}",
+                result.task_id
+            ));
+        }
+        if !valid(result) {
+            return Err(format!(
+                "classifier returned an invalid classification for task #{}",
+                result.task_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parking_reason(result: &TaskClassification) -> Option<&str> {
@@ -356,53 +471,54 @@ pub fn build_prompt_with_recommendations(
     let mut prompt = classifier_rubric(recommendations);
 
     prompt.push_str("\n\n## Tasks to classify\n\n");
-    for t in tasks {
+    for t in tasks.iter().take(CLASSIFICATION_BATCH_LIMIT) {
         prompt.push_str(&format!("### Task #{}\n", t.id));
-        prompt.push_str(&format!("**Title:** {}\n", t.title));
+        prompt.push_str(&format!(
+            "**Title:** {}\n",
+            truncate(&t.title, TITLE_CHAR_LIMIT)
+        ));
         if let Some(body) = &t.body {
-            let truncated = if body.len() > 2000 {
-                format!(
-                    "{}…",
-                    &body[..body.char_indices().nth(2000).map_or(body.len(), |(i, _)| i)]
-                )
-            } else {
-                body.clone()
-            };
+            let truncated = truncate(body, BODY_CHAR_LIMIT);
             prompt.push_str(&format!("**Body:**\n{truncated}\n"));
         }
         prompt.push('\n');
         if !t.dependencies.is_empty() {
             prompt.push_str(&format!(
                 "**Dependencies:** {}\n",
-                t.dependencies.join("; ")
+                t.dependencies
+                    .iter()
+                    .take(DEPENDENCY_LIMIT)
+                    .map(|dependency| truncate(dependency, DEPENDENCY_TITLE_CHAR_LIMIT + 32))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ));
         }
         if !t.recovery_notes.is_empty() {
             prompt.push_str(&format!(
                 "**Recovery context:** {}\n",
-                t.recovery_notes.join("\n")
+                t.recovery_notes
+                    .iter()
+                    .take(RECOVERY_NOTE_LIMIT)
+                    .map(|note| truncate(note, RECOVERY_NOTE_CHAR_LIMIT))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
     }
 
     if !dup_context.is_empty() {
         prompt.push_str("## Other open/working tasks (for duplicate detection)\n\n");
-        for t in dup_context {
+        for t in dup_context.iter().take(DUP_CONTEXT_LIMIT) {
             let snippet = t
                 .body
                 .as_deref()
-                .map(|b| {
-                    if b.len() > 200 {
-                        format!(
-                            "{}…",
-                            &b[..b.char_indices().nth(200).map_or(b.len(), |(i, _)| i)]
-                        )
-                    } else {
-                        b.to_string()
-                    }
-                })
+                .map(|body| truncate(body, DUP_BODY_CHAR_LIMIT))
                 .unwrap_or_default();
-            prompt.push_str(&format!("- #{}: {} — {snippet}\n", t.id, t.title));
+            prompt.push_str(&format!(
+                "- #{}: {} — {snippet}\n",
+                t.id,
+                truncate(&t.title, TITLE_CHAR_LIMIT)
+            ));
         }
     }
 
@@ -838,6 +954,10 @@ mod tests {
         parked.size = "L".into();
         parked.duplicate_of = vec![99];
         store_classifications(&mut conn, &[parked], "test:v2", 10).unwrap();
+        let parked_task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let parked_refs: serde_json::Value =
+            serde_json::from_str(parked_task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(parked_refs["classifier_policy_parked"], true);
         assert!(
             crate::tasks::retry_parked(&mut conn, task_id, "owner", true, 11)
                 .unwrap()
@@ -849,6 +969,7 @@ mod tests {
             .refs
             .unwrap();
         let retry_refs: serde_json::Value = serde_json::from_str(&retry_refs).unwrap();
+        assert_eq!(retry_refs["classifier_policy_parked"], true);
         for key in [
             "cx_est",
             "cx_size",
@@ -872,6 +993,102 @@ mod tests {
     }
 
     #[test]
+    fn generic_daemon_park_is_not_restored_by_reclassification() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "generic recovery park", 1);
+        crate::tasks::park(
+            &mut conn,
+            task_id,
+            "provider recovery exhausted",
+            "open",
+            10,
+        )
+        .unwrap();
+
+        store_classifications(&mut conn, &[classified(task_id, 3)], "test:v2", 11).unwrap();
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert!(refs.get("classifier_policy_parked").is_none());
+    }
+
+    #[test]
+    fn malformed_v2_refs_remain_candidates_for_live_and_backfill_queries() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "malformed v2", 1);
+        conn.execute(
+            "UPDATE tasks
+             SET refs='{\"cx_est\":3,\"cx_size\":\"BAD\",\"cx_ready\":true,\"cx_not_ready_reason\":null}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        assert_eq!(unclassified_tasks(&conn).unwrap()[0].id, task_id);
+        assert_eq!(tasks_missing_cx_all(&conn).unwrap()[0].id, task_id);
+        let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
+        assert!(!crate::tasks::classification_is_dispatchable(&refs));
+    }
+
+    #[test]
+    fn malformed_higher_queue_entry_does_not_starve_valid_claim_candidate() {
+        let (_dir, mut conn) = open_tmp();
+        let malformed = create_task(&mut conn, "malformed first", 1);
+        let valid_task = create_task(&mut conn, "valid second", 2);
+        conn.execute(
+            "UPDATE tasks
+             SET refs='{\"cx_est\":3,\"cx_size\":\"BAD\",\"cx_ready\":true,\"cx_not_ready_reason\":null}'
+             WHERE id=?1",
+            params![malformed],
+        )
+        .unwrap();
+        store_classifications(&mut conn, &[classified(valid_task, 3)], "test:v2", 20).unwrap();
+
+        let claimed = crate::tasks::claim(&mut conn, "worker", None, &[], 60, 21)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, valid_task);
+    }
+
+    #[test]
+    fn classifier_inputs_are_stably_bounded_and_truncated() {
+        let (_dir, mut conn) = open_tmp();
+        let total = DUP_CONTEXT_LIMIT + 5;
+        for seq in 0..total {
+            create_task(&mut conn, &format!("task {seq}"), seq as i64);
+        }
+        conn.execute(
+            "UPDATE tasks SET title=?1, body=?2 WHERE id=(SELECT min(id) FROM tasks)",
+            params![
+                "T".repeat(TITLE_CHAR_LIMIT + 100),
+                "B".repeat(BODY_CHAR_LIMIT + 100)
+            ],
+        )
+        .unwrap();
+
+        let batch = unclassified_tasks(&conn).unwrap();
+        assert_eq!(batch.len(), CLASSIFICATION_BATCH_LIMIT);
+        assert!(batch.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(batch[0].title.chars().count() <= TITLE_CHAR_LIMIT);
+        assert!(batch[0].body.as_deref().unwrap().chars().count() <= BODY_CHAR_LIMIT);
+
+        let dup_context = dup_context_tasks(&conn).unwrap();
+        assert_eq!(dup_context.len(), DUP_CONTEXT_LIMIT);
+        assert!(dup_context.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(dup_context[0].body.as_deref().unwrap().chars().count() <= DUP_BODY_CHAR_LIMIT);
+    }
+
+    #[test]
+    fn validate_batch_rejects_missing_duplicate_unexpected_and_invalid_items() {
+        assert!(validate_batch(&[classified(1, 3), classified(2, 3)], &[1, 2]).is_ok());
+        assert!(validate_batch(&[classified(1, 3)], &[1, 2]).is_err());
+        assert!(validate_batch(&[classified(1, 3), classified(1, 3)], &[1, 2]).is_err());
+        assert!(validate_batch(&[classified(1, 3), classified(3, 3)], &[1, 2]).is_err());
+        assert!(validate_batch(&[classified(1, 0)], &[1]).is_err());
+    }
+
+    #[test]
     fn classifier_prompt_contains_shared_rubric_descriptions() {
         let rubric = classifier_rubric(&complexity::recommendation_lines(
             complexity::RecommendationProvider::Claude,
@@ -887,12 +1104,16 @@ mod tests {
     #[test]
     fn skill_file_contains_shared_rubric_descriptions() {
         let skill = include_str!("../../.claude/skills/quorum/SKILL.md");
-        for (_level, _label, desc, _time) in &crate::complexity::RUBRIC {
+        for (level, label, desc, _reserved) in &crate::complexity::RUBRIC {
             assert!(
-                skill.contains(*desc),
-                "skill file missing rubric description: {desc}"
+                skill.contains(&format!("- {level}: {label} — {desc}")),
+                "skill file missing canonical rubric line for level {level}"
             );
         }
+        assert!(!skill.contains("min agent work"));
+        assert!(!skill.contains("15-30 min"));
+        assert!(!skill.contains("30-60 min"));
+        assert!(!skill.contains("> 60 min"));
     }
 }
 

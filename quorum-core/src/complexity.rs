@@ -2,7 +2,7 @@
 //! model/effort recommendations. Used by the classifier prompt, the
 //! cheatsheet, and regression tests.
 
-/// (level, short label, description, time estimate)
+/// (level, short label, description, reserved legacy field)
 pub const RUBRIC: [(u8, &str, &str, &str); 5] = [
     (1, "Trivial", "config tweak, typo fix, simple rename", ""),
     (2, "Simple", "single-file change, clear spec", ""),

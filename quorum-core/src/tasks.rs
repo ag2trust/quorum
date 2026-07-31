@@ -33,6 +33,7 @@ pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
+pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
 /// One-shot marker on a remediation-death park: the daemon owes this task a
 /// single PR-head check. Head moved → the dead worker did push, resume the
@@ -579,9 +580,13 @@ pub fn claim(
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3
-                       AND json_valid(refs) AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+                       AND json_valid(refs)
+                       AND json_type(refs, '$.cx_est')='integer'
+                       AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+                       AND json_type(refs, '$.cx_size')='text'
                        AND json_extract(refs, '$.cx_size') IN ('S','M','L')
-                       AND json_extract(refs, '$.cx_ready')=1
+                       AND json_type(refs, '$.cx_ready')='true'
+                       AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                        AND (
                          (status='open' AND {DEP_READY_CLAUSE})
@@ -597,9 +602,13 @@ pub fn claim(
         None => {
             let mut selector = format!(
                 "SELECT id FROM tasks
-                 WHERE json_valid(refs) AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+                 WHERE json_valid(refs)
+                   AND json_type(refs, '$.cx_est')='integer'
+                   AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+                   AND json_type(refs, '$.cx_size')='text'
                    AND json_extract(refs, '$.cx_size') IN ('S','M','L')
-                   AND json_extract(refs, '$.cx_ready')=1
+                   AND json_type(refs, '$.cx_ready')='true'
+                   AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                    AND (
                     (status='open' AND {DEP_READY_CLAUSE})
@@ -684,9 +693,12 @@ pub fn claim_provider_retry_rework(
         "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
            AND CASE WHEN json_valid(refs) THEN
-               json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+               json_type(refs, '$.cx_est')='integer'
+               AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
+               AND json_type(refs, '$.cx_size')='text'
                AND json_extract(refs, '$.cx_size') IN ('S','M','L')
-               AND json_extract(refs, '$.cx_ready')=1
+               AND json_type(refs, '$.cx_ready')='true'
+               AND json_type(refs, '$.cx_not_ready_reason')='null'
                AND NOT (json_extract(refs, '$.cx_est')=5
                         AND json_extract(refs, '$.cx_size')='L')
                AND (
@@ -757,9 +769,12 @@ pub fn claim_remediation_rework(
         "SELECT EXISTS(
              SELECT 1 FROM tasks
              WHERE id=?1 AND (NOT json_valid(refs)
-                 OR json_extract(refs, '$.cx_ready') IS NOT 1
-                 OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L')
+                 OR json_type(refs, '$.cx_est') IS NOT 'integer'
                  OR COALESCE(json_extract(refs, '$.cx_est'), 0) NOT BETWEEN 1 AND 5
+                 OR json_type(refs, '$.cx_size') IS NOT 'text'
+                 OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L')
+                 OR json_type(refs, '$.cx_ready') IS NOT 'true'
+                 OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
                  OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L'))
          )",
         params![id],
@@ -2137,12 +2152,62 @@ fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Res
     serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
 }
 
+fn set_classifier_policy_parked_refs(
+    refs: Option<&str>,
+    reason: &str,
+    resume_status: &str,
+) -> Result<String> {
+    let parked = set_parked_refs(refs, reason, resume_status)?;
+    let mut value: serde_json::Value = serde_json::from_str(&parked)
+        .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?
+        .insert(
+            CLASSIFIER_POLICY_PARKED_REF.into(),
+            serde_json::Value::Bool(true),
+        );
+    serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
+}
+
 pub const COMPLEXITY_FIVE_PARK_REASON: &str =
     "complexity 5 exceeds automatic dispatch policy; split or rescope into a new task";
+
+/// A complete v2 classification has the exact persisted types and
+/// readiness/reason relationship required by dispatch policy.
+pub fn classification_is_complete(refs: &Option<String>) -> bool {
+    let Some(refs) = refs else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs) else {
+        return false;
+    };
+    let Some(cx) = v.get("cx_est").and_then(serde_json::Value::as_i64) else {
+        return false;
+    };
+    let Some(size) = v.get("cx_size").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(ready) = v.get("cx_ready").and_then(serde_json::Value::as_bool) else {
+        return false;
+    };
+    let reason_is_valid = if ready {
+        v.get("cx_not_ready_reason")
+            .is_some_and(serde_json::Value::is_null)
+    } else {
+        v.get("cx_not_ready_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| !reason.trim().is_empty())
+    };
+    (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L" | "XL") && reason_is_valid
+}
 
 /// Classification policy is intentionally separate from model routing: difficult
 /// focused work may run, while unready or compound work is parked.
 pub fn classification_is_dispatchable(refs: &Option<String>) -> bool {
+    if !classification_is_complete(refs) {
+        return false;
+    }
     let Some(refs) = refs else {
         return false;
     };
@@ -2190,7 +2255,8 @@ pub(crate) fn park_classified_task_tx(
         "merging" => "in-review",
         other => other,
     };
-    let refs = set_parked_refs(refs.as_deref(), &effective_reason, resume_status)?;
+    let refs =
+        set_classifier_policy_parked_refs(refs.as_deref(), &effective_reason, resume_status)?;
     tx.execute(
         "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs, now],
@@ -2212,10 +2278,16 @@ pub(crate) fn restore_classified_task_tx(
     id: i64,
     now: i64,
 ) -> Result<bool> {
-    let row: Option<(String, Option<String>)> = tx.query_row(
-        "SELECT status, refs FROM tasks WHERE id=?1 AND status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1",
-        params![id], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).optional()?;
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT status, refs FROM tasks
+         WHERE id=?1 AND status='failed' AND json_valid(refs)
+           AND json_extract(refs, '$.daemon_parked')=1
+           AND json_extract(refs, '$.classifier_policy_parked')=1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
     let Some((_status, refs)) = row else {
         return Ok(false);
     };
@@ -2235,6 +2307,7 @@ pub(crate) fn restore_classified_task_tx(
     obj.remove(PARKED_REF);
     obj.remove(PARKED_REASON_REF);
     obj.remove(PARKED_RESUME_STATUS_REF);
+    obj.remove(CLASSIFIER_POLICY_PARKED_REF);
     tx.execute(
         "UPDATE tasks SET status=?2, refs=?3, updated_at=?4 WHERE id=?1",
         params![id, resume, value.to_string(), now],
@@ -2270,7 +2343,11 @@ pub(crate) fn park_complexity_five_tx(
         "merging" => "in-review",
         other => other,
     };
-    let refs = set_parked_refs(refs.as_deref(), COMPLEXITY_FIVE_PARK_REASON, resume_status)?;
+    let refs = set_classifier_policy_parked_refs(
+        refs.as_deref(),
+        COMPLEXITY_FIVE_PARK_REASON,
+        resume_status,
+    )?;
     tx.execute(
         "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs, now],
@@ -2459,9 +2536,12 @@ pub fn retry_parked(
         return Ok(None);
     };
     let policy_parked: bool = tx.query_row(
-        "SELECT COALESCE(json_valid(refs) AND (json_extract(refs, '$.cx_ready')!=1
-             OR json_extract(refs, '$.cx_size')='XL'
-             OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')), 0) FROM tasks WHERE id=?1",
+        "SELECT COALESCE(
+             json_valid(refs)
+             AND json_extract(refs, '$.classifier_policy_parked')=1,
+             0
+         )
+         FROM tasks WHERE id=?1",
         params![id],
         |row| row.get(0),
     )?;
@@ -2982,6 +3062,8 @@ mod tests {
             .or_insert_with(|| serde_json::json!("M"));
         map.entry("cx_ready")
             .or_insert_with(|| serde_json::json!(true));
+        map.entry("cx_not_ready_reason")
+            .or_insert(serde_json::Value::Null);
         map.entry("cx_by")
             .or_insert_with(|| serde_json::json!("test:v2"));
         let refs = value.to_string();
