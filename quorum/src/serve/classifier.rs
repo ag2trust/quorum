@@ -24,6 +24,15 @@ pub struct ClassifierSlot {
     pub isolation_dir: Option<tempfile::TempDir>,
 }
 
+impl ClassifierSlot {
+    /// Terminate and reap the provider before dropping the isolated workspace.
+    /// Claude's stream-json process is persistent after a Result event, so
+    /// dropping the slot alone would leave the child alive in a deleted cwd.
+    pub async fn kill_and_reap(self) {
+        let _terminal_output = self.proc.kill_and_reap().await;
+    }
+}
+
 /// Build the spec for a classifier agent. `bare` must follow the daemon's
 /// `no_bare_agent` setting (same as worker/reviewer spawns): on machines
 /// using subscription auth a `--bare` agent has no credentials, so every
@@ -428,6 +437,65 @@ mod tests {
             "operator auth must remain enabled: {args}"
         );
         assert!(!args.contains(&repo.path().display().to_string()), "{args}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_result_kills_and_reaps_persistent_classifier_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("persistent-classifier");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\n\
+             while IFS= read -r _turn; do\n\
+               printf '%s\\n' '{\"type\":\"result\",\"result\":\"{\\\"tasks\\\":[{\\\"task_id\\\":7,\\\"complexity\\\":2,\\\"size\\\":\\\"S\\\",\\\"ready\\\":true,\\\"not_ready_reason\\\":null}]}\",\"is_error\":false}'\n\
+             done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tasks = vec![TaskForClassification {
+            id: 7,
+            title: "classify me".into(),
+            body: None,
+            dependencies: vec![],
+            recovery_notes: vec![],
+        }];
+        let mut slot = spawn_classifier_configured(
+            &tasks,
+            &[],
+            runner.to_str(),
+            false,
+            CLASSIFIER_MODEL,
+            CLASSIFIER_EFFORT,
+            "read-only",
+            "",
+        )
+        .unwrap();
+        let pid = slot.proc.pid().expect("classifier pid");
+        slot.proc
+            .feed_turn(&classifier_turn(&tasks, &[]))
+            .await
+            .unwrap();
+        let result = drain_classifier_events(&mut slot)
+            .await
+            .expect("terminal result");
+        assert!(matches!(result, ClassifierResult::Done(_)));
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "child should persist after Result"
+        );
+
+        slot.kill_and_reap().await;
+
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

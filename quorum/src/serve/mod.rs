@@ -7562,62 +7562,34 @@ async fn tick(
 
     // ── Phase 7: Task classifier ─────────────────────────────────────
     // 7a: Drain events from in-flight classifier.
-    if let Some(slot) = classifier_slot.as_mut() {
-        // Check if the classifier process exited.
+    let classifier_terminal = if let Some(slot) = classifier_slot.as_mut() {
         let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
-        let pending_task_ids = slot.pending_task_ids.clone();
-
         if let Some(result) = classifier::drain_classifier_events(slot).await {
-            match result {
-                classifier::ClassifierResult::Done(text) => {
-                    match store_classifier_response(
-                        &db_path,
-                        &text,
-                        &pending_task_ids,
-                        &config.classifier_model,
-                    )
-                    .await
-                    {
-                        Ok(stored) => {
-                            log(&format!("classifier: stored {stored} classification(s)"));
-                            *classifier_consec_errors = 0;
-                            *classifier_backoff_until = None;
-                        }
-                        Err(error) => {
-                            record_classifier_failure(
-                                &db_path,
-                                &error,
-                                classifier_consec_errors,
-                                classifier_backoff_until,
-                            )
-                            .await;
-                        }
-                    }
-                    *classifier_slot = None;
-                }
-                classifier::ClassifierResult::Error(e) => {
-                    if classifier::is_auth_error(&e) {
-                        log(&format!(
-                            "classifier: {e} — if using subscription auth, \
-                             ensure no_bare_agent = true (the default)"
-                        ));
-                    } else {
-                        log(&format!("classifier: {e}"));
-                    }
-                    record_classifier_failure(
-                        &db_path,
-                        &e,
-                        classifier_consec_errors,
-                        classifier_backoff_until,
-                    )
-                    .await;
-                    *classifier_slot = None;
-                }
-            }
+            Some(result)
         } else if exited {
-            // Process exited without a Result event.
-            if !slot.response_text.is_empty() {
-                let text = std::mem::take(&mut slot.response_text);
+            Some(if slot.response_text.is_empty() {
+                classifier::ClassifierResult::Error("classifier exited without a response".into())
+            } else {
+                classifier::ClassifierResult::Done(std::mem::take(&mut slot.response_text))
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(result) = classifier_terminal {
+        // A Claude Result event ends the turn but not its persistent process.
+        // Consume the slot, kill the process group, and reap the child before
+        // dropping the TempDir or performing result/error handling.
+        let slot = classifier_slot
+            .take()
+            .expect("terminal classifier result requires an active slot");
+        let pending_task_ids = slot.pending_task_ids.clone();
+        slot.kill_and_reap().await;
+
+        match result {
+            classifier::ClassifierResult::Done(text) => {
                 match store_classifier_response(
                     &db_path,
                     &text,
@@ -7641,16 +7613,24 @@ async fn tick(
                         .await;
                     }
                 }
-            } else {
+            }
+            classifier::ClassifierResult::Error(error) => {
+                if classifier::is_auth_error(&error) {
+                    log(&format!(
+                        "classifier: {error} — if using subscription auth, \
+                         ensure no_bare_agent = true (the default)"
+                    ));
+                } else {
+                    log(&format!("classifier: {error}"));
+                }
                 record_classifier_failure(
                     &db_path,
-                    "classifier exited without a response",
+                    &error,
                     classifier_consec_errors,
                     classifier_backoff_until,
                 )
                 .await;
             }
-            *classifier_slot = None;
         }
     }
 

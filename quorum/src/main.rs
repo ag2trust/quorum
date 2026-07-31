@@ -1457,9 +1457,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 // The query itself is bounded. Re-open between batches so the
                 // provider call never keeps a SQLite connection or read
                 // transaction alive.
-                let tasks = {
+                let (tasks, dup_context) = {
                     let conn = quorum_core::db::open(&db)?;
-                    quorum_core::classify::tasks_missing_cx_all(&conn)?
+                    let tasks = quorum_core::classify::tasks_missing_cx_all(&conn)?;
+                    let task_ids: Vec<i64> = tasks.iter().map(|task| task.id).collect();
+                    let dup_context: Vec<_> = quorum_core::classify::dup_context_tasks(&conn)?
+                        .into_iter()
+                        .filter(|task| !task_ids.contains(&task.id))
+                        .take(quorum_core::classify::DUP_CONTEXT_LIMIT)
+                        .collect();
+                    (tasks, dup_context)
                 };
                 if tasks.is_empty() {
                     break;
@@ -1472,7 +1479,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 let results = rt.block_on(async {
                     let mut slot = serve::classifier::spawn_classifier_configured(
                         &tasks,
-                        &[],
+                        &dup_context,
                         agent_bin.as_deref(),
                         !no_bare_agent,
                         serve::classifier::CLASSIFIER_MODEL,
@@ -1483,14 +1490,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
                     let turn = serve::classifier::classifier_turn_with_recommendations(
                         &tasks,
-                        &[],
+                        &dup_context,
                         &recommendations,
                     );
                     if !slot.proc.is_codex() {
-                        slot.proc
-                            .feed_turn(&turn)
-                            .await
-                            .map_err(|e| QuorumError::Io(format!("feed classifier turn: {e}")))?;
+                        if let Err(error) = slot.proc.feed_turn(&turn).await {
+                            slot.kill_and_reap().await;
+                            return Err(QuorumError::Io(format!("feed classifier turn: {error}")));
+                        }
                     }
 
                     let deadline =
@@ -1519,7 +1526,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             break Err(QuorumError::Io("classifier timed out".into()));
                         }
                     };
-                    slot.proc.kill_and_reap().await;
+                    slot.kill_and_reap().await;
                     let response = response?;
                     serve::classifier::parse_validated_response(&response, &pending_task_ids)
                         .map_err(QuorumError::Io)

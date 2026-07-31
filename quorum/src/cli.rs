@@ -525,7 +525,7 @@ pub enum Command {
         /// Use the operator's installed Claude login (default: true).
         /// Set to false to pass --bare, requiring non-interactive credentials
         /// in the environment.
-        #[arg(long)]
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         no_bare_agent: bool,
     },
     /// Interpret PR review comments: fetch both comment endpoints, run a cheap
@@ -693,4 +693,27 @@ pub enum Command {
         #[arg(long)]
         raw: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn classify_defaults_to_operator_login_and_allows_explicit_bare_auth() {
+        let default = Cli::try_parse_from(["quorum", "classify", "--backfill"]).unwrap();
+        let Command::Classify { no_bare_agent, .. } = default.command else {
+            panic!("expected classify command");
+        };
+        assert!(no_bare_agent);
+
+        let explicit_bare =
+            Cli::try_parse_from(["quorum", "classify", "--backfill", "--no-bare-agent=false"])
+                .unwrap();
+        let Command::Classify { no_bare_agent, .. } = explicit_bare.command else {
+            panic!("expected classify command");
+        };
+        assert!(!no_bare_agent);
+    }
 }

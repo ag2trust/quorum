@@ -249,7 +249,10 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(tasks)
+    tasks
+        .into_iter()
+        .map(|task| enrich_task(conn, task))
+        .collect()
 }
 
 /// Store classification results into task refs and add notes for flags/dups.
@@ -402,7 +405,15 @@ fn merge_cx_into_refs(
         None => serde_json::json!({}),
     };
 
-    let map = obj.as_object_mut().unwrap();
+    // Malformed candidates intentionally include valid JSON scalars/arrays.
+    // They carry no preservable named refs, so normalize them to an object
+    // before installing the authoritative classification fields.
+    if !obj.is_object() {
+        obj = serde_json::json!({});
+    }
+    let map = obj
+        .as_object_mut()
+        .expect("classifier refs normalized to an object");
     map.insert("cx_est".into(), serde_json::json!(result.cx_est));
     map.insert("cx_size".into(), serde_json::json!(result.size));
     map.insert("cx_ready".into(), serde_json::json!(result.ready));
@@ -752,6 +763,34 @@ mod tests {
     }
 
     #[test]
+    fn non_object_refs_are_normalized_during_persistence() {
+        for (seq, raw_refs) in [(1, "[]"), (2, "null")] {
+            let (_dir, mut conn) = open_tmp();
+            let task_id = create_task(&mut conn, "non-object refs", seq);
+            conn.execute(
+                "UPDATE tasks SET refs=?2 WHERE id=?1",
+                params![task_id, raw_refs],
+            )
+            .unwrap();
+            assert_eq!(unclassified_tasks(&conn).unwrap()[0].id, task_id);
+
+            let stored =
+                store_classifications(&mut conn, &[classified(task_id, 3)], "test:v2", 20).unwrap();
+            assert_eq!(stored, 1);
+            let refs = crate::tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .unwrap();
+            let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+            assert!(refs.is_object());
+            assert_eq!(refs["cx_est"], 3);
+            assert_eq!(refs["cx_size"], "M");
+            assert_eq!(refs["cx_ready"], true);
+        }
+    }
+
+    #[test]
     fn store_classifications_records_each_classifier_model() {
         let (_dir, mut conn) = open_tmp();
         let luna_task = create_task(&mut conn, "Luna task", 1);
@@ -925,6 +964,30 @@ mod tests {
 
         let missing = tasks_missing_cx_all(&conn).unwrap();
         assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn backfill_candidates_include_bounded_dependency_and_recovery_context() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency_id = create_task(&mut conn, "dependency title", 1);
+        let task_id = create_task(&mut conn, "backfill target", 2);
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            params![task_id, serde_json::json!([dependency_id]).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body)
+             VALUES (?1, 10, 'daemon', 'bounded recovery evidence')",
+            params![task_id],
+        )
+        .unwrap();
+
+        let tasks = tasks_missing_cx_all(&conn).unwrap();
+        let task = tasks.iter().find(|task| task.id == task_id).unwrap();
+        assert_eq!(task.dependencies.len(), 1);
+        assert!(task.dependencies[0].contains("dependency title"));
+        assert_eq!(task.recovery_notes, vec!["bounded recovery evidence"]);
     }
 
     #[test]
