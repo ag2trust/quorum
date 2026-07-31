@@ -117,6 +117,47 @@ fn submit_with_changes_and_feedback() {
 }
 
 #[test]
+fn submit_with_changes_and_feedback_file() {
+    let home = tempfile::tempdir().unwrap();
+    init(home.path());
+    issue_cap(home.path(), "run-r2-file", 1, "Reviewer-2", "reviewer");
+    let feedback = home.path().join("feedback.txt");
+    std::fs::write(
+        &feedback,
+        "Fix the quoted `$value` handling\nand its negative path.",
+    )
+    .unwrap();
+
+    quorum()
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", "run-r2-file")
+        .args([
+            "submit",
+            "--agent",
+            "Reviewer-2",
+            "--pr",
+            "60",
+            "--verdict",
+            "changes",
+            "--feedback-file",
+        ])
+        .arg(&feedback)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\":true"));
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let rows = quorum_core::mailbox::poll_unconsumed(&conn).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1.feedback.as_deref(),
+        Some("Fix the quoted `$value` handling\nand its negative path."),
+        "feedback-file text must reach the mailbox unchanged"
+    );
+}
+
+#[test]
 fn submit_explicit_run_id_flag_overrides_env() {
     let home = tempfile::tempdir().unwrap();
     init(home.path());

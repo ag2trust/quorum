@@ -920,10 +920,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             pr,
             summary,
             verdict,
-            feedback,
+            mut feedback,
+            feedback_file,
             blocking,
             run_id,
         } => {
+            if let Some(path) = feedback_file {
+                feedback = Some(input::read_text(input::TextSource::File(path))?);
+            }
             if let Some(ref v) = verdict {
                 match v.as_str() {
                     "approved" | "changes" => {}
