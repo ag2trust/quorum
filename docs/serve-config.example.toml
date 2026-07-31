@@ -29,8 +29,8 @@ effort = "high"
 #         4=opus-47/high, 5=opus-48/high
 # Codex:  1=luna/high, 2=terra/high, 3=terra/high,
 #         4=sol/high, 5=sol/high
-# Complexity 5 is recommendation metadata only: the daemon durably parks
-# category-5 tasks instead of dispatching them.
+# The daemon parks tasks classified not ready, XL, or complexity-5 with size L.
+# Focused complexity-5 tasks sized S or M remain dispatchable.
 # Task creators cannot override complexity, model, or effort. Optional operator
 # overrides must use a closed tier and medium|high.
 # [suggested_models]

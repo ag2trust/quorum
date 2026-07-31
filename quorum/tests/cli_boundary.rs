@@ -482,6 +482,20 @@ fn internal_claim_api_available_without_cli_surface() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: 1,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
+        now,
+    )
+    .unwrap();
     let result =
         quorum_core::tasks::claim(&mut conn, "daemon-internal", Some(1), &[], 300, now).unwrap();
     assert!(result.is_some(), "internal claim API must succeed");

@@ -394,6 +394,25 @@ fn seed_task(home: &std::path::Path, title: &str) {
         "task-create failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let db = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    let task_id: i64 = conn
+        .query_row("SELECT MAX(id) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test-classifier:v2",
+        quorum_core::clock::now(),
+    )
+    .unwrap();
 }
 
 /// Core regression test: recovery budget persists across daemon restarts and
@@ -425,7 +444,7 @@ fn recovery_budget_exhaustion_across_daemon_restart() {
             None,
             0,
             None,
-            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -574,7 +593,7 @@ fn explicit_retry_of_parked_rework_spawns_replacement_worker() {
             Some("preserve original context"),
             0,
             None,
-            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             Some(1),
             now,
@@ -893,7 +912,7 @@ fn consecutive_restarts_accumulate_recovery_count() {
             None,
             0,
             None,
-            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,
@@ -978,7 +997,7 @@ fn exhaustion_produces_durable_diagnostics() {
             None,
             0,
             None,
-            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,

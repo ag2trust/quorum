@@ -2411,6 +2411,54 @@ async fn persist_classifier_error(db_path: &Path, detail: &str) {
     .await;
 }
 
+async fn record_classifier_failure(
+    db_path: &Path,
+    detail: &str,
+    consecutive_errors: &mut u32,
+    backoff_until: &mut Option<std::time::Instant>,
+) {
+    log(&format!("classifier: {detail}"));
+    persist_classifier_error(
+        db_path,
+        &format!("{detail}; unclassified tasks remain undispatchable until a successful retry"),
+    )
+    .await;
+    *consecutive_errors = consecutive_errors.saturating_add(1);
+    let delay = std::cmp::min(30 * (1u64 << (*consecutive_errors - 1).min(4)), 300);
+    *backoff_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
+    log(&format!(
+        "classifier: backoff {delay}s after {} consecutive error(s)",
+        *consecutive_errors
+    ));
+}
+
+async fn store_classifier_response(
+    db_path: &Path,
+    text: &str,
+    pending_task_ids: &[i64],
+    pending_inputs: &[quorum_core::classify::ClassificationInput],
+    classifier_model: &str,
+) -> std::result::Result<usize, String> {
+    let results = classifier::parse_validated_response(text, pending_task_ids)?;
+    let path = db_path.to_path_buf();
+    let pending_inputs = pending_inputs.to_vec();
+    let version = quorum_core::classify::classifier_provenance(classifier_model);
+    let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::classify::store_classifications_for_inputs(
+            &mut conn,
+            &results,
+            &pending_inputs,
+            &version,
+            now_unix(),
+        )
+    })
+    .await
+    .map_err(|error| format!("classifier storage join failed: {error}"))?
+    .map_err(|error| format!("classifier storage failed: {error}"))?;
+    Ok(stored)
+}
+
 async fn poll_pre_review_checks(
     config: &ServeConfig,
     waits: &mut HashMap<i64, PreReviewChecksEntry>,
@@ -3467,9 +3515,8 @@ async fn tick(
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
-    // Category-5 work is outside automatic-dispatch policy. Reconcile rows
-    // written by older daemons before any mailbox recovery or provisioning
-    // path can regain authority.
+    // Reconcile policy-blocked classifications written by older daemons before
+    // any mailbox recovery or provisioning path can regain authority.
     {
         let p = db_path.clone();
         let parked = tokio::task::spawn_blocking(move || -> Result<usize> {
@@ -3480,7 +3527,7 @@ async fn tick(
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
         if parked > 0 {
             log(&format!(
-                "policy: parked {parked} complexity-5 task(s); split or rescope before creating replacement tasks"
+                "policy: parked {parked} task(s) outside automatic dispatch policy; clarify, split, or rescope before retrying"
             ));
         }
     }
@@ -7213,12 +7260,6 @@ async fn tick(
             .unwrap_or_default()
         };
         for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
-            if classifier_complexity(task_refs).is_none() {
-                log(&format!(
-                    "task #{task_id} PR #{pr}: awaiting classifier-owned complexity before review dispatch"
-                ));
-                continue;
-            }
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -7389,6 +7430,12 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
+                    if !tasks::classification_is_dispatchable(task_refs) {
+                        log(&format!(
+                            "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
+                        ));
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         let r1_info = {
                             let p = db_path.clone();
@@ -7517,126 +7564,77 @@ async fn tick(
 
     // ── Phase 7: Task classifier ─────────────────────────────────────
     // 7a: Drain events from in-flight classifier.
-    if let Some(slot) = classifier_slot.as_mut() {
-        // Check if the classifier process exited.
+    let classifier_terminal = if let Some(slot) = classifier_slot.as_mut() {
         let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
-
         if let Some(result) = classifier::drain_classifier_events(slot).await {
-            match result {
-                classifier::ClassifierResult::Done(text) => {
-                    if let Some(results) = classifier::parse_response(&text) {
-                        let p = db_path.clone();
-                        let version =
-                            quorum_core::classify::classifier_provenance(&config.classifier_model);
-                        let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            let now = now_unix();
-                            quorum_core::classify::store_classifications(
-                                &mut conn, &results, &version, now,
-                            )
-                        })
-                        .await
-                        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                        .unwrap_or(0);
+            Some(result)
+        } else if exited {
+            Some(if slot.response_text.is_empty() {
+                classifier::ClassifierResult::Error("classifier exited without a response".into())
+            } else {
+                classifier::ClassifierResult::Done(std::mem::take(&mut slot.response_text))
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(result) = classifier_terminal {
+        // A Claude Result event ends the turn but not its persistent process.
+        // Consume the slot, kill the process group, and reap the child before
+        // dropping the TempDir or performing result/error handling.
+        let slot = classifier_slot
+            .take()
+            .expect("terminal classifier result requires an active slot");
+        let pending_task_ids = slot.pending_task_ids.clone();
+        let pending_inputs = slot.pending_inputs.clone();
+        slot.kill_and_reap().await;
 
-                        if stored > 0 {
-                            log(&format!("classifier: stored {stored} classification(s)"));
-                        }
-                    } else {
-                        log("classifier: failed to parse response");
-                        persist_classifier_error(
+        match result {
+            classifier::ClassifierResult::Done(text) => {
+                match store_classifier_response(
+                    &db_path,
+                    &text,
+                    &pending_task_ids,
+                    &pending_inputs,
+                    &config.classifier_model,
+                )
+                .await
+                {
+                    Ok(stored) => {
+                        log(&format!("classifier: stored {stored} classification(s)"));
+                        *classifier_consec_errors = 0;
+                        *classifier_backoff_until = None;
+                    }
+                    Err(error) => {
+                        record_classifier_failure(
                             &db_path,
-                            "classifier returned an unparseable response; unclassified tasks remain undispatchable",
+                            &error,
+                            classifier_consec_errors,
+                            classifier_backoff_until,
                         )
                         .await;
                     }
-                    *classifier_consec_errors = 0;
-                    *classifier_backoff_until = None;
-                    *classifier_slot = None;
-                }
-                classifier::ClassifierResult::Error(e) => {
-                    if classifier::is_auth_error(&e) {
-                        log(&format!(
-                            "classifier: {e} — if using subscription auth, \
-                             ensure no_bare_agent = true (the default)"
-                        ));
-                    } else {
-                        log(&format!("classifier: {e}"));
-                    }
-                    persist_classifier_error(
-                        &db_path,
-                        &format!(
-                            "{e}; unclassified tasks remain undispatchable until a successful retry"
-                        ),
-                    )
-                    .await;
-                    *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
-                    let delay =
-                        std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
-                    *classifier_backoff_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
-                    log(&format!(
-                        "classifier: backoff {delay}s after {} consecutive error(s)",
-                        *classifier_consec_errors
-                    ));
-                    *classifier_slot = None;
                 }
             }
-        } else if exited {
-            // Process exited without a Result event.
-            if !slot.response_text.is_empty() {
-                let text = std::mem::take(&mut slot.response_text);
-                if let Some(results) = classifier::parse_response(&text) {
-                    let p = db_path.clone();
-                    let version =
-                        quorum_core::classify::classifier_provenance(&config.classifier_model);
-                    let stored = tokio::task::spawn_blocking(move || -> Result<usize> {
-                        let mut conn = quorum_core::db::open(&p)?;
-                        let now = now_unix();
-                        quorum_core::classify::store_classifications(
-                            &mut conn, &results, &version, now,
-                        )
-                    })
-                    .await
-                    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                    .unwrap_or(0);
-
-                    if stored > 0 {
-                        log(&format!("classifier: stored {stored} classification(s)"));
-                    }
-                    *classifier_consec_errors = 0;
-                    *classifier_backoff_until = None;
+            classifier::ClassifierResult::Error(error) => {
+                if classifier::is_auth_error(&error) {
+                    log(&format!(
+                        "classifier: {error} — if using subscription auth, \
+                         ensure no_bare_agent = true (the default)"
+                    ));
                 } else {
-                    log("classifier: process exited without parseable response");
-                    persist_classifier_error(
-                        &db_path,
-                        "classifier exited without a parseable response; unclassified tasks remain undispatchable",
-                    )
-                    .await;
-                    *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
-                    let delay =
-                        std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
-                    *classifier_backoff_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
+                    log(&format!("classifier: {error}"));
                 }
-            } else {
-                log("classifier: process exited without response");
-                persist_classifier_error(
+                record_classifier_failure(
                     &db_path,
-                    "classifier exited without a response; unclassified tasks remain undispatchable",
+                    &error,
+                    classifier_consec_errors,
+                    classifier_backoff_until,
                 )
                 .await;
-                *classifier_consec_errors = classifier_consec_errors.saturating_add(1);
-                let delay =
-                    std::cmp::min(30 * (1u64 << (*classifier_consec_errors - 1).min(4)), 300);
-                *classifier_backoff_until =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(delay));
-                log(&format!(
-                    "classifier: backoff {delay}s after {} consecutive error(s)",
-                    *classifier_consec_errors
-                ));
             }
-            *classifier_slot = None;
         }
     }
 
@@ -7662,6 +7660,7 @@ async fn tick(
             let dup_context: Vec<_> = all_open
                 .into_iter()
                 .filter(|t| !task_ids.contains(&t.id))
+                .take(quorum_core::classify::DUP_CONTEXT_LIMIT)
                 .collect();
             Ok((tasks, dup_context))
         })
@@ -7673,7 +7672,6 @@ async fn tick(
                 match classifier::spawn_classifier_configured(
                     &tasks,
                     &dup_context,
-                    &config.repo_dir,
                     config.agent_bin.as_deref(),
                     config.bare_agent,
                     &config.classifier_model,
@@ -7696,7 +7694,14 @@ async fn tick(
                                 ),
                             );
                             if let Err(e) = slot.proc.feed_turn(&turn).await {
-                                log(&format!("classifier: feed_turn failed: {e}"));
+                                record_classifier_failure(
+                                    &db_path,
+                                    &format!("classifier feed_turn failed: {e}"),
+                                    classifier_consec_errors,
+                                    classifier_backoff_until,
+                                )
+                                .await;
+                                slot.proc.kill_and_reap().await;
                             } else {
                                 log(&format!("classifier: spawned for {} task(s)", tasks.len()));
                                 *classifier_slot = Some(slot);
@@ -7704,12 +7709,11 @@ async fn tick(
                         }
                     }
                     Err(e) => {
-                        log(&format!("classifier: spawn failed: {e}"));
-                        persist_classifier_error(
+                        record_classifier_failure(
                             &db_path,
-                            &format!(
-                                "classifier spawn failed: {e}; unclassified tasks remain undispatchable"
-                            ),
+                            &format!("classifier spawn failed: {e}"),
+                            classifier_consec_errors,
+                            classifier_backoff_until,
                         )
                         .await;
                     }
@@ -8605,6 +8609,30 @@ async fn provision_reviewer(
     head_sha: &str,
     recover_interrupted: bool,
 ) -> Result<()> {
+    // Defense in depth for every reviewer path (worker handoff, orphan
+    // recovery, and R2): incomplete legacy refs and policy-park
+    // classifications cannot acquire a reviewer identity or process.
+    let classification_dispatchable = {
+        let db_path = config.db_path.clone();
+        let task_id = worker.task_id;
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = quorum_core::db::open(&db_path)?;
+            Ok(tasks::get(&conn, task_id)?
+                .is_some_and(|task| tasks::classification_is_dispatchable(&task.refs)))
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+    };
+    if !classification_dispatchable {
+        log(&format!(
+            "{}: task #{} PR #{pr} lacks a complete dispatchable classification — \
+             reviewer not acquired or spawned",
+            role.as_str().to_uppercase(),
+            worker.task_id,
+        ));
+        return Ok(());
+    }
+
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
     // acquiring a name or creating reviewer resources.
@@ -9356,7 +9384,7 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if classifier_complexity(&t.refs).is_none() {
+            if !tasks::classification_is_dispatchable(&t.refs) {
                 return false;
             }
             if t.review_only {
@@ -12052,6 +12080,13 @@ mod tests {
             &mut conn, "owner", "retry", None, 0, None, None, None, None, 10,
         )
         .unwrap();
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            10,
+        )
+        .unwrap();
         tasks::claim(&mut conn, "worker", Some(task_id), &[], 3600, 11).unwrap();
         tasks::apply_event(
             &mut conn,
@@ -14403,7 +14438,9 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"branch":"daemon/spool-t1"}"#),
+            Some(
+                r#"{"branch":"daemon/spool-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
             None,
             None,
             now,
@@ -14808,6 +14845,13 @@ mod tests {
             None,
             None,
             None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
             now,
         )
         .unwrap();

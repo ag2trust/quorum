@@ -464,6 +464,20 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
         now,
     )
     .unwrap();
+    quorum_core::classify::store_classifications(
+        &mut conn,
+        &[quorum_core::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: vec![],
+        }],
+        "test:v2",
+        now,
+    )
+    .unwrap();
     quorum_core::tasks::claim(&mut conn, author, Some(id), &[], 3600, now).unwrap();
     quorum_core::tasks::apply_event(
         &mut conn,
@@ -1525,7 +1539,7 @@ fn replacement_instant_death_stops_at_budget() {
             None,
             0,
             None,
-            Some(r#"{"cx_est":3,"cx_by":"test-classifier"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test-classifier:v2"}"#),
             None,
             None,
             now,

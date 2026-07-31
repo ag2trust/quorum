@@ -2,33 +2,23 @@
 //! model/effort recommendations. Used by the classifier prompt, the
 //! cheatsheet, and regression tests.
 
-/// (level, short label, description, time estimate)
+/// (level, short label, description, reserved legacy field)
 pub const RUBRIC: [(u8, &str, &str, &str); 5] = [
     (1, "Trivial", "config tweak, typo fix, simple rename", ""),
-    (
-        2,
-        "Simple",
-        "single-file change, clear spec",
-        "< 15 min agent work",
-    ),
+    (2, "Simple", "single-file change, clear spec", ""),
     (
         3,
         "Moderate",
         "multi-file change, some design decisions",
-        "15-30 min",
+        "",
     ),
     (
         4,
         "Complex",
         "cross-cutting change, multiple components",
-        "30-60 min",
+        "",
     ),
-    (
-        5,
-        "Very complex",
-        "architectural change, new subsystem",
-        "> 60 min",
-    ),
+    (5, "Very complex", "architectural change, new subsystem", ""),
 ];
 
 /// Provider whose operational routing policy supplies recommendations.
