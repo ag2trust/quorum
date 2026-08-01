@@ -970,6 +970,32 @@ async fn publish_worker_completion(
         .await?;
     let known_pr = known_pr.or_else(|| prior.as_ref().and_then(|intent| intent.pr));
     let expected_remote_sha = match (&prior, known_pr) {
+        // A pre-fix continuation attempt could persist the new-branch intent
+        // shape (pr/baseline both NULL) before push_new_branch rejected the
+        // already-existing PR branch. Once the corrected slot/journal identity
+        // supplies the daemon-owned PR, repair that intent only from the
+        // immutable spawn-time target. Never adopt the mutable live PR head.
+        (Some(intent), Some(pr)) if intent.pr.is_none() => {
+            let baseline = load_publication_pr_baseline(&config.db_path, task_id, pr)
+                .await?
+                .ok_or_else(|| {
+                    format!("publication intent for PR #{pr} has no durable spawn-time target")
+                })?;
+            if baseline.is_fork || baseline.head_ref != branch {
+                return Err(format!(
+                    "spawn-time PR target for task #{task_id} does not match publish branch {branch}"
+                ));
+            }
+            if let Some(recorded) = intent.expected_remote_sha.as_deref() {
+                if recorded != baseline.head_sha {
+                    return Err(format!(
+                        "publication intent lease baseline {recorded} conflicts with spawn-time PR target {}",
+                        baseline.head_sha
+                    ));
+                }
+            }
+            Some(baseline.head_sha)
+        }
         (Some(intent), _) => intent.expected_remote_sha.clone(),
         (None, Some(pr)) => {
             let baseline = load_publication_pr_baseline(&config.db_path, task_id, pr).await?;
@@ -995,9 +1021,10 @@ async fn publish_worker_completion(
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
-        expected_remote_sha,
+        expected_remote_sha: expected_remote_sha.clone(),
     });
     intent.pr = known_pr;
+    intent.expected_remote_sha = expected_remote_sha;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
     if let Some(pr) = known_pr {
@@ -1969,6 +1996,26 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
     }
 }
 
+/// Resolve a worker's publication target without granting the worker any PR
+/// selection authority. An omitted signal retains the daemon-owned identity
+/// captured in the live slot or durable journal; an explicit signal may only
+/// confirm that exact identity.
+fn worker_publication_pr(
+    signaled_pr: Option<i64>,
+    daemon_pr: Option<i64>,
+) -> std::result::Result<Option<i64>, String> {
+    match (signaled_pr, daemon_pr) {
+        (Some(signaled), Some(expected)) if signaled == expected => Ok(Some(expected)),
+        (Some(signaled), Some(expected)) => Err(format!(
+            "worker signaled PR #{signaled}, but daemon recorded PR #{expected}"
+        )),
+        (Some(signaled), None) => Err(format!(
+            "worker signaled unbound PR #{signaled}; daemon creates initial PRs"
+        )),
+        (None, recorded) => Ok(recorded),
+    }
+}
+
 fn codex_retry_turn(refs: Option<&str>) -> Option<CodexRetryTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
     if !refs.get("codex_retry_requested")?.as_bool()? {
@@ -2081,10 +2128,9 @@ async fn recover_late_worker_done_with_publication(
     };
     let worktree = PathBuf::from(entry.worktree.as_deref().unwrap_or_default());
     let branch = entry.branch.as_deref().unwrap_or_default();
-    let known_pr = match (row.pr, entry.pr) {
-        (Some(signaled), Some(expected)) if signaled == expected => Some(expected),
-        (Some(_), _) => return Ok(false),
-        (None, expected) => expected,
+    let known_pr = match worker_publication_pr(row.pr, entry.pr) {
+        Ok(pr) => pr,
+        Err(_) => return Ok(false),
     };
     let published =
         match publish_worker_completion(config, wt_mgr, task_id, &worktree, branch, known_pr).await
@@ -6011,39 +6057,33 @@ async fn tick(
             // A worker cannot select a PR head to publish to. An explicit PR
             // signal is valid only when it matches the daemon-recorded PR for
             // this slot; otherwise use task refs or create the initial PR.
-            let effective_pr = if let Some(signaled_pr) = row.pr {
-                match workers[wi].pr {
-                    Some(expected_pr) if expected_pr == signaled_pr => Ok(Some(signaled_pr)),
-                    Some(expected_pr) => Err(format!(
-                        "worker signaled PR #{signaled_pr}, but daemon recorded PR #{expected_pr}"
-                    )),
-                    None => Err(format!(
-                        "worker signaled unbound PR #{signaled_pr}; daemon creates initial PRs"
-                    )),
-                }
-            } else {
-                let p = db_path.clone();
-                let tid = workers[wi].task_id;
-                let result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
-                    let conn = quorum_core::db::open(&p)?;
-                    let task = tasks::get(&conn, tid)?;
-                    Ok(task.and_then(|t| tasks::extract_pr_number(&t.refs)))
-                })
-                .await;
-                match result {
-                    Ok(Ok(pr)) => {
-                        if let Some(n) = pr {
-                            log(&format!(
-                                "BACKFILL: worker {} done without --pr but task #{} refs \
+            let effective_pr = match worker_publication_pr(row.pr, workers[wi].pr) {
+                Ok(Some(pr)) => Ok(Some(pr)),
+                Ok(None) => {
+                    let p = db_path.clone();
+                    let tid = workers[wi].task_id;
+                    let result = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
+                        let conn = quorum_core::db::open(&p)?;
+                        let task = tasks::get(&conn, tid)?;
+                        Ok(task.and_then(|t| tasks::extract_pr_number(&t.refs)))
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(pr)) => {
+                            if let Some(n) = pr {
+                                log(&format!(
+                                    "BACKFILL: worker {} done without --pr but task #{} refs \
                                  carry pr#{} — routing to review flow",
-                                workers[wi].agent_name, workers[wi].task_id, n
-                            ));
+                                    workers[wi].agent_name, workers[wi].task_id, n
+                                ));
+                            }
+                            Ok(pr)
                         }
-                        Ok(pr)
+                        Ok(Err(e)) => Err(format!("DB error loading refs for task #{tid}: {e}")),
+                        Err(e) => Err(format!("spawn_blocking join error for task #{tid}: {e}")),
                     }
-                    Ok(Err(e)) => Err(format!("DB error loading refs for task #{tid}: {e}")),
-                    Err(e) => Err(format!("spawn_blocking join error for task #{tid}: {e}")),
                 }
+                Err(error) => Err(error),
             };
 
             // DB error during refs lookup — log loudly, leave mailbox row
@@ -13415,6 +13455,33 @@ mod tests {
         let error = validate_initial_pr_target(&target, "daemon/worker-t1", "abc123", "main")
             .expect_err("wrong baseRefName must fail initial PR reconciliation");
         assert!(error.contains("base"));
+    }
+
+    #[test]
+    fn worker_publication_identity_is_daemon_owned() {
+        assert_eq!(
+            worker_publication_pr(None, Some(10)).unwrap(),
+            Some(10),
+            "omitting --pr must retain the live-slot or journal identity"
+        );
+        assert_eq!(
+            worker_publication_pr(Some(10), Some(10)).unwrap(),
+            Some(10),
+            "an explicit worker PR may only confirm daemon-owned identity"
+        );
+        assert_eq!(
+            worker_publication_pr(None, None).unwrap(),
+            None,
+            "a genuine initial delivery must remain on the new-PR path"
+        );
+
+        let mismatch = worker_publication_pr(Some(11), Some(10))
+            .expect_err("a worker cannot change the continuation target");
+        assert!(mismatch.contains("daemon recorded PR #10"));
+
+        let unbound = worker_publication_pr(Some(10), None)
+            .expect_err("an initial worker cannot select an existing PR");
+        assert!(unbound.contains("unbound PR #10"));
     }
 
     #[test]
