@@ -1509,6 +1509,11 @@ filesystem access is refused fail-closed. The view is an archive of the recorded
 and source drift is rejected before launch. A valid concrete blocker parks the source immediately
 with no second opinion.
 
+Current product limitation: Codex planning is refused fail-closed because its CLI transport does
+not yet provide that isolation boundary. A repository configured to plan with Codex records a
+bounded provider failure and releases or parks the source under the normal retry policy; use the
+Claude runner for daemon-managed decomposition until an enforceable Codex boundary exists.
+
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
 task row is created, the complete proposal is validated for scope coverage, real delivery
 boundaries, references, cycles, and duplicates, then classified as one batch. Every child must be

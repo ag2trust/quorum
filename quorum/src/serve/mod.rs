@@ -2582,6 +2582,7 @@ async fn reconcile_decomposition_startup(
     let (state, snapshot) = tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&path)?;
         tasks::clear_reviewer_provision_reservations(&mut conn)?;
+        quorum_core::decomposition::reconcile_startup_graphs(&mut conn, now_unix())?;
         Ok::<_, QuorumError>((
             inspect_startup_decomposition(&conn)?,
             load_planning_snapshot(&conn)?,
@@ -2602,6 +2603,9 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
         .query_row(
             "SELECT t.id,t.revision FROM tasks t
          WHERE t.status='open' AND t.assignee IS NULL AND t.review_only=0
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
+                           WHERE repository_graph.state IN ('active','blocked')
+                              OR repository_graph.active=1)
            AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
            AND json_extract(t.refs,'$.cx_size') IN ('L','XL')
            AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
@@ -2685,6 +2689,29 @@ async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::
     .map_err(|error| QuorumError::Io(format!("planner view join failed: {error}")))?
 }
 
+async fn repository_head_sha(repo: &Path) -> Result<String> {
+    let repo = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .map_err(|error| QuorumError::Io(format!("frozen-base capture failed: {error}")))?;
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success()
+            || !matches!(sha.len(), 40 | 64)
+            || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(QuorumError::Io(
+                "frozen-base capture returned no valid commit SHA".into(),
+            ));
+        }
+        Ok(sha)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("frozen-base capture join failed: {error}")))?
+}
+
 impl DrainState {
     fn new() -> Self {
         Self {
@@ -2756,6 +2783,61 @@ async fn record_decomposition_attempt(
     })
     .await
     .map_err(|error| QuorumError::Io(format!("decomposition attempt join: {error}")))??;
+    Ok(())
+}
+
+fn decomposition_process_name(graph_id: i64, role: &str) -> String {
+    format!("decomposition-{role}-{graph_id}")
+}
+
+async fn journal_decomposition_process(
+    config: &ServeConfig,
+    graph_id: i64,
+    source_task_id: i64,
+    role: &str,
+    pid: Option<i32>,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    let role = role.to_string();
+    let entry = JournalEntry {
+        agent: decomposition_process_name(graph_id, &role),
+        role: role.clone(),
+        task_id: Some(source_task_id),
+        session_id: agent::new_session_id(),
+        worktree: None,
+        branch: None,
+        phase: role,
+        cost_tokens: 0,
+        agent_state: None,
+        cost_usd: 0.0,
+        log_dir: None,
+        pid,
+        pr: None,
+        rework_count: 0,
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition journal join: {error}")))??;
+    Ok(())
+}
+
+async fn delete_decomposition_process(
+    config: &ServeConfig,
+    graph_id: i64,
+    role: &str,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    let name = decomposition_process_name(graph_id, role);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        journal::delete(&mut conn, &name)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition journal delete join: {error}")))??;
     Ok(())
 }
 
@@ -2906,6 +2988,7 @@ async fn tick_decomposition(
             let graph_id = coordinator
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("planner lost graph identity".into()))?;
+            delete_decomposition_process(config, graph_id, "planner").await?;
             match outcome {
                 planner::PlannerPoll::ProviderFailed(summary) => {
                     record_decomposition_attempt(
@@ -2983,6 +3066,7 @@ async fn tick_decomposition(
             let graph_id = coordinator
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("classifier lost graph identity".into()))?;
+            delete_decomposition_process(config, graph_id, "classifier").await?;
             match outcome {
                 classifier::ClassifierResult::Error(summary) => {
                     record_decomposition_attempt(
@@ -3026,21 +3110,32 @@ async fn tick_decomposition(
                             };
                             if let Some(snapshot) = snapshot {
                                 let path = config.db_path.clone();
-                                tokio::task::spawn_blocking(move || -> Result<()> {
-                                    let mut conn = quorum_core::db::open(&path)?;
-                                    quorum_core::decomposition::materialize_graph(
-                                        &mut conn,
+                                let materialized =
+                                    tokio::task::spawn_blocking(move || -> Result<bool> {
+                                        let mut conn = quorum_core::db::open(&path)?;
+                                        Ok(quorum_core::decomposition::materialize_graph(
+                                            &mut conn,
+                                            graph_id,
+                                            snapshot.source_revision,
+                                            &children,
+                                            now_unix(),
+                                        )?
+                                        .is_some())
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        QuorumError::Io(format!("materialization join: {error}"))
+                                    })??;
+                                if !materialized {
+                                    record_decomposition_attempt(
+                                        config,
                                         graph_id,
-                                        snapshot.source_revision,
-                                        &children,
-                                        now_unix(),
-                                    )?;
-                                    Ok(())
-                                })
-                                .await
-                                .map_err(|error| {
-                                    QuorumError::Io(format!("materialization join: {error}"))
-                                })??;
+                                        "blocker",
+                                        "materialization-authority-lost",
+                                        "atomic materialization lost graph or source authority",
+                                    )
+                                    .await?;
+                                }
                             }
                             coordinator.proposal = None;
                         }
@@ -3062,19 +3157,6 @@ async fn tick_decomposition(
                 planning_candidate(&conn)?
             };
             if let Some((source_task_id, expected_revision)) = candidate {
-                let repo = config.repo_dir.clone();
-                let sha = tokio::task::spawn_blocking(move || {
-                    std::process::Command::new("git")
-                        .args(["rev-parse", "HEAD"])
-                        .current_dir(repo)
-                        .output()
-                })
-                .await
-                .ok()
-                .and_then(|result| result.ok())
-                .filter(|output| output.status.success())
-                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                .unwrap_or_else(|| "unknown".into());
                 let path = config.db_path.clone();
                 let provider = config.runner_kind.to_string();
                 let model = planner_model(config.runner_kind).to_string();
@@ -3087,7 +3169,7 @@ async fn tick_decomposition(
                             expected_revision,
                             provider: &provider,
                             model: &model,
-                            frozen_base_sha: &sha,
+                            frozen_base_sha: "",
                             now: now_unix(),
                         },
                     )?;
@@ -3153,18 +3235,19 @@ async fn tick_decomposition(
     if snapshot.state == "draining"
         && decomposition_drain_ready(workers.len(), reviewers.len(), durable_in_flight, live)
     {
+        let sha = repository_head_sha(&config.repo_dir).await?;
         let path = config.db_path.clone();
         let graph_id = snapshot.graph_id;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&path)?;
-            quorum_core::decomposition::set_frozen_phase(
+            if !quorum_core::decomposition::bind_frozen_base_and_enter_planning(
                 &mut conn,
                 graph_id,
-                "draining",
-                "planning",
-                None,
+                &sha,
                 now_unix(),
-            )?;
+            )? {
+                return Err(QuorumError::Io("lost drain-to-planning SHA bind".into()));
+            }
             Ok(())
         })
         .await
@@ -3204,6 +3287,18 @@ async fn tick_decomposition(
         .await
         {
             Ok(slot) => {
+                if let Err(error) = journal_decomposition_process(
+                    config,
+                    snapshot.graph_id,
+                    snapshot.source_task_id,
+                    "planner",
+                    slot.pid(),
+                )
+                .await
+                {
+                    slot.kill_and_reap().await;
+                    return Err(error);
+                }
                 coordinator.planner_view = Some(view);
                 coordinator.planner_slot = Some(slot);
             }
@@ -3298,6 +3393,18 @@ async fn tick_decomposition(
                         .await?;
                         return Ok(false);
                     }
+                }
+                if let Err(error) = journal_decomposition_process(
+                    config,
+                    snapshot.graph_id,
+                    snapshot.source_task_id,
+                    "classifier",
+                    slot.proc.pid(),
+                )
+                .await
+                {
+                    slot.kill_and_reap().await;
+                    return Err(error);
                 }
                 coordinator.classifier_slot = Some(slot);
             }
@@ -9725,7 +9832,11 @@ async fn provision_reviewer(
     })
     .await
     .map_err(|error| QuorumError::Io(format!("review reservation release join: {error}")))?;
-    release?;
+    if !release? {
+        return Err(QuorumError::Io(format!(
+            "reviewer reservation release lost token authority for task #{task_id}"
+        )));
+    }
     result
 }
 
@@ -10097,13 +10208,30 @@ async fn provision_reviewer_reserved(
             let mut conn = quorum_core::db::open(&p)?;
             quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
         })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-        if let Err(e) = issue_res {
+        .await;
+        let issue_error = match issue_res {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(error) => Some(QuorumError::Io(format!("spawn_blocking join: {error}"))),
+        };
+        if let Some(e) = issue_error {
             log(&format!(
-                "reviewer capability issue failed for task {} agent {}: {e} — reviewer will fall back to compat auth",
+                "reviewer capability issue failed for task {} agent {}: {e} — tearing down provisioning",
                 worker.task_id, reviewer_name
             ));
+            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            name_pool.release(&reviewer_name);
+            let p = config.db_path.clone();
+            let rn = reviewer_name.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut conn) = quorum_core::db::open(&p) {
+                    let _ = journal::delete(&mut conn, &rn);
+                }
+            })
+            .await
+            .ok();
+            return Err(e);
         }
     }
 
@@ -10178,9 +10306,15 @@ async fn provision_reviewer_reserved(
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
                     let p = config.db_path.clone();
                     let rn = reviewer_name.clone();
+                    let failed_cap_run_id = cap_run_id.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Ok(mut conn) = quorum_core::db::open(&p) {
                             let _ = journal::delete(&mut conn, &rn);
+                            let _ = quorum_core::capabilities::revoke(
+                                &mut conn,
+                                &failed_cap_run_id,
+                                now_unix(),
+                            );
                         }
                     })
                     .await
@@ -10338,7 +10472,7 @@ async fn provision_reviewer_reserved(
             .await
             .ok();
 
-            fire_event(
+            if let Err(e) = fire_event_result(
                 &config.db_path,
                 &reviewer_name,
                 worker.task_id,
@@ -10346,7 +10480,41 @@ async fn provision_reviewer_reserved(
                     agent: reviewer_name.clone(),
                 },
             )
-            .await;
+            .await
+            {
+                log(&format!(
+                    "{}: ReviewerAttached was rejected after provisioning: {e}",
+                    role.as_str().to_uppercase()
+                ));
+                let _terminal_output = proc.kill_and_reap().await;
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                name_pool.release(&reviewer_name);
+                let p = config.db_path.clone();
+                let rn = reviewer_name.clone();
+                let failed_cap_run_id = cap_run_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut conn) = quorum_core::db::open(&p) {
+                        let _ = journal::delete(&mut conn, &rn);
+                        let _ = quorum_core::capabilities::revoke(
+                            &mut conn,
+                            &failed_cap_run_id,
+                            now_unix(),
+                        );
+                        let _ = quorum_core::agent_runs::close(
+                            &conn,
+                            reviewer_run_id,
+                            now_unix(),
+                            "attachment-failed",
+                        );
+                    }
+                })
+                .await
+                .ok();
+                return Err(QuorumError::Io(format!(
+                    "reviewer attachment failed after provisioning: {e}"
+                )));
+            }
 
             // R2: stash metadata for audit recording when the reviewer finishes.
             if let ReviewRole::R2 {
@@ -10443,9 +10611,15 @@ async fn provision_reviewer_reserved(
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
             let p = config.db_path.clone();
             let rn = reviewer_name.clone();
+            let failed_cap_run_id = cap_run_id.clone();
             tokio::task::spawn_blocking(move || {
                 if let Ok(mut conn) = quorum_core::db::open(&p) {
                     let _ = journal::delete(&mut conn, &rn);
+                    let _ = quorum_core::capabilities::revoke(
+                        &mut conn,
+                        &failed_cap_run_id,
+                        now_unix(),
+                    );
                 }
             })
             .await
@@ -16561,7 +16735,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_preclassification_requires_complete_ready_small_nondduplicate_batch() {
+    fn proposal_preclassification_requires_complete_ready_small_nonduplicate_batch() {
         let proposal = vec![
             planner::ProposedTask {
                 key: "a".into(),
@@ -16770,11 +16944,8 @@ mod tests {
     }
 
     #[test]
-    fn startup_reconciliation_recognizes_active_and_blocked_graphs() {
-        for (phase, expected) in [
-            ("active", StartupDecompositionState::Active),
-            ("blocked", StartupDecompositionState::Blocked),
-        ] {
+    fn startup_reconciliation_resets_aggregate_only_active_and_blocked_graphs() {
+        for phase in ["active", "blocked"] {
             let dir = tempfile::tempdir().unwrap();
             let mut conn = quorum_core::db::open(&dir.path().join(format!("{phase}.db"))).unwrap();
             let source = tasks::create(
@@ -16787,7 +16958,13 @@ mod tests {
                 rusqlite::params![source, phase, 1],
             )
             .unwrap();
-            assert_eq!(inspect_startup_decomposition(&conn).unwrap(), expected);
+            let outcome =
+                quorum_core::decomposition::reconcile_startup_graphs(&mut conn, 3).unwrap();
+            assert_eq!(outcome.reset, 1);
+            assert_eq!(
+                inspect_startup_decomposition(&conn).unwrap(),
+                StartupDecompositionState::Frozen
+            );
         }
     }
 
@@ -16819,6 +16996,15 @@ mod tests {
         std::fs::write(repo.path().join("state.txt"), "drifted").unwrap();
         git(&["add", "state.txt"]);
         git(&["commit", "-qm", "drift"]);
+        let drained_head = git(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            repository_head_sha(repo.path()).await.unwrap(),
+            drained_head
+        );
+        assert_ne!(drained_head, frozen);
         assert!(frozen_planner_view(repo.path(), &frozen).await.is_err());
+
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(repository_head_sha(not_a_repo.path()).await.is_err());
     }
 }

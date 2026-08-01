@@ -56,6 +56,88 @@ pub struct GraphBlocker<'a> {
     pub now: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartupReconcileResult {
+    pub healthy: usize,
+    pub reset: usize,
+    pub held: usize,
+}
+
+/// Reconcile every materialized active/blocked graph before generic daemon
+/// recovery. Incomplete graphs with no delivery evidence reset safely; once
+/// evidence exists, inconsistency is held for owner intervention.
+pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<StartupReconcileResult> {
+    let graph_ids = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM task_decompositions WHERE state IN ('active','blocked') ORDER BY id",
+        )?;
+        let graph_ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        graph_ids
+    };
+    let mut result = StartupReconcileResult::default();
+    for graph_id in graph_ids {
+        let consistent: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM task_decompositions d JOIN tasks source ON source.id=d.source_task_id
+                WHERE d.id=?1 AND d.active=1 AND d.accepted_plan_revision IS NOT NULL
+                  AND source.status='decomposed'
+                  AND (SELECT count(*) FROM task_graph_members m
+                       WHERE m.graph_id=d.id AND m.active=1
+                         AND m.plan_revision=d.accepted_plan_revision) BETWEEN 2 AND 8
+                  AND NOT EXISTS(
+                      SELECT 1 FROM task_graph_members m LEFT JOIN tasks child ON child.id=m.task_id
+                      WHERE m.graph_id=d.id AND
+                        (m.active!=1 OR m.plan_revision!=d.accepted_plan_revision OR child.id IS NULL)
+                  )
+            )",
+            [graph_id],
+            |row| row.get(0),
+        )?;
+        if consistent {
+            result.healthy += 1;
+            continue;
+        }
+        if recovery_reset(
+            conn,
+            graph_id,
+            "startup found an inconsistent task graph",
+            now,
+        )? {
+            reacquire_freeze(conn, graph_id, now)?;
+            result.reset += 1;
+            continue;
+        }
+        let tx = begin_immediate(conn)?;
+        let source_id: Option<i64> = tx
+            .query_row(
+                "SELECT source_task_id FROM task_decompositions
+                 WHERE id=?1 AND state IN ('active','blocked')",
+                [graph_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(source_id) = source_id {
+            tx.execute(
+                "UPDATE task_decompositions SET state='held',active=0,freeze_active=0,
+                 hold_code='inconsistent-graph-with-delivery-evidence',
+                 hold_summary='startup found inconsistent graph after delivery evidence',updated_at=?2
+                 WHERE id=?1",
+                params![graph_id, now],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET status='failed',assignee=NULL,reviewer=NULL,updated_at=?2
+                 WHERE id=?1 AND status!='done'",
+                params![source_id, now],
+            )?;
+            result.held += 1;
+        }
+        tx.commit().map_err(map_sql_err)?;
+    }
+    Ok(result)
+}
+
 fn is_unique_constraint(error: &rusqlite::Error) -> bool {
     matches!(error, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
 }
@@ -67,7 +149,9 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations))",
+           AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions
+                           WHERE state IN ('active','blocked') OR active=1))",
         params![input.source_task_id, input.expected_revision],
         |row| row.get(0),
     )?;
@@ -78,13 +162,12 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
         "INSERT INTO task_decompositions(
              source_task_id,state,active,freeze_active,planned_source_revision,
              planner_provider,planner_model,frozen_base_sha,created_at,updated_at)
-         VALUES (?1,'freeze-requested',0,1,?2,?3,?4,?5,?6,?6)",
+         VALUES (?1,'freeze-requested',0,1,?2,?3,?4,NULL,?5,?5)",
         params![
             input.source_task_id,
             input.expected_revision,
             input.provider,
             input.model,
-            input.frozen_base_sha,
             input.now
         ],
     );
@@ -103,6 +186,26 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     }
     tx.commit().map_err(map_sql_err)?;
     Ok(Some(graph_id))
+}
+
+pub fn bind_frozen_base_and_enter_planning(
+    conn: &mut Connection,
+    graph_id: i64,
+    sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(QuorumError::Usage("invalid frozen base SHA".into()));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions SET state='planning',frozen_base_sha=?2,updated_at=?3
+         WHERE id=?1 AND state='draining' AND freeze_active=1 AND active=0
+           AND frozen_base_sha IS NULL",
+        params![graph_id, sha, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
 }
 
 /// Record one bounded planning result. A valid blocker holds immediately and
@@ -989,6 +1092,44 @@ mod tests {
     }
 
     #[test]
+    fn frozen_sha_is_bound_only_at_drain_to_planning_handoff() {
+        let mut conn = setup();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "must-not-be-stored",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let initially_bound: Option<String> = conn
+            .query_row(
+                "SELECT frozen_base_sha FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(initially_bound.is_none());
+        set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+        let drained_head = "0123456789abcdef0123456789abcdef01234567";
+        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, drained_head, 4).unwrap());
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, drained_head, 5).unwrap());
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT state,frozen_base_sha FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("planning".into(), drained_head.into()));
+    }
+
+    #[test]
     fn concurrent_sources_have_one_freeze_winner() {
         use std::sync::{Arc, Barrier};
 
@@ -1329,6 +1470,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("freeze-requested".into(), 2));
+    }
+
+    #[test]
+    fn startup_reconciliation_keeps_complete_active_and_blocked_graphs() {
+        for blocked in [false, true] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            let ids = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), child("b", &["a"])],
+                4,
+            )
+            .unwrap()
+            .unwrap();
+            if blocked {
+                conn.execute(
+                    "UPDATE task_decompositions SET state='blocked' WHERE id=?1",
+                    [graph],
+                )
+                .unwrap();
+                conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [ids[0]])
+                    .unwrap();
+            }
+            let result = reconcile_startup_graphs(&mut conn, 5).unwrap();
+            assert_eq!(result.healthy, 1);
+            assert_eq!(result.reset, 0);
+            assert_eq!(result.held, 0);
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_holds_incomplete_graph_with_delivery_evidence() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &["a"])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute(
+            "DELETE FROM task_graph_members WHERE graph_id=?1 AND task_id=?2",
+            params![graph, ids[1]],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='working' WHERE id=?1", [ids[0]])
+            .unwrap();
+        let result = reconcile_startup_graphs(&mut conn, 5).unwrap();
+        assert_eq!(result.held, 1);
+        let state: (String, i64) = conn
+            .query_row(
+                "SELECT state,active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("held".into(), 0));
     }
 
     #[test]

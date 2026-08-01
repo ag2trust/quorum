@@ -296,6 +296,10 @@ pub struct PlannerSlot {
 }
 
 impl PlannerSlot {
+    pub fn pid(&self) -> Option<i32> {
+        self.proc.pid()
+    }
+
     pub async fn kill_and_reap(self) {
         let _ = self.proc.kill_and_reap().await;
     }
@@ -339,7 +343,10 @@ pub async fn spawn_planner(
                 env_vars: vec![],
             };
             let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
-            proc.feed_turn(&agent::user_turn(prompt)).await?;
+            if let Err(error) = proc.feed_turn(&agent::user_turn(prompt)).await {
+                let _ = proc.kill_and_reap().await;
+                return Err(error);
+            }
             RunnerProc::Claude(proc)
         }
     };
