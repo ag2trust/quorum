@@ -2796,6 +2796,7 @@ async fn journal_decomposition_process(
     source_task_id: i64,
     role: &str,
     pid: Option<i32>,
+    frozen_view: Option<&Path>,
 ) -> Result<()> {
     let path = config.db_path.clone();
     let role = role.to_string();
@@ -2804,7 +2805,7 @@ async fn journal_decomposition_process(
         role: role.clone(),
         task_id: Some(source_task_id),
         session_id: agent::new_session_id(),
-        worktree: None,
+        worktree: frozen_view.map(|path| path.to_string_lossy().into_owned()),
         branch: None,
         phase: role,
         cost_tokens: 0,
@@ -3293,6 +3294,7 @@ async fn tick_decomposition(
                     snapshot.source_task_id,
                     "planner",
                     slot.pid(),
+                    Some(view.path()),
                 )
                 .await
                 {
@@ -3400,6 +3402,7 @@ async fn tick_decomposition(
                     snapshot.source_task_id,
                     "classifier",
                     slot.proc.pid(),
+                    coordinator.planner_view.as_ref().map(|view| view.path()),
                 )
                 .await
                 {
@@ -9749,6 +9752,104 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
     }
 }
 
+async fn resolve_reviewer_runtime(
+    config: &ServeConfig,
+    recovery: Option<&ReviewerRecovery>,
+    task_id: i64,
+) -> Result<(String, String, runner::AgentKind, Option<String>)> {
+    if let Some(recovery) = recovery {
+        return Ok((
+            recovery.model.clone(),
+            recovery.effort.clone(),
+            recovery.kind,
+            recovery.thread_id.clone(),
+        ));
+    }
+    let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
+        config.provider_explicit,
+        config.review_model_explicit,
+        &config.review_model,
+        &config.review_effort,
+    ) {
+        model.to_string()
+    } else {
+        let path = config.db_path.clone();
+        let configured_model = config.model.clone();
+        tokio::task::spawn_blocking(move || -> Result<String> {
+            let conn = quorum_core::db::open(&path)?;
+            let worker_model = quorum_core::agent_runs::worker_model(&conn, task_id)?
+                .unwrap_or_else(|| configured_model.clone());
+            escalated_reviewer_model(&worker_model, &configured_model)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("reviewer model lookup join: {error}")))??
+    };
+    let kind = resolve_provider(&reviewer_model)?;
+    let effort = configured_reviewer_selection(
+        config.provider_explicit,
+        config.review_model_explicit,
+        &config.review_model,
+        &config.review_effort,
+    )
+    .map(|(_, effort)| effort.to_string())
+    .unwrap_or_else(|| config.effort.clone());
+    Ok((reviewer_model, effort, kind, None))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cleanup_failed_reviewer_provision(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    reviewer_name: &str,
+    worktree: &Path,
+    branch: &str,
+    capability_run_id: Option<&str>,
+    agent_run_id: Option<i64>,
+    process: Option<runner::RunnerProc>,
+) {
+    if let Some(process) = process {
+        let _ = process.kill_and_reap().await;
+    }
+    let path = config.db_path.clone();
+    let name = reviewer_name.to_string();
+    let capability = capability_run_id.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        if let Ok(mut conn) = quorum_core::db::open(&path) {
+            cleanup_failed_reviewer_db(
+                &mut conn,
+                &name,
+                capability.as_deref(),
+                agent_run_id,
+                now_unix(),
+            );
+        }
+    })
+    .await
+    .ok();
+    wt_mgr.remove(&config.repo_dir, worktree).await.ok();
+    wt_mgr.delete_branch(&config.repo_dir, branch).await;
+    name_pool.release(reviewer_name);
+}
+
+fn cleanup_failed_reviewer_db(
+    conn: &mut quorum_core::Connection,
+    reviewer_name: &str,
+    capability_run_id: Option<&str>,
+    agent_run_id: Option<i64>,
+    now: i64,
+) {
+    // Each operation is independently idempotent and best-effort so one stale
+    // row cannot prevent retirement of the remaining authority records.
+    if let Some(run_id) = agent_run_id {
+        let _ = quorum_core::agent_runs::close(conn, run_id, now, "provision-failed");
+    }
+    if let Some(capability) = capability_run_id {
+        let _ = quorum_core::capabilities::revoke(conn, capability, now);
+    }
+    let _ = journal::delete(conn, reviewer_name);
+}
+
 fn reviewer_name_exclusions(
     worker_name: &str,
     role: &ReviewRole,
@@ -9938,6 +10039,8 @@ async fn provision_reviewer_reserved(
             return Ok(());
         }
     }
+    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_thread_id) =
+        resolve_reviewer_runtime(config, recovery.as_ref(), worker.task_id).await?;
     let reviewer_name = if let Some(recovery) = &recovery {
         // Restart recovery deliberately reuses the interrupted reviewer's
         // durable identity. Normal provisioning below excludes every prior
@@ -9982,13 +10085,24 @@ async fn provision_reviewer_reserved(
     {
         let p = config.db_path.clone();
         let name = reviewer_name.clone();
-        let stale = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let stale_result = tokio::task::spawn_blocking(move || -> Result<usize> {
             let mut conn = quorum_core::db::open(&p)?;
             mailbox::consume_all_for_agent(&mut conn, &name)
         })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-        .unwrap_or(0);
+        .await;
+        let stale = match stale_result {
+            Ok(Ok(stale)) => stale,
+            Ok(Err(error)) => {
+                name_pool.release(&reviewer_name);
+                return Err(error);
+            }
+            Err(error) => {
+                name_pool.release(&reviewer_name);
+                return Err(QuorumError::Io(format!(
+                    "reviewer mailbox cleanup join: {error}"
+                )));
+            }
+        };
         if stale > 0 {
             log(&format!(
                 "consumed {stale} stale mailbox row(s) for {reviewer_name}"
@@ -10093,7 +10207,18 @@ async fn provision_reviewer_reserved(
                 role.as_str().to_uppercase()
             ));
         }
-        name_pool.release(&reviewer_name);
+        cleanup_failed_reviewer_provision(
+            config,
+            wt_mgr,
+            name_pool,
+            &reviewer_name,
+            &wt_path,
+            &branch,
+            None,
+            None,
+            None,
+        )
+        .await;
         return Ok(());
     }
     log(&format!(
@@ -10134,63 +10259,40 @@ async fn provision_reviewer_reserved(
         pr: Some(pr),
         rework_count: 0,
     };
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let journal_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
         journal::upsert(&mut conn, &entry)
     })
     .await
-    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-    .ok();
-
-    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_thread_id) =
-        if let Some(recovery) = &recovery {
-            log(&format!(
-                "recovering {} reviewer {} with persisted provider {} model {}",
-                role.as_str().to_uppercase(),
-                reviewer_name,
-                recovery.kind,
-                recovery.model
-            ));
-            (
-                recovery.model.clone(),
-                recovery.effort.clone(),
-                recovery.kind,
-                recovery.thread_id.clone(),
+    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")));
+    match journal_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) | Err(error) => {
+            cleanup_failed_reviewer_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                &reviewer_name,
+                &wt_path,
+                &branch,
+                None,
+                None,
+                None,
             )
-        } else {
-            let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
-                config.provider_explicit,
-                config.review_model_explicit,
-                &config.review_model,
-                &config.review_effort,
-            ) {
-                model.to_string()
-            } else {
-                let p = config.db_path.clone();
-                let tid = worker.task_id;
-                let cfg_model = config.model.clone();
-                tokio::task::spawn_blocking(move || -> Result<String> {
-                    let conn = quorum_core::db::open(&p)?;
-                    let worker_model = quorum_core::agent_runs::worker_model(&conn, tid)?
-                        .unwrap_or_else(|| cfg_model.clone());
-                    escalated_reviewer_model(&worker_model, &cfg_model)
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
-            };
-            let kind = resolve_provider(&reviewer_model)?;
-            let effort = if let Some((_, effort)) = configured_reviewer_selection(
-                config.provider_explicit,
-                config.review_model_explicit,
-                &config.review_model,
-                &config.review_effort,
-            ) {
-                effort.to_string()
-            } else {
-                config.effort.clone()
-            };
-            (reviewer_model, effort, kind, None)
-        };
+            .await;
+            return Err(error);
+        }
+    }
+
+    if let Some(recovery) = &recovery {
+        log(&format!(
+            "recovering {} reviewer {} with persisted provider {} model {}",
+            role.as_str().to_uppercase(),
+            reviewer_name,
+            recovery.kind,
+            recovery.model
+        ));
+    }
     log(&format!(
         "reviewer model escalated to {reviewer_model} for task {}",
         worker.task_id
@@ -10219,18 +10321,18 @@ async fn provision_reviewer_reserved(
                 "reviewer capability issue failed for task {} agent {}: {e} — tearing down provisioning",
                 worker.task_id, reviewer_name
             ));
-            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            name_pool.release(&reviewer_name);
-            let p = config.db_path.clone();
-            let rn = reviewer_name.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = journal::delete(&mut conn, &rn);
-                }
-            })
-            .await
-            .ok();
+            cleanup_failed_reviewer_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                &reviewer_name,
+                &wt_path,
+                &branch,
+                None,
+                None,
+                None,
+            )
+            .await;
             return Err(e);
         }
     }
@@ -10300,25 +10402,18 @@ async fn provision_reviewer_reserved(
                         "{}: reviewer feed_turn failed: {e}",
                         role.as_str().to_uppercase()
                     ));
-                    let _terminal_output = proc.kill_and_reap().await;
-                    name_pool.release(&reviewer_name);
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    let p = config.db_path.clone();
-                    let rn = reviewer_name.clone();
-                    let failed_cap_run_id = cap_run_id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut conn) = quorum_core::db::open(&p) {
-                            let _ = journal::delete(&mut conn, &rn);
-                            let _ = quorum_core::capabilities::revoke(
-                                &mut conn,
-                                &failed_cap_run_id,
-                                now_unix(),
-                            );
-                        }
-                    })
-                    .await
-                    .ok();
+                    cleanup_failed_reviewer_provision(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        &reviewer_name,
+                        &wt_path,
+                        &branch,
+                        Some(&cap_run_id),
+                        None,
+                        Some(proc),
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -10345,13 +10440,30 @@ async fn provision_reviewer_reserved(
                     pr: Some(pr),
                     rework_count: 0,
                 };
-                tokio::task::spawn_blocking(move || -> Result<()> {
+                let pid_journal = tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &pid_entry)
                 })
                 .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")));
+                match pid_journal {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) | Err(error) => {
+                        cleanup_failed_reviewer_provision(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            &reviewer_name,
+                            &wt_path,
+                            &branch,
+                            Some(&cap_run_id),
+                            None,
+                            Some(proc),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
             }
 
             // Persist the run before attaching the reviewer. The run history is
@@ -16782,6 +16894,87 @@ mod tests {
         duplicate[0].duplicate_of = vec![99];
         assert!(planned_children(&proposal, &duplicate).is_err());
         assert!(planned_children(&proposal, &valid[..1]).is_err());
+    }
+
+    #[test]
+    fn reviewer_post_resource_fault_matrix_retires_all_durable_authority() {
+        for stage in [
+            "journal",
+            "capability",
+            "spawn",
+            "feed",
+            "pid-journal",
+            "run",
+            "attachment",
+        ] {
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            quorum_core::db::migrate(&conn).unwrap();
+            let task_id = tasks::create(
+                &mut conn, "owner", stage, None, 0, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+                .unwrap();
+            let reviewer = format!("reviewer-{stage}");
+            let capability = format!("capability-{stage}");
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &capability,
+                task_id,
+                &reviewer,
+                "reviewer",
+                2,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                &reviewer,
+                "reviewer",
+                "claude-opus-4-7",
+                "high",
+                "claude",
+                2,
+            )
+            .unwrap();
+            journal::upsert(
+                &mut conn,
+                &JournalEntry {
+                    agent: reviewer.clone(),
+                    role: "reviewer".into(),
+                    task_id: Some(task_id),
+                    session_id: stage.into(),
+                    worktree: Some(format!("/tmp/reviewer-{stage}")),
+                    branch: Some(format!("review-{stage}")),
+                    phase: "reviewing".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: Some(999_999),
+                    pr: Some(1),
+                    rework_count: 0,
+                },
+            )
+            .unwrap();
+
+            cleanup_failed_reviewer_db(&mut conn, &reviewer, Some(&capability), Some(run_id), 3);
+            cleanup_failed_reviewer_db(&mut conn, &reviewer, Some(&capability), Some(run_id), 4);
+
+            let durable: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                       EXISTS(SELECT 1 FROM journal WHERE agent=?1),
+                       EXISTS(SELECT 1 FROM run_capabilities WHERE run_id=?2 AND revoked_at IS NULL),
+                       EXISTS(SELECT 1 FROM agent_runs WHERE id=?3 AND ended_at IS NULL)",
+                    rusqlite::params![reviewer, capability, run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(durable, (0, 0, 0), "fault stage {stage}");
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert!(task.reviewer.is_none(), "fault stage {stage}");
+        }
     }
 
     #[test]

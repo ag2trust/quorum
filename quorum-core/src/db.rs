@@ -2305,4 +2305,84 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
     }
+
+    #[test]
+    fn populated_v36_to_v37_preserves_graph_and_matches_proposal_write_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v36.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                    source_task_id,state,freeze_active,planned_source_revision,
+                    planner_provider,planner_model,created_at,updated_at)
+                 VALUES (1,'planning',1,1,'claude','opus',2,2)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN accepted_proposal_json;
+                 PRAGMA user_version=36;",
+            )
+            .unwrap();
+        }
+
+        let mut upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "task_decompositions", "accepted_proposal_json").unwrap());
+        let preserved: (String, String, String, i64) = upgraded
+            .query_row(
+                "SELECT state,planner_provider,planner_model,planned_source_revision
+                 FROM task_decompositions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("planning".into(), "claude".into(), "opus".into(), 1)
+        );
+
+        let exact = format!("\"{}\"", "a".repeat(65_534));
+        assert_eq!(exact.len(), 65_536);
+        assert!(crate::decomposition::accept_proposal(&mut upgraded, 1, &exact, 3).unwrap());
+        upgraded
+            .execute(
+                "UPDATE task_decompositions SET state='planning',accepted_proposal_json=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let over = format!("\"{}\"", "é".repeat(32_768));
+        assert!(over.len() > 65_536);
+        assert!(crate::decomposition::accept_proposal(&mut upgraded, 1, &over, 4).is_err());
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(reopened);
+
+        let newer_path = dir.path().join("newer.db");
+        let newer = Connection::open(&newer_path).unwrap();
+        newer
+            .execute_batch(&format!("PRAGMA user_version={}", SCHEMA_VERSION + 1))
+            .unwrap();
+        drop(newer);
+        assert!(matches!(
+            open(&newer_path),
+            Err(QuorumError::SchemaTooNew { .. })
+        ));
+    }
 }

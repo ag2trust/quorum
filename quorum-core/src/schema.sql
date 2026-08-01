@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     planner_model           TEXT,
     planner_session_id      TEXT,
     frozen_base_sha         TEXT,
-    accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(accepted_proposal_json) <= 65536),
+    accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(CAST(accepted_proposal_json AS BLOB)) <= 65536),
     accepted_plan_revision  INTEGER,
     hold_code               TEXT,
     hold_summary            TEXT,
