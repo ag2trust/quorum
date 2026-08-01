@@ -21,6 +21,7 @@ pub const MSG_PREVIEW_CHARS: usize = 80;
 pub const DONE_STUCK_THRESHOLD_SECS: i64 = 30 * 60;
 /// Alerts older than this stay in the feed but no longer affect the status snapshot.
 pub const ALERT_WINDOW_SECS: i64 = 12 * 60 * 60;
+const ALERT_DISPLAY_LIMIT: i64 = 10;
 /// Durable post-submit tasks to surface in REVIEWING. Bounded so `status --watch`
 /// remains cheap if review-only tasks accumulate.
 pub const REVIEWING_TASK_LIMIT: i64 = 20;
@@ -1384,65 +1385,70 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
 /// intentionally read-only so `quorum status` exposes latent corruption before
 /// daemon startup reconciliation gets a chance to clean it.
 fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
-    let window_start = now - ALERT_WINDOW_SECS;
-    let mut stmt = conn.prepare(
-        "SELECT body, refs, ts, kind
-         FROM messages
-         WHERE expires_at > ?1 AND ts > ?2 AND kind IN ('alert', 'critical')
-         ORDER BY ts DESC
-         LIMIT 10",
+    // Corrupt terminal retry authority is the signal this read-only surface
+    // exists to expose before daemon reconciliation. Reserve display capacity
+    // for it before ordinary persisted alerts, especially during alert-heavy
+    // incidents.
+    let mut terminal = conn.prepare(
+        "SELECT id, status, updated_at FROM tasks
+         WHERE status IN ('done','failed','cancelled')
+           AND json_valid(refs)
+           AND (
+               json_type(refs, '$.daemon_rework_retry_requested')='true'
+               OR json_type(refs, '$.daemon_parked_head_check')='true'
+               OR (
+                   status IN ('done','cancelled')
+                   AND (
+                       json_type(refs, '$.daemon_parked') IS NOT NULL
+                       OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                   )
+               )
+               OR (
+                   status='failed'
+                   AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                   AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+               )
+           )
+         ORDER BY updated_at DESC, id DESC
+         LIMIT ?1",
     )?;
-    let mut rows = stmt
-        .query_map(params![now, window_start], |r| {
+    let mut rows = terminal
+        .query_map(params![ALERT_DISPLAY_LIMIT], |row| {
+            let id = row.get::<_, i64>(0)?;
+            let status = row.get::<_, String>(1)?;
+            let updated_at = row.get::<_, i64>(2)?;
             Ok(AlertMessage {
-                body: r.get(0)?,
-                refs: r.get(1)?,
-                age_secs: (now - r.get::<_, i64>(2)?).max(0),
-                kind: r.get(3)?,
+                body: format!(
+                    "task #{id} is terminal ({status}) but carries runnable daemon retry markers"
+                ),
+                refs: Some(format!("task#{id}")),
+                age_secs: (now - updated_at).max(0),
+                kind: "critical".into(),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.len() < 10 {
-        let remaining = (10 - rows.len()) as i64;
-        let mut terminal = conn.prepare(
-            "SELECT id, status, updated_at FROM tasks
-             WHERE status IN ('done','failed','cancelled')
-               AND json_valid(refs)
-               AND (
-                   json_type(refs, '$.daemon_rework_retry_requested')='true'
-                   OR json_type(refs, '$.daemon_parked_head_check')='true'
-                   OR (
-                       status IN ('done','cancelled')
-                       AND (
-                           json_type(refs, '$.daemon_parked') IS NOT NULL
-                           OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
-                       )
-                   )
-                   OR (
-                       status='failed'
-                       AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
-                       AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
-                   )
-               )
-             ORDER BY updated_at DESC, id DESC
-             LIMIT ?1",
+
+    let remaining = ALERT_DISPLAY_LIMIT - rows.len() as i64;
+    if remaining > 0 {
+        let window_start = now - ALERT_WINDOW_SECS;
+        let mut stmt = conn.prepare(
+            "SELECT body, refs, ts, kind
+             FROM messages
+             WHERE expires_at > ?1 AND ts > ?2 AND kind IN ('alert', 'critical')
+             ORDER BY ts DESC
+             LIMIT ?3",
         )?;
-        let corrupt = terminal
-            .query_map(params![remaining], |row| {
-                let id = row.get::<_, i64>(0)?;
-                let status = row.get::<_, String>(1)?;
-                let updated_at = row.get::<_, i64>(2)?;
+        let persisted = stmt
+            .query_map(params![now, window_start, remaining], |r| {
                 Ok(AlertMessage {
-                    body: format!(
-                        "task #{id} is terminal ({status}) but carries runnable daemon retry markers"
-                    ),
-                    refs: Some(format!("task#{id}")),
-                    age_secs: (now - updated_at).max(0),
-                    kind: "critical".into(),
+                    body: r.get(0)?,
+                    refs: r.get(1)?,
+                    age_secs: (now - r.get::<_, i64>(2)?).max(0),
+                    kind: r.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows.extend(corrupt);
+        rows.extend(persisted);
     }
     Ok(rows)
 }
@@ -3183,6 +3189,61 @@ mod tests {
         let after = stats(&c, now + 1, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert!(after.alerts.is_empty());
         assert_eq!(after.health, HealthVerdict::OnTrack);
+    }
+
+    #[test]
+    fn terminal_retry_health_alert_is_not_starved_by_persisted_alert_cap() {
+        let (_d, mut c) = open_tmp();
+        let now = 100_000;
+        for index in 0..ALERT_DISPLAY_LIMIT {
+            crate::feed::post(
+                &mut c,
+                "daemon",
+                "critical",
+                None,
+                &format!("persisted alert {index}"),
+                None,
+                None,
+                ALERT_WINDOW_SECS,
+                now - index,
+            )
+            .unwrap();
+        }
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "legacy terminal retry",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"daemon_parked":true,"daemon_resume_status":"rework",
+                    "daemon_rework_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            now - 20,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![id])
+            .unwrap();
+
+        let view = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let task_ref = format!("task#{id}");
+        assert_eq!(view.alerts.len(), ALERT_DISPLAY_LIMIT as usize);
+        assert!(view.alerts.iter().any(|alert| {
+            alert.kind == "critical"
+                && alert.refs.as_deref() == Some(task_ref.as_str())
+                && alert.body.contains("runnable daemon retry markers")
+        }));
+        assert_eq!(
+            view.alerts
+                .iter()
+                .filter(|alert| alert.body.starts_with("persisted alert"))
+                .count(),
+            ALERT_DISPLAY_LIMIT as usize - 1,
+            "one persisted slot must yield to the terminal corruption signal"
+        );
     }
 
     #[test]

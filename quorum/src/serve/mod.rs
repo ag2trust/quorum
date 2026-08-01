@@ -654,8 +654,29 @@ async fn resolve_publication_pr_target(
     repo_dir: &Path,
     gh_repo: Option<&str>,
 ) -> std::result::Result<PrTarget, String> {
+    resolve_pr_target_with_timeout(pr, repo_dir, gh_repo, PUBLICATION_GH_TIMEOUT).await
+}
+
+async fn resolve_pr_target_with_timeout(
+    pr: i64,
+    repo_dir: &Path,
+    gh_repo: Option<&str>,
+    timeout: Duration,
+) -> std::result::Result<PrTarget, String> {
+    resolve_pr_target_with_program(pr, repo_dir, gh_repo, timeout, Path::new("gh")).await
+}
+
+async fn resolve_pr_target_with_program(
+    pr: i64,
+    repo_dir: &Path,
+    gh_repo: Option<&str>,
+    timeout: Duration,
+    program: &Path,
+) -> std::result::Result<PrTarget, String> {
     let args = pr_target_args(pr, gh_repo);
-    let output = run_publication_gh(&args, repo_dir, "gh pr view").await?;
+    let mut command = tokio::process::Command::new(program);
+    command.args(&args).current_dir(repo_dir);
+    let output = run_publication_gh_command(command, timeout, "gh pr view").await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr view failed: {}",
@@ -1153,6 +1174,70 @@ fn resolve_or_load_pr_target(
         base_ref: None,
         state: None,
     })
+}
+
+/// Resolve a remediation PR through the bounded, kill-and-reap GitHub runner,
+/// persist live state, and retain the existing persisted-target fallback when
+/// GitHub is unavailable. Database and join failures remain loud so they can
+/// never masquerade as a clean guarded-claim loss.
+async fn resolve_or_load_remediation_pr_target(
+    pr: i64,
+    task_id: i64,
+    db_path: &Path,
+    repo_dir: &Path,
+    gh_repo: Option<&str>,
+) -> Result<Option<PrTarget>> {
+    match resolve_publication_pr_target(pr, repo_dir, gh_repo).await {
+        Ok(target) => {
+            let p = db_path.to_path_buf();
+            let persisted = target.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&p)?;
+                pr_targets::upsert(
+                    &mut conn,
+                    task_id,
+                    persisted.pr,
+                    &persisted.head_ref,
+                    &persisted.head_sha,
+                    persisted.is_fork,
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!(
+                    "remediation PR target persistence join for task #{task_id}: {error}"
+                ))
+            })??;
+            Ok(Some(target))
+        }
+        Err(error) => {
+            log(&format!(
+                "remediation: live PR #{pr} target unavailable ({error}); trying persisted target"
+            ));
+            let p = db_path.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<Option<PrTarget>> {
+                let conn = quorum_core::db::open(&p)?;
+                let Some(stored) = pr_targets::get(&conn, task_id, pr)? else {
+                    return Ok(None);
+                };
+                Ok(Some(PrTarget {
+                    pr: stored.pr_number,
+                    head_ref: stored.head_ref,
+                    head_sha: stored.head_sha,
+                    is_fork: stored.is_fork,
+                    base_ref: None,
+                    state: None,
+                }))
+            })
+            .await
+            .map_err(|join_error| {
+                QuorumError::Io(format!(
+                    "remediation persisted PR target read join for task #{task_id}: {join_error}"
+                ))
+            })?
+        }
+    }
 }
 
 /// Validate the live GitHub target before a continuation worker receives any
@@ -3019,7 +3104,7 @@ async fn reconcile_ci_remediations(
             intent.pr,
             &intent.feedback,
         )
-        .await
+        .await?
         {
             RemediationSpawnOutcome::Spawned | RemediationSpawnOutcome::ClaimLost => continue,
             RemediationSpawnOutcome::ProvisionFailed => {}
@@ -3154,7 +3239,7 @@ async fn reconcile_remediation_retries(
             pr,
             &feedback,
         )
-        .await
+        .await?
             == RemediationSpawnOutcome::ProvisionFailed
         {
             park_remediation_provision_failure(config, task.id, pr, &feedback).await;
@@ -4446,7 +4531,7 @@ async fn tick(
                                                 pr_num,
                                                 &rework_msg,
                                             )
-                                            .await;
+                                            .await?;
                                             if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
                                             {
                                                 park_remediation_provision_failure(
@@ -4721,7 +4806,7 @@ async fn tick(
                                                 pr_num,
                                                 &rework_msg,
                                             )
-                                            .await;
+                                            .await?;
                                             if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
                                             {
                                                 park_remediation_provision_failure(
@@ -4930,7 +5015,7 @@ async fn tick(
                                                     pr_num,
                                                     &rework_msg,
                                                 )
-                                                .await;
+                                                .await?;
                                                 if spawn_ok
                                                     == RemediationSpawnOutcome::ProvisionFailed
                                                 {
@@ -5264,7 +5349,7 @@ async fn tick(
                                                 pr_num,
                                                 &rework_msg,
                                             )
-                                            .await;
+                                            .await?;
                                             if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
                                             {
                                                 park_remediation_provision_failure(
@@ -5648,7 +5733,7 @@ async fn tick(
                                                         pr_num,
                                                         &rework_msg,
                                                     )
-                                                    .await;
+                                                    .await?;
                                                     if spawn_ok
                                                         == RemediationSpawnOutcome::ProvisionFailed
                                                     {
@@ -5908,7 +5993,7 @@ async fn tick(
                                         rework_pr,
                                         feedback,
                                     )
-                                    .await;
+                                    .await?;
                                     if spawn_ok == RemediationSpawnOutcome::ProvisionFailed {
                                         park_remediation_provision_failure(
                                             config,
@@ -10806,6 +10891,29 @@ enum RemediationSpawnOutcome {
     ProvisionFailed,
 }
 
+async fn claim_remediation_for_spawn(
+    db_path: PathBuf,
+    agent: String,
+    task_id: i64,
+) -> Result<Option<tasks::Task>> {
+    tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::claim_remediation_rework(
+            &mut conn,
+            &agent,
+            task_id,
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            now_unix(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "remediation claim join for task #{task_id}: {error}"
+        ))
+    })?
+}
+
 /// Spawn a remediation worker for a task in rework with no live worker.
 /// The worker gets the existing PR, branch, blocking findings, and task body.
 /// Separates a clean lost guarded claim from an actual provisioning failure so
@@ -10820,7 +10928,7 @@ async fn spawn_remediation_worker(
     task_id: i64,
     pr: i64,
     feedback: &str,
-) -> RemediationSpawnOutcome {
+) -> Result<RemediationSpawnOutcome> {
     let db_path = &config.db_path;
 
     // Fetch task body + author for context and branch resolution.
@@ -10852,48 +10960,58 @@ async fn spawn_remediation_worker(
     // sweep. Without this, an intervening sweep_on_write sees a rework task
     // with no active claim and reaps it to open (#199).
     {
-        let p = db_path.clone();
-        let name = agent_name.clone();
-        let tid = task_id;
-        let claimed = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut conn = quorum_core::db::open(&p)?;
-            Ok(tasks::claim_remediation_rework(
-                &mut conn,
-                &name,
-                tid,
-                tasks::DEFAULT_LEASE_TTL_SECS,
-                now_unix(),
-            )?
-            .is_some())
-        })
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or(false);
-        if !claimed {
-            log(&format!(
-                "remediation: claim failed for task #{task_id} — task no longer in rework"
-            ));
-            name_pool.release(&agent_name);
-            return RemediationSpawnOutcome::ClaimLost;
+        match claim_remediation_for_spawn(db_path.clone(), agent_name.clone(), task_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                log(&format!(
+                    "remediation: claim lost for task #{task_id} — task no longer eligible"
+                ));
+                name_pool.release(&agent_name);
+                return Ok(RemediationSpawnOutcome::ClaimLost);
+            }
+            Err(error) => {
+                name_pool.release(&agent_name);
+                return Err(error);
+            }
         }
     }
 
     // Resolve external PR state only after the authoritative claim succeeds.
     // A zero-row guard outcome is therefore entirely side-effect free: no
     // GitHub lookup, worktree, run, park, notification, or retry strike.
-    let pr_target = {
-        let pr_val = pr;
-        let tid = task_id;
-        let dbp = db_path.clone();
-        let repo_dir = config.repo_dir.clone();
-        let gh_repo = config.repo.clone();
-        tokio::task::spawn_blocking(move || {
-            resolve_or_load_pr_target(pr_val, tid, &dbp, &repo_dir, Some(&gh_repo))
-        })
-        .await
-        .ok()
-        .flatten()
+    let pr_target = match resolve_or_load_remediation_pr_target(
+        pr,
+        task_id,
+        db_path,
+        &config.repo_dir,
+        Some(&config.repo),
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(error) => {
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            if let Err(release_error) = tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+            })
+            .await
+            .map_err(|join_error| {
+                QuorumError::Io(format!(
+                    "remediation lease release join for task #{task_id}: {join_error}"
+                ))
+            })
+            .and_then(|result| result)
+            {
+                log(&format!(
+                    "FATAL: remediation target resolution failed for task #{task_id}: {error}; \
+                     lease release also failed: {release_error}"
+                ));
+            }
+            name_pool.release(&agent_name);
+            return Err(error);
+        }
     };
     let fallback_branch = if pr_target.is_none() {
         let fb = orphan_worker_branch(&task_author, task_id, task_review_only);
@@ -10909,7 +11027,7 @@ async fn spawn_remediation_worker(
             })
             .await;
             name_pool.release(&agent_name);
-            return RemediationSpawnOutcome::ProvisionFailed;
+            return Ok(RemediationSpawnOutcome::ProvisionFailed);
         }
         fb
     } else {
@@ -11020,7 +11138,7 @@ async fn spawn_remediation_worker(
             .await;
         }
         name_pool.release(&agent_name);
-        return RemediationSpawnOutcome::ProvisionFailed;
+        return Ok(RemediationSpawnOutcome::ProvisionFailed);
     }
 
     // Inspection surfaces report the PR branch this run continues, not the
@@ -11139,7 +11257,7 @@ async fn spawn_remediation_worker(
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return RemediationSpawnOutcome::ProvisionFailed;
+                    return Ok(RemediationSpawnOutcome::ProvisionFailed);
                 }
                 resolved
             }
@@ -11158,7 +11276,7 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return RemediationSpawnOutcome::ProvisionFailed;
+                return Ok(RemediationSpawnOutcome::ProvisionFailed);
             }
             Err(error) => {
                 log(&format!(
@@ -11175,7 +11293,7 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return RemediationSpawnOutcome::ProvisionFailed;
+                return Ok(RemediationSpawnOutcome::ProvisionFailed);
             }
         }
     };
@@ -11214,7 +11332,7 @@ async fn spawn_remediation_worker(
         name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
-        return RemediationSpawnOutcome::ProvisionFailed;
+        return Ok(RemediationSpawnOutcome::ProvisionFailed);
     }
 
     // For Codex rework: look up persisted thread_id for continuation.
@@ -11259,7 +11377,7 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            return RemediationSpawnOutcome::ProvisionFailed;
+            return Ok(RemediationSpawnOutcome::ProvisionFailed);
         }
     };
 
@@ -11330,7 +11448,7 @@ async fn spawn_remediation_worker(
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return RemediationSpawnOutcome::ProvisionFailed;
+                    return Ok(RemediationSpawnOutcome::ProvisionFailed);
                 }
             }
 
@@ -11397,7 +11515,7 @@ async fn spawn_remediation_worker(
                 "remediation worker {} spawned for task #{task_id} PR #{pr}",
                 agent_name
             ));
-            RemediationSpawnOutcome::Spawned
+            Ok(RemediationSpawnOutcome::Spawned)
         }
         Err(e) => {
             log(&format!("remediation worker spawn failed: {e}"));
@@ -11416,7 +11534,7 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            RemediationSpawnOutcome::ProvisionFailed
+            Ok(RemediationSpawnOutcome::ProvisionFailed)
         }
     }
 }
@@ -11424,6 +11542,52 @@ async fn spawn_remediation_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remediation_pr_target_lookup_times_out_and_reaps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("hung-gh.sh");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = resolve_pr_target_with_program(
+            496,
+            dir.path(),
+            Some("test/repo"),
+            Duration::from_millis(100),
+            &program,
+        )
+        .await
+        .expect_err("hung remediation PR lookup must time out");
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bounded lookup took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn remediation_claim_database_error_is_not_a_clean_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("too-new.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", quorum_core::db::SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(conn);
+
+        let error = claim_remediation_for_spawn(db_path, "worker".into(), 1)
+            .await
+            .expect_err("abnormal database failure must propagate");
+        assert!(
+            matches!(error, QuorumError::SchemaTooNew { .. }),
+            "database failure was collapsed into a claim loss: {error}"
+        );
+    }
 
     #[test]
     fn tier_to_model_id_opus_46() {
