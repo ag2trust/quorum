@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 36;
+pub const SCHEMA_VERSION: i64 = 38;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -491,6 +491,26 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // newest-first bounded status projection. A live v35 database must run
         // SCHEMA_SQL once so both indexes are materialized.
 
+        // v38 repairs the split v36 lineages. Decomposition's v36 added optimistic
+        // task-edit columns, while main's independently shipped v36 did not. A main
+        // database could therefore be stamped v37 by the integration binary without
+        // receiving either column. Guard each ALTER independently so every historical
+        // shape converges without changing existing task data.
+        if current < 38 {
+            if !column_exists(conn, "tasks", "revision")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "tasks", "edit_count")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -747,6 +767,75 @@ mod tests {
             vec![2],
             "clean terminal history stays outside the index"
         );
+    }
+
+    #[test]
+    fn migrates_split_lineage_v37_adds_task_revision_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("split-v37.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     title TEXT NOT NULL,
+                     body TEXT,
+                     status TEXT NOT NULL,
+                     priority INTEGER NOT NULL DEFAULT 0,
+                     labels TEXT,
+                     assignee TEXT,
+                     created_by TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     refs TEXT,
+                     depends_on TEXT,
+                     sticky_until INTEGER,
+                     orig TEXT,
+                     author TEXT,
+                     reviewer TEXT,
+                     rework_round INTEGER NOT NULL DEFAULT 0,
+                     review_only INTEGER NOT NULL DEFAULT 0,
+                     recovery_attempts INTEGER NOT NULL DEFAULT 0,
+                     continue_pr INTEGER
+                 );
+                 INSERT INTO tasks(
+                     title,body,status,priority,created_by,created_at,updated_at,refs
+                 ) VALUES ('preserved','body','done',7,'owner',10,11,'{\"pr\":493}');
+                 PRAGMA user_version = 37;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let row: (String, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT title,status,priority,revision,edit_count FROM tasks WHERE id=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row, ("preserved".into(), "done".into(), 7, 1, 0));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "revision").unwrap());
+        assert!(column_exists(&reopened, "tasks", "edit_count").unwrap());
     }
 
     #[test]
