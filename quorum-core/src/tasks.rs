@@ -35,9 +35,12 @@ pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
 pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
-/// One-shot marker on a remediation-death park: the daemon owes this task a
-/// single PR-head check. Head moved → the dead worker did push, resume the
-/// task straight to in-review; otherwise clear the marker and stay parked.
+/// Maximum corrupt terminal retry rows reconciled in one daemon tick.  The
+/// bounded batch makes restart cleanup converge without turning one tick into
+/// an unbounded write transaction.
+pub const TERMINAL_RETRY_RECONCILE_LIMIT: i64 = 8;
+/// Legacy one-shot remediation head-check marker. New terminal parks never
+/// write it; restart reconciliation removes it without reviving the task.
 pub const PARKED_HEAD_CHECK_REF: &str = "daemon_parked_head_check";
 pub const CI_REMEDIATION_REQUESTED_REF: &str = "ci_remediation_requested";
 pub const CI_REMEDIATION_PR_REF: &str = "ci_remediation_pr";
@@ -1006,6 +1009,38 @@ pub fn claim_remediation_rework(
     Ok(Some(task))
 }
 
+/// Daemon-private: revalidate that a remediation worker still owns the exact
+/// live rework lease it acquired before an awaited provisioning prerequisite.
+///
+/// The `BEGIN IMMEDIATE` snapshot serializes this check with creator
+/// cancellation and other lifecycle writes. Logical expiry is part of the
+/// predicate, so an expired claim is never treated as provisioning authority.
+pub fn remediation_claim_still_owned(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let owned = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM tasks t
+               JOIN claims c ON c.target = 'task#' || t.id
+              WHERE t.id=?1
+                AND t.status='rework'
+                AND t.assignee=?2
+                AND c.holder=?2
+                AND c.active=1
+                AND c.expires_at > ?3
+         )",
+        params![id, agent, now],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(owned)
+}
+
 /// Release a remediation lease on provisioning failure. Deactivates the claim
 /// and clears the assignee, leaving the task in rework for the next provisioning
 /// attempt or reaper cycle.
@@ -1613,7 +1648,7 @@ where
             Event::SignaledDone { .. }
         ) | (Status::Rework, Status::InReview, Event::ReworkPushed)
     );
-    let mut recovery_attempts = if reset_recovery {
+    let recovery_attempts = if reset_recovery {
         0
     } else if is_crash_recovery && new_status == Status::Open {
         task.recovery_attempts + 1
@@ -1640,43 +1675,17 @@ where
     }
     // Review-only remediation death: the lifecycle layer already chose Failed
     // (park, never bounce to review — a replacement reviewer on the unchanged
-    // head burns a rework round with zero remediation applied). Write the
-    // durable park markers plus the one-shot head-check flag so the daemon can
-    // resume straight to in-review when the dead worker did push a new head.
-    //
-    // Parks the daemon itself caused (drain, shutdown teardown, restart
-    // recovery) additionally carry the auto-retry flag, bounded by the same
-    // recovery budget as crash requeues: the worker did nothing wrong, so the
-    // daemon owes it a respawn instead of demanding `task-retry` for an event
-    // it caused. Genuine failures (crash, error retries, watchdog, zombie,
-    // lease expiry) stay owner-gated.
+    // head burns a rework round with zero remediation applied). Write durable
+    // owner-gated park markers only.
+    // Every Failed park is owner-gated. In particular, daemon teardown must
+    // not put a runnable retry marker on a terminal row: after restart the
+    // pre-shutdown selection is no longer authoritative.
     let is_remediation_death_park = task.review_only
         && status == Status::Rework
         && new_status == Status::Failed
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
-    let auto_retry_park = is_remediation_death_park
-        && daemon_caused_failure(failure_cause)
-        && task.recovery_attempts < MAX_RECOVERY_ATTEMPTS;
     if is_remediation_death_park {
-        let parked = set_parked_refs_with_head_check(refs.as_deref(), failure_cause, "rework")?;
-        refs = Some(if auto_retry_park {
-            let mut value: serde_json::Value = serde_json::from_str(&parked)
-                .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?;
-            value
-                .as_object_mut()
-                .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?
-                .insert(
-                    PARKED_REWORK_RETRY_REF.into(),
-                    serde_json::Value::Bool(true),
-                );
-            // Each daemon-caused respawn spends recovery budget; the flag
-            // stops being set once the budget is gone, so a drain/restart
-            // loop can never respawn remediation unboundedly.
-            recovery_attempts = task.recovery_attempts + 1;
-            value.to_string()
-        } else {
-            parked
-        });
+        refs = Some(set_parked_refs(refs.as_deref(), failure_cause, "rework")?);
     }
 
     for eff in &effects {
@@ -1812,8 +1821,8 @@ fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
             "codex_retry_prompt",
             "codex_retry_turn_kind",
             "codex_retry_thread_id",
-            // Round-scoped remediation context: the push completing this round
-            // makes the persisted feedback and any pending head check stale.
+            // Round-scoped remediation context becomes stale once the push
+            // completes this round.
             "remediation_feedback",
             PARKED_HEAD_CHECK_REF,
             PARKED_REWORK_RETRY_REF,
@@ -2466,7 +2475,11 @@ pub fn dispose_dead_codex(
     Ok(DeadCodexDisposition::ProviderBlocked)
 }
 
-fn set_parked_refs(refs: Option<&str>, reason: &str, resume_status: &str) -> Result<String> {
+pub(crate) fn set_parked_refs(
+    refs: Option<&str>,
+    reason: &str,
+    resume_status: &str,
+) -> Result<String> {
     let mut value: serde_json::Value = match refs {
         Some(raw) => serde_json::from_str(raw)
             .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?,
@@ -2737,36 +2750,6 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
     Ok(parked)
 }
 
-/// AgentFailed reasons the daemon itself caused. Matched against the exact
-/// strings fed by the daemon's teardown paths: Phase 4a drain
-/// ("daemon draining"), shutdown worker teardown
-/// ("worker teardown (shutdown/cleanup)"), and startup recovery
-/// ("daemon restart recovery (<status> task)"). Keep in sync with
-/// quorum/src/serve — these are the only sites that feed daemon-caused
-/// AgentFailed events into rework tasks.
-fn daemon_caused_failure(reason: &str) -> bool {
-    reason == "daemon draining"
-        || reason == "worker teardown (shutdown/cleanup)"
-        || reason.starts_with("daemon restart recovery")
-}
-
-/// Park markers plus the one-shot head-check flag for a remediation-death
-/// park (the daemon owes the task exactly one PR-head comparison).
-pub(crate) fn set_parked_refs_with_head_check(
-    refs: Option<&str>,
-    reason: &str,
-    resume_status: &str,
-) -> Result<String> {
-    let parked = set_parked_refs(refs, reason, resume_status)?;
-    let mut value: serde_json::Value = serde_json::from_str(&parked)
-        .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?;
-    value
-        .as_object_mut()
-        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?
-        .insert(PARKED_HEAD_CHECK_REF.into(), serde_json::Value::Bool(true));
-    serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
-}
-
 /// Durably park an automatically blocked task. Failed is deliberately excluded
 /// from daemon provisioning; the task can only continue through `task-retry`.
 pub fn park(
@@ -2931,7 +2914,7 @@ pub fn retry_parked(
     } else {
         resume_status.as_str()
     };
-    tx.execute(
+    let updated = tx.execute(
         "UPDATE tasks
          SET status=?2,
              assignee=NULL,
@@ -2958,7 +2941,10 @@ pub fn retry_parked(
                   )
              END,
              updated_at=?3
-         WHERE id=?1",
+         WHERE id=?1 AND status='failed'
+           AND json_valid(refs)
+           AND json_extract(refs, '$.daemon_parked')=1
+           AND json_extract(refs, '$.daemon_resume_status')=?4",
         params![
             id,
             restored_status,
@@ -2967,6 +2953,10 @@ pub fn retry_parked(
             reset_recovery_budget
         ],
     )?;
+    if updated == 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
     deactivate_lease(&tx, id, now)?;
     crate::events::emit(
         &tx,
@@ -2985,83 +2975,92 @@ pub fn retry_parked(
     Ok(Some(task))
 }
 
-/// Settle the one-shot head check on a remediation-death park (D5b).
+/// Remove stale runnable retry state from terminal tasks in a bounded,
+/// idempotent transaction.
 ///
-/// `head_moved = true` means the dead remediation worker did push a new PR
-/// head before dying — its work deserves a verdict, so resume the task
-/// straight to `in-review` (reviewer cleared for orphan reattachment) without
-/// consuming a rework round. `head_moved = false` (head unchanged, or
-/// unresolvable) clears the marker and leaves the task parked for an explicit
-/// `task-retry`.
+/// `failed + daemon_parked` is the durable owner-retry representation, so its
+/// park reason and resume target remain intact.  Only the incompatible
+/// daemon-auto-retry flag is removed.  Fully terminal `done`/`cancelled` rows
+/// lose all runnable park/resume state while retaining the textual park reason
+/// and existing event/note history.  A failed row with an orphan resume marker
+/// (no park authority) is cleaned as corrupt as well.
 ///
-/// Guarded: a lost race (task already retried, cancelled, or check already
-/// settled) is a clean `Ok(false)` with no writes.
-pub fn resolve_parked_head_check(
-    conn: &mut Connection,
-    id: i64,
-    head_moved: bool,
-    now: i64,
-) -> Result<bool> {
+/// One audit note is inserted for each changed row in the same transaction.
+/// Repeated ticks therefore make no further writes.  Returns the reconciled
+/// task IDs for bounded daemon logging.
+pub fn reconcile_terminal_retry_markers(conn: &mut Connection, now: i64) -> Result<Vec<i64>> {
     let tx = begin_immediate(conn)?;
-    let still_pending: Option<i64> = tx
-        .query_row(
-            "SELECT 1 FROM tasks
-             WHERE id=?1 AND status='failed'
+    let ids: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM tasks INDEXED BY tasks_terminal_retry_id
+             WHERE status IN ('done','failed','cancelled')
                AND json_valid(refs)
-               AND json_extract(refs, '$.daemon_parked')=1
-               AND json_extract(refs, '$.daemon_parked_head_check')=1",
-            params![id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if still_pending.is_none() {
-        tx.commit()?;
-        return Ok(false);
-    }
-    if head_moved {
-        tx.execute(
+               AND (
+                   json_type(refs, '$.daemon_rework_retry_requested')='true'
+                   OR json_type(refs, '$.daemon_parked_head_check')='true'
+                   OR (
+                       status IN ('done','cancelled')
+                       AND (
+                           json_type(refs, '$.daemon_parked') IS NOT NULL
+                           OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                       )
+                   )
+                   OR (
+                       status='failed'
+                       AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                       AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+                   )
+               )
+             ORDER BY id
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![TERMINAL_RETRY_RECONCILE_LIMIT], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for id in &ids {
+        let changed = tx.execute(
             "UPDATE tasks
-             SET status='in-review',
-                 assignee=NULL,
-                 reviewer=NULL,
-                 refs=json_remove(
-                     refs,
-                     '$.daemon_parked',
-                     '$.daemon_parked_reason',
-                     '$.daemon_resume_status',
-                     '$.daemon_rework_retry_requested',
-                     '$.daemon_parked_head_check'
-                 ),
+             SET refs=CASE
+                   WHEN status='failed'
+                    AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) = 1
+                   THEN json_remove(
+                       refs,
+                       '$.daemon_rework_retry_requested',
+                       '$.daemon_parked_head_check'
+                   )
+                   WHEN status='failed' THEN json_remove(
+                       refs,
+                       '$.daemon_rework_retry_requested',
+                       '$.daemon_parked_head_check',
+                       '$.daemon_resume_status'
+                   )
+                   ELSE json_remove(
+                       refs,
+                       '$.daemon_parked',
+                       '$.daemon_resume_status',
+                       '$.daemon_rework_retry_requested',
+                       '$.daemon_parked_head_check',
+                       '$.classifier_policy_parked'
+                   )
+                 END,
                  updated_at=?2
-             WHERE id=?1",
+             WHERE id=?1 AND status IN ('done','failed','cancelled')",
             params![id, now],
         )?;
-        crate::events::emit(
-            &tx,
-            "task_in_review",
-            &lease_target(id),
-            "by daemon (remediation head advanced before worker death)",
-            now,
-        )?;
-        tx.execute(
-            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
-            params![
-                id,
-                now,
-                "remediation worker died after pushing; resumed to in-review for a fresh verdict"
-            ],
-        )?;
-    } else {
-        tx.execute(
-            "UPDATE tasks
-             SET refs=json_remove(refs, '$.daemon_parked_head_check'),
-                 updated_at=?2
-             WHERE id=?1",
-            params![id, now],
-        )?;
+        if changed == 1 {
+            tx.execute(
+                "INSERT INTO task_notes(task_id, ts, agent, body)
+                 VALUES (?1, ?2, 'daemon',
+                         'reconciled stale terminal daemon retry markers; lifecycle status preserved')",
+                params![id, now],
+            )?;
+        }
     }
     tx.commit()?;
-    Ok(true)
+    Ok(ids)
 }
 
 /// Atomically retry a task parked after a bounded provider failure.
@@ -5850,7 +5849,7 @@ mod tests {
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[PARKED_REF], true);
         assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
-        assert_eq!(refs[PARKED_HEAD_CHECK_REF], true);
+        assert!(refs.get(PARKED_HEAD_CHECK_REF).is_none());
         assert!(
             refs.get(PARKED_REWORK_RETRY_REF).is_none(),
             "a genuine crash park must stay owner-gated — no auto-retry flag"
@@ -5886,86 +5885,11 @@ mod tests {
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[PARKED_REF], true);
         assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
-        assert_eq!(refs[PARKED_HEAD_CHECK_REF], true);
-    }
-
-    #[test]
-    fn parked_head_check_head_moved_resumes_to_in_review() {
-        // The dead worker pushed before dying: its work deserves a verdict —
-        // resume straight to in-review, no rework round consumed.
-        let (_d, mut c) = open_tmp();
-        let id = review_only_task_in_rework(&mut c);
-        apply_event(
-            &mut c,
-            "system",
-            id,
-            &Event::AgentFailed {
-                reason: "crash".into(),
-            },
-            1003,
-        )
-        .unwrap();
-
-        let settled = resolve_parked_head_check(&mut c, id, true, 1004).unwrap();
-        assert!(settled);
-        let task = get(&c, id).unwrap().unwrap();
-        assert_eq!(task.status, "in-review");
-        assert_eq!(task.rework_round, 1, "resume must not touch rework_round");
-        assert!(task.reviewer.is_none(), "reviewer cleared for reattachment");
-        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert!(refs.get(PARKED_REF).is_none(), "park markers cleared");
         assert!(refs.get(PARKED_HEAD_CHECK_REF).is_none());
-
-        // Settled means settled: a second resolve is a clean no-op.
-        assert!(!resolve_parked_head_check(&mut c, id, true, 1005).unwrap());
     }
 
     #[test]
-    fn parked_head_check_head_unchanged_stays_parked_then_retry_reworks() {
-        let (_d, mut c) = open_tmp();
-        let id = review_only_task_in_rework(&mut c);
-        apply_event(&mut c, "system", id, &Event::LeaseExpired, 1003).unwrap();
-
-        let settled = resolve_parked_head_check(&mut c, id, false, 1004).unwrap();
-        assert!(settled);
-        let task = get(&c, id).unwrap().unwrap();
-        assert_eq!(task.status, "failed", "unchanged head stays parked");
-        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true, "park markers survive the check");
-        assert!(
-            refs.get(PARKED_HEAD_CHECK_REF).is_none(),
-            "one-shot marker cleared"
-        );
-        // Second resolve: marker gone → clean no-op even though still parked.
-        assert!(!resolve_parked_head_check(&mut c, id, false, 1005).unwrap());
-
-        // Explicit retry resumes the remediation flow.
-        let resumed = retry_parked(&mut c, id, "boss", true, 1006)
-            .unwrap()
-            .unwrap();
-        assert_eq!(resumed.status, "rework");
-        let refs: serde_json::Value =
-            serde_json::from_str(resumed.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
-        assert!(refs.get(PARKED_REF).is_none());
-    }
-
-    #[test]
-    fn parked_head_check_noop_on_unrelated_failed_task() {
-        // Guard: a provision-failure park (no head-check marker) is never
-        // touched by the head-check settle path.
-        let (_d, mut c) = open_tmp();
-        let id = review_only_task_in_rework(&mut c);
-        park(&mut c, id, "provisioning failed", "rework", 1003).unwrap();
-        assert!(!resolve_parked_head_check(&mut c, id, true, 1004).unwrap());
-        let task = get(&c, id).unwrap().unwrap();
-        assert_eq!(task.status, "failed", "park untouched");
-    }
-
-    #[test]
-    fn daemon_caused_park_sets_auto_retry_flag_within_budget() {
-        // Drain/shutdown/restart-recovery parks auto-retry: the daemon caused
-        // the death, so it owes the respawn. Budget spent per auto-retry park.
+    fn daemon_caused_park_is_owner_gated_even_with_budget() {
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
@@ -5983,38 +5907,16 @@ mod tests {
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[PARKED_REF], true);
+        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
         assert_eq!(
-            refs[PARKED_REWORK_RETRY_REF], true,
-            "daemon-caused park must carry the auto-retry flag"
-        );
-        assert_eq!(
-            r.task.recovery_attempts, 1,
-            "each auto-retry park spends recovery budget"
+            r.task.recovery_attempts, 0,
+            "owner-gated park must not spend an automatic retry budget"
         );
 
-        // Daemon auto-retry preserves the budget (reset_recovery_budget=false)…
-        let resumed = retry_parked(&mut c, id, "daemon", false, 1004)
+        let resumed = retry_parked(&mut c, id, "boss", true, 1004)
             .unwrap()
             .unwrap();
         assert_eq!(resumed.status, "rework");
-        assert_eq!(
-            resumed.recovery_attempts, 1,
-            "daemon retry must not refill the budget"
-        );
-        // …while an owner retry resets it.
-        apply_event(
-            &mut c,
-            "system",
-            id,
-            &Event::AgentFailed {
-                reason: "daemon draining".into(),
-            },
-            1005,
-        )
-        .unwrap();
-        let resumed = retry_parked(&mut c, id, "boss", true, 1006)
-            .unwrap()
-            .unwrap();
         assert_eq!(
             resumed.recovery_attempts, 0,
             "owner retry refills the budget"
@@ -6022,7 +5924,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_caused_park_stops_flagging_past_recovery_budget() {
+    fn daemon_caused_park_with_exhausted_budget_remains_owner_gated() {
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
         c.execute(
@@ -6047,12 +5949,331 @@ mod tests {
         assert_eq!(refs[PARKED_REF], true);
         assert!(
             refs.get(PARKED_REWORK_RETRY_REF).is_none(),
-            "exhausted budget must stop the auto-retry flag — owner-gated from here"
+            "terminal park must never carry an auto-retry flag"
         );
         assert_eq!(
             r.task.recovery_attempts, MAX_RECOVERY_ATTEMPTS,
             "no budget spend without a flag"
         );
+    }
+
+    fn row_count(conn: &Connection, table: &str, task_id: i64) -> i64 {
+        let sql = match table {
+            "task_notes" => "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+            "agent_runs" => "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1",
+            "events" => "SELECT COUNT(*) FROM events WHERE subject=?1",
+            other => panic!("unsupported test table {other}"),
+        };
+        if table == "events" {
+            conn.query_row(sql, params![lease_target(task_id)], |row| row.get(0))
+                .unwrap()
+        } else {
+            conn.query_row(sql, params![task_id], |row| row.get(0))
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn terminal_retry_marker_reconciliation_converges_without_amplification() {
+        let (dir, mut c) = open_tmp();
+        let exact_261 = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "daemon_parked": true,
+            "daemon_parked_reason": "remediation worker provisioning failed for PR #478",
+            "daemon_resume_status": "rework",
+            "daemon_rework_retry_requested": true,
+            "remediation_feedback": "blocking feedback",
+            "__quorum_noop": "retain",
+            "pr": 478
+        });
+        let failed = create(
+            &mut c,
+            "boss",
+            "legacy failed",
+            None,
+            0,
+            None,
+            Some(&exact_261.to_string()),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', refs=?2 WHERE id=?1",
+            params![failed, exact_261.to_string()],
+        )
+        .unwrap();
+
+        let terminal_ids =
+            [("done", "legacy done"), ("cancelled", "legacy cancelled")].map(|(status, title)| {
+                let id = create(
+                    &mut c,
+                    "boss",
+                    title,
+                    None,
+                    0,
+                    None,
+                    Some(&exact_261.to_string()),
+                    None,
+                    None,
+                    1000,
+                )
+                .unwrap();
+                c.execute(
+                    "UPDATE tasks SET status=?2, refs=?3 WHERE id=?1",
+                    params![id, status, exact_261.to_string()],
+                )
+                .unwrap();
+                (id, status)
+            });
+
+        let before_messages: i64 = c
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let all_ids = [failed, terminal_ids[0].0, terminal_ids[1].0];
+        let before_events = all_ids.map(|id| row_count(&c, "events", id));
+        let first = reconcile_terminal_retry_markers(&mut c, 1001).unwrap();
+        assert_eq!(first.len(), 3);
+        assert!(reconcile_terminal_retry_markers(&mut c, 1002)
+            .unwrap()
+            .is_empty());
+
+        // A restart (fresh SQLite connection) is also a no-op.
+        drop(c);
+        let mut c = crate::db::open(&dir.path().join("q.db")).unwrap();
+        assert!(reconcile_terminal_retry_markers(&mut c, 1003)
+            .unwrap()
+            .is_empty());
+
+        let failed_task = get(&c, failed).unwrap().unwrap();
+        assert_eq!(failed_task.status, "failed");
+        let failed_refs: serde_json::Value =
+            serde_json::from_str(failed_task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(failed_refs[PARKED_REF], true);
+        assert_eq!(failed_refs[PARKED_RESUME_STATUS_REF], "rework");
+        assert_eq!(failed_refs[PARKED_REASON_REF], exact_261[PARKED_REASON_REF]);
+        assert!(failed_refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        assert_eq!(failed_refs["pr"], 478);
+        assert_eq!(failed_refs["remediation_feedback"], "blocking feedback");
+        assert_eq!(
+            failed_refs["__quorum_noop"], "retain",
+            "reconciliation must preserve unrelated creator refs"
+        );
+
+        for (id, status) in terminal_ids {
+            let task = get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, status);
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert!(refs.get(PARKED_REF).is_none());
+            assert!(refs.get(PARKED_RESUME_STATUS_REF).is_none());
+            assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+            assert_eq!(refs[PARKED_REASON_REF], exact_261[PARKED_REASON_REF]);
+        }
+
+        for (index, id) in all_ids.into_iter().enumerate() {
+            assert_eq!(row_count(&c, "task_notes", id), 1, "one cleanup note");
+            assert_eq!(
+                row_count(&c, "events", id),
+                before_events[index],
+                "no retry/park event"
+            );
+            assert_eq!(row_count(&c, "agent_runs", id), 0, "no worker run");
+            let active_claims: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                    params![lease_target(id)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(active_claims, 0, "no remediation claim");
+        }
+        let after_messages: i64 = c
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after_messages, before_messages,
+            "no notifications or alerts"
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_retry_reconciliation_changes_each_row_once() {
+        let (dir, mut conn) = open_tmp();
+        let refs = serde_json::json!({
+            "daemon_parked": true,
+            "daemon_parked_reason": "remediation worker provisioning failed for PR #478",
+            "daemon_resume_status": "rework",
+            "daemon_rework_retry_requested": true,
+            "remediation_feedback": "blocking feedback",
+            "pr": 478
+        });
+        let id = create(
+            &mut conn,
+            "boss",
+            "concurrent legacy retry",
+            None,
+            0,
+            None,
+            Some(&refs.to_string()),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed', refs=?2 WHERE id=?1",
+            params![id, refs.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db_path = dir.path().join("q.db");
+        let contenders = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(contenders));
+        let handles: Vec<_> = (0..contenders)
+            .map(|attempt| {
+                let path = db_path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    reconcile_terminal_retry_markers(&mut conn, 1100 + attempt as i64).unwrap()
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes.iter().filter(|ids| ids.as_slice() == [id]).count(),
+            1,
+            "exactly one serialized tick must consume the marker: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes.iter().filter(|ids| ids.is_empty()).count(),
+            contenders - 1
+        );
+
+        let conn = crate::db::open(&db_path).unwrap();
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        assert_eq!(refs[PARKED_REF], true);
+        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
+        assert_eq!(row_count(&conn, "task_notes", id), 1);
+    }
+
+    #[test]
+    fn terminal_race_after_retry_selection_is_a_clean_negative() {
+        let (dir, mut selector) = open_tmp();
+        let id = review_only_task_in_rework(&mut selector);
+        selector
+            .execute(
+                "UPDATE tasks SET refs=json_set(refs,
+                    '$.daemon_rework_retry_requested', json('true'),
+                    '$.remediation_feedback', 'fix blocker',
+                    '$.pr', 50)
+                 WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+
+        // The daemon selected this rework row, then another lifecycle writer
+        // made it terminal before the authoritative remediation claim.
+        assert_eq!(
+            list(&selector, Some("rework"), None, None).unwrap().len(),
+            1
+        );
+        let terminal = crate::db::open(&dir.path().join("q.db")).unwrap();
+        terminal
+            .execute(
+                "UPDATE tasks SET status='cancelled' WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+
+        for attempt in 0..32 {
+            assert!(claim_remediation_rework(
+                &mut selector,
+                &format!("race-{attempt}"),
+                id,
+                TTL,
+                1100 + attempt,
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert_eq!(get(&selector, id).unwrap().unwrap().status, "cancelled");
+        let claimed_events: i64 = selector
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_claimed'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed_events, 0);
+        assert_eq!(row_count(&selector, "agent_runs", id), 0);
+        let claims: i64 = selector
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0);
+    }
+
+    #[test]
+    fn valid_owner_retried_remediation_claims_exactly_once_and_preserves_context() {
+        let (_dir, mut c) = open_tmp();
+        let id = review_only_task_in_rework(&mut c);
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=2,
+                 refs=json_set(refs, '$.pr', 50, '$.remediation_feedback', 'fix blocker')
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        park(&mut c, id, "provisioning failed", "rework", 1003).unwrap();
+        let retried = retry_parked(&mut c, id, "boss", true, 1004)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "rework");
+        assert_eq!(retried.recovery_attempts, 0);
+        assert_eq!(retried.rework_round, 1);
+        assert_eq!(extract_pr_number(&retried.refs), Some(50));
+        let retried_refs: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            retried_refs["remediation_feedback"].as_str(),
+            Some("fix blocker")
+        );
+
+        let claimed = claim_remediation_rework(&mut c, "replacement", id, TTL, 1005)
+            .unwrap()
+            .expect("valid retry must claim");
+        assert_eq!(claimed.assignee.as_deref(), Some("replacement"));
+        assert_eq!(claimed.author.as_deref(), None);
+        assert_eq!(extract_pr_number(&claimed.refs), Some(50));
+        assert!(has_live_lease(&c, id, 1005));
+        assert!(claim_remediation_rework(&mut c, "loser", id, TTL, 1006)
+            .unwrap()
+            .is_none());
+        let claimed_events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_claimed'",
+                params![lease_target(id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed_events, 1);
     }
 
     #[test]
@@ -7868,6 +8089,46 @@ mod tests {
         let t = get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "rework", "rework must survive repeated sweeps");
         assert_eq!(t.assignee.as_deref(), Some("REM1"));
+    }
+
+    #[test]
+    fn remediation_claim_revalidation_rejects_creator_cancellation() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+        claim_remediation_rework(&mut c, "REM1", id, TTL, 1400)
+            .unwrap()
+            .expect("remediation claim");
+
+        assert!(
+            remediation_claim_still_owned(&mut c, "REM1", id, 1401).unwrap(),
+            "fresh remediation lease should authorize provisioning"
+        );
+
+        cancel(&mut c, "boss", id, 1402).unwrap();
+
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "cancelled");
+        assert!(
+            !remediation_claim_still_owned(&mut c, "REM1", id, 1403).unwrap(),
+            "terminal lifecycle state must revoke provisioning authority"
+        );
     }
 
     #[test]
