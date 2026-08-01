@@ -2388,6 +2388,143 @@ struct DrainState {
     known_base_sha: Option<String>,
 }
 
+#[derive(Default)]
+struct DecompositionCoordinator {
+    graph_id: Option<i64>,
+    proposal: Option<Vec<planner::ProposedTask>>,
+    planner_slot: Option<planner::PlannerSlot>,
+    classifier_slot: Option<classifier::ClassifierSlot>,
+}
+
+#[derive(Clone)]
+struct PlanningSnapshot {
+    graph_id: i64,
+    source_task_id: i64,
+    source_revision: i64,
+    state: String,
+    freeze_active: bool,
+    updated_at: i64,
+    title: String,
+    body: Option<String>,
+    dependencies: Vec<i64>,
+    rejection_summaries: Vec<String>,
+}
+
+const DECOMPOSITION_PROVIDER_BACKOFF_SECS: i64 = 5;
+type PlanningSnapshotRow = (
+    i64,
+    i64,
+    i64,
+    String,
+    bool,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<PlanningSnapshot>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<PlanningSnapshotRow> = conn
+        .query_row(
+            "SELECT d.id,d.source_task_id,d.planned_source_revision,d.state,d.freeze_active,
+                    d.updated_at,t.title,t.body,t.depends_on
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
+             ORDER BY d.id LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        graph_id,
+        source_task_id,
+        source_revision,
+        state,
+        freeze_active,
+        updated_at,
+        title,
+        body,
+        depends_on,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let dependencies = depends_on
+        .as_deref()
+        .map(serde_json::from_str::<Vec<i64>>)
+        .transpose()
+        .map_err(|error| QuorumError::Io(format!("invalid planning source dependencies: {error}")))?
+        .unwrap_or_default();
+    let mut statement = conn.prepare(
+        "SELECT summary FROM decomposition_attempts
+         WHERE graph_id=?1 AND kind='proposal' ORDER BY ordinal DESC LIMIT 3",
+    )?;
+    let rejection_summaries = statement
+        .query_map([graph_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(Some(PlanningSnapshot {
+        graph_id,
+        source_task_id,
+        source_revision,
+        state,
+        freeze_active,
+        updated_at,
+        title,
+        body,
+        dependencies,
+        rejection_summaries,
+    }))
+}
+
+fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT t.id,t.revision FROM tasks t
+         WHERE t.status='open' AND t.assignee IS NULL AND t.review_only=0
+           AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
+           AND json_extract(t.refs,'$.cx_size') IN ('L','XL')
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
+           AND (t.depends_on IS NULL OR NOT EXISTS (
+               SELECT 1 FROM json_each(t.depends_on) dep
+               WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite
+                                 WHERE prerequisite.id=dep.value AND prerequisite.status='done')
+           ))
+         ORDER BY t.priority DESC,t.id ASC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn planner_kind(kind: crate::serve_config::RunnerKind) -> runner::AgentKind {
+    match kind {
+        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
+    }
+}
+
+fn planner_model(kind: crate::serve_config::RunnerKind) -> &'static str {
+    match planner_kind(kind) {
+        runner::AgentKind::Codex => planner::CODEX_PLANNER_MODEL,
+        runner::AgentKind::Claude => planner::CLAUDE_PLANNER_MODEL,
+    }
+}
+
 impl DrainState {
     fn new() -> Self {
         Self {
@@ -2433,6 +2570,567 @@ impl DrainState {
         self.drain_started_at
             .is_some_and(|t| t.elapsed().as_secs() >= timeout_secs)
     }
+}
+
+async fn record_decomposition_attempt(
+    config: &ServeConfig,
+    graph_id: i64,
+    kind: &'static str,
+    code: &str,
+    summary: &str,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    let code = code.to_string();
+    let summary: String = summary.chars().take(2048).collect();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph_id,
+            kind,
+            &code,
+            &summary,
+            now_unix(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition attempt join: {error}")))??;
+    Ok(())
+}
+
+async fn reset_decomposition_to_planning(
+    config: &ServeConfig,
+    graph_id: i64,
+    from: &'static str,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            graph_id,
+            from,
+            "planning",
+            None,
+            now_unix(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition phase join: {error}")))??;
+    Ok(())
+}
+
+fn proposed_classifier_tasks(
+    tasks: &[planner::ProposedTask],
+) -> Vec<quorum_core::classify::TaskForClassification> {
+    tasks
+        .iter()
+        .enumerate()
+        .map(
+            |(index, task)| quorum_core::classify::TaskForClassification {
+                id: -(index as i64) - 1,
+                revision: 1,
+                title: task.title.clone(),
+                body: Some(
+                    serde_json::json!({
+                        "observable_outcome": task.observable_outcome,
+                        "acceptance_criteria": task.acceptance_criteria,
+                        "source_constraints": task.source_constraints,
+                        "verification_expectations": task.verification_expectations,
+                    })
+                    .to_string(),
+                ),
+                dependencies: task.prerequisites.clone(),
+                recovery_notes: vec![],
+            },
+        )
+        .collect()
+}
+
+fn planned_children(
+    proposal: &[planner::ProposedTask],
+    classifications: &[quorum_core::classify::TaskClassification],
+) -> std::result::Result<Vec<quorum_core::decomposition::PlannedChild>, String> {
+    let by_id: HashMap<i64, &quorum_core::classify::TaskClassification> = classifications
+        .iter()
+        .map(|result| (result.task_id, result))
+        .collect();
+    proposal
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let id = -(index as i64) - 1;
+            let result = by_id
+                .get(&id)
+                .ok_or_else(|| format!("missing classification for {}", task.key))?;
+            if !result.ready
+                || !matches!(result.size.as_str(), "S" | "M")
+                || !result.duplicate_of.is_empty()
+            {
+                return Err(format!(
+                    "child {} is not an admission-ready nonduplicate S/M implementation",
+                    task.key
+                ));
+            }
+            let mut prerequisite_keys = Vec::new();
+            let mut source_dependency_ids = Vec::new();
+            for dependency in &task.prerequisites {
+                if let Some(raw) = dependency.strip_prefix("source:") {
+                    source_dependency_ids.push(
+                        raw.parse::<i64>()
+                            .map_err(|_| "invalid source dependency")?,
+                    );
+                } else {
+                    prerequisite_keys.push(dependency.clone());
+                }
+            }
+            Ok(quorum_core::decomposition::PlannedChild {
+                local_key: task.key.clone(),
+                title: task.title.clone(),
+                body: serde_json::json!({
+                    "observable_outcome": task.observable_outcome,
+                    "acceptance_criteria": task.acceptance_criteria,
+                    "source_constraints": task.source_constraints,
+                    "verification_expectations": task.verification_expectations,
+                })
+                .to_string(),
+                labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
+                classification_refs: serde_json::json!({
+                    "cx_est": result.cx_est,
+                    "cx_size": result.size,
+                    "cx_ready": result.ready,
+                    "cx_not_ready_reason": result.not_ready_reason,
+                    "cx_dup_of": result.duplicate_of,
+                    "cx_by": "decomposition-preclassification:v1",
+                })
+                .to_string(),
+                prerequisite_keys,
+                source_dependency_ids,
+            })
+        })
+        .collect()
+}
+
+/// Advance at most one durable decomposition coordinator. Returns whether the
+/// repository planning freeze is active after this tick.
+async fn tick_decomposition(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+    workers: &[SlotState],
+    reviewers: &[SlotState],
+) -> Result<bool> {
+    // First consume terminal provider output. Provider processes are always
+    // killed and reaped before durable retry/materialization decisions.
+    if let Some(slot) = coordinator.planner_slot.as_mut() {
+        if let Some(outcome) = planner::poll_planner(slot).await {
+            let slot = coordinator
+                .planner_slot
+                .take()
+                .expect("planner slot exists");
+            slot.kill_and_reap().await;
+            let graph_id = coordinator
+                .graph_id
+                .ok_or_else(|| QuorumError::Io("planner lost graph identity".into()))?;
+            match outcome {
+                planner::PlannerPoll::ProviderFailed(summary) => {
+                    record_decomposition_attempt(
+                        config,
+                        graph_id,
+                        "provider",
+                        "planner-provider",
+                        &summary,
+                    )
+                    .await?;
+                }
+                planner::PlannerPoll::SemanticRejected(summary) => {
+                    record_decomposition_attempt(
+                        config,
+                        graph_id,
+                        "proposal",
+                        "semantic-rejection",
+                        &summary,
+                    )
+                    .await?;
+                }
+                planner::PlannerPoll::Done(planner::PlannerResponse::Blocker {
+                    category,
+                    evidence,
+                    required_decision,
+                    why_no_safe_split,
+                }) => {
+                    let summary = serde_json::json!({"evidence":evidence,"required_decision":required_decision,
+                        "why_no_safe_split":why_no_safe_split}).to_string();
+                    record_decomposition_attempt(config, graph_id, "blocker", &category, &summary)
+                        .await?;
+                }
+                planner::PlannerPoll::Done(planner::PlannerResponse::Plan { tasks }) => {
+                    let path = config.db_path.clone();
+                    let moved = tokio::task::spawn_blocking(move || -> Result<bool> {
+                        let mut conn = quorum_core::db::open(&path)?;
+                        quorum_core::decomposition::set_frozen_phase(
+                            &mut conn,
+                            graph_id,
+                            "planning",
+                            "validating",
+                            None,
+                            now_unix(),
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("validation phase join: {error}"))
+                    })??;
+                    if moved {
+                        coordinator.proposal = Some(tasks);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(slot) = coordinator.classifier_slot.as_mut() {
+        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+        let terminal = classifier::drain_classifier_events(slot).await.or_else(|| {
+            exited.then(|| {
+                classifier::ClassifierResult::Error(
+                    "proposal classifier exited without a complete response".into(),
+                )
+            })
+        });
+        if let Some(outcome) = terminal {
+            let slot = coordinator
+                .classifier_slot
+                .take()
+                .expect("classifier slot exists");
+            let expected = slot.pending_task_ids.clone();
+            slot.kill_and_reap().await;
+            let graph_id = coordinator
+                .graph_id
+                .ok_or_else(|| QuorumError::Io("classifier lost graph identity".into()))?;
+            match outcome {
+                classifier::ClassifierResult::Error(summary) => {
+                    record_decomposition_attempt(
+                        config,
+                        graph_id,
+                        "provider",
+                        "classifier-provider",
+                        &summary,
+                    )
+                    .await?;
+                    coordinator.proposal = None;
+                }
+                classifier::ClassifierResult::Done(text) => {
+                    let result = classifier::parse_validated_response(&text, &expected).and_then(
+                        |classifications| {
+                            planned_children(
+                                coordinator.proposal.as_deref().unwrap_or_default(),
+                                &classifications,
+                            )
+                            .map(|children| (classifications, children))
+                        },
+                    );
+                    match result {
+                        Err(summary) => {
+                            reset_decomposition_to_planning(config, graph_id, "preclassifying")
+                                .await?;
+                            record_decomposition_attempt(
+                                config,
+                                graph_id,
+                                "proposal",
+                                "child-preclassification",
+                                &summary,
+                            )
+                            .await?;
+                            coordinator.proposal = None;
+                        }
+                        Ok((_classifications, children)) => {
+                            let snapshot = {
+                                let conn = quorum_core::db::open(&config.db_path)?;
+                                load_planning_snapshot(&conn)?
+                            };
+                            if let Some(snapshot) = snapshot {
+                                let path = config.db_path.clone();
+                                tokio::task::spawn_blocking(move || -> Result<()> {
+                                    let mut conn = quorum_core::db::open(&path)?;
+                                    quorum_core::decomposition::materialize_graph(
+                                        &mut conn,
+                                        graph_id,
+                                        snapshot.source_revision,
+                                        &children,
+                                        now_unix(),
+                                    )?;
+                                    Ok(())
+                                })
+                                .await
+                                .map_err(|error| {
+                                    QuorumError::Io(format!("materialization join: {error}"))
+                                })??;
+                            }
+                            coordinator.proposal = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut snapshot = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        load_planning_snapshot(&conn)?
+    };
+    if snapshot.is_none() {
+        coordinator.graph_id = None;
+        if coordinator.planner_slot.is_none() && coordinator.classifier_slot.is_none() {
+            let candidate = {
+                let conn = quorum_core::db::open(&config.db_path)?;
+                planning_candidate(&conn)?
+            };
+            if let Some((source_task_id, expected_revision)) = candidate {
+                let sha = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&config.repo_dir)
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let path = config.db_path.clone();
+                let provider = config.runner_kind.to_string();
+                let model = planner_model(config.runner_kind).to_string();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&path)?;
+                    quorum_core::decomposition::begin_planning(
+                        &mut conn,
+                        &quorum_core::decomposition::BeginPlanning {
+                            source_task_id,
+                            expected_revision,
+                            provider: &provider,
+                            model: &model,
+                            frozen_base_sha: &sha,
+                            now: now_unix(),
+                        },
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| QuorumError::Io(format!("begin planning join: {error}")))??;
+                let conn = quorum_core::db::open(&config.db_path)?;
+                snapshot = load_planning_snapshot(&conn)?;
+            }
+        }
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(false);
+    };
+    coordinator.graph_id = Some(snapshot.graph_id);
+
+    if snapshot.state == "provider-backoff" {
+        if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
+            let path = config.db_path.clone();
+            let graph_id = snapshot.graph_id;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::decomposition::reacquire_freeze(&mut conn, graph_id, now_unix())?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("freeze reacquire join: {error}")))??;
+        }
+        return Ok(false);
+    }
+    if !snapshot.freeze_active {
+        return Ok(false);
+    }
+    let durable_in_flight = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row("SELECT count(*) FROM journal", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+    };
+    if snapshot.state == "freeze-requested" {
+        let path = config.db_path.clone();
+        let graph_id = snapshot.graph_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "draining",
+                None,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("draining phase join: {error}")))??;
+        return Ok(true);
+    }
+    if snapshot.state == "draining"
+        && workers.is_empty()
+        && reviewers.is_empty()
+        && durable_in_flight == 0
+    {
+        let path = config.db_path.clone();
+        let graph_id = snapshot.graph_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "draining",
+                "planning",
+                None,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("planning phase join: {error}")))??;
+        return Ok(true);
+    }
+    if snapshot.state == "planning" && coordinator.planner_slot.is_none() {
+        let source = planner::PlanningSource {
+            task_id: snapshot.source_task_id,
+            revision: snapshot.source_revision,
+            title: &snapshot.title,
+            body: snapshot.body.as_deref(),
+            dependencies: &snapshot.dependencies,
+        };
+        let prompt = planner::build_prompt(&source, &snapshot.rejection_summaries);
+        match planner::spawn_planner(
+            planner_kind(config.runner_kind),
+            &config.repo_dir,
+            &prompt,
+            config.bare_agent,
+            config.agent_bin.as_deref(),
+        )
+        .await
+        {
+            Ok(slot) => coordinator.planner_slot = Some(slot),
+            Err(error) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "planner-spawn",
+                    &error.to_string(),
+                )
+                .await?
+            }
+        }
+    } else if snapshot.state == "validating" {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
+            record_decomposition_attempt(
+                config,
+                snapshot.graph_id,
+                "proposal",
+                "restart-lost-proposal",
+                "daemon restarted before proposal validation completed",
+            )
+            .await?;
+            return Ok(true);
+        };
+        match planner::validate_for_source(proposal, &snapshot.dependencies) {
+            Err(error) => {
+                reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "proposal",
+                    "deterministic-validation",
+                    &error.to_string(),
+                )
+                .await?;
+                coordinator.proposal = None;
+            }
+            Ok(()) => {
+                let path = config.db_path.clone();
+                let graph_id = snapshot.graph_id;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&path)?;
+                    quorum_core::decomposition::set_frozen_phase(
+                        &mut conn,
+                        graph_id,
+                        "validating",
+                        "preclassifying",
+                        None,
+                        now_unix(),
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!("preclassification phase join: {error}"))
+                })??;
+            }
+        }
+    } else if snapshot.state == "preclassifying" && coordinator.classifier_slot.is_none() {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            reset_decomposition_to_planning(config, snapshot.graph_id, "preclassifying").await?;
+            record_decomposition_attempt(
+                config,
+                snapshot.graph_id,
+                "proposal",
+                "restart-lost-proposal",
+                "daemon restarted before child preclassification completed",
+            )
+            .await?;
+            return Ok(true);
+        };
+        let tasks = proposed_classifier_tasks(proposal);
+        match classifier::spawn_classifier_configured(
+            &tasks,
+            &[],
+            config.agent_bin.as_deref(),
+            config.bare_agent,
+            &config.classifier_model,
+            &config.classifier_effort,
+            &config.codex_sandbox,
+            &quorum_core::complexity::recommendation_lines(recommendation_provider(
+                config.runner_kind,
+            )),
+        ) {
+            Ok(mut slot) => {
+                if !slot.proc.is_codex() {
+                    let turn = classifier::classifier_turn_with_recommendations(
+                        &tasks,
+                        &[],
+                        &quorum_core::complexity::recommendation_lines(recommendation_provider(
+                            config.runner_kind,
+                        )),
+                    );
+                    if let Err(error) = slot.proc.feed_turn(&turn).await {
+                        slot.kill_and_reap().await;
+                        record_decomposition_attempt(
+                            config,
+                            snapshot.graph_id,
+                            "provider",
+                            "classifier-feed",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        return Ok(false);
+                    }
+                }
+                coordinator.classifier_slot = Some(slot);
+            }
+            Err(error) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "classifier-spawn",
+                    &error.to_string(),
+                )
+                .await?
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Resolves when a drain deadline should interrupt long-running work inside
@@ -3239,6 +3937,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut last_publication_ref_reconcile: Option<std::time::Instant> = None;
     let mut publication_ref_reconcile_cursor: Option<i64> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
+    let mut decomposition_coordinator = DecompositionCoordinator::default();
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
@@ -3382,6 +4081,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 let _terminal_output = slot.proc.kill_and_reap().await;
             }
+            if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                slot.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                slot.kill_and_reap().await;
+            }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -3401,6 +4106,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             }
             if let Some(slot) = classifier_slot.take() {
                 let _terminal_output = slot.proc.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                slot.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                slot.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -3424,6 +4135,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                    slot.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
                     let _terminal_output = r.proc.kill_and_reap().await;
@@ -3480,6 +4197,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
                 }
+                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                    slot.kill_and_reap().await;
+                }
                 return Ok(exit);
             }
 
@@ -3493,6 +4216,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 ));
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                    slot.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
@@ -3556,6 +4285,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
+            &mut decomposition_coordinator,
             &mut classifier_consec_errors,
             &mut classifier_backoff_until,
             &mut doctor_slot,
@@ -3580,6 +4310,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     // names. Journal recovery reclaims the tasks on restart.
                     if let Some(slot) = classifier_slot.take() {
                         let _terminal_output = slot.proc.kill_and_reap().await;
+                    }
+                    if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                        slot.kill_and_reap().await;
+                    }
+                    if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                        slot.kill_and_reap().await;
                     }
                     for r in reviewers.drain(..) {
                         let _terminal_output = r.proc.kill_and_reap().await;
@@ -3612,6 +4348,7 @@ async fn tick(
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
+    decomposition_coordinator: &mut DecompositionCoordinator,
     classifier_consec_errors: &mut u32,
     classifier_backoff_until: &mut Option<std::time::Instant>,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
@@ -3619,6 +4356,9 @@ async fn tick(
     signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
+
+    let decomposition_freeze =
+        tick_decomposition(config, decomposition_coordinator, workers, reviewers).await?;
 
     // Reconcile policy-blocked classifications written by older daemons before
     // any mailbox recovery or provisioning path can regain authority.
@@ -7066,7 +7806,7 @@ async fn tick(
     // Each worker that has a PR and no paired reviewer (and is not draining)
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
     // Skip during drain — no new work, let existing agents finish.
-    if !drain_state.draining {
+    if !drain_state.draining && !decomposition_freeze {
         let active_in_review = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
@@ -7650,7 +8390,7 @@ async fn tick(
     // Gate on worker count, not total in_use_count() — reviewers must
     // not consume worker capacity (F16).
     // Skip during drain — no new tasks, let existing agents finish.
-    if !drain_state.draining {
+    if !drain_state.draining && !decomposition_freeze {
         while workers.len() < config.cap {
             if !spawn_worker(
                 config,
@@ -7752,7 +8492,11 @@ async fn tick(
             *classifier_backoff_until = None;
         }
     }
-    if classifier_slot.is_none() && !drain_state.draining && classifier_backoff_until.is_none() {
+    if classifier_slot.is_none()
+        && !drain_state.draining
+        && !decomposition_freeze
+        && classifier_backoff_until.is_none()
+    {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;
@@ -7835,7 +8579,7 @@ async fn tick(
     // priority ready job (attempts asc, past backoff, under cap), and (c)
     // log dead-lettered rows so operators see poison PRs instead of silent
     // starvation. Never touches task lifecycle: analytics-only, retry-only.
-    if !drain_state.draining {
+    if !drain_state.draining && !decomposition_freeze {
         let p = db_path.clone();
         let now_ts = now_unix();
         let outcome = tokio::task::spawn_blocking(move || -> Result<InterpretTickOutcome> {
@@ -7970,7 +8714,11 @@ async fn tick(
     }
 
     // 8b: Spawn doctor if enabled, idle, not draining, and a stalled task exists.
-    if config.doctor_enabled && doctor_slot.is_none() && !drain_state.draining {
+    if config.doctor_enabled
+        && doctor_slot.is_none()
+        && !drain_state.draining
+        && !decomposition_freeze
+    {
         let p = db_path.clone();
         let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
         let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
@@ -8722,8 +9470,14 @@ async fn provision_reviewer(
         let task_id = worker.task_id;
         tokio::task::spawn_blocking(move || -> Result<bool> {
             let conn = quorum_core::db::open(&db_path)?;
-            Ok(tasks::get(&conn, task_id)?
-                .is_some_and(|task| tasks::classification_is_dispatchable(&task.refs)))
+            let frozen: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(!frozen
+                && tasks::get(&conn, task_id)?
+                    .is_some_and(|task| tasks::classification_is_dispatchable(&task.refs)))
         })
         .await
         .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
@@ -10962,6 +11716,19 @@ async fn spawn_remediation_worker(
     feedback: &str,
 ) -> bool {
     let db_path = &config.db_path;
+    let frozen = quorum_core::db::open(db_path)
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+        .unwrap_or(true);
+    if frozen {
+        return false;
+    }
 
     // Fetch task body + author for context and branch resolution.
     let (task_body, task_author, task_review_only) = {
@@ -15479,5 +16246,130 @@ mod tests {
         assert!(!transcript.contains("must-not-complete"));
         assert!(!transcript.contains("provider warning"));
         assert!(!transcript.contains("42"));
+    }
+
+    #[test]
+    fn planning_candidate_is_ready_large_implementation_priority_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("candidate.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('small','open',100,'owner',1,1,
+               '{\"cx_est\":2,\"cx_size\":\"S\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-low','open',5,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-high','open',9,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('review-large','open',99,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1);"
+        ).unwrap();
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((3, 1)));
+    }
+
+    #[test]
+    fn planning_snapshot_restores_durable_phase_and_bounded_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("restart.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "large",
+            Some("outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "planning",
+            None,
+            3,
+        )
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "cycle",
+            "bounded cycle summary",
+            4,
+        )
+        .unwrap();
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.state, "planning");
+        assert!(snapshot.freeze_active);
+        assert_eq!(snapshot.rejection_summaries, vec!["bounded cycle summary"]);
+    }
+
+    #[test]
+    fn proposal_preclassification_requires_complete_ready_small_nondduplicate_batch() {
+        let proposal = vec![
+            planner::ProposedTask {
+                key: "a".into(),
+                title: "a".into(),
+                observable_outcome: "a works".into(),
+                acceptance_criteria: vec!["a".into()],
+                source_constraints: vec!["atomic".into()],
+                verification_expectations: vec!["test".into()],
+                prerequisites: vec![],
+            },
+            planner::ProposedTask {
+                key: "b".into(),
+                title: "b".into(),
+                observable_outcome: "b works".into(),
+                acceptance_criteria: vec!["b".into()],
+                source_constraints: vec!["atomic".into()],
+                verification_expectations: vec!["test".into()],
+                prerequisites: vec!["a".into()],
+            },
+        ];
+        let valid = vec![
+            quorum_core::classify::TaskClassification {
+                task_id: -1,
+                cx_est: 2,
+                size: "S".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            },
+            quorum_core::classify::TaskClassification {
+                task_id: -2,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            },
+        ];
+        assert_eq!(planned_children(&proposal, &valid).unwrap().len(), 2);
+        let mut large = valid.clone();
+        large[1].size = "L".into();
+        assert!(planned_children(&proposal, &large).is_err());
+        let mut duplicate = valid.clone();
+        duplicate[0].duplicate_of = vec![99];
+        assert!(planned_children(&proposal, &duplicate).is_err());
+        assert!(planned_children(&proposal, &valid[..1]).is_err());
     }
 }

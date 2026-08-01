@@ -696,6 +696,9 @@ pub fn claim(
                AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
                     OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
     ))";
+    const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
+        SELECT 1 FROM task_decompositions WHERE freeze_active=1
+    )";
     // Generated implementation work has additional graph authority. Keep this
     // predicate in the same BEGIN IMMEDIATE transaction as the task update so
     // sibling claims, failures, and graph blockers cannot race provisioning.
@@ -737,6 +740,7 @@ pub fn claim(
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3
+                       AND {NO_PLANNING_FREEZE_CLAUSE}
                        AND json_valid(refs)
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
@@ -762,6 +766,7 @@ pub fn claim(
             let mut selector = format!(
                 "SELECT id FROM tasks
                  WHERE json_valid(refs)
+                   AND {NO_PLANNING_FREEZE_CLAUSE}
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
@@ -860,6 +865,7 @@ pub fn claim_provider_retry_rework(
     let updated = tx.execute(
         "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
@@ -928,9 +934,12 @@ pub fn claim_remediation_rework(
     crate::agents::touch(&tx, agent, now)?;
 
     let status: Option<String> = tx
-        .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT status FROM tasks WHERE id=?1
+             AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+            params![id],
+            |r| r.get(0),
+        )
         .optional()?;
 
     let policy_parked: bool = tx.query_row(
@@ -2703,9 +2712,10 @@ pub(crate) fn park_complexity_five_tx(
     Ok(true)
 }
 
-/// Reconcile category-5 rows classified by an older daemon or changed while
-/// this daemon was stopped. Each tick parks at most [`SWEEP_LIMIT`] rows in
-/// stable ID order, bounding the write transaction while guaranteeing progress.
+/// Reconcile non-admissible classifications written by an older daemon or
+/// changed while this daemon was stopped. Admission-ready L/XL implementation
+/// tasks are intentionally left open for decomposition; review-only large work
+/// is held for an external split.
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
@@ -2714,8 +2724,7 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
                AND (json_extract(refs, '$.cx_ready')!=1
-                    OR json_extract(refs, '$.cx_size')='XL'
-                    OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L'))
+                    OR (review_only=1 AND json_extract(refs, '$.cx_size') IN ('L','XL')))
              ORDER BY id
              LIMIT ?1",
         )?;
@@ -8366,7 +8375,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
+            "UPDATE tasks SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
             params![id],
         )
         .unwrap();
@@ -8413,7 +8422,7 @@ mod tests {
             .unwrap();
             c.execute(
                 "UPDATE tasks
-                 SET refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
+                 SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
                  WHERE id=?1",
                 params![id],
             )
@@ -8633,5 +8642,55 @@ mod tests {
         )
         .is_err());
         assert_eq!(get(&c, ids[0]).unwrap().unwrap().status, "open");
+    }
+
+    #[test]
+    fn planning_freeze_atomically_blocks_all_new_task_authority() {
+        let (_dir, mut c) = open_tmp();
+        let source = create(&mut c, "owner", "large", None, 1, None,
+            Some(r#"{"cx_est":4,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1).unwrap();
+        let implementation = create(&mut c, "owner", "small", None, 1, None,
+            Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1).unwrap();
+        let review = create_with_continue_pr(&mut c, "owner", "review", None, 1, None,
+            Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, Some(42), None, 1).unwrap();
+        crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(claim(&mut c, "worker", Some(implementation), &[], 60, 3)
+            .unwrap()
+            .is_none());
+        assert!(claim(&mut c, "reviewer", Some(review), &[], 60, 3)
+            .unwrap()
+            .is_none());
+        c.execute(
+            "UPDATE tasks SET status='rework',assignee=NULL,
+            refs=json_set(refs,'$.daemon_rework_retry_requested',json('true')) WHERE id=?1",
+            [implementation],
+        )
+        .unwrap();
+        assert!(
+            claim_provider_retry_rework(&mut c, "retry", implementation, 60, 4)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            claim_remediation_rework(&mut c, "remediation", implementation, 60, 4)
+                .unwrap()
+                .is_none()
+        );
     }
 }

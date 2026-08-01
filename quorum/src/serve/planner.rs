@@ -7,7 +7,7 @@
 use super::agent::{self, AgentProc, AgentSpec};
 use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, RunnerProc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -47,6 +47,67 @@ pub struct ProposedTask {
     pub verification_expectations: Vec<String>,
     #[serde(default)]
     pub prerequisites: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanningSource<'a> {
+    pub task_id: i64,
+    pub revision: i64,
+    pub title: &'a str,
+    pub body: Option<&'a str>,
+    pub dependencies: &'a [i64],
+}
+
+/// Build one bounded, closed-book planner turn. Retry context is deliberately
+/// limited to structured rejection summaries; provider transcripts and prior
+/// continuation identities never enter a later attempt.
+pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String]) -> String {
+    let source_json = serde_json::to_string(source).expect("planning source serializes");
+    let retry_json = serde_json::to_string(
+        &rejection_summaries
+            .iter()
+            .take(3)
+            .map(|summary| summary.chars().take(1024).collect::<String>())
+            .collect::<Vec<_>>(),
+    )
+    .expect("rejection summaries serialize");
+    format!(
+        "You are Quorum's bounded decomposition planner. Split the source outcome into one \
+         closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
+         Preserve every source constraint. Do not create synthetic integration work, recursive \
+         planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
+         reference another task key or source:<dependency-id>. Return exactly one closed JSON \
+         object matching the PLAN/BLOCKER protocol; no markdown or commentary.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+    )
+}
+
+/// Recheck proposal dependencies against the authoritative source snapshot.
+/// Shape/cycle/text validation has already run in `parse_response`.
+pub fn validate_for_source(
+    tasks: &[ProposedTask],
+    source_dependency_ids: &[i64],
+) -> Result<(), PlannerParseError> {
+    let allowed: HashSet<i64> = source_dependency_ids.iter().copied().collect();
+    for task in tasks {
+        for prerequisite in &task.prerequisites {
+            if let Some(raw) = prerequisite.strip_prefix("source:") {
+                let id = raw
+                    .parse::<i64>()
+                    .map_err(|_| PlannerParseError::Semantic("invalid source dependency".into()))?;
+                if !allowed.contains(&id) {
+                    return semantic("proposal references a dependency outside the source");
+                }
+            }
+        }
+        let synthetic = format!("{} {}", task.title, task.observable_outcome).to_lowercase();
+        if ["integration task", "integrate all", "merge all siblings"]
+            .iter()
+            .any(|phrase| synthetic.contains(phrase))
+        {
+            return semantic("synthetic integration work is not permitted");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +419,11 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
             return Some(PlannerPoll::ProviderFailed("planner timed out".into()));
         }
     }
+    if matches!(slot.proc.try_wait(), Ok(Some(_))) {
+        return Some(PlannerPoll::ProviderFailed(
+            "planner exited without a terminal response".into(),
+        ));
+    }
     None
 }
 
@@ -464,5 +530,52 @@ mod tests {
         .err()
         .expect("oversized prompt must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn source_validation_rejects_foreign_dependencies_and_synthetic_integration() {
+        let foreign = ProposedTask {
+            key: "a".into(),
+            title: "Implement a".into(),
+            observable_outcome: "a works".into(),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["atomic".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec!["source:9".into()],
+        };
+        assert!(matches!(
+            validate_for_source(&[foreign], &[7]),
+            Err(PlannerParseError::Semantic(_))
+        ));
+        let synthetic = ProposedTask {
+            key: "integration".into(),
+            title: "Integration task".into(),
+            observable_outcome: "merge all siblings".into(),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["atomic".into()],
+            verification_expectations: vec!["tests".into()],
+            prerequisites: vec![],
+        };
+        assert!(matches!(
+            validate_for_source(&[synthetic], &[]),
+            Err(PlannerParseError::Semantic(_))
+        ));
+    }
+
+    #[test]
+    fn planner_prompt_is_bounded_and_contains_only_structured_retry_summaries() {
+        let dependencies = vec![3, 4];
+        let source = PlanningSource {
+            task_id: 7,
+            revision: 2,
+            title: "large outcome",
+            body: Some("preserve atomicity"),
+            dependencies: &dependencies,
+        };
+        let prompt = build_prompt(&source, &["cycle detected".into(), "x".repeat(5000)]);
+        assert!(prompt.len() < MAX_PROMPT_BYTES);
+        assert!(prompt.contains("cycle detected"));
+        assert!(!prompt.contains(&"x".repeat(1025)));
+        assert!(!prompt.contains("transcript"));
     }
 }
