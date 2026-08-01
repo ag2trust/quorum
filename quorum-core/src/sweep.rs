@@ -93,15 +93,10 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             // review: the replacement reviewer re-judges the unchanged PR
             // head and its changes verdict burns a rework round with zero
             // remediation applied. Park instead (same contract as the
-            // lifecycle layer); the daemon's head check resumes straight to
-            // in-review when the dead worker did push, and `task-retry`
-            // covers the rest.
+            // lifecycle layer); the resulting terminal park is owner-gated.
             let park_reason = format!("remediation {reason}");
-            let parked_refs = crate::tasks::set_parked_refs_with_head_check(
-                refs.as_deref(),
-                &park_reason,
-                "rework",
-            )?;
+            let parked_refs =
+                crate::tasks::set_parked_refs(refs.as_deref(), &park_reason, "rework")?;
             conn.execute(
                 "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
                 params![id, parked_refs, now],
@@ -1109,13 +1104,17 @@ mod tests {
             let target = format!("task#{id}");
             let evs = crate::events::list(&c, 0, Some(&target), 10, 1100).unwrap();
             if case.review_only {
-                // Parked, never reclaimed: durable markers + one-shot head
-                // check + task_parked event + loud owner alert.
+                // Parked, never reclaimed: durable owner-gated markers plus
+                // task_parked event and loud owner alert.
                 let refs: serde_json::Value =
                     serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
                 assert_eq!(refs["daemon_parked"], true, "{}", case.label);
                 assert_eq!(refs["daemon_resume_status"], "rework", "{}", case.label);
-                assert_eq!(refs["daemon_parked_head_check"], true, "{}", case.label);
+                assert!(
+                    refs.get("daemon_parked_head_check").is_none(),
+                    "{}",
+                    case.label
+                );
                 let parked = &evs
                     .iter()
                     .find(|e| e.kind == "task_parked")

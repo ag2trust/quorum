@@ -536,11 +536,10 @@ only through an explicit outside request)
 - `AgentFailed` / `LeaseExpired` (review_only=true) → Failed (parked, resume `rework`) ·
   effects: ReleaseLease, NotifyOwner. A lost remediation worker must not hand the
   unchanged PR head back to a fresh reviewer — that changes verdict would burn a rework
-  round with zero remediation applied. The park carries a one-shot head check: if the
-  daemon later observes the PR head moved past the spawn-time
-  `pr_targets.head_sha` (the worker pushed, then died before signaling), it resumes the
-  task straight to `in-review`; otherwise the task stays parked for `task-retry`. The
-  lapsed-lease sweep applies the same park instead of reclaiming to `in-review`.
+  round with zero remediation applied. The terminal park is never selected for
+  automatic retry, including after daemon restart; only an explicit `task-retry`
+  restores it to `rework`. The lapsed-lease sweep applies the same owner-gated park
+  instead of reclaiming to `in-review`.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From Merging:**
@@ -631,6 +630,12 @@ Retry does not change PR identity, approvals,
 dependencies, author/reviewer provenance, or rework count. An unparked or terminal task
 is a clean negative (exit 1). This explicit gate prevents hot respawn/provision loops:
 daemon ticks cannot retry a parked task until the operator requests it.
+
+Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
+runnable remediation retry markers. `failed` parks retain their reason and explicit
+owner-retry target but lose automatic retry/head-check authority; `done` and `cancelled`
+rows lose all park/resume authority. The cleanup writes one audit note and is idempotent.
+Before reconciliation, `quorum status` surfaces these rows as critical health alerts.
 
 ### Review responsibility boundary (agents own PR collaboration)
 
