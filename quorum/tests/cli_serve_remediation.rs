@@ -121,6 +121,10 @@ elif [ "$cmd" = "pr list" ]; then
   printf '[]\n'
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
+  if [ -n "${QUORUM_TEST_GH_BLOCK_DIR:-}" ]; then
+    : > "$QUORUM_TEST_GH_BLOCK_DIR/started"
+    while [ ! -f "$QUORUM_TEST_GH_BLOCK_DIR/release" ]; do sleep 0.02; done
+  fi
   if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
     branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   else
@@ -914,6 +918,276 @@ fn remediation_retry_fetches_original_branch_when_github_is_unavailable() {
     handle.sigkill();
 }
 
+/// Regression for #270: a creator may cancel after the remediation claim
+/// commits while the bounded PR lookup is still in flight. The post-lookup DB
+/// guard must observe the terminal transition and stop before any provisioning
+/// state, worktree, capability, run, process, park, or notification is created.
+#[test]
+fn cancellation_after_remediation_claim_prevents_provisioning() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    let gh_block = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let creator = "test";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    stage_failed_ci_remediation(home.path(), repo_dir.path(), task_id, pr);
+
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let baseline = {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let note_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        let task_message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_messages", [], |row| row.get(0))
+            .unwrap();
+        (event_count, note_count, message_count, task_message_count)
+    };
+
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+        &[(
+            "QUORUM_TEST_GH_BLOCK_DIR".into(),
+            gh_block.path().to_string_lossy().into_owned(),
+        )],
+    );
+
+    let lookup_started = gh_block.path().join("started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !lookup_started.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        lookup_started.exists(),
+        "remediation PR lookup did not start: {:?}",
+        handle.lines
+    );
+
+    let claimed_agent: String = {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "rework", "lookup must be blocked after the claim");
+        conn.query_row(
+            "SELECT holder FROM claims
+             WHERE target=?1 AND active=1 AND expires_at > unixepoch()",
+            [format!("task#{task_id}")],
+            |row| row.get(0),
+        )
+        .expect("remediation lookup must hold a live claim")
+    };
+
+    let task_id_arg = task_id.to_string();
+    let cancelled = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-update",
+            "--task-id",
+            &task_id_arg,
+            "--agent",
+            creator,
+            "--status",
+            "cancelled",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cancelled.status.success(),
+        "creator cancellation failed: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
+
+    std::fs::write(gh_block.path().join("release"), "release").unwrap();
+    assert!(
+        handle.wait_for("claim lost after PR lookup", 15),
+        "post-lookup claim loss was not observed: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(750));
+    handle.drain_pending_lines();
+
+    assert!(
+        handle
+            .lines
+            .iter()
+            .all(|line| !line.contains("spawning remediation worker")),
+        "cancelled task reached worker provisioning: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.lines.iter().all(|line| !line.contains("PARKED:")),
+        "clean post-lookup claim loss must not re-park: {:?}",
+        handle.lines
+    );
+    assert_eq!(
+        std::fs::read_dir(wt_base.path()).unwrap().count(),
+        0,
+        "no remediation worktree may be provisioned"
+    );
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "cancelled");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_ne!(refs["daemon_parked"], serde_json::Value::Bool(true));
+
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+            [format!("task#{task_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_claims, 0, "cancellation must revoke the claim");
+    let remediation_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE subject=?1 AND kind='task_claimed' AND body LIKE '%(remediation)%'",
+            [format!("task#{task_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remediation_claims, 1, "one guarded claim should commit");
+    let cancellations: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_cancelled'",
+            [format!("task#{task_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancellations, 1);
+    let recovered_intents: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE subject=?1 AND kind='ci_remediation_recovered'",
+            [format!("task#{task_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recovered_intents, 1, "durable intent recovers once");
+    let event_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE subject=?1",
+            [format!("task#{task_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_kinds = conn
+        .prepare("SELECT kind FROM events WHERE subject=?1 ORDER BY seq")
+        .unwrap()
+        .query_map([format!("task#{task_id}")], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        event_count,
+        baseline.0 + 3,
+        "only intent recovery, claim, and cancellation may add task events: {event_kinds:?}"
+    );
+    let note_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        note_count, baseline.1,
+        "claim loss must not add a park note"
+    );
+    let message_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        message_count, baseline.2,
+        "claim loss must not send a creator alert"
+    );
+    let task_message_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM task_messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        task_message_count, baseline.3,
+        "claim loss must not enqueue a task message"
+    );
+    let agent_runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent_runs, 0, "no remediation run may be recorded");
+    let journal_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM journal WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(journal_rows, 0, "no remediation journal row may be written");
+    let capabilities: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM run_capabilities WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(capabilities, 0, "no remediation capability may be issued");
+    assert!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE subject=?1 AND kind='remediation_lease_released'",
+            [format!("task#{task_id}")],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 0,
+        "cancelled claim loss must not emit a redundant lease-release event"
+    );
+
+    assert!(
+        !claimed_agent.is_empty(),
+        "the committed remediation holder must be observable"
+    );
+    handle.sigkill();
+}
+
 /// A fork PR head names a branch in the fork, not in origin, and the daemon
 /// holds no fork credentials. Remediation must park instead of provisioning a
 /// worktree aimed at a same-named origin branch.
@@ -1482,4 +1756,219 @@ fn rework_cap_bounds_remediation_attempts() {
     );
 
     handle.sigkill();
+}
+
+/// #270: a production-shaped terminal retry marker set is cleanup-only. It
+/// must remain inert across repeated ticks and daemon restart.
+#[test]
+fn terminal_parked_retry_markers_reconcile_once_without_provisioning() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let exact_261 = serde_json::json!({
+        "cx_est": 3,
+        "cx_size": "M",
+        "cx_ready": true,
+        "cx_not_ready_reason": null,
+        "cx_by": "integration-test:v2",
+        "daemon_parked": true,
+        "daemon_parked_reason": "remediation worker provisioning failed for PR #478",
+        "daemon_resume_status": "rework",
+        "daemon_rework_retry_requested": true,
+        "remediation_feedback": "blocking feedback",
+        "pr": 478
+    });
+    let task_ids = {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        ["failed", "done", "cancelled"].map(|status| {
+            let id = quorum_core::tasks::create(
+                &mut conn,
+                "test",
+                &format!("legacy {status} retry"),
+                None,
+                0,
+                None,
+                Some(&exact_261.to_string()),
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2, refs=?3 WHERE id=?1",
+                rusqlite::params![id, status, exact_261.to_string()],
+            )
+            .unwrap();
+            id
+        })
+    };
+
+    // The read-only pre-start audit must expose the latent runnable state.
+    let status = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status_json["alerts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|alert| alert["body"]
+                .as_str()
+                .unwrap_or("")
+                .contains("runnable daemon retry"))
+            .count(),
+        3
+    );
+
+    let baseline = {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        task_ids.map(|id| {
+            let events: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE subject=?1",
+                    [format!("task#{id}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let notes: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (events, notes)
+        })
+    };
+
+    let run_daemon = || {
+        ServeHandle::start(
+            home.path(),
+            repo_dir.path(),
+            wt_base.path(),
+            &names_file,
+            "true",
+            &[],
+        )
+    };
+    let mut first = run_daemon();
+    assert!(
+        first.wait_for("recovery: complete", 15),
+        "{:?}",
+        first.lines
+    );
+    assert!(
+        first.wait_for("reconciled stale terminal remediation retry markers", 15),
+        "{:?}",
+        first.lines
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    first.drain_pending_lines();
+    assert_eq!(
+        first
+            .lines
+            .iter()
+            .filter(|line| line.contains("reconciled stale terminal remediation retry markers"))
+            .count(),
+        3,
+        "each row reconciles once: {:?}",
+        first.lines
+    );
+    for forbidden in [
+        "auto-retrying daemon-caused remediation park",
+        "durable remediation retry: provisioning",
+        "remediation: claim failed",
+        "PARKED:",
+        "notified creator",
+    ] {
+        assert!(
+            first.lines.iter().all(|line| !line.contains(forbidden)),
+            "unexpected {forbidden}: {:?}",
+            first.lines
+        );
+    }
+    drop(first);
+
+    let mut restarted = run_daemon();
+    assert!(
+        restarted.wait_for("recovery: complete", 15),
+        "{:?}",
+        restarted.lines
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    restarted.drain_pending_lines();
+    assert!(
+        restarted
+            .lines
+            .iter()
+            .all(|line| !line.contains("remediation retry")),
+        "restart must be inert: {:?}",
+        restarted.lines
+    );
+    drop(restarted);
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let messages: i64 = conn
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(messages, 0, "no persistent alerts or notifications");
+    for (index, id) in task_ids.into_iter().enumerate() {
+        let task = quorum_core::tasks::get(&conn, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get("daemon_rework_retry_requested").is_none());
+        if task.status == "failed" {
+            assert_eq!(refs["daemon_parked"], true);
+            assert_eq!(refs["daemon_resume_status"], "rework");
+        } else {
+            assert!(refs.get("daemon_parked").is_none());
+            assert!(refs.get("daemon_resume_status").is_none());
+        }
+        let claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1",
+                [format!("task#{id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let notes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0);
+        assert_eq!(runs, 0);
+        assert_eq!(events, baseline[index].0, "no retry/park events");
+        assert_eq!(notes, baseline[index].1 + 1, "one audit note only");
+    }
 }

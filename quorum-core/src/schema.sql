@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 34). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 36). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -91,6 +91,51 @@ CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC)
 -- REVIEWING_TASK_LIMIT-sized candidate sets are merged for global ordering.
 CREATE INDEX IF NOT EXISTS tasks_reviewing_newest
     ON tasks(status, updated_at DESC, id DESC);
+-- v36: durable candidate representation for corrupt terminal retry authority.
+-- These partial indexes contain only rows reconciliation/status need to inspect,
+-- so proving the healthy steady state does not scan the unbounded terminal task
+-- history. Separate orderings keep both LIMIT queries bounded without sorting
+-- the entire candidate set.
+CREATE INDEX IF NOT EXISTS tasks_terminal_retry_id
+    ON tasks(id)
+    WHERE status IN ('done','failed','cancelled')
+      AND json_valid(refs)
+      AND (
+          json_type(refs, '$.daemon_rework_retry_requested')='true'
+          OR json_type(refs, '$.daemon_parked_head_check')='true'
+          OR (
+              status IN ('done','cancelled')
+              AND (
+                  json_type(refs, '$.daemon_parked') IS NOT NULL
+                  OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              )
+          )
+          OR (
+              status='failed'
+              AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+          )
+      );
+CREATE INDEX IF NOT EXISTS tasks_terminal_retry_recent
+    ON tasks(updated_at DESC, id DESC)
+    WHERE status IN ('done','failed','cancelled')
+      AND json_valid(refs)
+      AND (
+          json_type(refs, '$.daemon_rework_retry_requested')='true'
+          OR json_type(refs, '$.daemon_parked_head_check')='true'
+          OR (
+              status IN ('done','cancelled')
+              AND (
+                  json_type(refs, '$.daemon_parked') IS NOT NULL
+                  OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              )
+          )
+          OR (
+              status='failed'
+              AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+              AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+          )
+      );
 
 CREATE TABLE IF NOT EXISTS errors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

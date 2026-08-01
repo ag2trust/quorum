@@ -1289,9 +1289,13 @@ fn review_only_rework_expired_lease_parks_for_retry() {
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(refs["daemon_parked"], true);
     assert_eq!(refs["daemon_resume_status"], "rework");
-    assert_eq!(
-        refs["daemon_parked_head_check"], true,
-        "park owes exactly one PR-head check"
+    assert!(
+        refs.get("daemon_parked_head_check").is_none(),
+        "terminal park must not carry automatic head-check authority"
+    );
+    assert!(
+        refs.get("daemon_rework_retry_requested").is_none(),
+        "terminal park must stay owner-gated until explicit task-retry"
     );
 
     let events = events_for_task(home.path(), task_id);
