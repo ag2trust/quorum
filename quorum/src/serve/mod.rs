@@ -11989,21 +11989,6 @@ async fn cleanup_slot_inner(
     }
     close_agent_run(&config.db_path, state.agent_run_id, end_reason).await;
 
-    // Idle/drain cleanup retires the same run authority as lifecycle teardown.
-    // Leaving the capability live after deleting the journal would make the
-    // clean-shutdown path weaker than failure teardown.
-    if let Some(ref run_id) = state.cap_run_id {
-        let path = config.db_path.clone();
-        let run_id = run_id.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = quorum_core::db::open(&path) {
-                let _ = quorum_core::capabilities::revoke(&mut conn, &run_id, now_unix());
-            }
-        })
-        .await
-        .ok();
-    }
-
     let p = config.db_path.clone();
     let agent = state.agent_name.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {

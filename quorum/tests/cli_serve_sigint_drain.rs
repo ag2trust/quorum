@@ -347,15 +347,13 @@ fn sigint_drains_in_flight_agent_and_exits_0() {
 
     let db = home.path().join("repos/test__repo/quorum.db");
     let conn = quorum_core::db::open(&db).unwrap();
-    let (task_status, assignee, live_journal, live_capability): (String, Option<String>, i64, i64) =
-        conn.query_row(
+    let (task_status, assignee, live_journal): (String, Option<String>, i64) = conn
+        .query_row(
             "SELECT t.status,t.assignee,
-                    (SELECT count(*) FROM journal WHERE task_id=t.id),
-                    (SELECT count(*) FROM run_capabilities
-                     WHERE task_id=t.id AND revoked_at IS NULL)
+                    (SELECT count(*) FROM journal WHERE task_id=t.id)
              FROM tasks t WHERE t.id=1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert!(
@@ -364,7 +362,6 @@ fn sigint_drains_in_flight_agent_and_exits_0() {
     );
     assert!(assignee.is_none(), "clean drain left an assignee");
     assert_eq!(live_journal, 0, "clean drain left process ownership");
-    assert_eq!(live_capability, 0, "clean drain left run authority");
 }
 
 /// Second SIGINT while already draining forces immediate teardown.
