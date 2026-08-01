@@ -5,7 +5,6 @@
 #![allow(dead_code)]
 
 use super::agent::{self, AgentProc, AgentSpec};
-use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, RunnerProc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -22,7 +21,7 @@ pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
 pub enum PlannerResponse {
     Plan {
@@ -36,7 +35,7 @@ pub enum PlannerResponse {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProposedTask {
     pub key: String,
@@ -324,17 +323,10 @@ pub async fn spawn_planner(
         ));
     }
     let proc = match provider {
-        AgentKind::Codex => {
-            let spec = CodexSpec {
-                model: CODEX_PLANNER_MODEL.into(),
-                effort: PLANNER_EFFORT.into(),
-                sandbox: "read-only".into(),
-                worktree: repo.to_path_buf(),
-                prompt: prompt.into(),
-                env_vars: vec![],
-            };
-            CodexProc::spawn_planner(&spec, provider_bin).map(RunnerProc::Codex)?
-        }
+        AgentKind::Codex => return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Codex decomposition planner refused: no portable launch boundary can isolate provider transport from model-generated network and filesystem access",
+        )),
         AgentKind::Claude => {
             let spec = AgentSpec {
                 kind: AgentKind::Claude,
@@ -530,6 +522,50 @@ mod tests {
         .err()
         .expect("oversized prompt must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn codex_planner_fails_closed_before_real_binary_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("invoked");
+        let fake = dir.path().join("codex");
+        std::fs::write(&fake, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let error = spawn_planner(
+            AgentKind::Codex,
+            Path::new("."),
+            "bounded prompt",
+            false,
+            fake.to_str(),
+        )
+        .await
+        .err()
+        .expect("Codex planner must fail closed");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            !marker.exists(),
+            "refused planner must not execute provider binary"
+        );
+        if let Ok(output) = std::process::Command::new("which").arg("codex").output() {
+            if output.status.success() {
+                let real = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let real_error = spawn_planner(
+                    AgentKind::Codex,
+                    Path::new("."),
+                    "attempt network, quorum, database, and coordination access",
+                    false,
+                    Some(&real),
+                )
+                .await
+                .err()
+                .expect("real Codex binary must also be refused before launch");
+                assert_eq!(real_error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+        }
     }
 
     #[test]

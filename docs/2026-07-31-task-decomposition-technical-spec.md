@@ -166,6 +166,9 @@ Starting a cycle atomically moves the source to `planning`, records `freeze-requ
 `freeze_active=1`. Every worker, reviewer, remediation, and merge-start authority check must
 consult the freeze inside its existing `BEGIN IMMEDIATE` transaction. In-memory daemon phase
 checks are an optimization only.
+Reviewer external provisioning uses a short-lived durable reservation acquired by that
+transaction; freeze acquisition is refused while any reservation is live, and every success or
+failure path releases it.
 
 After the freeze commits, already active managed work may finish, including protected merge.
 Nothing new is provisioned. Planning starts only when live slots and durable in-flight journal

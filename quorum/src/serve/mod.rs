@@ -2394,6 +2394,7 @@ struct DecompositionCoordinator {
     proposal: Option<Vec<planner::ProposedTask>>,
     planner_slot: Option<planner::PlannerSlot>,
     classifier_slot: Option<classifier::ClassifierSlot>,
+    planner_view: Option<tempfile::TempDir>,
 }
 
 #[derive(Clone)]
@@ -2408,9 +2409,36 @@ struct PlanningSnapshot {
     body: Option<String>,
     dependencies: Vec<i64>,
     rejection_summaries: Vec<String>,
+    accepted_proposal: Option<Vec<planner::ProposedTask>>,
+    frozen_base_sha: String,
 }
 
 const DECOMPOSITION_PROVIDER_BACKOFF_SECS: i64 = 5;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DecompositionLiveWork {
+    // These are the only provider/network futures retained across tick
+    // boundaries. Merge, publication, collector, and recovery calls are
+    // awaited inline, so tick cannot begin the drain transition concurrently
+    // with one of those operations.
+    ordinary_classifier: bool,
+    doctor: bool,
+    pre_review_checks: bool,
+}
+
+fn decomposition_drain_ready(
+    workers: usize,
+    reviewers: usize,
+    durable_journal: i64,
+    live: DecompositionLiveWork,
+) -> bool {
+    workers == 0
+        && reviewers == 0
+        && durable_journal == 0
+        && !live.ordinary_classifier
+        && !live.doctor
+        && !live.pre_review_checks
+}
 type PlanningSnapshotRow = (
     i64,
     i64,
@@ -2421,6 +2449,8 @@ type PlanningSnapshotRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<PlanningSnapshot>> {
@@ -2428,7 +2458,8 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     let row: Option<PlanningSnapshotRow> = conn
         .query_row(
             "SELECT d.id,d.source_task_id,d.planned_source_revision,d.state,d.freeze_active,
-                    d.updated_at,t.title,t.body,t.depends_on
+                    d.updated_at,t.title,t.body,t.depends_on,d.accepted_proposal_json,
+                    d.frozen_base_sha
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
              ORDER BY d.id LIMIT 1",
@@ -2444,6 +2475,8 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                     row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
                 ))
             },
         )
@@ -2458,6 +2491,8 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         title,
         body,
         depends_on,
+        accepted_proposal_json,
+        frozen_base_sha,
     )) = row
     else {
         return Ok(None);
@@ -2468,6 +2503,10 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid planning source dependencies: {error}")))?
         .unwrap_or_default();
+    let accepted_proposal = accepted_proposal_json
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
     let mut statement = conn.prepare(
         "SELECT summary FROM decomposition_attempts
          WHERE graph_id=?1 AND kind='proposal' ORDER BY ordinal DESC LIMIT 3",
@@ -2486,7 +2525,75 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         body,
         dependencies,
         rejection_summaries,
+        accepted_proposal,
+        frozen_base_sha: frozen_base_sha.unwrap_or_default(),
     }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupDecompositionState {
+    None,
+    Frozen,
+    Active,
+    Blocked,
+}
+
+fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupDecompositionState> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, bool, Option<String>)> = conn
+        .query_row(
+            "SELECT state,freeze_active,accepted_proposal_json
+             FROM task_decompositions
+             WHERE state NOT IN ('held','completed','cancelled')
+             ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((state, freeze, proposal)) = row else {
+        return Ok(StartupDecompositionState::None);
+    };
+    if matches!(state.as_str(), "validating" | "preclassifying") {
+        let raw = proposal.ok_or_else(|| {
+            QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
+        })?;
+        serde_json::from_str::<Vec<planner::ProposedTask>>(&raw).map_err(|error| {
+            QuorumError::Io(format!(
+                "{state} decomposition proposal is invalid: {error}"
+            ))
+        })?;
+    }
+    Ok(if freeze {
+        StartupDecompositionState::Frozen
+    } else if state == "active" {
+        StartupDecompositionState::Active
+    } else if state == "blocked" {
+        StartupDecompositionState::Blocked
+    } else {
+        StartupDecompositionState::None
+    })
+}
+
+async fn reconcile_decomposition_startup(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+) -> Result<StartupDecompositionState> {
+    let path = config.db_path.clone();
+    let (state, snapshot) = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&path)?;
+        tasks::clear_reviewer_provision_reservations(&mut conn)?;
+        Ok::<_, QuorumError>((
+            inspect_startup_decomposition(&conn)?,
+            load_planning_snapshot(&conn)?,
+        ))
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition startup join: {error}")))??;
+    if let Some(snapshot) = snapshot {
+        coordinator.graph_id = Some(snapshot.graph_id);
+        coordinator.proposal = snapshot.accepted_proposal;
+    }
+    Ok(state)
 }
 
 fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
@@ -2523,6 +2630,59 @@ fn planner_model(kind: crate::serve_config::RunnerKind) -> &'static str {
         runner::AgentKind::Codex => planner::CODEX_PLANNER_MODEL,
         runner::AgentKind::Claude => planner::CLAUDE_PLANNER_MODEL,
     }
+}
+
+async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::TempDir> {
+    let repo = repo.to_path_buf();
+    let frozen_sha = frozen_sha.to_string();
+    tokio::task::spawn_blocking(move || -> Result<tempfile::TempDir> {
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .map_err(|error| QuorumError::Io(format!("planner HEAD check failed: {error}")))?;
+        let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if !head.status.success() || current != frozen_sha {
+            return Err(QuorumError::Io(format!(
+                "planner source drifted from frozen base {frozen_sha} to {current}"
+            )));
+        }
+        let archive = std::process::Command::new("git")
+            .args(["archive", "--format=tar", &frozen_sha])
+            .current_dir(&repo)
+            .output()
+            .map_err(|error| QuorumError::Io(format!("planner archive failed: {error}")))?;
+        if !archive.status.success() {
+            return Err(QuorumError::Io("planner frozen archive was refused".into()));
+        }
+        let view = tempfile::tempdir()
+            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+        let mut tar = std::process::Command::new("tar")
+            .args(["-xf", "-", "-C"])
+            .arg(view.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                QuorumError::Io(format!("planner archive extraction failed: {error}"))
+            })?;
+        use std::io::Write;
+        tar.stdin
+            .take()
+            .ok_or_else(|| QuorumError::Io("planner archive stdin unavailable".into()))?
+            .write_all(&archive.stdout)
+            .map_err(|error| QuorumError::Io(format!("planner archive write failed: {error}")))?;
+        let status = tar
+            .wait()
+            .map_err(|error| QuorumError::Io(format!("planner archive wait failed: {error}")))?;
+        if !status.success() {
+            return Err(QuorumError::Io(
+                "planner archive extraction was refused".into(),
+            ));
+        }
+        Ok(view)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("planner view join failed: {error}")))?
 }
 
 impl DrainState {
@@ -2581,7 +2741,7 @@ async fn record_decomposition_attempt(
 ) -> Result<()> {
     let path = config.db_path.clone();
     let code = code.to_string();
-    let summary: String = summary.chars().take(2048).collect();
+    let summary = truncate_utf8_bytes(summary, 2048).to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
         quorum_core::decomposition::record_attempt(
@@ -2597,6 +2757,17 @@ async fn record_decomposition_attempt(
     .await
     .map_err(|error| QuorumError::Io(format!("decomposition attempt join: {error}")))??;
     Ok(())
+}
+
+fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 async fn reset_decomposition_to_planning(
@@ -2720,6 +2891,7 @@ async fn tick_decomposition(
     coordinator: &mut DecompositionCoordinator,
     workers: &[SlotState],
     reviewers: &[SlotState],
+    live: DecompositionLiveWork,
 ) -> Result<bool> {
     // First consume terminal provider output. Provider processes are always
     // killed and reaped before durable retry/materialization decisions.
@@ -2730,6 +2902,7 @@ async fn tick_decomposition(
                 .take()
                 .expect("planner slot exists");
             slot.kill_and_reap().await;
+            coordinator.planner_view = None;
             let graph_id = coordinator
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("planner lost graph identity".into()))?;
@@ -2767,14 +2940,15 @@ async fn tick_decomposition(
                 }
                 planner::PlannerPoll::Done(planner::PlannerResponse::Plan { tasks }) => {
                     let path = config.db_path.clone();
+                    let proposal_json = serde_json::to_string(&tasks).map_err(|error| {
+                        QuorumError::Io(format!("proposal serialization failed: {error}"))
+                    })?;
                     let moved = tokio::task::spawn_blocking(move || -> Result<bool> {
                         let mut conn = quorum_core::db::open(&path)?;
-                        quorum_core::decomposition::set_frozen_phase(
+                        quorum_core::decomposition::accept_proposal(
                             &mut conn,
                             graph_id,
-                            "planning",
-                            "validating",
-                            None,
+                            &proposal_json,
                             now_unix(),
                         )
                     })
@@ -2888,14 +3062,19 @@ async fn tick_decomposition(
                 planning_candidate(&conn)?
             };
             if let Some((source_task_id, expected_revision)) = candidate {
-                let sha = std::process::Command::new("git")
-                    .args(["rev-parse", "HEAD"])
-                    .current_dir(&config.repo_dir)
-                    .output()
-                    .ok()
-                    .filter(|output| output.status.success())
-                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-                    .unwrap_or_else(|| "unknown".into());
+                let repo = config.repo_dir.clone();
+                let sha = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .current_dir(repo)
+                        .output()
+                })
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".into());
                 let path = config.db_path.clone();
                 let provider = config.runner_kind.to_string();
                 let model = planner_model(config.runner_kind).to_string();
@@ -2925,18 +3104,21 @@ async fn tick_decomposition(
         return Ok(false);
     };
     coordinator.graph_id = Some(snapshot.graph_id);
+    if coordinator.proposal.is_none() {
+        coordinator.proposal = snapshot.accepted_proposal.clone();
+    }
 
     if snapshot.state == "provider-backoff" {
         if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
             let path = config.db_path.clone();
             let graph_id = snapshot.graph_id;
-            tokio::task::spawn_blocking(move || -> Result<()> {
+            let reacquired = tokio::task::spawn_blocking(move || -> Result<bool> {
                 let mut conn = quorum_core::db::open(&path)?;
-                quorum_core::decomposition::reacquire_freeze(&mut conn, graph_id, now_unix())?;
-                Ok(())
+                quorum_core::decomposition::reacquire_freeze(&mut conn, graph_id, now_unix())
             })
             .await
             .map_err(|error| QuorumError::Io(format!("freeze reacquire join: {error}")))??;
+            return Ok(reacquired);
         }
         return Ok(false);
     }
@@ -2969,9 +3151,7 @@ async fn tick_decomposition(
         return Ok(true);
     }
     if snapshot.state == "draining"
-        && workers.is_empty()
-        && reviewers.is_empty()
-        && durable_in_flight == 0
+        && decomposition_drain_ready(workers.len(), reviewers.len(), durable_in_flight, live)
     {
         let path = config.db_path.clone();
         let graph_id = snapshot.graph_id;
@@ -3000,16 +3180,33 @@ async fn tick_decomposition(
             dependencies: &snapshot.dependencies,
         };
         let prompt = planner::build_prompt(&source, &snapshot.rejection_summaries);
+        let view = match frozen_planner_view(&config.repo_dir, &snapshot.frozen_base_sha).await {
+            Ok(view) => view,
+            Err(error) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "frozen-view",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
         match planner::spawn_planner(
             planner_kind(config.runner_kind),
-            &config.repo_dir,
+            view.path(),
             &prompt,
             config.bare_agent,
             config.agent_bin.as_deref(),
         )
         .await
         {
-            Ok(slot) => coordinator.planner_slot = Some(slot),
+            Ok(slot) => {
+                coordinator.planner_view = Some(view);
+                coordinator.planner_slot = Some(slot);
+            }
             Err(error) => {
                 record_decomposition_attempt(
                     config,
@@ -3023,16 +3220,9 @@ async fn tick_decomposition(
         }
     } else if snapshot.state == "validating" {
         let Some(proposal) = coordinator.proposal.as_ref() else {
-            reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
-            record_decomposition_attempt(
-                config,
-                snapshot.graph_id,
-                "proposal",
-                "restart-lost-proposal",
-                "daemon restarted before proposal validation completed",
-            )
-            .await?;
-            return Ok(true);
+            return Err(QuorumError::Io(
+                "validating decomposition lacks its durable accepted proposal".into(),
+            ));
         };
         match planner::validate_for_source(proposal, &snapshot.dependencies) {
             Err(error) => {
@@ -3070,16 +3260,9 @@ async fn tick_decomposition(
         }
     } else if snapshot.state == "preclassifying" && coordinator.classifier_slot.is_none() {
         let Some(proposal) = coordinator.proposal.as_ref() else {
-            reset_decomposition_to_planning(config, snapshot.graph_id, "preclassifying").await?;
-            record_decomposition_attempt(
-                config,
-                snapshot.graph_id,
-                "proposal",
-                "restart-lost-proposal",
-                "daemon restarted before child preclassification completed",
-            )
-            .await?;
-            return Ok(true);
+            return Err(QuorumError::Io(
+                "preclassifying decomposition lacks its durable accepted proposal".into(),
+            ));
         };
         let tasks = proposed_classifier_tasks(proposal);
         match classifier::spawn_classifier_configured(
@@ -3954,42 +4137,62 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         }
     }
 
+    // Decomposition authority is always reconstructed before any recovery
+    // pass that can complete, merge, reset, or provision task lifecycle.
+    let startup_decomposition =
+        reconcile_decomposition_startup(config, &mut decomposition_coordinator).await?;
+    let recovered_frozen_decomposition = startup_decomposition == StartupDecompositionState::Frozen;
+    if recovered_frozen_decomposition {
+        // A frozen restart must first terminate stale managed processes and
+        // empty the journal. Late completion and approval/network recovery are
+        // deliberately deferred to later ticks after planning releases authority.
+        if let Err(e) = recovery::recover(config, &wt_mgr).await {
+            log(&format!(
+                "frozen decomposition recovery failed: {e} — starting fresh"
+            ));
+        }
+    }
+
     // Fold outcomes that were committed by a managed process just before the
     // prior daemon died. These passes must run before approval and stateless
     // recovery: the latter may reset task state or delete the journal row that
     // supplies the exact managed-run identity.
-    if let Err(e) = recover_late_worker_completions(config).await {
-        log(&format!(
-            "late worker startup recovery failed: {e} — continuing"
-        ));
-    }
-    if let Err(e) = recover_late_reviewer_verdicts(config).await {
-        log(&format!(
-            "late reviewer startup recovery failed: {e} — continuing"
-        ));
-    }
+    if !recovered_frozen_decomposition {
+        if let Err(e) = recover_late_worker_completions(config).await {
+            log(&format!(
+                "late worker startup recovery failed: {e} — continuing"
+            ));
+        }
+        if let Err(e) = recover_late_reviewer_verdicts(config).await {
+            log(&format!(
+                "late reviewer startup recovery failed: {e} — continuing"
+            ));
+        }
 
-    // #228: approval recovery — merge already-approved PRs from durable,
-    // instance-independent state BEFORE stateless recovery, so a
-    // self-update-drain restart merges the approved PR instead of re-working it.
-    // Runs first so approved tasks are closed (and their journal rows dropped)
-    // before recovery::recover resets them to open.
-    if let Err(e) = approvals::recover(
-        &config.db_path,
-        &config.repo_dir,
-        &config.merge_executor,
-        config.merge_checks_timeout_secs,
-        config.merge_checks_poll_secs,
-    )
-    .await
-    {
-        log(&format!("approval recovery failed: {e} — continuing"));
+        // #228: approval recovery — merge already-approved PRs from durable,
+        // instance-independent state BEFORE stateless recovery, so a
+        // self-update-drain restart merges the approved PR instead of re-working it.
+        // Runs first so approved tasks are closed (and their journal rows dropped)
+        // before recovery::recover resets them to open.
+        if let Err(e) = approvals::recover(
+            &config.db_path,
+            &config.repo_dir,
+            &config.merge_executor,
+            config.merge_checks_timeout_secs,
+            config.merge_checks_poll_secs,
+        )
+        .await
+        {
+            log(&format!("approval recovery failed: {e} — continuing"));
+        }
     }
 
     // M7: stateless crash recovery — kill stale processes, wipe journal,
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
-    if let Err(e) = recovery::recover(config, &wt_mgr).await {
-        log(&format!("recovery failed: {e} — starting fresh"));
+    if !recovered_frozen_decomposition {
+        if let Err(e) = recovery::recover(config, &wt_mgr).await {
+            log(&format!("recovery failed: {e} — starting fresh"));
+        }
     }
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
     {
@@ -4357,8 +4560,20 @@ async fn tick(
 ) -> Result<()> {
     let db_path = config.db_path.clone();
 
-    let decomposition_freeze =
-        tick_decomposition(config, decomposition_coordinator, workers, reviewers).await?;
+    let decomposition_freeze = tick_decomposition(
+        config,
+        decomposition_coordinator,
+        workers,
+        reviewers,
+        DecompositionLiveWork {
+            ordinary_classifier: classifier_slot.is_some(),
+            doctor: doctor_slot.is_some(),
+            pre_review_checks: pre_review_checks.values().any(|entry| {
+                matches!(&entry.state, PreReviewChecksState::Waiting(handle) if !handle.is_finished())
+            }),
+        },
+    )
+    .await?;
 
     // Reconcile policy-blocked classifications written by older daemons before
     // any mailbox recovery or provisioning path can regain authority.
@@ -9462,36 +9677,71 @@ async fn provision_reviewer(
     head_sha: &str,
     recover_interrupted: bool,
 ) -> Result<()> {
-    // Defense in depth for every reviewer path (worker handoff, orphan
-    // recovery, and R2): incomplete legacy refs and policy-park
-    // classifications cannot acquire a reviewer identity or process.
-    let classification_dispatchable = {
-        let db_path = config.db_path.clone();
+    let reservation = uuid::Uuid::new_v4().to_string();
+    let reserved = {
+        let path = config.db_path.clone();
+        let token = reservation.clone();
         let task_id = worker.task_id;
+        let reservation_role = role.as_str().to_string();
         tokio::task::spawn_blocking(move || -> Result<bool> {
-            let conn = quorum_core::db::open(&db_path)?;
-            let frozen: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(!frozen
-                && tasks::get(&conn, task_id)?
-                    .is_some_and(|task| tasks::classification_is_dispatchable(&task.refs)))
+            let mut conn = quorum_core::db::open(&path)?;
+            tasks::reserve_reviewer_provision(
+                &mut conn,
+                task_id,
+                &token,
+                &reservation_role,
+                now_unix(),
+            )
         })
         .await
-        .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+        .map_err(|error| QuorumError::Io(format!("review reservation join: {error}")))??
     };
-    if !classification_dispatchable {
+    if !reserved {
         log(&format!(
-            "{}: task #{} PR #{pr} lacks a complete dispatchable classification — \
-             reviewer not acquired or spawned",
+            "{}: task #{} has no reviewer provisioning authority (phase, classification, reservation, or planning freeze)",
             role.as_str().to_uppercase(),
-            worker.task_id,
+            worker.task_id
         ));
         return Ok(());
     }
+    let task_id = worker.task_id;
+    let result = provision_reviewer_reserved(
+        config,
+        wt_mgr,
+        name_pool,
+        reviewers,
+        lifetime_roster,
+        pr,
+        worker,
+        role,
+        head_sha,
+        recover_interrupted,
+    )
+    .await;
+    let path = config.db_path.clone();
+    let release = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&path)?;
+        tasks::release_reviewer_provision(&mut conn, task_id, &reservation)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("review reservation release join: {error}")))?;
+    release?;
+    result
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn provision_reviewer_reserved(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    reviewers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    pr: i64,
+    worker: ReviewCounterpart<'_>,
+    role: &ReviewRole,
+    head_sha: &str,
+    recover_interrupted: bool,
+) -> Result<()> {
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
     // acquiring a name or creating reviewer resources.
@@ -11716,19 +11966,6 @@ async fn spawn_remediation_worker(
     feedback: &str,
 ) -> bool {
     let db_path = &config.db_path;
-    let frozen = quorum_core::db::open(db_path)
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-        })
-        .unwrap_or(true);
-    if frozen {
-        return false;
-    }
 
     // Fetch task body + author for context and branch resolution.
     let (task_body, task_author, task_review_only) = {
@@ -16371,5 +16608,217 @@ mod tests {
         duplicate[0].duplicate_of = vec![99];
         assert!(planned_children(&proposal, &duplicate).is_err());
         assert!(planned_children(&proposal, &valid[..1]).is_err());
+    }
+
+    #[test]
+    fn decomposition_drain_waits_for_every_tick_owned_live_slot_class() {
+        assert!(decomposition_drain_ready(
+            0,
+            0,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            1,
+            0,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            0,
+            1,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            0,
+            0,
+            1,
+            DecompositionLiveWork::default()
+        ));
+        for live in [
+            DecompositionLiveWork {
+                ordinary_classifier: true,
+                ..Default::default()
+            },
+            DecompositionLiveWork {
+                doctor: true,
+                ..Default::default()
+            },
+            DecompositionLiveWork {
+                pre_review_checks: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!decomposition_drain_ready(0, 0, 0, live));
+        }
+    }
+
+    #[test]
+    fn decomposition_attempt_truncation_is_utf8_byte_safe() {
+        let input = "é".repeat(2048);
+        let truncated = truncate_utf8_bytes(&input, 2048);
+        assert_eq!(truncated.len(), 2048);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn startup_reconciliation_covers_every_planning_phase_without_budget_charge() {
+        for phase in [
+            "freeze-requested",
+            "draining",
+            "planning",
+            "validating",
+            "preclassifying",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = quorum_core::db::open(&dir.path().join(format!("{phase}.db"))).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "large",
+                Some("outcome"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "abc",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            if phase != "freeze-requested" {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "freeze-requested",
+                    "draining",
+                    None,
+                    3,
+                )
+                .unwrap();
+            }
+            if !matches!(phase, "freeze-requested" | "draining") {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn, graph, "draining", "planning", None, 4,
+                )
+                .unwrap();
+            }
+            if matches!(phase, "validating" | "preclassifying") {
+                let proposal = serde_json::to_string(&vec![
+                    planner::ProposedTask {
+                        key: "a".into(),
+                        title: "a".into(),
+                        observable_outcome: "a".into(),
+                        acceptance_criteria: vec!["a".into()],
+                        source_constraints: vec!["a".into()],
+                        verification_expectations: vec!["a".into()],
+                        prerequisites: vec![],
+                    },
+                    planner::ProposedTask {
+                        key: "b".into(),
+                        title: "b".into(),
+                        observable_outcome: "b".into(),
+                        acceptance_criteria: vec!["b".into()],
+                        source_constraints: vec!["b".into()],
+                        verification_expectations: vec!["b".into()],
+                        prerequisites: vec!["a".into()],
+                    },
+                ])
+                .unwrap();
+                quorum_core::decomposition::accept_proposal(&mut conn, graph, &proposal, 5)
+                    .unwrap();
+                if phase == "preclassifying" {
+                    quorum_core::decomposition::set_frozen_phase(
+                        &mut conn,
+                        graph,
+                        "validating",
+                        "preclassifying",
+                        None,
+                        6,
+                    )
+                    .unwrap();
+                }
+            }
+            for _ in 0..5 {
+                assert_eq!(
+                    inspect_startup_decomposition(&conn).unwrap(),
+                    StartupDecompositionState::Frozen
+                );
+                let attempts: i64 = conn
+                    .query_row(
+                        "SELECT proposal_attempts FROM task_decompositions WHERE id=?1",
+                        [graph],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(attempts, 0, "restart inspection charged {phase}");
+            }
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_recognizes_active_and_blocked_graphs() {
+        for (phase, expected) in [
+            ("active", StartupDecompositionState::Active),
+            ("blocked", StartupDecompositionState::Blocked),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = quorum_core::db::open(&dir.path().join(format!("{phase}.db"))).unwrap();
+            let source = tasks::create(
+                &mut conn, "owner", "large", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at) VALUES (?1,?2,?3,0,1,2,2)",
+                rusqlite::params![source, phase, 1],
+            )
+            .unwrap();
+            assert_eq!(inspect_startup_decomposition(&conn).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn planner_view_is_exactly_frozen_and_rejects_head_drift() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("state.txt"), "frozen").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen = git(&["rev-parse", "HEAD"]);
+        let view = frozen_planner_view(repo.path(), &frozen).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("state.txt")).unwrap(),
+            "frozen"
+        );
+        assert!(!view.path().join(".git").exists());
+        std::fs::write(repo.path().join("state.txt"), "drifted").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "drift"]);
+        assert!(frozen_planner_view(repo.path(), &frozen).await.is_err());
     }
 }

@@ -1504,7 +1504,10 @@ Planning uses the configured provider's fixed frontier model (Sol/high for Codex
 Claude) with no downgrade. The planner receives a read-only repository view and bounded source
 context but no network, database, coordination command, or delivery authority. A separate
 planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
-blocker response. A valid concrete blocker parks the source immediately with no second opinion.
+blocker response; a provider whose transport cannot be separated from model-generated network or
+filesystem access is refused fail-closed. The view is an archive of the recorded frozen base SHA,
+and source drift is rejected before launch. A valid concrete blocker parks the source immediately
+with no second opinion.
 
 A plan contains 2–8 proposed implementation tasks and an acyclic prerequisite graph. Before any
 task row is created, the complete proposal is validated for scope coverage, real delivery
@@ -1516,7 +1519,14 @@ be done.
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
 the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;
-only bounded structured attempts and final reasons are durable.
+only bounded structured attempts, the accepted closed proposal needed to resume validation or
+preclassification, and final reasons are durable. Restart inspection never consumes a semantic
+proposal attempt.
+
+Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
+process creation. The same transaction checks task phase, classification, and planning freeze;
+planning freeze acquisition excludes live reservations. The daemon releases the reservation only
+after reviewer attachment or complete failed-provision cleanup.
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task, classification,
 edge, membership/provenance row, source `planning -> decomposed` transition, and active-graph

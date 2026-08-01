@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 36;
+pub const SCHEMA_VERSION: i64 = 37;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -503,6 +503,15 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             if !column_exists(conn, "tasks", "continue_pr")? {
                 conn.execute("ALTER TABLE tasks ADD COLUMN continue_pr INTEGER", [])?;
             }
+        }
+
+        // v37 persists an accepted bounded proposal across daemon restarts.
+        // The reservation table is created by SCHEMA_SQL.
+        if current < 37 && !column_exists(conn, "task_decompositions", "accepted_proposal_json")? {
+            conn.execute(
+                "ALTER TABLE task_decompositions ADD COLUMN accepted_proposal_json TEXT",
+                [],
+            )?;
         }
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -2279,6 +2288,7 @@ mod tests {
             "task_graph_members",
             "decomposition_attempts",
             "decomposition_cleanup",
+            "reviewer_provision_reservations",
         ] {
             let present: bool = conn
                 .query_row(
@@ -2289,6 +2299,7 @@ mod tests {
                 .unwrap();
             assert!(present, "{table} missing after v34 migration");
         }
+        assert!(column_exists(&conn, "task_decompositions", "accepted_proposal_json").unwrap());
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();

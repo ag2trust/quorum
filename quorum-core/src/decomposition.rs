@@ -66,7 +66,8 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let tx = begin_immediate(conn)?;
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
-         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL)",
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations))",
         params![input.source_task_id, input.expected_revision],
         |row| row.get(0),
     )?;
@@ -246,6 +247,34 @@ pub fn set_frozen_phase(
         "UPDATE task_decompositions SET state=?3,planner_session_id=?4,updated_at=?5
          WHERE id=?1 AND state=?2 AND freeze_active=1 AND active=0",
         params![graph_id, expected, next, planner_session_id, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
+}
+
+/// Durably accept one bounded provider proposal before leaving planning. This
+/// makes validating and preclassifying restart-resumable without charging a
+/// semantic rejection budget.
+pub fn accept_proposal(
+    conn: &mut Connection,
+    graph_id: i64,
+    proposal_json: &str,
+    now: i64,
+) -> Result<bool> {
+    if proposal_json.is_empty()
+        || proposal_json.len() > 65_536
+        || serde_json::from_str::<serde_json::Value>(proposal_json).is_err()
+    {
+        return Err(QuorumError::Usage(
+            "invalid bounded accepted decomposition proposal".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='validating',accepted_proposal_json=?2,updated_at=?3
+         WHERE id=?1 AND state='planning' AND freeze_active=1 AND active=0",
+        params![graph_id, proposal_json, now],
     )?;
     tx.commit().map_err(map_sql_err)?;
     Ok(changed == 1)
@@ -452,7 +481,7 @@ pub fn materialize_graph(
     }
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='active',active=1,freeze_active=0,
-             accepted_plan_revision=plan_revision,updated_at=?2
+             accepted_plan_revision=plan_revision,accepted_proposal_json=NULL,updated_at=?2
          WHERE id=?1 AND active=0 AND freeze_active=1",
         params![graph_id, now],
     );
@@ -1012,6 +1041,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(freezes, 1);
+    }
+
+    #[test]
+    fn concurrent_reviewer_reservation_and_planning_freeze_have_one_authority() {
+        use std::sync::{Arc, Barrier};
+        for iteration in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("review-freeze-{iteration}.db"));
+            let mut conn = crate::db::open(&path).unwrap();
+            let source = crate::tasks::create(
+                &mut conn, "owner", "large", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            let review = crate::tasks::create(
+                &mut conn, "owner", "review", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='in-review',refs=json_object(
+                    'cx_est',2,'cx_size','S','cx_ready',true,
+                    'cx_not_ready_reason',NULL,'cx_by','test:v2') WHERE id=?1",
+                [review],
+            )
+            .unwrap();
+            drop(conn);
+            let barrier = Arc::new(Barrier::new(2));
+            let reserve_path = path.clone();
+            let reserve_barrier = Arc::clone(&barrier);
+            let reserve = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&reserve_path).unwrap();
+                reserve_barrier.wait();
+                crate::tasks::reserve_reviewer_provision(&mut conn, review, "review-token", "r1", 2)
+                    .unwrap()
+            });
+            let plan_path = path.clone();
+            let plan_barrier = Arc::clone(&barrier);
+            let plan = std::thread::spawn(move || {
+                let mut conn = crate::db::open(&plan_path).unwrap();
+                plan_barrier.wait();
+                begin_planning(
+                    &mut conn,
+                    &BeginPlanning {
+                        source_task_id: source,
+                        expected_revision: 1,
+                        provider: "codex",
+                        model: "sol",
+                        frozen_base_sha: "abc",
+                        now: 2,
+                    },
+                )
+                .unwrap()
+                .is_some()
+            });
+            let reserved = reserve.join().unwrap();
+            let planned = plan.join().unwrap();
+            assert_ne!(reserved, planned);
+            if reserved {
+                let mut conn = crate::db::open(&path).unwrap();
+                assert!(crate::tasks::release_reviewer_provision(
+                    &mut conn,
+                    review,
+                    "review-token"
+                )
+                .unwrap());
+                assert!(begin_planning(
+                    &mut conn,
+                    &BeginPlanning {
+                        source_task_id: source,
+                        expected_revision: 1,
+                        provider: "codex",
+                        model: "sol",
+                        frozen_base_sha: "abc",
+                        now: 3,
+                    },
+                )
+                .unwrap()
+                .is_some());
+            }
+        }
     }
 
     #[test]

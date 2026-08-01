@@ -1015,6 +1015,79 @@ pub fn claim_remediation_rework(
     Ok(Some(task))
 }
 
+/// Atomically reserve reviewer provisioning authority against the repository
+/// planning freeze. The daemon must release the opaque token after either
+/// attaching the reviewer or cleaning up a failed external provision.
+pub fn reserve_reviewer_provision(
+    conn: &mut Connection,
+    task_id: i64,
+    token: &str,
+    role: &str,
+    now: i64,
+) -> Result<bool> {
+    if token.is_empty() || token.len() > 128 || token.contains('\0') || !matches!(role, "r1" | "r2")
+    {
+        return Err(QuorumError::Usage(
+            "invalid reviewer reservation token".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let eligible: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks t
+             WHERE t.id=?1
+               AND ?2 IN ('r1','r2') AND t.status='in-review'
+               AND json_valid(t.refs)
+               AND json_type(t.refs,'$.cx_est')='integer'
+               AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
+               AND json_extract(t.refs,'$.cx_size') IN ('S','M')
+               AND json_extract(t.refs,'$.cx_ready')=1
+               AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
+               AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
+         )",
+        params![task_id, role],
+        |row| row.get(0),
+    )?;
+    if !eligible {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let inserted = tx.execute(
+        "INSERT INTO reviewer_provision_reservations(task_id,token,role,created_at)
+         VALUES (?1,?2,?3,?4)",
+        params![task_id, token, role, now],
+    );
+    if matches!(&inserted, Err(error) if crate::claims::is_unique_violation_pub(error)) {
+        return Ok(false);
+    }
+    inserted?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub fn release_reviewer_provision(
+    conn: &mut Connection,
+    task_id: i64,
+    token: &str,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "DELETE FROM reviewer_provision_reservations WHERE task_id=?1 AND token=?2",
+        params![task_id, token],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+/// Startup-only crash cleanup. The daemon lock guarantees there is no live
+/// provisioning owner when the replacement daemon calls this.
+pub fn clear_reviewer_provision_reservations(conn: &mut Connection) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute("DELETE FROM reviewer_provision_reservations", [])?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// Release a remediation lease on provisioning failure. Deactivates the claim
 /// and clears the assignee, leaving the task in rework for the next provisioning
 /// attempt or reaper cycle.
