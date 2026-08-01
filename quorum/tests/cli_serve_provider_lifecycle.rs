@@ -653,7 +653,7 @@ classifier_effort = "medium"
 "#;
 
 #[test]
-fn continuation_worker_without_pr_publishes_with_spawn_lease() {
+fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
     let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
     case.handle.wait_for("spawning agent");
     let worker = case.handle.agent_after("spawning agent ");
@@ -700,7 +700,28 @@ fn continuation_worker_without_pr_publishes_with_spawn_lease() {
     .to_string();
     assert_ne!(worker_sha, baseline_sha);
 
-    // Managed workers normally omit --pr. The live slot must retain PR #10.
+    // Exact task #9 incident shape: the old routing bug persisted a
+    // new-branch publication intent before push_new_branch rejected the
+    // already-existing continuation branch. A retry retains this intent.
+    {
+        let conn = case.db();
+        let pre_fix_intent = serde_json::json!({
+            "branch": remote_branch.clone(),
+            "local_sha": worker_sha.clone(),
+            "pr": null,
+            "stage": "intent",
+            "expected_remote_sha": null,
+        });
+        quorum_core::tasks::set_publication_intent(&conn, 1, &pre_fix_intent.to_string(), 2)
+            .unwrap();
+        let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs["daemon_publication"]["pr"].is_null());
+        assert!(refs["daemon_publication"]["expected_remote_sha"].is_null());
+    }
+
+    // Managed workers normally omit --pr. The live slot must retain PR #10,
+    // then repair the missing lease only from the persisted pr_targets row.
     case.done(&worker, &[]);
     case.handle.wait_for("PR #10 ready for review");
 

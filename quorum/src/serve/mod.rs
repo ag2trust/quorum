@@ -970,6 +970,32 @@ async fn publish_worker_completion(
         .await?;
     let known_pr = known_pr.or_else(|| prior.as_ref().and_then(|intent| intent.pr));
     let expected_remote_sha = match (&prior, known_pr) {
+        // A pre-fix continuation attempt could persist the new-branch intent
+        // shape (pr/baseline both NULL) before push_new_branch rejected the
+        // already-existing PR branch. Once the corrected slot/journal identity
+        // supplies the daemon-owned PR, repair that intent only from the
+        // immutable spawn-time target. Never adopt the mutable live PR head.
+        (Some(intent), Some(pr)) if intent.pr.is_none() => {
+            let baseline = load_publication_pr_baseline(&config.db_path, task_id, pr)
+                .await?
+                .ok_or_else(|| {
+                    format!("publication intent for PR #{pr} has no durable spawn-time target")
+                })?;
+            if baseline.is_fork || baseline.head_ref != branch {
+                return Err(format!(
+                    "spawn-time PR target for task #{task_id} does not match publish branch {branch}"
+                ));
+            }
+            if let Some(recorded) = intent.expected_remote_sha.as_deref() {
+                if recorded != baseline.head_sha {
+                    return Err(format!(
+                        "publication intent lease baseline {recorded} conflicts with spawn-time PR target {}",
+                        baseline.head_sha
+                    ));
+                }
+            }
+            Some(baseline.head_sha)
+        }
         (Some(intent), _) => intent.expected_remote_sha.clone(),
         (None, Some(pr)) => {
             let baseline = load_publication_pr_baseline(&config.db_path, task_id, pr).await?;
@@ -995,9 +1021,10 @@ async fn publish_worker_completion(
         local_sha: local_sha.clone(),
         pr: known_pr,
         stage: "intent".into(),
-        expected_remote_sha,
+        expected_remote_sha: expected_remote_sha.clone(),
     });
     intent.pr = known_pr;
+    intent.expected_remote_sha = expected_remote_sha;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
     if let Some(pr) = known_pr {
