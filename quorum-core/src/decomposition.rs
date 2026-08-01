@@ -709,7 +709,13 @@ pub fn cancel_source_graph(
 fn graph_cleanup_intents(tx: &Transaction<'_>, graph_id: i64) -> Result<Vec<CleanupIntent>> {
     let mut intents = Vec::new();
     let mut stmt = tx.prepare(
-        "SELECT m.task_id,b.worktree,b.branch,p.pr_number,p.head_ref,p.head_sha,p.is_fork
+        "SELECT m.task_id,b.worktree,b.branch,p.pr_number,p.head_ref,p.head_sha,p.is_fork,
+                b.provenance_sha,
+                CASE WHEN json_valid(t.refs)
+                     THEN json_extract(t.refs,'$.daemon_publication.branch') END,
+                CASE WHEN json_valid(t.refs)
+                     THEN json_extract(t.refs,'$.daemon_publication.local_sha') END,
+                b.id,b.allocated_by,b.allocated_at
          FROM task_graph_members m
          JOIN tasks t ON t.id=m.task_id AND t.status!='done'
          LEFT JOIN task_branches b ON b.task_id=m.task_id
@@ -727,10 +733,30 @@ fn graph_cleanup_intents(tx: &Transaction<'_>, graph_id: i64) -> Result<Vec<Clea
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<i64>>(12)?,
         ))
     })?;
     for row in rows {
-        let (task_id, worktree, branch, pr, head_ref, head_sha, is_fork) = row?;
+        let (
+            task_id,
+            worktree,
+            branch,
+            pr,
+            head_ref,
+            head_sha,
+            is_fork,
+            provenance_sha,
+            publication_branch,
+            publication_sha,
+            allocation_id,
+            allocated_by,
+            allocated_at,
+        ) = row?;
         if let (Some(path), Some(name)) = (&worktree, &branch) {
             intents.push(CleanupIntent {
                 task_id,
@@ -738,20 +764,53 @@ fn graph_cleanup_intents(tx: &Transaction<'_>, graph_id: i64) -> Result<Vec<Clea
                 artifact_ref: serde_json::json!({"branch": name, "path": path}).to_string(),
             });
         }
-        if let (Some(name), Some(expected_sha), Some(target_ref), Some(0)) =
-            (&branch, &head_sha, &head_ref, is_fork)
-        {
-            if name == target_ref {
-                intents.push(CleanupIntent {
-                    task_id,
-                    artifact_kind: "branch".into(),
-                    artifact_ref: serde_json::json!({
-                        "expected_sha": expected_sha,
-                        "name": name,
-                    })
-                    .to_string(),
-                });
+        let definitive_sha = branch.as_ref().and_then(|name| {
+            if publication_branch.as_ref() == Some(name) {
+                publication_sha.as_ref()
+            } else if is_fork == Some(0) && head_ref.as_ref() == Some(name) {
+                head_sha.as_ref()
+            } else {
+                None
             }
+        });
+        if let (Some(name), Some(expected_sha)) = (&branch, definitive_sha) {
+            intents.push(CleanupIntent {
+                task_id,
+                artifact_kind: "branch".into(),
+                artifact_ref: serde_json::json!({
+                    "expected_sha": expected_sha,
+                    "name": name,
+                })
+                .to_string(),
+            });
+        } else if let (
+            Some(name),
+            Some(path),
+            Some(provenance_sha),
+            Some(allocation_id),
+            Some(allocated_by),
+            Some(allocated_at),
+        ) = (
+            &branch,
+            &worktree,
+            &provenance_sha,
+            allocation_id,
+            allocated_by,
+            allocated_at,
+        ) {
+            intents.push(CleanupIntent {
+                task_id,
+                artifact_kind: "branch-discovery".into(),
+                artifact_ref: serde_json::json!({
+                    "allocated_at": allocated_at,
+                    "allocated_by": allocated_by,
+                    "allocation_id": allocation_id,
+                    "name": name,
+                    "path": path,
+                    "provenance_sha": provenance_sha,
+                })
+                .to_string(),
+            });
         }
         if let (Some(pr_number), Some(head_ref), Some(head_sha)) = (pr, head_ref, head_sha) {
             intents.push(CleanupIntent {
@@ -849,11 +908,14 @@ fn cancel_graph_in_tx(
 }
 
 fn validate_cleanup_intent(intent: &CleanupIntent) -> Result<()> {
+    fn valid_sha(value: &str) -> bool {
+        matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
     if intent.artifact_ref.contains('\0')
         || intent.artifact_ref.len() > MAX_CLEANUP_ARTIFACT_BYTES
         || !matches!(
             intent.artifact_kind.as_str(),
-            "process" | "proposed-change" | "worktree" | "branch"
+            "process" | "proposed-change" | "worktree" | "branch" | "branch-discovery"
         )
     {
         return Err(QuorumError::Usage("invalid cleanup intent".into()));
@@ -895,7 +957,28 @@ fn validate_cleanup_intent(intent: &CleanupIntent) -> Result<()> {
                 && object
                     .get("expected_sha")
                     .and_then(|v| v.as_str())
+                    .is_some_and(valid_sha)
+        }
+        "branch-discovery" => {
+            object.len() == 6
+                && object
+                    .get("allocation_id")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|v| v > 0)
+                && object.get("name").and_then(|v| v.as_str()).is_some()
+                && object.get("path").and_then(|v| v.as_str()).is_some()
+                && object
+                    .get("allocated_by")
+                    .and_then(|v| v.as_str())
                     .is_some()
+                && object
+                    .get("allocated_at")
+                    .and_then(|v| v.as_i64())
+                    .is_some()
+                && object
+                    .get("provenance_sha")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(valid_sha)
         }
         _ => false,
     };
@@ -1724,8 +1807,8 @@ mod tests {
         }
         conn.execute(
             "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
-             VALUES (?1,42,'daemon/live','abc',0,4)",
-            [ids[1]],
+             VALUES (?1,42,'daemon/live',?2,0,4)",
+            params![ids[1], "a".repeat(40)],
         )
         .unwrap();
         conn.execute(
@@ -1760,7 +1843,9 @@ mod tests {
             intent.0 == ids[1]
                 && intent.1 == "branch"
                 && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()
-                    == serde_json::json!({"expected_sha":"abc","name":"daemon/live"})
+                    == serde_json::json!({
+                        "expected_sha":"a".repeat(40),"name":"daemon/live"
+                    })
         }));
         assert!(intents.iter().any(|intent| {
             intent.0 == ids[1]
@@ -1773,7 +1858,7 @@ mod tests {
                 && intent.1 == "proposed-change"
                 && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()
                     == serde_json::json!({
-                        "head_ref":"daemon/live","head_sha":"abc","pr_number":42
+                        "head_ref":"daemon/live","head_sha":"a".repeat(40),"pr_number":42
                     })
         }));
         assert!(intents.iter().any(|intent| {
@@ -1789,6 +1874,82 @@ mod tests {
         assert!(!intents
             .iter()
             .any(|intent| intent.0 == ids[0] && intent.1 != "process"));
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| intent.0 == ids[1] && intent.1 == "branch")
+                .count(),
+            1,
+            "PR-backed allocation has exactly one definitive branch intent"
+        );
+    }
+
+    #[test]
+    fn prepublication_allocation_creates_worktree_and_discovery_intents() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        let provenance = "b".repeat(40);
+        assert!(crate::branches::record_exact_allocation(
+            &mut conn,
+            ids[0],
+            "daemon/prepublication",
+            "/tmp/prepublication",
+            "worker",
+            &provenance,
+            4,
+        )
+        .unwrap());
+        let allocation_id: i64 = conn
+            .query_row(
+                "SELECT id FROM task_branches WHERE task_id=?1",
+                [ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        let intents: Vec<(String, serde_json::Value)> = conn
+            .prepare(
+                "SELECT artifact_kind,artifact_ref FROM decomposition_cleanup
+                 WHERE task_id=?1 ORDER BY artifact_kind",
+            )
+            .unwrap()
+            .query_map([ids[0]], |row| {
+                let kind: String = row.get(0)?;
+                let artifact: String = row.get(1)?;
+                Ok((kind, serde_json::from_str(&artifact).unwrap()))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            intents,
+            vec![
+                (
+                    "branch-discovery".into(),
+                    serde_json::json!({
+                        "allocated_at":4,
+                        "allocated_by":"worker",
+                        "allocation_id":allocation_id,
+                        "name":"daemon/prepublication",
+                        "path":"/tmp/prepublication",
+                        "provenance_sha":provenance,
+                    }),
+                ),
+                (
+                    "worktree".into(),
+                    serde_json::json!({
+                        "branch":"daemon/prepublication","path":"/tmp/prepublication"
+                    }),
+                ),
+            ]
+        );
     }
 
     #[test]

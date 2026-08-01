@@ -146,6 +146,128 @@ pub fn fail(
     })
 }
 
+/// Atomically converts a validated non-destructive branch discovery into an
+/// immutable CAS deletion. The caller resolves and validates `expected_sha`
+/// outside the transaction; this transaction revalidates allocation authority.
+pub fn finalize_branch_discovery(
+    conn: &mut Connection,
+    work: &CleanupWork,
+    expected_sha: &str,
+    tombstone_ref: &str,
+    now: i64,
+) -> Result<bool> {
+    if work.key.artifact_kind != "branch-discovery"
+        || !matches!(expected_sha.len(), 40 | 64)
+        || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit())
+        || !tombstone_ref.starts_with("refs/quorum/cleanup/")
+        || tombstone_ref.contains('\0')
+    {
+        return Err(QuorumError::Usage(
+            "invalid branch discovery finalization".into(),
+        ));
+    }
+    let value: Value = serde_json::from_str(&work.key.artifact_ref)
+        .map_err(|_| QuorumError::Usage("invalid branch discovery intent".into()))?;
+    let allocation_id = value["allocation_id"]
+        .as_i64()
+        .ok_or_else(|| QuorumError::Usage("invalid allocation id".into()))?;
+    let allocated_at = value["allocated_at"]
+        .as_i64()
+        .ok_or_else(|| QuorumError::Usage("invalid allocation time".into()))?;
+    let allocated_by = value["allocated_by"]
+        .as_str()
+        .ok_or_else(|| QuorumError::Usage("invalid allocator".into()))?;
+    let name = value["name"]
+        .as_str()
+        .ok_or_else(|| QuorumError::Usage("invalid branch".into()))?;
+    let path = value["path"]
+        .as_str()
+        .ok_or_else(|| QuorumError::Usage("invalid worktree".into()))?;
+    let provenance = value["provenance_sha"]
+        .as_str()
+        .ok_or_else(|| QuorumError::Usage("invalid provenance".into()))?;
+    let tx = begin_immediate(conn)?;
+    let authoritative: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM task_branches WHERE id=?1 AND task_id=?2 AND branch=?3 AND worktree=?4
+           AND allocated_by=?5 AND allocated_at=?6 AND provenance_sha=?7",
+            params![
+                allocation_id,
+                work.key.task_id,
+                name,
+                path,
+                allocated_by,
+                allocated_at,
+                provenance
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if authoritative.is_none() {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    }
+    let running: Option<i64> = tx.query_row(
+        "SELECT 1 FROM decomposition_cleanup WHERE graph_id=?1 AND task_id=?2 AND artifact_kind=?3
+           AND artifact_ref=?4 AND state='running' AND attempts=?5",
+        params![work.key.graph_id, work.key.task_id, work.key.artifact_kind, work.key.artifact_ref, work.attempt],
+        |row| row.get(0),
+    ).optional()?;
+    if running.is_none() {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    }
+    let delete_ref = serde_json::json!({"allocation_id":allocation_id,"expected_sha":expected_sha.to_ascii_lowercase(),"name":name,"tombstone_ref":tombstone_ref}).to_string();
+    tx.execute("INSERT OR IGNORE INTO decomposition_cleanup(graph_id,task_id,artifact_kind,artifact_ref,state,attempts,updated_at) VALUES (?1,?2,'branch-delete',?3,'pending',0,?4)", params![work.key.graph_id, work.key.task_id, delete_ref, now])?;
+    tx.execute("UPDATE decomposition_cleanup SET state='done',last_error=NULL,updated_at=?6 WHERE graph_id=?1 AND task_id=?2 AND artifact_kind=?3 AND artifact_ref=?4 AND state='running' AND attempts=?5",
+        params![work.key.graph_id, work.key.task_id, work.key.artifact_kind, work.key.artifact_ref, work.attempt, now])?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Convert a definitive known-SHA branch lease to the same tombstoned CAS
+/// deletion used by discovery, so crash/recreation safety is uniform.
+pub fn finalize_known_branch(
+    conn: &mut Connection,
+    work: &CleanupWork,
+    allocation_id: i64,
+    name: &str,
+    expected_sha: &str,
+    tombstone_ref: &str,
+    now: i64,
+) -> Result<bool> {
+    if work.key.artifact_kind != "branch"
+        || allocation_id <= 0
+        || !matches!(expected_sha.len(), 40 | 64)
+        || !expected_sha.bytes().all(|b| b.is_ascii_hexdigit())
+        || !tombstone_ref.starts_with("refs/quorum/cleanup/")
+    {
+        return Err(QuorumError::Usage(
+            "invalid known branch finalization".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let authority: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM task_branches WHERE id=?1 AND task_id=?2 AND branch=?3",
+            params![allocation_id, work.key.task_id, name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let running: Option<i64> = tx.query_row("SELECT 1 FROM decomposition_cleanup WHERE graph_id=?1 AND task_id=?2 AND artifact_kind='branch' AND artifact_ref=?3 AND state='running' AND attempts=?4",
+        params![work.key.graph_id,work.key.task_id,work.key.artifact_ref,work.attempt], |r| r.get(0)).optional()?;
+    if authority.is_none() || running.is_none() {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    }
+    let delete_ref = serde_json::json!({"allocation_id":allocation_id,"expected_sha":expected_sha,"name":name,"tombstone_ref":tombstone_ref}).to_string();
+    tx.execute("INSERT OR IGNORE INTO decomposition_cleanup(graph_id,task_id,artifact_kind,artifact_ref,state,attempts,updated_at) VALUES (?1,?2,'branch-delete',?3,'pending',0,?4)", params![work.key.graph_id,work.key.task_id,delete_ref,now])?;
+    tx.execute("UPDATE decomposition_cleanup SET state='done',last_error=NULL,updated_at=?5 WHERE graph_id=?1 AND task_id=?2 AND artifact_kind='branch' AND artifact_ref=?3 AND state='running' AND attempts=?4",
+        params![work.key.graph_id,work.key.task_id,work.key.artifact_ref,work.attempt,now])?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
 fn settle(
     conn: &mut Connection,
     work: &CleanupWork,
@@ -187,13 +309,16 @@ fn oldest_candidate(tx: &Transaction<'_>) -> Result<Option<CleanupKey>> {
                  AND prior.state IN ('pending','running')
                  AND CASE prior.artifact_kind
                        WHEN 'process' THEN 1 WHEN 'proposed-change' THEN 2
-                       WHEN 'worktree' THEN 3 WHEN 'branch' THEN 4 ELSE 0 END
+                       WHEN 'worktree' THEN 3 WHEN 'branch-discovery' THEN 4
+                       WHEN 'branch' THEN 5 WHEN 'branch-delete' THEN 5 ELSE 0 END
                      < CASE c.artifact_kind
                        WHEN 'process' THEN 1 WHEN 'proposed-change' THEN 2
-                       WHEN 'worktree' THEN 3 WHEN 'branch' THEN 4 ELSE 0 END)
+                       WHEN 'worktree' THEN 3 WHEN 'branch-discovery' THEN 4
+                       WHEN 'branch' THEN 5 WHEN 'branch-delete' THEN 5 ELSE 0 END)
          ORDER BY c.updated_at,c.graph_id,c.task_id,
                   CASE c.artifact_kind WHEN 'process' THEN 1 WHEN 'proposed-change' THEN 2
-                       WHEN 'worktree' THEN 3 WHEN 'branch' THEN 4 ELSE 0 END,
+                       WHEN 'worktree' THEN 3 WHEN 'branch-discovery' THEN 4
+                       WHEN 'branch' THEN 5 WHEN 'branch-delete' THEN 5 ELSE 0 END,
                   c.artifact_ref
          LIMIT 1",
         [MAX_CLEANUP_ATTEMPTS],
@@ -238,7 +363,46 @@ fn validate_key(key: &CleanupKey) -> std::result::Result<(), &'static str> {
         }
         "worktree" => exact(object, &["branch", "path"]) && strings(object, &["branch", "path"]),
         "branch" => {
-            exact(object, &["expected_sha", "name"]) && strings(object, &["expected_sha", "name"])
+            exact(object, &["expected_sha", "name"])
+                && strings(object, &["expected_sha", "name"])
+                && oid(object, "expected_sha")
+                && branch_name(object, "name")
+        }
+        "branch-discovery" => {
+            exact(
+                object,
+                &[
+                    "allocated_at",
+                    "allocated_by",
+                    "allocation_id",
+                    "name",
+                    "path",
+                    "provenance_sha",
+                ],
+            ) && strings(object, &["allocated_by", "name", "path", "provenance_sha"])
+                && oid(object, "provenance_sha")
+                && branch_name(object, "name")
+                && object
+                    .get("allocation_id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|v| v > 0)
+                && object
+                    .get("allocated_at")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|v| v > 0)
+        }
+        "branch-delete" => {
+            exact(
+                object,
+                &["allocation_id", "expected_sha", "name", "tombstone_ref"],
+            ) && strings(object, &["expected_sha", "name", "tombstone_ref"])
+                && oid(object, "expected_sha")
+                && branch_name(object, "name")
+                && object
+                    .get("allocation_id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|v| v > 0)
+                && deterministic_tombstone(key, object)
         }
         _ => return Err("unknown cleanup artifact kind"),
     };
@@ -256,6 +420,54 @@ fn strings(object: &Map<String, Value>, keys: &[&str]) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty() && !value.contains('\0'))
     })
+}
+
+fn oid(object: &Map<String, Value>, key: &str) -> bool {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn branch_name(object: &Map<String, Value>, key: &str) -> bool {
+    object.get(key).and_then(Value::as_str).is_some_and(|name| {
+        !name.is_empty()
+            && name.len() <= 255
+            && name != "@"
+            && !name.starts_with('-')
+            && !name.starts_with('/')
+            && !name.ends_with('/')
+            && !name.ends_with('.')
+            && !name.contains("//")
+            && !name.contains("..")
+            && !name.contains("@{")
+            && !name
+                .bytes()
+                .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+            && name
+                .split('/')
+                .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+    })
+}
+
+fn deterministic_tombstone(key: &CleanupKey, object: &Map<String, Value>) -> bool {
+    if key.graph_id <= 0 || key.task_id <= 0 {
+        return false;
+    }
+    let Some(allocation_id) = object
+        .get("allocation_id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+    else {
+        return false;
+    };
+    let expected = format!(
+        "refs/quorum/cleanup/{}/{}/{}",
+        key.graph_id, key.task_id, allocation_id
+    );
+    object.get("tombstone_ref").and_then(Value::as_str) == Some(expected.as_str())
 }
 
 #[cfg(test)]
@@ -393,9 +605,64 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_branch_artifacts_exhaust_before_external_execution() {
+        let mut conn = setup();
+        insert(
+            &conn,
+            "branch",
+            r#"{"expected_sha":"not-an-oid","name":"daemon/x"}"#,
+            1,
+        );
+        insert(
+            &conn,
+            "branch-discovery",
+            &serde_json::json!({
+                "allocated_at":1,"allocated_by":"agent","allocation_id":7,
+                "name":"refs/heads/../victim","path":"/tmp/w","provenance_sha":"a".repeat(40)
+            })
+            .to_string(),
+            2,
+        );
+        insert(
+            &conn,
+            "branch-delete",
+            &serde_json::json!({
+                "allocation_id":7,"expected_sha":"b".repeat(40),"name":"daemon/x",
+                "tombstone_ref":"refs/quorum/cleanup/999/2/7"
+            })
+            .to_string(),
+            3,
+        );
+        assert!(
+            claim_next(&mut conn, 4).unwrap().is_none(),
+            "corrupt rows must never escape to an external runner"
+        );
+        let rows: Vec<(String, i64, String)> = conn
+            .prepare(
+                "SELECT state,attempts,last_error FROM decomposition_cleanup ORDER BY updated_at",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows
+            .iter()
+            .all(|(state, attempts, error)| state == "exhausted"
+                && *attempts == 0
+                && !error.is_empty()));
+    }
+
+    #[test]
     fn graph_member_gates_and_per_task_action_order_hold() {
         let mut conn = setup();
-        insert(&conn, "branch", r#"{"expected_sha":"abc","name":"b"}"#, 1);
+        insert(
+            &conn,
+            "branch",
+            &serde_json::json!({"expected_sha":"a".repeat(40),"name":"b"}).to_string(),
+            1,
+        );
         insert(&conn, "worktree", r#"{"branch":"b","path":"/tmp/w"}"#, 1);
         insert(
             &conn,
@@ -499,7 +766,7 @@ mod tests {
              INSERT INTO decomposition_cleanup VALUES
                  (1,2,'process','{"agent":"done","pid":1,"session_id":"s"}',
                     'complete',1,NULL,10),
-                 (1,2,'branch','{"expected_sha":"abc","name":"retry"}',
+                 (1,2,'branch','{"expected_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"retry"}',
                     'failed',1,'old retryable failure',11),
                  (1,2,'worktree','{"branch":"cap","path":"/tmp/cap"}',
                     'failed',3,'old capped failure',12);
@@ -543,7 +810,8 @@ mod tests {
                 ),
                 (
                     "branch".into(),
-                    r#"{"expected_sha":"abc","name":"retry"}"#.into(),
+                    r#"{"expected_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"retry"}"#
+                        .into(),
                     "pending".into(),
                     1,
                     Some("old retryable failure".into()),

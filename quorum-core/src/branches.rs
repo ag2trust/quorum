@@ -29,6 +29,63 @@ pub struct BranchAllocation {
     pub existed: bool,
 }
 
+/// Persist an exact daemon-derived allocation and its immutable provisioning
+/// provenance before creating the Git branch/worktree. Replays succeed only
+/// for the identical tuple; collisions are clean negatives.
+#[allow(clippy::too_many_arguments)]
+pub fn record_exact_allocation(
+    conn: &mut Connection,
+    task_id: i64,
+    branch: &str,
+    worktree: &str,
+    allocator: &str,
+    provenance_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if [branch, worktree, allocator, provenance_sha]
+        .iter()
+        .any(|value| value.is_empty() || value.contains('\0'))
+        || !matches!(provenance_sha.len(), 40 | 64)
+        || !provenance_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(crate::error::QuorumError::Usage(
+            "invalid branch allocation provenance".into(),
+        ));
+    }
+    let tx = crate::db::begin_immediate(conn)?;
+    let existing: Option<(String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT branch,worktree,provenance_sha FROM task_branches WHERE task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        tx.commit()?;
+        return Ok(existing
+            == (
+                branch.to_string(),
+                worktree.to_string(),
+                Some(provenance_sha.to_ascii_lowercase()),
+            ));
+    }
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO task_branches(
+             task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            task_id,
+            branch,
+            worktree,
+            allocator,
+            now,
+            provenance_sha.to_ascii_lowercase()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(inserted == 1)
+}
+
 /// Maximum slugified-title length before the agent suffix is appended. Long enough to keep
 /// titles human-recognizable, short enough that the full branch fits comfortably below the
 /// 250-char Git ref limit even with a long agent name. (50 + slash + type + dash + agent =
@@ -283,6 +340,59 @@ mod tests {
     fn slugify_empty_falls_back_to_task() {
         assert_eq!(slugify(""), "task");
         assert_eq!(slugify("!!!"), "task");
+    }
+
+    #[test]
+    fn exact_allocation_binds_immutable_provenance_and_replays_exactly() {
+        let (_dir, mut conn) = fresh_db();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('task','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let sha = "a".repeat(40);
+        assert!(record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &sha,
+            2,
+        )
+        .unwrap());
+        assert!(record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &sha.to_uppercase(),
+            3,
+        )
+        .unwrap());
+        assert!(!record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &"b".repeat(40),
+            3,
+        )
+        .unwrap());
+        let stored: (String, String, String) = conn
+            .query_row(
+                "SELECT branch,worktree,provenance_sha FROM task_branches WHERE task_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("daemon/worker-t1".into(), "/tmp/worker-t1".into(), sha)
+        );
     }
 
     #[test]

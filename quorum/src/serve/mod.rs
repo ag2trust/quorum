@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod approvals;
 pub mod classifier;
+pub mod cleanup;
 #[allow(dead_code)]
 pub mod codex_agent;
 #[allow(dead_code)]
@@ -32,6 +33,7 @@ use quorum_core::mailbox;
 use quorum_core::pr_targets;
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
+use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -4370,6 +4372,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let startup_decomposition =
         reconcile_decomposition_startup(config, &mut decomposition_coordinator).await?;
     let recovered_frozen_decomposition = startup_decomposition == StartupDecompositionState::Frozen;
+
+    // Cleanup is an authority gate, including frozen-decomposition restarts:
+    // no recovery path may discard its journal/provenance before all eligible
+    // intents have settled or exhausted.
+    cleanup::startup(config, &wt_mgr).await?;
+
     if recovered_frozen_decomposition {
         // A frozen restart must first terminate stale managed processes and
         // empty the journal. Late completion and approval/network recovery are
@@ -4665,6 +4673,20 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 return Ok(exit);
             }
         }
+
+        // Bound cleanup work so unrelated tasks continue to make progress.
+        // Each claim is settled before the next one and external I/O never
+        // overlaps a database transaction.
+        cleanup::drain_tick(
+            config,
+            &wt_mgr,
+            cleanup::LiveSlots {
+                workers: &mut workers,
+                reviewers: &mut reviewers,
+                names: &mut name_pool,
+            },
+        )
+        .await?;
 
         // ── Drift check: unbacked/twin PR detection (~15 min cadence) ──
         let should_drift_check = match last_drift_check {
@@ -11032,6 +11054,68 @@ async fn spawn_worker(
     let wt_path = config
         .worktree_base
         .join(format!("{}-t{}", branch_agent, task.id));
+
+    // Persist immutable allocation provenance before git creates anything.
+    // Ref resolution is external I/O and completes before the short DB write.
+    if continue_target.is_none() {
+        let base_ref = format!("origin/{}", config.base_branch);
+        let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
+            Ok(sha) => sha,
+            Err(error) => {
+                park_task(
+                    &db_path,
+                    task.id,
+                    &format!("branch provenance resolution failed: {error}"),
+                    "open",
+                )
+                .await;
+                name_pool.release(&agent_name);
+                return Ok(false);
+            }
+        };
+        let allocation_db = db_path.clone();
+        let allocation_branch = branch.clone();
+        let allocation_worktree = wt_path.to_string_lossy().into_owned();
+        let allocation_agent = agent_name.clone();
+        let allocation_task = task.id;
+        let recorded = tokio::task::spawn_blocking(move || {
+            let mut conn = quorum_core::db::open(&allocation_db)?;
+            let existing: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT provenance_sha FROM task_branches WHERE task_id=?1",
+                    [allocation_task],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let provenance = match existing.as_ref() {
+                Some(Some(provenance)) => provenance.as_str(),
+                Some(None) => return Ok(false),
+                None => resolved_provenance.as_str(),
+            };
+            quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                allocation_task,
+                &allocation_branch,
+                &allocation_worktree,
+                &allocation_agent,
+                provenance,
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("branch allocation join: {e}")))??;
+        if !recorded {
+            park_task(
+                &db_path,
+                task.id,
+                "branch allocation provenance conflict",
+                "open",
+            )
+            .await;
+            name_pool.release(&agent_name);
+            return Ok(false);
+        }
+    }
 
     let provision_result = if let Some(target) = &continue_target {
         wt_mgr

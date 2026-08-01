@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 39;
+pub const SCHEMA_VERSION: i64 = 40;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -570,6 +570,16 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             )?;
         }
 
+        // v40 binds a task-owned branch allocation to the immutable commit it
+        // was provisioned from. Historical allocations remain NULL and are
+        // deliberately ineligible for destructive branch discovery.
+        if current < 40 && !column_exists(conn, "task_branches", "provenance_sha")? {
+            conn.execute(
+                "ALTER TABLE task_branches ADD COLUMN provenance_sha TEXT",
+                [],
+            )?;
+        }
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -895,6 +905,58 @@ mod tests {
         let reopened = open(&path).unwrap();
         assert!(column_exists(&reopened, "tasks", "revision").unwrap());
         assert!(column_exists(&reopened, "tasks", "edit_count").unwrap());
+    }
+
+    #[test]
+    fn migrates_v39_branch_allocations_with_nullable_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v39-branch-provenance.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE task_branches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL UNIQUE,
+                    branch TEXT NOT NULL UNIQUE,
+                    worktree TEXT NOT NULL,
+                    allocated_by TEXT NOT NULL,
+                    allocated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO task_branches(
+                    task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (7,'daemon/legacy-t7','/tmp/legacy-t7','legacy',10);
+                 PRAGMA user_version = 39;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let row: (i64, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT task_id,branch,worktree,provenance_sha FROM task_branches WHERE task_id=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (7, "daemon/legacy-t7".into(), "/tmp/legacy-t7".into(), None)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "task_branches", "provenance_sha").unwrap());
+        assert!(reopened
+            .query_row(
+                "SELECT provenance_sha IS NULL FROM task_branches WHERE task_id=7",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]

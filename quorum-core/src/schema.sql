@@ -294,7 +294,10 @@ CREATE TABLE IF NOT EXISTS task_branches (
     branch       TEXT NOT NULL UNIQUE,
     worktree     TEXT NOT NULL,
     allocated_by TEXT NOT NULL,
-    allocated_at INTEGER NOT NULL
+    allocated_at INTEGER NOT NULL,
+    -- Immutable base/provenance commit captured before provisioning. It is
+    -- not necessarily the later deletion SHA after a worker commits.
+    provenance_sha TEXT
 );
 CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);
 
