@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 36). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 37). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     planner_model           TEXT,
     planner_session_id      TEXT,
     frozen_base_sha         TEXT,
+    accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(CAST(accepted_proposal_json AS BLOB)) <= 65536),
     accepted_plan_revision  INTEGER,
     hold_code               TEXT,
     hold_summary            TEXT,
@@ -170,6 +171,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_graph
     ON task_decompositions(active) WHERE active = 1;
 CREATE UNIQUE INDEX IF NOT EXISTS one_planning_freeze
     ON task_decompositions(freeze_active) WHERE freeze_active = 1;
+
+-- v37: short-lived daemon reviewer reservations serialize external reviewer
+-- provisioning against acquisition of the repository planning freeze.
+CREATE TABLE IF NOT EXISTS reviewer_provision_reservations (
+    task_id       INTEGER PRIMARY KEY REFERENCES tasks(id),
+    token         TEXT NOT NULL UNIQUE,
+    role          TEXT NOT NULL CHECK(role IN ('r1','r2')),
+    created_at    INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS task_graph_members (
     graph_id      INTEGER NOT NULL REFERENCES task_decompositions(id),

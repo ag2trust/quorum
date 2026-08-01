@@ -404,7 +404,12 @@ pub fn store_classifications_for_inputs(
                     params![result.task_id, now, note],
                 )?;
             }
-            if let Some(reason) = parking_reason(&sanitized) {
+            let review_only: bool = tx.query_row(
+                "SELECT review_only FROM tasks WHERE id=?1",
+                params![result.task_id],
+                |row| row.get(0),
+            )?;
+            if let Some(reason) = parking_reason(&sanitized, review_only) {
                 crate::tasks::park_classified_task_tx(&tx, result.task_id, reason, now)?;
             } else {
                 crate::tasks::restore_classified_task_tx(&tx, result.task_id, now)?;
@@ -485,17 +490,19 @@ pub fn validate_batch(
     Ok(())
 }
 
-fn parking_reason(result: &TaskClassification) -> Option<&str> {
+fn parking_reason(result: &TaskClassification, review_only: bool) -> Option<&str> {
     if !result.ready {
         return result.not_ready_reason.as_deref();
     }
-    if result.size == "XL" {
+    if review_only && result.size == "XL" {
         return Some(
-            "execution size XL exceeds automatic dispatch policy; split or rescope into new tasks",
+            "review-only size XL cannot be decomposed automatically; split or rescope externally",
         );
     }
-    if result.cx_est == 5 && result.size == "L" {
-        return Some("complexity 5 with size L exceeds automatic dispatch policy; split or rescope into new tasks");
+    if review_only && result.size == "L" {
+        return Some(
+            "review-only size L cannot be decomposed automatically; split or rescope externally",
+        );
     }
     None
 }
@@ -1261,9 +1268,14 @@ mod tests {
     }
 
     #[test]
-    fn category_five_classification_atomically_parks_without_run_or_error() {
+    fn large_review_only_classification_atomically_parks_without_run_or_error() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "Architectural task", 1);
+        conn.execute(
+            "UPDATE tasks SET review_only=1 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
         let mut parked = classified(task_id, 5);
         parked.size = "L".into();
         let results = vec![parked];
@@ -1284,7 +1296,7 @@ mod tests {
         assert!(refs["daemon_parked_reason"]
             .as_str()
             .unwrap()
-            .contains("complexity 5"));
+            .contains("review-only size L"));
         let active_claims: i64 = conn
             .query_row(
                 "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
@@ -1468,6 +1480,11 @@ mod tests {
     fn retry_requests_reclassification_and_dispatchable_result_restores_status() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "rescope", 1);
+        conn.execute(
+            "UPDATE tasks SET review_only=1 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
         let mut parked = classified(task_id, 5);
         parked.size = "L".into();
         parked.duplicate_of = vec![99];
@@ -1670,10 +1687,12 @@ mod redesigned_tests {
 
     #[test]
     fn policy_allows_focused_complexity_five() {
-        assert!(parking_reason(&result(5, "S", true, None)).is_none());
-        assert!(parking_reason(&result(5, "M", true, None)).is_none());
-        assert!(parking_reason(&result(5, "L", true, None)).is_some());
-        assert!(parking_reason(&result(2, "XL", true, None)).is_some());
+        assert!(parking_reason(&result(5, "S", true, None), false).is_none());
+        assert!(parking_reason(&result(5, "M", true, None), false).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), false).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), true).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), true).is_some());
     }
 
     #[test]
