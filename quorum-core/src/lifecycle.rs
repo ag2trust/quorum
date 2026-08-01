@@ -337,9 +337,8 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
                 // review: the replacement reviewer re-judges the unchanged PR
                 // head and its changes verdict burns a rework round with zero
                 // remediation applied. Park instead (Failed + daemon_parked
-                // refs, written by the storage layer); the daemon's head check
-                // resumes straight to in-review when the worker did push, and
-                // `task-retry` covers the rest.
+                // refs, written by the storage layer); only an explicit
+                // `task-retry` can restore it to rework.
                 Ok((
                     Status::Failed,
                     vec![

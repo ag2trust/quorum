@@ -2992,14 +2992,15 @@ async fn reconcile_ci_remediations(
                 &intent.head_sha[..12.min(intent.head_sha.len())],
                 intent.attempts
             );
-            park_task(&config.db_path, task_id, &reason, "rework").await;
-            notify_provision_failure(
-                &config.db_path,
-                task_id,
-                "CI remediation provisioning exhausted",
-                &format!("#{}", intent.pr),
-            )
-            .await;
+            if park_task(&config.db_path, task_id, &reason, "rework").await {
+                notify_provision_failure(
+                    &config.db_path,
+                    task_id,
+                    "CI remediation provisioning exhausted",
+                    &format!("#{}", intent.pr),
+                )
+                .await;
+            }
             continue;
         }
 
@@ -3008,7 +3009,7 @@ async fn reconcile_ci_remediations(
             intent.pr,
             &intent.head_sha[..12.min(intent.head_sha.len())]
         ));
-        if spawn_remediation_worker(
+        match spawn_remediation_worker(
             config,
             wt_mgr,
             name_pool,
@@ -3020,7 +3021,8 @@ async fn reconcile_ci_remediations(
         )
         .await
         {
-            continue;
+            RemediationSpawnOutcome::Spawned | RemediationSpawnOutcome::ClaimLost => continue,
+            RemediationSpawnOutcome::ProvisionFailed => {}
         }
 
         let p = config.db_path.clone();
@@ -3046,14 +3048,15 @@ async fn reconcile_ci_remediations(
                     intent.pr,
                     &intent.head_sha[..12.min(intent.head_sha.len())]
                 );
-                park_task(&config.db_path, task_id, &reason, "rework").await;
-                notify_provision_failure(
-                    &config.db_path,
-                    task_id,
-                    "CI remediation provisioning exhausted",
-                    &format!("#{}", intent.pr),
-                )
-                .await;
+                if park_task(&config.db_path, task_id, &reason, "rework").await {
+                    notify_provision_failure(
+                        &config.db_path,
+                        task_id,
+                        "CI remediation provisioning exhausted",
+                        &format!("#{}", intent.pr),
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -3074,48 +3077,28 @@ async fn reconcile_remediation_retries(
     lifetime_roster: &mut LifetimeRoster,
     draining: bool,
 ) -> Result<()> {
-    if draining {
-        return Ok(());
-    }
-    // Auto-retry daemon-caused parks first (drain/shutdown/restart-recovery
-    // teardown of a remediation worker, flagged at park time within the
-    // recovery budget): the daemon caused the park, so it owes the respawn —
-    // no `task-retry` demanded of the owner. `reset_recovery_budget=false`
-    // keeps the budget spent at park time, so a drain loop stays bounded.
-    // Genuine-failure parks never carry the flag and stay owner-gated.
+    // Reconcile legacy/corrupt terminal retry state before considering any
+    // runnable rework.  This is bounded and idempotent in the core write
+    // transaction, so restarts converge without provisioning or notification
+    // side effects even while the daemon is draining.
     {
         let p = config.db_path.clone();
-        let unparked = tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
+        let reconciled = tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
             let mut conn = quorum_core::db::open(&p)?;
-            let ids: Vec<i64> = {
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM tasks
-                     WHERE status='failed'
-                       AND json_valid(refs)
-                       AND json_extract(refs, '$.daemon_parked')=1
-                       AND json_extract(refs, '$.daemon_rework_retry_requested')=1
-                     LIMIT 8",
-                )?;
-                let rows = stmt
-                    .query_map([], |row| row.get(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                rows
-            };
-            let mut resumed = Vec::new();
-            for id in ids {
-                if tasks::retry_parked(&mut conn, id, "daemon", false, now_unix())?.is_some() {
-                    resumed.push(id);
-                }
-            }
-            Ok(resumed)
+            tasks::reconcile_terminal_retry_markers(&mut conn, now_unix())
         })
         .await
-        .map_err(|error| QuorumError::Io(format!("auto-retry park scan join: {error}")))??;
-        for id in unparked {
+        .map_err(|error| {
+            QuorumError::Io(format!("terminal retry reconciliation join: {error}"))
+        })??;
+        for id in reconciled {
             log(&format!(
-                "auto-retrying daemon-caused remediation park for task #{id}"
+                "reconciled stale terminal remediation retry markers for task #{id}"
             ));
         }
+    }
+    if draining {
+        return Ok(());
     }
     let pending = {
         let p = config.db_path.clone();
@@ -3123,7 +3106,10 @@ async fn reconcile_remediation_retries(
             let conn = quorum_core::db::open(&p)?;
             Ok(tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
-                .filter(|task| remediation_retry_feedback(task.refs.as_deref()).is_some())
+                .filter(|task| {
+                    tasks::classification_is_dispatchable(&task.refs)
+                        && remediation_retry_feedback(task.refs.as_deref()).is_some()
+                })
                 .collect())
         })
         .await
@@ -3158,7 +3144,7 @@ async fn reconcile_remediation_retries(
             "durable remediation retry: provisioning task #{} on PR #{pr}",
             task.id
         ));
-        if !spawn_remediation_worker(
+        if spawn_remediation_worker(
             config,
             wt_mgr,
             name_pool,
@@ -3169,6 +3155,7 @@ async fn reconcile_remediation_retries(
             &feedback,
         )
         .await
+            == RemediationSpawnOutcome::ProvisionFailed
         {
             park_remediation_provision_failure(config, task.id, pr, &feedback).await;
         }
@@ -4460,7 +4447,8 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await;
-                                            if !spawn_ok {
+                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
@@ -4734,7 +4722,8 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await;
-                                            if !spawn_ok {
+                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
@@ -4942,7 +4931,9 @@ async fn tick(
                                                     &rework_msg,
                                                 )
                                                 .await;
-                                                if !spawn_ok {
+                                                if spawn_ok
+                                                    == RemediationSpawnOutcome::ProvisionFailed
+                                                {
                                                     park_remediation_provision_failure(
                                                         config,
                                                         reviewer_task_id,
@@ -5274,7 +5265,8 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await;
-                                            if !spawn_ok {
+                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
@@ -5657,7 +5649,9 @@ async fn tick(
                                                         &rework_msg,
                                                     )
                                                     .await;
-                                                    if !spawn_ok {
+                                                    if spawn_ok
+                                                        == RemediationSpawnOutcome::ProvisionFailed
+                                                    {
                                                         park_remediation_provision_failure(
                                                             config,
                                                             reviewer_task_id,
@@ -5915,7 +5909,7 @@ async fn tick(
                                         feedback,
                                     )
                                     .await;
-                                    if !spawn_ok {
+                                    if spawn_ok == RemediationSpawnOutcome::ProvisionFailed {
                                         park_remediation_provision_failure(
                                             config,
                                             reviewer_task_id,
@@ -7643,7 +7637,6 @@ async fn tick(
         drain_state.draining,
     )
     .await?;
-    reconcile_parked_head_checks(config, drain_state.draining).await?;
 
     // ── Phase 6: Spawn workers up to cap ───────────────────────────────
     // Gate on worker count, not total in_use_count() — reviewers must
@@ -10093,23 +10086,37 @@ async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strik
     park_task(db_path, task_id, &reason, "open").await;
 }
 
-async fn park_task(db_path: &std::path::Path, task_id: i64, reason: &str, resume_status: &str) {
-    log(&format!("PARKED: task #{task_id}: {reason}"));
+async fn park_task(
+    db_path: &std::path::Path,
+    task_id: i64,
+    reason: &str,
+    resume_status: &str,
+) -> bool {
     let p = db_path.to_path_buf();
+    let reason_for_log = reason.to_string();
     let reason = reason.to_string();
     let resume_status = resume_status.to_string();
-    match tokio::task::spawn_blocking(move || -> Result<()> {
+    match tokio::task::spawn_blocking(move || -> Result<bool> {
         let mut conn = quorum_core::db::open(&p)?;
-        tasks::park(&mut conn, task_id, &reason, &resume_status, now_unix())?;
-        Ok(())
+        Ok(tasks::park(&mut conn, task_id, &reason, &resume_status, now_unix())?.is_some())
     })
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => log(&format!("FATAL: failed to park task #{task_id}: {error}")),
-        Err(error) => log(&format!(
-            "FATAL: park task #{task_id} join failure: {error}"
-        )),
+        Ok(Ok(true)) => {
+            log(&format!("PARKED: task #{task_id}: {reason_for_log}"));
+            true
+        }
+        Ok(Ok(false)) => false,
+        Ok(Err(error)) => {
+            log(&format!("FATAL: failed to park task #{task_id}: {error}"));
+            false
+        }
+        Err(error) => {
+            log(&format!(
+                "FATAL: park task #{task_id} join failure: {error}"
+            ));
+            false
+        }
     }
 }
 
@@ -10450,172 +10457,15 @@ async fn park_remediation_provision_failure(
     // replacement remediation turn remains tied to the unresolved finding.
     persist_remediation_feedback(&config.db_path, task_id, feedback).await;
     let reason = format!("remediation worker provisioning failed for PR #{pr}");
-    park_task(&config.db_path, task_id, &reason, "rework").await;
-    notify_provision_failure(
-        &config.db_path,
-        task_id,
-        "remediation worker provisioning failed",
-        &format!("#{pr}"),
-    )
-    .await;
-}
-
-/// Parks older than this fall out of the head-check scan entirely: the PR is
-/// likely gone or the daemon was down for a long stretch, and `task-retry`
-/// remains the recovery path. Keeps dead rows from consuming a GitHub lookup
-/// every tick forever.
-const PARKED_HEAD_CHECK_MAX_AGE_SECS: i64 = 24 * 3600;
-/// A park younger than the remediation lease TTL is never settled as
-/// "unchanged": the dying worker's push can still be in flight, and settling
-/// early would strand delivered work behind a manual retry. A moved head
-/// settles immediately at any age.
-const PARKED_HEAD_CHECK_MIN_AGE_SECS: i64 = tasks::DEFAULT_LEASE_TTL_SECS;
-/// Head checks settled per tick — each costs one GitHub lookup.
-const PARKED_HEAD_CHECK_SCAN_LIMIT: i64 = 4;
-
-/// Settle one-shot head checks on remediation-death parks (D5b).
-///
-/// A remediation worker can push its fix and die before signaling
-/// `ReworkPushed`; the park that followed would then strand finished work
-/// behind a manual retry. Compare the PR head now against the head recorded
-/// at remediation spawn (`pr_targets.head_sha`):
-/// - moved → resume the task straight to `in-review` (any age) so the pushed
-///   head gets a fresh verdict. NOTE: a moved head proves a push happened,
-///   not that the remediation is complete — a WIP push gets its verdict from
-///   the reviewer, which is still strictly better than stranding it parked.
-/// - unchanged → settle (stay parked for `task-retry`) only once the park is
-///   older than the remediation lease TTL; younger parks stay pending so a
-///   slow in-flight push still gets rescued next tick.
-/// - unresolvable (gh error/rate limit) → NO settle, no writes; the marker
-///   stays pending and the age window bounds how long we keep trying.
-///
-/// The GitHub lookup runs with no DB transaction held.
-async fn reconcile_parked_head_checks(config: &ServeConfig, draining: bool) -> Result<()> {
-    if draining {
-        return Ok(());
+    if park_task(&config.db_path, task_id, &reason, "rework").await {
+        notify_provision_failure(
+            &config.db_path,
+            task_id,
+            "remediation worker provisioning failed",
+            &format!("#{pr}"),
+        )
+        .await;
     }
-    // (task_id, pr, spawn_head_sha, park_age_secs) for pending head checks.
-    type PendingHeadCheck = (i64, Option<i64>, Option<String>, i64);
-    let pending: Vec<PendingHeadCheck> = {
-        let p = config.db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<PendingHeadCheck>> {
-            let conn = quorum_core::db::open(&p)?;
-            let now = now_unix();
-            let mut stmt = conn.prepare(
-                "SELECT id, refs, ?1 - updated_at FROM tasks
-                 WHERE status='failed'
-                   AND json_valid(refs)
-                   AND json_extract(refs, '$.daemon_parked')=1
-                   AND json_extract(refs, '$.daemon_parked_head_check')=1
-                   AND updated_at > ?1 - ?2
-                 LIMIT ?3",
-            )?;
-            let rows = stmt
-                .query_map(
-                    (
-                        now,
-                        PARKED_HEAD_CHECK_MAX_AGE_SECS,
-                        PARKED_HEAD_CHECK_SCAN_LIMIT,
-                    ),
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    },
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(rows
-                .into_iter()
-                .map(|(id, refs, age)| {
-                    // Baseline read is `pr_targets::get` on purpose: it must
-                    // NOT go through `resolve_or_load_pr_target`, which
-                    // upserts the current head and would silently destroy the
-                    // spawn-time baseline this comparison depends on.
-                    let pr = tasks::extract_pr_number(&refs);
-                    let spawn_sha = pr.and_then(|pr| {
-                        pr_targets::get(&conn, id, pr)
-                            .ok()
-                            .flatten()
-                            .map(|target| target.head_sha)
-                    });
-                    (id, pr, spawn_sha, age)
-                })
-                .collect())
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("parked head-check scan join: {error}")))??
-    };
-
-    for (task_id, pr, spawn_sha, park_age) in pending {
-        let (Some(pr), Some(spawn_sha)) = (pr, spawn_sha) else {
-            // No PR identity or no spawn baseline: a comparison is impossible
-            // forever, so settle as parked rather than re-scan every tick.
-            let p = config.db_path.clone();
-            let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let mut conn = quorum_core::db::open(&p)?;
-                tasks::resolve_parked_head_check(&mut conn, task_id, false, now_unix())
-            })
-            .await
-            .map_err(|error| {
-                QuorumError::Io(format!("parked head-check settle join: {error}"))
-            })??;
-            if settled {
-                log(&format!(
-                    "head check: no PR baseline for task #{task_id} — settled, staying parked"
-                ));
-            }
-            continue;
-        };
-
-        // Same injectable seam as every other daemon head read (startup
-        // verdict recovery, CI gating): the harness's command executor
-        // answers with the local repo head, so both branches are testable.
-        let current = {
-            let repo = config.repo_dir.clone();
-            let executor = Arc::clone(&config.merge_executor);
-            tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
-                .await
-                .ok()
-                .flatten()
-        };
-        let head_moved = match current {
-            Some(current_sha) => current_sha != spawn_sha,
-            None => {
-                // Transient lookup failure must not consume the one-shot
-                // marker — leave it pending; the age window bounds retries.
-                log(&format!(
-                    "head check: PR #{pr} unresolved for task #{task_id} — will retry"
-                ));
-                continue;
-            }
-        };
-        if !head_moved && park_age < PARKED_HEAD_CHECK_MIN_AGE_SECS {
-            // Unchanged but young: a slow in-flight push could still land.
-            continue;
-        }
-
-        let p = config.db_path.clone();
-        let settled = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut conn = quorum_core::db::open(&p)?;
-            tasks::resolve_parked_head_check(&mut conn, task_id, head_moved, now_unix())
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("parked head-check settle join: {error}")))??;
-        // Logged after the settle commits so observers (and tests) never see
-        // the outcome line while the marker is still pending.
-        if settled && head_moved {
-            log(&format!(
-                "head check: task #{task_id} head advanced before worker death — resumed to in-review"
-            ));
-        } else if settled {
-            log(&format!(
-                "head check settled for task #{task_id} — staying parked"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Atomically persist the round's blocking feedback and log on failure — this
@@ -10945,9 +10795,21 @@ static R2_META: std::sync::LazyLock<std::sync::Mutex<HashMap<String, R2Meta>>> =
 
 // ── Remediation worker (#159) ────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemediationSpawnOutcome {
+    Spawned,
+    /// The authoritative guarded DB claim lost because the task was no longer
+    /// eligible.  This is a clean race outcome: callers must not park, notify,
+    /// or charge a provisioning strike.
+    ClaimLost,
+    /// Eligibility was claimed, but external worker provisioning failed.
+    ProvisionFailed,
+}
+
 /// Spawn a remediation worker for a task in rework with no live worker.
 /// The worker gets the existing PR, branch, blocking findings, and task body.
-/// Returns true if a worker was successfully added to the workers vec.
+/// Separates a clean lost guarded claim from an actual provisioning failure so
+/// lifecycle races can never flow into the park/notification path.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_remediation_worker(
     config: &ServeConfig,
@@ -10958,7 +10820,7 @@ async fn spawn_remediation_worker(
     task_id: i64,
     pr: i64,
     feedback: &str,
-) -> bool {
+) -> RemediationSpawnOutcome {
     let db_path = &config.db_path;
 
     // Fetch task body + author for context and branch resolution.
@@ -10981,34 +10843,6 @@ async fn spawn_remediation_worker(
         })
         .await
         .unwrap_or((String::new(), String::new(), false))
-    };
-
-    // #189/#201: resolve PR target from GitHub, persist on success, fall
-    // back to persisted target when GitHub is unavailable.
-    let pr_target = {
-        let pr_val = pr;
-        let tid = task_id;
-        let dbp = db_path.clone();
-        let repo_dir = config.repo_dir.clone();
-        let gh_repo = config.repo.clone();
-        tokio::task::spawn_blocking(move || {
-            resolve_or_load_pr_target(pr_val, tid, &dbp, &repo_dir, Some(&gh_repo))
-        })
-        .await
-        .ok()
-        .flatten()
-    };
-    let fallback_branch = if pr_target.is_none() {
-        let fb = orphan_worker_branch(&task_author, task_id, task_review_only);
-        if fb.is_none() {
-            log(&format!(
-                "remediation: cannot resolve PR #{pr} target — cannot spawn worker"
-            ));
-            return false;
-        }
-        fb
-    } else {
-        None
     };
 
     let agent_name = name_pool.acquire().into_name();
@@ -11041,9 +10875,46 @@ async fn spawn_remediation_worker(
                 "remediation: claim failed for task #{task_id} — task no longer in rework"
             ));
             name_pool.release(&agent_name);
-            return false;
+            return RemediationSpawnOutcome::ClaimLost;
         }
     }
+
+    // Resolve external PR state only after the authoritative claim succeeds.
+    // A zero-row guard outcome is therefore entirely side-effect free: no
+    // GitHub lookup, worktree, run, park, notification, or retry strike.
+    let pr_target = {
+        let pr_val = pr;
+        let tid = task_id;
+        let dbp = db_path.clone();
+        let repo_dir = config.repo_dir.clone();
+        let gh_repo = config.repo.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_or_load_pr_target(pr_val, tid, &dbp, &repo_dir, Some(&gh_repo))
+        })
+        .await
+        .ok()
+        .flatten()
+    };
+    let fallback_branch = if pr_target.is_none() {
+        let fb = orphan_worker_branch(&task_author, task_id, task_review_only);
+        if fb.is_none() {
+            log(&format!(
+                "remediation: cannot resolve PR #{pr} target — cannot spawn worker"
+            ));
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+            })
+            .await;
+            name_pool.release(&agent_name);
+            return RemediationSpawnOutcome::ProvisionFailed;
+        }
+        fb
+    } else {
+        None
+    };
 
     // Drain stale mailbox rows.
     {
@@ -11149,7 +11020,7 @@ async fn spawn_remediation_worker(
             .await;
         }
         name_pool.release(&agent_name);
-        return false;
+        return RemediationSpawnOutcome::ProvisionFailed;
     }
 
     // Inspection surfaces report the PR branch this run continues, not the
@@ -11268,7 +11139,7 @@ async fn spawn_remediation_worker(
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return false;
+                    return RemediationSpawnOutcome::ProvisionFailed;
                 }
                 resolved
             }
@@ -11287,7 +11158,7 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return false;
+                return RemediationSpawnOutcome::ProvisionFailed;
             }
             Err(error) => {
                 log(&format!(
@@ -11304,7 +11175,7 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return false;
+                return RemediationSpawnOutcome::ProvisionFailed;
             }
         }
     };
@@ -11343,7 +11214,7 @@ async fn spawn_remediation_worker(
         name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
-        return false;
+        return RemediationSpawnOutcome::ProvisionFailed;
     }
 
     // For Codex rework: look up persisted thread_id for continuation.
@@ -11388,7 +11259,7 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            return false;
+            return RemediationSpawnOutcome::ProvisionFailed;
         }
     };
 
@@ -11459,7 +11330,7 @@ async fn spawn_remediation_worker(
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return false;
+                    return RemediationSpawnOutcome::ProvisionFailed;
                 }
             }
 
@@ -11526,7 +11397,7 @@ async fn spawn_remediation_worker(
                 "remediation worker {} spawned for task #{task_id} PR #{pr}",
                 agent_name
             ));
-            true
+            RemediationSpawnOutcome::Spawned
         }
         Err(e) => {
             log(&format!("remediation worker spawn failed: {e}"));
@@ -11545,7 +11416,7 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            false
+            RemediationSpawnOutcome::ProvisionFailed
         }
     }
 }

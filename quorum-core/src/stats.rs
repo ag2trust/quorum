@@ -1379,7 +1379,10 @@ fn deduped_errors(conn: &Connection, now: i64) -> Result<(Vec<DedupedError>, i64
     Ok((recent, older))
 }
 
-/// Owner-alert messages from the last 12 hours for the ALERTS cockpit section (#88).
+/// Owner-alert messages from the last 12 hours plus synthetic health alerts for
+/// terminal tasks that still carry runnable daemon retry state.  The latter is
+/// intentionally read-only so `quorum status` exposes latent corruption before
+/// daemon startup reconciliation gets a chance to clean it.
 fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
     let window_start = now - ALERT_WINDOW_SECS;
     let mut stmt = conn.prepare(
@@ -1389,7 +1392,7 @@ fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
          ORDER BY ts DESC
          LIMIT 10",
     )?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map(params![now, window_start], |r| {
             Ok(AlertMessage {
                 body: r.get(0)?,
@@ -1399,6 +1402,48 @@ fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() < 10 {
+        let remaining = (10 - rows.len()) as i64;
+        let mut terminal = conn.prepare(
+            "SELECT id, status, updated_at FROM tasks
+             WHERE status IN ('done','failed','cancelled')
+               AND json_valid(refs)
+               AND (
+                   json_type(refs, '$.daemon_rework_retry_requested')='true'
+                   OR json_type(refs, '$.daemon_parked_head_check')='true'
+                   OR (
+                       status IN ('done','cancelled')
+                       AND (
+                           json_type(refs, '$.daemon_parked') IS NOT NULL
+                           OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                       )
+                   )
+                   OR (
+                       status='failed'
+                       AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                       AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+                   )
+               )
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let corrupt = terminal
+            .query_map(params![remaining], |row| {
+                let id = row.get::<_, i64>(0)?;
+                let status = row.get::<_, String>(1)?;
+                let updated_at = row.get::<_, i64>(2)?;
+                Ok(AlertMessage {
+                    body: format!(
+                        "task #{id} is terminal ({status}) but carries runnable daemon retry markers"
+                    ),
+                    refs: Some(format!("task#{id}")),
+                    age_secs: (now - updated_at).max(0),
+                    kind: "critical".into(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.extend(corrupt);
+    }
     Ok(rows)
 }
 
@@ -3101,6 +3146,43 @@ mod tests {
         let after_window = stats(&c, now + 2, crate::agents::ONLINE_WINDOW_SECS).unwrap();
         assert!(after_window.alerts.is_empty());
         assert_eq!(after_window.health, HealthVerdict::OnTrack);
+    }
+
+    #[test]
+    fn terminal_runnable_retry_marker_is_a_health_alert_until_reconciled() {
+        let (_d, mut c) = open_tmp();
+        let now = 100_000;
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "legacy terminal retry",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"daemon_parked":true,"daemon_resume_status":"rework",
+                    "daemon_rework_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            now - 10,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", params![id])
+            .unwrap();
+
+        let before = stats(&c, now, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(before.health, HealthVerdict::Attention);
+        assert!(before.alerts.iter().any(|alert| {
+            alert.kind == "critical"
+                && alert.body.contains(&format!("task #{id}"))
+                && alert.body.contains("runnable daemon retry markers")
+        }));
+
+        crate::tasks::reconcile_terminal_retry_markers(&mut c, now + 1).unwrap();
+        let after = stats(&c, now + 1, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(after.alerts.is_empty());
+        assert_eq!(after.health, HealthVerdict::OnTrack);
     }
 
     #[test]
