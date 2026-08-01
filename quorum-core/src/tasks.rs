@@ -2811,7 +2811,7 @@ pub fn reconcile_terminal_retry_markers(conn: &mut Connection, now: i64) -> Resu
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
         let mut stmt = tx.prepare(
-            "SELECT id FROM tasks
+            "SELECT id FROM tasks INDEXED BY tasks_terminal_retry_id
              WHERE status IN ('done','failed','cancelled')
                AND json_valid(refs)
                AND (
@@ -2842,16 +2842,19 @@ pub fn reconcile_terminal_retry_markers(conn: &mut Connection, now: i64) -> Resu
     for id in &ids {
         let changed = tx.execute(
             "UPDATE tasks
-             SET refs=CASE status
-                   WHEN 'failed' THEN json_remove(
+             SET refs=CASE
+                   WHEN status='failed'
+                    AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) = 1
+                   THEN json_remove(
+                       refs,
+                       '$.daemon_rework_retry_requested',
+                       '$.daemon_parked_head_check'
+                   )
+                   WHEN status='failed' THEN json_remove(
                        refs,
                        '$.daemon_rework_retry_requested',
                        '$.daemon_parked_head_check',
-                       CASE
-                           WHEN COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
-                           THEN '$.daemon_resume_status'
-                           ELSE '$.__quorum_noop'
-                       END
+                       '$.daemon_resume_status'
                    )
                    ELSE json_remove(
                        refs,
@@ -5797,6 +5800,7 @@ mod tests {
             "daemon_resume_status": "rework",
             "daemon_rework_retry_requested": true,
             "remediation_feedback": "blocking feedback",
+            "__quorum_noop": "retain",
             "pr": 478
         });
         let failed = create(
@@ -5869,6 +5873,10 @@ mod tests {
         assert!(failed_refs.get(PARKED_REWORK_RETRY_REF).is_none());
         assert_eq!(failed_refs["pr"], 478);
         assert_eq!(failed_refs["remediation_feedback"], "blocking feedback");
+        assert_eq!(
+            failed_refs["__quorum_noop"], "retain",
+            "reconciliation must preserve unrelated creator refs"
+        );
 
         for (id, status) in terminal_ids {
             let task = get(&c, id).unwrap().unwrap();

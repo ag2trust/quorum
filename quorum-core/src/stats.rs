@@ -1390,7 +1390,8 @@ fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
     // for it before ordinary persisted alerts, especially during alert-heavy
     // incidents.
     let mut terminal = conn.prepare(
-        "SELECT id, status, updated_at FROM tasks
+        "SELECT id, status, updated_at
+         FROM tasks INDEXED BY tasks_terminal_retry_recent
          WHERE status IN ('done','failed','cancelled')
            AND json_valid(refs)
            AND (

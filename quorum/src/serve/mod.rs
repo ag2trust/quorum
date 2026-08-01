@@ -11047,6 +11047,25 @@ async fn spawn_remediation_worker(
             return Ok(RemediationSpawnOutcome::ClaimLost);
         }
         Err(error) => {
+            let p = db_path.clone();
+            let name = agent_name.clone();
+            if let Err(release_error) = tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&p)?;
+                tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+            })
+            .await
+            .map_err(|join_error| {
+                QuorumError::Io(format!(
+                    "remediation lease release join for task #{task_id}: {join_error}"
+                ))
+            })
+            .and_then(|result| result)
+            {
+                log(&format!(
+                    "FATAL: remediation claim revalidation failed for task #{task_id}: {error}; \
+                     lease release also failed: {release_error}"
+                ));
+            }
             name_pool.release(&agent_name);
             return Err(error);
         }
