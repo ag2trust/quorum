@@ -1,40 +1,41 @@
 # Quorum
 
-**A local manager for teams of AI coding agents.**
-
-Quorum turns a repo-local task queue into a managed pipeline:
+Quorum is a local tool I use to run coding agents through implementation, review, rework,
+and merge:
 
 ```text
-task → implementation agent → review agent → merge
-                         ↖ rework ↙
+task → worker → review → merge
+             ↖ rework ↙
 ```
 
-One `quorum serve` daemon chooses work, provisions isolated worktrees, keeps workers and
-reviewers attached across rework, and merges approved PRs. One SQLite file per repo is the
-source of truth. The CLI creates work, reports state, and lets managed agents signal the
-daemon.
+It is built for agents first. The human interface is mostly `quorum status`, a small local
+dashboard, and the occasional intervention when an agent or provider gets stuck.
 
-There is no web UI, network coordination service, or auth layer. Quorum is local and
-agent-first; `quorum status` is the small human-readable window into it.
+This is not a polished or stable product. It follows my own workflow, assumes Git, GitHub,
+local credentials, and capable coding agents, and has sharp edges. Commands, prompts,
+configuration, database schemas, and existing behavior may change without notice. If it is
+useful to you, great—but there are no compatibility or support guarantees.
 
-## Why Quorum
+## What it does
 
-- **Atomic:** SQLite transactions prevent double assignment under concurrent processes.
-- **Fail-safe:** stable exit codes and JSON errors make failures loud and branchable.
-- **Managed:** the daemon owns claiming, leases, review, rework, and merge.
-- **Recoverable:** expired leases and supervised restarts keep work from stranding.
-- **Cheap:** agents receive focused task context instead of repeatedly scanning a shared log.
+One `quorum serve` process manages a repository-local task queue. It chooses work,
+provisions isolated worktrees, starts Claude or Codex agents, sends completed changes
+through independent review, and merges approved PRs. SQLite is the local source of truth.
+
+Agents are expected to do most of the work. Quorum provides atomic assignment and a
+bounded lifecycle, but it cannot make an agent correct, recover unavailable credentials,
+or turn an unclear task into a good implementation.
 
 ## Install
 
-Prebuilt binary (macOS and Linux, no Rust toolchain):
+Prebuilt binary on macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ag2trust/quorum/main/install.sh | sh
 quorum init
 ```
 
-Or build from source:
+Or build it:
 
 ```sh
 cargo build --release
@@ -42,155 +43,94 @@ cp target/release/quorum ~/.local/bin/
 quorum init
 ```
 
-The binary statically links SQLite. State lives at
-`~/.quorum/repos/<owner>__<name>/quorum.db`.
+State lives under `~/.quorum/repos/<owner>__<name>/`.
 
-## Run the manager
+## Start it
 
-For this repository, the supervised launcher is recommended because it rebuilds and
-restarts after Quorum merges an update to itself:
+For a normal repository:
 
 ```sh
-scripts/serve-supervisor.sh \
+quorum serve \
   --repo owner/name \
   --repo-dir /path/to/repo \
-  --worktree-base /path/to/worktrees \
-  --cap 4 \
-  --self-update-drain
+  --worktree-base /path/to/worktrees
 ```
 
-For a basic launch, use `quorum serve --help` to see configuration flags. Only one daemon
-may hold a repo database; a second live daemon fails loudly.
+Use `quorum serve --help` for provider, model, concurrency, and budget settings. This repo
+uses `scripts/serve-supervisor.sh` so Quorum can rebuild and restart after updating itself.
+Only one daemon can manage a repository database at a time.
 
-## Create work
+## Give it work
 
-If implementation is needed, create a normal task. The daemon will select it and spawn a
-managed worker:
+There are three task entry modes.
+
+Start a new implementation from the configured base branch:
 
 ```sh
 quorum task-create \
   --created-by coordinator \
   --title "Add retry telemetry" \
-  --labels '["type:observability","area:status"]' \
   --body-stdin <<'EOF'
 Record retry counts in the status JSON and cover the failure path.
 EOF
 ```
 
-If a PR already exists and only needs review and merge, use `--review-pr`:
+Continue work on the exact current head of an existing PR:
 
 ```sh
 quorum task-create \
   --created-by coordinator \
-  --title "Review and merge PR #412" \
-  --review-pr 412 \
-  --labels '["type:review"]' \
-  --body-stdin <<'EOF'
-Review the existing PR and drive it through merge.
-EOF
-```
-
-A review-only task has no implementation worker. If review requests changes, the outside
-PR author must update the branch and create a new review request as needed; the task may
-fail because Quorum cannot assign rework. Merge conflicts likewise require the outside
-author to update the PR before review/merge can continue.
-
-If implementation must continue from an existing PR, use `--continue-pr` instead:
-
-```sh
-quorum task-create \
-  --created-by coordinator \
-  --title "Continue implementation of PR #412" \
+  --title "Finish PR #412" \
   --continue-pr 412 \
-  --labels '["type:implementation"]' \
   --body-stdin <<'EOF'
-Finish the existing implementation and verify the complete result.
+Finish the implementation and verify the complete result.
 EOF
 ```
 
-`--continue-pr` creates an implementation task at the exact head of an open PR in the
-managed repository. The daemon publishes the worker's result back to that PR only while
-its recorded branch and head SHA still match; concurrent movement fails closed rather
-than silently falling back to a new branch or PR. `--continue-pr` and `--review-pr` are
-mutually exclusive. Generic task refs are metadata, not publication authority, and task
-creators must not supply `refs.pr` to emulate either mode.
-
-Task creators describe scope and acceptance criteria but do not select complexity, model,
-or effort. The daemon classifies each task before dispatch and applies its configured
-provider's routing table. Labels beginning with `complexity:`, `tier:`, or `effort:` are
-rejected. Complexity-5 tasks are classified and then durably parked without an agent run;
-split or rescope them into smaller replacement tasks. Retrying the unchanged parked task
-is a clean negative.
-
-## Watch progress
+Review and merge a PR whose implementation is already complete:
 
 ```sh
-quorum status                 # compact human view
-quorum status --json          # machine-readable health
-quorum task-list --brief      # token-cheap queue summary
+quorum task-create \
+  --created-by coordinator \
+  --title "Review PR #412" \
+  --review-pr 412 \
+  --body-stdin <<'EOF'
+Review the existing implementation and merge it if it is sound.
+EOF
+```
+
+`--continue-pr` creates a managed worker from the recorded PR head. `--review-pr` skips the
+worker and starts with review. They are mutually exclusive. If a review-only PR needs code
+changes, its outside author must update it; Quorum has no managed worker for that task.
+
+Give implementation tasks a concrete outcome, relevant constraints, and a way to verify
+the result. The daemon chooses complexity, model, and effort. Managed agents receive their
+assignment directly; they do not poll or claim tasks.
+
+## See what is happening
+
+```sh
+quorum status                 # terminal overview
+quorum web                    # loopback-only dashboard
+quorum task-list --brief      # queue summary
 quorum task-get --task-id 42  # full task and notes
-quorum log --refs task#42     # lifecycle history
-quorum tail --agent Agent-42  # managed session output
+quorum log --refs task#42     # lifecycle events
+quorum tail Agent-42          # one managed session
 ```
 
-Managed agents do not poll or claim work. Their prompt contains the assignment, branch,
-and worktree. Workers hand off a PR with `quorum submit`; reviewers submit an attested
-verdict. The daemon performs the state transitions and merge.
+Use `quorum <command> --help` for exact flags and `quorum help` for the current workflow.
+Most commands emit JSON. Exit codes are `0` for success, `1` for an expected negative
+result, `2` for bad input, and `3` for an internal or database failure.
 
-## Messages and safe text
+## Working on Quorum
 
-The feed contains agent-authored messages; the event log contains state changes emitted by
-Quorum. Use `read` for “what did agents say?” and `log` for “what changed?”
-
-Free text always travels through stdin or a file, not a shell flag:
-
-```sh
-quorum post --agent coordinator --kind info --body-stdin <<'EOF'
-anything "goes": $vars, `backticks`, and multiple lines
-EOF
-```
-
-Input must be valid UTF-8 without NUL bytes. Quorum binds text as SQLite parameters and
-emits JSON.
-
-## Command discovery and exit codes
-
-Run `quorum help` for the workflow cheat-sheet and `quorum <command> --help` for exact
-flags. `help-agent` remains a compatibility alias.
-
-| Code | Meaning |
-|---:|---|
-| `0` | Success |
-| `1` | Clean negative result (nothing available, not holder) |
-| `2` | Usage or invalid input |
-| `3` | Internal, database, or migration error |
-
-## How it works
-
-Every CLI invocation opens the repo database, migrates if needed, performs one atomic
-operation, prints JSON, and exits. The long-lived daemon drives the task state machine:
-
-```text
-open → working → in-review → merging → done
-           ↑          ↕
-           └────── rework
-```
-
-SQLite WAL mode, `BEGIN IMMEDIATE`, guarded updates, and partial unique indexes provide
-cross-process atomicity. Expiring rows are filtered by time before physical cleanup, and a
-single-daemon lease prevents competing managers.
-
-The full invariants and transition table live in
-[`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md).
-
-## Development
+Contributor and agent instructions live in [`AGENTS.md`](AGENTS.md). The design record is
+[`docs/2026-06-23-quorum-design.md`](docs/2026-06-23-quorum-design.md). Run the full gate
+before submitting any change:
 
 ```sh
 ./preflight.sh
 ```
-
-That gate checks the branch base, formatting, clippy, and the full test suite, including
-the multi-process claim-race canary. Contributor rules are in [`AGENTS.md`](AGENTS.md).
 
 ## License
 

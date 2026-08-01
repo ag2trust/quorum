@@ -98,9 +98,10 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\
-         - The `--feedback` string is a lifecycle-signal summary; the authoritative \
+         - One or more blocking findings: write a short blocker summary to a temp file, then \
+         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
+         --feedback-file <path>\n\
+         - The feedback file is a lifecycle-signal summary; the authoritative \
          findings must already be on the PR.\n\
          - Never signal approved for a review whose own text says changes are needed \
          before merge.\n\
@@ -231,9 +232,10 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\
-         - The `--feedback` string is a lifecycle-signal summary; the authoritative \
+         - One or more blocking findings: write a short blocker summary to a temp file, then \
+         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
+         --feedback-file <path>\n\
+         - The feedback file is a lifecycle-signal summary; the authoritative \
          findings must already be on the PR.\n\
          - Never signal approved for a review whose own text says changes are needed \
          before merge.\n\
@@ -323,9 +325,10 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\
-         - The `--feedback` string is a lifecycle-signal summary; the authoritative \
+         - One or more blocking findings: write a short blocker summary to a temp file, then \
+         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
+         --feedback-file <path>\n\
+         - The feedback file is a lifecycle-signal summary; the authoritative \
          findings must already be on the PR.\n\
          - Never signal approved for a review whose own text says changes are needed \
          before merge.\n\
@@ -413,9 +416,10 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\
-         - The `--feedback` string is a lifecycle-signal summary; the authoritative \
+         - One or more blocking findings: write a short blocker summary to a temp file, then \
+         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
+         --feedback-file <path>\n\
+         - The feedback file is a lifecycle-signal summary; the authoritative \
          findings must already be on the PR.\n\
          - Never signal approved for a review whose own text says changes are needed \
          before merge.\n\
@@ -541,9 +545,10 @@ pub fn build_rereview_turn(
          - Classify every finding as BLOCKING or advisory.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
-         - One or more blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict changes --blocking <count> --feedback \"<the blocking findings>\"\n\
-         - The `--feedback` string is a lifecycle-signal summary; the authoritative \
+         - One or more blocking findings: write a short blocker summary to a temp file, then \
+         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
+         --feedback-file <path>\n\
+         - The feedback file is a lifecycle-signal summary; the authoritative \
          findings must already be on the PR.\n\n\
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \

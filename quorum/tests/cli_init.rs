@@ -259,7 +259,8 @@ fn upgrade_replaces_stale_skill() {
         "embedded skill must mention quorum"
     );
     assert!(
-        after.contains("Transferring implementation responsibility outside Quorum"),
+        after.contains("cancel that task before external")
+            && after.contains("create a new `--review-pr` task"),
         "embedded skill must document external transfer protocol"
     );
 }
