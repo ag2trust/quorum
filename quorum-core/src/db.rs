@@ -505,6 +505,12 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             }
         }
 
+        // v36 = indexed corrupt terminal retry candidates (#270). The two
+        // partial indexes are created by SCHEMA_SQL: one supports the daemon's
+        // oldest-first bounded reconciliation batch, and one supports the
+        // newest-first bounded status projection. A live v35 database must run
+        // SCHEMA_SQL once so both indexes are materialized.
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -636,6 +642,131 @@ mod tests {
 
         let reopened = open(&path).unwrap();
         assert!(column_exists(&reopened, "tasks", "continue_pr").unwrap());
+    }
+
+    #[test]
+    fn migrates_v35_to_v36_adds_bounded_terminal_retry_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v35.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            apply_pragmas(&conn).unwrap();
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE TABLE tasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     title TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     priority INTEGER NOT NULL DEFAULT 0,
+                     created_by TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     refs TEXT
+                 );
+                 INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
+                     VALUES
+                     ('clean terminal','done','boss',1,1,'{\"pr\":1}'),
+                     ('corrupt terminal','failed','boss',2,2,
+                      '{\"daemon_rework_retry_requested\":true}'),
+                     ('malformed refs','cancelled','boss',3,3,'{');
+                 PRAGMA user_version = 35;
+                 COMMIT;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index'
+                   AND name IN ('tasks_terminal_retry_id',
+                                'tasks_terminal_retry_recent')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index_count, 2,
+            "v35 database must gain both candidate indexes"
+        );
+
+        let predicate = "status IN ('done','failed','cancelled')
+             AND json_valid(refs)
+             AND (
+                 json_type(refs, '$.daemon_rework_retry_requested')='true'
+                 OR json_type(refs, '$.daemon_parked_head_check')='true'
+                 OR (
+                     status IN ('done','cancelled')
+                     AND (
+                         json_type(refs, '$.daemon_parked') IS NOT NULL
+                         OR json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                     )
+                 )
+                 OR (
+                     status='failed'
+                     AND json_type(refs, '$.daemon_resume_status') IS NOT NULL
+                     AND COALESCE(json_extract(refs, '$.daemon_parked'), 0) != 1
+                 )
+             )";
+        let plan = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join(" | ")
+        };
+        let reconcile_plan = plan(&format!(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM tasks INDEXED BY tasks_terminal_retry_id
+             WHERE {predicate} ORDER BY id LIMIT 8"
+        ));
+        assert!(
+            reconcile_plan.contains("tasks_terminal_retry_id"),
+            "reconciliation must use its candidate-only index: {reconcile_plan}"
+        );
+        assert!(
+            !reconcile_plan.contains("USE TEMP B-TREE"),
+            "reconciliation must not sort the candidate set: {reconcile_plan}"
+        );
+
+        let status_plan = plan(&format!(
+            "EXPLAIN QUERY PLAN
+             SELECT id,status,updated_at
+             FROM tasks INDEXED BY tasks_terminal_retry_recent
+             WHERE {predicate}
+             ORDER BY updated_at DESC,id DESC LIMIT 10"
+        ));
+        assert!(
+            status_plan.contains("tasks_terminal_retry_recent"),
+            "status must use its candidate-only index: {status_plan}"
+        );
+        assert!(
+            !status_plan.contains("USE TEMP B-TREE"),
+            "status must not sort the candidate set: {status_plan}"
+        );
+
+        let candidates: Vec<i64> = conn
+            .prepare(&format!(
+                "SELECT id FROM tasks INDEXED BY tasks_terminal_retry_id
+                 WHERE {predicate} ORDER BY id"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            candidates,
+            vec![2],
+            "clean terminal history stays outside the index"
+        );
     }
 
     #[test]
