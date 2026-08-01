@@ -79,9 +79,10 @@ VERSION="$("$BINARY" --version 2>&1)" || err "'quorum --version' failed"
 printf '  version : %s\n' "$VERSION"
 
 # 2. Required subcommands — sync is the one that was missing in the cutover incident.
-HELP="$("$BINARY" help 2>&1)" || err "'quorum help' failed"
+# Probe each command directly: `quorum help` is a curated guide, and sync is hidden
+# from the public command listing even though the daemon invokes it internally.
 for cmd in sync init status; do
-  if ! printf '%s' "$HELP" | grep -q "$cmd"; then
+  if ! "$BINARY" "$cmd" --help >/dev/null 2>&1; then
     err "installed binary lacks '$cmd' subcommand — stale build?"
   fi
 done
