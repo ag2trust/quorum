@@ -10914,6 +10914,23 @@ async fn claim_remediation_for_spawn(
     })?
 }
 
+async fn revalidate_remediation_claim_for_spawn(
+    db_path: PathBuf,
+    agent: String,
+    task_id: i64,
+) -> Result<bool> {
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::remediation_claim_still_owned(&mut conn, &agent, task_id, now_unix())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "remediation claim revalidation join for task #{task_id}: {error}"
+        ))
+    })?
+}
+
 /// Spawn a remediation worker for a task in rework with no live worker.
 /// The worker gets the existing PR, branch, blocking findings, and task body.
 /// Separates a clean lost guarded claim from an actual provisioning failure so
@@ -11013,6 +11030,28 @@ async fn spawn_remediation_worker(
             return Err(error);
         }
     };
+
+    // PR resolution is awaited after the initial claim and may take up to the
+    // bounded GitHub deadline. A creator cancellation during that interval
+    // atomically deactivates the lease. Revalidate the authoritative lifecycle
+    // state and exact live holder before feedback, worktree, capability, run,
+    // or process side effects.
+    match revalidate_remediation_claim_for_spawn(db_path.clone(), agent_name.clone(), task_id).await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            log(&format!(
+                "remediation: claim lost after PR lookup for task #{task_id} — task no longer eligible"
+            ));
+            name_pool.release(&agent_name);
+            return Ok(RemediationSpawnOutcome::ClaimLost);
+        }
+        Err(error) => {
+            name_pool.release(&agent_name);
+            return Err(error);
+        }
+    }
+
     let fallback_branch = if pr_target.is_none() {
         let fb = orphan_worker_branch(&task_author, task_id, task_review_only);
         if fb.is_none() {

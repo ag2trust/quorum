@@ -965,6 +965,38 @@ pub fn claim_remediation_rework(
     Ok(Some(task))
 }
 
+/// Daemon-private: revalidate that a remediation worker still owns the exact
+/// live rework lease it acquired before an awaited provisioning prerequisite.
+///
+/// The `BEGIN IMMEDIATE` snapshot serializes this check with creator
+/// cancellation and other lifecycle writes. Logical expiry is part of the
+/// predicate, so an expired claim is never treated as provisioning authority.
+pub fn remediation_claim_still_owned(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let owned = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM tasks t
+               JOIN claims c ON c.target = 'task#' || t.id
+              WHERE t.id=?1
+                AND t.status='rework'
+                AND t.assignee=?2
+                AND c.holder=?2
+                AND c.active=1
+                AND c.expires_at > ?3
+         )",
+        params![id, agent, now],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(owned)
+}
+
 /// Release a remediation lease on provisioning failure. Deactivates the claim
 /// and clears the assignee, leaving the task in rework for the next provisioning
 /// attempt or reaper cycle.
@@ -7858,6 +7890,46 @@ mod tests {
         let t = get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "rework", "rework must survive repeated sweeps");
         assert_eq!(t.assignee.as_deref(), Some("REM1"));
+    }
+
+    #[test]
+    fn remediation_claim_revalidation_rejects_creator_cancellation() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1200,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictChanges, 1300).unwrap();
+        claim_remediation_rework(&mut c, "REM1", id, TTL, 1400)
+            .unwrap()
+            .expect("remediation claim");
+
+        assert!(
+            remediation_claim_still_owned(&mut c, "REM1", id, 1401).unwrap(),
+            "fresh remediation lease should authorize provisioning"
+        );
+
+        cancel(&mut c, "boss", id, 1402).unwrap();
+
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "cancelled");
+        assert!(
+            !remediation_claim_still_owned(&mut c, "REM1", id, 1403).unwrap(),
+            "terminal lifecycle state must revoke provisioning authority"
+        );
     }
 
     #[test]
