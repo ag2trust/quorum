@@ -696,6 +696,35 @@ pub fn claim(
                AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
                     OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
     ))";
+    // Generated implementation work has additional graph authority. Keep this
+    // predicate in the same BEGIN IMMEDIATE transaction as the task update so
+    // sibling claims, failures, and graph blockers cannot race provisioning.
+    // Review/rework authority for an already-started child is intentionally not
+    // gated: active children may finish after a sibling fails or blocks the graph.
+    const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
+        SELECT 1 FROM task_graph_members own_member
+        WHERE own_member.task_id=tasks.id
+    ) OR EXISTS (
+        SELECT 1
+        FROM task_graph_members own_member
+        JOIN task_decompositions graph ON graph.id=own_member.graph_id
+        JOIN tasks source ON source.id=graph.source_task_id
+        WHERE own_member.task_id=tasks.id AND own_member.active=1
+          AND graph.state='active' AND graph.active=1
+          AND source.status='decomposed'
+          AND NOT EXISTS (
+              SELECT 1 FROM task_graph_members sibling_member
+              JOIN tasks sibling ON sibling.id=sibling_member.task_id
+              WHERE sibling_member.graph_id=own_member.graph_id
+                AND sibling_member.active=1 AND sibling.status='failed'
+          )
+          AND 2 > (
+              SELECT COUNT(*) FROM task_graph_members sibling_member
+              JOIN tasks sibling ON sibling.id=sibling_member.task_id
+              WHERE sibling_member.graph_id=own_member.graph_id
+                AND sibling_member.active=1 AND sibling.status='working'
+          )
+    ))";
 
     let mut task = match task_id {
         Some(id) => tx
@@ -718,7 +747,8 @@ pub fn claim(
                        AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                        AND {CONTINUE_PR_UNOWNED_CLAUSE}
                        AND (
-                         (status='open' AND {DEP_READY_CLAUSE})
+                         (status='open' AND {DEP_READY_CLAUSE}
+                            AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
                          OR (status='in-review' AND reviewer IS NULL \
                              AND (author IS NULL OR author != ?1))
                      )
@@ -741,7 +771,8 @@ pub fn claim(
                    AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                    AND {CONTINUE_PR_UNOWNED_CLAUSE}
                    AND (
-                    (status='open' AND {DEP_READY_CLAUSE})
+                    (status='open' AND {DEP_READY_CLAUSE}
+                       AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
                     OR (status='in-review' AND reviewer IS NULL \
                         AND (author IS NULL OR author != ?1))
                 )"
@@ -757,7 +788,14 @@ pub fn claim(
                 }
                 selector.push(')');
             }
-            selector.push_str(" ORDER BY priority DESC, id ASC LIMIT 1");
+            selector.push_str(
+                " ORDER BY
+                    CASE WHEN status='open' AND EXISTS (
+                        SELECT 1 FROM task_graph_members graph_priority
+                        WHERE graph_priority.task_id=tasks.id AND graph_priority.active=1
+                    ) THEN 0 ELSE 1 END,
+                    priority DESC, id ASC LIMIT 1",
+            );
 
             let sql = format!(
                 "UPDATE tasks SET
@@ -3104,6 +3142,7 @@ pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -
         &format!("closed on merge (recovery): {note}"),
         now,
     )?;
+    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
     tx.commit()?;
     Ok(true)
 }
