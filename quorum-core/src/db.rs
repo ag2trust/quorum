@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 38;
+pub const SCHEMA_VERSION: i64 = 39;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -538,6 +538,36 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                     [],
                 )?;
             }
+        }
+
+        // v39 makes decomposition cleanup crash-recoverable. SQLite cannot
+        // alter a CHECK constraint, so rebuild the table under the same write
+        // lock. Historical `complete` rows remain terminal; historical
+        // `failed` rows become retryable pending work.
+        if current < 39 {
+            conn.execute_batch(
+                "CREATE TABLE decomposition_cleanup_v39 (
+                     graph_id       INTEGER NOT NULL REFERENCES task_decompositions(id),
+                     task_id        INTEGER NOT NULL REFERENCES tasks(id),
+                     artifact_kind  TEXT NOT NULL,
+                     artifact_ref   TEXT NOT NULL,
+                     state          TEXT NOT NULL DEFAULT 'pending'
+                                          CHECK(state IN ('pending','running','done','exhausted')),
+                     attempts       INTEGER NOT NULL DEFAULT 0,
+                     last_error     TEXT,
+                     updated_at     INTEGER NOT NULL,
+                     PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
+                 );
+                 INSERT INTO decomposition_cleanup_v39(
+                     graph_id,task_id,artifact_kind,artifact_ref,state,attempts,last_error,updated_at)
+                 SELECT graph_id,task_id,artifact_kind,artifact_ref,
+                        CASE state WHEN 'complete' THEN 'done'
+                                   WHEN 'failed' THEN 'pending' ELSE state END,
+                        attempts,last_error,updated_at
+                 FROM decomposition_cleanup;
+                 DROP TABLE decomposition_cleanup;
+                 ALTER TABLE decomposition_cleanup_v39 RENAME TO decomposition_cleanup;",
+            )?;
         }
 
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;

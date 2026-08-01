@@ -1562,7 +1562,13 @@ child done. Source dependents remain blocked until then. Cancelling a source ato
 graph non-runnable, cancels unfinished children, revokes authority, and records idempotent cleanup
 intents. The daemon then stops processes and closes/removes only unmerged, revocable artifacts.
 Lifecycle history, reviews, and merged delivery records remain. Direct child cancellation is
-rejected.
+rejected. Cleanup intent execution is a durable lease state machine
+(`pending -> running -> done|pending|exhausted`) with a three-attempt cap. Startup returns an
+interrupted running lease to pending below the cap and exhausts it at the cap. Claims are atomic,
+require a cancelled inactive graph and current graph membership, and preserve per-task action
+order: process, proposed change, worktree, then branch. Malformed, unknown, or oversized persisted
+intents exhaust loudly without external execution; completion and failure are guarded by the
+claimed attempt so stale workers cannot settle a newer lease.
 
 Task revisions use compare-and-swap edits. An accepted pre-materialization edit invalidates
 pending classification/planning and restarts admission; stale/replayed edits do not count. The
