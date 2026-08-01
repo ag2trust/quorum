@@ -120,6 +120,12 @@ impl ServeHandle {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
         assert!(self.child.wait().unwrap().success());
     }
+
+    fn crash_mut(&mut self) {
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL) };
+        let status = self.child.wait().unwrap();
+        assert!(!status.success());
+    }
 }
 
 struct Case {
@@ -142,19 +148,24 @@ impl Case {
         labels: Option<&str>,
         role_config: Option<&str>,
     ) -> Self {
-        Self::start_with_review_pr(default_provider, model, labels, role_config, None)
+        Self::start_with_pr_assignment(default_provider, model, labels, role_config, None, None)
     }
 
     fn start_review_only(default_provider: &str, model: &str) -> Self {
-        Self::start_with_review_pr(default_provider, model, None, None, Some(1))
+        Self::start_with_pr_assignment(default_provider, model, None, None, Some(1), None)
     }
 
-    fn start_with_review_pr(
+    fn start_continue(default_provider: &str, model: &str, pr: i64) -> Self {
+        Self::start_with_pr_assignment(default_provider, model, None, None, None, Some(pr))
+    }
+
+    fn start_with_pr_assignment(
         default_provider: &str,
         model: &str,
         labels: Option<&str>,
         role_config: Option<&str>,
         review_pr: Option<i64>,
+        continue_pr: Option<i64>,
     ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -191,6 +202,9 @@ impl Case {
         if let Some(pr) = review_pr {
             let pr_string = pr.to_string();
             create.args(["--review-pr", &pr_string]);
+        } else if let Some(pr) = continue_pr {
+            let pr_string = pr.to_string();
+            create.args(["--continue-pr", &pr_string]);
         }
         assert!(create.status().unwrap().success());
         let db_path = home.path().join("repos/test__repo/quorum.db");
@@ -218,8 +232,12 @@ impl Case {
         // resolved PR identity before the daemon begins orphan review
         // provisioning so the test exercises the same verified-PR path as
         // production rather than a branch-name fallback.
-        if let Some(pr) = review_pr {
-            let head_ref = format!("review-pr-{pr}");
+        if let Some(pr) = review_pr.or(continue_pr) {
+            let head_ref = if review_pr.is_some() {
+                format!("review-pr-{pr}")
+            } else {
+                format!("continue-pr-{pr}")
+            };
             assert!(Command::new("git")
                 .args(["-C", &repo.path().to_string_lossy(), "branch", &head_ref])
                 .status()
@@ -233,23 +251,38 @@ impl Case {
                     .stdout,
             )
             .unwrap();
-            let mut conn =
-                quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
-            quorum_core::pr_targets::upsert(&mut conn, 1, pr, &head_ref, head_sha.trim(), false)
+            if review_pr.is_some() {
+                let mut conn =
+                    quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+                quorum_core::pr_targets::upsert(
+                    &mut conn,
+                    1,
+                    pr,
+                    &head_ref,
+                    head_sha.trim(),
+                    false,
+                )
                 .unwrap();
+            }
         }
 
         let gh_shim = tempfile::tempdir().unwrap();
         let gh_state = gh_shim.path().join("state");
         std::fs::create_dir_all(&gh_state).unwrap();
-        if let Some(pr) = review_pr {
-            std::fs::write(gh_state.join(pr.to_string()), format!("review-pr-{pr}")).unwrap();
+        if let Some(pr) = review_pr.or(continue_pr) {
+            let head_ref = if review_pr.is_some() {
+                format!("review-pr-{pr}")
+            } else {
+                format!("continue-pr-{pr}")
+            };
+            std::fs::write(gh_state.join(pr.to_string()), head_ref).unwrap();
         }
         let gh_path = gh_shim.path().join("gh");
         std::fs::write(
             &gh_path,
             r#"#!/bin/sh
 set -eu
+printf '%s\n' "$*" >> "$QUORUM_TEST_GH_STATE/calls"
 cmd="${1:-} ${2:-}"
 if [ "$cmd" = "pr create" ]; then
   shift 2
@@ -279,7 +312,7 @@ elif [ "$cmd" = "pr view" ]; then
   if [ -z "$sha" ]; then
     sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -618,6 +651,271 @@ review_effort = "high"
 classifier_model = "gpt-5.6-terra"
 classifier_effort = "medium"
 "#;
+
+#[test]
+fn continuation_worker_without_pr_publishes_with_spawn_lease() {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+
+    let (worktree, remote_branch, journal_pr, baseline_sha) = {
+        let conn = case.db();
+        let journal: (String, String, Option<i64>) = conn
+            .query_row(
+                "SELECT worktree, branch, pr FROM journal WHERE agent=?1",
+                [&worker],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 10)
+            .unwrap()
+            .expect("spawn must persist the immutable continuation baseline");
+        (journal.0, journal.1, journal.2, target.head_sha)
+    };
+    assert_eq!(journal_pr, Some(10));
+    assert_eq!(remote_branch, "continue-pr-10");
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "continuation work",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let worker_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(worker_sha, baseline_sha);
+
+    // Managed workers normally omit --pr. The live slot must retain PR #10.
+    case.done(&worker, &[]);
+    case.handle.wait_for("PR #10 ready for review");
+
+    let published_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/continue-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(published_sha, worker_sha, "existing PR head must advance");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(10));
+    let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+    assert_eq!(
+        target.head_sha, baseline_sha,
+        "publication must retain the spawn-time lease baseline"
+    );
+    drop(conn);
+
+    let gh_calls = std::fs::read_to_string(case.gh_shim.path().join("state/calls")).unwrap();
+    assert!(gh_calls.lines().any(|line| line.starts_with("pr view 10")));
+    assert!(
+        !gh_calls.lines().any(|line| line.starts_with("pr create")
+            || (line.starts_with("pr list") && line.contains("--head"))),
+        "continuation publication must never enter initial-PR routing: {gh_calls}"
+    );
+}
+
+#[test]
+fn restart_recovery_retains_journal_pr_when_worker_omits_pr() {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+
+    let (worktree, baseline_sha) = {
+        let conn = case.db();
+        let (worktree, journal_pr): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT worktree, pr FROM journal WHERE agent=?1",
+                [&worker],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(journal_pr, Some(10));
+        let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+        (worktree, target.head_sha)
+    };
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "late continuation work",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let worker_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_ne!(worker_sha, baseline_sha);
+
+    // Crash before the worker signal is observed. Startup must recover the
+    // exact journal identity even though the durable mailbox row has no PR.
+    case.handle.crash_mut();
+    case.done(&worker, &[]);
+    case.restart_after_stop("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("startup worker recovery: folded");
+
+    let published_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/continue-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(published_sha, worker_sha);
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(10));
+}
+
+#[test]
+fn continuation_publication_rejects_a_head_moved_after_spawn() {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+
+    let (worktree, baseline_sha) = {
+        let conn = case.db();
+        let worktree: String = conn
+            .query_row(
+                "SELECT worktree FROM journal WHERE agent=?1",
+                [&worker],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+        (worktree, target.head_sha)
+    };
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "continuation work",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let tree = format!("{baseline_sha}^{{tree}}");
+    let moved_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "commit-tree",
+                &tree,
+                "-p",
+                &baseline_sha,
+                "-m",
+                "racing writer",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(!moved_sha.is_empty());
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "update-ref",
+            "refs/heads/continue-pr-10",
+            &moved_sha,
+            &baseline_sha,
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    case.done(&worker, &[]);
+    case.handle.wait_for("outside publication lease");
+    case.handle.wait_for("PARKED: task #1");
+
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/continue-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_sha, moved_sha, "moved PR head must be preserved");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+    drop(conn);
+
+    let gh_calls = std::fs::read_to_string(case.gh_shim.path().join("state/calls")).unwrap();
+    assert!(
+        !gh_calls.lines().any(|line| line.starts_with("pr create")
+            || (line.starts_with("pr list") && line.contains("--head"))),
+        "a lease failure must not fall back to initial publication: {gh_calls}"
+    );
+}
 
 #[test]
 fn configurable_chatgpt_only_lifecycle_persists_role_models_and_efforts() {
