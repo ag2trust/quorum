@@ -306,7 +306,7 @@ fn oldest_candidate(tx: &Transaction<'_>) -> Result<Option<CleanupKey>> {
            AND NOT EXISTS (
                SELECT 1 FROM decomposition_cleanup prior
                WHERE prior.graph_id=c.graph_id AND prior.task_id=c.task_id
-                 AND prior.state IN ('pending','running')
+                 AND prior.state != 'done'
                  AND CASE prior.artifact_kind
                        WHEN 'process' THEN 1 WHEN 'proposed-change' THEN 2
                        WHEN 'worktree' THEN 3 WHEN 'branch-discovery' THEN 4
@@ -356,6 +356,7 @@ fn validate_key(key: &CleanupKey) -> std::result::Result<(), &'static str> {
         "proposed-change" => {
             exact(object, &["head_ref", "head_sha", "pr_number"])
                 && strings(object, &["head_ref", "head_sha"])
+                && oid(object, "head_sha")
                 && object
                     .get("pr_number")
                     .and_then(Value::as_i64)
@@ -594,18 +595,29 @@ mod tests {
             3,
         );
         assert!(claim_next(&mut conn, 4).unwrap().is_none());
-        let rows: Vec<(String, String)> = conn.prepare(
+        let rows: Vec<(String, Option<String>)> = conn.prepare(
             "SELECT state,last_error FROM decomposition_cleanup ORDER BY updated_at,artifact_kind"
         ).unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
             .collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(rows.len(), 3);
-        assert!(rows
-            .iter()
-            .all(|(state, error)| state == "exhausted" && !error.is_empty()));
+        assert_eq!(
+            rows.iter()
+                .filter(|(state, _)| state == "exhausted")
+                .count(),
+            1
+        );
+        assert!(rows.iter().any(|(state, error)| state == "exhausted"
+            && error.as_deref().is_some_and(|error| !error.is_empty())));
+        assert_eq!(
+            rows.iter()
+                .filter(|(state, error)| state == "pending" && error.is_none())
+                .count(),
+            2
+        );
     }
 
     #[test]
-    fn corrupt_branch_artifacts_exhaust_before_external_execution() {
+    fn corrupt_earlier_branch_artifact_blocks_later_external_execution() {
         let mut conn = setup();
         insert(
             &conn,
@@ -637,7 +649,7 @@ mod tests {
             claim_next(&mut conn, 4).unwrap().is_none(),
             "corrupt rows must never escape to an external runner"
         );
-        let rows: Vec<(String, i64, String)> = conn
+        let rows: Vec<(String, i64, Option<String>)> = conn
             .prepare(
                 "SELECT state,attempts,last_error FROM decomposition_cleanup ORDER BY updated_at",
             )
@@ -647,11 +659,22 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert!(rows
-            .iter()
-            .all(|(state, attempts, error)| state == "exhausted"
-                && *attempts == 0
-                && !error.is_empty()));
+        assert_eq!(
+            rows.iter()
+                .filter(|(state, attempts, error)| state == "exhausted"
+                    && *attempts == 0
+                    && error.as_deref().is_some_and(|error| !error.is_empty()))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(state, attempts, error)| state == "pending"
+                    && *attempts == 0
+                    && error.is_none())
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -667,7 +690,8 @@ mod tests {
         insert(
             &conn,
             "proposed-change",
-            r#"{"head_ref":"b","head_sha":"abc","pr_number":7}"#,
+            &serde_json::json!({"head_ref":"b","head_sha":"a".repeat(40),"pr_number":7})
+                .to_string(),
             1,
         );
         insert(&conn, "process", process_ref(), 1);
@@ -685,6 +709,49 @@ mod tests {
             .unwrap();
         conn.execute("DELETE FROM task_graph_members", []).unwrap();
         assert!(claim_next(&mut conn, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn exhausted_earlier_action_blocks_later_destructive_cleanup() {
+        let mut conn = setup();
+        insert(&conn, "process", process_ref(), 1);
+        insert(&conn, "worktree", r#"{"branch":"b","path":"/tmp/w"}"#, 2);
+        for now in [3, 4, 5] {
+            let process = claim_next(&mut conn, now).unwrap().unwrap();
+            assert_eq!(process.key.artifact_kind, "process");
+            fail(&mut conn, &process, "process identity mismatch", now + 10).unwrap();
+        }
+        assert!(claim_next(&mut conn, 20).unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM decomposition_cleanup WHERE artifact_kind='worktree'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "pending"
+        );
+    }
+
+    #[test]
+    fn malformed_proposed_change_oid_exhausts_before_execution() {
+        let mut conn = setup();
+        insert(
+            &conn,
+            "proposed-change",
+            r#"{"head_ref":"daemon/task","head_sha":"not-an-oid","pr_number":7}"#,
+            1,
+        );
+        assert!(claim_next(&mut conn, 2).unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM decomposition_cleanup WHERE artifact_kind='proposed-change'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "exhausted"
+        );
     }
 
     #[test]
@@ -768,7 +835,7 @@ mod tests {
                     'complete',1,NULL,10),
                  (1,2,'branch','{"expected_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"retry"}',
                     'failed',1,'old retryable failure',11),
-                 (1,2,'worktree','{"branch":"cap","path":"/tmp/cap"}',
+                 (1,2,'branch','{"expected_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"cap"}',
                     'failed',3,'old capped failure',12);
              PRAGMA user_version=38;
              PRAGMA foreign_keys=ON;"#,
@@ -818,8 +885,9 @@ mod tests {
                     11
                 ),
                 (
-                    "worktree".into(),
-                    r#"{"branch":"cap","path":"/tmp/cap"}"#.into(),
+                    "branch".into(),
+                    r#"{"expected_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","name":"cap"}"#
+                        .into(),
                     "pending".into(),
                     3,
                     Some("old capped failure".into()),
@@ -851,9 +919,14 @@ mod tests {
         assert_eq!(final_retry.attempt, 3);
         assert!(complete(&mut conn, &final_retry, 23).unwrap());
         assert!(claim_next(&mut conn, 24).unwrap().is_none());
-        let capped: (String, i64, String) = conn.query_row(
-            "SELECT state,attempts,last_error FROM decomposition_cleanup WHERE artifact_kind='worktree'",
-            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let capped: (String, i64, String) = conn
+            .query_row(
+                "SELECT state,attempts,last_error FROM decomposition_cleanup
+             WHERE artifact_kind='branch' AND artifact_ref LIKE '%\"name\":\"cap\"%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
         assert_eq!(
             capped,
             (
