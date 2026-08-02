@@ -40,6 +40,26 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<String>> {
+    let conn = quorum_core::db::open(db_path)?;
+    quorum_core::decomposition_review::load(&conn, task_id)?
+        .map(|context| context.to_bounded_json())
+        .transpose()
+}
+
+fn prepare_reviewer_authority(
+    db_path: &Path,
+    task_id: i64,
+    run_id: &str,
+    reviewer: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let mut conn = quorum_core::db::open(db_path)?;
+    quorum_core::decomposition_review::load_and_issue_capability(
+        &mut conn, task_id, run_id, reviewer, now,
+    )
+}
 use tokio::io::{AsyncRead, AsyncReadExt};
 use worktree::WorktreeManager;
 
@@ -4195,12 +4215,35 @@ async fn resume_reviewer_after_ci(
         return Ok(false);
     }
 
-    let rereview_turn = reviewer::build_rereview_turn(
+    let graph_context = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_graph_review_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("graph review context join: {error}")))??
+    };
+    let rereview_turn = reviewer::build_rereview_turn_with_context(
         &reviewers[reviewer_index].agent_name,
         pr,
         &workers[worker_index].agent_name,
         &config.effort,
+        graph_context.as_deref(),
     );
+    // Revalidate at the external feed boundary. This second guarded read makes
+    // any cancellation/context change during CI/prompt preparation fail loud
+    // before the sticky reviewer receives another turn.
+    let current_graph_context = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_graph_review_context(&db_path, task_id))
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("graph rereview revalidation join: {error}"))
+            })??
+    };
+    if current_graph_context != graph_context {
+        return Err(QuorumError::Io(format!(
+            "graph review authority changed before re-review feed for task #{task_id}"
+        )));
+    }
     if let Err(error) = reviewers[reviewer_index]
         .proc
         .feed_turn(&rereview_turn)
@@ -10688,44 +10731,55 @@ async fn provision_reviewer_reserved(
         worker.task_id
     ));
 
-    // #130: issue the run capability BEFORE spawning so the reviewer inherits
-    // QUORUM_RUN_ID in its environment.
+    // Atomically load generated-child scope and issue reviewer authority.
+    // Source cancellation and provisioning serialize at this transaction;
+    // stale/corrupt membership leaves no capability and spawns no process.
     let cap_run_id = uuid::Uuid::new_v4().to_string();
-    {
+    let graph_context = {
         let p = config.db_path.clone();
+        let tid = worker.task_id;
         let rid = cap_run_id.clone();
         let name = reviewer_name.clone();
-        let tid = worker.task_id;
-        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
+        let loaded = tokio::task::spawn_blocking(move || {
+            prepare_reviewer_authority(&p, tid, &rid, &name, now_unix())
         })
         .await;
-        let issue_error = match issue_res {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error),
-            Err(error) => Some(QuorumError::Io(format!("spawn_blocking join: {error}"))),
-        };
-        if let Some(e) = issue_error {
-            log(&format!(
-                "reviewer capability issue failed for task {} agent {}: {e} — tearing down provisioning",
-                worker.task_id, reviewer_name
-            ));
-            cleanup_failed_reviewer_provision(
-                config,
-                wt_mgr,
-                name_pool,
-                &reviewer_name,
-                &wt_path,
-                &branch,
-                None,
-                None,
-                None,
-            )
-            .await;
-            return Err(e);
+        match loaded {
+            Ok(Ok(context)) => context,
+            Ok(Err(error)) => {
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(error) => {
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                return Err(QuorumError::Io(format!(
+                    "graph review context join: {error}"
+                )));
+            }
         }
-    }
+    };
 
     // Build the role-appropriate prompt BEFORE spawn — Codex takes it as a
     // CLI argument while Claude receives it via stdin after spawn.
@@ -10736,7 +10790,12 @@ async fn provision_reviewer_reserved(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
+            reviewer::build_review_prompt_for_kind_with_context(
+                reviewer_kind,
+                &spec,
+                &reviewer_effort,
+                graph_context.as_deref(),
+            )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
             let spec = reviewer::R2ReviewSpec {
@@ -10745,7 +10804,12 @@ async fn provision_reviewer_reserved(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
+            reviewer::build_r2_review_prompt_for_kind_with_context(
+                reviewer_kind,
+                &spec,
+                &reviewer_effort,
+                graph_context.as_deref(),
+            )
         }
     };
 
@@ -10874,9 +10938,9 @@ async fn provision_reviewer_reserved(
                 let review_cap = cap_run_id.clone();
                 let review_head = head_sha.to_string();
                 tokio::task::spawn_blocking(move || -> Result<i64> {
-                    let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_reviewer_with_launch(
-                        &conn,
+                    let mut conn = quorum_core::db::open(&p)?;
+                    quorum_core::decomposition_review::persist_reviewer_run_if_current(
+                        &mut conn,
                         tid,
                         &name,
                         &m,
@@ -18029,5 +18093,34 @@ mod tests {
 
         let not_a_repo = tempfile::tempdir().unwrap();
         assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+    }
+
+    #[test]
+    fn reviewer_context_wiring_fails_closed_for_noncurrent_graph_plan() {
+        let (dir, conn, _graph, child, _mailbox_id, _row) = graph_blocker_fixture("reviewer", true);
+        drop(conn);
+        let db = dir.path().join("blocker.db");
+        assert!(prepare_reviewer_authority(&db, child, "new-cap", "NewReviewer", 10).is_err());
+        let conn = quorum_core::db::open(&db).unwrap();
+        let capabilities: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM run_capabilities WHERE run_id='new-cap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE agent_name='NewReviewer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let attached: Option<String> = conn
+            .query_row("SELECT reviewer FROM tasks WHERE id=?1", [child], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!((capabilities, runs, attached.as_deref()), (0, 0, Some("R")));
     }
 }
