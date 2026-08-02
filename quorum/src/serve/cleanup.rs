@@ -216,7 +216,7 @@ async fn cleanup_process(
         serde_json::from_str(&work.key.artifact_ref).map_err(|e| e.to_string())?;
     if let Some(live) = live {
         if kill_matching_live_slot(live, work.key.task_id, &identity).await? {
-            delete_process_journal(&config.db_path, work.key.task_id, &identity).await?;
+            settle_process_identity(&config.db_path, work.key.task_id, &identity).await?;
             return Ok(());
         }
     }
@@ -249,7 +249,7 @@ async fn kill_matching_live_slot(
     Ok(false)
 }
 
-async fn delete_process_journal(
+async fn settle_process_identity(
     db_path: &Path,
     task: i64,
     identity: &ProcessRef,
@@ -259,11 +259,30 @@ async fn delete_process_journal(
     let session = identity.session_id.clone();
     let pid = identity.pid;
     tokio::task::spawn_blocking(move || {
-        let conn = quorum_core::db::open(&path)?;
-        conn.execute(
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let role = tx
+            .query_row(
+                "SELECT role FROM journal
+                 WHERE agent=?1 AND task_id=?2 AND session_id=?3 AND pid=?4",
+                rusqlite::params![agent, task, session, pid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(role) = role else {
+            tx.commit()?;
+            return Ok::<_, QuorumError>(());
+        };
+        tx.execute(
+            "UPDATE agent_runs SET ended_at=?1,end_reason='cancelled'
+             WHERE task_id=?2 AND agent_name=?3 AND role=?4 AND ended_at IS NULL",
+            rusqlite::params![quorum_core::clock::now(), task, agent, role],
+        )?;
+        tx.execute(
             "DELETE FROM journal WHERE agent=?1 AND task_id=?2 AND session_id=?3 AND pid=?4",
             rusqlite::params![agent, task, session, pid],
         )?;
+        tx.commit()?;
         Ok::<_, QuorumError>(())
     })
     .await
@@ -323,18 +342,7 @@ async fn cleanup_process_at(db_path: &Path, work: &CleanupWork) -> std::result::
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let path = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let conn = quorum_core::db::open(&path)?;
-        conn.execute(
-            "DELETE FROM journal WHERE agent=?1 AND task_id=?2 AND session_id=?3 AND pid=?4",
-            rusqlite::params![identity.agent, task, identity.session_id, pid],
-        )?;
-        Ok::<_, QuorumError>(())
-    })
-    .await
-    .map_err(|e| format!("process journal cleanup join: {e}"))?
-    .map_err(|e| e.to_string())
+    settle_process_identity(db_path, task, &identity).await
 }
 
 async fn cleanup_pr(config: &ServeConfig, work: &CleanupWork) -> std::result::Result<(), String> {
@@ -513,6 +521,17 @@ fn validate_worktree_path(base: &Path, path: &Path) -> std::result::Result<(), S
         .map_err(|e| format!("canonicalize cleanup worktree parent: {e}"))?;
     if canonical_parent != canonical_base {
         return Err("cleanup worktree parent resolves outside configured base".into());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            let canonical_path = std::fs::canonicalize(path)
+                .map_err(|e| format!("canonicalize cleanup worktree path: {e}"))?;
+            if canonical_path.parent() != Some(canonical_base.as_path()) {
+                return Err("cleanup worktree resolves outside configured base".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("inspect cleanup worktree path: {error}")),
     }
     Ok(())
 }
@@ -826,6 +845,21 @@ mod tests {
     }
 
     #[test]
+    fn symlinked_worktree_cannot_escape_configured_base() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("quorum-wt");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let escaped = base.join("task-1");
+        symlink(&outside, &escaped).unwrap();
+        assert!(validate_worktree_path(&base, &escaped)
+            .unwrap_err()
+            .contains("outside configured base"));
+    }
+
+    #[test]
     fn existing_unregistered_worktree_fails_loud() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("existing");
@@ -886,6 +920,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("q.db");
         let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (22,'cancelled child','cancelled','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let run_id = quorum_core::agent_runs::insert(
+            &conn, 22, "worker-a", "worker", "test", "medium", "codex", 1,
+        )
+        .unwrap();
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .process_group(0)
@@ -912,7 +956,73 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT ended_at IS NOT NULL,end_reason FROM agent_runs WHERE id=?1",
+                [run_id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            (true, "cancelled".into())
+        );
         cleanup_process_at(&db_path, &work).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_process_settlement_closes_only_matching_role_before_journal_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (22,'cancelled child','cancelled','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let worker_run = quorum_core::agent_runs::insert(
+            &conn, 22, "agent-a", "worker", "test", "medium", "codex", 1,
+        )
+        .unwrap();
+        let reviewer_run = quorum_core::agent_runs::insert(
+            &conn, 22, "agent-a", "reviewer", "test", "medium", "codex", 2,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO journal(agent,role,task_id,session_id,phase,pid,updated_at)
+             VALUES ('agent-a','worker',22,'session-a','working',12345,1)",
+            [],
+        )
+        .unwrap();
+        let identity = ProcessRef {
+            agent: "agent-a".into(),
+            session_id: "session-a".into(),
+            pid: 12345,
+        };
+        settle_process_identity(&db_path, 22, &identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT ended_at IS NOT NULL,end_reason FROM agent_runs WHERE id=?1",
+                [worker_run],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            (true, "cancelled".into())
+        );
+        assert!(conn
+            .query_row(
+                "SELECT ended_at IS NULL FROM agent_runs WHERE id=?1",
+                [reviewer_run],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM journal", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1001,6 +1111,10 @@ mod tests {
             .unwrap();
         let stale_pid = stale_child.id() as i32;
         conn.execute("INSERT INTO journal(agent,role,task_id,session_id,phase,pid,updated_at) VALUES ('worker-a','worker',2,'session-a','working',?1,9)", [stale_pid]).unwrap();
+        let stale_run_id = quorum_core::agent_runs::insert(
+            &conn, 2, "worker-a", "worker", "test", "medium", "codex", 9,
+        )
+        .unwrap();
         let process_ref = serde_json::json!({
             "agent":"worker-a", "session_id":"session-a", "pid":stale_pid
         })
@@ -1122,6 +1236,15 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT ended_at IS NOT NULL,end_reason FROM agent_runs WHERE id=?1",
+                [stale_run_id],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            (true, "cancelled".into())
         );
         assert_eq!(
             conn.query_row(
