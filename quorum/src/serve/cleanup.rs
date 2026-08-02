@@ -526,8 +526,11 @@ fn validate_worktree_path(base: &Path, path: &Path) -> std::result::Result<(), S
         Ok(_) => {
             let canonical_path = std::fs::canonicalize(path)
                 .map_err(|e| format!("canonicalize cleanup worktree path: {e}"))?;
-            if canonical_path.parent() != Some(canonical_base.as_path()) {
-                return Err("cleanup worktree resolves outside configured base".into());
+            let basename = path
+                .file_name()
+                .ok_or_else(|| "cleanup worktree path has no basename".to_string())?;
+            if canonical_path != canonical_base.join(basename) {
+                return Err("cleanup worktree resolves to a different canonical child".into());
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -856,7 +859,22 @@ mod tests {
         symlink(&outside, &escaped).unwrap();
         assert!(validate_worktree_path(&base, &escaped)
             .unwrap_err()
-            .contains("outside configured base"));
+            .contains("different canonical child"));
+    }
+
+    #[test]
+    fn symlinked_worktree_cannot_alias_another_child() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("quorum-wt");
+        let other = base.join("task-2");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let aliased = base.join("task-1");
+        symlink(&other, &aliased).unwrap();
+        assert!(validate_worktree_path(&base, &aliased)
+            .unwrap_err()
+            .contains("different canonical child"));
     }
 
     #[test]
