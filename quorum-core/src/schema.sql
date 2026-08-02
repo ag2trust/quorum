@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 38). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 41). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -211,7 +211,7 @@ CREATE TABLE IF NOT EXISTS decomposition_cleanup (
     artifact_kind  TEXT NOT NULL,
     artifact_ref   TEXT NOT NULL,
     state          TEXT NOT NULL DEFAULT 'pending'
-                       CHECK(state IN ('pending','complete','failed')),
+                       CHECK(state IN ('pending','running','done','exhausted')),
     attempts       INTEGER NOT NULL DEFAULT 0,
     last_error     TEXT,
     updated_at     INTEGER NOT NULL,
@@ -294,7 +294,10 @@ CREATE TABLE IF NOT EXISTS task_branches (
     branch       TEXT NOT NULL UNIQUE,
     worktree     TEXT NOT NULL,
     allocated_by TEXT NOT NULL,
-    allocated_at INTEGER NOT NULL
+    allocated_at INTEGER NOT NULL,
+    -- Immutable base/provenance commit captured before provisioning. It is
+    -- not necessarily the later deletion SHA after a worker commits.
+    provenance_sha TEXT
 );
 CREATE INDEX IF NOT EXISTS task_branches_task ON task_branches(task_id);
 
@@ -429,7 +432,12 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     sub_role    TEXT,
     -- v31: resolved provider for this run ('claude' or 'codex'). NULL for
     -- pre-existing rows (implies Claude). Recovery must use this, not re-resolve.
-    provider    TEXT
+    provider    TEXT,
+    -- v41: immutable daemon-captured reviewer launch authority. All three are
+    -- NULL for workers and historical reviewer rows.
+    review_cap_run_id TEXT,
+    review_pr         INTEGER,
+    review_head_sha   TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 

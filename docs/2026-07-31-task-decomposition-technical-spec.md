@@ -324,6 +324,16 @@ transaction to mark the graph non-runnable, cancel every unfinished child, revok
 run capabilities, record durable cleanup intents, and mark the source cancelled. Done children,
 events, reviews, approvals, and merged-delivery records remain intact.
 
+Every daemon-owned child branch allocation durably records its exact worktree, branch name, and
+immutable provisioning commit before Git provisioning. The provisioning commit is provenance,
+not deletion authority: an unpublished worker may advance the branch before cancellation. When no
+pinned publication or validated PR head supplies an exact deletion SHA, cancellation records a
+non-destructive `branch-discovery` intent containing the complete immutable allocation identity.
+After process, proposed-change, and worktree cleanup, the daemon revalidates that allocation and
+provenance, resolves the now-quiescent ref, and atomically replaces discovery with a finalized
+old-OID-bound branch deletion intent. Ref deletion uses compare-and-delete semantics and a
+deterministic cleanup tombstone so crash replay cannot delete a branch recreated at the same name.
+
 After commit, the daemon kills and reaps active graph processes and executes cleanup intents:
 close unmerged proposed changes, remove temporary worktrees, and remove only validated revocable
 branches. Each action is idempotent, bounded, and retried after restart. Cleanup failure is loud

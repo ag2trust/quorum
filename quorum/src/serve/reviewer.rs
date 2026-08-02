@@ -185,11 +185,59 @@ pub fn spawn_reviewer(
 
 /// Build a review prompt appropriate for the resolved provider.
 /// Claude: invokes the builtin `review` skill. Codex: follows AGENTS.md.
+#[cfg(test)]
 pub fn build_review_prompt_for_kind(kind: AgentKind, spec: &ReviewerSpec, effort: &str) -> String {
+    build_review_prompt_for_kind_with_context(kind, spec, effort, None)
+}
+
+pub fn build_review_prompt_for_kind_with_context(
+    kind: AgentKind,
+    spec: &ReviewerSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+) -> String {
     match kind {
-        AgentKind::Claude => build_review_prompt(spec, effort),
-        AgentKind::Codex => build_codex_review_prompt(spec, effort),
+        AgentKind::Claude => format!(
+            "{}{}",
+            build_review_prompt(spec, effort),
+            graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
+        ),
+        AgentKind::Codex => format!(
+            "{}{}",
+            build_codex_review_prompt(spec, effort),
+            graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
+        ),
     }
+}
+
+fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> String {
+    let Some(context) = context else {
+        return String::new();
+    };
+    let category = quorum_core::decomposition::GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION;
+    let example = crate::graph_blocker::Feedback {
+        category: category.into(),
+        affected_task: 1,
+        violated_assigned_boundary: "<exact assigned boundary violated>".into(),
+        evidence: vec!["<concrete diff or repository evidence>".into()],
+    };
+    let payload = serde_json::to_string(&example).expect("static graph-blocker example serializes");
+    format!(
+        "\n\n## Generated-child review boundary\n\n\
+         The following bounded JSON is authoritative for this generated child's assignment and \
+         direct prerequisites only:\n```json\n{context}\n```\n\
+         Review this child against its assigned requirements. Do not absorb, require, or move \
+         unrelated sibling scope into this PR. A sibling is relevant only when it is listed above \
+         as a direct prerequisite; inspect no transitive or unrelated sibling assignment as scope.\n\
+         Use ordinary `--verdict changes` for defects within this child's implementation. Use the \
+         distinct `--verdict graph-blocker` only when concrete diff/repository evidence proves the \
+         decomposition boundary itself is invalid (for example the assigned outcome necessarily \
+         requires forbidden sibling scope). The only supported category is `{category}`. Signal it \
+         with this exact closed payload shape:\n\
+         `quorum submit --agent {reviewer} --pr {pr} --verdict graph-blocker --feedback-json '{payload}'`\n\
+         Replace affected_task with this context's task_id and replace both placeholders with \
+         concrete bounded evidence. Do not invent categories or extra fields.\n"
+    )
 }
 
 fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
@@ -258,14 +306,32 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
 }
 
 /// Build an R2 review prompt appropriate for the resolved provider.
+#[cfg(test)]
 pub fn build_r2_review_prompt_for_kind(
     kind: AgentKind,
     spec: &R2ReviewSpec,
     effort: &str,
 ) -> String {
+    build_r2_review_prompt_for_kind_with_context(kind, spec, effort, None)
+}
+
+pub fn build_r2_review_prompt_for_kind_with_context(
+    kind: AgentKind,
+    spec: &R2ReviewSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+) -> String {
     match kind {
-        AgentKind::Claude => build_r2_review_prompt(spec, effort),
-        AgentKind::Codex => build_codex_r2_review_prompt(spec, effort),
+        AgentKind::Claude => format!(
+            "{}{}",
+            build_r2_review_prompt(spec, effort),
+            graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
+        ),
+        AgentKind::Codex => format!(
+            "{}{}",
+            build_codex_r2_review_prompt(spec, effort),
+            graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
+        ),
     }
 }
 
@@ -511,11 +577,22 @@ pub fn build_worker_turn(
     ))
 }
 
+#[cfg(test)]
 pub fn build_rereview_turn(
     reviewer_name: &str,
     pr: i64,
     worker_agent: &str,
     effort: &str,
+) -> String {
+    build_rereview_turn_with_context(reviewer_name, pr, worker_agent, effort, None)
+}
+
+pub fn build_rereview_turn_with_context(
+    reviewer_name: &str,
+    pr: i64,
+    worker_agent: &str,
+    effort: &str,
+    graph_context: Option<&str>,
 ) -> String {
     super::agent::user_turn(&format!(
         "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
@@ -553,12 +630,13 @@ pub fn build_rereview_turn(
          Do NOT merge the PR yourself — the daemon handles merging.\n\
          Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
          approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.",
+         Do NOT mark the task done yourself — the daemon handles task lifecycle.{graph_contract}",
         worker = worker_agent,
         name = reviewer_name,
         pr = pr,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
+        graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
     ))
 }
 
@@ -1648,5 +1726,80 @@ mod tests {
             }
             assert!(found > 0, "{label}: must contain quorum CLI invocations");
         }
+    }
+
+    #[test]
+    fn generated_context_is_present_for_r1_r2_and_rereview_only() {
+        let context = r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[{"task_id":2,"title":"types","status":"done"}]}"#;
+        let r1_spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "W".into(),
+            reviewer_name: "R1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "W".into(),
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
+        let prompts = [
+            build_review_prompt_for_kind_with_context(
+                AgentKind::Claude,
+                &r1_spec,
+                "high",
+                Some(context),
+            ),
+            build_review_prompt_for_kind_with_context(
+                AgentKind::Codex,
+                &r1_spec,
+                "high",
+                Some(context),
+            ),
+            build_r2_review_prompt_for_kind_with_context(
+                AgentKind::Claude,
+                &r2_spec,
+                "high",
+                Some(context),
+            ),
+            build_r2_review_prompt_for_kind_with_context(
+                AgentKind::Codex,
+                &r2_spec,
+                "high",
+                Some(context),
+            ),
+            build_rereview_turn_with_context("R1", 42, "W", "high", Some(context)),
+        ];
+        for prompt in prompts {
+            assert!(prompt.contains("parser only"));
+            assert!(prompt.contains("Do not absorb, require, or move unrelated sibling scope"));
+            assert!(prompt.contains("--verdict graph-blocker"));
+            assert!(prompt.contains("--verdict changes"));
+            assert!(prompt.contains("boundary-violation"));
+            assert!(prompt.contains("affected_task"));
+            assert!(prompt.contains("violated_assigned_boundary"));
+            assert!(prompt.contains("evidence"));
+        }
+
+        let ordinary = build_review_prompt_for_kind(AgentKind::Claude, &r1_spec, "high");
+        assert!(!ordinary.contains("Generated-child review boundary"));
+        assert!(!ordinary.contains("parser only"));
+        assert_eq!(
+            ordinary,
+            build_review_prompt_for_kind_with_context(AgentKind::Claude, &r1_spec, "high", None)
+        );
+        assert_eq!(
+            build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+            build_review_prompt_for_kind_with_context(AgentKind::Codex, &r1_spec, "high", None)
+        );
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            assert_eq!(
+                build_r2_review_prompt_for_kind(kind, &r2_spec, "high"),
+                build_r2_review_prompt_for_kind_with_context(kind, &r2_spec, "high", None)
+            );
+        }
+        assert_eq!(
+            build_rereview_turn("R1", 42, "W", "high"),
+            build_rereview_turn_with_context("R1", 42, "W", "high", None)
+        );
     }
 }

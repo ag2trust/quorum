@@ -1958,6 +1958,25 @@ pub fn update(
     fields: &TaskUpdate,
     now: i64,
 ) -> Result<Task> {
+    let edit_requested =
+        fields.body.is_some() || fields.refs.is_some() || fields.depends_on.is_some();
+    if fields.status == Some("cancelled") && !edit_requested {
+        match crate::decomposition::cancel_source_graph(
+            conn,
+            agent,
+            id,
+            fields.expected_revision,
+            now,
+        )? {
+            crate::decomposition::SourceCancellation::Cancelled => {
+                return get(conn, id)?.ok_or(QuorumError::NotHolder);
+            }
+            crate::decomposition::SourceCancellation::Rejected => {
+                return Err(QuorumError::NotHolder);
+            }
+            crate::decomposition::SourceCancellation::NotGraphSource => {}
+        }
+    }
     struct EditableSnapshot {
         body: Option<String>,
         depends_on: Option<String>,
@@ -1966,8 +1985,6 @@ pub fn update(
         edit_count: i64,
     }
 
-    let edit_requested =
-        fields.body.is_some() || fields.refs.is_some() || fields.depends_on.is_some();
     if edit_requested && fields.expected_revision.is_none() {
         return Err(QuorumError::Usage(
             "task edits require --expected-revision".into(),
@@ -8976,6 +8993,80 @@ mod tests {
         )
         .is_err());
         assert_eq!(get(&c, ids[0]).unwrap().unwrap().status, "open");
+    }
+
+    #[test]
+    fn creator_cancels_materialized_graph_through_source_update() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "owner", "large", None, 0, None, None, None, None, 1).unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        crate::decomposition::set_frozen_phase(
+            &mut c,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            3,
+        )
+        .unwrap();
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids =
+            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
+                .unwrap()
+                .unwrap();
+
+        let cancelled = update(
+            &mut c,
+            "owner",
+            source,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(ids
+            .iter()
+            .all(|id| get(&c, *id).unwrap().unwrap().status == "cancelled"));
+        assert!(matches!(
+            update(
+                &mut c,
+                "owner",
+                source,
+                &TaskUpdate {
+                    status: Some("cancelled"),
+                    expected_revision: Some(1),
+                    ..Default::default()
+                },
+                6,
+            ),
+            Err(QuorumError::NotHolder)
+        ));
     }
 
     #[test]

@@ -362,6 +362,9 @@ pub enum Command {
         /// compatibility --feedback flag is supplied.
         #[arg(long = "feedback-file")]
         feedback_file: Option<PathBuf>,
+        /// Closed bounded JSON evidence for `--verdict graph-blocker`.
+        #[arg(long = "feedback-json", conflicts_with_all = ["feedback", "feedback_file", "blocking"])]
+        feedback_json: Option<String>,
         /// Count of BLOCKING findings in your review. `--verdict approved`
         /// requires `--blocking 0` — any blocking finding requires
         /// `--verdict changes`.

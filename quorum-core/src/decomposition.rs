@@ -14,6 +14,7 @@ pub const MAX_PROPOSAL_ATTEMPTS: i64 = 3;
 pub const MAX_PROVIDER_FAILURES: i64 = 3;
 pub const MIN_CHILDREN: usize = 2;
 pub const MAX_CHILDREN: usize = 8;
+const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginPlanning<'a> {
@@ -45,6 +46,17 @@ pub struct CleanupIntent {
     pub artifact_ref: String,
 }
 
+/// Result of attempting the externally-authorized source cancellation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCancellation {
+    /// The task has never been a decomposition source; ordinary task cancellation applies.
+    NotGraphSource,
+    /// The graph was cancelled and all unfinished execution authority was revoked.
+    Cancelled,
+    /// The request was stale, unauthorized, or an idempotent replay.
+    Rejected,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphBlocker<'a> {
     pub task_id: i64,
@@ -55,6 +67,8 @@ pub struct GraphBlocker<'a> {
     pub evidence: &'a [String],
     pub now: i64,
 }
+
+pub const GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION: &str = "boundary-violation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StartupReconcileResult {
@@ -623,8 +637,237 @@ pub fn cancel_graph(
     let Some(graph_id) = graph_id else {
         return Ok(false);
     };
-    cancel_unfinished_members(&tx, graph_id, now)?;
+    cancel_graph_in_tx(&tx, graph_id, source_task_id, intents, now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
+/// Cancel a materialized graph through its source task using external creator
+/// or current-assignee authority. Identity, revision, artifact ownership, and
+/// revocation are all checked while holding the same immediate write transaction.
+pub fn cancel_source_graph(
+    conn: &mut Connection,
+    caller: &str,
+    source_task_id: i64,
+    expected_revision: Option<i64>,
+    now: i64,
+) -> Result<SourceCancellation> {
+    if caller.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "embedded NUL in source cancellation caller".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let source: Option<(i64, String, i64, String, Option<String>, i64)> = tx
+        .query_row(
+            "SELECT d.id,d.state,d.active,t.created_by,t.assignee,t.revision
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.source_task_id=?1",
+            [source_task_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((graph_id, state, active, creator, assignee, revision)) = source else {
+        tx.commit()?;
+        return Ok(SourceCancellation::NotGraphSource);
+    };
+    let Some(expected_revision) = expected_revision else {
+        return Err(QuorumError::Usage(
+            "decomposed source cancellation requires --expected-revision".into(),
+        ));
+    };
+    if creator != caller && assignee.as_deref() != Some(caller)
+        || revision != expected_revision
+        || active != 1
+        || !matches!(state.as_str(), "active" | "blocked")
+    {
+        tx.commit()?;
+        return Ok(SourceCancellation::Rejected);
+    }
+
+    crate::agents::touch(&tx, caller, now)?;
+    let intents = graph_cleanup_intents(&tx, graph_id)?;
+    cancel_graph_in_tx(&tx, graph_id, source_task_id, &intents, now)?;
+    crate::events::emit(
+        &tx,
+        "task_cancelled",
+        &format!("task#{source_task_id}"),
+        &format!("cancelled by {caller}"),
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(SourceCancellation::Cancelled)
+}
+
+fn graph_cleanup_intents(tx: &Transaction<'_>, graph_id: i64) -> Result<Vec<CleanupIntent>> {
+    let mut intents = Vec::new();
+    let mut stmt = tx.prepare(
+        "SELECT m.task_id,b.worktree,b.branch,p.pr_number,p.head_ref,p.head_sha,p.is_fork,
+                b.provenance_sha,
+                CASE WHEN json_valid(t.refs)
+                     THEN json_extract(t.refs,'$.daemon_publication.branch') END,
+                CASE WHEN json_valid(t.refs)
+                     THEN json_extract(t.refs,'$.daemon_publication.local_sha') END,
+                b.id,b.allocated_by,b.allocated_at
+         FROM task_graph_members m
+         JOIN tasks t ON t.id=m.task_id AND t.status!='done'
+         LEFT JOIN task_branches b ON b.task_id=m.task_id
+         LEFT JOIN pr_targets p ON p.task_id=m.task_id
+              AND json_valid(t.refs)
+              AND CAST(json_extract(t.refs,'$.pr') AS TEXT)=CAST(p.pr_number AS TEXT)
+         WHERE m.graph_id=?1 ORDER BY m.task_id",
+    )?;
+    let rows = stmt.query_map([graph_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<i64>>(12)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            task_id,
+            worktree,
+            branch,
+            pr,
+            head_ref,
+            head_sha,
+            is_fork,
+            provenance_sha,
+            publication_branch,
+            publication_sha,
+            allocation_id,
+            allocated_by,
+            allocated_at,
+        ) = row?;
+        if let (Some(path), Some(name)) = (&worktree, &branch) {
+            intents.push(CleanupIntent {
+                task_id,
+                artifact_kind: "worktree".into(),
+                artifact_ref: serde_json::json!({"branch": name, "path": path}).to_string(),
+            });
+        }
+        let definitive_sha = branch.as_ref().and_then(|name| {
+            if publication_branch.as_ref() == Some(name) {
+                publication_sha.as_ref()
+            } else if is_fork == Some(0) && head_ref.as_ref() == Some(name) {
+                head_sha.as_ref()
+            } else {
+                None
+            }
+        });
+        if let (Some(name), Some(expected_sha)) = (&branch, definitive_sha) {
+            intents.push(CleanupIntent {
+                task_id,
+                artifact_kind: "branch".into(),
+                artifact_ref: serde_json::json!({
+                    "expected_sha": expected_sha,
+                    "name": name,
+                })
+                .to_string(),
+            });
+        } else if let (
+            Some(name),
+            Some(path),
+            Some(provenance_sha),
+            Some(allocation_id),
+            Some(allocated_by),
+            Some(allocated_at),
+        ) = (
+            &branch,
+            &worktree,
+            &provenance_sha,
+            allocation_id,
+            allocated_by,
+            allocated_at,
+        ) {
+            intents.push(CleanupIntent {
+                task_id,
+                artifact_kind: "branch-discovery".into(),
+                artifact_ref: serde_json::json!({
+                    "allocated_at": allocated_at,
+                    "allocated_by": allocated_by,
+                    "allocation_id": allocation_id,
+                    "name": name,
+                    "path": path,
+                    "provenance_sha": provenance_sha,
+                })
+                .to_string(),
+            });
+        }
+        if let (Some(pr_number), Some(head_ref), Some(head_sha)) = (pr, head_ref, head_sha) {
+            intents.push(CleanupIntent {
+                task_id,
+                artifact_kind: "proposed-change".into(),
+                artifact_ref: serde_json::json!({
+                    "head_ref": head_ref,
+                    "head_sha": head_sha,
+                    "pr_number": pr_number,
+                })
+                .to_string(),
+            });
+        }
+    }
+    drop(stmt);
+
+    let mut stmt = tx.prepare(
+        "SELECT j.task_id,j.agent,j.session_id,j.pid
+         FROM journal j JOIN task_graph_members m ON m.task_id=j.task_id
+         WHERE m.graph_id=?1 AND j.pid IS NOT NULL ORDER BY j.task_id,j.agent",
+    )?;
+    let rows = stmt.query_map([graph_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (task_id, agent, session_id, pid) = row?;
+        intents.push(CleanupIntent {
+            task_id,
+            artifact_kind: "process".into(),
+            artifact_ref: serde_json::json!({
+                "agent": agent,
+                "session_id": session_id,
+                "pid": pid,
+            })
+            .to_string(),
+        });
+    }
+    Ok(intents)
+}
+
+fn cancel_graph_in_tx(
+    tx: &Transaction<'_>,
+    graph_id: i64,
+    source_task_id: i64,
+    intents: &[CleanupIntent],
+    now: i64,
+) -> Result<()> {
+    cancel_unfinished_members(tx, graph_id, now)?;
     for intent in intents {
+        validate_cleanup_intent(intent)?;
         let member: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM task_graph_members
              WHERE graph_id=?1 AND task_id=?2)",
@@ -663,8 +906,95 @@ pub fn cancel_graph(
          WHERE id=?1 AND status!='done'",
         params![source_task_id, now],
     )?;
-    tx.commit().map_err(map_sql_err)?;
-    Ok(true)
+    Ok(())
+}
+
+fn validate_cleanup_intent(intent: &CleanupIntent) -> Result<()> {
+    fn valid_sha(value: &str) -> bool {
+        matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+    if intent.artifact_ref.contains('\0')
+        || intent.artifact_ref.len() > MAX_CLEANUP_ARTIFACT_BYTES
+        || !matches!(
+            intent.artifact_kind.as_str(),
+            "process" | "proposed-change" | "worktree" | "branch" | "branch-discovery"
+        )
+    {
+        return Err(QuorumError::Usage("invalid cleanup intent".into()));
+    }
+    let value: serde_json::Value = serde_json::from_str(&intent.artifact_ref)
+        .map_err(|_| QuorumError::Usage("invalid cleanup intent JSON".into()))?;
+    let Some(object) = value.as_object() else {
+        return Err(QuorumError::Usage(
+            "cleanup intent must be a JSON object".into(),
+        ));
+    };
+    let valid = match intent.artifact_kind.as_str() {
+        "process" => {
+            object.len() == 3
+                && object.get("agent").and_then(|v| v.as_str()).is_some()
+                && object.get("session_id").and_then(|v| v.as_str()).is_some()
+                && object
+                    .get("pid")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|v| v > 0)
+        }
+        "proposed-change" => {
+            object.len() == 3
+                && object
+                    .get("pr_number")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|v| v > 0)
+                && object.get("head_ref").and_then(|v| v.as_str()).is_some()
+                && object.get("head_sha").and_then(|v| v.as_str()).is_some()
+        }
+        "worktree" => {
+            object.len() == 2
+                && object.get("path").and_then(|v| v.as_str()).is_some()
+                && object.get("branch").and_then(|v| v.as_str()).is_some()
+        }
+        "branch" => {
+            object.len() == 2
+                && object.get("name").and_then(|v| v.as_str()).is_some()
+                && object
+                    .get("expected_sha")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(valid_sha)
+        }
+        "branch-discovery" => {
+            object.len() == 6
+                && object
+                    .get("allocation_id")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|v| v > 0)
+                && object.get("name").and_then(|v| v.as_str()).is_some()
+                && object.get("path").and_then(|v| v.as_str()).is_some()
+                && object
+                    .get("allocated_by")
+                    .and_then(|v| v.as_str())
+                    .is_some()
+                && object
+                    .get("allocated_at")
+                    .and_then(|v| v.as_i64())
+                    .is_some()
+                && object
+                    .get("provenance_sha")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(valid_sha)
+        }
+        _ => false,
+    };
+    if !valid
+        || object
+            .values()
+            .filter_map(|value| value.as_str())
+            .any(|value| value.is_empty() || value.contains('\0'))
+    {
+        return Err(QuorumError::Usage(
+            "cleanup intent has invalid fields".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> Result<()> {
@@ -705,8 +1035,7 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
             "embedded NUL in graph-blocker input".into(),
         ));
     }
-    if blocker.category.trim().is_empty()
-        || blocker.category.len() > 128
+    if blocker.category != GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION
         || blocker.violated_boundary.trim().is_empty()
         || blocker.violated_boundary.len() > 1024
         || blocker.evidence.is_empty()
@@ -1450,6 +1779,296 @@ mod tests {
     }
 
     #[test]
+    fn authorized_source_cancellation_derives_only_owned_unfinished_artifacts() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done',refs='{\"pr\":41}' WHERE id=?1",
+            [ids[0]],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='working',assignee='worker',refs='{\"pr\":42}' WHERE id=?1",
+            [ids[1]],
+        )
+        .unwrap();
+        for (task, branch, worktree) in [
+            (ids[0], "daemon/done", "/tmp/done"),
+            (ids[1], "daemon/live", "/tmp/live"),
+        ] {
+            conn.execute(
+                "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (?1,?2,?3,'daemon',4)",
+                params![task, branch, worktree],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+             VALUES (?1,42,'daemon/live',?2,0,4)",
+            params![ids[1], "a".repeat(40)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO journal(agent,role,task_id,session_id,phase,pid,updated_at)
+             VALUES ('worker','worker',?1,'session-live','working',1234,4)",
+            [ids[1]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO journal(agent,role,task_id,session_id,phase,pid,updated_at)
+             VALUES ('done-worker','worker',?1,'session-done','working',1235,4)",
+            [ids[0]],
+        )
+        .unwrap();
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        let intents: Vec<(i64, String, String)> = conn
+            .prepare(
+                "SELECT task_id,artifact_kind,artifact_ref FROM decomposition_cleanup
+                 ORDER BY artifact_kind",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(intents.len(), 5);
+        assert!(intents.iter().any(|intent| {
+            intent.0 == ids[1]
+                && intent.1 == "branch"
+                && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()
+                    == serde_json::json!({
+                        "expected_sha":"a".repeat(40),"name":"daemon/live"
+                    })
+        }));
+        assert!(intents.iter().any(|intent| {
+            intent.0 == ids[1]
+                && intent.1 == "worktree"
+                && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()
+                    == serde_json::json!({"branch":"daemon/live","path":"/tmp/live"})
+        }));
+        assert!(intents.iter().any(|intent| {
+            intent.0 == ids[1]
+                && intent.1 == "proposed-change"
+                && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()
+                    == serde_json::json!({
+                        "head_ref":"daemon/live","head_sha":"a".repeat(40),"pr_number":42
+                    })
+        }));
+        assert!(intents.iter().any(|intent| {
+            intent.0 == ids[1]
+                && intent.1 == "process"
+                && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()["pid"] == 1234
+        }));
+        assert!(intents.iter().any(|intent| {
+            intent.0 == ids[0]
+                && intent.1 == "process"
+                && serde_json::from_str::<serde_json::Value>(&intent.2).unwrap()["pid"] == 1235
+        }));
+        assert!(!intents
+            .iter()
+            .any(|intent| intent.0 == ids[0] && intent.1 != "process"));
+        assert_eq!(
+            intents
+                .iter()
+                .filter(|intent| intent.0 == ids[1] && intent.1 == "branch")
+                .count(),
+            1,
+            "PR-backed allocation has exactly one definitive branch intent"
+        );
+    }
+
+    #[test]
+    fn prepublication_allocation_creates_worktree_and_discovery_intents() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        let provenance = "b".repeat(40);
+        assert!(crate::branches::record_exact_allocation(
+            &mut conn,
+            ids[0],
+            "daemon/prepublication",
+            "/tmp/prepublication",
+            "worker",
+            &provenance,
+            4,
+        )
+        .unwrap());
+        let allocation_id: i64 = conn
+            .query_row(
+                "SELECT id FROM task_branches WHERE task_id=?1",
+                [ids[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        let intents: Vec<(String, serde_json::Value)> = conn
+            .prepare(
+                "SELECT artifact_kind,artifact_ref FROM decomposition_cleanup
+                 WHERE task_id=?1 ORDER BY artifact_kind",
+            )
+            .unwrap()
+            .query_map([ids[0]], |row| {
+                let kind: String = row.get(0)?;
+                let artifact: String = row.get(1)?;
+                Ok((kind, serde_json::from_str(&artifact).unwrap()))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            intents,
+            vec![
+                (
+                    "branch-discovery".into(),
+                    serde_json::json!({
+                        "allocated_at":4,
+                        "allocated_by":"worker",
+                        "allocation_id":allocation_id,
+                        "name":"daemon/prepublication",
+                        "path":"/tmp/prepublication",
+                        "provenance_sha":provenance,
+                    }),
+                ),
+                (
+                    "worktree".into(),
+                    serde_json::json!({
+                        "branch":"daemon/prepublication","path":"/tmp/prepublication"
+                    }),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_cancellation_rejects_wrong_creator_stale_revision_and_replay() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cancel_source_graph(&mut conn, "stranger", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Rejected
+        );
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(2), 5).unwrap(),
+            SourceCancellation::Rejected
+        );
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        assert_eq!(
+            cancel_source_graph(&mut conn, "owner", 1, Some(1), 6).unwrap(),
+            SourceCancellation::Rejected
+        );
+        let source_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_status, "cancelled");
+    }
+
+    #[test]
+    fn current_source_assignee_can_cancel_but_stranger_cannot() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET assignee='delegate' WHERE id=1", [])
+            .unwrap();
+        assert_eq!(
+            cancel_source_graph(&mut conn, "stranger", 1, Some(1), 5).unwrap(),
+            SourceCancellation::Rejected
+        );
+        assert_eq!(
+            cancel_source_graph(&mut conn, "delegate", 1, Some(1), 6).unwrap(),
+            SourceCancellation::Cancelled
+        );
+        let source: (String, Option<String>) = conn
+            .query_row("SELECT status,assignee FROM tasks WHERE id=1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(source, ("cancelled".into(), None));
+    }
+
+    #[test]
+    fn source_cancellation_requires_expected_revision() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cancel_source_graph(&mut conn, "owner", 1, None, 5),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn cleanup_intents_reject_unknown_malformed_nul_and_oversize_without_mutation() {
+        for (kind, artifact_ref) in [
+            ("unknown", r#"{"value":"x"}"#.to_string()),
+            ("process", "not-json".to_string()),
+            (
+                "worktree",
+                serde_json::json!({"branch":"daemon/live","path":"bad\0path"}).to_string(),
+            ),
+            (
+                "branch",
+                serde_json::json!({
+                    "expected_sha":"a".repeat(MAX_CLEANUP_ARTIFACT_BYTES),
+                    "name":"daemon/live"
+                })
+                .to_string(),
+            ),
+        ] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            let result = cancel_graph(
+                &mut conn,
+                1,
+                &[CleanupIntent {
+                    task_id: ids[0],
+                    artifact_kind: kind.into(),
+                    artifact_ref,
+                }],
+                5,
+            );
+            assert!(matches!(result, Err(QuorumError::Usage(_))));
+            let unchanged: (String, String, i64) = conn
+                .query_row(
+                    "SELECT d.state,t.status,
+                       (SELECT count(*) FROM decomposition_cleanup WHERE graph_id=d.id)
+                     FROM task_decompositions d JOIN tasks t ON t.id=?2 WHERE d.id=?1",
+                    params![graph, ids[0]],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(unchanged, ("active".into(), "open".into(), 0));
+        }
+    }
+
+    #[test]
     fn recovery_reset_is_refused_after_delivery_evidence() {
         let mut conn = setup();
         let graph = begin(&mut conn);
@@ -1707,6 +2326,71 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_graph_blocker_replay_has_one_atomic_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph-blocker-race.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let (graph, ids) = make_reviewable_graph(&mut conn);
+        add_reviewer_authority(&mut conn, ids[0], "r", "review-run", "reviewer", 4);
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for now in [5, 6] {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let task_id = ids[0];
+            handles.push(std::thread::spawn(move || {
+                let mut conn = crate::db::open(&path).unwrap();
+                let evidence = vec!["diff crosses the assigned child boundary".into()];
+                barrier.wait();
+                block_graph(
+                    &mut conn,
+                    &GraphBlocker {
+                        task_id,
+                        reviewer: "r",
+                        run_id: "review-run",
+                        category: "boundary-violation",
+                        violated_boundary: "parser-only child",
+                        evidence: &evidence,
+                        now,
+                    },
+                )
+                .unwrap()
+            }));
+        }
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+
+        let conn = crate::db::open(&path).unwrap();
+        assert_eq!(
+            graph_mutation_state(&conn, graph, ids[0]),
+            ("blocked".into(), "failed".into(), 1)
+        );
+        let live_capabilities: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM run_capabilities
+                 WHERE run_id='review-run' AND revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_capabilities, 0);
+    }
+
+    #[test]
     fn graph_blocker_rejects_unknown_revoked_wrong_and_superseded_runs_without_mutation() {
         enum InvalidRun {
             Unknown,
@@ -1832,6 +2516,29 @@ mod tests {
     }
 
     #[test]
+    fn graph_blocker_core_rejects_unsupported_category_without_mutation() {
+        let mut conn = setup();
+        let (graph, ids) = make_reviewable_graph(&mut conn);
+        add_reviewer_authority(&mut conn, ids[0], "r", "review-run", "reviewer", 4);
+        let before = graph_mutation_state(&conn, graph, ids[0]);
+        let evidence = vec!["concrete diff evidence".into()];
+        assert!(block_graph(
+            &mut conn,
+            &GraphBlocker {
+                task_id: ids[0],
+                reviewer: "r",
+                run_id: "review-run",
+                category: "invented-category",
+                violated_boundary: "assigned boundary",
+                evidence: &evidence,
+                now: 5,
+            },
+        )
+        .is_err());
+        assert_eq!(graph_mutation_state(&conn, graph, ids[0]), before);
+    }
+
+    #[test]
     fn final_child_merge_completes_graph_and_source_atomically() {
         let mut conn = setup();
         let graph = begin(&mut conn);
@@ -1947,6 +2654,428 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("timed out waiting for process claim barrier");
+    }
+
+    /// Internal subprocess entrypoint paired with `process_child_claim_helper`
+    /// to race source cancellation against generated execution authority.
+    #[test]
+    fn process_source_cancel_helper() {
+        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_CANCEL_DB") else {
+            return;
+        };
+        let ready_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_READY").unwrap();
+        let go_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_GO").unwrap();
+        let result_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_RESULT").ok();
+        std::fs::write(&ready_path, b"ready").unwrap();
+        for _ in 0..500 {
+            if std::path::Path::new(&go_path).exists() {
+                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
+                let outcome = cancel_source_graph(&mut conn, "owner", 1, Some(1), 11).unwrap();
+                if let Some(result_path) = result_path {
+                    std::fs::write(
+                        result_path,
+                        match outcome {
+                            SourceCancellation::Cancelled => b"won".as_slice(),
+                            SourceCancellation::Rejected => b"lost".as_slice(),
+                            SourceCancellation::NotGraphSource => b"not-graph".as_slice(),
+                        },
+                    )
+                    .unwrap();
+                } else {
+                    assert_eq!(outcome, SourceCancellation::Cancelled);
+                }
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for process cancellation barrier");
+    }
+
+    #[test]
+    fn process_graph_lifecycle_event_helper() {
+        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_EVENT_DB") else {
+            return;
+        };
+        let task_id: i64 = std::env::var("QUORUM_TEST_GRAPH_EVENT_TASK")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let event = std::env::var("QUORUM_TEST_GRAPH_EVENT_KIND").unwrap();
+        let ready_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_READY").unwrap();
+        let go_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_GO").unwrap();
+        let result_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_RESULT").unwrap();
+        std::fs::write(&ready_path, b"ready").unwrap();
+        for _ in 0..500 {
+            if std::path::Path::new(&go_path).exists() {
+                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
+                let outcome = match event.as_str() {
+                    "submit" => (
+                        "worker",
+                        crate::lifecycle::Event::SignaledDone { pr: "42".into() },
+                    ),
+                    "review" => ("reviewer", crate::lifecycle::Event::VerdictApprove),
+                    "merge" => {
+                        let won = crate::tasks::close_after_merge(
+                            &mut conn,
+                            task_id,
+                            "merged by race test",
+                            10,
+                        )
+                        .unwrap();
+                        std::fs::write(
+                            result_path,
+                            if won {
+                                b"won".as_slice()
+                            } else {
+                                b"lost".as_slice()
+                            },
+                        )
+                        .unwrap();
+                        return;
+                    }
+                    _ => panic!("unknown graph event helper kind"),
+                };
+                let won = crate::tasks::apply_event(&mut conn, outcome.0, task_id, &outcome.1, 10)
+                    .is_ok();
+                std::fs::write(
+                    result_path,
+                    if won {
+                        b"won".as_slice()
+                    } else {
+                        b"lost".as_slice()
+                    },
+                )
+                .unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("timed out waiting for process lifecycle event barrier");
+    }
+
+    fn race_cancel_with_event(
+        db_path: &std::path::Path,
+        task_id: i64,
+        event_kind: &str,
+        dir: &std::path::Path,
+    ) -> (String, String) {
+        use std::process::Command;
+        let go_path = dir.join("event-go");
+        let event_ready = dir.join("event-ready");
+        let event_result = dir.join("event-result");
+        let cancel_ready = dir.join("cancel-ready");
+        let cancel_result = dir.join("cancel-result");
+        let test_binary = std::env::current_exe().unwrap();
+        let mut event = Command::new(&test_binary)
+            .arg("--exact")
+            .arg("decomposition::tests::process_graph_lifecycle_event_helper")
+            .env("QUORUM_TEST_GRAPH_EVENT_DB", db_path)
+            .env("QUORUM_TEST_GRAPH_EVENT_TASK", task_id.to_string())
+            .env("QUORUM_TEST_GRAPH_EVENT_KIND", event_kind)
+            .env("QUORUM_TEST_GRAPH_EVENT_READY", &event_ready)
+            .env("QUORUM_TEST_GRAPH_EVENT_GO", &go_path)
+            .env("QUORUM_TEST_GRAPH_EVENT_RESULT", &event_result)
+            .spawn()
+            .unwrap();
+        let mut cancel = Command::new(&test_binary)
+            .arg("--exact")
+            .arg("decomposition::tests::process_source_cancel_helper")
+            .env("QUORUM_TEST_GRAPH_CANCEL_DB", db_path)
+            .env("QUORUM_TEST_GRAPH_CANCEL_READY", &cancel_ready)
+            .env("QUORUM_TEST_GRAPH_CANCEL_GO", &go_path)
+            .env("QUORUM_TEST_GRAPH_CANCEL_RESULT", &cancel_result)
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if event_ready.exists() && cancel_ready.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(event_ready.exists() && cancel_ready.exists());
+        std::fs::write(&go_path, b"go").unwrap();
+        assert!(event.wait().unwrap().success());
+        assert!(cancel.wait().unwrap().success());
+        (
+            std::fs::read_to_string(event_result).unwrap(),
+            std::fs::read_to_string(cancel_result).unwrap(),
+        )
+    }
+
+    #[test]
+    fn real_process_cancel_racing_child_claim_leaves_no_authority() {
+        use std::process::Command;
+
+        for iteration in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("quorum.db");
+            let mut conn = crate::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            drop(conn);
+
+            let go_path = dir.path().join("go");
+            let claim_ready = dir.path().join("claim-ready");
+            let claim_result = dir.path().join("claim-result");
+            let cancel_ready = dir.path().join("cancel-ready");
+            let test_binary = std::env::current_exe().unwrap();
+            let mut claim = Command::new(&test_binary)
+                .arg("--exact")
+                .arg("decomposition::tests::process_child_claim_helper")
+                .env("QUORUM_TEST_GRAPH_CLAIM_DB", &db_path)
+                .env("QUORUM_TEST_GRAPH_CLAIM_TASK", ids[0].to_string())
+                .env("QUORUM_TEST_GRAPH_CLAIM_AGENT", "process-worker")
+                .env("QUORUM_TEST_GRAPH_CLAIM_READY", &claim_ready)
+                .env("QUORUM_TEST_GRAPH_CLAIM_GO", &go_path)
+                .env("QUORUM_TEST_GRAPH_CLAIM_RESULT", &claim_result)
+                .spawn()
+                .unwrap();
+            let mut cancel = Command::new(&test_binary)
+                .arg("--exact")
+                .arg("decomposition::tests::process_source_cancel_helper")
+                .env("QUORUM_TEST_GRAPH_CANCEL_DB", &db_path)
+                .env("QUORUM_TEST_GRAPH_CANCEL_READY", &cancel_ready)
+                .env("QUORUM_TEST_GRAPH_CANCEL_GO", &go_path)
+                .spawn()
+                .unwrap();
+            for _ in 0..500 {
+                if claim_ready.exists() && cancel_ready.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(claim_ready.exists() && cancel_ready.exists());
+            std::fs::write(&go_path, b"go").unwrap();
+            assert!(
+                claim.wait().unwrap().success(),
+                "claim iteration {iteration}"
+            );
+            assert!(
+                cancel.wait().unwrap().success(),
+                "cancel iteration {iteration}"
+            );
+
+            let conn = crate::db::open(&db_path).unwrap();
+            let authority: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                       (SELECT count(*) FROM claims WHERE active=1),
+                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
+                          AND task_id IN (SELECT task_id FROM task_graph_members WHERE graph_id=?1)),
+                       (SELECT active FROM task_decompositions WHERE id=?1)",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(authority, (0, 0, 0), "iteration {iteration}");
+        }
+    }
+
+    #[test]
+    fn real_process_cancel_racing_submit_revokes_winner_and_stale_submit_is_inert() {
+        for iteration in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("quorum.db");
+            let mut conn = crate::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='working',assignee='worker' WHERE id=?1",
+                [ids[0]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO claims(target,holder,ts,expires_at,active)
+                 VALUES (?1,'worker',4,100,1)",
+                [format!("task#{}", ids[0])],
+            )
+            .unwrap();
+            crate::capabilities::issue(&mut conn, "worker-run", ids[0], "worker", "worker", 4)
+                .unwrap();
+            drop(conn);
+
+            let (submit, cancel) = race_cancel_with_event(&db_path, ids[0], "submit", dir.path());
+            assert!(
+                matches!(submit.as_str(), "won" | "lost") && cancel == "won",
+                "iteration {iteration}: submit={submit}, cancel={cancel}"
+            );
+            let mut conn = crate::db::open(&db_path).unwrap();
+            let state: (String, String, i64, i64) = conn
+                .query_row(
+                    "SELECT d.state,t.status,
+                       (SELECT count(*) FROM claims WHERE active=1),
+                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
+                          AND task_id=?2)
+                     FROM task_decompositions d JOIN tasks t ON t.id=?2 WHERE d.id=?1",
+                    params![graph, ids[0]],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("cancelled".into(), "cancelled".into(), 0, 0));
+            let events_before: i64 = conn
+                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+                .unwrap();
+            assert!(crate::tasks::apply_event(
+                &mut conn,
+                "worker",
+                ids[0],
+                &crate::lifecycle::Event::SignaledDone { pr: "42".into() },
+                12,
+            )
+            .is_err());
+            let events_after: i64 = conn
+                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(events_before, events_after);
+        }
+    }
+
+    #[test]
+    fn real_process_cancel_racing_review_revokes_authority_and_stale_review_is_inert() {
+        for iteration in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("quorum.db");
+            let mut conn = crate::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='in-review',reviewer='reviewer' WHERE id=?1",
+                [ids[0]],
+            )
+            .unwrap();
+            crate::capabilities::issue(&mut conn, "review-run", ids[0], "reviewer", "reviewer", 4)
+                .unwrap();
+            drop(conn);
+
+            let (review, cancel) = race_cancel_with_event(&db_path, ids[0], "review", dir.path());
+            assert!(
+                matches!(review.as_str(), "won" | "lost") && cancel == "won",
+                "iteration {iteration}: review={review}, cancel={cancel}"
+            );
+            let mut conn = crate::db::open(&db_path).unwrap();
+            let authority: (String, i64) = conn
+                .query_row(
+                    "SELECT t.status,
+                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
+                          AND task_id=?1)
+                     FROM tasks t WHERE t.id=?1",
+                    [ids[0]],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(authority, ("cancelled".into(), 0));
+            let events_before: i64 = conn
+                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+                .unwrap();
+            assert!(crate::tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                ids[0],
+                &crate::lifecycle::Event::VerdictApprove,
+                12,
+            )
+            .is_err());
+            let events_after: i64 = conn
+                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(events_before, events_after);
+        }
+    }
+
+    #[test]
+    fn real_process_cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes() {
+        for iteration in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("quorum.db");
+            let mut conn = crate::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+                .unwrap();
+            conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
+                .unwrap();
+            drop(conn);
+
+            let (merge, cancel) = race_cancel_with_event(&db_path, ids[1], "merge", dir.path());
+            assert_ne!(merge, cancel, "iteration {iteration}");
+            let conn = crate::db::open(&db_path).unwrap();
+            let state: (String, String, String, String) = conn
+                .query_row(
+                    "SELECT d.state,source.status,first.status,last.status
+                     FROM task_decompositions d
+                     JOIN tasks source ON source.id=d.source_task_id
+                     JOIN tasks first ON first.id=?2 JOIN tasks last ON last.id=?3
+                     WHERE d.id=?1",
+                    params![graph, ids[0], ids[1]],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            if merge == "won" {
+                assert_eq!(cancel, "lost");
+                assert_eq!(
+                    state,
+                    (
+                        "completed".into(),
+                        "done".into(),
+                        "done".into(),
+                        "done".into()
+                    )
+                );
+                let cleanup: i64 = conn
+                    .query_row("SELECT count(*) FROM decomposition_cleanup", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(cleanup, 0);
+            } else {
+                assert_eq!(cancel, "won");
+                assert_eq!(
+                    state,
+                    (
+                        "cancelled".into(),
+                        "cancelled".into(),
+                        "done".into(),
+                        "cancelled".into()
+                    )
+                );
+            }
+        }
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub mod control;
 pub mod daemon_lock;
 pub mod db;
 pub mod decomposition;
+pub mod decomposition_cleanup;
+pub mod decomposition_review;
 pub mod drift;
 pub mod errlog;
 pub mod error;
