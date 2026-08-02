@@ -1,0 +1,17 @@
+# Keep the image build context limited to files needed to compile Quorum and
+# describe/test the container contract.
+*
+!Cargo.toml
+!Cargo.lock
+!LICENSE
+!README.md
+!.claude/
+!.claude/skills/
+!.claude/skills/quorum/
+!.claude/skills/quorum/SKILL.md
+!quorum/
+!quorum/**
+!quorum-core/
+!quorum-core/**
+!docker/
+!docker/**
