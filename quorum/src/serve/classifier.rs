@@ -18,6 +18,7 @@ pub fn classifier_kind(model: &str) -> std::io::Result<AgentKind> {
 #[allow(dead_code)]
 pub struct ClassifierSlot {
     pub proc: RunnerProc,
+    pub model: String,
     pub pending_task_ids: Vec<i64>,
     /// Internally-derived identity of each exact input sent to this provider
     /// turn.  Never accept a model-supplied revision/fingerprint.
@@ -126,6 +127,7 @@ pub fn spawn_classifier_configured(
     };
     Ok(ClassifierSlot {
         proc,
+        model: model.to_string(),
         pending_task_ids,
         pending_inputs,
         response_text: String::new(),

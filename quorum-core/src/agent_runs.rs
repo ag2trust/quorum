@@ -49,6 +49,7 @@ pub fn insert_reviewer_with_launch(
     model: &str,
     effort: &str,
     provider: &str,
+    role_assignment_id: Option<i64>,
     spawned_at: i64,
     sub_role: Option<&str>,
     cap_run_id: &str,
@@ -65,11 +66,20 @@ pub fn insert_reviewer_with_launch(
         return Ok(None);
     }
     conn.execute(
-        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at,
-             sub_role,review_cap_run_id,review_pr,review_head_sha)
-         VALUES (?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10)",
+        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+             role_assignment_id,spawned_at,sub_role,review_cap_run_id,review_pr,review_head_sha)
+         VALUES (?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
-            task_id, agent_name, model, effort, provider, spawned_at, sub_role, cap_run_id, pr,
+            task_id,
+            agent_name,
+            model,
+            effort,
+            provider,
+            role_assignment_id,
+            spawned_at,
+            sub_role,
+            cap_run_id,
+            pr,
             head_sha
         ],
     )?;
@@ -109,6 +119,7 @@ pub struct AgentRun {
     pub model: String,
     pub effort: String,
     pub provider: Option<String>,
+    pub role_assignment_id: Option<i64>,
     pub spawned_at: i64,
     pub ended_at: Option<i64>,
     pub end_reason: Option<String>,
@@ -126,10 +137,37 @@ pub fn insert(
     provider: &str,
     spawned_at: i64,
 ) -> Result<i64> {
+    insert_with_assignment(
+        conn, task_id, agent_name, role, model, effort, provider, None, spawned_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_with_assignment(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    role: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    role_assignment_id: Option<i64>,
+    spawned_at: i64,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider, spawned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![task_id, agent_name, role, model, effort, provider, spawned_at],
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
+             role_assignment_id, spawned_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            task_id,
+            agent_name,
+            role,
+            model,
+            effort,
+            provider,
+            role_assignment_id,
+            spawned_at
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -145,10 +183,35 @@ pub fn insert_r2(
     provider: &str,
     spawned_at: i64,
 ) -> Result<i64> {
+    insert_r2_with_assignment(
+        conn, task_id, agent_name, model, effort, provider, None, spawned_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_r2_with_assignment(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    role_assignment_id: Option<i64>,
+    spawned_at: i64,
+) -> Result<i64> {
     conn.execute(
-        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider, spawned_at, sub_role)
-         VALUES (?1, ?2, 'reviewer', ?3, ?4, ?5, ?6, 'r2')",
-        params![task_id, agent_name, model, effort, provider, spawned_at],
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
+             role_assignment_id, spawned_at, sub_role)
+         VALUES (?1, ?2, 'reviewer', ?3, ?4, ?5, ?6, ?7, 'r2')",
+        params![
+            task_id,
+            agent_name,
+            model,
+            effort,
+            provider,
+            role_assignment_id,
+            spawned_at
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -191,7 +254,7 @@ pub fn interrupted_reviewer(
     is_r2: bool,
 ) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
          FROM agent_runs
          WHERE task_id = ?1
            AND role = 'reviewer'
@@ -209,9 +272,10 @@ pub fn interrupted_reviewer(
                 model: r.get(4)?,
                 effort: r.get(5)?,
                 provider: r.get(6)?,
-                spawned_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                end_reason: r.get(9)?,
+                role_assignment_id: r.get(7)?,
+                spawned_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                end_reason: r.get(10)?,
             })
         },
     )
@@ -222,7 +286,7 @@ pub fn interrupted_reviewer(
 /// All runs for a task, ordered by id.
 pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
     let mut stmt = conn.prepare(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason \
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason \
          FROM agent_runs WHERE task_id = ?1 ORDER BY id ASC",
     )?;
     let runs = stmt
@@ -235,9 +299,10 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
                 model: r.get(4)?,
                 effort: r.get(5)?,
                 provider: r.get(6)?,
-                spawned_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                end_reason: r.get(9)?,
+                role_assignment_id: r.get(7)?,
+                spawned_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                end_reason: r.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -247,13 +312,13 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
 /// Latest run identity for a task, without materializing its complete history.
 pub fn latest_for_task(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
     conn.query_row(
-        "SELECT id, agent_name, role, sub_role, model, effort, provider, spawned_at, ended_at, end_reason
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
          FROM agent_runs WHERE task_id = ?1 ORDER BY spawned_at DESC, id DESC LIMIT 1",
         params![task_id],
         |r| Ok(AgentRun {
             id: r.get(0)?, agent: r.get(1)?, role: r.get(2)?, sub_role: r.get(3)?,
-            model: r.get(4)?, effort: r.get(5)?, provider: r.get(6)?, spawned_at: r.get(7)?,
-            ended_at: r.get(8)?, end_reason: r.get(9)?,
+            model: r.get(4)?, effort: r.get(5)?, provider: r.get(6)?, role_assignment_id: r.get(7)?,
+            spawned_at: r.get(8)?, ended_at: r.get(9)?, end_reason: r.get(10)?,
         }),
     ).optional().map_err(Into::into)
 }
@@ -354,6 +419,7 @@ mod tests {
             "model",
             "high",
             "codex",
+            None,
             10,
             Some("r2"),
             "cap-9",
@@ -369,7 +435,7 @@ mod tests {
             (9, 79, sha)
         );
         assert!(insert_reviewer_with_launch(
-            &c, 10, "bad", "model", "high", "codex", 11, None, "", 79, sha,
+            &c, 10, "bad", "model", "high", "codex", None, 11, None, "", 79, sha,
         )
         .unwrap()
         .is_none());
@@ -381,6 +447,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(bad_rows, 0);
+    }
+
+    #[test]
+    fn assignment_aware_insert_round_trips_without_changing_run_identity() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c, "boss", "routed", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,'worker:task:routed',?1,'worker','sol','codex','codex',
+                     'gpt-5.6-sol','high','worker:M','g1',100)",
+            [tid],
+        )
+        .unwrap();
+        let run_id = insert_with_assignment(
+            &c,
+            tid,
+            "Routed",
+            "worker",
+            "gpt-5.6-sol",
+            "high",
+            "codex",
+            Some(42),
+            101,
+        )
+        .unwrap();
+        let run = latest_for_task(&c, tid).unwrap().unwrap();
+        assert_eq!(run.id, run_id);
+        assert_eq!(run.role_assignment_id, Some(42));
+        assert_eq!(
+            worker_model(&c, tid).unwrap().as_deref(),
+            Some("gpt-5.6-sol")
+        );
     }
 
     #[test]

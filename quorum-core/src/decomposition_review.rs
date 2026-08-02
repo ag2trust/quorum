@@ -212,6 +212,7 @@ pub fn persist_reviewer_run_if_current(
     model: &str,
     effort: &str,
     provider: &str,
+    role_assignment_id: Option<i64>,
     spawned_at: i64,
     sub_role: Option<&str>,
     cap_run_id: &str,
@@ -229,11 +230,11 @@ pub fn persist_reviewer_run_if_current(
     }
     let tx = begin_immediate(conn)?;
     let inserted = tx.execute(
-        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at,
-             sub_role,review_cap_run_id,review_pr,review_head_sha)
-         SELECT ?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10
+        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+             role_assignment_id,spawned_at,sub_role,review_cap_run_id,review_pr,review_head_sha)
+         SELECT ?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10,?11
          WHERE EXISTS(SELECT 1 FROM run_capabilities c
-                      WHERE c.run_id=?8 AND c.task_id=?1 AND c.agent=?2
+                      WHERE c.run_id=?9 AND c.task_id=?1 AND c.agent=?2
                         AND c.role='reviewer' AND c.revoked_at IS NULL)
            AND (NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)
                 OR EXISTS(SELECT 1 FROM task_graph_members m
@@ -243,7 +244,17 @@ pub fn persist_reviewer_run_if_current(
                             AND d.state='active' AND source.status='decomposed'
                             AND d.accepted_plan_revision=m.plan_revision))",
         params![
-            task_id, agent, model, effort, provider, spawned_at, sub_role, cap_run_id, pr, head_sha
+            task_id,
+            agent,
+            model,
+            effort,
+            provider,
+            role_assignment_id,
+            spawned_at,
+            sub_role,
+            cap_run_id,
+            pr,
+            head_sha
         ],
     )?;
     let id = (inserted == 1).then(|| tx.last_insert_rowid());
@@ -397,6 +408,7 @@ mod tests {
                 "model",
                 "high",
                 "claude",
+                None,
                 10,
                 None,
                 "cap",
@@ -458,6 +470,7 @@ mod tests {
                     "model",
                     "high",
                     "claude",
+                    None,
                     10,
                     None,
                     "cap",

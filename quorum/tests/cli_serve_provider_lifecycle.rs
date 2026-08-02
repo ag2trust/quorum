@@ -1,6 +1,5 @@
 //! Deterministic production-path coverage for mixed provider lifecycle routing.
 
-use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -33,6 +32,28 @@ fn write_names(dir: &std::path::Path) -> std::path::PathBuf {
         writeln!(file, "Agent{i}").unwrap();
     }
     path
+}
+
+fn routing_config(provider: &str, model: &str) -> String {
+    let (runner, worker_model, reviewer_model, planner_profile) = if provider == "codex" {
+        ("codex", "gpt-5.6-terra", "gpt-5.6-terra", "planner")
+    } else {
+        ("claude", model, "claude-opus-4-7", "primary")
+    };
+    let planner = if provider == "codex" {
+        "[model_profiles.planner]\nrunner = \"claude\"\nmodel = \"claude-opus-4-8\"\neffort = \"high\"\n"
+    } else {
+        ""
+    };
+    format!(
+        "[model_profiles.primary]\nrunner = \"{runner}\"\nmodel = \"{worker_model}\"\neffort = \"high\"\n\
+         [model_profiles.reviewer]\nrunner = \"{runner}\"\nmodel = \"{reviewer_model}\"\neffort = \"high\"\n\
+         {planner}\
+         [routing.classifier]\nprimary = 100\n[routing.planner]\n{planner_profile} = 100\n\
+         [routing.collector]\nprimary = 100\n\
+         [routing.worker.1]\nprimary = 100\n[routing.worker.2]\nprimary = 100\n[routing.worker.3]\nprimary = 100\n[routing.worker.4]\nprimary = 100\n[routing.worker.5]\nprimary = 100\n\
+         [routing.reviewer.1]\nreviewer = 100\n[routing.reviewer.2]\nreviewer = 100\n[routing.reviewer.3]\nreviewer = 100\n[routing.reviewer.4]\nreviewer = 100\n[routing.reviewer.5]\nreviewer = 100\n"
+    )
 }
 
 fn write_dual_protocol_runner(dir: &std::path::Path) -> std::path::PathBuf {
@@ -175,11 +196,17 @@ impl Case {
         let runner = write_dual_protocol_runner(home.path());
         let runner_log = home.path().join("runner.log");
         std::fs::write(&runner_log, "").unwrap();
-        let config_path = role_config.map(|contents| {
-            let path = home.path().join("serve.toml");
-            std::fs::write(&path, contents).unwrap();
-            path
-        });
+        let config_path = home.path().join("serve.toml");
+        let config_contents = role_config
+            .map(|contents| {
+                if contents == CHATGPT_ONLY_ROLE_CONFIG {
+                    routing_config("codex", "gpt-5.6-terra")
+                } else {
+                    contents.to_owned()
+                }
+            })
+            .unwrap_or_else(|| routing_config(default_provider, model));
+        std::fs::write(&config_path, &config_contents).unwrap();
 
         assert!(Command::new(cargo_bin("quorum"))
             .env("QUORUM_HOME", home.path())
@@ -321,19 +348,15 @@ fi
         )
         .unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!(
-            "{}:{}",
-            gh_shim.path().display(),
-            env::var("PATH").unwrap_or_default()
-        );
+        let codex_path = gh_shim.path().join("codex");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&runner, &codex_path).unwrap();
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(&runner, &codex_path).unwrap();
+        }
+        let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", gh_shim.path().display());
         let sentinel = tempfile::tempdir().unwrap();
-        let codex_only = role_config.is_some_and(|config| config.contains(r#"provider = "codex""#));
-        let cli_provider = if codex_only {
-            "codex"
-        } else {
-            default_provider
-        };
-        let cli_model = if codex_only { "gpt-5.6-terra" } else { model };
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", home.path())
@@ -354,12 +377,6 @@ fi
                 &worktrees.path().to_string_lossy(),
                 "--names-file",
                 &names.to_string_lossy(),
-                "--agent",
-                cli_provider,
-                "--model",
-                cli_model,
-                "--agent-bin",
-                &runner.to_string_lossy(),
                 "--merge-cmd",
                 "true",
                 "--merge-checks-cmd",
@@ -371,8 +388,9 @@ fi
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
-        if let Some(path) = config_path {
-            serve.args(["--config", &path.to_string_lossy()]);
+        serve.args(["--config", &config_path.to_string_lossy()]);
+        if !config_contents.contains("runner = \"codex\"") {
+            serve.args(["--agent-bin", &runner.to_string_lossy()]);
         }
         let mut child = serve
             .stderr(Stdio::piped())
@@ -429,22 +447,18 @@ fi
     ) {
         let names = self.home.path().join("names.txt");
         let runner = self.home.path().join("dual-runner.sh");
-        let config_path = role_config.map(|contents| {
-            let path = self.home.path().join("restart-serve.toml");
-            std::fs::write(&path, contents).unwrap();
-            path
-        });
+        let config_path = self.home.path().join("restart-serve.toml");
+        let config_contents = role_config
+            .map(|contents| {
+                if contents == CHATGPT_ONLY_ROLE_CONFIG {
+                    routing_config("codex", "gpt-5.6-terra")
+                } else {
+                    contents.to_owned()
+                }
+            })
+            .unwrap_or_else(|| routing_config(default_provider, model));
+        std::fs::write(&config_path, &config_contents).unwrap();
         let sentinel = tempfile::tempdir().unwrap();
-        let cli_provider = if role_config.is_some() {
-            "codex"
-        } else {
-            default_provider
-        };
-        let cli_model = if role_config.is_some() {
-            "gpt-5.6-terra"
-        } else {
-            model
-        };
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", self.home.path())
@@ -453,9 +467,8 @@ fi
             .env(
                 "PATH",
                 format!(
-                    "{}:{}",
-                    self.gh_shim.path().display(),
-                    env::var("PATH").unwrap_or_default()
+                    "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                    self.gh_shim.path().display()
                 ),
             )
             .env("QUORUM_TEST_GH_STATE", self.gh_shim.path().join("state"))
@@ -472,12 +485,6 @@ fi
                 &self._worktrees.path().to_string_lossy(),
                 "--names-file",
                 &names.to_string_lossy(),
-                "--agent",
-                cli_provider,
-                "--model",
-                cli_model,
-                "--agent-bin",
-                &runner.to_string_lossy(),
                 "--merge-cmd",
                 "true",
                 "--merge-checks-cmd",
@@ -489,8 +496,9 @@ fi
                 "--exit-when-gone",
                 &sentinel.path().to_string_lossy(),
             ]);
-        if let Some(path) = config_path {
-            serve.args(["--config", &path.to_string_lossy()]);
+        serve.args(["--config", &config_path.to_string_lossy()]);
+        if !config_contents.contains("runner = \"codex\"") {
+            serve.args(["--agent-bin", &runner.to_string_lossy()]);
         }
         let mut child = serve
             .stderr(Stdio::piped())
@@ -642,15 +650,7 @@ fn run_routes_with_effort(
         .collect()
 }
 
-const CHATGPT_ONLY_ROLE_CONFIG: &str = r#"
-provider = "codex"
-worker_model = "gpt-5.6-terra"
-worker_effort = "medium"
-review_model = "gpt-5.6-terra"
-review_effort = "high"
-classifier_model = "gpt-5.6-terra"
-classifier_effort = "medium"
-"#;
+const CHATGPT_ONLY_ROLE_CONFIG: &str = "chatgpt-only-routing";
 
 #[test]
 fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
@@ -997,8 +997,8 @@ fn production_lifecycle_routes_claude_default_all_codex_and_mixed() {
         run_routes(&codex),
         [
             ("worker", None, "gpt-5.6-terra", "codex"),
-            ("reviewer", None, "o3", "codex"),
-            ("reviewer", Some("r2"), "o3", "codex"),
+            ("reviewer", None, "gpt-5.6-terra", "codex"),
+            ("reviewer", Some("r2"), "gpt-5.6-terra", "codex"),
         ]
     );
 

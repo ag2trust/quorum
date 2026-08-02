@@ -8,6 +8,43 @@ fn cargo_bin() -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin("quorum")
 }
 
+const ROUTING_POLICY: &str = r#"
+[model_profiles.primary]
+runner = "codex"
+model = "gpt-5.6-sol"
+effort = "high"
+[model_profiles.planner]
+runner = "claude"
+model = "claude-opus-4-8"
+effort = "high"
+[routing.classifier]
+primary = 100
+[routing.planner]
+planner = 100
+[routing.collector]
+primary = 100
+[routing.worker.1]
+primary = 100
+[routing.worker.2]
+primary = 100
+[routing.worker.3]
+primary = 100
+[routing.worker.4]
+primary = 100
+[routing.worker.5]
+primary = 100
+[routing.reviewer.1]
+primary = 100
+[routing.reviewer.2]
+primary = 100
+[routing.reviewer.3]
+primary = 100
+[routing.reviewer.4]
+primary = 100
+[routing.reviewer.5]
+primary = 100
+"#;
+
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut f = std::fs::File::create(&path).unwrap();
@@ -90,7 +127,7 @@ fn serve_config_file_with_flag_override() {
         .unwrap();
     assert!(init_status.success(), "init failed");
 
-    // Write a config file with cap=8 and model=opus-48
+    // Write a config file with cap=8 and a complete routing policy.
     let config_path = home.path().join("serve-test.toml");
     std::fs::write(
         &config_path,
@@ -100,9 +137,8 @@ repo = "test/repo"
 repo_dir = "{repo_dir}"
 worktree_base = "{wt_base}"
 cap = 8
-model = "opus-48"
-effort = "max"
 max_turn_wall_secs = 2700
+{ROUTING_POLICY}
 "#,
             repo_dir = repo_dir.path().to_string_lossy(),
             wt_base = wt_base.path().to_string_lossy(),
@@ -154,15 +190,10 @@ max_turn_wall_secs = 2700
         stderr_text.contains("2 (flag)"),
         "cap should show '2 (flag)':\n{stderr_text}"
     );
-    // model=opus-48 from file (no flag override)
+    // The routing policy is summarized without presenting a legacy fixed model.
     assert!(
-        stderr_text.contains("opus-48 (file)"),
-        "model should show 'opus-48 (file)':\n{stderr_text}"
-    );
-    // effort=max from file (no flag override)
-    assert!(
-        stderr_text.contains("max (file)"),
-        "effort should show 'max (file)':\n{stderr_text}"
+        stderr_text.contains("model_profiles:            2"),
+        "profile count missing from banner:\n{stderr_text}"
     );
     // max_turn_wall_secs=2700 from file
     assert!(
@@ -241,6 +272,76 @@ fn serve_config_rejects_unknown_keys() {
 }
 
 #[test]
+fn serve_rejects_removed_fixed_routing_flags() {
+    for flag in ["--agent", "--model", "--effort"] {
+        let output = Command::new(cargo_bin())
+            .args(["serve", flag, "legacy-value"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unexpected argument"),
+            "{flag} should be rejected by CLI parsing: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn serve_without_routing_policy_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .args([
+            "serve",
+            "--repo",
+            "test/repo",
+            "--repo-dir",
+            "/tmp/x",
+            "--worktree-base",
+            "/tmp/y",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("model_profiles"),
+        "missing routing policy must fail before work can be claimed: {output:?}"
+    );
+}
+
+#[test]
+fn serve_rejects_cli_usd_limit_when_routing_can_select_codex() {
+    let home = tempfile::tempdir().unwrap();
+    let config_path = home.path().join("routing.toml");
+    std::fs::write(&config_path, ROUTING_POLICY).unwrap();
+
+    let output = Command::new(cargo_bin())
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "serve",
+            "--config",
+            &config_path.to_string_lossy(),
+            "--repo",
+            "test/repo",
+            "--repo-dir",
+            "/tmp/x",
+            "--worktree-base",
+            "/tmp/y",
+            "--max-turn-cost-usd",
+            "1.0",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("USD cost limits"),
+        "CLI override must fail before daemon startup: {output:?}"
+    );
+}
+
+#[test]
 fn serve_config_rejects_invalid_r2_sampling_values_with_exit_2() {
     let home = tempfile::tempdir().unwrap();
     let init_status = Command::new(cargo_bin())
@@ -264,7 +365,7 @@ fn serve_config_rejects_invalid_r2_sampling_values_with_exit_2() {
         ),
     ] {
         let config_path = home.path().join(name);
-        std::fs::write(&config_path, contents).unwrap();
+        std::fs::write(&config_path, format!("{contents}{ROUTING_POLICY}")).unwrap();
         let output = Command::new(cargo_bin())
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
@@ -290,7 +391,7 @@ fn serve_config_rejects_invalid_r2_sampling_values_with_exit_2() {
 }
 
 #[test]
-fn strict_codex_config_rejects_claude_only_model_floor_at_startup() {
+fn legacy_fixed_routing_keys_are_rejected_at_startup() {
     let home = tempfile::tempdir().unwrap();
 
     let init_status = Command::new(cargo_bin())
@@ -326,8 +427,8 @@ fn strict_codex_config_rejects_claude_only_model_floor_at_startup() {
     assert_eq!(output.status.code(), Some(2), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot use min_model"),
-        "startup error should explain the provider conflict: {stderr}"
+        stderr.contains("legacy routing key"),
+        "startup error should explain the hard cutover: {stderr}"
     );
 }
 
@@ -398,7 +499,7 @@ fn serve_config_default_path_loaded() {
             r#"
 repo_dir = "{repo_dir}"
 worktree_base = "{wt_base}"
-model = "fable-5"
+{ROUTING_POLICY}
 "#,
             repo_dir = repo_dir.path().to_string_lossy(),
             wt_base = wt_base.path().to_string_lossy(),
@@ -436,8 +537,8 @@ model = "fable-5"
         "should auto-discover default config path:\n{stderr_text}"
     );
     assert!(
-        stderr_text.contains("fable-5 (file)"),
-        "model should come from auto-discovered config:\n{stderr_text}"
+        stderr_text.contains("model_profiles:            2"),
+        "routing policy should come from auto-discovered config:\n{stderr_text}"
     );
 
     drop(sentinel);

@@ -26,6 +26,16 @@ pub struct BeginPlanning<'a> {
     pub now: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BeginRoutedPlanning<'a> {
+    pub source_task_id: i64,
+    pub expected_revision: i64,
+    pub assignment: &'a crate::role_assignments::AssignmentRequest,
+    pub pool: &'a crate::role_assignments::ValidatedPool,
+    pub seed: u64,
+    pub now: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedChild {
     pub local_key: String,
@@ -200,6 +210,115 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     }
     tx.commit().map_err(map_sql_err)?;
     Ok(Some(graph_id))
+}
+
+/// Atomically win planning authority, consume one planner allocation turn, and bind the
+/// resulting immutable assignment to the new aggregate. A stale/lost planning request
+/// returns `Ok(None)` before touching routing state.
+pub fn begin_routed_planning(
+    conn: &mut Connection,
+    input: &BeginRoutedPlanning<'_>,
+) -> Result<Option<(i64, crate::role_assignments::RoleAssignment)>> {
+    let expected_key = format!(
+        "planner:task:{}:revision:{}",
+        input.source_task_id, input.expected_revision
+    );
+    if input.assignment.role != "planner"
+        || input.assignment.task_id != Some(input.source_task_id)
+        || input.assignment.pr_number.is_some()
+        || input.assignment.review_stage.is_some()
+        || input.assignment.responsibility_key != expected_key
+    {
+        return Err(QuorumError::Usage(
+            "planner assignment does not match source responsibility".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let eligible: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions
+                           WHERE state IN ('active','blocked') OR active=1))",
+        params![input.source_task_id, input.expected_revision],
+        |row| row.get(0),
+    )?;
+    if !eligible {
+        return Ok(None);
+    }
+    let assignment = crate::role_assignments::assign_or_get_tx(
+        &tx,
+        input.assignment,
+        input.pool,
+        input.seed,
+        input.now,
+    )?;
+    let inserted = tx.execute(
+        "INSERT INTO task_decompositions(
+             source_task_id,state,active,freeze_active,planned_source_revision,
+             planner_provider,planner_model,planner_assignment_id,frozen_base_sha,
+             created_at,updated_at)
+         VALUES (?1,'freeze-requested',0,1,?2,?3,?4,?5,NULL,?6,?6)",
+        params![
+            input.source_task_id,
+            input.expected_revision,
+            assignment.provider,
+            assignment.model,
+            assignment.id,
+            input.now
+        ],
+    );
+    if matches!(&inserted, Err(error) if is_unique_constraint(error)) {
+        return Ok(None);
+    }
+    inserted.map_err(map_sql_err)?;
+    let graph_id = tx.last_insert_rowid();
+    let changed = tx.execute(
+        "UPDATE tasks SET status='planning',updated_at=?3
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL",
+        params![input.source_task_id, input.expected_revision, input.now],
+    )?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(Some((graph_id, assignment)))
+}
+
+/// Link a planning aggregate to the durable routing assignment that selected its
+/// executable profile. The guarded join prevents a caller from attaching another task,
+/// revision, or role's assignment. Rebinding to a different assignment fails closed.
+pub fn bind_planner_assignment(
+    conn: &mut Connection,
+    graph_id: i64,
+    assignment_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let valid: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM task_decompositions d
+             JOIN role_assignments a ON a.id=?2
+             WHERE d.id=?1 AND a.role='planner'
+               AND a.task_id=d.source_task_id
+               AND a.responsibility_key=(
+                   'planner:task:' || d.source_task_id || ':revision:' || d.planned_source_revision)
+               AND a.provider=d.planner_provider AND a.model=d.planner_model
+               AND (d.planner_assignment_id IS NULL OR d.planner_assignment_id=a.id)
+         )",
+        params![graph_id, assignment_id],
+        |row| row.get(0),
+    )?;
+    if !valid {
+        return Ok(false);
+    }
+    let changed = tx.execute(
+        "UPDATE task_decompositions SET planner_assignment_id=?2,updated_at=?3
+         WHERE id=?1 AND (planner_assignment_id IS NULL OR planner_assignment_id=?2)",
+        params![graph_id, assignment_id, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
 }
 
 pub fn bind_frozen_base_and_enter_planning(
@@ -1322,6 +1441,97 @@ mod tests {
             set_frozen_phase(conn, graph, "freeze-requested", "preclassifying", None, 2).unwrap()
         );
         graph
+    }
+
+    fn planner_pool() -> crate::role_assignments::ValidatedPool {
+        crate::role_assignments::ValidatedPool {
+            pool_key: "planner".into(),
+            policy_generation: "g1".into(),
+            profiles: vec![crate::role_assignments::WeightedProfile {
+                profile: crate::role_assignments::ModelProfile {
+                    id: "planner-sol".into(),
+                    provider: "codex".into(),
+                    runner: "codex".into(),
+                    model: "sol".into(),
+                    effort: "high".into(),
+                },
+                percent: 100,
+            }],
+        }
+    }
+
+    fn planner_request() -> crate::role_assignments::AssignmentRequest {
+        crate::role_assignments::AssignmentRequest {
+            responsibility_key: "planner:task:1:revision:1".into(),
+            task_id: Some(1),
+            pr_number: None,
+            role: "planner".into(),
+            review_stage: None,
+            complexity: None,
+        }
+    }
+
+    #[test]
+    fn routed_planning_binds_assignment_in_authority_transaction() {
+        let mut conn = setup();
+        let request = planner_request();
+        let pool = planner_pool();
+        let (graph, assignment) = begin_routed_planning(
+            &mut conn,
+            &BeginRoutedPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                assignment: &request,
+                pool: &pool,
+                seed: 7,
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let stored: (i64, String, String) = conn
+            .query_row(
+                "SELECT planner_assignment_id,planner_provider,planner_model
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (assignment.id, "codex".into(), "sol".into()));
+    }
+
+    #[test]
+    fn lost_planning_authority_consumes_no_assignment_or_cursor_turn() {
+        let mut conn = setup();
+        conn.execute("UPDATE tasks SET status='working' WHERE id=1", [])
+            .unwrap();
+        let request = planner_request();
+        let pool = planner_pool();
+        assert!(begin_routed_planning(
+            &mut conn,
+            &BeginRoutedPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                assignment: &request,
+                pool: &pool,
+                seed: 7,
+                now: 2,
+            },
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM role_assignments", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM routing_cursors", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     fn child(key: &str, deps: &[&str]) -> PlannedChild {

@@ -210,7 +210,16 @@ fi
 
     fn wait_for_n(&mut self, needle: &str, n: usize, timeout_secs: u64) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let mut count = 0;
+        // Earlier waits may already have consumed matching lines. Count the
+        // complete observed stream so call ordering cannot hide an event.
+        let mut count = self
+            .lines
+            .iter()
+            .filter(|line| line.contains(needle))
+            .count();
+        if count >= n {
+            return true;
+        }
         while std::time::Instant::now() < deadline {
             let remaining = deadline - std::time::Instant::now();
             match self.rx.recv_timeout(remaining) {

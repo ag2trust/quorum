@@ -738,24 +738,31 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     fn restart_config(db_path: PathBuf, repo_dir: PathBuf, worktree_base: PathBuf) -> ServeConfig {
+        let profile = crate::serve_config::ModelProfile {
+            runner: "codex".into(),
+            model: "test".into(),
+            effort: "medium".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
         ServeConfig {
             db_path,
             cap: 1,
-            runner_kind: crate::serve_config::RunnerKind::Codex,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
             repo_dir,
             worktree_base,
             names_file: None,
             agent_bin: None,
-            model: "test".into(),
-            effort: "medium".into(),
-            provider_explicit: false,
-            review_model_explicit: false,
-            review_model: "test".into(),
-            review_effort: "medium".into(),
-            classifier_model: "test".into(),
-            classifier_effort: "medium".into(),
-            collector_model: "test".into(),
-            collector_effort: "medium".into(),
             merge_executor: std::sync::Arc::new(super::super::merge::CommandMergeExecutor {
                 command: "true".into(),
                 checks_cmd: None,
@@ -781,9 +788,6 @@ mod tests {
             r2_enabled: false,
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
-            suggested_models: std::collections::HashMap::new(),
-            min_model: None,
-            min_effort: None,
             codex_sandbox: "danger-full-access".into(),
         }
     }

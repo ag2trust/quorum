@@ -1471,31 +1471,66 @@ say "repository instructions" instead of `CLAUDE.md`.
 
 ### Configuration and model routing
 
-Runner selection is explicit and defaults to Claude for compatibility:
+Model routing is a repository-wide hard cutover. Every executable choice is defined once as
+a stable model profile containing an exact provider model, supported runner, and effort.
+Every required role then names a routing pool. Pool entries use positive integer percentages
+that total exactly 100; fixed `agent`, `provider`, `model`, `effort`, `worker_model`,
+`review_model`, `classifier_model`, and `collector_model` selection is not accepted.
 
 ```toml
-agent = "claude"
-agent_bin = "claude"
-model = "claude-opus-4-7"
-effort = "high"
-```
-
-Codex:
-
-```toml
-agent = "codex"
-agent_bin = "codex"
+[model_profiles.terra]
+runner = "codex"
 model = "gpt-5.6-terra"
 effort = "high"
 
-[codex]
-sandbox = "danger-full-access"
-ignore_user_config = false
+[model_profiles.opus]
+runner = "claude"
+model = "claude-opus-4-8"
+effort = "high"
+
+[routing.classifier]
+terra = 80
+opus = 20
+[routing.planner]
+opus = 100
+[routing.collector]
+terra = 100
+[routing.worker.1]
+terra = 100
+[routing.worker.2]
+terra = 100
+[routing.worker.3]
+terra = 80
+opus = 20
+[routing.worker.4]
+opus = 100
+[routing.worker.5]
+opus = 100
+[routing.reviewer.1]
+terra = 100
+[routing.reviewer.2]
+terra = 100
+[routing.reviewer.3]
+terra = 80
+opus = 20
+[routing.reviewer.4]
+opus = 100
+[routing.reviewer.5]
+opus = 100
 ```
 
-Never infer runner kind from the executable filename. Existing top-level
-`no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
-Runner-specific configuration is scoped under `[claude]` or `[codex]`.
+Each pool is materialized as a randomized 100-slot epoch containing exactly the configured
+number of slots for each profile. The daemon persists the shuffled order and position before
+use. Assignment creation and position advancement occur in one `BEGIN IMMEDIATE` transaction;
+a restart cannot reroll the epoch or consume another slot. Pool membership or percentage
+changes create a new policy generation and fresh epoch. Existing assignments retain their
+profile snapshot. Allocation state is independent per repository, role, complexity pool, and
+review stage: R1 and R2 use the same reviewer eligibility pool but separate bags and positions.
+
+Startup fails before any claim when a profile is invalid, a required pool is absent or empty,
+a profile is duplicated in a pool, a percentage is not a positive integer, a pool does not total
+100, or legacy fixed-model routing is present. Never infer runner kind from an executable
+filename. Runner-specific process options remain scoped under `[claude]` or `[codex]`.
 
 ### Bounded task decomposition
 
@@ -1505,8 +1540,8 @@ new managed delivery, lets active delivery finish, and plans against the resulti
 S/M implementation tasks dispatch normally regardless of complexity. Review-only L/XL work is
 parked for external splitting.
 
-Planning uses the configured provider's fixed frontier model (Sol/high for Codex, Opus/high for
-Claude) with no downgrade. The planner receives a read-only repository view and bounded source
+Planning uses the profile selected from the planner routing pool. The planner receives a
+read-only repository view and bounded source
 context but no network, database, coordination command, or delivery authority. A separate
 planner spawn boundary enforces those restrictions and accepts only one bounded, closed plan or
 blocker response; a provider whose transport cannot be separated from model-generated network or
@@ -1601,34 +1636,17 @@ labels are ignored.
   writes the standard refs, note, and event with no claim, run, or error row; an explicit
   retry requests reclassification of remaining work and a newly dispatchable result restores
   the saved lifecycle status.
-- The active daemon provider selects the corresponding model and effort from its five-level
-  routing ladder. Operator-owned `suggested_models` overrides and minimum model/effort
-  floors remain available; creators cannot lower or raise an individual task.
+- A new worker assignment selects from the complexity-specific worker routing pool. Task
+  creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*` model)
   or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
-- Reviewers continue to use the daemon's configured provider.
+- A new R1 or R2 assignment selects from the complexity-specific reviewer pool. Review
+  stages retain independent bags, and allocation never changes which stages are required.
 
-The built-in Codex recommendation ladder is `1=luna/high`, `2=terra/high`,
-`3=terra/high`, `4=sol/high`, `5=sol/high`. Level 5 remains in classifier guidance and
-stored context. Focused level-5 work sized `S` or `M` is dispatchable; level 5 with size
-`L` is outside automatic execution policy.
-
-Claude's Sonnet/Opus order is not a cross-runner abstraction. Replace shared rank
-inference with explicit per-role selections while preserving Claude defaults:
-
-```toml
-[models]
-worker = "claude-opus-4-6"
-reviewer = "claude-opus-4-7"
-r2 = "claude-opus-4-8"
-classifier = "claude-haiku-4-5-20251001"
-doctor = "claude-sonnet-4-20250514"
-```
-
-Complexity overrides map directly to `model/effort`. R1 and R2 models are explicit;
-there is no universal "next stronger model" across families.
+There is no cross-runner strength ladder. Eligibility and percentages are explicit in each
+pool, and a profile's effort is part of its durable executable snapshot.
 
 ### Delivery sequence
 
@@ -1640,56 +1658,23 @@ there is no universal "next stronger model" across families.
    watchdogs, auth/quota failure, and unsupported-USD-limit rejection.
 4. **Enable Codex R1 and R2.** Prove changes/rework/re-review, stale-head rejection,
    self-review prevention, daemon-owned CI wait, approval, and merge.
-5. **Simplify configuration.** Preserve old Claude configuration, add explicit
-   per-role mappings, and install runner-appropriate Quorum guidance.
+5. **Cut over configuration.** Require profiles and complete routing pools, reject legacy
+   fixed-model keys, and install runner-appropriate Quorum guidance.
 
 Classifier, doctor, review interpreter, and analytics collector are not initial Codex
 parity requirements. They remain Claude-backed or disabled until the primary
 worker → R1 → R2 → merge lifecycle is proven. Mixed-runner behavior is never inferred.
 
-### Optional single-provider operation
+### Assignment continuity and evidence
 
-After the mixed-runner lifecycle is proven, an operator may select one provider for every
-managed coding role:
-
-```toml
-provider = "codex"
-
-worker_model = "gpt-5.6-terra"
-worker_effort = "medium"
-
-review_model = "gpt-5.6-terra"
-review_effort = "high"
-
-classifier_model = "gpt-5.6-luna"
-classifier_effort = "medium"
-```
-
-`provider` is optional. When absent, the legacy `agent` / `model` / `effort` configuration
-and Claude-compatible defaults remain available. When present, it is a fail-safe operating
-constraint for workers, live task classification, post-merge review classification, and
-collectors. `review_model` is the explicit exception: R1 and R2 resolve their runner from
-that model and may intentionally use the other supported provider. Classifier routing
-always stays within the configured worker provider; a cross-provider operator override is
-rejected rather than overriding the constraint. Reviewer spawn, retry, persistence, and
-recovery must instead remain bound to the configured reviewer model's provider; they must
-not fall back to a worker-provider CLI or resume a continuation belonging to another
-provider.
-
-The role model and effort fields are independently configurable. R1 and R2 use the explicit
-review selection instead of cross-provider strength inference. Every run persists the exact
-provider, model, effort, role, and provider continuation identity before lifecycle
-attachment; recovery reuses those durable values. Unknown models, provider/model mismatch,
-missing continuation metadata, and unavailable configured runners fail loudly and enter the
-existing bounded retry or parked-task path.
-
-The classifier and defaulted collectors use Codex `gpt-5.6-luna` at medium effort, and
-R1/R2 retain their configured review selection. Worker routing is authoritative:
-complexities 1–5 map to `luna/high`, `terra/high`, `sol/medium`, `sol/high`, and `sol/high`.
-Claude retains its provider-specific five-level ladder. `suggested_models` may let an
-operator replace a level using only the closed task-tier vocabulary and medium/high effort.
-These ladders do not claim cross-vendor benchmark equivalence or establish a cross-vendor
-strength ordering.
+A role assignment is created once for a new responsibility. Restart, continuation, retry,
+re-review, and rework reuse its persisted profile and consume no allocation slot. Removing a
+profile from current policy cannot make its existing assignments unrecoverable. Classifier,
+planner, collector, worker, R1, and R2 outcomes extend the existing canonical run, usage,
+review, and outcome evidence with assignment/profile identity; routing does not create a
+parallel statistics subsystem. Unknown models, unavailable runners, missing continuation
+metadata, or a profile snapshot that cannot be executed fail loudly through the existing
+bounded retry or parked-task path, never by silent substitution.
 
 ### Verification gates
 

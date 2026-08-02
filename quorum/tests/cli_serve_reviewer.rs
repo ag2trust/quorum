@@ -315,13 +315,11 @@ fn seed_task(home: &std::path::Path, title: &str) {
 
 fn configure_r2_sampling(home: &std::path::Path, target: i64, probability: f64) {
     let path = home.join("serve").join("test__repo.toml");
-    std::fs::write(
-        path,
-        format!(
-            "r2_enabled = true\nr2_target_per_stratum = {target}\nr2_steady_state_p = {probability}\n"
-        ),
-    )
-    .unwrap();
+    let routing = std::fs::read_to_string(&path).unwrap();
+    let config = format!(
+        "r2_enabled = true\nr2_target_per_stratum = {target}\nr2_steady_state_p = {probability}\n{routing}"
+    );
+    std::fs::write(path, config).unwrap();
 }
 
 fn r2_run_count(home: &std::path::Path, task_id: i64) -> i64 {

@@ -112,7 +112,7 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
                         THEN json_extract(refs, '$.classifier_policy_parked')=1
                         ELSE 0 END)
          AND {INCOMPLETE_CLASSIFICATION_PREDICATE}
-         ORDER BY id
+         ORDER BY priority DESC, id
          LIMIT ?3"
     );
     let mut stmt = conn.prepare(&query)?;
