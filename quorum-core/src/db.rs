@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 41;
+pub const SCHEMA_VERSION: i64 = 42;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -603,6 +603,28 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             [],
         )?;
 
+        // v42 = durable weighted model routing. Net-new authority tables are created by
+        // SCHEMA_SQL; these nullable links extend existing canonical evidence without
+        // reinterpreting historical rows.
+        if current < 42 {
+            if !column_exists(conn, "agent_runs", "role_assignment_id")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN role_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            if !column_exists(conn, "task_decompositions", "planner_assignment_id")? {
+                conn.execute("ALTER TABLE task_decompositions ADD COLUMN planner_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            if !column_exists(conn, "review_collection_runs", "role_assignment_id")? {
+                conn.execute("ALTER TABLE review_collection_runs ADD COLUMN role_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS agent_runs_role_assignment
+                     ON agent_runs(role_assignment_id);
+                 CREATE INDEX IF NOT EXISTS review_collection_runs_role_assignment
+                     ON review_collection_runs(role_assignment_id);
+                 CREATE INDEX IF NOT EXISTS task_decompositions_planner_assignment
+                     ON task_decompositions(planner_assignment_id);",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -666,6 +688,8 @@ mod tests {
             "journal",
             "daemon_lock",
             "agent_runs",
+            "role_assignments",
+            "routing_cursors",
             "task_messages",
             "task_message_deliveries",
         ] {
@@ -691,6 +715,64 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v38_to_v42_migration_adds_routing_authority_and_nullable_evidence_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v38.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_runs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+                    agent_name TEXT NOT NULL, role TEXT NOT NULL, model TEXT NOT NULL,
+                    effort TEXT NOT NULL, spawned_at INTEGER NOT NULL, ended_at INTEGER,
+                    end_reason TEXT, sub_role TEXT, provider TEXT
+                 );
+                 CREATE TABLE task_decompositions(
+                    id INTEGER PRIMARY KEY, active INTEGER NOT NULL DEFAULT 0,
+                    freeze_active INTEGER NOT NULL DEFAULT 0,
+                    accepted_proposal_json TEXT
+                 );
+                 CREATE TABLE review_collection_runs(
+                    pr_number INTEGER PRIMARY KEY, task_id INTEGER, status TEXT,
+                    error TEXT, collector_model TEXT, collector_version TEXT,
+                    findings_count INTEGER, attempted_at INTEGER, completed_at INTEGER
+                 );
+                 INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+                    VALUES (1,'old-worker','worker','old-model','high','codex',2);
+                 PRAGMA user_version=38;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for table in ["role_assignments", "routing_cursors"] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        assert!(column_exists(&conn, "agent_runs", "role_assignment_id").unwrap());
+        assert!(column_exists(&conn, "task_decompositions", "planner_assignment_id").unwrap());
+        assert!(column_exists(&conn, "review_collection_runs", "role_assignment_id").unwrap());
+        let historical: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT model,role_assignment_id FROM agent_runs WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(historical, ("old-model".into(), None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]

@@ -311,10 +311,12 @@ pub enum PlannerPoll {
     SemanticRejected(String),
 }
 
-/// Spawn only the provider selected by the configured runner. There is no
-/// fallback and model/effort are not caller-configurable.
+/// Spawn only the provider selected by the durable role assignment. There is
+/// no fallback or model substitution.
 pub async fn spawn_planner(
     provider: AgentKind,
+    model: &str,
+    effort: &str,
     repo: &Path,
     prompt: &str,
     bare: bool,
@@ -334,8 +336,8 @@ pub async fn spawn_planner(
         AgentKind::Claude => {
             let spec = AgentSpec {
                 kind: AgentKind::Claude,
-                model: CLAUDE_PLANNER_MODEL.into(),
-                effort: PLANNER_EFFORT.into(),
+                model: model.into(),
+                effort: effort.into(),
                 session_id: agent::new_session_id(),
                 worktree: repo.to_path_buf(),
                 bare,
@@ -520,6 +522,8 @@ mod tests {
         let prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
         let error = spawn_planner(
             AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
             Path::new("."),
             &prompt,
             false,
@@ -544,6 +548,8 @@ mod tests {
         }
         let error = spawn_planner(
             AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
             Path::new("."),
             "bounded prompt",
             false,
@@ -562,10 +568,12 @@ mod tests {
                 let real = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let real_error = spawn_planner(
                     AgentKind::Codex,
+                    CODEX_PLANNER_MODEL,
+                    PLANNER_EFFORT,
                     Path::new("."),
                     "attempt network, quorum, database, and coordination access",
                     false,
-                    Some(&real),
+                    Some(real.as_str()),
                 )
                 .await
                 .err()

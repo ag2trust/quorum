@@ -394,18 +394,9 @@ pub enum Command {
         /// When absent, names are auto-generated.
         #[arg(long)]
         names_file: Option<String>,
-        /// Runner type: "claude" (default) or "codex".
-        #[arg(long)]
-        agent: Option<String>,
         /// Override the agent binary (default: "claude" or "codex" per runner).
         #[arg(long)]
         agent_bin: Option<String>,
-        /// Model to pass to spawned agents (default: sonnet).
-        #[arg(long)]
-        model: Option<String>,
-        /// Effort level to pass to spawned agents (default: high).
-        #[arg(long)]
-        effort: Option<String>,
         /// Path to a file containing a GitHub token for merging PRs.
         /// Read at merge time; never passed to agent processes.
         #[arg(long)]

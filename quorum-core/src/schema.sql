@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 41). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 42). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     planner_provider        TEXT,
     planner_model           TEXT,
     planner_session_id      TEXT,
+    planner_assignment_id   INTEGER REFERENCES role_assignments(id),
     frozen_base_sha         TEXT,
     accepted_proposal_json  TEXT CHECK(accepted_proposal_json IS NULL OR length(CAST(accepted_proposal_json AS BLOB)) <= 65536),
     accepted_plan_revision  INTEGER,
@@ -412,6 +413,45 @@ CREATE TABLE IF NOT EXISTS daemon_lock (
     heartbeat_at  INTEGER NOT NULL
 );
 
+-- v42: one immutable executable routing decision per managed responsibility.
+-- Execution fields are snapshots, so later configuration changes or profile removal
+-- cannot reinterpret or strand an existing assignment.
+CREATE TABLE IF NOT EXISTS role_assignments (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    responsibility_key  TEXT NOT NULL UNIQUE,
+    task_id             INTEGER,
+    pr_number           INTEGER,
+    role                TEXT NOT NULL CHECK(role IN
+                            ('classifier','planner','worker','reviewer','collector')),
+    review_stage        TEXT CHECK(review_stage IN ('r1','r2')),
+    complexity          TEXT,
+    profile_id          TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    runner              TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    effort              TEXT NOT NULL,
+    pool_key            TEXT NOT NULL,
+    policy_generation   TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    CHECK((role = 'reviewer' AND review_stage IS NOT NULL) OR
+          (role != 'reviewer' AND review_stage IS NULL))
+);
+CREATE INDEX IF NOT EXISTS role_assignments_task ON role_assignments(task_id);
+CREATE INDEX IF NOT EXISTS role_assignments_pr ON role_assignments(pr_number);
+
+-- The exact shuffled 100-slot epoch is persisted. `next_slot` and assignment insertion
+-- advance in one BEGIN IMMEDIATE transaction, so restart never rerolls a pending turn.
+CREATE TABLE IF NOT EXISTS routing_cursors (
+    pool_key           TEXT NOT NULL,
+    policy_generation  TEXT NOT NULL,
+    epoch              INTEGER NOT NULL DEFAULT 0 CHECK(epoch >= 0),
+    bag_json           TEXT NOT NULL CHECK(json_valid(bag_json)
+                              AND length(CAST(bag_json AS BLOB)) <= 65536),
+    next_slot          INTEGER NOT NULL CHECK(next_slot BETWEEN 0 AND 100),
+    updated_at         INTEGER NOT NULL,
+    PRIMARY KEY(pool_key, policy_generation)
+);
+
 -- Agent-performance capture: one row per daemon-spawned agent process (worker
 -- or reviewer). Records the RESOLVED model+effort (after label→model mapping +
 -- daemon defaults) so query surfaces can cut by what actually ran, not what was
@@ -437,7 +477,9 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     -- NULL for workers and historical reviewer rows.
     review_cap_run_id TEXT,
     review_pr         INTEGER,
-    review_head_sha   TEXT
+    review_head_sha   TEXT,
+    -- v42: durable routing decision that caused this process run.
+    role_assignment_id INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 
@@ -517,7 +559,8 @@ CREATE TABLE IF NOT EXISTS review_collection_runs (
     collector_version   TEXT NOT NULL,
     findings_count      INTEGER NOT NULL DEFAULT 0,
     attempted_at        INTEGER NOT NULL,
-    completed_at        INTEGER
+    completed_at        INTEGER,
+    role_assignment_id  INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
 
