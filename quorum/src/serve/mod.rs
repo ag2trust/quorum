@@ -3616,14 +3616,16 @@ async fn tick_decomposition(
         let graph_id = snapshot.graph_id;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&path)?;
-            if !quorum_core::decomposition::bind_frozen_base_and_enter_planning(
+            // A zero-row bind is an expected lost race (invariant #3): a concurrent
+            // block/cancel/recovery moved the graph off 'draining' during the head-SHA
+            // fetch above. Clean negative, not an internal error — the next tick re-reads
+            // the new state. Mirrors begin_planning's Ok(None)-is-expected contract.
+            quorum_core::decomposition::bind_frozen_base_and_enter_planning(
                 &mut conn,
                 graph_id,
                 &sha,
                 now_unix(),
-            )? {
-                return Err(QuorumError::Io("lost drain-to-planning SHA bind".into()));
-            }
+            )?;
             Ok(())
         })
         .await
