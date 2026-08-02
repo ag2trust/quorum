@@ -74,10 +74,19 @@ same PR and provide concurrency/runtime evidence appropriate to the invariant.
 
 ## Git and delivery workflow
 
-- Never edit the shared `~/dev/quorum` checkout. Create a worktree from `origin/main`:
+- Never edit the shared `~/dev/quorum` checkout. By default, create a worktree from
+  `origin/main`:
 
   ```bash
   git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/main
+  ```
+
+- For work explicitly scoped to the hosted Quorum initiative, create the worktree from
+  `origin/develop` and open the PR against `develop`:
+
+  ```bash
+  git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/develop
+  gh pr create --base develop
   ```
 
 - Never branch from another feature branch. Do not rebase solely to become current;
