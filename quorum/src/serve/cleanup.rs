@@ -715,6 +715,72 @@ mod tests {
     use quorum_core::decomposition_cleanup::CleanupKey;
     use std::os::unix::process::ExitStatusExt;
 
+    fn restart_config(db_path: PathBuf, repo_dir: PathBuf, worktree_base: PathBuf) -> ServeConfig {
+        ServeConfig {
+            db_path,
+            cap: 1,
+            runner_kind: crate::serve_config::RunnerKind::Codex,
+            repo_dir,
+            worktree_base,
+            names_file: None,
+            agent_bin: None,
+            model: "test".into(),
+            effort: "medium".into(),
+            provider_explicit: false,
+            review_model_explicit: false,
+            review_model: "test".into(),
+            review_effort: "medium".into(),
+            classifier_model: "test".into(),
+            classifier_effort: "medium".into(),
+            collector_model: "test".into(),
+            collector_effort: "medium".into(),
+            merge_executor: std::sync::Arc::new(super::super::merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            bare_agent: true,
+            limits: super::super::CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            suggested_models: std::collections::HashMap::new(),
+            min_model: None,
+            min_effort: None,
+            codex_sandbox: "danger-full-access".into(),
+        }
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
     fn response(status: i32, http: u16, body: &str) -> std::process::Output {
         std::process::Output {
             status: std::process::ExitStatus::from_raw(status),
@@ -870,6 +936,222 @@ mod tests {
             std::fs::read_to_string(log).unwrap(),
             "pr\nclose\n42\n--repo\nowner/repo\n"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_replays_interrupted_cancel_cleanup_and_preserves_done_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree_base = dir.path().join("worktrees");
+        let worker_tree = worktree_base.join("task-2");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&worktree_base).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README"), "base\n").unwrap();
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "base"]);
+        git(&repo, &["branch", "daemon/task-2"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                worker_tree.to_str().unwrap(),
+                "daemon/task-2",
+            ],
+        );
+        std::fs::write(worker_tree.join("result"), "finished\n").unwrap();
+        git(&worker_tree, &["add", "result"]);
+        git(&worker_tree, &["commit", "-m", "finished result"]);
+        let worker_sha = git(&worker_tree, &["rev-parse", "HEAD"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
+               (1,'source','cancelled','owner',1,10),
+               (2,'completed child','done','owner',1,9),
+               (3,'unfinished child','cancelled','owner',1,10);
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,planned_source_revision,created_at,updated_at)
+               VALUES (1,1,'cancelled',0,0,1,1,10);
+             INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+               VALUES (1,2,'done-child',1,0),(1,3,'unfinished-child',1,0);
+             INSERT INTO events(ts,kind,subject,body,expires_at) VALUES (9,'merge_succeeded','task#2','historical merge',9999999999);
+             INSERT INTO approvals(pr_number,review_role,task_id,author,reviewer,verdict,blocking_count,approved_head_sha,created_at)
+               VALUES (42,'r1',2,'author','reviewer','approve',0,'historical-head',9);
+             INSERT INTO review_findings(pr_number,task_id,reviewer,kind,text,source_endpoint,created_at)
+               VALUES (42,2,'reviewer','suggestion','historical review','pulls',9);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+             VALUES (2,'daemon/task-2',?1,'daemon',2,?2)",
+            rusqlite::params![worker_tree.to_string_lossy(), worker_sha],
+        )
+        .unwrap();
+        quorum_core::pr_targets::upsert(&mut conn, 2, 42, "daemon/task-2", &worker_sha, false)
+            .unwrap();
+        use std::os::unix::process::CommandExt;
+        let mut stale_child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let stale_pid = stale_child.id() as i32;
+        conn.execute("INSERT INTO journal(agent,role,task_id,session_id,phase,pid,updated_at) VALUES ('worker-a','worker',2,'session-a','working',?1,9)", [stale_pid]).unwrap();
+        let process_ref = serde_json::json!({
+            "agent":"worker-a", "session_id":"session-a", "pid":stale_pid
+        })
+        .to_string();
+        let pr_ref = serde_json::json!({
+            "pr_number":42, "head_ref":"daemon/task-2", "head_sha":worker_sha
+        })
+        .to_string();
+        let worktree_ref = serde_json::json!({
+            "path":worker_tree, "branch":"daemon/task-2"
+        })
+        .to_string();
+        let branch_ref = serde_json::json!({
+            "name":"daemon/task-2", "expected_sha":worker_sha
+        })
+        .to_string();
+        for (kind, artifact, state, attempts, updated) in [
+            ("process", process_ref, "running", 1, 1),
+            // A merged/terminal proposed change is history, not destructive work.
+            ("proposed-change", pr_ref, "done", 1, 2),
+            ("worktree", worktree_ref, "pending", 0, 3),
+            ("branch", branch_ref, "pending", 0, 4),
+        ] {
+            conn.execute(
+                "INSERT INTO decomposition_cleanup(graph_id,task_id,artifact_kind,artifact_ref,state,attempts,updated_at)
+                 VALUES (1,2,?1,?2,?3,?4,?5)",
+                rusqlite::params![kind, artifact, state, attempts, updated],
+            )
+            .unwrap();
+        }
+        drop(conn); // daemon crash/restart boundary
+
+        let config = restart_config(db_path.clone(), repo.clone(), worktree_base);
+        let manager = WorktreeManager::new();
+        let stale_reaper = tokio::task::spawn_blocking(move || stale_child.wait().unwrap());
+        assert!(startup(&config, &manager).await.unwrap() >= 3);
+        assert!(
+            !stale_reaper.await.unwrap().success(),
+            "stale process must be killed and reaped"
+        );
+        // A second restart proves terminal replay and tombstone retirement are idempotent.
+        assert_eq!(startup(&config, &manager).await.unwrap(), 0);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM decomposition_cleanup WHERE state NOT IN ('done','exhausted')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT status FROM tasks WHERE id=2", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "done"
+        );
+        assert_eq!(
+            conn.query_row("SELECT status FROM tasks WHERE id=3", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            conn.query_row("SELECT status FROM tasks WHERE id=1", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM task_decompositions WHERE id=1",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT pr_number FROM pr_targets WHERE task_id=2",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            42
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE subject='task#2'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM approvals WHERE pr_number=42",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM review_findings WHERE pr_number=42",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM journal", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state||':'||attempts FROM decomposition_cleanup
+                 WHERE graph_id=1 AND task_id=2 AND artifact_kind='proposed-change'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "done:1",
+            "terminal merged-PR cleanup history must not be replayed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT branch FROM task_branches WHERE task_id=2",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "daemon/task-2"
+        );
+        assert!(!worker_tree.exists());
+        assert!(!std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show-ref", "--verify", "refs/heads/daemon/task-2"])
+            .output()
+            .unwrap()
+            .status
+            .success());
     }
 
     #[test]
