@@ -11042,7 +11042,28 @@ async fn spawn_worker(
     // forking a duplicate PR (#340).
     let branch_agent = task.author.as_deref().unwrap_or(&agent_name);
     let session_id = agent::new_session_id();
-    let branch = if continue_target.is_some() {
+    let reserved_allocation = if continue_target.is_none() {
+        let allocation_db = db_path.clone();
+        let allocation_task = task.id;
+        tokio::task::spawn_blocking(move || {
+            let conn = quorum_core::db::open(&allocation_db)?;
+            let allocation = conn
+                .query_row(
+                    "SELECT branch,worktree FROM task_branches WHERE task_id=?1",
+                    [allocation_task],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok::<_, QuorumError>(allocation)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("reserved allocation join: {e}")))??
+    } else {
+        None
+    };
+    let branch = if let Some((branch, _)) = &reserved_allocation {
+        branch.clone()
+    } else if continue_target.is_some() {
         reviewer::remediation_branch(&agent_name, task.id)
     } else {
         format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id)
@@ -11051,9 +11072,14 @@ async fn spawn_worker(
         .as_ref()
         .map(|target| target.head_ref.clone())
         .unwrap_or_else(|| branch.clone());
-    let wt_path = config
-        .worktree_base
-        .join(format!("{}-t{}", branch_agent, task.id));
+    let wt_path = reserved_allocation
+        .as_ref()
+        .map(|(_, path)| PathBuf::from(path))
+        .unwrap_or_else(|| {
+            config
+                .worktree_base
+                .join(format!("{}-t{}", branch_agent, task.id))
+        });
 
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
@@ -11080,24 +11106,24 @@ async fn spawn_worker(
         let allocation_task = task.id;
         let recorded = tokio::task::spawn_blocking(move || {
             let mut conn = quorum_core::db::open(&allocation_db)?;
-            let existing: Option<Option<String>> = conn
+            let existing: Option<(String, Option<String>)> = conn
                 .query_row(
-                    "SELECT provenance_sha FROM task_branches WHERE task_id=?1",
+                    "SELECT allocated_by,provenance_sha FROM task_branches WHERE task_id=?1",
                     [allocation_task],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let provenance = match existing.as_ref() {
-                Some(Some(provenance)) => provenance.as_str(),
-                Some(None) => return Ok(false),
-                None => resolved_provenance.as_str(),
+            let (allocator, provenance) = match existing.as_ref() {
+                Some((allocator, Some(provenance))) => (allocator.as_str(), provenance.as_str()),
+                Some((allocator, None)) => (allocator.as_str(), resolved_provenance.as_str()),
+                None => (allocation_agent.as_str(), resolved_provenance.as_str()),
             };
             quorum_core::branches::record_exact_allocation(
                 &mut conn,
                 allocation_task,
                 &allocation_branch,
                 &allocation_worktree,
-                &allocation_agent,
+                allocator,
                 provenance,
                 now_unix(),
             )
