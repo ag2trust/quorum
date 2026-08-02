@@ -8,6 +8,7 @@ mod cheatsheet;
 mod cli;
 mod cockpit;
 mod config;
+mod graph_blocker;
 mod input;
 mod output;
 mod paths;
@@ -924,18 +925,34 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             verdict,
             mut feedback,
             feedback_file,
+            feedback_json,
             blocking,
             run_id,
         } => {
             if let Some(ref v) = verdict {
                 match v.as_str() {
-                    "approved" | "changes" => {}
+                    "approved" | "changes" | "graph-blocker" => {}
                     _ => {
                         return Err(QuorumError::Usage(format!(
-                            "--verdict must be 'approved' or 'changes', got '{v}'"
+                            "--verdict must be 'approved', 'changes', or 'graph-blocker', got '{v}'"
                         )));
                     }
                 }
+            }
+            if verdict.as_deref() == Some("graph-blocker") && feedback_json.is_none() {
+                return Err(QuorumError::Usage(
+                    "--verdict graph-blocker requires --feedback-json".into(),
+                ));
+            }
+            if verdict.as_deref() == Some("graph-blocker") && pr.is_none() {
+                return Err(QuorumError::Usage(
+                    "--verdict graph-blocker requires --pr".into(),
+                ));
+            }
+            if feedback_json.is_some() && verdict.as_deref() != Some("graph-blocker") {
+                return Err(QuorumError::Usage(
+                    "--feedback-json requires --verdict graph-blocker".into(),
+                ));
             }
             if (feedback.is_some() || feedback_file.is_some())
                 && verdict.as_deref() != Some("changes")
@@ -947,8 +964,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             if let Some(path) = feedback_file {
                 feedback = Some(input::read_text(input::TextSource::File(path))?);
             }
-            verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
-                .map_err(QuorumError::Usage)?;
+            if verdict.as_deref() != Some("graph-blocker") {
+                verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
+                    .map_err(QuorumError::Usage)?;
+            } else if blocking.is_some() || feedback.is_some() {
+                return Err(QuorumError::Usage(
+                    "graph-blocker uses only --feedback-json, not ordinary review feedback or --blocking"
+                        .into(),
+                ));
+            }
             let rid = resolve_run_id(run_id, "submit")?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
@@ -960,6 +984,19 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
                 .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
             let kind = quorum_core::mailbox::MailboxKind::Done;
+            let payload = if let Some(raw) = feedback_json {
+                let graph_feedback =
+                    graph_blocker::parse_feedback(&raw).map_err(QuorumError::Usage)?;
+                if graph_feedback.affected_task != cap.task_id {
+                    return Err(QuorumError::Usage(format!(
+                        "graph-blocker affected_task {} does not match reviewer task {}",
+                        graph_feedback.affected_task, cap.task_id
+                    )));
+                }
+                Some(graph_blocker::encode(rid, graph_feedback).map_err(QuorumError::Usage)?)
+            } else {
+                verdict::attestation_payload(blocking)
+            };
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
                 kind,
@@ -969,7 +1006,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 feedback,
                 note: summary,
                 to_agent: None,
-                payload: verdict::attestation_payload(blocking),
+                payload,
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));

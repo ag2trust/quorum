@@ -248,6 +248,99 @@ fn review_head_matches_launch(
     )
 }
 
+#[derive(Debug)]
+struct LiveGraphBlockerAuthority<'a> {
+    agent_run_id: Option<i64>,
+    task_id: i64,
+    agent: &'a str,
+    cap_run_id: Option<&'a str>,
+    pr: Option<i64>,
+    head_sha: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphBlockerConsumeOutcome {
+    Blocked,
+    Rejected,
+    RetryHeadUnavailable,
+}
+
+/// Storage-only graph-blocker convergence boundary. External head resolution
+/// happens before this call; immutable launch authority comes only from the
+/// daemon-written agent_run row, never from a worktree or mailbox assertion.
+fn consume_graph_blocker_signal(
+    conn: &mut quorum_core::Connection,
+    mailbox_id: i64,
+    row: &mailbox::MailboxRow,
+    current_head_sha: Option<&str>,
+    live: Option<&LiveGraphBlockerAuthority<'_>>,
+    now: i64,
+) -> Result<GraphBlockerConsumeOutcome> {
+    let envelope = row
+        .payload
+        .as_deref()
+        .and_then(|raw| crate::graph_blocker::parse_envelope(raw).ok());
+    let launch = match envelope.as_ref() {
+        Some(value) => quorum_core::agent_runs::review_launch_for_capability(conn, &value.run_id)?,
+        None => None,
+    };
+    let structural_matches = match (
+        row.kind == mailbox::MailboxKind::Done,
+        row.verdict.as_deref(),
+        row.task_id,
+        row.pr,
+        envelope.as_ref(),
+        launch.as_ref(),
+    ) {
+        (true, Some("graph-blocker"), Some(task), Some(pr), Some(envelope), Some(launch)) => {
+            task == launch.task_id
+                && pr == launch.pr
+                && row.agent == launch.agent_name
+                && envelope.feedback.affected_task == launch.task_id
+                && envelope.run_id == launch.cap_run_id
+                && live.is_none_or(|slot| {
+                    slot.agent_run_id == Some(launch.agent_run_id)
+                        && slot.task_id == launch.task_id
+                        && slot.agent == launch.agent_name
+                        && slot.cap_run_id == Some(launch.cap_run_id.as_str())
+                        && slot.pr == Some(launch.pr)
+                        && slot.head_sha == Some(launch.head_sha.as_str())
+                })
+        }
+        _ => false,
+    };
+    if structural_matches && current_head_sha.is_none() {
+        return Ok(GraphBlockerConsumeOutcome::RetryHeadUnavailable);
+    }
+    let identity_matches = structural_matches
+        && launch.as_ref().is_some_and(|launch| {
+            review_head_matches_launch(Some(&launch.head_sha), current_head_sha)
+        });
+    let blocked = if identity_matches {
+        let envelope = envelope.expect("matched envelope");
+        quorum_core::decomposition::block_graph(
+            conn,
+            &quorum_core::decomposition::GraphBlocker {
+                task_id: envelope.feedback.affected_task,
+                reviewer: &row.agent,
+                run_id: &envelope.run_id,
+                category: &envelope.feedback.category,
+                violated_boundary: &envelope.feedback.violated_assigned_boundary,
+                evidence: &envelope.feedback.evidence,
+                now,
+            },
+        )?
+    } else {
+        false
+    };
+    mailbox::mark_consumed(conn, mailbox_id)?;
+    Ok(if blocked {
+        GraphBlockerConsumeOutcome::Blocked
+    } else {
+        GraphBlockerConsumeOutcome::Rejected
+    })
+}
+
 /// Whether an R2 was required for this PR head when R1 approved. Decisions are
 /// retained in a daemon-owned table by PR and head SHA so a later rework head
 /// cannot change the requirement if an earlier head is force-pushed back.
@@ -2282,7 +2375,22 @@ async fn recover_late_worker_completions(config: &ServeConfig) -> Result<()> {
 /// Reconcile late reviewer verdicts before generic recovery deletes the
 /// journal/worktree identity. Git and PR-head lookups happen before the core
 /// transaction; that transaction itself is storage-only.
-async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateReviewerRecovery {
+    Settled,
+    Deferred,
+}
+
+fn ensure_late_reviewer_recovery_settled(outcome: LateReviewerRecovery) -> Result<()> {
+    match outcome {
+        LateReviewerRecovery::Settled => Ok(()),
+        LateReviewerRecovery::Deferred => Err(QuorumError::Io(
+            "late reviewer recovery deferred: graph-blocker PR head unavailable; preserving reviewer authority for retry after relaunch".into(),
+        )),
+    }
+}
+
+async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateReviewerRecovery> {
     let p = config.db_path.clone();
     let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, mailbox::MailboxRow)>> {
         let conn = quorum_core::db::open(&p)?;
@@ -2290,7 +2398,50 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late reviewer poll join: {error}")))??;
+    let mut deferred = false;
     for (mailbox_id, row) in rows {
+        if row.kind == mailbox::MailboxKind::Done && row.verdict.as_deref() == Some("graph-blocker")
+        {
+            let current_sha = if let Some(pr) = row.pr.filter(|pr| *pr > 0) {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("late graph blocker head lookup join: {error}"))
+                    })?
+            } else {
+                None
+            };
+            let p = config.db_path.clone();
+            let row_owned = row.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    mailbox_id,
+                    &row_owned,
+                    current_sha.as_deref(),
+                    None,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("late graph blocker join: {error}")))??;
+            log(&format!(
+                "startup graph blocker {} for task {:?}",
+                match outcome {
+                    GraphBlockerConsumeOutcome::Blocked => "folded",
+                    GraphBlockerConsumeOutcome::Rejected => "rejected",
+                    GraphBlockerConsumeOutcome::RetryHeadUnavailable => {
+                        "head unavailable; retaining for retry"
+                    }
+                },
+                row.task_id
+            ));
+            deferred |= outcome == GraphBlockerConsumeOutcome::RetryHeadUnavailable;
+            continue;
+        }
         let (Some(task_id), Some(pr), Some(raw_verdict)) =
             (row.task_id, row.pr, row.verdict.as_deref())
         else {
@@ -2379,7 +2530,11 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(if deferred {
+        LateReviewerRecovery::Deferred
+    } else {
+        LateReviewerRecovery::Settled
+    })
 }
 
 fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
@@ -4399,11 +4554,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 "late worker startup recovery failed: {e} — continuing"
             ));
         }
-        if let Err(e) = recover_late_reviewer_verdicts(config).await {
-            log(&format!(
-                "late reviewer startup recovery failed: {e} — continuing"
-            ));
-        }
+        let late_reviewers = recover_late_reviewer_verdicts(config).await.map_err(|e| {
+            QuorumError::Io(format!(
+                "late reviewer startup recovery failed before generic recovery: {e}"
+            ))
+        })?;
+        ensure_late_reviewer_recovery_settled(late_reviewers)?;
 
         // #228: approval recovery — merge already-approved PRs from durable,
         // instance-independent state BEFORE stateless recovery, so a
@@ -4985,6 +5141,100 @@ async fn tick(
                 "reviewer {} done (pr={:?}, verdict={:?}{note_suffix})",
                 reviewers[ri].agent_name, row.pr, row.verdict
             ));
+
+            // A graph blocker is not an ordinary review verdict. The CLI
+            // carries the exact immutable run capability in a closed payload;
+            // this daemon boundary rechecks roster ownership and the current
+            // PR head before the core transaction is allowed to mutate state.
+            if row.verdict.as_deref() == Some("graph-blocker") {
+                let pr = row.pr.unwrap_or_default();
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let current = if pr > 0 {
+                    tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let p = db_path.clone();
+                let row_owned = row.clone();
+                let mailbox_id = *id;
+                let live = LiveGraphBlockerAuthority {
+                    agent_run_id: reviewers[ri].agent_run_id,
+                    task_id: reviewers[ri].task_id,
+                    agent: &reviewers[ri].agent_name,
+                    cap_run_id: reviewers[ri].cap_run_id.as_deref(),
+                    pr: reviewers[ri].pr,
+                    head_sha: reviewers[ri].reviewed_head_sha.as_deref(),
+                };
+                let live_owned = (
+                    live.agent_run_id,
+                    live.task_id,
+                    live.agent.to_string(),
+                    live.cap_run_id.map(str::to_string),
+                    live.pr,
+                    live.head_sha.map(str::to_string),
+                );
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    let live = LiveGraphBlockerAuthority {
+                        agent_run_id: live_owned.0,
+                        task_id: live_owned.1,
+                        agent: &live_owned.2,
+                        cap_run_id: live_owned.3.as_deref(),
+                        pr: live_owned.4,
+                        head_sha: live_owned.5.as_deref(),
+                    };
+                    consume_graph_blocker_signal(
+                        &mut conn,
+                        mailbox_id,
+                        &row_owned,
+                        current.as_deref(),
+                        Some(&live),
+                        now_unix(),
+                    )
+                })
+                .await
+                .map_err(|error| QuorumError::Io(format!("graph blocker join: {error}")))??;
+
+                if outcome == GraphBlockerConsumeOutcome::Blocked {
+                    log(&format!(
+                        "graph blocker accepted from {} for task #{}",
+                        row.agent, reviewer_task_id
+                    ));
+                    let reviewer = reviewers.remove(ri);
+                    teardown_reviewer(config, wt_mgr, name_pool, reviewer, "graph-blocker").await;
+                    if let Some(wi) = workers
+                        .iter()
+                        .position(|worker| worker.task_id == reviewer_task_id)
+                    {
+                        let worker = workers.remove(wi);
+                        cleanup_slot_inner(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            worker,
+                            None,
+                            false,
+                            "graph-blocker",
+                        )
+                        .await;
+                    }
+                } else if outcome == GraphBlockerConsumeOutcome::Rejected {
+                    log(&format!(
+                        "graph blocker rejected without lifecycle mutation from {} for task {:?}",
+                        row.agent, row.task_id
+                    ));
+                } else {
+                    log(&format!(
+                        "graph blocker head unavailable for {} task {:?}; retaining mailbox row for retry",
+                        row.agent, row.task_id
+                    ));
+                }
+                break;
+            }
 
             // #206: gate the verdict before acting on it. An `approved` row
             // without the zero-blocking attestation payload (i.e. one that
@@ -10621,30 +10871,26 @@ async fn provision_reviewer_reserved(
                 let prov = reviewer_provider;
                 let tid = worker.task_id;
                 let is_r2 = role.is_r2();
+                let review_cap = cap_run_id.clone();
+                let review_head = head_sha.to_string();
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    if is_r2 {
-                        quorum_core::agent_runs::insert_r2(
-                            &conn,
-                            tid,
-                            &name,
-                            &m,
-                            &e,
-                            &prov,
-                            now_unix(),
-                        )
-                    } else {
-                        quorum_core::agent_runs::insert(
-                            &conn,
-                            tid,
-                            &name,
-                            "reviewer",
-                            &m,
-                            &e,
-                            &prov,
-                            now_unix(),
-                        )
-                    }
+                    quorum_core::agent_runs::insert_reviewer_with_launch(
+                        &conn,
+                        tid,
+                        &name,
+                        &m,
+                        &e,
+                        &prov,
+                        now_unix(),
+                        is_r2.then_some("r2"),
+                        &review_cap,
+                        pr,
+                        &review_head,
+                    )?
+                    .ok_or_else(|| {
+                        QuorumError::Io("invalid immutable reviewer launch authority".into())
+                    })
                 })
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
@@ -13042,6 +13288,320 @@ async fn spawn_remediation_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn graph_blocker_fixture(
+        cap_role: &str,
+        bind_launch: bool,
+    ) -> (
+        tempfile::TempDir,
+        quorum_core::Connection,
+        i64,
+        i64,
+        i64,
+        mailbox::MailboxRow,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("blocker.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'source','decomposed','owner',1,1),
+                        (2,'child','in-review','owner',1,1),
+                        (3,'sibling','open','owner',1,1);
+             UPDATE tasks SET reviewer='R',assignee='R' WHERE id=2;
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+                 VALUES (1,1,'active',1,0,1,1,1);
+             INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (1,2,'child',1,1),(1,3,'sibling',1,1);
+             INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+                 VALUES (2,'daemon/child','/tmp/moved-review-worktree','daemon',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+             INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (2,71,'daemon/child','0123456789abcdef0123456789abcdef01234567',0,1);
+             INSERT INTO journal(agent,role,task_id,session_id,worktree,branch,phase,pr,updated_at)
+                 VALUES ('R','reviewer',2,'session','/tmp/moved-review-worktree','review/pr-71-r','reviewing',71,1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES ('task#2','R',1,999,1)",
+            [],
+        )
+        .unwrap();
+        quorum_core::capabilities::issue(&mut conn, "cap-2", 2, "R", cap_role, 2).unwrap();
+        if bind_launch {
+            quorum_core::agent_runs::insert_reviewer_with_launch(
+                &conn, 2, "R", "model", "high", "codex", 2, None, "cap-2", 71, REVIEW_SHA,
+            )
+            .unwrap()
+            .unwrap();
+        } else {
+            quorum_core::agent_runs::insert(&conn, 2, "R", "reviewer", "model", "high", "codex", 2)
+                .unwrap();
+        }
+        let feedback = crate::graph_blocker::Feedback {
+            category: quorum_core::decomposition::GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION.into(),
+            affected_task: 2,
+            violated_assigned_boundary: "parser-only child".into(),
+            evidence: vec!["diff changes sibling-owned schema".into()],
+        };
+        let row = mailbox::MailboxRow {
+            agent: "R".into(),
+            kind: mailbox::MailboxKind::Done,
+            task_id: Some(2),
+            pr: Some(71),
+            verdict: Some("graph-blocker".into()),
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: Some(crate::graph_blocker::encode("cap-2".into(), feedback).unwrap()),
+        };
+        let id = mailbox::append(&mut conn, &row).unwrap();
+        (dir, conn, 1, 2, id, row)
+    }
+
+    fn assert_blocked_convergence(conn: &mut quorum_core::Connection, mailbox_id: i64) {
+        assert!(mailbox::poll_unconsumed(conn).unwrap().is_empty());
+        let state: (String, String, String, i64) = conn
+            .query_row(
+                "SELECT d.state,child.status,source.status,
+                    (SELECT count(*) FROM decomposition_attempts WHERE graph_id=d.id)
+             FROM task_decompositions d JOIN tasks child ON child.id=2
+             JOIN tasks source ON source.id=1 WHERE d.id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("blocked".into(), "failed".into(), "decomposed".into(), 1)
+        );
+        let authority: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT c.revoked_at,r.ended_at FROM run_capabilities c
+             JOIN agent_runs r ON r.review_cap_run_id=c.run_id WHERE c.run_id='cap-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(authority.0.is_some() && authority.1.is_some());
+        assert!(tasks::claim(conn, "next", Some(3), &[], 60, 20)
+            .unwrap()
+            .is_none());
+        let preserved: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM task_branches WHERE task_id=2),
+                    (SELECT count(*) FROM pr_targets WHERE task_id=2)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1));
+        let consumed: i64 = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn graph_blocker_daemon_boundary_live_restart_and_replay_converge() {
+        for live_mode in [false, true] {
+            let (_dir, mut conn, _graph, _child, id, row) = graph_blocker_fixture("reviewer", true);
+            let live = LiveGraphBlockerAuthority {
+                agent_run_id: Some(1),
+                task_id: 2,
+                agent: "R",
+                cap_run_id: Some("cap-2"),
+                pr: Some(71),
+                head_sha: Some(REVIEW_SHA),
+            };
+            assert_eq!(
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    id,
+                    &row,
+                    None,
+                    live_mode.then_some(&live),
+                    9,
+                )
+                .unwrap(),
+                GraphBlockerConsumeOutcome::RetryHeadUnavailable
+            );
+            assert_eq!(mailbox::poll_unconsumed(&conn).unwrap().len(), 1);
+            assert_eq!(
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    id,
+                    &row,
+                    Some(REVIEW_SHA),
+                    live_mode.then_some(&live),
+                    10,
+                )
+                .unwrap(),
+                GraphBlockerConsumeOutcome::Blocked
+            );
+            assert_blocked_convergence(&mut conn, id);
+            let replay_id = mailbox::append(&mut conn, &row).unwrap();
+            assert_eq!(
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    replay_id,
+                    &row,
+                    Some(REVIEW_SHA),
+                    None,
+                    11,
+                )
+                .unwrap(),
+                GraphBlockerConsumeOutcome::Rejected
+            );
+            assert_blocked_convergence(&mut conn, replay_id);
+        }
+    }
+
+    #[test]
+    fn graph_blocker_daemon_boundary_invalid_authority_is_consumed_without_mutation() {
+        enum Invalid {
+            MovedHead,
+            HistoricalNullLaunch,
+            Revoked,
+            WrongRole,
+            WrongTask,
+            WrongRun,
+            WrongPr,
+            WrongLiveHead,
+            MissingTask,
+            MissingPr,
+        }
+        for case in [
+            Invalid::MovedHead,
+            Invalid::HistoricalNullLaunch,
+            Invalid::Revoked,
+            Invalid::WrongRole,
+            Invalid::WrongTask,
+            Invalid::WrongRun,
+            Invalid::WrongPr,
+            Invalid::WrongLiveHead,
+            Invalid::MissingTask,
+            Invalid::MissingPr,
+        ] {
+            let role = if matches!(case, Invalid::WrongRole) {
+                "worker"
+            } else {
+                "reviewer"
+            };
+            let bind = !matches!(case, Invalid::HistoricalNullLaunch);
+            let (_dir, mut conn, _graph, _child, id, mut row) = graph_blocker_fixture(role, bind);
+            if matches!(case, Invalid::Revoked) {
+                quorum_core::capabilities::revoke(&mut conn, "cap-2", 5).unwrap();
+            }
+            if matches!(case, Invalid::WrongTask) {
+                row.task_id = Some(3);
+            }
+            if matches!(case, Invalid::MissingTask) {
+                row.task_id = None;
+            }
+            if matches!(case, Invalid::WrongRun) {
+                row.payload = Some(row.payload.unwrap().replace("cap-2", "other"));
+            }
+            if matches!(case, Invalid::WrongPr) {
+                row.pr = Some(72);
+            }
+            if matches!(case, Invalid::MissingPr) {
+                row.pr = None;
+            }
+            let current = if matches!(case, Invalid::MovedHead) {
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            } else {
+                Some(REVIEW_SHA)
+            };
+            let live = LiveGraphBlockerAuthority {
+                agent_run_id: Some(1),
+                task_id: 2,
+                agent: "R",
+                cap_run_id: Some("cap-2"),
+                pr: Some(71),
+                head_sha: if matches!(case, Invalid::WrongLiveHead) {
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                } else {
+                    Some(REVIEW_SHA)
+                },
+            };
+            let before: (String,String,i64)=conn.query_row("SELECT d.state,t.status,(SELECT count(*) FROM decomposition_attempts) FROM task_decompositions d JOIN tasks t ON t.id=2 WHERE d.id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(
+                consume_graph_blocker_signal(&mut conn, id, &row, current, Some(&live), 10)
+                    .unwrap(),
+                GraphBlockerConsumeOutcome::Rejected
+            );
+            let after: (String,String,i64)=conn.query_row("SELECT d.state,t.status,(SELECT count(*) FROM decomposition_attempts) FROM task_decompositions d JOIN tasks t ON t.id=2 WHERE d.id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(after, before);
+            assert!(mailbox::poll_unconsumed(&conn).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn graph_blocker_storage_error_retains_mailbox_for_retry() {
+        let (_dir, mut conn, _graph, _child, id, row) = graph_blocker_fixture("reviewer", true);
+        conn.execute(
+            "ALTER TABLE agent_runs RENAME TO unavailable_agent_runs",
+            [],
+        )
+        .unwrap();
+        assert!(
+            consume_graph_blocker_signal(&mut conn, id, &row, Some(REVIEW_SHA), None, 10,).is_err()
+        );
+        let consumed: Option<i64> = conn
+            .query_row("SELECT consumed_at FROM mailbox WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(consumed.is_none());
+    }
+
+    #[test]
+    fn startup_deferred_graph_blocker_preserves_identity_before_generic_recovery() {
+        let (_dir, mut conn, _graph, _child, id, row) = graph_blocker_fixture("reviewer", true);
+        let outcome = consume_graph_blocker_signal(&mut conn, id, &row, None, None, 9).unwrap();
+        assert_eq!(outcome, GraphBlockerConsumeOutcome::RetryHeadUnavailable);
+
+        let mut generic_recovery_called = false;
+        let startup: Result<()> = (|| {
+            ensure_late_reviewer_recovery_settled(LateReviewerRecovery::Deferred)?;
+            generic_recovery_called = true;
+            Ok(())
+        })();
+        assert!(startup.is_err());
+        assert!(!generic_recovery_called);
+        let preserved: (Option<i64>, Option<i64>, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT c.revoked_at,r.ended_at,
+                        (SELECT count(*) FROM journal WHERE agent='R'),m.consumed_at
+                 FROM run_capabilities c JOIN agent_runs r ON r.review_cap_run_id=c.run_id
+                 JOIN mailbox m ON m.id=?1 WHERE c.run_id='cap-2'",
+                [id],
+                |record| {
+                    Ok((
+                        record.get(0)?,
+                        record.get(1)?,
+                        record.get(2)?,
+                        record.get(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, (None, None, 1, None));
+
+        assert_eq!(
+            consume_graph_blocker_signal(&mut conn, id, &row, Some(REVIEW_SHA), None, 10).unwrap(),
+            GraphBlockerConsumeOutcome::Blocked
+        );
+        ensure_late_reviewer_recovery_settled(LateReviewerRecovery::Settled).unwrap();
+        assert_blocked_convergence(&mut conn, id);
+    }
 
     #[cfg(unix)]
     #[tokio::test]

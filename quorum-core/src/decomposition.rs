@@ -68,6 +68,8 @@ pub struct GraphBlocker<'a> {
     pub now: i64,
 }
 
+pub const GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION: &str = "boundary-violation";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StartupReconcileResult {
     pub healthy: usize,
@@ -1033,8 +1035,7 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
             "embedded NUL in graph-blocker input".into(),
         ));
     }
-    if blocker.category.trim().is_empty()
-        || blocker.category.len() > 128
+    if blocker.category != GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION
         || blocker.violated_boundary.trim().is_empty()
         || blocker.violated_boundary.len() > 1024
         || blocker.evidence.is_empty()
@@ -2325,6 +2326,71 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_graph_blocker_replay_has_one_atomic_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph-blocker-race.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let (graph, ids) = make_reviewable_graph(&mut conn);
+        add_reviewer_authority(&mut conn, ids[0], "r", "review-run", "reviewer", 4);
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for now in [5, 6] {
+            let path = path.clone();
+            let barrier = Arc::clone(&barrier);
+            let task_id = ids[0];
+            handles.push(std::thread::spawn(move || {
+                let mut conn = crate::db::open(&path).unwrap();
+                let evidence = vec!["diff crosses the assigned child boundary".into()];
+                barrier.wait();
+                block_graph(
+                    &mut conn,
+                    &GraphBlocker {
+                        task_id,
+                        reviewer: "r",
+                        run_id: "review-run",
+                        category: "boundary-violation",
+                        violated_boundary: "parser-only child",
+                        evidence: &evidence,
+                        now,
+                    },
+                )
+                .unwrap()
+            }));
+        }
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+
+        let conn = crate::db::open(&path).unwrap();
+        assert_eq!(
+            graph_mutation_state(&conn, graph, ids[0]),
+            ("blocked".into(), "failed".into(), 1)
+        );
+        let live_capabilities: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM run_capabilities
+                 WHERE run_id='review-run' AND revoked_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_capabilities, 0);
+    }
+
+    #[test]
     fn graph_blocker_rejects_unknown_revoked_wrong_and_superseded_runs_without_mutation() {
         enum InvalidRun {
             Unknown,
@@ -2447,6 +2513,29 @@ mod tests {
             assert!(matches!(error, QuorumError::BadInput(_)));
             assert_eq!(graph_mutation_state(&conn, graph, ids[0]), before);
         }
+    }
+
+    #[test]
+    fn graph_blocker_core_rejects_unsupported_category_without_mutation() {
+        let mut conn = setup();
+        let (graph, ids) = make_reviewable_graph(&mut conn);
+        add_reviewer_authority(&mut conn, ids[0], "r", "review-run", "reviewer", 4);
+        let before = graph_mutation_state(&conn, graph, ids[0]);
+        let evidence = vec!["concrete diff evidence".into()];
+        assert!(block_graph(
+            &mut conn,
+            &GraphBlocker {
+                task_id: ids[0],
+                reviewer: "r",
+                run_id: "review-run",
+                category: "invented-category",
+                violated_boundary: "assigned boundary",
+                evidence: &evidence,
+                now: 5,
+            },
+        )
+        .is_err());
+        assert_eq!(graph_mutation_state(&conn, graph, ids[0]), before);
     }
 
     #[test]

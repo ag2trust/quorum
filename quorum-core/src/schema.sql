@@ -432,7 +432,12 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     sub_role    TEXT,
     -- v31: resolved provider for this run ('claude' or 'codex'). NULL for
     -- pre-existing rows (implies Claude). Recovery must use this, not re-resolve.
-    provider    TEXT
+    provider    TEXT,
+    -- v41: immutable daemon-captured reviewer launch authority. All three are
+    -- NULL for workers and historical reviewer rows.
+    review_cap_run_id TEXT,
+    review_pr         INTEGER,
+    review_head_sha   TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
 

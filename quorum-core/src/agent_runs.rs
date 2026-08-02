@@ -2,6 +2,102 @@
 
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLaunch {
+    pub agent_run_id: i64,
+    pub task_id: i64,
+    pub agent_name: String,
+    pub cap_run_id: String,
+    pub pr: i64,
+    pub head_sha: String,
+}
+
+/// Bind the immutable daemon-captured review target to the exact persisted
+/// reviewer run before lifecycle attachment becomes visible.
+#[cfg(test)]
+pub fn bind_review_launch(
+    conn: &Connection,
+    agent_run_id: i64,
+    cap_run_id: &str,
+    pr: i64,
+    head_sha: &str,
+) -> Result<bool> {
+    if cap_run_id.is_empty()
+        || cap_run_id.contains('\0')
+        || pr <= 0
+        || head_sha.len() != 40
+        || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Ok(false);
+    }
+    Ok(conn.execute(
+        "UPDATE agent_runs SET review_cap_run_id=?2,review_pr=?3,review_head_sha=?4
+         WHERE id=?1 AND role='reviewer' AND ended_at IS NULL
+           AND review_cap_run_id IS NULL AND review_pr IS NULL AND review_head_sha IS NULL",
+        params![agent_run_id, cap_run_id, pr, head_sha],
+    )? == 1)
+}
+
+/// Atomically create a reviewer run together with its immutable launch
+/// authority. No observer can see an authoritative run without the binding.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_reviewer_with_launch(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    spawned_at: i64,
+    sub_role: Option<&str>,
+    cap_run_id: &str,
+    pr: i64,
+    head_sha: &str,
+) -> Result<Option<i64>> {
+    if cap_run_id.is_empty()
+        || cap_run_id.contains('\0')
+        || pr <= 0
+        || head_sha.len() != 40
+        || !head_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !matches!(sub_role, None | Some("r2"))
+    {
+        return Ok(None);
+    }
+    conn.execute(
+        "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at,
+             sub_role,review_cap_run_id,review_pr,review_head_sha)
+         VALUES (?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            task_id, agent_name, model, effort, provider, spawned_at, sub_role, cap_run_id, pr,
+            head_sha
+        ],
+    )?;
+    Ok(Some(conn.last_insert_rowid()))
+}
+
+pub fn review_launch_for_capability(
+    conn: &Connection,
+    cap_run_id: &str,
+) -> Result<Option<ReviewLaunch>> {
+    Ok(conn
+        .query_row(
+            "SELECT id,task_id,agent_name,review_cap_run_id,review_pr,review_head_sha
+         FROM agent_runs WHERE review_cap_run_id=?1 AND role='reviewer' AND ended_at IS NULL",
+            [cap_run_id],
+            |row| {
+                Ok(ReviewLaunch {
+                    agent_run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent_name: row.get(2)?,
+                    cap_run_id: row.get(3)?,
+                    pr: row.get(4)?,
+                    head_sha: row.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -221,6 +317,70 @@ mod tests {
             .unwrap();
         assert_eq!(ended, 200);
         assert_eq!(reason, "done");
+    }
+
+    #[test]
+    fn review_launch_is_immutable_capability_bound_and_fail_closed() {
+        let (_d, c) = open_tmp();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let run = insert(&c, 7, "R", "reviewer", "model", "high", "codex", 10).unwrap();
+        assert!(bind_review_launch(&c, run, "cap-7", 71, sha).unwrap());
+        assert!(!bind_review_launch(&c, run, "other", 72, sha).unwrap());
+        assert!(!bind_review_launch(&c, run, "bad", 71, "not-a-sha").unwrap());
+        assert_eq!(
+            review_launch_for_capability(&c, "cap-7").unwrap(),
+            Some(ReviewLaunch {
+                agent_run_id: run,
+                task_id: 7,
+                agent_name: "R".into(),
+                cap_run_id: "cap-7".into(),
+                pr: 71,
+                head_sha: sha.into(),
+            })
+        );
+        assert_eq!(review_launch_for_capability(&c, "other").unwrap(), None);
+        close(&c, run, 20, "done").unwrap();
+        assert_eq!(review_launch_for_capability(&c, "cap-7").unwrap(), None);
+    }
+
+    #[test]
+    fn reviewer_insert_persists_launch_authority_in_one_row() {
+        let (_d, c) = open_tmp();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let run = insert_reviewer_with_launch(
+            &c,
+            9,
+            "R2",
+            "model",
+            "high",
+            "codex",
+            10,
+            Some("r2"),
+            "cap-9",
+            79,
+            sha,
+        )
+        .unwrap()
+        .unwrap();
+        let launch = review_launch_for_capability(&c, "cap-9").unwrap().unwrap();
+        assert_eq!(launch.agent_run_id, run);
+        assert_eq!(
+            (launch.task_id, launch.pr, launch.head_sha.as_str()),
+            (9, 79, sha)
+        );
+        assert!(insert_reviewer_with_launch(
+            &c, 10, "bad", "model", "high", "codex", 11, None, "", 79, sha,
+        )
+        .unwrap()
+        .is_none());
+        let bad_rows: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE agent_name='bad'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_rows, 0);
     }
 
     #[test]
