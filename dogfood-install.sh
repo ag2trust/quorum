@@ -46,7 +46,8 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
 
   printf '=== Installing dogfood binary to %s ===\n' "$BINARY"
   mkdir -p "$INSTALL_DIR"
-  TEMP_BINARY="$INSTALL_DIR/.quorum-dev.tmp.$$"
+  TEMP_BINARY=$(mktemp "$INSTALL_DIR/.quorum-dev.tmp.XXXXXX") \
+    || err "could not create temporary binary in $INSTALL_DIR"
   trap 'rm -f "$TEMP_BINARY"' EXIT HUP INT TERM
   cp "$BUILT" "$TEMP_BINARY"
   chmod 0755 "$TEMP_BINARY"
