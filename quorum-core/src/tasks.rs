@@ -288,6 +288,13 @@ const COLS: &str = "id, title, body, status, priority, labels, assignee, created
                     created_at, updated_at, refs, depends_on, author, reviewer, \
                     rework_round, review_only, recovery_attempts, continue_pr";
 
+const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
+    SELECT 1 FROM json_each(depends_on) je
+    WHERE NOT EXISTS (
+        SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
+    )
+))";
+
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     Ok(Task {
         id: r.get(0)?,
@@ -678,12 +685,6 @@ pub fn claim(
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
 
-    const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
-        SELECT 1 FROM json_each(depends_on) je
-        WHERE NOT EXISTS (
-            SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
-        )
-    ))";
     const CONTINUE_PR_UNOWNED_CLAUSE: &str = "(continue_pr IS NULL OR NOT EXISTS (
         SELECT 1 FROM tasks owner
         WHERE owner.id != tasks.id
@@ -817,8 +818,10 @@ pub fn claim_provider_retry_rework(
     crate::agents::touch(&tx, agent, now)?;
 
     let updated = tx.execute(
-        "UPDATE tasks SET assignee=?1, updated_at=?2
+        &format!(
+            "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
+           AND {DEP_READY_CLAUSE}
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
@@ -833,7 +836,8 @@ pub fn claim_provider_retry_rework(
                    OR json_type(refs, '$.daemon_rework_retry_requested')='true'
                )
                ELSE 0
-           END",
+           END"
+        ),
         params![agent, now, id],
     )?;
     let mut task = if updated == 1 {
@@ -887,9 +891,11 @@ pub fn claim_remediation_rework(
     crate::agents::touch(&tx, agent, now)?;
 
     let status: Option<String> = tx
-        .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            &format!("SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}"),
+            params![id],
+            |r| r.get(0),
+        )
         .optional()?;
 
     let policy_parked: bool = tx.query_row(
@@ -7550,6 +7556,60 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_rework_claim_waits_for_dependencies() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create(
+            &mut conn,
+            "owner",
+            "dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        let dependencies = format!("[{dependency}]");
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(r#"{"codex_retry_requested":true}"#),
+            Some(&dependencies),
+            None,
+            11,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework' WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        assert!(
+            claim_provider_retry_rework(&mut conn, "replacement", task_id, TTL, 12)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(get(&conn, task_id).unwrap().unwrap().assignee, None);
+
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![dependency],
+        )
+        .unwrap();
+        let claimed = claim_provider_retry_rework(&mut conn, "replacement", task_id, TTL, 13)
+            .unwrap()
+            .expect("done dependency must allow provider retry rework claim");
+        assert_eq!(claimed.id, task_id);
+    }
+
+    #[test]
     fn provider_retry_with_malformed_refs_is_a_clean_negative() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create(
@@ -7860,6 +7920,60 @@ mod tests {
             t2.status, "rework",
             "rework must survive sweep after lease installed"
         );
+    }
+
+    #[test]
+    fn remediation_rework_claim_waits_for_dependencies() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create(
+            &mut conn,
+            "owner",
+            "dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let dependencies = format!("[{dependency}]");
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            None,
+            Some(&dependencies),
+            None,
+            1001,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework' WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        assert!(
+            claim_remediation_rework(&mut conn, "remediation", task_id, TTL, 1002)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(get(&conn, task_id).unwrap().unwrap().assignee, None);
+
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![dependency],
+        )
+        .unwrap();
+        let claimed = claim_remediation_rework(&mut conn, "remediation", task_id, TTL, 1003)
+            .unwrap()
+            .expect("done dependency must allow remediation rework claim");
+        assert_eq!(claimed.id, task_id);
     }
 
     #[test]
