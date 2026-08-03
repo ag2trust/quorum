@@ -259,16 +259,20 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
     Ok(())
 }
 
-/// Park open tasks whose dependencies cannot currently be satisfied: every dep is terminal
-/// (done/failed/cancelled) but at least one is failed or cancelled. They stay excluded from
-/// provisioning until an explicit retry, without losing their dependency context.
+/// Park unleased open or rework tasks whose dependencies cannot currently be satisfied: every
+/// dep is terminal (done/failed/cancelled) but at least one is failed or cancelled. They stay
+/// excluded from provisioning until an explicit retry, without losing their dependency context.
 pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
-    let doomed: Vec<(i64, i64)> = {
+    let doomed: Vec<(i64, i64, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT t.id, je.value AS dep_id
+            "SELECT t.id, je.value AS dep_id, t.status
              FROM tasks t, json_each(t.depends_on) je
-             WHERE t.status = 'open'
+             WHERE t.status IN ('open', 'rework')
                AND t.depends_on IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims c
+                   WHERE c.target = 'task#' || t.id AND c.active=1 AND c.expires_at > ?1
+               )
                -- every dep is terminal …
                AND NOT EXISTS (
                    SELECT 1 FROM json_each(t.depends_on) j2
@@ -282,16 +286,18 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
                    JOIN tasks d ON d.id = j3.value
                    WHERE d.status IN ('failed','cancelled')
                )
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![now, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let mut count = 0usize;
     let mut seen = std::collections::HashSet::new();
-    for (task_id, failed_dep) in &doomed {
+    for (task_id, failed_dep, resume_status) in &doomed {
         if !seen.insert(*task_id) {
             continue;
         }
@@ -305,11 +311,15 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
                      COALESCE(refs, '{}'),
                      '$.daemon_parked', json('true'),
                      '$.daemon_parked_reason', ?1,
-                     '$.daemon_resume_status', 'open'
+                     '$.daemon_resume_status', ?2
                  ),
-                 updated_at=?2
-             WHERE id=?3",
-            params![reason, now, task_id],
+                 updated_at=?3
+             WHERE id=?4",
+            params![reason, resume_status, now, task_id],
+        )?;
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
+            params![target],
         )?;
         conn.execute(
             "INSERT INTO task_notes(task_id, ts, agent, body)
@@ -886,12 +896,17 @@ mod tests {
             100,
         )
         .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework' WHERE id=?1",
+            params![child],
+        )
+        .unwrap();
         // dep is still open (non-terminal).
         let n = cascade_dead_deps(&c, 300, 100).unwrap();
         assert_eq!(n, 0, "non-terminal dep should not trigger cascade");
         assert_eq!(
             crate::tasks::get(&c, child).unwrap().unwrap().status,
-            "open"
+            "rework"
         );
     }
 
