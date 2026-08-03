@@ -19,6 +19,8 @@ assert_eq "10001:10001" "$identity" "runtime identity"
 docker run --rm "$image" sh -ec '
   test "$HOME" = /home/quorum
   test "$QUORUM_HOME" = /data/quorum
+  test "$(getent passwd 10001 | cut -d: -f1,6,7)" = "quorum:/home/quorum:/bin/sh"
+  test "$(getent group 10001 | cut -d: -f1)" = quorum
   touch /data/quorum/.writable /data/repos/.writable /data/worktrees/.writable
   quorum --help >/dev/null
   QUORUM_REPO=smoke/project quorum init >/dev/null
@@ -28,6 +30,13 @@ docker run --rm "$image" sh -ec '
   codex --version | grep -F "codex-cli 0.146.0" >/dev/null
   test -f /usr/share/doc/codex/LICENSE
   test -f /usr/share/doc/codex/NOTICE
+  for path in /usr/local/bin/quorum /opt/codex/bin/codex /usr/bin/git /usr/bin/gh /etc/passwd; do
+    test ! -w "$path"
+    if sh -c "printf x >> \"\$1\"" sh "$path" 2>/dev/null; then
+      printf "smoke: runtime user mutated root-owned path %s\n" "$path" >&2
+      exit 1
+    fi
+  done
 '
 
 printf 'smoke: %s passed\n' "$image"

@@ -10,12 +10,13 @@ Build from the repository root so `.dockerignore` bounds the context:
 
 ```sh
 docker build --platform linux/amd64 --tag quorum:local .
-./docker/smoke.sh quorum:local
+./docker/verify.sh quorum:local
 ```
 
 The build pins the Debian base digest, Rust builder version, direct `git` and `gh` package
 versions, and Codex release/checksum. A wrong `CODEX_SHA256` fails the build before the
-archive is extracted:
+archive is extracted. `verify.sh` exercises this negative path automatically; the
+equivalent manual check is:
 
 ```sh
 docker build \
@@ -24,8 +25,9 @@ docker build \
 ```
 
 Rebuilding after a Debian package leaves its configured repositories may require updating
-the base digest and package pins together. Provider upgrades likewise require an image
-rebuild; Codex's startup update check is disabled.
+the base digest and package pins together. The root-owned provider binary is upgraded by
+building and replacing the image. Quorum managed runs ignore Codex user configuration, so
+this image does not claim to control provider update behavior through a user config file.
 
 ## Runtime paths
 
@@ -47,5 +49,5 @@ The image includes the pinned, checksummed Codex standalone package and its Apac
 and notice. It intentionally does not include Claude Code: its redistribution terms have
 not been established for this public image. Self-hosters may create a derived image that
 installs Claude Code under terms they have independently accepted. Quorum itself does not
-need provider-specific container changes; `quorum serve --runner` selects an available
+need provider-specific container changes; `quorum serve --agent codex` selects the bundled
 provider CLI.

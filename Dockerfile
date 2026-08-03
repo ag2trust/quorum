@@ -31,7 +31,6 @@ RUN curl --fail --location --show-error \
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 ARG GIT_VERSION=1:2.39.5-0+deb12u3
 ARG GH_VERSION=2.23.0+dfsg1-1
-ARG CODEX_VERSION=0.146.0
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
       ca-certificates=20230311+deb12u1 \
@@ -44,10 +43,10 @@ COPY --from=quorum-builder /src/target/release/quorum /usr/local/bin/quorum
 COPY --from=codex-fetcher /opt/codex /opt/codex
 COPY LICENSE /usr/share/doc/quorum/LICENSE
 RUN install --directory --owner=10001 --group=10001 \
-      /home/quorum /home/quorum/.codex \
+      /home/quorum \
       /data /data/quorum /data/repos /data/worktrees \
-    && printf 'check_for_update_on_startup = false\n' > /home/quorum/.codex/config.toml \
-    && chown 10001:10001 /home/quorum/.codex/config.toml \
+    && printf 'quorum:x:10001:\n' >> /etc/group \
+    && printf 'quorum:x:10001:10001:Quorum runtime:/home/quorum:/bin/sh\n' >> /etc/passwd \
     && install --directory /usr/share/doc/codex \
     && cp /opt/codex/LICENSE /opt/codex/NOTICE /usr/share/doc/codex/
 
