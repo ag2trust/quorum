@@ -887,8 +887,38 @@ pub fn claim_remediation_rework(
     ttl: i64,
     now: i64,
 ) -> Result<Option<Task>> {
+    claim_remediation_rework_with_feedback(conn, agent, id, ttl, now, None)
+}
+
+/// Variant of [`claim_remediation_rework`] used by the daemon when it holds
+/// accepted blocking feedback for the pending remediation turn. The feedback
+/// is persisted in the same transaction before a dependency-triggered sweep
+/// can terminally park the rework task.
+pub fn claim_remediation_rework_with_feedback(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    ttl: i64,
+    now: i64,
+    feedback: Option<&str>,
+) -> Result<Option<Task>> {
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
+
+    if let Some(feedback) = feedback {
+        tx.execute(
+            "UPDATE tasks
+             SET refs=json_set(COALESCE(refs, '{}'), '$.remediation_feedback', ?2),
+                 updated_at=?3
+             WHERE id=?1 AND status='rework'
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims c
+                   WHERE c.target='task#' || tasks.id
+                     AND c.active=1 AND c.expires_at > ?3
+               )",
+            params![id, feedback, now],
+        )?;
+    }
 
     let status: Option<String> = tx
         .query_row(

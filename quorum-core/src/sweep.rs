@@ -68,13 +68,6 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                      json_type(t.refs, '$.daemon_rework_retry_requested')='true'
                      OR json_type(t.refs, '$.codex_retry_requested')='true'
                  )
-                 AND t.depends_on IS NOT NULL
-                 AND EXISTS (
-                     SELECT 1 FROM json_each(t.depends_on) je
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
-                     )
-                 )
              )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
              LIMIT ?2",
@@ -1512,6 +1505,14 @@ mod tests {
             params![dependency],
         )
         .unwrap();
+        // A write can sweep after the dependency resolves but before the
+        // replacement worker claims. Durable provider retry identity must
+        // survive that ready-but-unclaimed interval.
+        reap_lapsed_tasks(&c, 1101, SWEEP_LIMIT).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, task_id).unwrap().unwrap().status,
+            "rework"
+        );
         crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 3600, 1101)
             .unwrap()
             .expect("resolved Codex retry must claim in rework");
