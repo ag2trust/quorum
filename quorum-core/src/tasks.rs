@@ -2647,6 +2647,39 @@ pub fn set_remediation_feedback(
     Ok(())
 }
 
+/// Retain blocking feedback when a remediation claim loses solely because its
+/// dependencies are not ready. The guarded write ensures a concurrent winner
+/// keeps its lease and feedback, while the durable retry reconciler can resume
+/// an unleased rework task once its dependencies complete.
+pub fn retain_blocked_remediation_retry(
+    conn: &mut Connection,
+    id: i64,
+    feedback: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let updated = tx.execute(
+        "UPDATE tasks
+         SET refs = json_set(
+                 COALESCE(refs, '{}'),
+                 '$.remediation_feedback', ?2,
+                 '$.daemon_rework_retry_requested', json('true')
+             ),
+             updated_at = ?3
+         WHERE id = ?1
+           AND status = 'rework'
+           AND depends_on IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM claims c
+               WHERE c.target = 'task#' || tasks.id
+                 AND c.active = 1 AND c.expires_at > ?3
+           )",
+        params![id, feedback, now],
+    )?;
+    tx.commit()?;
+    Ok(updated == 1)
+}
+
 /// Explicitly resume the same task after an automatic park. PR, branch,
 /// dependency, approval, author, and rework context remain untouched.
 ///

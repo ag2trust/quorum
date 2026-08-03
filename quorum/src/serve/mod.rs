@@ -10954,6 +10954,23 @@ async fn claim_remediation_for_spawn(
     })?
 }
 
+async fn retain_blocked_remediation_retry_for_spawn(
+    db_path: PathBuf,
+    task_id: i64,
+    feedback: String,
+) -> Result<bool> {
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::retain_blocked_remediation_retry(&mut conn, task_id, &feedback, now_unix())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "blocked remediation retry persistence join for task #{task_id}: {error}"
+        ))
+    })?
+}
+
 async fn revalidate_remediation_claim_for_spawn(
     db_path: PathBuf,
     agent: String,
@@ -11023,6 +11040,17 @@ async fn spawn_remediation_worker(
                 log(&format!(
                     "remediation: claim lost for task #{task_id} — task no longer eligible"
                 ));
+                if retain_blocked_remediation_retry_for_spawn(
+                    db_path.clone(),
+                    task_id,
+                    feedback.to_string(),
+                )
+                .await?
+                {
+                    log(&format!(
+                        "remediation: retained blocked retry for task #{task_id}"
+                    ));
+                }
                 name_pool.release(&agent_name);
                 return Ok(RemediationSpawnOutcome::ClaimLost);
             }

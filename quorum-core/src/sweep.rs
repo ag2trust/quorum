@@ -64,7 +64,10 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
              AND NOT (
                  t.status = 'rework'
                  AND json_valid(t.refs)
-                 AND json_type(t.refs, '$.daemon_rework_retry_requested')='true'
+                 AND (
+                     json_type(t.refs, '$.daemon_rework_retry_requested')='true'
+                     OR json_type(t.refs, '$.codex_retry_requested')='true'
+                 )
                  AND t.depends_on IS NOT NULL
                  AND EXISTS (
                      SELECT 1 FROM json_each(t.depends_on) je
@@ -1445,6 +1448,82 @@ mod tests {
         reap_lapsed_tasks(&c, 1400, SWEEP_LIMIT).unwrap();
         let t = crate::tasks::get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "open", "rework past grace must be reaped");
+    }
+
+    #[test]
+    fn reaper_preserves_dependency_blocked_codex_retry_until_rework_push() {
+        let (_d, mut c) = open_tmp();
+        let dependency = crate::tasks::create(
+            &mut c,
+            "owner",
+            "pending dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "owner",
+            "Codex retry",
+            None,
+            0,
+            None,
+            Some(r#"{"codex_retry_requested":true}"#),
+            Some(&format!("[{dependency}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        crate::classify::store_classifications(
+            &mut c,
+            &[crate::classify::TaskClassification {
+                task_id,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "unit-test:v2",
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework', updated_at=1000 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        // This is after the provisioning grace. The blocked provider retry
+        // must remain rework so its eventual ReworkPushed is legal.
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+
+        c.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![dependency],
+        )
+        .unwrap();
+        crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 3600, 1101)
+            .unwrap()
+            .expect("resolved Codex retry must claim in rework");
+        let pushed = crate::tasks::apply_event(
+            &mut c,
+            "codex",
+            task_id,
+            &crate::lifecycle::Event::ReworkPushed,
+            1102,
+        )
+        .unwrap();
+        assert_eq!(pushed.task.status, "in-review");
     }
 
     #[test]
