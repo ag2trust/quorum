@@ -875,6 +875,142 @@ fn terminal_dependency_parks_durable_ci_remediation() {
     handle.sigkill();
 }
 
+/// An owner-requested remediation retry must retain its rework identity while
+/// waiting beyond the provisioning grace for a dependency to complete.
+#[test]
+fn pending_dependency_preserves_owner_requested_remediation_retry() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let prompt_log = home.path().join("remediation-prompts.jsonl");
+    let feedback = "preserved remediation feedback after dependency wait";
+    let dependency;
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        dependency = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "pending dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2, status='rework' WHERE id=?1",
+            rusqlite::params![task_id, format!("[{dependency}]")],
+        )
+        .unwrap();
+        quorum_core::tasks::set_remediation_feedback(&conn, task_id, feedback, now).unwrap();
+        quorum_core::tasks::park(
+            &mut conn,
+            task_id,
+            "previous remediation provisioning failed",
+            "rework",
+            now,
+        )
+        .unwrap()
+        .expect("rework task must park before owner retry");
+        let retried = quorum_core::tasks::retry_parked(&mut conn, task_id, "owner", true, now + 1)
+            .unwrap()
+            .expect("owner retry must restore rework");
+        assert_eq!(retried.status, "rework");
+        assert!(!retried.ready, "pending dependency must gate the retry");
+        conn.execute(
+            "UPDATE tasks SET updated_at=?2 WHERE id=?1",
+            rusqlite::params![
+                task_id,
+                now - quorum_core::sweep::REWORK_PROVISIONING_GRACE_SECS - 1
+            ],
+        )
+        .unwrap();
+    }
+
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+        &[(
+            "FAKE_AGENT_PROMPT_LOG".into(),
+            prompt_log.to_string_lossy().to_string(),
+        )],
+    );
+    assert!(
+        handle.wait_for("remediation: claim lost for task", 15),
+        "dependency-gated retry did not reach the remediation claim: {:?}",
+        handle.lines
+    );
+
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework", "pending retry must outlive grace");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_rework_retry_requested"], true);
+        assert_eq!(refs["remediation_feedback"], feedback);
+    }
+
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            rusqlite::params![dependency],
+        )
+        .unwrap();
+    }
+    assert!(
+        handle.wait_for("durable remediation retry: provisioning task", 15),
+        "resolved dependency did not return to the dedicated retry reconciler: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning remediation worker", 15),
+        "dedicated retry did not provision remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "remediation worker did not receive its rework turn: {:?}",
+        handle.lines
+    );
+    let prompts = std::fs::read_to_string(&prompt_log).unwrap();
+    assert!(
+        prompts.contains(feedback),
+        "replacement worker must receive preserved remediation feedback: {prompts}"
+    );
+    handle.sigkill();
+}
+
 /// Regression: a failed remediation provisioning attempt must not overwrite
 /// the original managed worker identity. When GitHub is unavailable on the
 /// later attempt and no PR target was persisted, remediation must fetch the

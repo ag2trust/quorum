@@ -61,6 +61,18 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                      ELSE 0
                  END != 1
              )
+             AND NOT (
+                 t.status = 'rework'
+                 AND json_valid(t.refs)
+                 AND json_type(t.refs, '$.daemon_rework_retry_requested')='true'
+                 AND t.depends_on IS NOT NULL
+                 AND EXISTS (
+                     SELECT 1 FROM json_each(t.depends_on) je
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
+                     )
+                 )
+             )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
              LIMIT ?2",
         )?;
