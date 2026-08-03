@@ -9599,7 +9599,8 @@ async fn spawn_worker(
                 .into_iter()
                 .filter(|task| {
                     codex_retry_turn(task.refs.as_deref()).is_some()
-                        || daemon_rework_retry_requested(task.refs.as_deref())
+                        || (daemon_rework_retry_requested(task.refs.as_deref())
+                            && remediation_retry_feedback(task.refs.as_deref()).is_none())
                 }),
         );
         let found = available.into_iter().find(|t| {
