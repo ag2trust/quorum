@@ -65,8 +65,8 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                  t.status = 'rework'
                  AND json_valid(t.refs)
                  AND (
-                     json_type(t.refs, '$.daemon_rework_retry_requested')='true'
-                     OR json_type(t.refs, '$.codex_retry_requested')='true'
+                     COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
+                     OR COALESCE(json_type(t.refs, '$.codex_retry_requested')='true', 0)
                  )
              )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
