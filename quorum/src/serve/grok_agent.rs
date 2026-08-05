@@ -240,7 +240,16 @@ impl BoundedStdout {
             })
             .to_string();
         }
-        let line = String::from_utf8_lossy(&self.line).into_owned();
+        let line = match std::str::from_utf8(&self.line) {
+            Ok(line) => line.to_string(),
+            Err(error) => serde_json::json!({
+                "type": "provider.stdout_invalid_utf8",
+                "line_bytes": self.line.len(),
+                "valid_up_to": error.valid_up_to(),
+                "invalid_sequence_bytes": error.error_len(),
+            })
+            .to_string(),
+        };
         self.line.clear();
         line
     }
@@ -487,6 +496,12 @@ mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
 
+    // The installed CLI's unauthenticated protocol startup and invalid-key
+    // startup contend when they run concurrently, occasionally delaying one
+    // past the bounded assertion window. They exercise one real binary
+    // serially while the pure argument and fixture tests remain parallel.
+    static REAL_CLI_PROTOCOL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn test_spec(worktree: &std::path::Path) -> GrokSpec {
         GrokSpec {
             model: SUPPORTED_MODEL.into(),
@@ -680,6 +695,19 @@ mod tests {
         proc.kill_and_reap().await;
     }
 
+    #[tokio::test]
+    async fn invalid_utf8_cannot_be_repaired_into_authoritative_terminal_json() {
+        let mut proc = shell_proc("printf '{\"type\":\"end\",\"sessionId\":\"\\377\"}\\n'").await;
+        let raw = proc.next_raw_line().await.unwrap();
+        let marker: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(marker["type"], "provider.stdout_invalid_utf8");
+        assert_eq!(marker["invalid_sequence_bytes"], 1);
+        assert!(!raw.contains('\u{fffd}'));
+        assert!(normalize_grok_line(&raw).is_empty());
+        assert!(proc.next_raw_line().await.is_none());
+        proc.kill_and_reap().await;
+    }
+
     async fn shell_proc(script: &str) -> GrokProc {
         let mut command = Command::new("/bin/sh");
         command
@@ -800,6 +828,7 @@ mod tests {
             eprintln!("skipped: no official grok binary on PATH");
             return;
         }
+        let _guard = REAL_CLI_PROTOCOL_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
         let mut spec = test_spec(worktree.path());
@@ -827,6 +856,7 @@ mod tests {
             eprintln!("skipped: no official grok binary on PATH");
             return;
         }
+        let _guard = REAL_CLI_PROTOCOL_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
         let secret = "quorum-invalid-xai-key-must-not-be-printed";

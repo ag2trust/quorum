@@ -1376,7 +1376,17 @@ pub fn resolve_provider(model: &str) -> Result<runner::AgentKind> {
 }
 
 fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
-    resolve_provider(model)
+    resolve_managed_provider(model, "worker")
+}
+
+fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind> {
+    let kind = resolve_provider(model)?;
+    if kind == runner::AgentKind::Grok {
+        return Err(QuorumError::Usage(format!(
+            "model '{model}' selects Grok, but managed Grok {role} roles are not enabled"
+        )));
+    }
+    Ok(kind)
 }
 
 fn explicitly_configured_provider(config: &ServeConfig) -> Option<runner::AgentKind> {
@@ -1501,7 +1511,7 @@ fn resolve_remediation_provider(
     _config_runner: crate::serve_config::RunnerKind,
 ) -> Result<(String, runner::AgentKind)> {
     let model = recorded_model.unwrap_or_else(|| config_model.to_string());
-    let model_kind = resolve_provider(&model)?;
+    let model_kind = resolve_managed_provider(&model, "remediation")?;
     let kind = match recorded_provider {
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
@@ -1554,7 +1564,7 @@ fn resolve_reviewer_recovery(
             run.id
         ))
     })?;
-    let kind = resolve_provider(&run.model)?;
+    let kind = resolve_managed_provider(&run.model, "reviewer recovery")?;
     if provider != kind.to_string() {
         return Err(QuorumError::Io(format!(
             "persisted provider '{provider}' does not match reviewer model '{}' resolved as '{kind}'",
@@ -2118,7 +2128,7 @@ fn worker_publication_pr(
 fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
     let turn = runner_state::requested_retry_any(&refs)?;
-    let resolved = runner::AgentKind::for_model(&turn.model).ok()?;
+    let resolved = resolve_worker_provider(&turn.model).ok()?;
     (turn.provider == resolved.to_string()).then_some(turn)
 }
 
@@ -9215,7 +9225,7 @@ async fn provision_reviewer(
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
             };
-            let kind = resolve_provider(&reviewer_model)?;
+            let kind = resolve_managed_provider(&reviewer_model, "reviewer")?;
             let effort = if let Some((_, effort)) = configured_reviewer_selection(
                 config.provider_explicit,
                 config.review_model_explicit,
@@ -11751,6 +11761,32 @@ mod tests {
     }
 
     #[test]
+    fn grok_resolves_only_at_the_transport_boundary_not_managed_roles() {
+        assert_eq!(
+            resolve_provider("grok-4.5").unwrap(),
+            runner::AgentKind::Grok
+        );
+        for role in ["worker", "remediation", "reviewer", "reviewer recovery"] {
+            let error = resolve_managed_provider("grok-4.5", role).unwrap_err();
+            assert!(error.to_string().contains("not enabled"), "{role}: {error}");
+        }
+        assert!(resolve_remediation_provider(
+            None,
+            Some("grok-4.5".into()),
+            "claude-opus-4-6",
+            crate::serve_config::RunnerKind::Claude,
+        )
+        .is_err());
+        assert!(resolve_remediation_provider(
+            Some("grok"),
+            Some("grok-4.5".into()),
+            "claude-opus-4-6",
+            crate::serve_config::RunnerKind::Claude,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn resolve_provider_default_claude_model() {
         assert_eq!(
             resolve_provider("claude-opus-4-6").unwrap(),
@@ -12336,6 +12372,28 @@ mod tests {
         })
         .to_string();
         assert!(runner_retry_turn(Some(&refs)).is_none());
+    }
+
+    #[test]
+    fn provider_retry_rejects_transport_only_grok_even_when_identity_matches() {
+        let refs = serde_json::json!({
+            "runner_retry": {
+                "provider": "grok",
+                "model": "grok-4.5",
+                "effort": "high",
+                "prompt": "replace the daemon-owned worker prompt",
+                "turn_kind": "initial",
+                "requested": true
+            }
+        })
+        .to_string();
+        assert!(runner_state::retry_requested(
+            &serde_json::from_str(&refs).unwrap()
+        ));
+        assert!(
+            runner_retry_turn(Some(&refs)).is_none(),
+            "transport-only Grok must remain invalid in managed retry dispatch"
+        );
     }
 
     #[test]
@@ -14392,6 +14450,42 @@ mod tests {
                 .find(|pair| pair[0] == "--model")
                 .map(|pair| pair[1].as_str()),
             Some("gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn interrupted_grok_reviewer_cannot_enter_managed_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("grok-reviewer-restart.db");
+        let task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "transport-only reviewer",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                10,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn, task_id, "r1-grok", "reviewer", "grok-4.5", "high", "grok", 11,
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+        }
+
+        let error = resolve_reviewer_recovery(&db_path, task_id, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("managed Grok reviewer recovery roles are not enabled"),
+            "{error}"
         );
     }
 

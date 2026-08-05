@@ -1331,6 +1331,9 @@ Readers continue accepting historical `codex_thread_id`, Codex reviewer thread k
 and `codex_retry_*` / `codex_provider_*` records. Neutral records, when present, are
 authoritative and must match the selected runner; historical assignments and evidence
 are never rewritten merely to adopt the neutral representation.
+Task creator APIs reject neutral `runner_*` and legacy `codex_*` provider-state refs;
+managed dispatch independently rejects any transport-only runner recovered from durable
+state, so stale or forged metadata cannot enable an uncanaried lifecycle role.
 
 ### Claude behavior remains stable
 
@@ -1471,11 +1474,13 @@ Consumed events:
 | `error` | terminal failure with complete usage/cost when available |
 | all other, unknown, or malformed lines | preserved raw and lifecycle-inert |
 
-Every complete stdout line at or below the one-MiB line bound is returned byte-for-byte
-apart from the line terminator and written through the existing raw JSONL path. An
-oversized line becomes an explicit truncation record. Stdout retained during teardown,
-stderr lines, and bytes within an individual stderr line are separately bounded. The
-process runs in its own process group; teardown kills the group and reaps the child.
+Every complete valid-UTF-8 stdout line at or below the one-MiB line bound is returned
+byte-for-byte apart from the line terminator and written through the existing raw JSONL
+path. An oversized line becomes an explicit truncation record. Invalid UTF-8 becomes an
+explicit `provider.stdout_invalid_utf8` record that carries only byte counts/offsets and
+is lifecycle-inert; bytes are never repaired into provider JSON. Stdout retained during
+teardown, stderr lines, and bytes within an individual stderr line are separately bounded.
+The process runs in its own process group; teardown kills the group and reaps the child.
 
 An `end` event is the protocol's success marker, but managed success will additionally
 require exit status zero when Grok lifecycle roles are enabled. `error`, non-zero exit,
