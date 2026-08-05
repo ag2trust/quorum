@@ -223,6 +223,38 @@ fn task_creators_cannot_inject_managed_runner_state() {
         .assert()
         .success()
         .stdout(predicates::str::contains("runner_retry").not());
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    quorum_core::tasks::update_refs_daemon(
+        &mut conn,
+        1,
+        r#"{"runner_continuation":{"provider":"codex","id":"thread-exact"},"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"resume exact turn","turn_kind":"rework","continuation_id":"thread-exact","requested":true},"codex_thread_id":"thread-legacy"}"#,
+        1000,
+    )
+    .unwrap();
+    drop(conn);
+
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "boss",
+            "--task-id",
+            "1",
+            "--refs",
+            r#"{"ticket":"ABC"}"#,
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("thread-exact"))
+        .stdout(predicates::str::contains("resume exact turn"))
+        .stdout(predicates::str::contains("thread-legacy"))
+        .stdout(predicates::str::contains("\\\"ticket\\\":\\\"ABC\\\""));
 }
 
 #[test]

@@ -1332,8 +1332,10 @@ and `codex_retry_*` / `codex_provider_*` records. Neutral records, when present,
 authoritative and must match the selected runner; historical assignments and evidence
 are never rewritten merely to adopt the neutral representation.
 Task creator APIs reject neutral `runner_*` and legacy `codex_*` provider-state refs;
-managed dispatch independently rejects any transport-only runner recovered from durable
-state, so stale or forged metadata cannot enable an uncanaried lifecycle role.
+creator and assignee metadata replacement also preserves existing refs in those namespaces.
+Only the daemon-authoritative refs path may mutate or clear runner state. Managed dispatch
+independently rejects any transport-only runner recovered from durable state, so stale or
+forged metadata cannot enable an uncanaried lifecycle role.
 
 ### Claude behavior remains stable
 

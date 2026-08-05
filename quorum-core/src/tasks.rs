@@ -422,6 +422,24 @@ fn preserve_classifier_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
+    preserve_protected_refs(existing, replacement, false)
+}
+
+/// Creator and assignee metadata replacement cannot mutate or erase durable
+/// runner state. The daemon uses `preserve_classifier_refs` directly so its
+/// authoritative refs path can still replace or clear these keys.
+fn preserve_creator_protected_refs(
+    existing: &Option<String>,
+    replacement: Option<&str>,
+) -> Option<String> {
+    preserve_protected_refs(existing, replacement, true)
+}
+
+fn preserve_protected_refs(
+    existing: &Option<String>,
+    replacement: Option<&str>,
+    preserve_runner_state: bool,
+) -> Option<String> {
     let replacement = replacement?;
     let mut next: serde_json::Value =
         serde_json::from_str(replacement).unwrap_or_else(|_| serde_json::json!({}));
@@ -433,19 +451,23 @@ fn preserve_classifier_refs(
         .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
         .and_then(|value| value.as_object().cloned())
     {
-        // PR association and classifier output are daemon-owned. Metadata replacement may
-        // add caller keys, but it cannot erase or rewrite these established values.
-        for key in [
-            "pr",
-            "cx_est",
-            "cx_size",
-            "cx_ready",
-            "cx_not_ready_reason",
-            "cx_by",
-            "cx_dup_of",
-        ] {
-            if let Some(value) = existing_map.get(key) {
-                next_map.insert(key.to_string(), value.clone());
+        // PR association, classifier output, and (on creator/assignee paths)
+        // runner state are daemon-owned. Metadata replacement may add caller
+        // keys, but it cannot erase or rewrite established protected values.
+        for (key, value) in existing_map {
+            let classifier_or_pr = matches!(
+                key.as_str(),
+                "pr" | "cx_est"
+                    | "cx_size"
+                    | "cx_ready"
+                    | "cx_not_ready_reason"
+                    | "cx_by"
+                    | "cx_dup_of"
+            );
+            let runner_state =
+                preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
+            if classifier_or_pr || runner_state {
+                next_map.insert(key, value);
             }
         }
     }
@@ -460,7 +482,8 @@ fn invalidate_classifier_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    let refs = preserve_classifier_refs(existing, replacement).or_else(|| existing.clone())?;
+    let refs =
+        preserve_creator_protected_refs(existing, replacement).or_else(|| existing.clone())?;
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&refs) else {
         return Some(refs);
     };
@@ -1906,7 +1929,7 @@ pub fn update(
     let preserved_refs = if classifier_input_changed {
         invalidate_classifier_refs(&existing_refs, fields.refs)
     } else {
-        preserve_classifier_refs(&existing_refs, fields.refs)
+        preserve_creator_protected_refs(&existing_refs, fields.refs)
     };
 
     let n = match fields.status {
@@ -6640,6 +6663,94 @@ mod tests {
         assert_eq!(refs["ticket"], "ABC");
         assert_eq!(refs["cx_est"], 5);
         assert_eq!(refs["cx_by"], "classifier:v1");
+    }
+
+    #[test]
+    fn assignee_metadata_replacement_preserves_runner_state_but_daemon_can_replace_it() {
+        let (_d, mut conn) = open_tmp();
+        let id = create(
+            &mut conn,
+            "boss",
+            "runner state",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let classifications = [crate::classify::TaskClassification {
+            task_id: id,
+            cx_est: 3,
+            size: "M".into(),
+            ready: true,
+            not_ready_reason: None,
+            duplicate_of: Vec::new(),
+        }];
+        crate::classify::store_classifications(&mut conn, &classifications, "test:v2", 1001)
+            .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 1002).unwrap();
+        update_refs_daemon(
+            &mut conn,
+            id,
+            &serde_json::json!({
+                "pr": 513,
+                "old_metadata": "replace me",
+                "runner_continuation": {"provider": "codex", "id": "thread-exact"},
+                "runner_retry": {
+                    "provider": "codex", "model": "gpt-5", "effort": "high",
+                    "prompt": "resume exact turn", "turn_kind": "rework",
+                    "continuation_id": "thread-exact", "requested": true
+                },
+                "runner_provider_block": {"provider": "codex", "reason": "quota"},
+                "codex_thread_id": "thread-legacy",
+                "codex_retry_requested": true
+            })
+            .to_string(),
+            1003,
+        )
+        .unwrap();
+
+        let updated = update(
+            &mut conn,
+            "worker",
+            id,
+            &TaskUpdate {
+                refs: Some(r#"{"ticket":"ABC"}"#),
+                ..Default::default()
+            },
+            1004,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(updated.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["ticket"], "ABC");
+        assert!(refs.get("old_metadata").is_none());
+        assert_eq!(refs["runner_continuation"]["id"], "thread-exact");
+        assert_eq!(refs["runner_retry"]["prompt"], "resume exact turn");
+        assert_eq!(refs["runner_provider_block"]["reason"], "quota");
+        assert_eq!(refs["codex_thread_id"], "thread-legacy");
+        assert_eq!(refs["codex_retry_requested"], true);
+
+        update_refs_daemon(
+            &mut conn,
+            id,
+            r#"{"ticket":"daemon","runner_continuation":{"provider":"codex","id":"thread-new"}}"#,
+            1005,
+        )
+        .unwrap();
+        let task = get(&conn, id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["ticket"], "daemon");
+        assert_eq!(refs["runner_continuation"]["id"], "thread-new");
+        assert!(refs.get("runner_retry").is_none());
+        assert!(refs.get("runner_provider_block").is_none());
+        assert!(refs.get("codex_thread_id").is_none());
+        assert!(refs.get("codex_retry_requested").is_none());
+        assert_eq!(refs["pr"], 513);
+        assert_eq!(refs["cx_by"], "test:v2");
     }
 
     // ── T6: lifecycle replay idempotency ──────────────────────────────────
