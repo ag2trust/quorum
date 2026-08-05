@@ -63,6 +63,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
              )
              AND NOT (
                  t.status = 'rework'
+                 AND t.assignee IS NULL
                  AND json_valid(t.refs)
                  AND (
                      COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
@@ -136,9 +137,24 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
         // `working` (they enter the lifecycle at in-review), so the park
         // branch above already consumed every review_only row this query can
         // return.
+        let preserve_rework = status == "rework"
+            && refs
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|value| {
+                    value
+                        .get(crate::tasks::PARKED_REWORK_RETRY_REF)
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        || value
+                            .get("codex_retry_requested")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                });
+        let recovered_status = if preserve_rework { "rework" } else { "open" };
         conn.execute(
-            "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1 WHERE id=?2",
-            params![now, id],
+            "UPDATE tasks SET status=?1, assignee=NULL, updated_at=?2 WHERE id=?3",
+            params![recovered_status, now, id],
         )?;
         // Clear any lingering (now-expired) lease row so the next claim starts clean.
         conn.execute(
@@ -146,8 +162,8 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             params![target],
         )?;
         let body = match prev {
-            Some(a) => format!("reclaimed from {a} ({reason}) → open"),
-            None => format!("reclaimed ({reason}) → open"),
+            Some(a) => format!("reclaimed from {a} ({reason}) → {recovered_status}"),
+            None => format!("reclaimed ({reason}) → {recovered_status}"),
         };
         crate::events::emit(conn, "task_reclaimed", &target, &body, now)?;
     }
@@ -1513,15 +1529,41 @@ mod tests {
             crate::tasks::get(&c, task_id).unwrap().unwrap().status,
             "rework"
         );
-        crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 3600, 1101)
+        crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 10, 1101)
             .unwrap()
             .expect("resolved Codex retry must claim in rework");
+
+        // If the replacement worker's lease lapses, the durable retry marker
+        // must not exempt the claimed row forever. Recovery clears the stale
+        // assignee while preserving rework semantics for another replacement.
+        reap_lapsed_tasks(&c, 1162, SWEEP_LIMIT).unwrap();
+        let recovered = crate::tasks::get(&c, task_id).unwrap().unwrap();
+        assert_eq!(recovered.status, "rework");
+        assert!(
+            recovered.assignee.is_none(),
+            "lapsed replacement assignee must be cleared"
+        );
+        let refs: serde_json::Value =
+            serde_json::from_str(recovered.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["codex_retry_requested"], true);
+        let active_claims: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                params![format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0, "lapsed replacement lease is deactivated");
+
+        crate::tasks::claim_provider_retry_rework(&mut c, "replacement", task_id, 3600, 1163)
+            .unwrap()
+            .expect("recovered Codex retry must be claimable again in rework");
         let pushed = crate::tasks::apply_event(
             &mut c,
-            "codex",
+            "replacement",
             task_id,
             &crate::lifecycle::Event::ReworkPushed,
-            1102,
+            1164,
         )
         .unwrap();
         assert_eq!(pushed.task.status, "in-review");
