@@ -22,7 +22,6 @@ pub mod session_log;
 pub mod stream;
 pub mod worktree;
 
-use agent::{AgentProc, AgentSpec};
 use names::Pool;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
@@ -1449,6 +1448,21 @@ fn agent_bin_for_runner(
         crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
     };
     (kind == configured_kind).then_some(agent_bin).flatten()
+}
+
+fn runner_adapter_config<'a>(
+    config: &'a ServeConfig,
+    executable: Option<&'a str>,
+) -> runner::AdapterConfig<'a> {
+    runner::AdapterConfig {
+        executable,
+        claude_bare: config.bare_agent,
+        claude_allowed_tools: config
+            .allowed_tools
+            .as_deref()
+            .unwrap_or(agent::ALLOWED_TOOLS),
+        codex_sandbox: &config.codex_sandbox,
+    }
 }
 
 fn configured_reviewer_selection<'a>(
@@ -8314,32 +8328,25 @@ async fn feed_worker_turn(
             env_vars.push(("QUORUM_RUN_ID".into(), rid.clone()));
         }
 
-        let new_proc = if let Some(ref tid) = slot.codex_thread_id {
-            codex_agent::CodexProc::spawn_resume(
-                tid,
+        let new_proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
                 model,
                 effort,
-                &config.codex_sandbox,
-                &slot.worktree_path,
-                raw_prompt,
-                &env_vars,
-                config.agent_bin.as_deref(),
-            )?
-        } else {
-            codex_agent::CodexProc::spawn(
-                &codex_agent::CodexSpec {
-                    model: model.to_string(),
-                    effort: effort.to_string(),
-                    sandbox: config.codex_sandbox.clone(),
-                    worktree: slot.worktree_path.clone(),
-                    prompt: raw_prompt.to_string(),
-                    env_vars,
-                },
-                config.agent_bin.as_deref(),
-            )?
-        };
+                worktree: &slot.worktree_path,
+                prompt: raw_prompt,
+                environment: &env_vars,
+                mode: runner::LaunchMode::Normal,
+                continuation_id: runner_continuation_id(
+                    slot.proc.kind(),
+                    &slot.session_id,
+                    slot.codex_thread_id.as_deref(),
+                ),
+            },
+            &runner_adapter_config(config, config.agent_bin.as_deref()),
+        )
+        .await?;
 
-        let old = std::mem::replace(&mut slot.proc, runner::RunnerProc::Codex(new_proc));
+        let old = std::mem::replace(&mut slot.proc, new_proc);
         tokio::spawn(async move { old.kill_and_reap().await });
         Ok(())
     } else {
@@ -8354,12 +8361,36 @@ fn should_replace_pending_prompt(prompt: &str) -> bool {
 
 fn codex_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str)> {
     if slot.model.is_empty() || slot.effort.is_empty() {
-        Err(std::io::Error::new(
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Codex continuation missing its resolved model/effort identity",
-        ))
-    } else {
-        Ok((&slot.model, &slot.effort))
+        ));
+    }
+    match runner::AgentKind::for_model(&slot.model) {
+        Ok(runner::AgentKind::Codex) => Ok((&slot.model, &slot.effort)),
+        Ok(actual) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Codex continuation model '{}' resolves to {actual}; refusing provider migration",
+                slot.model
+            ),
+        )),
+        Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    }
+}
+
+/// Select the opaque identity understood by the resolved runner. Claude's
+/// identity is daemon-issued before launch; Codex may only receive its exact
+/// provider-issued thread. Keeping this choice in one place prevents stale
+/// cross-provider metadata from migrating a continuation between adapters.
+fn runner_continuation_id<'a>(
+    kind: runner::AgentKind,
+    claude_session_id: &'a str,
+    provider_continuation_id: Option<&'a str>,
+) -> Option<&'a str> {
+    match kind {
+        runner::AgentKind::Claude => Some(claude_session_id),
+        runner::AgentKind::Codex => provider_continuation_id,
     }
 }
 
@@ -9199,8 +9230,8 @@ async fn provision_reviewer(
         }
     }
 
-    // Build the role-appropriate prompt BEFORE spawn — Codex takes it as a
-    // CLI argument while Claude receives it via stdin after spawn.
+    // Prompt composition remains role- and provider-aware; the runner adapter
+    // owns how that neutral prompt reaches the CLI.
     let prompt = match role {
         ReviewRole::R1 => {
             let spec = reviewer::ReviewerSpec {
@@ -9227,60 +9258,23 @@ async fn provision_reviewer(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
-    let spawn_result = if let Some(thread_id) = reviewer_thread_id.as_deref() {
-        codex_agent::CodexProc::spawn_resume(
-            thread_id,
-            &reviewer_model,
-            &reviewer_effort,
-            &config.codex_sandbox,
-            &wt_path,
-            &prompt,
-            &reviewer_env,
-            reviewer_agent_bin,
-        )
-        .map(runner::RunnerProc::Codex)
-    } else {
-        reviewer::spawn_reviewer(
-            reviewer_kind,
-            &reviewer_model,
-            &reviewer_effort,
-            &session_id,
-            &wt_path,
-            reviewer_agent_bin,
-            config.bare_agent,
-            reviewer_env,
-            config.allowed_tools.as_deref(),
-            &config.codex_sandbox,
-            &prompt,
-        )
-    };
+    let continuation_id =
+        runner_continuation_id(reviewer_kind, &session_id, reviewer_thread_id.as_deref());
+    let spawn_result = runner::RunnerProc::launch(
+        &runner::LaunchRequest {
+            model: &reviewer_model,
+            effort: &reviewer_effort,
+            worktree: &wt_path,
+            prompt: &prompt,
+            environment: &reviewer_env,
+            mode: runner::LaunchMode::Normal,
+            continuation_id,
+        },
+        &runner_adapter_config(config, reviewer_agent_bin),
+    )
+    .await;
     match spawn_result {
-        Ok(mut proc) => {
-            // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
-            if !proc.is_codex() {
-                let turn1 = agent::user_turn(&prompt);
-                if let Err(e) = proc.feed_turn(&turn1).await {
-                    log(&format!(
-                        "{}: reviewer feed_turn failed: {e}",
-                        role.as_str().to_uppercase()
-                    ));
-                    let _terminal_output = proc.kill_and_reap().await;
-                    name_pool.release(&reviewer_name);
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    let p = config.db_path.clone();
-                    let rn = reviewer_name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut conn) = quorum_core::db::open(&p) {
-                            let _ = journal::delete(&mut conn, &rn);
-                        }
-                    })
-                    .await
-                    .ok();
-                    return Ok(());
-                }
-            }
-
+        Ok(proc) => {
             // M7: persist PID immediately so crash recovery can clean up
             let spawn_pid = proc.pid();
             {
@@ -9843,7 +9837,7 @@ async fn spawn_worker(
     ));
 
     // #172: enforce the operator-configured minimum after classifier routing and
-    // before AgentSpec construction. The floor may raise, but never lower, the
+    // before runner launch. The floor may raise, but never lower, the
     // classifier-owned selection.
     let (floored_model, floored_effort) = apply_model_effort_floor(
         &resolved_model,
@@ -9980,75 +9974,29 @@ async fn spawn_worker(
         return Ok(false);
     }
 
-    let spawn_result: std::io::Result<runner::RunnerProc> = match resolved_kind {
-        runner::AgentKind::Claude => {
-            let spec = AgentSpec {
-                kind: runner::AgentKind::Claude,
-                model: resolved_model.clone(),
-                effort: resolved_effort.clone(),
-                session_id: session_id.clone(),
-                worktree: wt_path.clone(),
-                bare: config.bare_agent,
-                allowed_tools: config
-                    .allowed_tools
-                    .clone()
-                    .unwrap_or_else(|| agent::ALLOWED_TOOLS.to_string()),
-                env_vars: worker_env_vars,
-            };
-            AgentProc::spawn(&spec, config.agent_bin.as_deref()).map(runner::RunnerProc::Claude)
-        }
-        runner::AgentKind::Codex => {
-            if let Some(thread_id) = retry_turn
-                .as_ref()
-                .and_then(|retry| retry.thread_id.as_deref())
-            {
-                codex_agent::CodexProc::spawn_resume(
-                    thread_id,
-                    &resolved_model,
-                    &resolved_effort,
-                    &config.codex_sandbox,
-                    &wt_path,
-                    &prompt_text,
-                    &worker_env_vars,
-                    config.agent_bin.as_deref(),
-                )
-                .map(runner::RunnerProc::Codex)
-            } else {
-                let spec = codex_agent::CodexSpec {
-                    model: resolved_model.clone(),
-                    effort: resolved_effort.clone(),
-                    sandbox: config.codex_sandbox.clone(),
-                    worktree: wt_path.clone(),
-                    prompt: prompt_text.clone(),
-                    env_vars: worker_env_vars,
-                };
-                codex_agent::CodexProc::spawn(&spec, config.agent_bin.as_deref())
-                    .map(runner::RunnerProc::Codex)
-            }
-        }
-    };
+    let continuation_id = runner_continuation_id(
+        resolved_kind,
+        &session_id,
+        retry_turn
+            .as_ref()
+            .and_then(|retry| retry.thread_id.as_deref()),
+    );
+    let spawn_result = runner::RunnerProc::launch(
+        &runner::LaunchRequest {
+            model: &resolved_model,
+            effort: &resolved_effort,
+            worktree: &wt_path,
+            prompt: &prompt_text,
+            environment: &worker_env_vars,
+            mode: runner::LaunchMode::Normal,
+            continuation_id,
+        },
+        &runner_adapter_config(config, config.agent_bin.as_deref()),
+    )
+    .await;
 
     match spawn_result {
-        Ok(mut proc) => {
-            // Claude: feed the first turn via stdin. Codex: prompt was a CLI arg.
-            if !proc.is_codex() {
-                let turn1 = agent::user_turn(&prompt_text);
-                if let Err(e) = proc.feed_turn(&turn1).await {
-                    log(&format!("feed_turn failed: {e}"));
-                    let _terminal_output = proc.kill_and_reap().await;
-                    let strikes = poison_tracker.record_strike(task.id);
-                    if strikes >= MAX_POISON_STRIKES {
-                        poison_task(&db_path, &agent_name, task.id, strikes).await;
-                    } else {
-                        release_task(&db_path, &agent_name, task.id).await;
-                    }
-                    name_pool.release(&agent_name);
-                    wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(worker_repo_dir, &branch).await;
-                    return Ok(false);
-                }
-            }
-
+        Ok(proc) => {
             // M7: persist PID immediately so crash recovery can clean up
             let spawn_pid = proc.pid();
             {
@@ -11497,77 +11445,24 @@ async fn spawn_remediation_worker(
         }
     };
 
-    let spawn_result: std::io::Result<runner::RunnerProc> = match remediation_kind {
-        runner::AgentKind::Claude => agent::AgentProc::spawn(
-            &agent::AgentSpec {
-                kind: runner::AgentKind::Claude,
-                model: remediation_model.clone(),
-                effort: remediation_effort.clone(),
-                session_id: session_id.clone(),
-                worktree: wt_path.clone(),
-                bare: config.bare_agent,
-                allowed_tools: config
-                    .allowed_tools
-                    .as_deref()
-                    .unwrap_or(agent::ALLOWED_TOOLS)
-                    .to_string(),
-                env_vars: remediation_env,
-            },
-            config.agent_bin.as_deref(),
-        )
-        .map(runner::RunnerProc::Claude),
-        runner::AgentKind::Codex => match codex_thread_id.as_deref() {
-            Some(tid) => codex_agent::CodexProc::spawn_resume(
-                tid,
-                &remediation_model,
-                &remediation_effort,
-                &config.codex_sandbox,
-                &wt_path,
-                &prompt,
-                &remediation_env,
-                config.agent_bin.as_deref(),
-            ),
-            None => codex_agent::CodexProc::spawn(
-                &codex_agent::CodexSpec {
-                    model: remediation_model.clone(),
-                    effort: remediation_effort.clone(),
-                    sandbox: config.codex_sandbox.clone(),
-                    worktree: wt_path.clone(),
-                    prompt: prompt.clone(),
-                    env_vars: remediation_env.clone(),
-                },
-                config.agent_bin.as_deref(),
-            ),
-        }
-        .map(runner::RunnerProc::Codex),
-    };
+    let continuation_id =
+        runner_continuation_id(remediation_kind, &session_id, codex_thread_id.as_deref());
+    let spawn_result = runner::RunnerProc::launch(
+        &runner::LaunchRequest {
+            model: &remediation_model,
+            effort: &remediation_effort,
+            worktree: &wt_path,
+            prompt: &prompt,
+            environment: &remediation_env,
+            mode: runner::LaunchMode::Normal,
+            continuation_id,
+        },
+        &runner_adapter_config(config, config.agent_bin.as_deref()),
+    )
+    .await;
 
     match spawn_result {
-        Ok(mut proc) => {
-            if !proc.is_codex() {
-                let turn1 = agent::user_turn(&prompt);
-                if let Err(e) = proc.feed_turn(&turn1).await {
-                    log(&format!("remediation feed_turn failed: {e}"));
-                    let _terminal_output = proc.kill_and_reap().await;
-                    // Release the lease installed by claim_remediation_rework.
-                    {
-                        let p = db_path.clone();
-                        let name = agent_name.clone();
-                        let tid = task_id;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            tasks::release_remediation_lease(&mut conn, &name, tid, now_unix())
-                        })
-                        .await;
-                    }
-                    cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                    name_pool.release(&agent_name);
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return Ok(RemediationSpawnOutcome::ProvisionFailed);
-                }
-            }
-
+        Ok(proc) => {
             let remediation_provider_str = remediation_kind.to_string();
             let worker_run_id = {
                 let p = db_path.clone();
@@ -12233,7 +12128,7 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let reader = BufReader::new(stdout).lines();
-        let proc = runner::RunnerProc::Claude(AgentProc::from_parts(child, stdin, reader));
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(child, stdin, reader));
         let now = Instant::now();
         SlotState {
             agent_name: "Test-1".into(),
@@ -12271,9 +12166,10 @@ mod tests {
     #[test]
     fn codex_continuation_requires_exact_run_identity() {
         let mut slot = make_dummy_slot();
+        slot.model = "gpt-5.6-terra".into();
         assert_eq!(
             codex_continuation_identity(&slot).unwrap(),
-            ("test-model", "high")
+            ("gpt-5.6-terra", "high")
         );
         slot.model.clear();
         assert_eq!(
@@ -12286,6 +12182,44 @@ mod tests {
             codex_continuation_identity(&slot).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+        slot.effort = "high".into();
+        slot.model = "claude-opus-4-6".into();
+        assert!(
+            codex_continuation_identity(&slot)
+                .unwrap_err()
+                .to_string()
+                .contains("refusing provider migration"),
+            "a Codex process must never continue through a Claude adapter"
+        );
+    }
+
+    #[test]
+    fn every_managed_role_keeps_continuation_identity_with_its_runner() {
+        for role in ["worker", "remediation", "r1", "r2"] {
+            assert_eq!(
+                runner_continuation_id(
+                    runner::AgentKind::Claude,
+                    "claude-session",
+                    Some("stale-codex-thread"),
+                ),
+                Some("claude-session"),
+                "{role} must not migrate a Claude launch onto a Codex thread"
+            );
+            assert_eq!(
+                runner_continuation_id(
+                    runner::AgentKind::Codex,
+                    "unused-claude-session",
+                    Some("exact-codex-thread"),
+                ),
+                Some("exact-codex-thread"),
+                "{role} must preserve the provider-issued Codex thread"
+            );
+            assert_eq!(
+                runner_continuation_id(runner::AgentKind::Codex, "unused-claude-session", None,),
+                None,
+                "{role} must not fabricate a Codex continuation identity"
+            );
+        }
     }
 
     #[test]

@@ -21,9 +21,7 @@
 //!   post findings as inline and summary comments; the daemon posts formal
 //!   approval or request-changes from the reviewer verdict as the merge account.
 
-use super::agent::{AgentProc, AgentSpec, ALLOWED_TOOLS};
-use super::codex_agent;
-use super::runner::{AgentKind, RunnerProc};
+use super::runner::AgentKind;
 use std::path::{Path, PathBuf};
 
 pub struct ReviewerSpec {
@@ -136,51 +134,6 @@ pub fn reviewer_branch(pr: i64, reviewer_name: &str) -> String {
 /// forbids one branch in two worktrees.
 pub fn remediation_branch(agent_name: &str, task_id: i64) -> String {
     format!("remediation/{}-t{}", agent_name.to_lowercase(), task_id)
-}
-
-/// Spawn a reviewer as Claude or Codex based on the resolved model.
-/// `prompt` is the full review prompt text; for Claude it is fed via stdin,
-/// for Codex it is passed as a CLI argument.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_reviewer(
-    kind: AgentKind,
-    model: &str,
-    effort: &str,
-    session_id: &str,
-    worktree_path: &Path,
-    agent_bin: Option<&str>,
-    bare: bool,
-    env_vars: Vec<(String, String)>,
-    allowed_tools_override: Option<&str>,
-    codex_sandbox: &str,
-    prompt: &str,
-) -> std::io::Result<RunnerProc> {
-    match kind {
-        AgentKind::Claude => {
-            let agent_spec = AgentSpec {
-                kind: AgentKind::Claude,
-                model: model.to_string(),
-                effort: effort.to_string(),
-                session_id: session_id.to_string(),
-                worktree: worktree_path.to_path_buf(),
-                bare,
-                allowed_tools: allowed_tools_override.unwrap_or(ALLOWED_TOOLS).to_string(),
-                env_vars,
-            };
-            AgentProc::spawn(&agent_spec, agent_bin).map(RunnerProc::Claude)
-        }
-        AgentKind::Codex => {
-            let spec = codex_agent::CodexSpec {
-                model: model.to_string(),
-                effort: effort.to_string(),
-                sandbox: codex_sandbox.to_string(),
-                worktree: worktree_path.to_path_buf(),
-                prompt: prompt.to_string(),
-                env_vars,
-            };
-            codex_agent::CodexProc::spawn(&spec, agent_bin).map(RunnerProc::Codex)
-        }
-    }
 }
 
 /// Build a review prompt appropriate for the resolved provider.
