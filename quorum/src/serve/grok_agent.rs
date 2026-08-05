@@ -257,6 +257,7 @@ impl BoundedStdout {
 
 pub struct GrokProc {
     child: Child,
+    process_group_id: libc::pid_t,
     reader: BoundedStdout,
     diagnostics: DiagnosticBuffer,
     stderr_task: tokio::task::JoinHandle<()>,
@@ -320,6 +321,13 @@ impl GrokProc {
         }
 
         let mut child = command.spawn()?;
+        // `Child::id()` becomes `None` after `try_wait()` observes leader
+        // exit, but descendants may still hold the process group's pipes.
+        // Persist the group ID before any caller can reap the leader.
+        let process_group_id = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("spawned Grok process has no process-group ID"))?
+            as libc::pid_t;
         let reader = BoundedStdout::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -328,6 +336,7 @@ impl GrokProc {
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
         Ok(Self {
             child,
+            process_group_id,
             reader,
             diagnostics,
             stderr_task,
@@ -358,10 +367,11 @@ impl GrokProc {
     }
 
     pub async fn kill_and_reap(mut self) -> Vec<CapturedOutput> {
-        if let Some(pid) = self.child.id() {
-            unsafe {
-                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
-            }
+        // Always target the spawn-time process group, even when `try_wait`
+        // already observed and reaped the leader. Descendants can otherwise
+        // retain stdout/stderr and make the drains below wait forever.
+        unsafe {
+            libc::killpg(self.process_group_id, libc::SIGKILL);
         }
         let _ = self.child.wait().await;
 
@@ -725,6 +735,7 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
+        let process_group_id = child.id().unwrap() as libc::pid_t;
         let reader = BoundedStdout::new(child.stdout.take().unwrap());
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -733,6 +744,7 @@ mod tests {
             tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
         GrokProc {
             child,
+            process_group_id,
             reader,
             diagnostics,
             stderr_task,
@@ -797,6 +809,37 @@ mod tests {
             |line| matches!(line, CapturedOutput::StderrTruncated { dropped } if *dropped > 0)
         ));
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child was not reaped");
+    }
+
+    #[tokio::test]
+    async fn teardown_kills_stored_process_group_after_leader_is_reaped() {
+        let mut proc = shell_proc("trap '' HUP; (trap '' HUP; sleep 30) & exit 0").await;
+        let process_group_id = proc.process_group_id;
+
+        let status = wait_status(&mut proc).await;
+        assert!(status.success());
+        assert!(
+            proc.child.id().is_none(),
+            "test must exercise teardown after try_wait loses the leader ID"
+        );
+        assert_eq!(
+            unsafe { libc::killpg(process_group_id, 0) },
+            0,
+            "a descendant must still hold the process group and inherited pipes"
+        );
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(5), proc.kill_and_reap())
+            .await
+            .expect("post-exit teardown hung on descendant-held pipes");
+        assert!(output.is_empty());
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while unsafe { libc::killpg(process_group_id, 0) } == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Grok descendant process group was not reaped");
     }
 
     fn grok_available() -> bool {

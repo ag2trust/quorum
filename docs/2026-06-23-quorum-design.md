@@ -1482,7 +1482,9 @@ path. An oversized line becomes an explicit truncation record. Invalid UTF-8 bec
 explicit `provider.stdout_invalid_utf8` record that carries only byte counts/offsets and
 is lifecycle-inert; bytes are never repaired into provider JSON. Stdout retained during
 teardown, stderr lines, and bytes within an individual stderr line are separately bounded.
-The process runs in its own process group; teardown kills the group and reaps the child.
+The process runs in its own process group. The adapter retains that group ID independently
+of the leader's reap state, so teardown kills descendants holding inherited pipes before it
+drains bounded output and reaps the child.
 
 An `end` event is the protocol's success marker, but managed success will additionally
 require exit status zero when Grok lifecycle roles are enabled. `error`, non-zero exit,
