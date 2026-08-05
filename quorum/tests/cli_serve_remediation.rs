@@ -778,6 +778,577 @@ fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
     handle.sigkill();
 }
 
+/// A durable CI remediation with a terminal-not-done dependency must park
+/// instead of retrying its clean-negative claim on every daemon tick.
+#[test]
+fn terminal_dependency_parks_durable_ci_remediation() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let dependency = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "cancelled dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dependency],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            rusqlite::params![task_id, format!("[{dependency}]")],
+        )
+        .unwrap();
+    }
+    stage_failed_ci_remediation(home.path(), repo_dir.path(), task_id, pr);
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("remediation: claim lost for task", 15),
+        "durable CI reconciler did not attempt the dependency-gated claim: {:?}",
+        handle.lines
+    );
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(
+        task.status, "failed",
+        "terminal dependency must park rework"
+    );
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+    assert_eq!(refs["daemon_resume_status"], "rework");
+    assert!(refs["daemon_parked_reason"]
+        .as_str()
+        .unwrap()
+        .contains("terminal-not-done"));
+    assert!(
+        quorum_core::tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .is_some(),
+        "parking must preserve the CI remediation context for an explicit retry"
+    );
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning remediation worker")),
+        "a terminal dependency must stop remediation provisioning: {:?}",
+        handle.lines
+    );
+    handle.sigkill();
+}
+
+/// A clean dependency-gated inline remediation claim must retain the accepted
+/// reviewer feedback so the durable retry path, rather than generic dispatch,
+/// resumes the original rework once the dependency completes.
+#[test]
+fn pending_dependency_preserves_inline_remediation_feedback() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let prompt_log = home.path().join("inline-remediation-prompts.jsonl");
+    let feedback = "preserve this inline remediation feedback";
+
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+        &[(
+            "FAKE_AGENT_PROMPT_LOG".into(),
+            prompt_log.to_string_lossy().to_string(),
+        )],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "reviewer not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen: {:?}",
+        handle.lines
+    );
+
+    let dependency;
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        dependency = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "pending dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            rusqlite::params![task_id, format!("[{dependency}]")],
+        )
+        .unwrap();
+    }
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            feedback,
+        ],
+    );
+    assert!(
+        handle.wait_for("remediation: retained blocked retry", 15),
+        "inline clean negative did not retain retry intent: {:?}",
+        handle.lines
+    );
+
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_rework_retry_requested"], true);
+        assert_eq!(refs["remediation_feedback"], feedback);
+
+        // Age the task beyond grace and exercise the guarded claim's
+        // sweep-on-write. The durable intent must keep it in rework.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "UPDATE tasks SET updated_at=?2 WHERE id=?1",
+            rusqlite::params![
+                task_id,
+                now - quorum_core::sweep::REWORK_PROVISIONING_GRACE_SECS - 1
+            ],
+        )
+        .unwrap();
+        assert!(quorum_core::tasks::claim_remediation_rework(
+            &mut conn,
+            "test-remediation",
+            task_id,
+            3600,
+            now,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            quorum_core::tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "rework"
+        );
+    }
+
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            rusqlite::params![dependency],
+        )
+        .unwrap();
+    }
+    assert!(
+        handle.wait_for("durable remediation retry: provisioning task", 15),
+        "resolved dependency did not use durable retry: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning remediation worker", 15),
+        "durable retry did not provision remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "remediation worker did not receive its turn: {:?}",
+        handle.lines
+    );
+    let prompts = std::fs::read_to_string(&prompt_log).unwrap();
+    assert!(
+        prompts.contains(feedback),
+        "replacement worker must receive preserved feedback: {prompts}"
+    );
+    handle.sigkill();
+}
+
+/// Terminal dependency cascading must retain inline verdict feedback so an
+/// explicit owner retry can resume the same remediation after resolution.
+#[test]
+fn terminal_dependency_retry_preserves_inline_remediation_feedback() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let prompt_log = home
+        .path()
+        .join("terminal-inline-remediation-prompts.jsonl");
+    let feedback = "preserve feedback across terminal dependency park";
+
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+        &[(
+            "FAKE_AGENT_PROMPT_LOG".into(),
+            prompt_log.to_string_lossy().to_string(),
+        )],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "reviewer not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer_name = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer result not seen: {:?}",
+        handle.lines
+    );
+
+    let dependency;
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        dependency = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "cancelled dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            rusqlite::params![dependency],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            rusqlite::params![task_id, format!("[{dependency}]")],
+        )
+        .unwrap();
+    }
+
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer_name,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            feedback,
+        ],
+    );
+    assert!(
+        handle.wait_for("remediation: claim lost for task", 15),
+        "terminal dependency did not gate inline remediation: {:?}",
+        handle.lines
+    );
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked"], true);
+        assert_eq!(refs["daemon_resume_status"], "rework");
+        assert_eq!(refs["remediation_feedback"], feedback);
+    }
+
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            rusqlite::params![dependency],
+        )
+        .unwrap();
+    }
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-retry",
+            "--task-id",
+            &task_id.to_string(),
+            "--by",
+            "owner",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "task-retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(
+        handle.wait_for("durable remediation retry: provisioning task", 15),
+        "owner retry did not use durable remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning remediation worker", 15),
+        "owner retry did not provision remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "remediation worker did not receive its turn: {:?}",
+        handle.lines
+    );
+    let prompts = std::fs::read_to_string(&prompt_log).unwrap();
+    assert!(
+        prompts.contains(feedback),
+        "replacement worker must receive preserved feedback: {prompts}"
+    );
+    handle.sigkill();
+}
+
+/// An owner-requested remediation retry must retain its rework identity while
+/// waiting beyond the provisioning grace for a dependency to complete.
+#[test]
+fn pending_dependency_preserves_owner_requested_remediation_retry() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let prompt_log = home.path().join("remediation-prompts.jsonl");
+    let feedback = "preserved remediation feedback after dependency wait";
+    let dependency;
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        dependency = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "pending dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2, status='rework' WHERE id=?1",
+            rusqlite::params![task_id, format!("[{dependency}]")],
+        )
+        .unwrap();
+        quorum_core::tasks::set_remediation_feedback(&conn, task_id, feedback, now).unwrap();
+        quorum_core::tasks::park(
+            &mut conn,
+            task_id,
+            "previous remediation provisioning failed",
+            "rework",
+            now,
+        )
+        .unwrap()
+        .expect("rework task must park before owner retry");
+        let retried = quorum_core::tasks::retry_parked(&mut conn, task_id, "owner", true, now + 1)
+            .unwrap()
+            .expect("owner retry must restore rework");
+        assert_eq!(retried.status, "rework");
+        assert!(!retried.ready, "pending dependency must gate the retry");
+        conn.execute(
+            "UPDATE tasks SET updated_at=?2 WHERE id=?1",
+            rusqlite::params![
+                task_id,
+                now - quorum_core::sweep::REWORK_PROVISIONING_GRACE_SECS - 1
+            ],
+        )
+        .unwrap();
+    }
+
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+        &[(
+            "FAKE_AGENT_PROMPT_LOG".into(),
+            prompt_log.to_string_lossy().to_string(),
+        )],
+    );
+    assert!(
+        handle.wait_for("remediation: claim lost for task", 15),
+        "dependency-gated retry did not reach the remediation claim: {:?}",
+        handle.lines
+    );
+
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework", "pending retry must outlive grace");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_rework_retry_requested"], true);
+        assert_eq!(refs["remediation_feedback"], feedback);
+    }
+
+    {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            rusqlite::params![dependency],
+        )
+        .unwrap();
+    }
+    assert!(
+        handle.wait_for("durable remediation retry: provisioning task", 15),
+        "resolved dependency did not return to the dedicated retry reconciler: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("spawning remediation worker", 15),
+        "dedicated retry did not provision remediation: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "remediation worker did not receive its rework turn: {:?}",
+        handle.lines
+    );
+    let prompts = std::fs::read_to_string(&prompt_log).unwrap();
+    assert!(
+        prompts.contains(feedback),
+        "replacement worker must receive preserved remediation feedback: {prompts}"
+    );
+    handle.sigkill();
+}
+
 /// Regression: a failed remediation provisioning attempt must not overwrite
 /// the original managed worker identity. When GitHub is unavailable on the
 /// later attempt and no PR target was persisted, remediation must fetch the

@@ -9578,7 +9578,8 @@ async fn spawn_worker(
                 .into_iter()
                 .filter(|task| {
                     codex_retry_turn(task.refs.as_deref()).is_some()
-                        || daemon_rework_retry_requested(task.refs.as_deref())
+                        || (daemon_rework_retry_requested(task.refs.as_deref())
+                            && remediation_retry_feedback(task.refs.as_deref()).is_none())
                 }),
         );
         let found = available.into_iter().find(|t| {
@@ -10914,21 +10915,40 @@ async fn claim_remediation_for_spawn(
     db_path: PathBuf,
     agent: String,
     task_id: i64,
+    feedback: String,
 ) -> Result<Option<tasks::Task>> {
     tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
         let mut conn = quorum_core::db::open(&db_path)?;
-        tasks::claim_remediation_rework(
+        tasks::claim_remediation_rework_with_feedback(
             &mut conn,
             &agent,
             task_id,
             tasks::DEFAULT_LEASE_TTL_SECS,
             now_unix(),
+            Some(&feedback),
         )
     })
     .await
     .map_err(|error| {
         QuorumError::Io(format!(
             "remediation claim join for task #{task_id}: {error}"
+        ))
+    })?
+}
+
+async fn retain_blocked_remediation_retry_for_spawn(
+    db_path: PathBuf,
+    task_id: i64,
+    feedback: String,
+) -> Result<bool> {
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::retain_blocked_remediation_retry(&mut conn, task_id, &feedback, now_unix())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "blocked remediation retry persistence join for task #{task_id}: {error}"
         ))
     })?
 }
@@ -10996,12 +11016,30 @@ async fn spawn_remediation_worker(
     // sweep. Without this, an intervening sweep_on_write sees a rework task
     // with no active claim and reaps it to open (#199).
     {
-        match claim_remediation_for_spawn(db_path.clone(), agent_name.clone(), task_id).await {
+        match claim_remediation_for_spawn(
+            db_path.clone(),
+            agent_name.clone(),
+            task_id,
+            feedback.to_string(),
+        )
+        .await
+        {
             Ok(Some(_)) => {}
             Ok(None) => {
                 log(&format!(
                     "remediation: claim lost for task #{task_id} — task no longer eligible"
                 ));
+                if retain_blocked_remediation_retry_for_spawn(
+                    db_path.clone(),
+                    task_id,
+                    feedback.to_string(),
+                )
+                .await?
+                {
+                    log(&format!(
+                        "remediation: retained blocked retry for task #{task_id}"
+                    ));
+                }
                 name_pool.release(&agent_name);
                 return Ok(RemediationSpawnOutcome::ClaimLost);
             }
@@ -11013,8 +11051,9 @@ async fn spawn_remediation_worker(
     }
 
     // Resolve external PR state only after the authoritative claim succeeds.
-    // A zero-row guard outcome is therefore entirely side-effect free: no
-    // GitHub lookup, worktree, run, park, notification, or retry strike.
+    // A zero-row guard outcome only persists its accepted feedback for a
+    // possible owner retry; it performs no external lookup, worktree, run,
+    // park, notification, or retry strike.
     let pr_target = match resolve_or_load_remediation_pr_target(
         pr,
         task_id,
@@ -11657,7 +11696,7 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let error = claim_remediation_for_spawn(db_path, "worker".into(), 1)
+        let error = claim_remediation_for_spawn(db_path, "worker".into(), 1, "feedback".into())
             .await
             .expect_err("abnormal database failure must propagate");
         assert!(

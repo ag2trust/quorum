@@ -61,6 +61,15 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                      ELSE 0
                  END != 1
              )
+             AND NOT (
+                 t.status = 'rework'
+                 AND t.assignee IS NULL
+                 AND json_valid(t.refs)
+                 AND (
+                     COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
+                     OR COALESCE(json_type(t.refs, '$.codex_retry_requested')='true', 0)
+                 )
+             )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
              LIMIT ?2",
         )?;
@@ -128,9 +137,24 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
         // `working` (they enter the lifecycle at in-review), so the park
         // branch above already consumed every review_only row this query can
         // return.
+        let preserve_rework = status == "rework"
+            && refs
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|value| {
+                    value
+                        .get(crate::tasks::PARKED_REWORK_RETRY_REF)
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        || value
+                            .get("codex_retry_requested")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                });
+        let recovered_status = if preserve_rework { "rework" } else { "open" };
         conn.execute(
-            "UPDATE tasks SET status='open', assignee=NULL, updated_at=?1 WHERE id=?2",
-            params![now, id],
+            "UPDATE tasks SET status=?1, assignee=NULL, updated_at=?2 WHERE id=?3",
+            params![recovered_status, now, id],
         )?;
         // Clear any lingering (now-expired) lease row so the next claim starts clean.
         conn.execute(
@@ -138,8 +162,8 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             params![target],
         )?;
         let body = match prev {
-            Some(a) => format!("reclaimed from {a} ({reason}) → open"),
-            None => format!("reclaimed ({reason}) → open"),
+            Some(a) => format!("reclaimed from {a} ({reason}) → {recovered_status}"),
+            None => format!("reclaimed ({reason}) → {recovered_status}"),
         };
         crate::events::emit(conn, "task_reclaimed", &target, &body, now)?;
     }
@@ -259,16 +283,20 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
     Ok(())
 }
 
-/// Park open tasks whose dependencies cannot currently be satisfied: every dep is terminal
-/// (done/failed/cancelled) but at least one is failed or cancelled. They stay excluded from
-/// provisioning until an explicit retry, without losing their dependency context.
+/// Park unleased open or rework tasks whose dependencies cannot currently be satisfied: every
+/// dep is terminal (done/failed/cancelled) but at least one is failed or cancelled. They stay
+/// excluded from provisioning until an explicit retry, without losing their dependency context.
 pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
-    let doomed: Vec<(i64, i64)> = {
+    let doomed: Vec<(i64, i64, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT t.id, je.value AS dep_id
+            "SELECT t.id, je.value AS dep_id, t.status
              FROM tasks t, json_each(t.depends_on) je
-             WHERE t.status = 'open'
+             WHERE t.status IN ('open', 'rework')
                AND t.depends_on IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM claims c
+                   WHERE c.target = 'task#' || t.id AND c.active=1 AND c.expires_at > ?1
+               )
                -- every dep is terminal …
                AND NOT EXISTS (
                    SELECT 1 FROM json_each(t.depends_on) j2
@@ -282,16 +310,18 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
                    JOIN tasks d ON d.id = j3.value
                    WHERE d.status IN ('failed','cancelled')
                )
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![now, limit as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
     let mut count = 0usize;
     let mut seen = std::collections::HashSet::new();
-    for (task_id, failed_dep) in &doomed {
+    for (task_id, failed_dep, resume_status) in &doomed {
         if !seen.insert(*task_id) {
             continue;
         }
@@ -305,11 +335,15 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
                      COALESCE(refs, '{}'),
                      '$.daemon_parked', json('true'),
                      '$.daemon_parked_reason', ?1,
-                     '$.daemon_resume_status', 'open'
+                     '$.daemon_resume_status', ?2
                  ),
-                 updated_at=?2
-             WHERE id=?3",
-            params![reason, now, task_id],
+                 updated_at=?3
+             WHERE id=?4",
+            params![reason, resume_status, now, task_id],
+        )?;
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1 AND active=1",
+            params![target],
         )?;
         conn.execute(
             "INSERT INTO task_notes(task_id, ts, agent, body)
@@ -886,12 +920,17 @@ mod tests {
             100,
         )
         .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework' WHERE id=?1",
+            params![child],
+        )
+        .unwrap();
         // dep is still open (non-terminal).
         let n = cascade_dead_deps(&c, 300, 100).unwrap();
         assert_eq!(n, 0, "non-terminal dep should not trigger cascade");
         assert_eq!(
             crate::tasks::get(&c, child).unwrap().unwrap().status,
-            "open"
+            "rework"
         );
     }
 
@@ -1418,6 +1457,116 @@ mod tests {
         reap_lapsed_tasks(&c, 1400, SWEEP_LIMIT).unwrap();
         let t = crate::tasks::get(&c, id).unwrap().unwrap();
         assert_eq!(t.status, "open", "rework past grace must be reaped");
+    }
+
+    #[test]
+    fn reaper_preserves_dependency_blocked_codex_retry_until_rework_push() {
+        let (_d, mut c) = open_tmp();
+        let dependency = crate::tasks::create(
+            &mut c,
+            "owner",
+            "pending dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "owner",
+            "Codex retry",
+            None,
+            0,
+            None,
+            Some(r#"{"codex_retry_requested":true}"#),
+            Some(&format!("[{dependency}]")),
+            None,
+            1000,
+        )
+        .unwrap();
+        crate::classify::store_classifications(
+            &mut c,
+            &[crate::classify::TaskClassification {
+                task_id,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "unit-test:v2",
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework', updated_at=1000 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        // This is after the provisioning grace. The blocked provider retry
+        // must remain rework so its eventual ReworkPushed is legal.
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+
+        c.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![dependency],
+        )
+        .unwrap();
+        // A write can sweep after the dependency resolves but before the
+        // replacement worker claims. Durable provider retry identity must
+        // survive that ready-but-unclaimed interval.
+        reap_lapsed_tasks(&c, 1101, SWEEP_LIMIT).unwrap();
+        assert_eq!(
+            crate::tasks::get(&c, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+        crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 10, 1101)
+            .unwrap()
+            .expect("resolved Codex retry must claim in rework");
+
+        // If the replacement worker's lease lapses, the durable retry marker
+        // must not exempt the claimed row forever. Recovery clears the stale
+        // assignee while preserving rework semantics for another replacement.
+        reap_lapsed_tasks(&c, 1162, SWEEP_LIMIT).unwrap();
+        let recovered = crate::tasks::get(&c, task_id).unwrap().unwrap();
+        assert_eq!(recovered.status, "rework");
+        assert!(
+            recovered.assignee.is_none(),
+            "lapsed replacement assignee must be cleared"
+        );
+        let refs: serde_json::Value =
+            serde_json::from_str(recovered.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["codex_retry_requested"], true);
+        let active_claims: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                params![format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0, "lapsed replacement lease is deactivated");
+
+        crate::tasks::claim_provider_retry_rework(&mut c, "replacement", task_id, 3600, 1163)
+            .unwrap()
+            .expect("recovered Codex retry must be claimable again in rework");
+        let pushed = crate::tasks::apply_event(
+            &mut c,
+            "replacement",
+            task_id,
+            &crate::lifecycle::Event::ReworkPushed,
+            1164,
+        )
+        .unwrap();
+        assert_eq!(pushed.task.status, "in-review");
     }
 
     #[test]
