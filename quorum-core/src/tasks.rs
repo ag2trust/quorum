@@ -11,6 +11,7 @@
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use crate::lifecycle::{Effect, Event, Status, TaskView};
+use crate::runner_state::{self, PendingTurn, ProviderBlock};
 use crate::sweep::SWEEP_LIMIT;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Serialize;
@@ -832,7 +833,8 @@ pub fn claim_provider_retry_rework(
                AND NOT (json_extract(refs, '$.cx_est')=5
                         AND json_extract(refs, '$.cx_size')='L')
                AND (
-                   json_type(refs, '$.codex_retry_requested')='true'
+                   json_type(refs, '$.runner_retry.requested')='true'
+                   OR json_type(refs, '$.codex_retry_requested')='true'
                    OR json_type(refs, '$.daemon_rework_retry_requested')='true'
                )
                ELSE 0
@@ -1742,7 +1744,7 @@ where
     if matches!(event, Event::SignaledDone { .. } | Event::ReworkPushed)
         && new_status == Status::InReview
     {
-        refs = clear_codex_retry_refs(refs.as_deref())?;
+        refs = clear_runner_retry_refs(refs.as_deref())?;
     }
 
     tx.execute(
@@ -1786,24 +1788,19 @@ where
     })
 }
 
-fn clear_codex_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
+fn clear_runner_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
     let Some(refs) = refs else {
         return Ok(None);
     };
     let mut value: serde_json::Value = serde_json::from_str(refs)
         .map_err(|error| QuorumError::Io(format!("invalid persisted refs JSON: {error}")))?;
-    if let Some(object) = value.as_object_mut() {
+    if value.is_object() {
+        // The worker delivered a PR, so a staged provider retry is stale —
+        // replaying it would re-run already-completed work. Clear both the
+        // neutral representation and historical Codex state.
+        runner_state::clear_provider_retry(&mut value);
+        let object = value.as_object_mut().expect("checked task refs object");
         for key in [
-            // The worker delivered a PR, so a staged provider retry is stale —
-            // replaying it would re-run already-completed work.
-            "codex_provider_blocked",
-            "codex_provider_error",
-            "codex_retry_requested",
-            "codex_retry_model",
-            "codex_retry_effort",
-            "codex_retry_prompt",
-            "codex_retry_turn_kind",
-            "codex_retry_thread_id",
             // Round-scoped remediation context becomes stale once the push
             // completes this round.
             "remediation_feedback",
@@ -2037,7 +2034,7 @@ pub fn update(
 }
 
 /// Daemon-authoritative refs update — bypasses the assignee guard.
-/// Used for internal bookkeeping (e.g. persisting Codex thread IDs)
+/// Used for internal bookkeeping (e.g. persisting runner continuation IDs)
 /// where the daemon needs to write task metadata it doesn't "own" via
 /// the normal agent-scoped update path.
 pub fn update_refs_daemon(conn: &mut Connection, id: i64, refs: &str, now: i64) -> Result<()> {
@@ -2077,7 +2074,7 @@ pub fn set_publication_intent(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum DeadCodexDisposition {
+pub enum DeadTurnRunnerDisposition {
     DonePending,
     DeliveryRecorded,
     OwnershipTransferred,
@@ -2227,36 +2224,29 @@ pub fn dispose_managed_exit(
     .map(|transition| ManagedExitDisposition::AgentFailed(Box::new(transition)))
 }
 
-pub struct CodexProviderBlock<'a> {
-    pub reason: &'a str,
-    pub model: &'a str,
-    pub effort: &'a str,
-    pub prompt: &'a str,
-    pub turn_kind: &'a str,
-    pub thread_id: Option<&'a str>,
-}
-
-/// Atomically distinguish a submitted Codex worker from a provider failure.
+/// Atomically distinguish a submitted turn-oriented worker from a provider
+/// failure.
 ///
 /// The immediate transaction serializes the Done-row check with both mailbox
 /// append and provider-block persistence, so committed work cannot be staged
 /// for a duplicate retry through a check/write race.
-pub fn dispose_dead_codex(
+pub fn dispose_dead_turn_runner(
     conn: &mut Connection,
     id: i64,
     agent: &str,
-    block: &CodexProviderBlock<'_>,
+    block: &ProviderBlock,
+    pending_turn: &PendingTurn,
     now: i64,
-) -> Result<DeadCodexDisposition> {
+) -> Result<DeadTurnRunnerDisposition> {
     let tx = begin_immediate(conn)?;
     match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id)? {
         ManagedExitClassification::OutcomePending => {
             tx.commit()?;
-            return Ok(DeadCodexDisposition::DonePending);
+            return Ok(DeadTurnRunnerDisposition::DonePending);
         }
         ManagedExitClassification::OutcomeRecorded => {
             tx.commit()?;
-            return Ok(DeadCodexDisposition::DeliveryRecorded);
+            return Ok(DeadTurnRunnerDisposition::DeliveryRecorded);
         }
         ManagedExitClassification::OwnershipTransferred
         | ManagedExitClassification::ActiveWithoutOutcome => {}
@@ -2277,7 +2267,7 @@ pub fn dispose_dead_codex(
         .optional()?;
     let Some((status, refs_raw, author, assignee)) = task else {
         tx.commit()?;
-        return Ok(DeadCodexDisposition::OwnershipTransferred);
+        return Ok(DeadTurnRunnerDisposition::OwnershipTransferred);
     };
     // Match apply_event's worker submission authority: the current assignee
     // owns the phase directly, while a daemon-issued active worker capability
@@ -2291,43 +2281,38 @@ pub fn dispose_dead_codex(
             && (author.as_deref() == Some(agent) || has_worker_capability)
             && extract_pr_number(&refs_raw).is_some()
         {
-            DeadCodexDisposition::DeliveryRecorded
+            DeadTurnRunnerDisposition::DeliveryRecorded
         } else {
-            DeadCodexDisposition::OwnershipTransferred
+            DeadTurnRunnerDisposition::OwnershipTransferred
         };
         tx.commit()?;
         return Ok(disposition);
     }
     if !owns_worker_phase {
         tx.commit()?;
-        return Ok(DeadCodexDisposition::OwnershipTransferred);
+        return Ok(DeadTurnRunnerDisposition::OwnershipTransferred);
     }
     let mut refs: serde_json::Value = refs_raw
         .as_deref()
         .and_then(|refs| serde_json::from_str(refs).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    refs["codex_provider_blocked"] = serde_json::Value::Bool(true);
-    refs["codex_provider_error"] = serde_json::Value::String(block.reason.to_string());
-    refs["codex_retry_model"] = serde_json::Value::String(block.model.to_string());
-    refs["codex_retry_effort"] = serde_json::Value::String(block.effort.to_string());
-    refs["codex_retry_prompt"] = serde_json::Value::String(block.prompt.to_string());
-    refs["codex_retry_turn_kind"] = serde_json::Value::String(block.turn_kind.to_string());
-    match block.thread_id {
-        Some(thread_id) => {
-            refs["codex_retry_thread_id"] = serde_json::Value::String(thread_id.to_string());
-        }
-        None => {
-            if let Some(object) = refs.as_object_mut() {
-                object.remove("codex_retry_thread_id");
-            }
-        }
+    if block.provider.is_empty()
+        || block.reason.is_empty()
+        || block.provider != pending_turn.provider
+        || !runner_state::pending_turn_is_complete(pending_turn)
+    {
+        return Err(QuorumError::Io(format!(
+            "provider block '{}' does not match a complete pending turn '{}'",
+            block.provider, pending_turn.provider
+        )));
     }
+    runner_state::set_provider_block(&mut refs, block, pending_turn);
     tx.execute(
         "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs.to_string(), now],
     )?;
     tx.commit()?;
-    Ok(DeadCodexDisposition::ProviderBlocked)
+    Ok(DeadTurnRunnerDisposition::ProviderBlocked)
 }
 
 pub(crate) fn set_parked_refs(
@@ -2967,25 +2952,35 @@ pub fn retry_provider_blocked(
     crate::agents::touch(&tx, by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
 
-    let n = tx.execute(
-        "UPDATE tasks SET
-             refs=json_set(
-                 json_remove(refs, '$.codex_provider_blocked', '$.codex_provider_error'),
-                 '$.codex_retry_requested', json('true')
-             ),
-             status=CASE WHEN status='working' THEN 'open' ELSE status END,
-             assignee=NULL,
-             updated_at=?2
-         WHERE id=?1
-           AND status IN ('working','rework')
-           AND json_valid(refs)
-           AND json_extract(refs, '$.codex_provider_blocked')=1",
-        params![id, now],
-    )?;
-    if n == 0 {
+    let current = tx
+        .query_row(
+            "SELECT status, refs FROM tasks WHERE id=?1 AND status IN ('working','rework')",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((status, Some(refs_raw))) = current else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let Ok(mut refs) = serde_json::from_str::<serde_json::Value>(&refs_raw) else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    if !refs.is_object() || !runner_state::request_retry(&mut refs) {
         tx.commit()?;
         return Ok(None);
     }
+    let next_status = if status == "working" {
+        "open"
+    } else {
+        "rework"
+    };
+    tx.execute(
+        "UPDATE tasks SET refs=?2, status=?3, assignee=NULL, updated_at=?4
+         WHERE id=?1 AND status=?5",
+        params![id, refs.to_string(), next_status, now, status],
+    )?;
     deactivate_lease(&tx, id, now)?;
     crate::events::emit(
         &tx,
@@ -7843,7 +7838,8 @@ mod tests {
         assert_eq!(refs["keep"], "yes");
         assert_eq!(refs["pr"], 419);
         assert_eq!(refs["codex_thread_id"], "thread-old");
-        assert_eq!(refs["codex_retry_requested"], true);
+        assert!(crate::runner_state::requested_retry(&refs, "codex").is_some());
+        assert!(refs.get("codex_retry_requested").is_none());
         assert_eq!(retried.rework_round, 2);
         assert_eq!(retried.author.as_deref(), Some("original-author"));
         let active_lease: i64 = conn
@@ -7887,6 +7883,59 @@ mod tests {
     }
 
     #[test]
+    fn neutral_provider_retry_is_atomic_and_cleared_on_submit() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        let refs = serde_json::json!({
+            "pr": 420,
+            "runner_provider_block": {
+                "provider": "codex", "reason": "quota"
+            },
+            "runner_retry": {
+                "provider": "codex", "model": "gpt-5", "effort": "high",
+                "prompt": "finish exact turn", "turn_kind": "rework",
+                "continuation_id": "thread-neutral"
+            }
+        });
+        update_refs_daemon(&mut conn, id, &refs.to_string(), 12).unwrap();
+
+        let retried = retry_provider_blocked(&mut conn, id, "operator", 13)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, "open");
+        let queued: serde_json::Value =
+            serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+        let retry = crate::runner_state::requested_retry(&queued, "codex").unwrap();
+        assert_eq!(retry.prompt, "finish exact turn");
+        assert_eq!(retry.continuation_id.as_deref(), Some("thread-neutral"));
+        assert!(queued
+            .get(crate::runner_state::PROVIDER_BLOCK_REF)
+            .is_none());
+
+        claim(&mut conn, "retry-worker", Some(id), &[], TTL, 14).unwrap();
+        let submitted = apply_event(
+            &mut conn,
+            "retry-worker",
+            id,
+            &Event::SignaledDone { pr: "420".into() },
+            15,
+        )
+        .unwrap()
+        .task;
+        let submitted_refs: serde_json::Value =
+            serde_json::from_str(submitted.refs.as_deref().unwrap()).unwrap();
+        assert!(submitted_refs.get(crate::runner_state::RETRY_REF).is_none());
+        assert_eq!(
+            submitted_refs[crate::runner_state::CONTINUATION_REF]["id"],
+            "thread-neutral"
+        );
+    }
+
+    #[test]
     fn provider_retry_rejects_review_phase() {
         let (_dir, mut conn) = open_tmp();
         let id = create(
@@ -7926,7 +7975,7 @@ mod tests {
 
     #[test]
     fn malformed_persisted_retry_refs_are_internal_error() {
-        let error = clear_codex_retry_refs(Some("{")).unwrap_err();
+        let error = clear_runner_retry_refs(Some("{")).unwrap_err();
         assert_eq!(error.exit_code(), 3);
         assert!(error.to_string().contains("invalid persisted refs JSON"));
     }

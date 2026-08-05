@@ -1130,7 +1130,7 @@ fn workerless_review_only_changes_start_fresh_codex_remediation_on_verified_pr()
     assert_eq!(task.assignee.as_deref(), Some(remediation.as_str()));
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(
-        refs["codex_thread_id"].as_str(),
+        refs["runner_continuation"]["id"].as_str(),
         Some(format!("thread-{remediation}").as_str()),
         "the fresh remediation thread must be durable before any later continuation"
     );
@@ -1720,7 +1720,8 @@ fn remediation_retry_for_implementation_task_preserves_feedback_and_codex_thread
     assert_eq!(task.status, "failed");
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(refs["remediation_feedback"], "preserve this exact blocker");
-    assert_eq!(refs["codex_thread_id"], original_thread);
+    assert_eq!(refs["runner_continuation"]["provider"], "codex");
+    assert_eq!(refs["runner_continuation"]["id"], original_thread);
     drop(conn);
 
     write_dual_protocol_runner(case.home.path());
@@ -1787,7 +1788,7 @@ fn restart_resumes_codex_reviewer_with_persisted_identity_model_and_thread() {
     let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
     assert_eq!(
-        refs["codex_reviewer_r1_thread_id"].as_str(),
+        refs["runner_reviewer_r1_continuation"]["id"].as_str(),
         Some(expected_thread.as_str())
     );
     let head_sha = String::from_utf8(

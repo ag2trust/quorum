@@ -141,6 +141,16 @@ pub enum AgentKind {
     Codex,
 }
 
+/// Process lifetime declared by a runner adapter. Lifecycle orchestration uses
+/// this capability instead of branching on a provider name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnMode {
+    /// One persistent child accepts later turns over its input stream.
+    PersistentChild,
+    /// Each turn is a new process and later turns resume opaque provider state.
+    RespawnPerTurn,
+}
+
 /// Provider-neutral inputs for starting one runner turn.
 ///
 /// Provider adapters translate this request into their private command specs.
@@ -257,8 +267,8 @@ impl RunnerProc {
         }
     }
 
-    pub fn is_codex(&self) -> bool {
-        matches!(self, Self::Codex(_))
+    pub fn turn_mode(&self) -> TurnMode {
+        self.kind().turn_mode()
     }
 
     pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
@@ -270,6 +280,13 @@ impl RunnerProc {
 }
 
 impl AgentKind {
+    pub fn turn_mode(self) -> TurnMode {
+        match self {
+            Self::Claude => TurnMode::PersistentChild,
+            Self::Codex => TurnMode::RespawnPerTurn,
+        }
+    }
+
     /// Resolve the provider from the model string chosen for a managed run.
     ///
     /// This is the authoritative model-to-runner mapping. Unknown models are
@@ -319,6 +336,18 @@ mod provider_tests {
         assert_eq!(AgentKind::for_model("o1").unwrap(), AgentKind::Codex);
         assert_eq!(AgentKind::for_model("o3").unwrap(), AgentKind::Codex);
         assert_eq!(AgentKind::for_model("o4-mini").unwrap(), AgentKind::Codex);
+    }
+
+    #[test]
+    fn adapters_declare_their_process_lifetime() {
+        assert_eq!(
+            AgentKind::Claude.turn_mode(),
+            super::TurnMode::PersistentChild
+        );
+        assert_eq!(
+            AgentKind::Codex.turn_mode(),
+            super::TurnMode::RespawnPerTurn
+        );
     }
 }
 
