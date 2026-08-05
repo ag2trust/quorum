@@ -1,6 +1,9 @@
 //! AgentProc: spawn, feed, read, and kill one claude child process.
 
-use super::runner::{capture_diagnostics, AgentKind, CapturedOutput, DiagnosticBuffer};
+use super::runner::{
+    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, AgentKind,
+    CapturedOutput, DiagnosticBuffer, LaunchMode, LaunchRequest, NormalizedLine, TokenUsage,
+};
 use super::stream::{self, Event};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -54,6 +57,48 @@ pub fn user_turn(content: &str) -> String {
 }
 
 impl AgentProc {
+    /// Translate a neutral runner request into Claude's persistent stream-json
+    /// process and feed its initial user turn.
+    pub async fn launch(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> std::io::Result<Self> {
+        let spec = AgentSpec {
+            kind: AgentKind::Claude,
+            model: request.model.to_string(),
+            effort: request.effort.to_string(),
+            session_id: request
+                .continuation_id
+                .map(str::to_owned)
+                .unwrap_or_else(new_session_id),
+            worktree: request.worktree.to_path_buf(),
+            bare: config.claude_bare,
+            allowed_tools: config.claude_allowed_tools.to_string(),
+            env_vars: request.environment.to_vec(),
+        };
+        let mut proc = match request.mode {
+            LaunchMode::Normal => Self::spawn(&spec, config.executable)?,
+            LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable)?,
+        };
+        if let Err(error) = proc.feed_turn(&user_turn(request.prompt)).await {
+            let _ = proc.kill_and_reap().await;
+            return Err(error);
+        }
+        Ok(proc)
+    }
+
+    pub fn normalize_line(raw: &str) -> NormalizedLine {
+        let event = stream::parse_line(raw);
+        let terminal_text = match &event {
+            Some(Event::Result { result, .. }) => Some(stream::result_text(result)),
+            _ => None,
+        };
+        NormalizedLine {
+            events: event.map(normalize_event).unwrap_or_default(),
+            terminal_text,
+        }
+    }
+
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
         Self::spawn_configured(spec, agent_bin, false)
     }
@@ -229,6 +274,86 @@ impl AgentProc {
     }
 }
 
+fn normalize_event(event: Event) -> Vec<AgentEvent> {
+    match event {
+        Event::Result {
+            result,
+            usage,
+            total_cost_usd,
+            is_error,
+            ..
+        } => {
+            let usage = usage.map(|usage| TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            });
+            if is_error.unwrap_or(false) {
+                let message = stream::result_text(&result);
+                vec![AgentEvent::TurnFailed {
+                    message: if message.is_empty() {
+                        "agent returned an error result".into()
+                    } else {
+                        message
+                    },
+                    usage,
+                    cost_usd: total_cost_usd,
+                }]
+            } else {
+                vec![AgentEvent::TurnCompleted {
+                    usage,
+                    cost_usd: total_cost_usd,
+                }]
+            }
+        }
+        Event::Assistant { message } => {
+            let mut events = Vec::new();
+            if let Some(text) = stream::assistant_text(&message) {
+                events.push(AgentEvent::AssistantText { text });
+            }
+            if let Some(blocks) = message
+                .get("content")
+                .and_then(|content| content.as_array())
+            {
+                for block in blocks {
+                    if block.get("type").and_then(|kind| kind.as_str()) == Some("tool_use") {
+                        if let Some(name) = block.get("name").and_then(|name| name.as_str()) {
+                            let input = block
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            events.push(AgentEvent::Activity {
+                                kind: ActivityKind::ToolUse,
+                                summary: tool_summary(name, &input),
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(usage) = message.get("usage") {
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0);
+                let output = usage
+                    .get("output_tokens")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0);
+                if input + output > 0 {
+                    events.push(AgentEvent::MidTurnUsage {
+                        tokens: input + output,
+                    });
+                }
+            }
+            events
+        }
+        Event::ToolUse { name, input } => vec![AgentEvent::Activity {
+            kind: ActivityKind::ToolUse,
+            summary: tool_summary(&name, &input),
+        }],
+        Event::Other => vec![],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +431,19 @@ mod tests {
         ]
     }
 
+    fn classifier_spec(worktree: &std::path::Path, bare: bool) -> AgentSpec {
+        AgentSpec {
+            kind: AgentKind::Claude,
+            model: crate::serve::classifier::CLASSIFIER_MODEL.to_string(),
+            effort: crate::serve::classifier::CLASSIFIER_EFFORT.to_string(),
+            session_id: new_session_id(),
+            worktree: worktree.to_path_buf(),
+            bare,
+            allowed_tools: String::new(),
+            env_vars: vec![],
+        }
+    }
+
     /// Positive contract: a production-built spec must clear the CLI's
     /// argument validation. Any stream event back (init, assistant,
     /// result — even an auth-failure result) proves the args parsed;
@@ -317,7 +455,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let mut spec = crate::serve::classifier::classifier_spec(tmp.path(), true);
+        let mut spec = classifier_spec(tmp.path(), true);
         spec.env_vars = no_auth_env(tmp.path());
 
         let mut proc = AgentProc::spawn(&spec, None).expect("spawn claude");
@@ -342,7 +480,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let mut spec = crate::serve::classifier::classifier_spec(tmp.path(), false);
+        let mut spec = classifier_spec(tmp.path(), false);
         spec.env_vars = no_auth_env(tmp.path());
 
         let mut proc = AgentProc::spawn_restricted(&spec, None).expect("spawn claude");
@@ -369,7 +507,7 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let mut spec = crate::serve::classifier::classifier_spec(tmp.path(), true);
+        let mut spec = classifier_spec(tmp.path(), true);
         spec.session_id = "classifier-1".into();
         spec.env_vars = no_auth_env(tmp.path());
 

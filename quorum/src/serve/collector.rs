@@ -16,10 +16,8 @@
 //! - Idempotent: re-running for the same PR replaces prior findings and the run
 //!   record via `pr_number`-keyed UPSERT.
 
-use super::agent::{self, AgentProc, AgentSpec};
 use super::classifier::{CLASSIFIER_EFFORT, CLASSIFIER_MODEL};
-use super::codex_agent::{CodexProc, CodexSpec};
-use super::runner::{AgentEvent, AgentKind, RunnerProc};
+use super::runner::{AdapterConfig, AgentEvent, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::review_findings::{
@@ -522,41 +520,25 @@ async fn spawn_and_run_classifier(
     inputs: &CollectorInputs,
 ) -> Result<String> {
     let prompt = review_findings::build_collector_prompt(inputs);
-    let kind = AgentKind::for_model(&request.collector_model)
-        .map_err(|e| QuorumError::Io(format!("collector provider: {e}")))?;
-    let mut proc = match kind {
-        AgentKind::Claude => {
-            let spec = AgentSpec {
-                kind,
-                model: request.collector_model.clone(),
-                effort: request.collector_effort.clone(),
-                session_id: agent::new_session_id(),
-                worktree: request.repo_dir.clone(),
-                bare: request.bare_agent,
-                allowed_tools: String::new(),
-                env_vars: request.env_vars.clone(),
-            };
-            let mut proc = AgentProc::spawn(&spec, request.agent_bin.as_deref())
-                .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
-            proc.feed_turn(&agent::user_turn(&prompt))
-                .await
-                .map_err(|e| QuorumError::Io(format!("feed_turn: {e}")))?;
-            RunnerProc::Claude(proc)
-        }
-        AgentKind::Codex => {
-            let spec = CodexSpec {
-                model: request.collector_model.clone(),
-                effort: request.collector_effort.clone(),
-                sandbox: request.codex_sandbox.clone(),
-                worktree: request.repo_dir.clone(),
-                prompt,
-                env_vars: request.env_vars.clone(),
-            };
-            CodexProc::spawn(&spec, request.agent_bin.as_deref())
-                .map(RunnerProc::Codex)
-                .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?
-        }
-    };
+    let mut proc = RunnerProc::launch(
+        &LaunchRequest {
+            model: &request.collector_model,
+            effort: &request.collector_effort,
+            worktree: &request.repo_dir,
+            prompt: &prompt,
+            environment: &request.env_vars,
+            mode: LaunchMode::Normal,
+            continuation_id: None,
+        },
+        &AdapterConfig {
+            executable: request.agent_bin.as_deref(),
+            claude_bare: request.bare_agent,
+            claude_allowed_tools: "",
+            codex_sandbox: &request.codex_sandbox,
+        },
+    )
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
 
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
@@ -570,35 +552,19 @@ async fn spawn_and_run_classifier(
         }
         match timeout(remaining, proc.next_raw_line()).await {
             Ok(Some(raw)) => {
-                if kind == AgentKind::Claude {
-                    if let Some(super::stream::Event::Result {
-                        result, is_error, ..
-                    }) = super::stream::parse_line(&raw)
-                    {
-                        let text = super::stream::result_text(&result);
-                        if is_error.unwrap_or(false) {
-                            break Err(QuorumError::Io(format!(
-                                "classifier returned an error: {text}"
-                            )));
-                        }
-                        if !text.is_empty() {
-                            response_text = text;
-                        }
-                        break Ok(response_text.clone());
-                    }
+                let line = proc.normalize_line(&raw);
+                if let Some(text) = line.terminal_text.as_ref().filter(|text| !text.is_empty()) {
+                    response_text = text.clone();
                 }
-                let events = match kind {
-                    AgentKind::Claude => super::runner::normalize_claude_line(&raw),
-                    AgentKind::Codex => super::runner::normalize_codex_line(&raw),
-                };
                 let mut terminal = None;
-                for event in events {
+                for event in line.events {
                     match event {
                         AgentEvent::AssistantText { text } => response_text.push_str(&text),
                         AgentEvent::TurnCompleted { .. } => {
                             terminal = Some(Ok(response_text.clone()))
                         }
                         AgentEvent::TurnFailed { message, .. } => {
+                            let message = line.terminal_text.as_deref().unwrap_or(&message);
                             terminal = Some(Err(QuorumError::Io(format!(
                                 "classifier returned an error: {message}"
                             ))))

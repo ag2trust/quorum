@@ -1501,18 +1501,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         "workspace-write",
                         &recommendations,
                     )
+                    .await
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
-                    let turn = serve::classifier::classifier_turn_with_recommendations(
-                        &tasks,
-                        &dup_context,
-                        &recommendations,
-                    );
-                    if !slot.proc.is_codex() {
-                        if let Err(error) = slot.proc.feed_turn(&turn).await {
-                            slot.kill_and_reap().await;
-                            return Err(QuorumError::Io(format!("feed classifier turn: {error}")));
-                        }
-                    }
 
                     let deadline =
                         tokio::time::Instant::now() + std::time::Duration::from_secs(120);
