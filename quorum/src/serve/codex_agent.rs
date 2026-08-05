@@ -6,7 +6,10 @@
 //! `thread.started` JSONL event.
 
 use super::codex_stream::{self, Event};
-use super::runner::{capture_diagnostics, CapturedOutput, DiagnosticBuffer};
+use super::runner::{
+    capture_diagnostics, tool_summary, ActivityKind, AdapterConfig, AgentEvent, CapturedOutput,
+    DiagnosticBuffer, LaunchMode, LaunchRequest, NormalizedLine, TokenUsage,
+};
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -102,6 +105,52 @@ pub struct CodexProc {
 }
 
 impl CodexProc {
+    /// Translate a neutral runner request into one Codex `exec` process.
+    pub fn launch(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> std::io::Result<Self> {
+        if request.mode == LaunchMode::Restricted && request.continuation_id.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "restricted Codex launch cannot resume a prior thread",
+            ));
+        }
+        if let Some(thread_id) = request.continuation_id {
+            return Self::spawn_resume(
+                thread_id,
+                request.model,
+                request.effort,
+                config.codex_sandbox,
+                request.worktree,
+                request.prompt,
+                request.environment,
+                config.executable,
+            );
+        }
+        let spec = CodexSpec {
+            model: request.model.to_string(),
+            effort: request.effort.to_string(),
+            sandbox: config.codex_sandbox.to_string(),
+            worktree: request.worktree.to_path_buf(),
+            prompt: request.prompt.to_string(),
+            env_vars: request.environment.to_vec(),
+        };
+        match request.mode {
+            LaunchMode::Normal => Self::spawn(&spec, config.executable),
+            LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable),
+        }
+    }
+
+    pub fn normalize_line(raw: &str) -> NormalizedLine {
+        NormalizedLine {
+            events: codex_stream::parse_line(raw)
+                .map(normalize_event)
+                .unwrap_or_default(),
+            terminal_text: None,
+        }
+    }
+
     /// Restricted single-turn mode for classifiers.  It deliberately omits the
     /// normal worker escape hatch that disables Codex sandbox/approval policy.
     pub fn spawn_restricted(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -277,6 +326,51 @@ impl CodexProc {
         let _ = self.stderr_task.await;
         terminal.extend(diagnostics.drain());
         terminal
+    }
+}
+
+fn normalize_event(event: Event) -> Vec<AgentEvent> {
+    match event {
+        Event::ThreadStarted { thread_id } => vec![AgentEvent::ThreadStarted { thread_id }],
+        Event::ItemStarted { item } | Event::ItemCompleted { item } => match item {
+            codex_stream::Item::AgentMessage { text, .. } if !text.is_empty() => {
+                vec![AgentEvent::AssistantText { text }]
+            }
+            codex_stream::Item::CommandExecution { command, .. } => vec![AgentEvent::Activity {
+                kind: ActivityKind::ToolUse,
+                summary: tool_summary("command", &serde_json::json!({"command": command})),
+            }],
+            codex_stream::Item::FileChange { changes, .. } => {
+                let path = changes
+                    .first()
+                    .map(|change| change.path.as_str())
+                    .unwrap_or("file");
+                vec![AgentEvent::Activity {
+                    kind: ActivityKind::ToolUse,
+                    summary: tool_summary("file_change", &serde_json::json!({"file_path": path})),
+                }]
+            }
+            _ => vec![],
+        },
+        Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
+            usage: usage.map(|usage| TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            cost_usd: None,
+        }],
+        Event::TurnFailed { error } => vec![AgentEvent::TurnFailed {
+            message: error
+                .map(|error| error.message)
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| "Codex turn failed".into()),
+            usage: None,
+            cost_usd: None,
+        }],
+        // Top-level errors can be retryable transport warnings. Only the
+        // authoritative terminal turn events advance lifecycle state.
+        Event::Error { .. } => vec![],
+        _ => vec![],
     }
 }
 

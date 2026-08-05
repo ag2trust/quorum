@@ -1222,8 +1222,8 @@ prior backfill are retained as audit data but do not affect the default report.
 
 ## Built-in coding runners: Claude and Codex
 
-**Date:** 2026-07-24
-**Status:** Approved design; implementation pending.
+**Date:** 2026-07-24 (provider-neutral launch request 2026-08-05)
+**Status:** Approved design; Claude and Codex implementation active.
 
 ### Decision and boundary
 
@@ -1257,17 +1257,23 @@ done, or redefine review policy.
 
 ### Internal run contract
 
-Use the smallest normalized model consumed by the daemon:
+Role orchestration starts a turn with the smallest provider-neutral request consumed by
+the runner boundary:
 
 ```rust
-struct AgentSpec {
-    kind: AgentKind,
-    executable: PathBuf,
-    model: String,
-    effort: String,
-    worktree: PathBuf,
-    environment: Vec<(String, String)>,
-    session_id: Option<String>,
+enum LaunchMode {
+    Normal,
+    Restricted,
+}
+
+struct LaunchRequest<'a> {
+    model: &'a str,
+    effort: &'a str,
+    worktree: &'a Path,
+    prompt: &'a str,
+    environment: &'a [(String, String)],
+    mode: LaunchMode,
+    continuation_id: Option<&'a str>,
 }
 
 enum AgentEvent {
@@ -1278,6 +1284,16 @@ enum AgentEvent {
     TurnFailed { message: String },
 }
 ```
+
+The boundary resolves `model` through the closed `AgentKind` enum and explicitly
+dispatches to one built-in adapter. It does not accept a caller-selected kind/model pair,
+fall back between adapters, or expose a provider trait. Installed executable and existing
+provider settings (`bare`/tool allowlist for Claude and sandbox for Codex) are adapter
+configuration, not part of turn identity. `agent.rs` and `codex_agent.rs` alone translate
+the neutral request into provider command specs, apply environment and execution mode,
+feed or embed the initial prompt, and parse raw protocol lines. Restricted mode remains
+an explicit adapter behavior: Claude uses its closed-book safe-mode invocation and Codex
+uses its pinned read-only invocation without the normal sandbox bypass.
 
 Do not mirror either CLI's complete schema. Preserve each raw JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized

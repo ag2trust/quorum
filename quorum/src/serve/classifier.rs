@@ -1,18 +1,10 @@
 //! Daemon classifier phase — spawns a headless agent to batch-classify tasks.
 
-use super::agent::{AgentProc, AgentSpec};
-use super::codex_agent::{CodexProc, CodexSpec};
-use super::runner::{AgentEvent, AgentKind, RunnerProc};
+use super::runner::{AdapterConfig, AgentEvent, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::classify::{self, ClassifierResponse, TaskClassification, TaskForClassification};
-use std::path::Path;
 
 pub const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const CLASSIFIER_EFFORT: &str = "low";
-
-pub fn classifier_kind(model: &str) -> std::io::Result<AgentKind> {
-    AgentKind::for_model(model)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-}
 
 /// In-flight classifier state, persisted across daemon ticks.
 #[allow(dead_code)]
@@ -36,34 +28,11 @@ impl ClassifierSlot {
     }
 }
 
-/// Build the spec for a classifier agent. `bare` must follow the daemon's
-/// `no_bare_agent` setting (same as worker/reviewer spawns): on machines
-/// using subscription auth a `--bare` agent has no credentials, so every
-/// classifier turn fails "Not logged in · Please run /login" and the daemon
-/// respawn-loops (observed live 2026-07-10, right after the session-id fix).
-#[allow(dead_code)] // retained for direct contract tests and compatibility callers
-pub fn classifier_spec(repo_dir: &Path, bare: bool) -> AgentSpec {
-    classifier_spec_for(repo_dir, bare, CLASSIFIER_MODEL, CLASSIFIER_EFFORT)
-}
-
-pub fn classifier_spec_for(repo_dir: &Path, bare: bool, model: &str, effort: &str) -> AgentSpec {
-    AgentSpec {
-        kind: AgentKind::Claude,
-        model: model.to_string(),
-        effort: effort.to_string(),
-        session_id: super::agent::new_session_id(),
-        worktree: repo_dir.to_path_buf(),
-        bare,
-        allowed_tools: String::new(),
-        env_vars: vec![],
-    }
-}
-
 /// Spawn using the provider resolved from `model`. Provider resolution is
 /// authoritative: an unknown model is rejected and a failed spawn is returned
 /// directly; neither condition falls back to the other runner.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_classifier_configured(
+pub async fn spawn_classifier_configured(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
     agent_bin: Option<&str>,
@@ -93,37 +62,31 @@ pub fn spawn_classifier_configured(
             ),
         ));
     }
-    let kind = classifier_kind(model)?;
     let pending_task_ids = tasks.iter().map(|t| t.id).collect();
     let pending_inputs = classify::classification_inputs(tasks);
     let dir = tempfile::tempdir()?;
-    let proc = match kind {
-        AgentKind::Claude => {
-            let spec = classifier_spec_for(dir.path(), bare, model, effort);
-            // Safe mode retains the operator's supported auth path while
-            // suppressing CLAUDE.md, plugins, hooks, MCP, skills, and other
-            // user/project context. The empty temporary cwd is the only
-            // directory exposed to the process.
-            AgentProc::spawn_restricted(&spec, agent_bin).map(RunnerProc::Claude)?
-        }
-        AgentKind::Codex => {
-            let spec = CodexSpec {
-                model: model.to_string(),
-                effort: effort.to_string(),
-                sandbox: codex_sandbox.to_string(),
-                worktree: dir.path().to_path_buf(),
-                prompt: classify::build_prompt_with_recommendations(
-                    tasks,
-                    dup_context,
-                    recommendations,
-                ),
-                env_vars: vec![],
-            };
-            // Classifiers receive all permitted context in their prompt and
-            // must not inherit the worker's sandbox-bypass launch mode.
-            CodexProc::spawn_restricted(&spec, agent_bin).map(RunnerProc::Codex)?
-        }
-    };
+    let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
+    // Safe mode retains Claude's configured auth path while suppressing user
+    // context; Codex retains its read-only sandbox without the normal bypass.
+    // The empty temporary cwd is the only directory exposed to either runner.
+    let proc = RunnerProc::launch(
+        &LaunchRequest {
+            model,
+            effort,
+            worktree: dir.path(),
+            prompt: &prompt,
+            environment: &[],
+            mode: LaunchMode::Restricted,
+            continuation_id: None,
+        },
+        &AdapterConfig {
+            executable: agent_bin,
+            claude_bare: bare,
+            claude_allowed_tools: "",
+            codex_sandbox,
+        },
+    )
+    .await?;
     Ok(ClassifierSlot {
         proc,
         pending_task_ids,
@@ -143,53 +106,24 @@ pub fn classifier_turn(
     super::agent::user_turn(&prompt)
 }
 
-/// Build a classifier turn using the active provider's routing policy.
-pub fn classifier_turn_with_recommendations(
-    tasks: &[TaskForClassification],
-    dup_context: &[TaskForClassification],
-    recommendations: &str,
-) -> String {
-    let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
-    super::agent::user_turn(&prompt)
-}
-
 /// Drain events from the classifier agent (non-blocking, bounded).
 /// Returns `Some(response_text)` when the agent produces a Result event.
 pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<ClassifierResult> {
     while let Ok(Some(raw)) =
         tokio::time::timeout(std::time::Duration::from_secs(2), slot.proc.next_raw_line()).await
     {
-        if slot.proc.kind() == AgentKind::Claude {
-            if let Some(super::stream::Event::Result {
-                result, is_error, ..
-            }) = super::stream::parse_line(&raw)
-            {
-                let text = super::stream::result_text(&result);
-                if is_error.unwrap_or(false) {
-                    let detail = if text.is_empty() {
-                        "classifier agent returned an error".into()
-                    } else {
-                        format!("classifier agent error: {}", truncate_error(&text, 300))
-                    };
-                    return Some(ClassifierResult::Error(detail));
-                }
-                if !text.is_empty() {
-                    slot.response_text = text;
-                }
-                return Some(ClassifierResult::Done(slot.response_text.clone()));
-            }
+        let line = slot.proc.normalize_line(&raw);
+        if let Some(text) = line.terminal_text.as_ref().filter(|text| !text.is_empty()) {
+            slot.response_text = text.clone();
         }
-        let events = match slot.proc.kind() {
-            AgentKind::Claude => super::runner::normalize_claude_line(&raw),
-            AgentKind::Codex => super::runner::normalize_codex_line(&raw),
-        };
-        for event in events {
+        for event in line.events {
             match event {
                 AgentEvent::TurnFailed { message, .. } => {
+                    let message = line.terminal_text.as_deref().unwrap_or(&message);
                     let detail = if message.is_empty() {
                         "classifier agent returned an error".into()
                     } else {
-                        format!("classifier agent error: {}", truncate_error(&message, 300))
+                        format!("classifier agent error: {}", truncate_error(message, 300))
                     };
                     return Some(ClassifierResult::Error(detail));
                 }
@@ -297,33 +231,6 @@ fn extract_json(text: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn classifier_spec_threads_bare_flag() {
-        assert!(!classifier_spec(Path::new("."), false).bare);
-        assert!(classifier_spec(Path::new("."), true).bare);
-    }
-
-    #[test]
-    fn configured_spec_preserves_model_and_effort() {
-        let spec = classifier_spec_for(Path::new("."), false, "claude-test", "medium");
-        assert_eq!(spec.kind, AgentKind::Claude);
-        assert_eq!(spec.model, "claude-test");
-        assert_eq!(spec.effort, "medium");
-    }
-
-    #[test]
-    fn configured_provider_is_resolved_from_model_without_fallback() {
-        assert_eq!(classifier_kind("gpt-5.6-terra").unwrap(), AgentKind::Codex);
-        assert_eq!(
-            classifier_kind("claude-haiku-4-5-20251001").unwrap(),
-            AgentKind::Claude
-        );
-        assert_eq!(
-            classifier_kind("unknown").unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn configured_codex_classifier_invokes_exact_model_and_effort() {
@@ -361,6 +268,7 @@ mod tests {
             "danger-full-access",
             "   1 → gpt-5.6-luna / medium",
         )
+        .await
         .unwrap();
         while slot.proc.next_raw_line().await.is_some() {}
         slot.proc.kill_and_reap().await;
@@ -416,6 +324,7 @@ mod tests {
             "read-only",
             "   1 → claude-sonnet / medium",
         )
+        .await
         .unwrap();
         while slot.proc.next_raw_line().await.is_some() {}
         slot.proc.kill_and_reap().await;
@@ -478,12 +387,9 @@ mod tests {
             "read-only",
             "",
         )
+        .await
         .unwrap();
         let pid = slot.proc.pid().expect("classifier pid");
-        slot.proc
-            .feed_turn(&classifier_turn(&tasks, &[]))
-            .await
-            .unwrap();
         let result = drain_classifier_events(&mut slot)
             .await
             .expect("terminal result");

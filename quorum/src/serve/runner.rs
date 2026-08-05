@@ -11,6 +11,7 @@
 use super::agent::AgentProc;
 use super::codex_agent::CodexProc;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 
@@ -132,14 +133,56 @@ where
         diagnostics.note_dropped_bytes(line_dropped);
     }
 }
-use super::{codex_stream, stream};
-
 /// Closed runner enum — supporting another runner requires an explicit code
 /// change, not configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Claude,
     Codex,
+}
+
+/// Provider-neutral inputs for starting one runner turn.
+///
+/// Provider adapters translate this request into their private command specs.
+/// The model is resolved through [`AgentKind::for_model`]; callers cannot pair
+/// an arbitrary runner with a model or fall back after an adapter fails.
+pub struct LaunchRequest<'a> {
+    pub model: &'a str,
+    pub effort: &'a str,
+    pub worktree: &'a Path,
+    /// Raw prompt text. The Claude adapter wraps it as a stream-json user turn;
+    /// turn-oriented adapters pass it through their command boundary.
+    pub prompt: &'a str,
+    pub environment: &'a [(String, String)],
+    pub mode: LaunchMode,
+    /// Opaque provider identity. Claude uses it as its pre-spawn session UUID;
+    /// Codex uses it to resume the exact provider-issued thread.
+    pub continuation_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    Normal,
+    Restricted,
+}
+
+/// Installed-runner settings interpreted only by the corresponding adapter.
+/// These are deliberately separate from the neutral turn identity above.
+pub struct AdapterConfig<'a> {
+    pub executable: Option<&'a str>,
+    pub claude_bare: bool,
+    pub claude_allowed_tools: &'a str,
+    pub codex_sandbox: &'a str,
+}
+
+/// One raw provider line plus its normalized lifecycle events.
+///
+/// Claude's terminal `result` can carry the classifier's response without an
+/// assistant event, so adapters expose that text without leaking raw protocol
+/// parsing back into role orchestration.
+pub struct NormalizedLine {
+    pub events: Vec<AgentEvent>,
+    pub terminal_text: Option<String>,
 }
 
 /// Provider-specific process transport behind the normalized runner boundary.
@@ -149,6 +192,19 @@ pub enum RunnerProc {
 }
 
 impl RunnerProc {
+    /// Resolve and launch the explicit built-in adapter for this model.
+    pub async fn launch(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> std::io::Result<Self> {
+        let kind = AgentKind::for_model(request.model)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        match kind {
+            AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
+            AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
+        }
+    }
+
     pub fn kind(&self) -> AgentKind {
         match self {
             Self::Claude(_) => AgentKind::Claude,
@@ -181,6 +237,13 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.next_raw_line().await,
             Self::Codex(proc) => proc.next_raw_line().await,
+        }
+    }
+
+    pub fn normalize_line(&self, raw: &str) -> NormalizedLine {
+        match self {
+            Self::Claude(_) => AgentProc::normalize_line(raw),
+            Self::Codex(_) => CodexProc::normalize_line(raw),
         }
     }
 
@@ -304,164 +367,16 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
-/// Normalize a raw Claude stream-json line into zero or more `AgentEvent`s.
-///
-/// A single Claude line can produce multiple normalized events (e.g. an
-/// Assistant message with inline tool_use blocks yields both AssistantText
-/// and Activity events). Unknown/unparseable lines produce an empty vec —
-/// they are inert and must not advance lifecycle state.
+/// Compatibility entry point for sites that do not hold a process instance.
+/// Provider-specific raw parsing remains owned by the Claude adapter.
 pub fn normalize_claude_line(raw: &str) -> Vec<AgentEvent> {
-    let event = match stream::parse_line(raw) {
-        Some(e) => e,
-        None => return vec![],
-    };
-
-    match event {
-        stream::Event::Result {
-            result,
-            usage,
-            total_cost_usd,
-            is_error,
-            ..
-        } => {
-            let tok = usage.map(|u| TokenUsage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-            });
-            if is_error.unwrap_or(false) {
-                let message = stream::result_text(&result);
-                vec![AgentEvent::TurnFailed {
-                    message: if message.is_empty() {
-                        "agent returned an error result".into()
-                    } else {
-                        message
-                    },
-                    usage: tok,
-                    cost_usd: total_cost_usd,
-                }]
-            } else {
-                vec![AgentEvent::TurnCompleted {
-                    usage: tok,
-                    cost_usd: total_cost_usd,
-                }]
-            }
-        }
-
-        stream::Event::Assistant { message } => {
-            let mut events = Vec::new();
-
-            if let Some(text) = stream::assistant_text(&message) {
-                events.push(AgentEvent::AssistantText { text });
-            }
-
-            // Inline tool_use blocks in content array
-            if let Some(blocks) = message.get("content").and_then(|c| c.as_array()) {
-                for block in blocks {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
-                            let input = block
-                                .get("input")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null);
-                            let summary = tool_summary(name, &input);
-                            events.push(AgentEvent::Activity {
-                                kind: ActivityKind::ToolUse,
-                                summary,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Mid-turn usage on assistant messages
-            if let Some(usage) = message.get("usage") {
-                let input = usage
-                    .get("input_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                let output = usage
-                    .get("output_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                if input + output > 0 {
-                    events.push(AgentEvent::MidTurnUsage {
-                        tokens: input + output,
-                    });
-                }
-            }
-
-            events
-        }
-
-        stream::Event::ToolUse { name, input } => {
-            let summary = tool_summary(&name, &input);
-            vec![AgentEvent::Activity {
-                kind: ActivityKind::ToolUse,
-                summary,
-            }]
-        }
-
-        stream::Event::Other => vec![],
-    }
+    AgentProc::normalize_line(raw).events
 }
 
+/// Compatibility entry point for sites that do not hold a process instance.
+/// Provider-specific raw parsing remains owned by the Codex adapter.
 pub fn normalize_codex_line(raw: &str) -> Vec<AgentEvent> {
-    let event = match codex_stream::parse_line(raw) {
-        Some(event) => event,
-        None => return vec![],
-    };
-    match event {
-        codex_stream::Event::ThreadStarted { thread_id } => {
-            vec![AgentEvent::ThreadStarted { thread_id }]
-        }
-        codex_stream::Event::ItemStarted { item } | codex_stream::Event::ItemCompleted { item } => {
-            match item {
-                codex_stream::Item::AgentMessage { text, .. } if !text.is_empty() => {
-                    vec![AgentEvent::AssistantText { text }]
-                }
-                codex_stream::Item::CommandExecution { command, .. } => {
-                    vec![AgentEvent::Activity {
-                        kind: ActivityKind::ToolUse,
-                        summary: tool_summary("command", &serde_json::json!({"command": command})),
-                    }]
-                }
-                codex_stream::Item::FileChange { changes, .. } => {
-                    let path = changes
-                        .first()
-                        .map(|change| change.path.as_str())
-                        .unwrap_or("file");
-                    vec![AgentEvent::Activity {
-                        kind: ActivityKind::ToolUse,
-                        summary: tool_summary(
-                            "file_change",
-                            &serde_json::json!({"file_path": path}),
-                        ),
-                    }]
-                }
-                _ => vec![],
-            }
-        }
-        codex_stream::Event::TurnCompleted { usage } => vec![AgentEvent::TurnCompleted {
-            usage: usage.map(|usage| TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-            }),
-            cost_usd: None,
-        }],
-        codex_stream::Event::TurnFailed { error } => vec![AgentEvent::TurnFailed {
-            message: error
-                .map(|error| error.message)
-                .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| "Codex turn failed".into()),
-            usage: None,
-            cost_usd: None,
-        }],
-        // Codex emits top-level Error events for retryable transport/reconnect
-        // warnings before a later terminal turn event. Lifecycle state changes
-        // only on turn.completed/turn.failed or authoritative process exit.
-        codex_stream::Event::Error { .. } => vec![],
-        _ => vec![],
-    }
+    CodexProc::normalize_line(raw).events
 }
 
 pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
@@ -472,7 +387,7 @@ pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
 }
 
 /// Compact tool label for live stats (matches existing `now_label` behavior).
-fn tool_summary(name: &str, input: &serde_json::Value) -> String {
+pub(super) fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     let snippet = match name {
         "Bash" => input
             .get("command")
@@ -517,6 +432,265 @@ fn truncate_label(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn recording_runner(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let runner = dir.join("recording-runner");
+        let args = dir.join("args.log");
+        let turn = dir.join("turn.log");
+        let environment = dir.join("environment.log");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\n\
+                 for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > '{}'\n\
+                 printf '%s\\n' \"$QUORUM_ADAPTER_TEST\" > '{}'\n\
+                 if [ \"$1\" = '-p' ]; then\n\
+                   IFS= read -r line\n\
+                   printf '%s\\n' \"$line\" > '{}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\",\"is_error\":false}}'\n\
+                 else\n\
+                   printf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"runner-thread\"}}'\n\
+                   printf '%s\\n' '{{\"type\":\"turn.completed\"}}'\n\
+                 fi\n",
+                args.display(),
+                environment.display(),
+                turn.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runner
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_launch_dispatches_to_each_explicit_adapter() {
+        let claude_dir = tempfile::tempdir().unwrap();
+        let claude_bin = recording_runner(claude_dir.path());
+        let claude_environment = vec![("QUORUM_ADAPTER_TEST".into(), "claude-env".into())];
+        let mut claude = RunnerProc::launch(
+            &LaunchRequest {
+                model: "claude-sonnet-5",
+                effort: "high",
+                worktree: claude_dir.path(),
+                prompt: "claude prompt",
+                environment: &claude_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: claude_bin.to_str(),
+                claude_bare: true,
+                claude_allowed_tools: "Bash,Read",
+                codex_sandbox: "danger-full-access",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(claude.kind(), AgentKind::Claude);
+        let _ = claude.next_raw_line().await;
+        claude.kill_and_reap().await;
+        let args = std::fs::read_to_string(claude_dir.path().join("args.log")).unwrap();
+        assert!(args.contains("<--add-dir>"), "{args}");
+        assert!(args.contains("<--bare>"), "{args}");
+        assert!(args.contains("<Bash,Read>"), "{args}");
+        assert!(!args.contains("<--safe-mode>"), "{args}");
+        let argv: Vec<&str> = args.lines().collect();
+        let session_flag = argv
+            .iter()
+            .position(|arg| *arg == "<--session-id>")
+            .unwrap();
+        let session_id = argv[session_flag + 1]
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(session_id).is_ok(), "{args}");
+        let turn = std::fs::read_to_string(claude_dir.path().join("turn.log")).unwrap();
+        let turn: serde_json::Value = serde_json::from_str(turn.trim()).unwrap();
+        assert_eq!(turn["message"]["content"], "claude prompt");
+        assert_eq!(
+            std::fs::read_to_string(claude_dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "claude-env"
+        );
+
+        let codex_dir = tempfile::tempdir().unwrap();
+        let codex_bin = recording_runner(codex_dir.path());
+        let codex_environment = vec![("QUORUM_ADAPTER_TEST".into(), "codex-env".into())];
+        let mut codex = RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                worktree: codex_dir.path(),
+                prompt: "codex prompt",
+                environment: &codex_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: codex_bin.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "workspace-write",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(codex.kind(), AgentKind::Codex);
+        while codex.next_raw_line().await.is_some() {}
+        codex.kill_and_reap().await;
+        let args = std::fs::read_to_string(codex_dir.path().join("args.log")).unwrap();
+        assert!(
+            args.contains("<--dangerously-bypass-approvals-and-sandbox>"),
+            "{args}"
+        );
+        assert!(args.contains("<workspace-write>"), "{args}");
+        assert!(args.contains("<codex prompt>"), "{args}");
+        assert_eq!(
+            std::fs::read_to_string(codex_dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "codex-env"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_launch_dispatches_to_each_safe_adapter() {
+        for (model, expected_kind) in [
+            ("claude-haiku-4-5-20251001", AgentKind::Claude),
+            ("gpt-5.6-terra", AgentKind::Codex),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let executable = recording_runner(dir.path());
+            let mut proc = RunnerProc::launch(
+                &LaunchRequest {
+                    model,
+                    effort: "low",
+                    worktree: dir.path(),
+                    prompt: "restricted prompt",
+                    environment: &[],
+                    mode: LaunchMode::Restricted,
+                    continuation_id: None,
+                },
+                &AdapterConfig {
+                    executable: executable.to_str(),
+                    claude_bare: false,
+                    claude_allowed_tools: "",
+                    codex_sandbox: "danger-full-access",
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(proc.kind(), expected_kind);
+            while proc.next_raw_line().await.is_some() {}
+            proc.kill_and_reap().await;
+            let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+            match expected_kind {
+                AgentKind::Claude => {
+                    assert!(args.contains("<--safe-mode>"), "{args}");
+                    assert!(args.contains("<--no-session-persistence>"), "{args}");
+                    assert!(!args.contains("<--add-dir>"), "{args}");
+                }
+                AgentKind::Codex => {
+                    assert!(args.contains("<read-only>"), "{args}");
+                    assert!(
+                        !args.contains("<--dangerously-bypass-approvals-and-sandbox>"),
+                        "{args}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_unknown_model_before_adapter_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match RunnerProc::launch(
+            &LaunchRequest {
+                model: "unknown-runner-model",
+                effort: "low",
+                worktree: dir.path(),
+                prompt: "prompt",
+                environment: &[],
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: Some("/definitely/not/a/runner"),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "read-only",
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("unknown model unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("unknown model"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_identity_dispatches_to_codex_resume_only_in_normal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = recording_runner(dir.path());
+        let mut proc = RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "continue exactly",
+                environment: &[],
+                mode: LaunchMode::Normal,
+                continuation_id: Some("provider-thread-7"),
+            },
+            &AdapterConfig {
+                executable: executable.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+            },
+        )
+        .await
+        .unwrap();
+        while proc.next_raw_line().await.is_some() {}
+        proc.kill_and_reap().await;
+        let args = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+        let argv: Vec<&str> = args.lines().collect();
+        assert_eq!(&argv[..3], &["<exec>", "<resume>", "<provider-thread-7>"]);
+        assert!(args.contains("<continue exactly>"), "{args}");
+
+        let error = match RunnerProc::launch(
+            &LaunchRequest {
+                model: "gpt-5.6-terra",
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "invalid restricted resume",
+                environment: &[],
+                mode: LaunchMode::Restricted,
+                continuation_id: Some("provider-thread-7"),
+            },
+            &AdapterConfig {
+                executable: executable.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("restricted continuation unexpectedly launched"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn normalize_result_success() {

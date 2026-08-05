@@ -7902,33 +7902,12 @@ async fn tick(
                     &quorum_core::complexity::recommendation_lines(recommendation_provider(
                         config.runner_kind,
                     )),
-                ) {
-                    Ok(mut slot) => {
-                        if slot.proc.is_codex() {
-                            log(&format!("classifier: spawned for {} task(s)", tasks.len()));
-                            *classifier_slot = Some(slot);
-                        } else {
-                            let turn = classifier::classifier_turn_with_recommendations(
-                                &tasks,
-                                &dup_context,
-                                &quorum_core::complexity::recommendation_lines(
-                                    recommendation_provider(config.runner_kind),
-                                ),
-                            );
-                            if let Err(e) = slot.proc.feed_turn(&turn).await {
-                                record_classifier_failure(
-                                    &db_path,
-                                    &format!("classifier feed_turn failed: {e}"),
-                                    classifier_consec_errors,
-                                    classifier_backoff_until,
-                                )
-                                .await;
-                                slot.proc.kill_and_reap().await;
-                            } else {
-                                log(&format!("classifier: spawned for {} task(s)", tasks.len()));
-                                *classifier_slot = Some(slot);
-                            }
-                        }
+                )
+                .await
+                {
+                    Ok(slot) => {
+                        log(&format!("classifier: spawned for {} task(s)", tasks.len()));
+                        *classifier_slot = Some(slot);
                     }
                     Err(e) => {
                         record_classifier_failure(
