@@ -161,11 +161,10 @@ pub fn requested_retry_any(refs: &Value) -> Option<PendingTurn> {
 }
 
 pub fn retry_requested(refs: &Value) -> bool {
-    refs.get(RETRY_REF)
-        .and_then(|retry| retry.get("requested"))
-        .and_then(Value::as_bool)
-        == Some(true)
-        || refs.get("codex_retry_requested").and_then(Value::as_bool) == Some(true)
+    if let Some(retry) = refs.get(RETRY_REF) {
+        return retry.get("requested").and_then(Value::as_bool) == Some(true);
+    }
+    refs.get("codex_retry_requested").and_then(Value::as_bool) == Some(true)
 }
 
 pub fn pending_turn_is_complete(turn: &PendingTurn) -> bool {
@@ -372,6 +371,17 @@ mod tests {
             }
         });
         assert!(requested_retry(&initial_without_continuation, "codex").is_some());
+
+        let stale_legacy_request = serde_json::json!({
+            RETRY_REF: {
+                "provider": "codex", "model": "gpt-5", "effort": "high",
+                "prompt": "finish", "turn_kind": "rework",
+                "continuation_id": "thread-new", "requested": false
+            },
+            "codex_retry_requested": true
+        });
+        assert!(!retry_requested(&stale_legacy_request));
+        assert!(requested_retry_any(&stale_legacy_request).is_none());
 
         let continuation_refs = serde_json::json!({
             CONTINUATION_REF: {"provider": "claude", "id": "session-new"},

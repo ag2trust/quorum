@@ -833,8 +833,10 @@ pub fn claim_provider_retry_rework(
                AND NOT (json_extract(refs, '$.cx_est')=5
                         AND json_extract(refs, '$.cx_size')='L')
                AND (
-                   json_type(refs, '$.runner_retry.requested')='true'
-                   OR json_type(refs, '$.codex_retry_requested')='true'
+                   CASE WHEN json_type(refs, '$.runner_retry') IS NOT NULL
+                       THEN COALESCE(json_type(refs, '$.runner_retry.requested')='true', 0)
+                       ELSE COALESCE(json_type(refs, '$.codex_retry_requested')='true', 0)
+                   END
                    OR json_type(refs, '$.daemon_rework_retry_requested')='true'
                )
                ELSE 0
@@ -7676,6 +7678,52 @@ mod tests {
         .unwrap();
         conn.execute(
             "UPDATE tasks SET status='rework', refs='{' WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        assert!(
+            claim_provider_retry_rework(&mut conn, "replacement", task_id, TTL, 11)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(get(&conn, task_id).unwrap().unwrap().assignee, None);
+    }
+
+    #[test]
+    fn neutral_retry_marker_precedes_stale_codex_request_during_claim() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "task",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-new","requested":false},"codex_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        crate::classify::store_classifications(
+            &mut conn,
+            &[crate::classify::TaskClassification {
+                task_id,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            }],
+            "unit-test:v2",
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework' WHERE id=?1",
             params![task_id],
         )
         .unwrap();

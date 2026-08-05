@@ -67,8 +67,14 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                  AND json_valid(t.refs)
                  AND (
                      COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
-                     OR COALESCE(json_type(t.refs, '$.runner_retry.requested')='true', 0)
-                     OR COALESCE(json_type(t.refs, '$.codex_retry_requested')='true', 0)
+                     OR CASE WHEN json_type(t.refs, '$.runner_retry') IS NOT NULL
+                         THEN COALESCE(
+                             json_type(t.refs, '$.runner_retry.requested')='true', 0
+                         )
+                         ELSE COALESCE(
+                             json_type(t.refs, '$.codex_retry_requested')='true', 0
+                         )
+                     END
                  )
              )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
@@ -1567,6 +1573,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pushed.task.status, "in-review");
+    }
+
+    #[test]
+    fn reaper_ignores_stale_codex_request_when_neutral_retry_is_not_requested() {
+        let (_d, mut c) = open_tmp();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "owner",
+            "blocked retry",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-new","requested":false},"codex_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework', updated_at=1000 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        let reaped = crate::tasks::get(&c, task_id).unwrap().unwrap();
+        assert_eq!(reaped.status, "open");
+        assert!(!crate::runner_state::retry_requested(
+            &serde_json::from_str(reaped.refs.as_deref().unwrap()).unwrap()
+        ));
     }
 
     #[test]
