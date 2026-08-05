@@ -51,7 +51,7 @@ const DEFAULT_SERVE_TOML: &str = "\
 # policy, not a cross-vendor benchmark. Explicit task tier:/effort: labels win.
 # [suggested_models]
 # \"1\" = \"luna/medium\"  # closed tiers: sonnet-5|opus-46|opus-47|opus-48|luna|terra|sol
-# agent = \"claude\"        # runner: \"claude\" or \"codex\"
+# agent = \"claude\"        # managed runner: \"claude\" or \"codex\"; Grok is transport-only
 # cap = 4
 # model = \"sonnet\"
 # effort = \"high\"
@@ -62,6 +62,12 @@ const DEFAULT_SERVE_TOML: &str = "\
 # base_branch = \"main\"
 # min_model = \"opus-47\"   # floor: bump workers below this tier up to it
 # min_effort = \"high\"     # floor: medium|high
+
+## Grok Build transport validation only; managed Grok roles are not enabled.
+# [grok]
+# sandbox = \"workspace\"                 # off|workspace
+# permission_mode = \"bypassPermissions\"
+# max_turns = 64                         # 1..=256
 
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000

@@ -1220,17 +1220,20 @@ restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
 Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
 
-## Built-in coding runners: Claude and Codex
+## Built-in coding runners: Claude, Codex, and Grok Build
 
 **Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
-**Status:** Approved design; Claude and Codex implementation active.
+**Status:** Approved design; Claude and Codex managed lifecycle active; Grok Build
+transport implemented but not enabled for managed roles.
 
 ### Decision and boundary
 
-Quorum supports exactly two built-in coding runners in this design:
+Quorum supports exactly three explicit built-in coding runners in this design:
 
 - `claude` preserves the existing persistent Claude Code stream-json behavior.
 - `codex` uses the stable non-interactive Codex CLI JSONL interface.
+- `grok` uses the official Grok Build CLI's native headless `streaming-json`
+  interface. It is transport-only until separate lifecycle canaries enable roles.
 
 This is a closed Rust enum, not a public provider trait or plugin API:
 
@@ -1238,6 +1241,7 @@ This is a closed Rust enum, not a public provider trait or plugin API:
 enum AgentKind {
     Claude,
     Codex,
+    Grok,
 }
 ```
 
@@ -1288,14 +1292,16 @@ enum AgentEvent {
 The boundary resolves `model` through the closed `AgentKind` enum and explicitly
 dispatches to one built-in adapter. It does not accept a caller-selected kind/model pair,
 fall back between adapters, or expose a provider trait. Installed executable and existing
-provider settings (`bare`/tool allowlist for Claude and sandbox for Codex) are adapter
-configuration, not part of turn identity. `agent.rs` and `codex_agent.rs` alone translate
-the neutral request into provider command specs, apply environment and execution mode,
-feed or embed the initial prompt, and parse raw protocol lines. Restricted mode remains
-an explicit adapter behavior: Claude uses its closed-book safe-mode invocation and Codex
-uses its pinned read-only invocation without the normal sandbox bypass.
+provider settings (`bare`/tool allowlist for Claude, sandbox for Codex, and the closed
+Grok permission/sandbox profile) are adapter configuration, not part of turn identity.
+`agent.rs`, `codex_agent.rs`, and `grok_agent.rs` alone translate the neutral request
+into provider command specs, apply environment and execution mode, feed or embed the
+initial prompt, and parse raw protocol lines. Restricted mode remains an explicit adapter
+behavior: Claude uses its closed-book safe-mode invocation, Codex uses its pinned read-only
+invocation without the normal sandbox bypass, and Grok uses native `read-only` plus
+`dontAsk` with a reduced turn ceiling.
 
-Do not mirror either CLI's complete schema. Preserve each raw JSON line in
+Do not mirror any CLI's complete schema. Preserve each raw JSON line in
 `stream.jsonl`, parse only fields Quorum consumes, render a compact normalized
 transcript, and ignore unknown events without advancing lifecycle state.
 
@@ -1305,6 +1311,8 @@ column name for schema compatibility:
 - Claude receives a Quorum-generated UUID before spawn.
 - Codex issues a thread ID in `thread.started`; Quorum persists it before relying on
   continuation.
+- Grok issues a session ID in terminal `end`; Quorum emits and persists that identity
+  immediately before terminal success and passes it back only through exact `--resume`.
 
 Missing required continuation identity is an abnormal startup failure. Assistant
 prose is never task completion.
@@ -1422,23 +1430,126 @@ must not emit a second `AgentFailed`, duplicate `task_in_review`/`task_rework`, 
 the new owner's lease, or classify exit status 0 as a crash merely because the
 turn-oriented provider process ended.
 
+### Official Grok Build transport
+
+The Grok adapter uses only the official CLI's one-shot, read-only stdout protocol. It
+does not use the ACP server, internal session files, executable-name inference, or an
+emulation of Claude `allowedTools`/`bare`/hooks or Codex flags.
+
+First turn, conceptually:
+
+```text
+grok -p <prompt> --output-format streaming-json --model grok-4.5
+  --reasoning-effort <low|medium|high>
+  --permission-mode bypassPermissions --sandbox <off|workspace>
+  --max-turns <1..256> --verbatim
+```
+
+Continuation, conceptually:
+
+```text
+grok --resume <session-id> -p <prompt> --output-format streaming-json
+  --model grok-4.5 --reasoning-effort <low|medium|high>
+  --permission-mode bypassPermissions --sandbox <off|workspace>
+  --max-turns <1..256> --verbatim
+```
+
+Exact argument order is pinned in fixtures and exercised against the installed binary.
+Restricted launches are fresh turns using `read-only`, `dontAsk`, and at most eight
+turns; restricted continuation is rejected. Normal configuration accepts only the
+verified model, effort vocabulary, permission mode, sandbox profiles, and bounded turn
+range. Unknown values and unverified safety combinations fail before spawn.
+
+Consumed events:
+
+| Grok `streaming-json` event | Normalized meaning |
+|---|---|
+| non-empty `text.data` | `AssistantText` |
+| `tool_call` | compact `Activity` using `toolName`/`rawInput` |
+| `end` with non-empty `sessionId` | continuation identity, then terminal success with complete usage/cost when available |
+| `end` without a session ID | terminal failure |
+| `error` | terminal failure with complete usage/cost when available |
+| all other, unknown, or malformed lines | preserved raw and lifecycle-inert |
+
+Every complete stdout line at or below the one-MiB line bound is returned byte-for-byte
+apart from the line terminator and written through the existing raw JSONL path. An
+oversized line becomes an explicit truncation record. Stdout retained during teardown,
+stderr lines, and bytes within an individual stderr line are separately bounded. The
+process runs in its own process group; teardown kills the group and reaps the child.
+
+An `end` event is the protocol's success marker, but managed success will additionally
+require exit status zero when Grok lifecycle roles are enabled. `error`, non-zero exit,
+EOF without `end`, missing session identity, timeout, and forced termination are failure
+paths; the adapter never fabricates a terminal event from EOF or exit alone. Grok emits
+the session identity late, so no continuation may be relied on before `end`.
+
+#### Grok discovery record
+
+**Verified facts (2026-08-05):**
+
+- The installed official executable resolved to `~/.grok/bin/grok` and reported
+  `grok 0.2.114 (0c785038798)`. Its help exposes `-p`/`--single`,
+  `--output-format streaming-json`, `--resume`, `--model`,
+  `--reasoning-effort`, `--permission-mode`, `--sandbox`, and `--max-turns`.
+- The installed catalog exposed only `grok-4.5`; its supported effort choices were
+  `low`, `medium`, and `high` (`high` default). The adapter therefore treats both
+  vocabularies as closed rather than forwarding future strings optimistically.
+- Native `streaming-json` is newline-delimited, type-tagged JSON. Official source and
+  documentation define `thought`, `text`, `tool_call`, `tool_call_update`, `usage`,
+  lifecycle/activity events, terminal `end`, and `error`. The successful `end` line is
+  last and carries `sessionId` and `requestId`.
+- Official usage fields distinguish uncached input, cache-read input, cache-creation
+  input, and output tokens. The adapter reports total input as the sum of all three input
+  buckets. `usage_is_incomplete` means the aggregate is not authoritative.
+- `total_cost_usd` is emitted only when server cost is complete. Its absence means
+  unknown, never zero. `cost_is_partial` or `usage_is_incomplete` suppresses normalized
+  USD cost; Quorum does not derive prices or sum incomplete per-model rows.
+- The CLI stores interactive/device authentication itself and supports `XAI_API_KEY`.
+  Official precedence is model-specific configured key/environment key, then cached
+  interactive/OAuth credentials, then the `XAI_API_KEY` fallback. Quorum inherits the
+  CLI environment and credential state and neither stores nor prints credential values.
+- Native permission modes include `default`, `acceptEdits`, `auto`, `dontAsk`,
+  `bypassPermissions`, and `plan`. Native sandbox profiles include `off`, `workspace`,
+  `devbox`, `read-only`, and `strict`; resumed sessions reject a changed sandbox. Quorum
+  enables only the combinations above because the others have not passed lifecycle
+  canaries.
+- Isolated-home real-binary probes produced a structured `error` for missing/invalid
+  authentication, rejected an invalid permission value during argument parsing, and
+  entered the headless protocol with the pinned initial and resume placement without a
+  successful model call. Some authentication failures did not promptly terminate after
+  emitting the error, so bounded group kill/reap is part of the transport contract.
+
+**Hypotheses and deliberately unverified behavior:**
+
+- Grok has not passed Quorum's worker, remediation, R1, R2, restart, shutdown, mailbox,
+  or cost-limit canaries. No managed lifecycle role routes to this adapter yet.
+- Catalog additions, new reasoning efforts, `devbox`/`strict`/custom sandboxes, and
+  permission modes other than the pinned profiles may become usable later, but are not
+  accepted based on help text alone.
+- Device login, cached interactive login, API-key success, and billable successful
+  continuation were not executed in the zero-token transport probes. The adapter relies
+  on the official CLI for those flows and makes no broader authentication or USD
+  accounting claim.
+
 ### Capabilities and safety limits
 
 Capabilities are fixed internal facts, not a negotiation framework:
 
-| Capability | Claude | Codex |
-|---|---:|---:|
-| resumable continuation | yes | yes |
-| JSON event stream | yes | yes |
-| token usage | yes | yes |
-| stream-provided USD cost | yes | no |
-| CLI tool allowlist | yes | no |
-| provider-native review skill | optional | not required |
+| Capability | Claude | Codex | Grok Build |
+|---|---:|---:|---:|
+| resumable continuation | yes | yes | transport only |
+| JSON event stream | yes | yes | yes |
+| token usage | yes | yes | when complete |
+| authoritative stream-provided USD cost | yes | no | when complete |
+| Quorum-managed CLI tool allowlist | yes | no | no |
+| provider-native review skill | optional | not required | not enabled |
 
 Never fabricate missing telemetry. Token, wall-clock, task-wall, and idle limits
 continue when their data is observable. Codex does not expose reliable ChatGPT
-subscription USD cost per turn. If a Codex daemon is configured with a USD safety
-limit, startup fails loudly rather than ignoring it or failing every completed turn.
+subscription USD cost per turn. Grok exposes USD only for a server-complete ledger;
+its managed accounting semantics remain disabled with its lifecycle roles. If a Codex
+daemon is configured with a USD safety limit, startup fails loudly rather than ignoring
+it or failing every completed turn.
 
 Use the minimum Codex sandbox proven by the full lifecycle canary. Begin validation
 with `danger-full-access` because runs use git, GitHub CLI, Quorum, repository hooks,
@@ -1524,9 +1635,22 @@ sandbox = "danger-full-access"
 ignore_user_config = false
 ```
 
+Grok transport validation vocabulary (not a managed runner selection):
+
+```toml
+[grok]
+sandbox = "workspace"              # off | workspace
+permission_mode = "bypassPermissions"
+max_turns = 64                      # 1..=256
+```
+
+`agent = "grok"`, `provider = "grok"`, and `grok-4.5` on any managed role are
+rejected at startup. The `[grok]` section exists so the adapter's accepted safety
+profile can be parsed and validated without silently enabling production routing.
+
 Never infer runner kind from the executable filename. Existing top-level
 `no_bare_agent` and `allowed_tools` remain backward-compatible Claude settings.
-Runner-specific configuration is scoped under `[claude]` or `[codex]`.
+Runner-specific configuration is scoped under `[claude]`, `[codex]`, or `[grok]`.
 
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
 constraints, and verification but have no routing authority. `task-create` rejects every
@@ -1550,8 +1674,10 @@ labels are ignored.
 - The active daemon provider selects the corresponding model and effort from its five-level
   routing ladder. Operator-owned `suggested_models` overrides and minimum model/effort
   floors remain available; creators cannot lower or raise an individual task.
-- `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*` model)
-  or `AgentKind::Codex` (known OpenAI models including `gpt-5*`).
+- `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
+  model), `AgentKind::Codex` (known OpenAI models including `gpt-5*`), or the exact
+  transport-only `AgentKind::Grok` model `grok-4.5`. Managed role resolution rejects
+  Grok after this explicit model classification.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
 - Reviewers continue to use the daemon's configured provider.

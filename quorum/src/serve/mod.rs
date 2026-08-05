@@ -12,6 +12,7 @@ pub mod codex_agent;
 pub mod codex_stream;
 pub mod collector;
 pub mod doctor;
+pub mod grok_agent;
 pub mod merge;
 pub mod names;
 pub mod recovery;
@@ -1384,6 +1385,7 @@ fn explicitly_configured_provider(config: &ServeConfig) -> Option<runner::AgentK
         .then_some(match config.runner_kind {
             crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
             crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+            crate::serve_config::RunnerKind::Grok => runner::AgentKind::Grok,
         })
 }
 
@@ -1447,6 +1449,7 @@ fn agent_bin_for_runner(
     let configured_kind = match runner_kind {
         crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
         crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+        crate::serve_config::RunnerKind::Grok => runner::AgentKind::Grok,
     };
     (kind == configured_kind).then_some(agent_bin).flatten()
 }
@@ -1463,6 +1466,7 @@ fn runner_adapter_config<'a>(
             .as_deref()
             .unwrap_or(agent::ALLOWED_TOOLS),
         codex_sandbox: &config.codex_sandbox,
+        grok: Default::default(),
     }
 }
 
@@ -1644,6 +1648,9 @@ fn recommendation_provider(
         crate::serve_config::RunnerKind::Codex => {
             quorum_core::complexity::RecommendationProvider::Codex
         }
+        crate::serve_config::RunnerKind::Grok => {
+            unreachable!("Grok managed lifecycle routing is not enabled")
+        }
     }
 }
 
@@ -1668,6 +1675,9 @@ fn suggested_for(
         .unwrap_or_else(|| match provider {
             crate::serve_config::RunnerKind::Claude => ("claude-opus-4-6".into(), "medium".into()),
             crate::serve_config::RunnerKind::Codex => ("gpt-5.6-terra".into(), "medium".into()),
+            crate::serve_config::RunnerKind::Grok => {
+                unreachable!("Grok managed lifecycle routing is not enabled")
+            }
         })
 }
 
@@ -8400,6 +8410,7 @@ fn runner_continuation_id<'a>(
     match kind {
         runner::AgentKind::Claude => Some(claude_session_id),
         runner::AgentKind::Codex => provider_continuation_id,
+        runner::AgentKind::Grok => provider_continuation_id,
     }
 }
 
@@ -9902,6 +9913,7 @@ async fn spawn_worker(
         let expected = match config.runner_kind {
             crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
             crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
+            crate::serve_config::RunnerKind::Grok => runner::AgentKind::Grok,
         };
         let actual = resolve_worker_provider(&resolved_model)?;
         if actual != expected {
