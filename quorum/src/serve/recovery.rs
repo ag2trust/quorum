@@ -157,9 +157,7 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
                 .as_deref()
                 .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
                 .map(|refs| {
-                    refs.get("codex_provider_blocked")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
+                    quorum_core::runner_state::provider_block(&refs).is_some()
                         || refs
                             .get(tasks::PARKED_REWORK_RETRY_REF)
                             .and_then(serde_json::Value::as_bool)

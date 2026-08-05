@@ -28,6 +28,7 @@ use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::pr_targets;
+use quorum_core::runner_state::{self, ContinuationIdentity, ContinuationSlot, PendingTurn};
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1521,14 +1522,14 @@ struct ReviewerRecovery {
     model: String,
     effort: String,
     kind: runner::AgentKind,
-    thread_id: Option<String>,
+    continuation_id: Option<String>,
 }
 
-fn reviewer_thread_ref_key(is_r2: bool) -> &'static str {
+fn reviewer_continuation_slot(is_r2: bool) -> ContinuationSlot {
     if is_r2 {
-        "codex_reviewer_r2_thread_id"
+        ContinuationSlot::ReviewerR2
     } else {
-        "codex_reviewer_r1_thread_id"
+        ContinuationSlot::ReviewerR1
     }
 }
 
@@ -1556,25 +1557,23 @@ fn resolve_reviewer_recovery(
             run.model
         )));
     }
-    // Continuation IDs are Codex-specific. A task can retain an older Codex
-    // reviewer thread while a later Claude reviewer is interrupted; never let
-    // that stale ref select the Codex resume path for the Claude run.
-    let thread_id = (kind == runner::AgentKind::Codex)
+    // A task can retain an older turn-oriented reviewer continuation while a
+    // later persistent-child reviewer is interrupted. Provider tagging keeps
+    // stale refs from selecting the wrong adapter's resume path.
+    let continuation_id = (kind.turn_mode() == runner::TurnMode::RespawnPerTurn)
         .then(|| {
             task_refs
                 .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
                 .and_then(|refs| {
-                    refs.get(reviewer_thread_ref_key(is_r2))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
+                    runner_state::continuation(&refs, reviewer_continuation_slot(is_r2), provider)
                 })
+                .map(|identity| identity.id)
         })
         .flatten();
-    if kind == runner::AgentKind::Codex && thread_id.is_none() {
+    if kind.turn_mode() == runner::TurnMode::RespawnPerTurn && continuation_id.is_none() {
         return Err(QuorumError::Io(format!(
-            "interrupted Codex reviewer run {} has no persisted {}",
-            run.id,
-            reviewer_thread_ref_key(is_r2)
+            "interrupted turn-oriented reviewer run {} has no persisted continuation for {}",
+            run.id, provider,
         )));
     }
     Ok(Some(ReviewerRecovery {
@@ -1582,7 +1581,7 @@ fn resolve_reviewer_recovery(
         model: run.model,
         effort: run.effort,
         kind,
-        thread_id,
+        continuation_id,
     }))
 }
 
@@ -2071,20 +2070,11 @@ pub(crate) struct SlotState {
     /// PR head SHA at reviewer spawn time. Used to detect stale approvals
     /// when the author pushes new commits between review and merge.
     reviewed_head_sha: Option<String>,
-    /// Codex thread identity for continuation. Set from the first
-    /// `thread.started` event, persisted to task refs before use.
-    codex_thread_id: Option<String>,
+    /// Opaque runner continuation identity. Set from the runner's session
+    /// event and persisted to task refs before use.
+    continuation_id: Option<String>,
     pending_prompt: String,
     pending_turn_kind: String,
-}
-
-#[derive(Debug, Clone)]
-struct CodexRetryTurn {
-    model: String,
-    effort: String,
-    prompt: String,
-    turn_kind: String,
-    thread_id: Option<String>,
 }
 
 fn worker_done_event(rework_count: u32, pr: i64) -> Event {
@@ -2115,21 +2105,11 @@ fn worker_publication_pr(
     }
 }
 
-fn codex_retry_turn(refs: Option<&str>) -> Option<CodexRetryTurn> {
+fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
-    if !refs.get("codex_retry_requested")?.as_bool()? {
-        return None;
-    }
-    Some(CodexRetryTurn {
-        model: refs.get("codex_retry_model")?.as_str()?.to_string(),
-        effort: refs.get("codex_retry_effort")?.as_str()?.to_string(),
-        prompt: refs.get("codex_retry_prompt")?.as_str()?.to_string(),
-        turn_kind: refs.get("codex_retry_turn_kind")?.as_str()?.to_string(),
-        thread_id: refs
-            .get("codex_retry_thread_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string),
-    })
+    let turn = runner_state::requested_retry_any(&refs)?;
+    let resolved = runner::AgentKind::for_model(&turn.model).ok()?;
+    (turn.provider == resolved.to_string()).then_some(turn)
 }
 
 /// Fold a worker completion that arrived after its slot disappeared. The core
@@ -2426,7 +2406,7 @@ fn available_worker_slots(cap: usize, active_workers: usize) -> usize {
 
 fn retry_slot_rework_count(
     rework_round: i64,
-    retry: Option<&CodexRetryTurn>,
+    retry: Option<&PendingTurn>,
     daemon_retry: bool,
 ) -> u32 {
     if daemon_retry
@@ -3071,11 +3051,12 @@ async fn resume_reviewer_after_ci(
         .feed_turn(&rereview_turn)
         .await
     {
-        let reason = if reviewers[reviewer_index].proc.is_codex() {
-            "codex_rereview"
-        } else {
-            "failed"
-        };
+        let reason =
+            if reviewers[reviewer_index].proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
+                "codex_rereview"
+            } else {
+                "failed"
+            };
         log(&format!(
             "ResumeReviewer: feed_turn failed for task #{task_id}: {error} \
              — tearing down ({reason})"
@@ -6677,38 +6658,63 @@ async fn tick(
     }
     for &i in error_failed.iter().rev() {
         let dead = workers.remove(i);
-        if dead.proc.is_codex() {
+        if dead.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
+            let provider = dead.proc.kind().to_string();
             let reason = dead
                 .last_error_text
                 .as_deref()
-                .unwrap_or("Codex provider/protocol failure")
+                .unwrap_or("runner provider/protocol failure")
                 .to_string();
             log(&format!(
-                "parking task #{} after bounded Codex failure: {reason}",
+                "classifying task #{} after bounded turn-oriented runner failure: {reason}",
                 dead.task_id
             ));
-            if let Err(error) = persist_codex_provider_block(
+            let pending_turn = PendingTurn {
+                provider,
+                model: dead.model.clone(),
+                effort: dead.effort.clone(),
+                prompt: dead.pending_prompt.clone(),
+                turn_kind: dead.pending_turn_kind.clone(),
+                continuation_id: dead.continuation_id.clone(),
+                requested: false,
+            };
+            match dispose_dead_turn_runner_worker(
                 &db_path,
                 dead.task_id,
+                &dead.agent_name,
                 &reason,
-                &CodexRetryTurn {
-                    model: dead.model.clone(),
-                    effort: dead.effort.clone(),
-                    prompt: dead.pending_prompt.clone(),
-                    turn_kind: dead.pending_turn_kind.clone(),
-                    thread_id: dead.codex_thread_id.clone(),
-                },
+                &pending_turn,
             )
             .await
             {
-                log(&format!(
-                    "FATAL: cannot durably park task #{}; retaining slot: {error}",
-                    dead.task_id
-                ));
-                workers.insert(i, dead);
-                continue;
+                Ok(tasks::DeadTurnRunnerDisposition::DonePending) => {
+                    workers.insert(i, dead);
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
+                    cleanup_slot(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        dead,
+                        None,
+                        "ownership_transferred",
+                    )
+                    .await;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
+                }
+                Err(error) => {
+                    log(&format!(
+                        "FATAL: cannot classify task #{} runner failure; retaining slot: {error}",
+                        dead.task_id
+                    ));
+                    workers.insert(i, dead);
+                }
             }
-            cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
             continue;
         }
         fire_event(
@@ -6808,20 +6814,22 @@ async fn tick(
     }
     for &(i, status) in dead_workers.iter().rev() {
         let dead = workers.remove(i);
-        if dead.proc.is_codex() {
+        if dead.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
             let reason = dead
                 .last_error_text
                 .as_deref()
-                .unwrap_or("Codex process exited before task submission")
+                .unwrap_or("turn-oriented runner exited before task submission")
                 .to_string();
-            let retry = CodexRetryTurn {
+            let retry = PendingTurn {
+                provider: dead.proc.kind().to_string(),
                 model: dead.model.clone(),
                 effort: dead.effort.clone(),
                 prompt: dead.pending_prompt.clone(),
                 turn_kind: dead.pending_turn_kind.clone(),
-                thread_id: dead.codex_thread_id.clone(),
+                continuation_id: dead.continuation_id.clone(),
+                requested: false,
             };
-            match dispose_dead_codex_worker(
+            match dispose_dead_turn_runner_worker(
                 &db_path,
                 dead.task_id,
                 &dead.agent_name,
@@ -6830,13 +6838,13 @@ async fn tick(
             )
             .await
             {
-                Ok(tasks::DeadCodexDisposition::DonePending) => {
+                Ok(tasks::DeadTurnRunnerDisposition::DonePending) => {
                     // Phase 2 must consume the row while the slot still owns its
                     // branch/worktree. Keep the dead slot until the next tick.
                     workers.insert(i, dead);
                     continue;
                 }
-                Ok(tasks::DeadCodexDisposition::DeliveryRecorded) => {
+                Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
                     log(&format!(
                         "worker {} exited normally after delivering task #{} — cleaning up completed run",
                         dead.agent_name, dead.task_id
@@ -6844,7 +6852,7 @@ async fn tick(
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "completed").await;
                     continue;
                 }
-                Ok(tasks::DeadCodexDisposition::OwnershipTransferred) => {
+                Ok(tasks::DeadTurnRunnerDisposition::OwnershipTransferred) => {
                     log(&format!(
                         "worker {} exit ignored after task #{} ownership/state advanced — cleaning up",
                         dead.agent_name, dead.task_id
@@ -6860,7 +6868,7 @@ async fn tick(
                     .await;
                     continue;
                 }
-                Ok(tasks::DeadCodexDisposition::ProviderBlocked) => {
+                Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
                     continue;
                 }
@@ -8301,16 +8309,15 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
     None
 }
 
-/// Persist a Codex thread_id to task refs for continuation across restart/rework.
-/// Feed a worker turn (rework, error-retry, or message). Claude uses stdin
-/// feed_turn; Codex kills the exited process and spawns a new one with
-/// thread-based continuation.
+/// Feed a worker turn according to the adapter's declared process lifetime.
+/// Persistent-child runners receive stdin; turn-oriented runners respawn with
+/// their opaque continuation identity.
 async fn feed_worker_turn(
     slot: &mut SlotState,
     raw_prompt: &str,
     config: &ServeConfig,
 ) -> std::io::Result<()> {
-    if slot.proc.is_codex() {
+    if slot.proc.turn_mode() == runner::TurnMode::RespawnPerTurn {
         if should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
@@ -8319,7 +8326,7 @@ async fn feed_worker_turn(
                 "continuation".into()
             };
         }
-        let (model, effort) = codex_continuation_identity(slot)?;
+        let (model, effort) = runner_continuation_identity(slot)?;
         let mut env_vars: Vec<(String, String)> = vec![
             ("QUORUM_REPO".into(), config.repo.clone()),
             ("QUORUM_AGENT".into(), slot.agent_name.clone()),
@@ -8339,7 +8346,7 @@ async fn feed_worker_turn(
                 continuation_id: runner_continuation_id(
                     slot.proc.kind(),
                     &slot.session_id,
-                    slot.codex_thread_id.as_deref(),
+                    slot.continuation_id.as_deref(),
                 ),
             },
             &runner_adapter_config(config, config.agent_bin.as_deref()),
@@ -8359,20 +8366,22 @@ fn should_replace_pending_prompt(prompt: &str) -> bool {
     !prompt.starts_with("Your previous turn was interrupted by a transport/API error")
 }
 
-fn codex_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str)> {
+fn runner_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str)> {
     if slot.model.is_empty() || slot.effort.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Codex continuation missing its resolved model/effort identity",
+            "runner continuation missing its resolved model/effort identity",
         ));
     }
+    let expected = slot.proc.kind();
     match runner::AgentKind::for_model(&slot.model) {
-        Ok(runner::AgentKind::Codex) => Ok((&slot.model, &slot.effort)),
+        Ok(actual) if actual == expected => Ok((&slot.model, &slot.effort)),
         Ok(actual) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
-                "Codex continuation model '{}' resolves to {actual}; refusing provider migration",
-                slot.model
+                "runner continuation model '{}' resolves to {actual}, but the active runner is \
+                 {expected}; refusing provider migration",
+                slot.model,
             ),
         )),
         Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
@@ -8394,14 +8403,18 @@ fn runner_continuation_id<'a>(
     }
 }
 
-async fn persist_codex_thread_id(
+async fn persist_runner_continuation(
     db_path: &std::path::Path,
     task_id: i64,
-    thread_id: &str,
-    ref_key: &'static str,
+    provider: &str,
+    continuation_id: &str,
+    slot: ContinuationSlot,
 ) {
     let p = db_path.to_path_buf();
-    let tid = thread_id.to_string();
+    let identity = ContinuationIdentity {
+        provider: provider.to_string(),
+        id: continuation_id.to_string(),
+    };
     let task_id_val = task_id;
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -8412,7 +8425,7 @@ async fn persist_codex_thread_id(
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
-            refs[ref_key] = serde_json::Value::String(tid);
+            runner_state::set_continuation(&mut refs, slot, &identity);
             let refs_str = refs.to_string();
             tasks::update_refs_daemon(&mut conn, task_id_val, &refs_str, now_unix())?;
         }
@@ -8422,61 +8435,60 @@ async fn persist_codex_thread_id(
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => log(&format!(
-            "persist_codex_thread_id failed for task #{task_id}: {e}"
+            "persist_runner_continuation failed for task #{task_id}: {e}"
         )),
         Err(e) => log(&format!(
-            "persist_codex_thread_id join error for task #{task_id}: {e}"
+            "persist_runner_continuation join error for task #{task_id}: {e}"
         )),
     }
 }
 
-/// Phase 4b disposition for a dead Codex worker.
+/// Phase 4b disposition for a dead turn-oriented worker.
 ///
-/// The Codex process exits at turn end, so a successful `quorum submit` and the
-/// process death land in the same tick window: the task is still `working`
+/// A turn-oriented process exits at turn end, so a successful `quorum submit`
+/// and process death can land in the same tick window: the task is still `working`
 /// because the daemon has not drained the mailbox yet (task #218 / PR #439 —
 /// the done row was written 15s before the run was closed as `provider_blocked`,
 /// staging a retry of already-shipped work). So "still working" alone is not
 /// evidence of provider failure — park only when no done signal is pending.
-async fn dispose_dead_codex_worker(
+async fn dispose_dead_turn_runner_worker(
     db_path: &Path,
     task_id: i64,
     agent: &str,
     reason: &str,
-    retry: &CodexRetryTurn,
-) -> Result<tasks::DeadCodexDisposition> {
+    retry: &PendingTurn,
+) -> Result<tasks::DeadTurnRunnerDisposition> {
     let p = db_path.to_path_buf();
     let agent = agent.to_string();
     let retry = retry.clone();
     let reason = reason.to_string();
     let disposition =
-        tokio::task::spawn_blocking(move || -> Result<tasks::DeadCodexDisposition> {
+        tokio::task::spawn_blocking(move || -> Result<tasks::DeadTurnRunnerDisposition> {
             let mut conn = quorum_core::db::open(&p)?;
-            tasks::dispose_dead_codex(
+            tasks::dispose_dead_turn_runner(
                 &mut conn,
                 task_id,
                 &agent,
-                &tasks::CodexProviderBlock {
-                    reason: &reason,
-                    model: &retry.model,
-                    effort: &retry.effort,
-                    prompt: &retry.prompt,
-                    turn_kind: &retry.turn_kind,
-                    thread_id: retry.thread_id.as_deref(),
+                &runner_state::ProviderBlock {
+                    provider: retry.provider.clone(),
+                    reason,
                 },
+                &retry,
                 now_unix(),
             )
         })
         .await
-        .map_err(|error| QuorumError::Io(format!("dead-Codex disposition join failed: {error}")))?;
+        .map_err(|error| {
+            QuorumError::Io(format!("dead runner disposition join failed: {error}"))
+        })?;
     disposition
 }
 
-async fn persist_codex_provider_block(
+async fn persist_runner_provider_block(
     db_path: &std::path::Path,
     task_id: i64,
     reason: &str,
-    retry: &CodexRetryTurn,
+    retry: &PendingTurn,
 ) -> Result<()> {
     let p = db_path.to_path_buf();
     let reason = reason.to_string();
@@ -8489,22 +8501,14 @@ async fn persist_codex_provider_block(
                 .as_deref()
                 .and_then(|refs| serde_json::from_str(refs).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
-            refs["codex_provider_blocked"] = serde_json::Value::Bool(true);
-            refs["codex_provider_error"] = serde_json::Value::String(reason);
-            refs["codex_retry_model"] = serde_json::Value::String(retry.model);
-            refs["codex_retry_effort"] = serde_json::Value::String(retry.effort);
-            refs["codex_retry_prompt"] = serde_json::Value::String(retry.prompt);
-            refs["codex_retry_turn_kind"] = serde_json::Value::String(retry.turn_kind);
-            match retry.thread_id {
-                Some(thread_id) => {
-                    refs["codex_retry_thread_id"] = serde_json::Value::String(thread_id);
-                }
-                None => {
-                    if let Some(object) = refs.as_object_mut() {
-                        object.remove("codex_retry_thread_id");
-                    }
-                }
-            }
+            runner_state::set_provider_block(
+                &mut refs,
+                &runner_state::ProviderBlock {
+                    provider: retry.provider.clone(),
+                    reason,
+                },
+                &retry,
+            );
             tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now_unix())?;
         }
         Ok(())
@@ -8526,8 +8530,13 @@ async fn cleanup_failed_remediation_identity(db_path: &Path, agent_name: &str, c
     .await;
 }
 
-async fn codex_thread_id_from_refs(db_path: &std::path::Path, task_id: i64) -> Option<String> {
+async fn runner_continuation_id_from_refs(
+    db_path: &std::path::Path,
+    task_id: i64,
+    provider: &str,
+) -> Option<String> {
     let p = db_path.to_path_buf();
+    let provider = provider.to_string();
     tokio::task::spawn_blocking(move || -> Option<String> {
         let conn = quorum_core::db::open(&p).ok()?;
         let task = tasks::get(&conn, task_id).ok()??;
@@ -8535,24 +8544,22 @@ async fn codex_thread_id_from_refs(db_path: &std::path::Path, task_id: i64) -> O
             .refs
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())?;
-        refs.get("codex_thread_id")
-            .or_else(|| refs.get("codex_retry_thread_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+        runner_state::continuation(&refs, ContinuationSlot::Worker, &provider)
+            .map(|identity| identity.id)
     })
     .await
     .ok()
     .flatten()
 }
 
-fn require_codex_remediation_thread(
+fn require_remediation_continuation(
     kind: runner::AgentKind,
     review_only: bool,
     has_original_worker: bool,
-    thread_id: Option<String>,
+    continuation_id: Option<String>,
 ) -> Result<Option<String>> {
-    // A managed Codex worker can only be resumed through its exact durable
-    // provider thread.  Review-only tasks are different: they deliberately
+    // A managed turn-oriented worker can only be resumed through its exact
+    // durable provider identity. Review-only tasks are different: they deliberately
     // have no managed worker run, so their first remediation is a fresh turn
     // on the already verified PR worktree.  Once that turn emits and persists
     // its thread ID, later remediation follows the normal exact continuation
@@ -8560,15 +8567,15 @@ fn require_codex_remediation_thread(
     // its capability is revoked and rework is retained; recovery resumes only
     // after the thread ID is durable. A shutdown before that event therefore
     // fails closed rather than creating a second fresh turn.
-    if kind == runner::AgentKind::Codex
-        && thread_id.is_none()
+    if kind.turn_mode() == runner::TurnMode::RespawnPerTurn
+        && continuation_id.is_none()
         && (!review_only || has_original_worker)
     {
         return Err(QuorumError::Io(
-            "Codex remediation requires the original persisted thread_id".into(),
+            "turn-oriented remediation requires the original persisted continuation".into(),
         ));
     }
-    Ok(thread_id)
+    Ok(continuation_id)
 }
 
 /// Drain stream events from an agent slot (bounded per tick, 5s timeout).
@@ -8595,13 +8602,20 @@ async fn drain_events(
         for agent_event in &events {
             match agent_event {
                 runner::AgentEvent::ThreadStarted { thread_id } => {
-                    slot.codex_thread_id = Some(thread_id.clone());
-                    let ref_key = if role == "worker" {
-                        "codex_thread_id"
+                    slot.continuation_id = Some(thread_id.clone());
+                    let continuation_slot = if role == "worker" {
+                        ContinuationSlot::Worker
                     } else {
-                        reviewer_thread_ref_key(slot.r2_origin)
+                        reviewer_continuation_slot(slot.r2_origin)
                     };
-                    persist_codex_thread_id(db_path, slot.task_id, thread_id, ref_key).await;
+                    persist_runner_continuation(
+                        db_path,
+                        slot.task_id,
+                        &slot.proc.kind().to_string(),
+                        thread_id,
+                        continuation_slot,
+                    )
+                    .await;
                 }
                 runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
                     let turn_tokens =
@@ -9154,7 +9168,7 @@ async fn provision_reviewer(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_thread_id) =
+    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_continuation_id) =
         if let Some(recovery) = &recovery {
             log(&format!(
                 "recovering {} reviewer {} with persisted provider {} model {}",
@@ -9167,7 +9181,7 @@ async fn provision_reviewer(
                 recovery.model.clone(),
                 recovery.effort.clone(),
                 recovery.kind,
-                recovery.thread_id.clone(),
+                recovery.continuation_id.clone(),
             )
         } else {
             let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
@@ -9258,8 +9272,11 @@ async fn provision_reviewer(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
-    let continuation_id =
-        runner_continuation_id(reviewer_kind, &session_id, reviewer_thread_id.as_deref());
+    let continuation_id = runner_continuation_id(
+        reviewer_kind,
+        &session_id,
+        reviewer_continuation_id.as_deref(),
+    );
     let spawn_result = runner::RunnerProc::launch(
         &runner::LaunchRequest {
             model: &reviewer_model,
@@ -9500,7 +9517,7 @@ async fn provision_reviewer(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: role.is_r2(),
                 reviewed_head_sha: spawn_head_sha,
-                codex_thread_id: reviewer_thread_id,
+                continuation_id: reviewer_continuation_id,
                 pending_prompt: String::new(),
                 pending_turn_kind: if role.is_r2() {
                     "r2-review".into()
@@ -9571,7 +9588,10 @@ async fn spawn_worker(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
                 .filter(|task| {
-                    codex_retry_turn(task.refs.as_deref()).is_some()
+                    task.refs
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .is_some_and(|refs| runner_state::retry_requested(&refs))
                         || (daemon_rework_retry_requested(task.refs.as_deref())
                             && remediation_retry_feedback(task.refs.as_deref()).is_none())
                 }),
@@ -9597,6 +9617,27 @@ async fn spawn_worker(
         Some(t) => t,
         None => return Ok(false),
     };
+
+    let retry_marker_present = task
+        .refs
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .is_some_and(|refs| runner_state::retry_requested(&refs));
+    if retry_marker_present && runner_retry_turn(task.refs.as_deref()).is_none() {
+        let resume_status = task.status.clone();
+        park_task(
+            &db_path,
+            task.id,
+            "runner retry state is partial or does not match its declared provider",
+            &resume_status,
+        )
+        .await;
+        log(&format!(
+            "task #{} has invalid durable runner retry state — parked fail-closed",
+            task.id
+        ));
+        return Ok(false);
+    }
 
     let acquire_result = name_pool.acquire();
     if acquire_result.is_generated() && name_pool.has_file() {
@@ -9851,7 +9892,7 @@ async fn spawn_worker(
             task.id
         ));
     }
-    let retry_turn = codex_retry_turn(task.refs.as_deref());
+    let retry_turn = runner_retry_turn(task.refs.as_deref());
     let (resolved_model, resolved_effort) = retry_turn
         .as_ref()
         .map(|retry| (retry.model.clone(), retry.effort.clone()))
@@ -9956,7 +9997,7 @@ async fn spawn_worker(
             // Rework retry: park so the operator can intervene without
             // losing the durable turn. Do NOT call release_task — it
             // would set status=open and break the rework state contract.
-            persist_codex_provider_block(
+            persist_runner_provider_block(
                 &db_path,
                 task.id,
                 "Codex+USD cost limit incompatible — daemon has max_*_cost_usd configured",
@@ -9979,7 +10020,7 @@ async fn spawn_worker(
         &session_id,
         retry_turn
             .as_ref()
-            .and_then(|retry| retry.thread_id.as_deref()),
+            .and_then(|retry| retry.continuation_id.as_deref()),
     );
     let spawn_result = runner::RunnerProc::launch(
         &runner::LaunchRequest {
@@ -10088,7 +10129,9 @@ async fn spawn_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
-                codex_thread_id: None,
+                continuation_id: retry_turn
+                    .as_ref()
+                    .and_then(|retry| retry.continuation_id.clone()),
                 pending_prompt: prompt_text,
                 pending_turn_kind: retry_turn
                     .as_ref()
@@ -11371,16 +11414,23 @@ async fn spawn_remediation_worker(
              are configured — parking to avoid silent over-spend"
         ));
         let park_prompt = prompt.clone();
-        persist_codex_provider_block(
+        persist_runner_provider_block(
             db_path,
             task_id,
             "Codex+USD cost limit incompatible — daemon has max_*_cost_usd configured",
-            &CodexRetryTurn {
+            &PendingTurn {
+                provider: remediation_kind.to_string(),
                 model: remediation_model.clone(),
                 effort: remediation_effort.clone(),
                 prompt: park_prompt,
                 turn_kind: "rework".into(),
-                thread_id: codex_thread_id_from_refs(db_path, task_id).await,
+                continuation_id: runner_continuation_id_from_refs(
+                    db_path,
+                    task_id,
+                    &remediation_kind.to_string(),
+                )
+                .await,
+                requested: false,
             },
         )
         .await
@@ -11399,33 +11449,36 @@ async fn spawn_remediation_worker(
         return Ok(RemediationSpawnOutcome::ProvisionFailed);
     }
 
-    // For Codex rework: look up persisted thread_id for continuation.
-    let recovered_thread_id = if remediation_kind == runner::AgentKind::Codex {
-        codex_thread_id_from_refs(db_path, task_id).await
-    } else {
-        None
-    };
-    let codex_thread_id = match require_codex_remediation_thread(
+    // Turn-oriented rework resumes the exact provider-tagged continuation.
+    let recovered_continuation_id =
+        if remediation_kind.turn_mode() == runner::TurnMode::RespawnPerTurn {
+            runner_continuation_id_from_refs(db_path, task_id, &remediation_kind.to_string()).await
+        } else {
+            None
+        };
+    let continuation_id = match require_remediation_continuation(
         remediation_kind,
         task_review_only,
         has_original_worker,
-        recovered_thread_id,
+        recovered_continuation_id,
     ) {
         Ok(thread_id) => thread_id,
         Err(error) => {
             log(&format!(
-                "remediation: task #{task_id} has no persisted Codex thread_id — parking: {error}"
+                "remediation: task #{task_id} has no persisted runner continuation — parking: {error}"
             ));
-            persist_codex_provider_block(
+            persist_runner_provider_block(
                 db_path,
                 task_id,
-                "Codex remediation requires the original persisted thread_id",
-                &CodexRetryTurn {
+                "turn-oriented remediation requires the original persisted continuation",
+                &PendingTurn {
+                    provider: remediation_kind.to_string(),
                     model: remediation_model.clone(),
                     effort: remediation_effort.clone(),
                     prompt: prompt.clone(),
                     turn_kind: "rework".into(),
-                    thread_id: None,
+                    continuation_id: None,
+                    requested: false,
                 },
             )
             .await
@@ -11445,8 +11498,8 @@ async fn spawn_remediation_worker(
         }
     };
 
-    let continuation_id =
-        runner_continuation_id(remediation_kind, &session_id, codex_thread_id.as_deref());
+    let launch_continuation_id =
+        runner_continuation_id(remediation_kind, &session_id, continuation_id.as_deref());
     let spawn_result = runner::RunnerProc::launch(
         &runner::LaunchRequest {
             model: &remediation_model,
@@ -11455,7 +11508,7 @@ async fn spawn_remediation_worker(
             prompt: &prompt,
             environment: &remediation_env,
             mode: runner::LaunchMode::Normal,
-            continuation_id,
+            continuation_id: launch_continuation_id,
         },
         &runner_adapter_config(config, config.agent_bin.as_deref()),
     )
@@ -11517,7 +11570,7 @@ async fn spawn_remediation_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
-                codex_thread_id,
+                continuation_id,
                 pending_prompt: prompt,
                 pending_turn_kind: "rework".into(),
             });
@@ -12157,39 +12210,39 @@ mod tests {
             cap_run_id: None,
             r2_origin: false,
             reviewed_head_sha: None,
-            codex_thread_id: None,
+            continuation_id: None,
             pending_prompt: "test prompt".into(),
             pending_turn_kind: "initial".into(),
         }
     }
 
     #[test]
-    fn codex_continuation_requires_exact_run_identity() {
+    fn runner_continuation_requires_exact_run_identity() {
         let mut slot = make_dummy_slot();
-        slot.model = "gpt-5.6-terra".into();
+        slot.model = "claude-opus-4-6".into();
         assert_eq!(
-            codex_continuation_identity(&slot).unwrap(),
-            ("gpt-5.6-terra", "high")
+            runner_continuation_identity(&slot).unwrap(),
+            ("claude-opus-4-6", "high")
         );
         slot.model.clear();
         assert_eq!(
-            codex_continuation_identity(&slot).unwrap_err().kind(),
+            runner_continuation_identity(&slot).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
         slot.model = "test-model".into();
         slot.effort.clear();
         assert_eq!(
-            codex_continuation_identity(&slot).unwrap_err().kind(),
+            runner_continuation_identity(&slot).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
         slot.effort = "high".into();
-        slot.model = "claude-opus-4-6".into();
+        slot.model = "gpt-5.6-terra".into();
         assert!(
-            codex_continuation_identity(&slot)
+            runner_continuation_identity(&slot)
                 .unwrap_err()
                 .to_string()
                 .contains("refusing provider migration"),
-            "a Codex process must never continue through a Claude adapter"
+            "a runner must never continue through a different provider adapter"
         );
     }
 
@@ -12235,12 +12288,12 @@ mod tests {
             "codex_retry_thread_id": "thread-exact"
         })
         .to_string();
-        let retry = codex_retry_turn(Some(&refs)).unwrap();
+        let retry = runner_retry_turn(Some(&refs)).unwrap();
         assert_eq!(retry.prompt, feedback);
         assert_eq!(retry.turn_kind, "rework");
-        assert_eq!(retry.thread_id.as_deref(), Some("thread-exact"));
+        assert_eq!(retry.continuation_id.as_deref(), Some("thread-exact"));
         let args = codex_agent::resume_args(
-            retry.thread_id.as_deref().unwrap(),
+            retry.continuation_id.as_deref().unwrap(),
             &retry.model,
             &retry.effort,
             &retry.prompt,
@@ -12253,7 +12306,24 @@ mod tests {
     #[test]
     fn provider_retry_rejects_incomplete_durable_turn() {
         let refs = r#"{"codex_retry_requested":true,"codex_retry_model":"gpt"}"#;
-        assert!(codex_retry_turn(Some(refs)).is_none());
+        assert!(runner_retry_turn(Some(refs)).is_none());
+    }
+
+    #[test]
+    fn provider_retry_rejects_declared_provider_model_mismatch() {
+        let refs = serde_json::json!({
+            "runner_retry": {
+                "provider": "codex",
+                "model": "claude-opus-4-8",
+                "effort": "high",
+                "prompt": "continue exact work",
+                "turn_kind": "rework",
+                "continuation_id": "thread-1",
+                "requested": true
+            }
+        })
+        .to_string();
+        assert!(runner_retry_turn(Some(&refs)).is_none());
     }
 
     #[test]
@@ -12307,9 +12377,9 @@ mod tests {
         // Simulated daemon crash/restart: reopen the DB after provider output.
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
-        let restored = codex_retry_turn(task.refs.as_deref()).unwrap();
+        let restored = runner_retry_turn(task.refs.as_deref()).unwrap();
         assert_eq!(restored.prompt, "exact rework feedback");
-        assert_eq!(restored.thread_id.as_deref(), Some("thread-exact"));
+        assert_eq!(restored.continuation_id.as_deref(), Some("thread-exact"));
         assert_eq!(restored.model, "gpt-exact");
         assert_eq!(restored.effort, "high");
     }
@@ -12371,7 +12441,7 @@ mod tests {
             .unwrap();
         assert_eq!(queued.status, "rework");
         assert!(queued.assignee.is_none());
-        let retry = codex_retry_turn(queued.refs.as_deref()).unwrap();
+        let retry = runner_retry_turn(queued.refs.as_deref()).unwrap();
         let reconstructed_count = retry_slot_rework_count(queued.rework_round, Some(&retry), false);
         let event = worker_done_event(reconstructed_count, 419);
         assert!(matches!(event, Event::ReworkPushed));
@@ -12410,16 +12480,18 @@ mod tests {
     async fn provider_block_persistence_fails_loud_before_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let impossible = dir.path().join("missing-parent").join("quorum.db");
-        let error = persist_codex_provider_block(
+        let error = persist_runner_provider_block(
             &impossible,
             1,
             "quota",
-            &CodexRetryTurn {
+            &PendingTurn {
+                provider: "codex".into(),
                 model: "gpt-test".into(),
                 effort: "high".into(),
                 prompt: "continue exact work".into(),
                 turn_kind: "rework".into(),
-                thread_id: Some("thread-1".into()),
+                continuation_id: Some("thread-1".into()),
+                requested: false,
             },
         )
         .await
@@ -14292,7 +14364,7 @@ mod tests {
         let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
             .unwrap()
             .expect("interrupted reviewer recovery");
-        let thread_id = recovery.thread_id.as_deref().unwrap();
+        let thread_id = recovery.continuation_id.as_deref().unwrap();
         let args = codex_agent::resume_args(
             thread_id,
             &recovery.model,
@@ -14359,7 +14431,7 @@ mod tests {
         assert_eq!(recovery.kind, runner::AgentKind::Claude);
         assert_eq!(recovery.model, "claude-opus-4-8");
         assert_eq!(
-            recovery.thread_id, None,
+            recovery.continuation_id, None,
             "a Claude recovery must ignore a stale Codex continuation ref"
         );
         assert!(
@@ -14501,26 +14573,26 @@ mod tests {
     #[test]
     fn codex_remediation_only_starts_fresh_for_workerless_review_only_tasks() {
         assert!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, false, true, None).is_err(),
+            require_remediation_continuation(runner::AgentKind::Codex, false, true, None).is_err(),
             "implementation remediation must never silently start a fresh thread"
         );
         assert!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, true, true, None).is_err(),
+            require_remediation_continuation(runner::AgentKind::Codex, true, true, None).is_err(),
             "a review-only task with a prior managed worker must keep exact continuation semantics"
         );
         assert_eq!(
-            require_codex_remediation_thread(runner::AgentKind::Codex, true, false, None).unwrap(),
+            require_remediation_continuation(runner::AgentKind::Codex, true, false, None).unwrap(),
             None,
             "a workerless review-only task may start its first Codex remediation turn fresh"
         );
         assert_eq!(
-            require_codex_remediation_thread(runner::AgentKind::Claude, false, false, None)
+            require_remediation_continuation(runner::AgentKind::Claude, false, false, None)
                 .unwrap(),
             None,
             "legacy Claude remediation does not require Codex thread metadata"
         );
         assert_eq!(
-            require_codex_remediation_thread(
+            require_remediation_continuation(
                 runner::AgentKind::Codex,
                 true,
                 true,
@@ -14712,42 +14784,43 @@ mod tests {
             )
             .unwrap();
         }
-        let retry = CodexRetryTurn {
+        let retry = PendingTurn {
+            provider: "codex".into(),
             model: "o3".into(),
             effort: "high".into(),
             prompt: "continue exact work".into(),
             turn_kind: "rework".into(),
-            thread_id: Some("thread-99".into()),
+            continuation_id: Some("thread-99".into()),
+            requested: false,
         };
-        persist_codex_provider_block(&db_path, 1, "Codex+USD cost limit incompatible", &retry)
+        persist_runner_provider_block(&db_path, 1, "Codex+USD cost limit incompatible", &retry)
             .await
             .unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
-        assert!(
-            refs["codex_provider_error"]
-                .as_str()
-                .unwrap()
-                .contains("USD"),
-            "error must mention USD"
-        );
-        assert_eq!(refs["codex_retry_model"].as_str(), Some("o3"));
+        let block = runner_state::provider_block(&refs).unwrap();
+        assert_eq!(block.provider, "codex");
+        assert!(block.reason.contains("USD"), "error must mention USD");
+        let pending: PendingTurn =
+            serde_json::from_value(refs[runner_state::RETRY_REF].clone()).unwrap();
+        assert_eq!(pending.model, "o3");
         assert_eq!(
-            refs["codex_retry_thread_id"].as_str(),
+            pending.continuation_id.as_deref(),
             Some("thread-99"),
             "thread identity must survive parking"
         );
     }
 
-    fn dead_codex_retry() -> CodexRetryTurn {
-        CodexRetryTurn {
+    fn dead_codex_retry() -> PendingTurn {
+        PendingTurn {
+            provider: "codex".into(),
             model: "gpt-5.6-codex".into(),
             effort: "high".into(),
             prompt: "finish the active turn".into(),
             turn_kind: "initial".into(),
-            thread_id: Some("thread-live".into()),
+            continuation_id: Some("thread-live".into()),
+            requested: false,
         }
     }
 
@@ -14856,22 +14929,27 @@ mod tests {
             .unwrap();
         }
 
-        let disposition =
-            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
-                .await
-                .unwrap();
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(disposition, tasks::DeadCodexDisposition::DonePending);
+        assert_eq!(disposition, tasks::DeadTurnRunnerDisposition::DonePending);
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["branch"].as_str(), Some("daemon/spool-t1"));
         assert!(
-            refs.get("codex_provider_blocked").is_none(),
+            refs.get(runner_state::PROVIDER_BLOCK_REF).is_none(),
             "a submitted worker must not be marked provider-blocked"
         );
         assert!(
-            refs.get("codex_retry_prompt").is_none(),
+            refs.get(runner_state::RETRY_REF).is_none(),
             "already-shipped work must not stage a duplicate retry"
         );
         assert!(
@@ -14904,7 +14982,7 @@ mod tests {
             .unwrap();
         }
 
-        let disposition = dispose_dead_codex_worker(
+        let disposition = dispose_dead_turn_runner_worker(
             &db_path,
             1,
             "Spool",
@@ -14914,7 +14992,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(disposition, tasks::DeadCodexDisposition::ProviderBlocked);
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::ProviderBlocked
+        );
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
@@ -14922,16 +15003,13 @@ mod tests {
             mailbox::has_unconsumed(&conn, "Spool", mailbox::MailboxKind::Done, 2).unwrap(),
             "the mismatched task row remains pending but must not suppress task #1 parking"
         );
-        assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
-        assert_eq!(
-            refs["codex_provider_error"].as_str(),
-            Some("provider quota exhausted")
-        );
-        assert_eq!(
-            refs["codex_retry_prompt"].as_str(),
-            Some("finish the active turn")
-        );
-        assert_eq!(refs["codex_retry_thread_id"].as_str(), Some("thread-live"));
+        let block = runner_state::provider_block(&refs).unwrap();
+        assert_eq!(block.provider, "codex");
+        assert_eq!(block.reason, "provider quota exhausted");
+        let pending: PendingTurn =
+            serde_json::from_value(refs[runner_state::RETRY_REF].clone()).unwrap();
+        assert_eq!(pending.prompt, "finish the active turn");
+        assert_eq!(pending.continuation_id.as_deref(), Some("thread-live"));
     }
 
     #[tokio::test]
@@ -14958,21 +15036,26 @@ mod tests {
             .unwrap();
         }
 
-        let disposition =
-            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
-                .await
-                .unwrap();
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(disposition, tasks::DeadCodexDisposition::DonePending);
+        assert_eq!(disposition, tasks::DeadTurnRunnerDisposition::DonePending);
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert!(
-            refs.get("codex_provider_blocked").is_none(),
+            refs.get(runner_state::PROVIDER_BLOCK_REF).is_none(),
             "a successful rework submit must not be parked"
         );
         assert!(
-            refs.get("codex_retry_prompt").is_none(),
+            refs.get(runner_state::RETRY_REF).is_none(),
             "successful rework must not stage a duplicate retry"
         );
     }
@@ -15002,7 +15085,7 @@ mod tests {
             .unwrap();
         }
 
-        let disposition = dispose_dead_codex_worker(
+        let disposition = dispose_dead_turn_runner_worker(
             &db_path,
             1,
             "Replacement",
@@ -15012,18 +15095,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(disposition, tasks::DeadCodexDisposition::ProviderBlocked);
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::ProviderBlocked
+        );
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         assert_eq!(task.status, "rework");
         assert_eq!(task.author.as_deref(), Some("Original"));
         assert_eq!(task.assignee.as_deref(), Some("Original"));
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs["codex_provider_blocked"].as_bool(), Some(true));
-        assert_eq!(
-            refs["codex_provider_error"].as_str(),
-            Some("provider quota exhausted")
-        );
+        let block = runner_state::provider_block(&refs).unwrap();
+        assert_eq!(block.provider, "codex");
+        assert_eq!(block.reason, "provider quota exhausted");
     }
 
     #[tokio::test]
@@ -15054,7 +15138,7 @@ mod tests {
             .await
             .unwrap();
 
-        let disposition = dispose_dead_codex_worker(
+        let disposition = dispose_dead_turn_runner_worker(
             &db_path,
             1,
             "Replacement",
@@ -15066,7 +15150,7 @@ mod tests {
 
         assert_eq!(
             disposition,
-            tasks::DeadCodexDisposition::DeliveryRecorded,
+            tasks::DeadTurnRunnerDisposition::DeliveryRecorded,
             "consumed replacement rework must use the completed cleanup path"
         );
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -15087,7 +15171,7 @@ mod tests {
         );
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert!(
-            refs.get("codex_provider_blocked").is_none(),
+            refs.get(runner_state::PROVIDER_BLOCK_REF).is_none(),
             "consumed rework must not stage a provider retry"
         );
     }
@@ -15107,13 +15191,18 @@ mod tests {
         .await
         .unwrap();
 
-        let disposition =
-            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
-                .await
-                .unwrap();
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             disposition,
-            tasks::DeadCodexDisposition::DeliveryRecorded,
+            tasks::DeadTurnRunnerDisposition::DeliveryRecorded,
             "a normal Codex exit after submission must be cleanup-only"
         );
 
@@ -15149,13 +15238,18 @@ mod tests {
             .unwrap();
         }
 
-        let disposition =
-            dispose_dead_codex_worker(&db_path, 1, "Spool", "process exited", &dead_codex_retry())
-                .await
-                .unwrap();
+        let disposition = dispose_dead_turn_runner_worker(
+            &db_path,
+            1,
+            "Spool",
+            "process exited",
+            &dead_codex_retry(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             disposition,
-            tasks::DeadCodexDisposition::OwnershipTransferred
+            tasks::DeadTurnRunnerDisposition::OwnershipTransferred
         );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -15163,13 +15257,13 @@ mod tests {
         assert_eq!(task.status, "working");
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert!(
-            refs.get("codex_provider_blocked").is_none(),
+            refs.get(runner_state::PROVIDER_BLOCK_REF).is_none(),
             "a stale process must not stage a retry against another owner's task"
         );
     }
 
     #[tokio::test]
-    async fn codex_thread_id_from_refs_reads_both_keys() {
+    async fn runner_continuation_id_from_refs_reads_both_keys() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("thread.db");
         {
@@ -15182,12 +15276,12 @@ mod tests {
             let refs = r#"{"codex_retry_thread_id":"tid-abc"}"#;
             tasks::update_refs_daemon(&mut conn, 1, refs, now_unix()).unwrap();
         }
-        let tid = codex_thread_id_from_refs(&db_path, 1).await;
+        let tid = runner_continuation_id_from_refs(&db_path, 1, "codex").await;
         assert_eq!(tid.as_deref(), Some("tid-abc"));
     }
 
     #[tokio::test]
-    async fn codex_thread_id_from_refs_prefers_primary_key() {
+    async fn runner_continuation_id_from_refs_prefers_primary_key() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("thread2.db");
         {
@@ -15199,7 +15293,7 @@ mod tests {
             let refs = r#"{"codex_thread_id":"primary","codex_retry_thread_id":"fallback"}"#;
             tasks::update_refs_daemon(&mut conn, 1, refs, now_unix()).unwrap();
         }
-        let tid = codex_thread_id_from_refs(&db_path, 1).await;
+        let tid = runner_continuation_id_from_refs(&db_path, 1, "codex").await;
         assert_eq!(tid.as_deref(), Some("primary"));
     }
 

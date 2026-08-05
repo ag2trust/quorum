@@ -326,9 +326,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   claim. Both paths carry the exact persisted failed turn. `in-review` is
   rejected; Codex R1/R2 belongs to the later reviewer-provider phase.
   Before teardown, Quorum stores the pending raw prompt, turn kind, exact
-  model/effort, and provider thread ID (when issued) in task refs. Provisioning
-  reuses the task branch and PR, resumes that thread when present (fresh
-  `exec` only before a thread exists), and never substitutes the generic
+  model/effort, and opaque provider continuation ID (when issued) in task refs.
+  Provisioning reuses the task branch and PR, resumes that identity when present
+  (a fresh turn only before an identity exists), and never substitutes the generic
   initial task prompt. Provider events do not consume retry metadata. It is
   removed atomically with the successful worker submit transition into
   `in-review`, so any crash while implementation remains active restarts from
@@ -1222,7 +1222,7 @@ prior backfill are retained as audit data but do not affect the default report.
 
 ## Built-in coding runners: Claude and Codex
 
-**Date:** 2026-07-24 (provider-neutral launch request 2026-08-05)
+**Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
 **Status:** Approved design; Claude and Codex implementation active.
 
 ### Decision and boundary
@@ -1309,6 +1309,21 @@ column name for schema compatibility:
 Missing required continuation identity is an abnormal startup failure. Assistant
 prose is never task completion.
 
+Task refs persist runner recovery state as provider-tagged JSON objects. New writes use
+`runner_continuation` (or the role-scoped `runner_reviewer_r1_continuation` /
+`runner_reviewer_r2_continuation`), `runner_provider_block`, and `runner_retry`.
+Continuation IDs are opaque. A retry records its provider, exact model and effort, raw
+pending prompt, turn kind, optional continuation ID, and whether an operator requested
+the retry. The block reason remains distinct from that pending-turn identity. A
+provider/model mismatch, absent required continuation, or partial retry fails closed;
+it never falls through to the generic initial prompt.
+
+These refs are additive metadata, so no SQLite schema migration or backfill is required.
+Readers continue accepting historical `codex_thread_id`, Codex reviewer thread keys,
+and `codex_retry_*` / `codex_provider_*` records. Neutral records, when present, are
+authoritative and must match the selected runner; historical assignments and evidence
+are never rewritten merely to adopt the neutral representation.
+
 ### Claude behavior remains stable
 
 The Claude runner preserves the production contract: one persistent child,
@@ -1387,7 +1402,7 @@ remain `in-review` with that reviewer attached:
 - transferred ownership or an already-advanced task makes a stale process exit
   cleanup-only;
 - only a run that still owns its phase without a current submission/verdict produces
-  `AgentFailed` (or, for a blocked Codex worker, durable provider-block recovery).
+  `AgentFailed` (or, for a blocked turn-oriented worker, durable provider-block recovery).
 
 Consumed mailbox history is not sufficient while the same sticky run owns a later
 round: an old initial submission cannot excuse a missing rework push, and an old R1/R2
@@ -1395,7 +1410,7 @@ verdict cannot excuse a missing verdict after re-review. Exit status and provide
 are retained as diagnostics, never lifecycle authority. The daemon classifies before
 using failure language or alerts. Cleanup records `completed` for a recorded outcome,
 `ownership_transferred` for a stale run, `crashed` only for a genuine owner-without-
-outcome failure, and `provider_blocked` only after durable Codex retry state is stored.
+outcome failure, and `provider_blocked` only after durable runner retry state is stored.
 
 This classification is intentionally independent of observation order. In particular,
 `submit → in-review → exit`, `submit → exit → in-review`, and

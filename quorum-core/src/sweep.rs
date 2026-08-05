@@ -67,7 +67,14 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                  AND json_valid(t.refs)
                  AND (
                      COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
-                     OR COALESCE(json_type(t.refs, '$.codex_retry_requested')='true', 0)
+                     OR CASE WHEN json_type(t.refs, '$.runner_retry') IS NOT NULL
+                         THEN COALESCE(
+                             json_type(t.refs, '$.runner_retry.requested')='true', 0
+                         )
+                         ELSE COALESCE(
+                             json_type(t.refs, '$.codex_retry_requested')='true', 0
+                         )
+                     END
                  )
              )
              AND NOT (status = 'rework' AND updated_at > ?1 - ?3)
@@ -146,10 +153,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                         .get(crate::tasks::PARKED_REWORK_RETRY_REF)
                         .and_then(serde_json::Value::as_bool)
                         == Some(true)
-                        || value
-                            .get("codex_retry_requested")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(true)
+                        || crate::runner_state::retry_requested(&value)
                 });
         let recovered_status = if preserve_rework { "rework" } else { "open" };
         conn.execute(
@@ -1460,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn reaper_preserves_dependency_blocked_codex_retry_until_rework_push() {
+    fn reaper_preserves_dependency_blocked_runner_retry_until_rework_push() {
         let (_d, mut c) = open_tmp();
         let dependency = crate::tasks::create(
             &mut c,
@@ -1478,11 +1482,13 @@ mod tests {
         let task_id = crate::tasks::create(
             &mut c,
             "owner",
-            "Codex retry",
+            "runner retry",
             None,
             0,
             None,
-            Some(r#"{"codex_retry_requested":true}"#),
+            Some(
+                r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-1","requested":true}}"#,
+            ),
             Some(&format!("[{dependency}]")),
             None,
             1000,
@@ -1531,7 +1537,7 @@ mod tests {
         );
         crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 10, 1101)
             .unwrap()
-            .expect("resolved Codex retry must claim in rework");
+            .expect("resolved runner retry must claim in rework");
 
         // If the replacement worker's lease lapses, the durable retry marker
         // must not exempt the claimed row forever. Recovery clears the stale
@@ -1545,7 +1551,7 @@ mod tests {
         );
         let refs: serde_json::Value =
             serde_json::from_str(recovered.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs["codex_retry_requested"], true);
+        assert!(crate::runner_state::retry_requested(&refs));
         let active_claims: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
@@ -1557,7 +1563,7 @@ mod tests {
 
         crate::tasks::claim_provider_retry_rework(&mut c, "replacement", task_id, 3600, 1163)
             .unwrap()
-            .expect("recovered Codex retry must be claimable again in rework");
+            .expect("recovered runner retry must be claimable again in rework");
         let pushed = crate::tasks::apply_event(
             &mut c,
             "replacement",
@@ -1567,6 +1573,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pushed.task.status, "in-review");
+    }
+
+    #[test]
+    fn reaper_ignores_stale_codex_request_when_neutral_retry_is_not_requested() {
+        let (_d, mut c) = open_tmp();
+        let task_id = crate::tasks::create(
+            &mut c,
+            "owner",
+            "blocked retry",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-new","requested":false},"codex_retry_requested":true}"#,
+            ),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='rework', updated_at=1000 WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        let reaped = crate::tasks::get(&c, task_id).unwrap().unwrap();
+        assert_eq!(reaped.status, "open");
+        assert!(!crate::runner_state::retry_requested(
+            &serde_json::from_str(reaped.refs.as_deref().unwrap()).unwrap()
+        ));
     }
 
     #[test]

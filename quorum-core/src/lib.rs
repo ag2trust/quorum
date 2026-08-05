@@ -34,6 +34,7 @@ pub mod provision_attempts;
 pub mod review_audits;
 pub mod review_findings;
 pub mod review_interpret_jobs;
+pub mod runner_state;
 pub mod stats;
 pub mod sweep;
 pub mod sync;
