@@ -13,6 +13,7 @@ use std::path::Path;
 pub enum RunnerKind {
     Claude,
     Codex,
+    Grok,
 }
 
 impl std::fmt::Display for RunnerKind {
@@ -20,6 +21,7 @@ impl std::fmt::Display for RunnerKind {
         match self {
             Self::Claude => write!(f, "claude"),
             Self::Codex => write!(f, "codex"),
+            Self::Grok => write!(f, "grok"),
         }
     }
 }
@@ -29,8 +31,9 @@ impl RunnerKind {
         match s {
             None | Some("claude") => Ok(Self::Claude),
             Some("codex") => Ok(Self::Codex),
+            Some("grok") => Ok(Self::Grok),
             Some(other) => Err(QuorumError::Usage(format!(
-                "bad agent value: \"{other}\" (expected \"claude\" or \"codex\")"
+                "bad agent value: \"{other}\" (expected \"claude\", \"codex\", or \"grok\")"
             ))),
         }
     }
@@ -123,6 +126,8 @@ declare_serve_file_config! {
     min_effort: Option<String>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
+    /// Transport-only Grok adapter configuration. Managed Grok roles remain disabled.
+    grok: Option<GrokFileConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +187,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("min_model", ConfigKeyDisposition::Runtime),
     ("min_effort", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
+    ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
     ("test_only_unconsumed", ConfigKeyDisposition::Deprecated),
 ];
@@ -265,6 +271,13 @@ pub fn resolve_roles(
         .or(cli_agent)
         .or(file.agent.as_deref());
     let provider = RunnerKind::from_str_opt(provider_name)?;
+    if provider == RunnerKind::Grok {
+        return Err(QuorumError::Usage(
+            "provider=\"grok\" is not enabled for managed lifecycle roles; \
+             the built-in Grok transport is validation-only"
+                .into(),
+        ));
+    }
     let provider_explicit = file.provider.is_some();
 
     let (
@@ -338,6 +351,20 @@ pub fn resolve_roles(
         || file.review_model.is_some()
         || file.classifier_model.is_some()
         || file.collector_model.is_some();
+    for (role, model) in [
+        ("worker", roles.worker_model.as_str()),
+        ("review", roles.review_model.as_str()),
+        ("classifier", roles.classifier_model.as_str()),
+        ("collector", roles.collector_model.as_str()),
+    ] {
+        if crate::serve::runner::AgentKind::for_model(model)
+            .is_ok_and(|kind| kind == crate::serve::runner::AgentKind::Grok)
+        {
+            return Err(QuorumError::Usage(format!(
+                "{role}_model \"{model}\" selects Grok, but managed Grok lifecycle roles are not enabled"
+            )));
+        }
+    }
     if provider_explicit || role_models_explicit {
         // `review_model` may intentionally select the other supported provider:
         // reviewer spawning resolves its provider from this model. The remaining
@@ -352,6 +379,7 @@ pub fn resolve_roles(
             let expected = match provider {
                 RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
                 RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
+                RunnerKind::Grok => unreachable!("Grok provider was rejected above"),
             };
             if actual != expected {
                 return Err(QuorumError::Usage(format!(
@@ -374,6 +402,45 @@ pub struct CodexFileConfig {
     pub sandbox: Option<String>,
 }
 
+/// `[grok]` transport settings. These are validated now so enabling managed
+/// roles later cannot inherit permissive or misspelled values silently.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrokFileConfig {
+    pub sandbox: Option<String>,
+    pub permission_mode: Option<String>,
+    pub max_turns: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokResolvedConfig {
+    pub sandbox: String,
+    pub permission_mode: String,
+    pub max_turns: u32,
+}
+
+pub fn resolve_grok_adapter(file: Option<&GrokFileConfig>) -> Result<GrokResolvedConfig> {
+    let resolved = GrokResolvedConfig {
+        sandbox: file
+            .and_then(|config| config.sandbox.clone())
+            .unwrap_or_else(|| crate::serve::grok_agent::DEFAULT_SANDBOX.into()),
+        permission_mode: file
+            .and_then(|config| config.permission_mode.clone())
+            .unwrap_or_else(|| crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into()),
+        max_turns: file
+            .and_then(|config| config.max_turns)
+            .unwrap_or(crate::serve::grok_agent::DEFAULT_MAX_TURNS),
+    };
+    crate::serve::grok_agent::GrokAdapterConfig {
+        sandbox: &resolved.sandbox,
+        permission_mode: &resolved.permission_mode,
+        max_turns: resolved.max_turns,
+    }
+    .validate()
+    .map_err(QuorumError::Usage)?;
+    Ok(resolved)
+}
+
 /// Load serve config from `path`. Malformed / unknown keys → exit 2.
 /// When `explicit` is true (user passed --config), missing file → exit 2.
 /// When false (auto-discovered default path), missing file → built-in defaults.
@@ -384,6 +451,7 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             let cfg: ServeFileConfig = toml::from_str(&s).map_err(|e| {
                 QuorumError::Usage(format!("bad serve config {}: {e}", path.display()))
             })?;
+            resolve_grok_adapter(cfg.grok.as_ref())?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
@@ -944,6 +1012,72 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         .unwrap();
         let cfg = load(&path, true).unwrap();
         assert_eq!(cfg.doctor_enabled, Some(true));
+    }
+
+    #[test]
+    fn grok_transport_configuration_is_closed_and_validated() {
+        let cfg: ServeFileConfig = toml::from_str(
+            "[grok]\nsandbox = \"off\"\npermission_mode = \"bypassPermissions\"\nmax_turns = 12\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_grok_adapter(cfg.grok.as_ref()).unwrap(),
+            GrokResolvedConfig {
+                sandbox: "off".into(),
+                permission_mode: "bypassPermissions".into(),
+                max_turns: 12,
+            }
+        );
+        for source in [
+            "[grok]\nsandbox = \"custom\"\n",
+            "[grok]\npermission_mode = \"auto\"\n",
+            "[grok]\nmax_turns = 0\n",
+            "[grok]\nmax_turns = 257\n",
+        ] {
+            let cfg: ServeFileConfig = toml::from_str(source).unwrap();
+            let error = resolve_grok_adapter(cfg.grok.as_ref()).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn load_rejects_invalid_grok_transport_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(&path, "[grok]\npermission_mode = \"default\"\n").unwrap();
+        let error = load(&path, true).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("permission_mode"), "{error}");
+    }
+
+    #[test]
+    fn grok_provider_and_role_models_remain_transport_only() {
+        assert_eq!(
+            RunnerKind::from_str_opt(Some("grok")).unwrap(),
+            RunnerKind::Grok
+        );
+        assert_eq!(RunnerKind::Grok.to_string(), "grok");
+
+        for (source, cli_agent) in [
+            ("provider = \"grok\"\n", None),
+            ("agent = \"grok\"\n", None),
+            ("", Some("grok")),
+        ] {
+            let config: ServeFileConfig = toml::from_str(source).unwrap();
+            let error = resolve_roles(&config, cli_agent, "sonnet", "high").unwrap_err();
+            assert!(error.to_string().contains("not enabled"), "{error}");
+        }
+
+        for key in [
+            "worker_model",
+            "review_model",
+            "classifier_model",
+            "collector_model",
+        ] {
+            let cfg: ServeFileConfig = toml::from_str(&format!("{key} = \"grok-4.5\"\n")).unwrap();
+            let error = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+            assert!(error.to_string().contains("not enabled"), "{key}: {error}");
+        }
     }
 
     #[test]

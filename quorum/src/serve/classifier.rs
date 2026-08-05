@@ -84,6 +84,7 @@ pub async fn spawn_classifier_configured(
             claude_bare: bare,
             claude_allowed_tools: "",
             codex_sandbox,
+            grok: Default::default(),
         },
     )
     .await?;

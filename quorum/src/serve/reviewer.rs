@@ -142,6 +142,7 @@ pub fn build_review_prompt_for_kind(kind: AgentKind, spec: &ReviewerSpec, effort
     match kind {
         AgentKind::Claude => build_review_prompt(spec, effort),
         AgentKind::Codex => build_codex_review_prompt(spec, effort),
+        AgentKind::Grok => unreachable!("Grok managed reviewer roles are not enabled"),
     }
 }
 
@@ -219,6 +220,7 @@ pub fn build_r2_review_prompt_for_kind(
     match kind {
         AgentKind::Claude => build_r2_review_prompt(spec, effort),
         AgentKind::Codex => build_codex_r2_review_prompt(spec, effort),
+        AgentKind::Grok => unreachable!("Grok managed reviewer roles are not enabled"),
     }
 }
 

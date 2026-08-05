@@ -5,11 +5,13 @@
 //! Quorum consumes are parsed into normalized events. Unknown events are inert.
 //!
 //! `journal.session_id` is an opaque runner continuation ID: Claude receives a
-//! Quorum-generated UUID before spawn; Codex will persist the thread ID from
-//! `thread.started`. The column name is retained for schema compatibility.
+//! Quorum-generated UUID before spawn; Codex persists the thread ID from
+//! `thread.started`; Grok persists the session ID from terminal `end`. The
+//! column name is retained for schema compatibility.
 
 use super::agent::AgentProc;
 use super::codex_agent::CodexProc;
+use super::grok_agent::{GrokAdapterConfig, GrokProc};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -20,6 +22,7 @@ const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
 
 pub enum CapturedOutput {
     Stdout(String),
+    StdoutTruncated { dropped: usize },
     Stderr(String),
     StderrTruncated { dropped: usize },
     StderrBytesTruncated { dropped: usize },
@@ -29,6 +32,11 @@ impl CapturedOutput {
     pub fn session_line(&self) -> String {
         match self {
             Self::Stdout(line) => line.clone(),
+            Self::StdoutTruncated { dropped } => serde_json::json!({
+                "type":"provider.stdout_truncated",
+                "dropped_lines":dropped
+            })
+            .to_string(),
             Self::Stderr(text) => {
                 serde_json::json!({"type":"provider.stderr","text":text}).to_string()
             }
@@ -139,6 +147,7 @@ where
 pub enum AgentKind {
     Claude,
     Codex,
+    Grok,
 }
 
 /// Process lifetime declared by a runner adapter. Lifecycle orchestration uses
@@ -166,7 +175,8 @@ pub struct LaunchRequest<'a> {
     pub environment: &'a [(String, String)],
     pub mode: LaunchMode,
     /// Opaque provider identity. Claude uses it as its pre-spawn session UUID;
-    /// Codex uses it to resume the exact provider-issued thread.
+    /// Codex uses it to resume the exact provider-issued thread; Grok uses it
+    /// with the official CLI's exact-session `--resume` command.
     pub continuation_id: Option<&'a str>,
 }
 
@@ -183,6 +193,7 @@ pub struct AdapterConfig<'a> {
     pub claude_bare: bool,
     pub claude_allowed_tools: &'a str,
     pub codex_sandbox: &'a str,
+    pub grok: GrokAdapterConfig<'a>,
 }
 
 /// One raw provider line plus its normalized lifecycle events.
@@ -199,6 +210,7 @@ pub struct NormalizedLine {
 pub enum RunnerProc {
     Claude(AgentProc),
     Codex(CodexProc),
+    Grok(GrokProc),
 }
 
 impl RunnerProc {
@@ -212,6 +224,7 @@ impl RunnerProc {
         match kind {
             AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
+            AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
         }
     }
 
@@ -219,6 +232,7 @@ impl RunnerProc {
         match self {
             Self::Claude(_) => AgentKind::Claude,
             Self::Codex(_) => AgentKind::Codex,
+            Self::Grok(_) => AgentKind::Grok,
         }
     }
 
@@ -226,6 +240,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.kill_and_reap().await,
             Self::Codex(proc) => proc.kill_and_reap().await,
+            Self::Grok(proc) => proc.kill_and_reap().await,
         }
     }
 
@@ -233,6 +248,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.pid(),
             Self::Codex(proc) => proc.pid(),
+            Self::Grok(proc) => proc.pid(),
         }
     }
 
@@ -240,6 +256,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.try_wait(),
             Self::Codex(proc) => proc.try_wait(),
+            Self::Grok(proc) => proc.try_wait(),
         }
     }
 
@@ -247,6 +264,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.next_raw_line().await,
             Self::Codex(proc) => proc.next_raw_line().await,
+            Self::Grok(proc) => proc.next_raw_line().await,
         }
     }
 
@@ -254,6 +272,7 @@ impl RunnerProc {
         match self {
             Self::Claude(_) => AgentProc::normalize_line(raw),
             Self::Codex(_) => CodexProc::normalize_line(raw),
+            Self::Grok(_) => GrokProc::normalize_line(raw),
         }
     }
 
@@ -263,6 +282,10 @@ impl RunnerProc {
             Self::Codex(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Codex is turn-oriented — respawn with its thread ID",
+            )),
+            Self::Grok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Grok is turn-oriented — respawn with its session ID",
             )),
         }
     }
@@ -275,6 +298,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.drain_diagnostics(),
             Self::Codex(proc) => proc.drain_diagnostics(),
+            Self::Grok(proc) => proc.drain_diagnostics(),
         }
     }
 }
@@ -284,6 +308,7 @@ impl AgentKind {
         match self {
             Self::Claude => TurnMode::PersistentChild,
             Self::Codex => TurnMode::RespawnPerTurn,
+            Self::Grok => TurnMode::RespawnPerTurn,
         }
     }
 
@@ -292,7 +317,9 @@ impl AgentKind {
     /// This is the authoritative model-to-runner mapping. Unknown models are
     /// rejected so callers cannot spawn one runner and persist another.
     pub fn for_model(model: &str) -> Result<Self, String> {
-        if model == "o1"
+        if model == super::grok_agent::SUPPORTED_MODEL {
+            Ok(Self::Grok)
+        } else if model == "o1"
             || model == "o3"
             || model.starts_with("o1-")
             || model.starts_with("o3-")
@@ -312,7 +339,7 @@ impl AgentKind {
         } else {
             Err(format!(
                 "unknown model '{model}': cannot resolve provider \
-                 (expected claude-*/Claude alias or supported OpenAI model)"
+                 (expected claude-*/Claude alias, supported OpenAI model, or grok-4.5)"
             ))
         }
     }
@@ -323,6 +350,7 @@ impl std::fmt::Display for AgentKind {
         match self {
             Self::Claude => f.write_str("claude"),
             Self::Codex => f.write_str("codex"),
+            Self::Grok => f.write_str("grok"),
         }
     }
 }
@@ -348,6 +376,7 @@ mod provider_tests {
             AgentKind::Codex.turn_mode(),
             super::TurnMode::RespawnPerTurn
         );
+        assert_eq!(AgentKind::Grok.turn_mode(), super::TurnMode::RespawnPerTurn);
     }
 }
 
@@ -358,8 +387,9 @@ pub enum AgentEvent {
         thread_id: String,
     },
     /// Runner session identity established. For Claude this fires on the
-    /// first assistant event (identity is pre-spawn); for Codex it will fire
-    /// on `thread.started`.
+    /// first assistant event (identity is pre-spawn); for Codex it fires on
+    /// `thread.started`; for Grok it fires immediately before terminal success
+    /// when the `end` event provides `sessionId`.
     AssistantText {
         text: String,
     },
@@ -368,7 +398,8 @@ pub enum AgentEvent {
         summary: String,
     },
     /// Terminal success. `cost_usd` is provider-optional (Claude provides
-    /// session-cumulative USD; Codex does not).
+    /// session-cumulative USD; Codex does not; Grok provides it only when its
+    /// structured terminal protocol marks the ledger complete).
     TurnCompleted {
         usage: Option<TokenUsage>,
         cost_usd: Option<f64>,
@@ -408,10 +439,17 @@ pub fn normalize_codex_line(raw: &str) -> Vec<AgentEvent> {
     CodexProc::normalize_line(raw).events
 }
 
+/// Compatibility entry point for sites that do not hold a process instance.
+/// Provider-specific raw parsing remains owned by the Grok adapter.
+pub fn normalize_grok_line(raw: &str) -> Vec<AgentEvent> {
+    GrokProc::normalize_line(raw).events
+}
+
 pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
     match kind {
         AgentKind::Claude => normalize_claude_line(raw),
         AgentKind::Codex => normalize_codex_line(raw),
+        AgentKind::Grok => normalize_grok_line(raw),
     }
 }
 
@@ -515,6 +553,7 @@ mod tests {
                 claude_bare: true,
                 claude_allowed_tools: "Bash,Read",
                 codex_sandbox: "danger-full-access",
+                grok: Default::default(),
             },
         )
         .await
@@ -565,6 +604,7 @@ mod tests {
                 claude_bare: false,
                 claude_allowed_tools: "",
                 codex_sandbox: "workspace-write",
+                grok: Default::default(),
             },
         )
         .await
@@ -584,6 +624,45 @@ mod tests {
                 .unwrap()
                 .trim(),
             "codex-env"
+        );
+
+        let grok_dir = tempfile::tempdir().unwrap();
+        let grok_bin = recording_runner(grok_dir.path());
+        let grok_environment = vec![("QUORUM_ADAPTER_TEST".into(), "grok-env".into())];
+        let mut grok = RunnerProc::launch(
+            &LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: grok_dir.path(),
+                prompt: "grok prompt",
+                environment: &grok_environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &AdapterConfig {
+                executable: grok_bin.to_str(),
+                claude_bare: true,
+                claude_allowed_tools: "Bash,Read",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(grok.kind(), AgentKind::Grok);
+        while grok.next_raw_line().await.is_some() {}
+        grok.kill_and_reap().await;
+        let args = std::fs::read_to_string(grok_dir.path().join("args.log")).unwrap();
+        assert!(args.contains("<streaming-json>"), "{args}");
+        assert!(args.contains("<grok-4.5>"), "{args}");
+        assert!(args.contains("<grok prompt>"), "{args}");
+        assert!(!args.contains("<--bare>"), "{args}");
+        assert!(!args.contains("<Bash,Read>"), "{args}");
+        assert_eq!(
+            std::fs::read_to_string(grok_dir.path().join("environment.log"))
+                .unwrap()
+                .trim(),
+            "grok-env"
         );
     }
 
@@ -611,6 +690,7 @@ mod tests {
                     claude_bare: false,
                     claude_allowed_tools: "",
                     codex_sandbox: "danger-full-access",
+                    grok: Default::default(),
                 },
             )
             .await
@@ -632,6 +712,7 @@ mod tests {
                         "{args}"
                     );
                 }
+                AgentKind::Grok => unreachable!("fixture contains only Claude and Codex"),
             }
         }
     }
@@ -654,6 +735,7 @@ mod tests {
                 claude_bare: false,
                 claude_allowed_tools: "",
                 codex_sandbox: "read-only",
+                grok: Default::default(),
             },
         )
         .await
@@ -685,6 +767,7 @@ mod tests {
                 claude_bare: false,
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
+                grok: Default::default(),
             },
         )
         .await
@@ -711,6 +794,7 @@ mod tests {
                 claude_bare: false,
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
+                grok: Default::default(),
             },
         )
         .await
@@ -872,6 +956,7 @@ mod tests {
     fn agent_kind_display() {
         assert_eq!(AgentKind::Claude.to_string(), "claude");
         assert_eq!(AgentKind::Codex.to_string(), "codex");
+        assert_eq!(AgentKind::Grok.to_string(), "grok");
     }
 
     #[test]
@@ -906,6 +991,14 @@ mod tests {
             AgentKind::for_model("gpt-5.6-terra").unwrap(),
             AgentKind::Codex
         );
+    }
+
+    #[test]
+    fn for_model_grok_is_exact_and_closed() {
+        assert_eq!(AgentKind::for_model("grok-4.5").unwrap(), AgentKind::Grok);
+        assert!(AgentKind::for_model("grok").is_err());
+        assert!(AgentKind::for_model("grok-4.6").is_err());
+        assert!(AgentKind::for_model("/opt/bin/grok").is_err());
     }
 
     #[test]
