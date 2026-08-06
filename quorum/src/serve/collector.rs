@@ -57,6 +57,7 @@ pub struct CollectionRequest {
     pub bare_agent: bool,
     pub collector_model: String,
     pub collector_effort: String,
+    pub role_assignment_id: Option<i64>,
     pub codex_sandbox: String,
     /// Extra env vars threaded into the spawned classifier process. Empty in
     /// production. Used by tests to script the fake-agent binary per-call so
@@ -86,6 +87,7 @@ impl CollectionRequest {
             bare_agent,
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
+            role_assignment_id: None,
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
         }
@@ -177,6 +179,7 @@ pub async fn run_collection_with_inputs(
     let task_id = request.task_id;
     let db_path = request.db_path.clone();
     let collector_model = request.collector_model.clone();
+    let role_assignment_id = request.role_assignment_id;
     let count = findings.len() as i64;
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
@@ -194,6 +197,7 @@ pub async fn run_collection_with_inputs(
                 findings_count: count,
                 attempted_at,
                 completed_at: Some(now),
+                role_assignment_id,
             },
         )?;
         Ok(())
@@ -229,6 +233,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let task_id = request.task_id;
     let error_text = error.to_string();
     let collector_model = request.collector_model.clone();
+    let role_assignment_id = request.role_assignment_id;
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = quorum_core::db::open(&db_path)?;
         let now = clock::now();
@@ -244,6 +249,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 findings_count: 0,
                 attempted_at,
                 completed_at: Some(now),
+                role_assignment_id,
             },
         )?;
         quorum_core::errlog::log_error(&conn, now, "review-collector", &error_text);
@@ -835,6 +841,7 @@ mod tests {
             bare_agent: true,
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
+            role_assignment_id: None,
             codex_sandbox: "danger-full-access".to_string(),
             env_vars,
         }
@@ -1104,6 +1111,7 @@ mod tests {
             bare_agent: true,
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
+            role_assignment_id: None,
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
         };

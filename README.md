@@ -43,6 +43,9 @@ cp target/release/quorum ~/.local/bin/
 quorum init
 ```
 
+For the initial self-hostable container image, including its persistence and provider
+packaging contract, see [`docker/README.md`](docker/README.md).
+
 State lives under `~/.quorum/repos/<owner>__<name>/`.
 
 ## Start it

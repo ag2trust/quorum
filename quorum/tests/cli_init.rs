@@ -162,6 +162,12 @@ fn init_creates_serve_config_scaffold() {
         content.contains("R2 pre-merge review sampling"),
         "scaffold must document R2 sampling"
     );
+    assert!(
+        content.contains("[model_profiles.primary]")
+            && content.contains("[routing.classifier]")
+            && content.contains("[routing.reviewer.\"1\"]"),
+        "scaffold must document the required hard-cutover routing policy"
+    );
 }
 
 #[test]

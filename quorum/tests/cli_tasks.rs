@@ -242,6 +242,8 @@ fn task_creators_cannot_inject_managed_runner_state() {
             "boss",
             "--task-id",
             "1",
+            "--expected-revision",
+            "1",
             "--refs",
             r#"{"ticket":"ABC"}"#,
         ])

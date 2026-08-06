@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod approvals;
 pub mod classifier;
+pub mod cleanup;
 #[allow(dead_code)]
 pub mod codex_agent;
 #[allow(dead_code)]
@@ -15,6 +16,7 @@ pub mod doctor;
 pub mod grok_agent;
 pub mod merge;
 pub mod names;
+pub mod planner;
 pub mod recovery;
 pub mod render;
 pub mod reviewer;
@@ -32,12 +34,33 @@ use quorum_core::pr_targets;
 use quorum_core::runner_state::{self, ContinuationIdentity, ContinuationSlot, PendingTurn};
 use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
+use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+
+fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<String>> {
+    let conn = quorum_core::db::open(db_path)?;
+    quorum_core::decomposition_review::load(&conn, task_id)?
+        .map(|context| context.to_bounded_json())
+        .transpose()
+}
+
+fn prepare_reviewer_authority(
+    db_path: &Path,
+    task_id: i64,
+    run_id: &str,
+    reviewer: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let mut conn = quorum_core::db::open(db_path)?;
+    quorum_core::decomposition_review::load_and_issue_capability(
+        &mut conn, task_id, run_id, reviewer, now,
+    )
+}
 use tokio::io::{AsyncRead, AsyncReadExt};
 use worktree::WorktreeManager;
 
@@ -69,6 +92,114 @@ impl ReviewRole {
     fn is_r2(&self) -> bool {
         matches!(self, ReviewRole::R2 { .. })
     }
+}
+
+fn configured_routing_pool(
+    config: &ServeConfig,
+    role: &str,
+    complexity: Option<u8>,
+    review_stage: Option<&str>,
+) -> Result<quorum_core::role_assignments::ValidatedPool> {
+    let percentages = match role {
+        "classifier" => &config.routing.classifier,
+        "planner" => &config.routing.planner,
+        "collector" => &config.routing.collector,
+        "worker" => config
+            .routing
+            .worker
+            .get(
+                &complexity
+                    .ok_or_else(|| QuorumError::Usage("worker routing requires complexity".into()))?
+                    .to_string(),
+            )
+            .ok_or_else(|| QuorumError::Usage("missing worker complexity pool".into()))?,
+        "reviewer" => config
+            .routing
+            .reviewer
+            .get(
+                &complexity
+                    .ok_or_else(|| {
+                        QuorumError::Usage("reviewer routing requires complexity".into())
+                    })?
+                    .to_string(),
+            )
+            .ok_or_else(|| QuorumError::Usage("missing reviewer complexity pool".into()))?,
+        _ => return Err(QuorumError::Usage(format!("unknown routing role {role}"))),
+    };
+    let base_key = match complexity {
+        Some(level) => format!("{role}.{level}"),
+        None => role.to_string(),
+    };
+    let pool_key = review_stage.map_or(base_key.clone(), |stage| format!("{base_key}.{stage}"));
+    let policy_generation =
+        crate::serve_config::routing_generation(&base_key, percentages, &config.model_profiles)?;
+    let mut weighted = Vec::with_capacity(percentages.len());
+    for (profile_id, percentage) in percentages {
+        let profile = &config.model_profiles[profile_id];
+        weighted.push(quorum_core::role_assignments::WeightedProfile {
+            profile: quorum_core::role_assignments::ModelProfile {
+                id: profile_id.clone(),
+                provider: profile.runner.clone(),
+                runner: profile.runner.clone(),
+                model: profile.model.clone(),
+                effort: profile.effort.clone(),
+            },
+            percent: *percentage,
+        });
+    }
+    Ok(quorum_core::role_assignments::ValidatedPool {
+        pool_key,
+        policy_generation,
+        profiles: weighted,
+    })
+}
+
+fn assign_role(
+    config: &ServeConfig,
+    request: quorum_core::role_assignments::AssignmentRequest,
+    complexity: Option<u8>,
+) -> Result<quorum_core::role_assignments::RoleAssignment> {
+    let pool = configured_routing_pool(
+        config,
+        &request.role,
+        complexity,
+        request.review_stage.as_deref(),
+    )?;
+    let mut conn = quorum_core::db::open(&config.db_path)?;
+    quorum_core::role_assignments::assign_or_get(&mut conn, &request, &pool, now_unix())
+}
+
+fn assign_classifier_batch(
+    config: &ServeConfig,
+    tasks: &[quorum_core::classify::TaskForClassification],
+) -> Result<quorum_core::role_assignments::RoleAssignment> {
+    let identity = tasks
+        .iter()
+        .map(|task| format!("{}:{}", task.id, task.revision))
+        .collect::<Vec<_>>()
+        .join(",");
+    let responsibility_key = if tasks.len() == 1 {
+        format!(
+            "classifier:task:{}:revision:{}",
+            tasks[0].id, tasks[0].revision
+        )
+    } else {
+        // Decomposition preclassification has one durably accepted proposal;
+        // its ordered synthetic task identities are stable across retries.
+        format!("classifier:decomposition-batch:{identity}")
+    };
+    assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key,
+            task_id: (tasks.len() == 1).then_some(tasks[0].id),
+            pr_number: None,
+            role: "classifier".into(),
+            review_stage: None,
+            complexity: None,
+        },
+        None,
+    )
 }
 
 struct PoisonTracker {
@@ -246,6 +377,99 @@ fn review_head_matches_launch(
     )
 }
 
+#[derive(Debug)]
+struct LiveGraphBlockerAuthority<'a> {
+    agent_run_id: Option<i64>,
+    task_id: i64,
+    agent: &'a str,
+    cap_run_id: Option<&'a str>,
+    pr: Option<i64>,
+    head_sha: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphBlockerConsumeOutcome {
+    Blocked,
+    Rejected,
+    RetryHeadUnavailable,
+}
+
+/// Storage-only graph-blocker convergence boundary. External head resolution
+/// happens before this call; immutable launch authority comes only from the
+/// daemon-written agent_run row, never from a worktree or mailbox assertion.
+fn consume_graph_blocker_signal(
+    conn: &mut quorum_core::Connection,
+    mailbox_id: i64,
+    row: &mailbox::MailboxRow,
+    current_head_sha: Option<&str>,
+    live: Option<&LiveGraphBlockerAuthority<'_>>,
+    now: i64,
+) -> Result<GraphBlockerConsumeOutcome> {
+    let envelope = row
+        .payload
+        .as_deref()
+        .and_then(|raw| crate::graph_blocker::parse_envelope(raw).ok());
+    let launch = match envelope.as_ref() {
+        Some(value) => quorum_core::agent_runs::review_launch_for_capability(conn, &value.run_id)?,
+        None => None,
+    };
+    let structural_matches = match (
+        row.kind == mailbox::MailboxKind::Done,
+        row.verdict.as_deref(),
+        row.task_id,
+        row.pr,
+        envelope.as_ref(),
+        launch.as_ref(),
+    ) {
+        (true, Some("graph-blocker"), Some(task), Some(pr), Some(envelope), Some(launch)) => {
+            task == launch.task_id
+                && pr == launch.pr
+                && row.agent == launch.agent_name
+                && envelope.feedback.affected_task == launch.task_id
+                && envelope.run_id == launch.cap_run_id
+                && live.is_none_or(|slot| {
+                    slot.agent_run_id == Some(launch.agent_run_id)
+                        && slot.task_id == launch.task_id
+                        && slot.agent == launch.agent_name
+                        && slot.cap_run_id == Some(launch.cap_run_id.as_str())
+                        && slot.pr == Some(launch.pr)
+                        && slot.head_sha == Some(launch.head_sha.as_str())
+                })
+        }
+        _ => false,
+    };
+    if structural_matches && current_head_sha.is_none() {
+        return Ok(GraphBlockerConsumeOutcome::RetryHeadUnavailable);
+    }
+    let identity_matches = structural_matches
+        && launch.as_ref().is_some_and(|launch| {
+            review_head_matches_launch(Some(&launch.head_sha), current_head_sha)
+        });
+    let blocked = if identity_matches {
+        let envelope = envelope.expect("matched envelope");
+        quorum_core::decomposition::block_graph(
+            conn,
+            &quorum_core::decomposition::GraphBlocker {
+                task_id: envelope.feedback.affected_task,
+                reviewer: &row.agent,
+                run_id: &envelope.run_id,
+                category: &envelope.feedback.category,
+                violated_boundary: &envelope.feedback.violated_assigned_boundary,
+                evidence: &envelope.feedback.evidence,
+                now,
+            },
+        )?
+    } else {
+        false
+    };
+    mailbox::mark_consumed(conn, mailbox_id)?;
+    Ok(if blocked {
+        GraphBlockerConsumeOutcome::Blocked
+    } else {
+        GraphBlockerConsumeOutcome::Rejected
+    })
+}
+
 /// Whether an R2 was required for this PR head when R1 approved. Decisions are
 /// retained in a daemon-owned table by PR and head SHA so a later rework head
 /// cannot change the requirement if an earlier head is force-pushed back.
@@ -343,47 +567,6 @@ fn is_provision_exhausted(
     let attempts =
         quorum_core::provision_attempts::get_attempts(conn, task_id, pr, role, head_sha)?;
     Ok(attempts >= MAX_REVIEWER_PROVISION_STRIKES as i64)
-}
-
-/// Record a reviewer provisioning failure before returning to the daemon loop.
-/// Configuration/recovery mismatches must use this same bounded path as
-/// worktree and process failures; otherwise a stale persisted reviewer aborts
-/// every tick without ever parking the task.
-async fn record_reviewer_provision_failure(
-    config: &ServeConfig,
-    task_id: i64,
-    pr: i64,
-    role: &ReviewRole,
-    head_sha: &str,
-) {
-    let role_str = role.as_str().to_string();
-    let sha = head_sha.to_string();
-    let strikes = {
-        let p = config.db_path.clone();
-        tokio::task::spawn_blocking(move || -> i64 {
-            quorum_core::db::open(&p)
-                .ok()
-                .and_then(|mut conn| {
-                    quorum_core::provision_attempts::record_attempt(
-                        &mut conn, task_id, pr, &role_str, &sha,
-                    )
-                    .ok()
-                })
-                .unwrap_or(0)
-        })
-        .await
-        .unwrap_or(0)
-    };
-    log(&format!(
-        "{} provision strike {strikes}/{MAX_REVIEWER_PROVISION_STRIKES} for task #{task_id} PR #{pr}",
-        role.as_str().to_uppercase()
-    ));
-    if strikes >= MAX_REVIEWER_PROVISION_STRIKES as i64 {
-        log(&format!(
-            "REVIEWER PROVISION EXHAUSTED: parking task #{task_id} after {strikes} consecutive {} provision failures for PR #{pr}",
-            role.as_str().to_uppercase()
-        ));
-    }
 }
 
 /// Check whether total reviewer runs for a task exceed the safety cap.
@@ -1135,7 +1318,31 @@ fn log(msg: &str) {
 /// `review_collection_runs` table (loud, observable, retryable) and MUST NOT
 /// touch the completed task. See serve/collector.rs.
 fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
-    let request = collector::CollectionRequest::new(
+    let assignment = match assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!("collector:pr:{pr_num}"),
+            task_id: Some(task_id),
+            pr_number: Some(pr_num),
+            role: "collector".into(),
+            review_stage: None,
+            complexity: None,
+        },
+        None,
+    ) {
+        Ok(assignment) => assignment,
+        Err(error) => {
+            log(&format!(
+                "collector routing failed for PR #{pr_num}: {error}"
+            ));
+            return;
+        }
+    };
+    let collector_agent_bin = resolve_provider(&assignment.model)
+        .ok()
+        .and_then(|kind| agent_bin_for_kind(config, kind))
+        .map(str::to_owned);
+    let mut request = collector::CollectionRequest::new(
         pr_num,
         Some(task_id),
         // ServeConfig::repo is the "owner/name" slug this daemon manages —
@@ -1148,14 +1355,15 @@ fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
         },
         config.db_path.clone(),
         config.repo_dir.clone(),
-        config.agent_bin.clone(),
+        collector_agent_bin,
         config.bare_agent,
     )
     .with_collector(
-        config.collector_model.clone(),
-        config.collector_effort.clone(),
+        assignment.model.clone(),
+        assignment.effort.clone(),
         config.codex_sandbox.clone(),
     );
+    request.role_assignment_id = Some(assignment.id);
     collector::spawn_detached(request);
 }
 
@@ -1366,6 +1574,7 @@ fn persist_continue_pr_baseline(
     Ok(())
 }
 
+#[cfg(test)]
 fn tier_to_model_id(tier: &str) -> Option<String> {
     quorum_core::model_tiers::model_id_for_tier(tier).map(str::to_string)
 }
@@ -1390,13 +1599,8 @@ fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind
 }
 
 fn explicitly_configured_provider(config: &ServeConfig) -> Option<runner::AgentKind> {
-    config
-        .provider_explicit
-        .then_some(match config.runner_kind {
-            crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
-            crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
-            crate::serve_config::RunnerKind::Grok => runner::AgentKind::Grok,
-        })
+    let _ = config;
+    None
 }
 
 fn require_configured_provider(
@@ -1407,22 +1611,7 @@ fn require_configured_provider(
     require_provider_match(explicitly_configured_provider(config), actual, context)
 }
 
-/// Reviewer recovery is governed by the configured reviewer model, not the
-/// worker provider. This permits an intentional cross-provider reviewer while
-/// still refusing to revive a persisted reviewer from a different configuration.
-fn require_configured_reviewer_provider(
-    config: &ServeConfig,
-    actual: runner::AgentKind,
-    context: &str,
-) -> Result<()> {
-    require_reviewer_provider(
-        config.provider_explicit || config.review_model_explicit,
-        &config.review_model,
-        actual,
-        context,
-    )
-}
-
+#[cfg(test)]
 fn require_reviewer_provider(
     provider_explicit: bool,
     review_model: &str,
@@ -1439,12 +1628,12 @@ fn require_reviewer_provider(
 /// may intentionally use the other provider, in which case it must use that
 /// provider's default executable rather than receiving incompatible flags.
 fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&str> {
-    agent_bin_for_runner(
-        config.provider_explicit || config.review_model_explicit,
-        config.runner_kind,
-        config.agent_bin.as_deref(),
-        kind,
-    )
+    let runner_kind = match config.model_profiles.values().next()?.runner.as_str() {
+        "claude" => crate::serve_config::RunnerKind::Claude,
+        "codex" => crate::serve_config::RunnerKind::Codex,
+        _ => return None,
+    };
+    agent_bin_for_runner(true, runner_kind, config.agent_bin.as_deref(), kind)
 }
 
 fn agent_bin_for_runner(
@@ -1480,6 +1669,7 @@ fn runner_adapter_config<'a>(
     }
 }
 
+#[cfg(test)]
 fn configured_reviewer_selection<'a>(
     provider_explicit: bool,
     review_model_explicit: bool,
@@ -1504,6 +1694,7 @@ fn require_provider_match(
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_remediation_provider(
     recorded_provider: Option<&str>,
     recorded_model: Option<String>,
@@ -1533,6 +1724,7 @@ fn resolve_remediation_provider(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReviewerRecovery {
     agent: String,
+    assignment_id: Option<i64>,
     model: String,
     effort: String,
     kind: runner::AgentKind,
@@ -1592,6 +1784,7 @@ fn resolve_reviewer_recovery(
     }
     Ok(Some(ReviewerRecovery {
         agent: run.agent,
+        assignment_id: run.role_assignment_id,
         model: run.model,
         effort: run.effort,
         kind,
@@ -1599,6 +1792,7 @@ fn resolve_reviewer_recovery(
     }))
 }
 
+#[cfg(test)]
 const MODEL_TIERS: &[&str] = &[
     "claude-sonnet-5",
     "claude-opus-4-6",
@@ -1606,10 +1800,12 @@ const MODEL_TIERS: &[&str] = &[
     "claude-opus-4-8",
 ];
 
+#[cfg(test)]
 fn model_rank(model: &str) -> Option<usize> {
     MODEL_TIERS.iter().position(|&m| m == model)
 }
 
+#[cfg(test)]
 fn escalated_reviewer_model(worker_model: &str, config_model: &str) -> Result<String> {
     use crate::serve::runner::AgentKind;
     let worker_is_claude = resolve_provider(worker_model)? == AgentKind::Claude;
@@ -1640,6 +1836,7 @@ fn classifier_complexity(refs: &Option<String>) -> Option<u8> {
         .filter(|value| (1..=5).contains(value))
 }
 
+#[cfg(test)]
 fn effort_rank(effort: &str) -> u8 {
     match effort {
         "medium" => 1,
@@ -1648,6 +1845,7 @@ fn effort_rank(effort: &str) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn recommendation_provider(
     kind: crate::serve_config::RunnerKind,
 ) -> quorum_core::complexity::RecommendationProvider {
@@ -1664,6 +1862,7 @@ fn recommendation_provider(
     }
 }
 
+#[cfg(test)]
 fn suggested_for(
     cx: u8,
     provider: crate::serve_config::RunnerKind,
@@ -1691,6 +1890,7 @@ fn suggested_for(
         })
 }
 
+#[cfg(test)]
 fn classifier_worker_selection(
     task_id: i64,
     refs: &Option<String>,
@@ -1712,6 +1912,7 @@ fn classifier_worker_selection(
 /// resolved value stands in as the missing companion, so the combined floor
 /// comparison only fires on the configured dimension.
 /// Never lowers a pair already at/above the floor.
+#[cfg(test)]
 fn apply_model_effort_floor(
     resolved_model: &str,
     resolved_effort: &str,
@@ -1733,6 +1934,7 @@ fn apply_model_effort_floor(
 /// Compare against the mandatory Claude-only worker floor. Legacy mode permits
 /// a Codex task tier with a Claude floor; that task must still be clamped to
 /// the floor rather than silently bypassing it.
+#[cfg(test)]
 fn is_below_model_effort_floor(
     resolved_model: &str,
     resolved_effort: &str,
@@ -1852,22 +2054,12 @@ pub struct CostLimits {
 pub struct ServeConfig {
     pub db_path: PathBuf,
     pub cap: usize,
-    #[allow(dead_code)]
-    pub runner_kind: crate::serve_config::RunnerKind,
+    pub model_profiles: std::collections::BTreeMap<String, crate::serve_config::ModelProfile>,
+    pub routing: crate::serve_config::RoutingPolicy,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
     pub names_file: Option<PathBuf>,
     pub agent_bin: Option<String>,
-    pub model: String,
-    pub effort: String,
-    pub provider_explicit: bool,
-    pub review_model_explicit: bool,
-    pub review_model: String,
-    pub review_effort: String,
-    pub classifier_model: String,
-    pub classifier_effort: String,
-    pub collector_model: String,
-    pub collector_effort: String,
     pub merge_executor: Arc<dyn merge::MergeExecutor>,
     /// Pass `--bare` to spawned agents, stripping operator-local hooks,
     /// plugins, memory, and MCP config. Default: false (inherit operator login).
@@ -1917,13 +2109,6 @@ pub struct ServeConfig {
     pub r2_target_per_stratum: i64,
     /// Probability of an R2 after its stratum reaches the coverage target.
     pub r2_steady_state_p: f64,
-    /// Per-complexity suggested model/effort overrides (keys "1".."5", values "tier/effort").
-    pub suggested_models: std::collections::HashMap<String, String>,
-    /// #172: minimum worker model floor as a full model id (e.g. "claude-opus-4-7"),
-    /// or None for no floor. Validated + tier→id converted at config load.
-    pub min_model: Option<String>,
-    /// #172: minimum worker effort floor ("medium"|"high"), or None for no floor.
-    pub min_effort: Option<String>,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
 }
@@ -2293,7 +2478,22 @@ async fn recover_late_worker_completions(config: &ServeConfig) -> Result<()> {
 /// Reconcile late reviewer verdicts before generic recovery deletes the
 /// journal/worktree identity. Git and PR-head lookups happen before the core
 /// transaction; that transaction itself is storage-only.
-async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateReviewerRecovery {
+    Settled,
+    Deferred,
+}
+
+fn ensure_late_reviewer_recovery_settled(outcome: LateReviewerRecovery) -> Result<()> {
+    match outcome {
+        LateReviewerRecovery::Settled => Ok(()),
+        LateReviewerRecovery::Deferred => Err(QuorumError::Io(
+            "late reviewer recovery deferred: graph-blocker PR head unavailable; preserving reviewer authority for retry after relaunch".into(),
+        )),
+    }
+}
+
+async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<LateReviewerRecovery> {
     let p = config.db_path.clone();
     let rows = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, mailbox::MailboxRow)>> {
         let conn = quorum_core::db::open(&p)?;
@@ -2301,7 +2501,50 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
     })
     .await
     .map_err(|error| QuorumError::Io(format!("late reviewer poll join: {error}")))??;
+    let mut deferred = false;
     for (mailbox_id, row) in rows {
+        if row.kind == mailbox::MailboxKind::Done && row.verdict.as_deref() == Some("graph-blocker")
+        {
+            let current_sha = if let Some(pr) = row.pr.filter(|pr| *pr > 0) {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("late graph blocker head lookup join: {error}"))
+                    })?
+            } else {
+                None
+            };
+            let p = config.db_path.clone();
+            let row_owned = row.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut conn = quorum_core::db::open(&p)?;
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    mailbox_id,
+                    &row_owned,
+                    current_sha.as_deref(),
+                    None,
+                    now_unix(),
+                )
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("late graph blocker join: {error}")))??;
+            log(&format!(
+                "startup graph blocker {} for task {:?}",
+                match outcome {
+                    GraphBlockerConsumeOutcome::Blocked => "folded",
+                    GraphBlockerConsumeOutcome::Rejected => "rejected",
+                    GraphBlockerConsumeOutcome::RetryHeadUnavailable => {
+                        "head unavailable; retaining for retry"
+                    }
+                },
+                row.task_id
+            ));
+            deferred |= outcome == GraphBlockerConsumeOutcome::RetryHeadUnavailable;
+            continue;
+        }
         let (Some(task_id), Some(pr), Some(raw_verdict)) =
             (row.task_id, row.pr, row.verdict.as_deref())
         else {
@@ -2390,7 +2633,11 @@ async fn recover_late_reviewer_verdicts(config: &ServeConfig) -> Result<()> {
             ));
         }
     }
-    Ok(())
+    Ok(if deferred {
+        LateReviewerRecovery::Deferred
+    } else {
+        LateReviewerRecovery::Settled
+    })
 }
 
 fn daemon_rework_retry_requested(refs: Option<&str>) -> bool {
@@ -2532,6 +2779,316 @@ struct DrainState {
     known_base_sha: Option<String>,
 }
 
+#[derive(Default)]
+struct DecompositionCoordinator {
+    graph_id: Option<i64>,
+    proposal: Option<Vec<planner::ProposedTask>>,
+    planner_slot: Option<planner::PlannerSlot>,
+    classifier_slot: Option<classifier::ClassifierSlot>,
+    planner_view: Option<tempfile::TempDir>,
+}
+
+#[derive(Clone)]
+struct PlanningSnapshot {
+    graph_id: i64,
+    source_task_id: i64,
+    source_revision: i64,
+    state: String,
+    freeze_active: bool,
+    updated_at: i64,
+    title: String,
+    body: Option<String>,
+    dependencies: Vec<i64>,
+    rejection_summaries: Vec<String>,
+    accepted_proposal: Option<Vec<planner::ProposedTask>>,
+    frozen_base_sha: String,
+}
+
+const DECOMPOSITION_PROVIDER_BACKOFF_SECS: i64 = 5;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DecompositionLiveWork {
+    // These are the only provider/network futures retained across tick
+    // boundaries. Merge, publication, collector, and recovery calls are
+    // awaited inline, so tick cannot begin the drain transition concurrently
+    // with one of those operations.
+    ordinary_classifier: bool,
+    doctor: bool,
+    pre_review_checks: bool,
+}
+
+fn decomposition_drain_ready(
+    workers: usize,
+    reviewers: usize,
+    durable_journal: i64,
+    live: DecompositionLiveWork,
+) -> bool {
+    workers == 0
+        && reviewers == 0
+        && durable_journal == 0
+        && !live.ordinary_classifier
+        && !live.doctor
+        && !live.pre_review_checks
+}
+type PlanningSnapshotRow = (
+    i64,
+    i64,
+    i64,
+    String,
+    bool,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<PlanningSnapshot>> {
+    use rusqlite::OptionalExtension;
+    let row: Option<PlanningSnapshotRow> = conn
+        .query_row(
+            "SELECT d.id,d.source_task_id,d.planned_source_revision,d.state,d.freeze_active,
+                    d.updated_at,t.title,t.body,t.depends_on,d.accepted_proposal_json,
+                    d.frozen_base_sha
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
+             ORDER BY d.id LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        graph_id,
+        source_task_id,
+        source_revision,
+        state,
+        freeze_active,
+        updated_at,
+        title,
+        body,
+        depends_on,
+        accepted_proposal_json,
+        frozen_base_sha,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let dependencies = depends_on
+        .as_deref()
+        .map(serde_json::from_str::<Vec<i64>>)
+        .transpose()
+        .map_err(|error| QuorumError::Io(format!("invalid planning source dependencies: {error}")))?
+        .unwrap_or_default();
+    let accepted_proposal = accepted_proposal_json
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| QuorumError::Io(format!("invalid durable accepted proposal: {error}")))?;
+    let mut statement = conn.prepare(
+        "SELECT summary FROM decomposition_attempts
+         WHERE graph_id=?1 AND kind='proposal' ORDER BY ordinal DESC LIMIT 3",
+    )?;
+    let rejection_summaries = statement
+        .query_map([graph_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(Some(PlanningSnapshot {
+        graph_id,
+        source_task_id,
+        source_revision,
+        state,
+        freeze_active,
+        updated_at,
+        title,
+        body,
+        dependencies,
+        rejection_summaries,
+        accepted_proposal,
+        frozen_base_sha: frozen_base_sha.unwrap_or_default(),
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupDecompositionState {
+    None,
+    Frozen,
+    Active,
+    Blocked,
+}
+
+fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupDecompositionState> {
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, bool, Option<String>)> = conn
+        .query_row(
+            "SELECT state,freeze_active,accepted_proposal_json
+             FROM task_decompositions
+             WHERE state NOT IN ('held','completed','cancelled')
+             ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((state, freeze, proposal)) = row else {
+        return Ok(StartupDecompositionState::None);
+    };
+    if matches!(state.as_str(), "validating" | "preclassifying") {
+        let raw = proposal.ok_or_else(|| {
+            QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
+        })?;
+        serde_json::from_str::<Vec<planner::ProposedTask>>(&raw).map_err(|error| {
+            QuorumError::Io(format!(
+                "{state} decomposition proposal is invalid: {error}"
+            ))
+        })?;
+    }
+    Ok(if freeze {
+        StartupDecompositionState::Frozen
+    } else if state == "active" {
+        StartupDecompositionState::Active
+    } else if state == "blocked" {
+        StartupDecompositionState::Blocked
+    } else {
+        StartupDecompositionState::None
+    })
+}
+
+async fn reconcile_decomposition_startup(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+) -> Result<StartupDecompositionState> {
+    let path = config.db_path.clone();
+    let (state, snapshot) = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&path)?;
+        tasks::clear_reviewer_provision_reservations(&mut conn)?;
+        quorum_core::decomposition::reconcile_startup_graphs(&mut conn, now_unix())?;
+        Ok::<_, QuorumError>((
+            inspect_startup_decomposition(&conn)?,
+            load_planning_snapshot(&conn)?,
+        ))
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition startup join: {error}")))??;
+    if let Some(snapshot) = snapshot {
+        coordinator.graph_id = Some(snapshot.graph_id);
+        coordinator.proposal = snapshot.accepted_proposal;
+    }
+    Ok(state)
+}
+
+fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
+    use rusqlite::OptionalExtension;
+    Ok(conn
+        .query_row(
+            "SELECT t.id,t.revision FROM tasks t
+         WHERE t.status='open' AND t.assignee IS NULL AND t.review_only=0
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
+                           WHERE repository_graph.state IN ('active','blocked')
+                              OR repository_graph.active=1)
+           AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
+           AND json_extract(t.refs,'$.cx_size') IN ('L','XL')
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
+           AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
+           AND (t.depends_on IS NULL OR NOT EXISTS (
+               SELECT 1 FROM json_each(t.depends_on) dep
+               WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite
+                                 WHERE prerequisite.id=dep.value AND prerequisite.status='done')
+           ))
+         ORDER BY t.priority DESC,t.id ASC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::TempDir> {
+    let repo = repo.to_path_buf();
+    let frozen_sha = frozen_sha.to_string();
+    tokio::task::spawn_blocking(move || -> Result<tempfile::TempDir> {
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .map_err(|error| QuorumError::Io(format!("planner HEAD check failed: {error}")))?;
+        let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        if !head.status.success() || current != frozen_sha {
+            return Err(QuorumError::Io(format!(
+                "planner source drifted from frozen base {frozen_sha} to {current}"
+            )));
+        }
+        let archive = std::process::Command::new("git")
+            .args(["archive", "--format=tar", &frozen_sha])
+            .current_dir(&repo)
+            .output()
+            .map_err(|error| QuorumError::Io(format!("planner archive failed: {error}")))?;
+        if !archive.status.success() {
+            return Err(QuorumError::Io("planner frozen archive was refused".into()));
+        }
+        let view = tempfile::tempdir()
+            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+        let mut tar = std::process::Command::new("tar")
+            .args(["-xf", "-", "-C"])
+            .arg(view.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                QuorumError::Io(format!("planner archive extraction failed: {error}"))
+            })?;
+        use std::io::Write;
+        tar.stdin
+            .take()
+            .ok_or_else(|| QuorumError::Io("planner archive stdin unavailable".into()))?
+            .write_all(&archive.stdout)
+            .map_err(|error| QuorumError::Io(format!("planner archive write failed: {error}")))?;
+        let status = tar
+            .wait()
+            .map_err(|error| QuorumError::Io(format!("planner archive wait failed: {error}")))?;
+        if !status.success() {
+            return Err(QuorumError::Io(
+                "planner archive extraction was refused".into(),
+            ));
+        }
+        Ok(view)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("planner view join failed: {error}")))?
+}
+
+async fn repository_head_sha(repo: &Path) -> Result<String> {
+    let repo = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .map_err(|error| QuorumError::Io(format!("frozen-base capture failed: {error}")))?;
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !output.status.success()
+            || !matches!(sha.len(), 40 | 64)
+            || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(QuorumError::Io(
+                "frozen-base capture returned no valid commit SHA".into(),
+            ));
+        }
+        Ok(sha)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("frozen-base capture join failed: {error}")))?
+}
+
 impl DrainState {
     fn new() -> Self {
         Self {
@@ -2577,6 +3134,685 @@ impl DrainState {
         self.drain_started_at
             .is_some_and(|t| t.elapsed().as_secs() >= timeout_secs)
     }
+}
+
+async fn record_decomposition_attempt(
+    config: &ServeConfig,
+    graph_id: i64,
+    kind: &'static str,
+    code: &str,
+    summary: &str,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    let code = code.to_string();
+    let summary = truncate_utf8_bytes(summary, 2048).to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph_id,
+            kind,
+            &code,
+            &summary,
+            now_unix(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition attempt join: {error}")))??;
+    Ok(())
+}
+
+fn decomposition_process_name(graph_id: i64, role: &str) -> String {
+    format!("decomposition-{role}-{graph_id}")
+}
+
+async fn journal_decomposition_process(
+    config: &ServeConfig,
+    graph_id: i64,
+    source_task_id: i64,
+    role: &str,
+    pid: Option<i32>,
+    frozen_view: Option<&Path>,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    let role = role.to_string();
+    let entry = JournalEntry {
+        agent: decomposition_process_name(graph_id, &role),
+        role: role.clone(),
+        task_id: Some(source_task_id),
+        session_id: agent::new_session_id(),
+        worktree: frozen_view.map(|path| path.to_string_lossy().into_owned()),
+        branch: None,
+        phase: role,
+        cost_tokens: 0,
+        agent_state: None,
+        cost_usd: 0.0,
+        log_dir: None,
+        pid,
+        pr: None,
+        rework_count: 0,
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition journal join: {error}")))??;
+    Ok(())
+}
+
+async fn delete_decomposition_process(
+    config: &ServeConfig,
+    graph_id: i64,
+    role: &str,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    let name = decomposition_process_name(graph_id, role);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        journal::delete(&mut conn, &name)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition journal delete join: {error}")))??;
+    Ok(())
+}
+
+fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+async fn reset_decomposition_to_planning(
+    config: &ServeConfig,
+    graph_id: i64,
+    from: &'static str,
+) -> Result<()> {
+    let path = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            graph_id,
+            from,
+            "planning",
+            None,
+            now_unix(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("decomposition phase join: {error}")))??;
+    Ok(())
+}
+
+fn proposed_classifier_tasks(
+    tasks: &[planner::ProposedTask],
+) -> Vec<quorum_core::classify::TaskForClassification> {
+    tasks
+        .iter()
+        .enumerate()
+        .map(
+            |(index, task)| quorum_core::classify::TaskForClassification {
+                id: -(index as i64) - 1,
+                revision: 1,
+                title: task.title.clone(),
+                body: Some(
+                    serde_json::json!({
+                        "observable_outcome": task.observable_outcome,
+                        "acceptance_criteria": task.acceptance_criteria,
+                        "source_constraints": task.source_constraints,
+                        "verification_expectations": task.verification_expectations,
+                    })
+                    .to_string(),
+                ),
+                dependencies: task.prerequisites.clone(),
+                recovery_notes: vec![],
+            },
+        )
+        .collect()
+}
+
+fn planned_children(
+    proposal: &[planner::ProposedTask],
+    classifications: &[quorum_core::classify::TaskClassification],
+) -> std::result::Result<Vec<quorum_core::decomposition::PlannedChild>, String> {
+    let by_id: HashMap<i64, &quorum_core::classify::TaskClassification> = classifications
+        .iter()
+        .map(|result| (result.task_id, result))
+        .collect();
+    proposal
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            let id = -(index as i64) - 1;
+            let result = by_id
+                .get(&id)
+                .ok_or_else(|| format!("missing classification for {}", task.key))?;
+            if !result.ready
+                || !matches!(result.size.as_str(), "S" | "M")
+                || !result.duplicate_of.is_empty()
+            {
+                return Err(format!(
+                    "child {} is not an admission-ready nonduplicate S/M implementation",
+                    task.key
+                ));
+            }
+            let mut prerequisite_keys = Vec::new();
+            let mut source_dependency_ids = Vec::new();
+            for dependency in &task.prerequisites {
+                if let Some(raw) = dependency.strip_prefix("source:") {
+                    source_dependency_ids.push(
+                        raw.parse::<i64>()
+                            .map_err(|_| "invalid source dependency")?,
+                    );
+                } else {
+                    prerequisite_keys.push(dependency.clone());
+                }
+            }
+            Ok(quorum_core::decomposition::PlannedChild {
+                local_key: task.key.clone(),
+                title: task.title.clone(),
+                body: serde_json::json!({
+                    "observable_outcome": task.observable_outcome,
+                    "acceptance_criteria": task.acceptance_criteria,
+                    "source_constraints": task.source_constraints,
+                    "verification_expectations": task.verification_expectations,
+                })
+                .to_string(),
+                labels: Some("[\"type:implementation\",\"generated:decomposition\"]".into()),
+                classification_refs: serde_json::json!({
+                    "cx_est": result.cx_est,
+                    "cx_size": result.size,
+                    "cx_ready": result.ready,
+                    "cx_not_ready_reason": result.not_ready_reason,
+                    "cx_dup_of": result.duplicate_of,
+                    "cx_by": "decomposition-preclassification:v1",
+                })
+                .to_string(),
+                prerequisite_keys,
+                source_dependency_ids,
+            })
+        })
+        .collect()
+}
+
+/// Advance at most one durable decomposition coordinator. Returns whether the
+/// repository planning freeze is active after this tick.
+async fn tick_decomposition(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+    workers: &[SlotState],
+    reviewers: &[SlotState],
+    live: DecompositionLiveWork,
+) -> Result<bool> {
+    // First consume terminal provider output. Provider processes are always
+    // killed and reaped before durable retry/materialization decisions.
+    if let Some(slot) = coordinator.planner_slot.as_mut() {
+        if let Some(outcome) = planner::poll_planner(slot).await {
+            let slot = coordinator
+                .planner_slot
+                .take()
+                .expect("planner slot exists");
+            slot.kill_and_reap().await;
+            coordinator.planner_view = None;
+            let graph_id = coordinator
+                .graph_id
+                .ok_or_else(|| QuorumError::Io("planner lost graph identity".into()))?;
+            delete_decomposition_process(config, graph_id, "planner").await?;
+            match outcome {
+                planner::PlannerPoll::ProviderFailed(summary) => {
+                    record_decomposition_attempt(
+                        config,
+                        graph_id,
+                        "provider",
+                        "planner-provider",
+                        &summary,
+                    )
+                    .await?;
+                }
+                planner::PlannerPoll::SemanticRejected(summary) => {
+                    record_decomposition_attempt(
+                        config,
+                        graph_id,
+                        "proposal",
+                        "semantic-rejection",
+                        &summary,
+                    )
+                    .await?;
+                }
+                planner::PlannerPoll::Done(planner::PlannerResponse::Blocker {
+                    category,
+                    evidence,
+                    required_decision,
+                    why_no_safe_split,
+                }) => {
+                    let summary = serde_json::json!({"evidence":evidence,"required_decision":required_decision,
+                        "why_no_safe_split":why_no_safe_split}).to_string();
+                    record_decomposition_attempt(config, graph_id, "blocker", &category, &summary)
+                        .await?;
+                }
+                planner::PlannerPoll::Done(planner::PlannerResponse::Plan { tasks }) => {
+                    let path = config.db_path.clone();
+                    let proposal_json = serde_json::to_string(&tasks).map_err(|error| {
+                        QuorumError::Io(format!("proposal serialization failed: {error}"))
+                    })?;
+                    let moved = tokio::task::spawn_blocking(move || -> Result<bool> {
+                        let mut conn = quorum_core::db::open(&path)?;
+                        quorum_core::decomposition::accept_proposal(
+                            &mut conn,
+                            graph_id,
+                            &proposal_json,
+                            now_unix(),
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("validation phase join: {error}"))
+                    })??;
+                    if moved {
+                        coordinator.proposal = Some(tasks);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(slot) = coordinator.classifier_slot.as_mut() {
+        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+        let terminal = classifier::drain_classifier_events(slot).await.or_else(|| {
+            exited.then(|| {
+                classifier::ClassifierResult::Error(
+                    "proposal classifier exited without a complete response".into(),
+                )
+            })
+        });
+        if let Some(outcome) = terminal {
+            let slot = coordinator
+                .classifier_slot
+                .take()
+                .expect("classifier slot exists");
+            let expected = slot.pending_task_ids.clone();
+            slot.kill_and_reap().await;
+            let graph_id = coordinator
+                .graph_id
+                .ok_or_else(|| QuorumError::Io("classifier lost graph identity".into()))?;
+            delete_decomposition_process(config, graph_id, "classifier").await?;
+            match outcome {
+                classifier::ClassifierResult::Error(summary) => {
+                    record_decomposition_attempt(
+                        config,
+                        graph_id,
+                        "provider",
+                        "classifier-provider",
+                        &summary,
+                    )
+                    .await?;
+                    coordinator.proposal = None;
+                }
+                classifier::ClassifierResult::Done(text) => {
+                    let result = classifier::parse_validated_response(&text, &expected).and_then(
+                        |classifications| {
+                            planned_children(
+                                coordinator.proposal.as_deref().unwrap_or_default(),
+                                &classifications,
+                            )
+                            .map(|children| (classifications, children))
+                        },
+                    );
+                    match result {
+                        Err(summary) => {
+                            reset_decomposition_to_planning(config, graph_id, "preclassifying")
+                                .await?;
+                            record_decomposition_attempt(
+                                config,
+                                graph_id,
+                                "proposal",
+                                "child-preclassification",
+                                &summary,
+                            )
+                            .await?;
+                            coordinator.proposal = None;
+                        }
+                        Ok((_classifications, children)) => {
+                            let snapshot = {
+                                let conn = quorum_core::db::open(&config.db_path)?;
+                                load_planning_snapshot(&conn)?
+                            };
+                            if let Some(snapshot) = snapshot {
+                                let path = config.db_path.clone();
+                                let materialized =
+                                    tokio::task::spawn_blocking(move || -> Result<bool> {
+                                        let mut conn = quorum_core::db::open(&path)?;
+                                        Ok(quorum_core::decomposition::materialize_graph(
+                                            &mut conn,
+                                            graph_id,
+                                            snapshot.source_revision,
+                                            &children,
+                                            now_unix(),
+                                        )?
+                                        .is_some())
+                                    })
+                                    .await
+                                    .map_err(|error| {
+                                        QuorumError::Io(format!("materialization join: {error}"))
+                                    })??;
+                                if !materialized {
+                                    record_decomposition_attempt(
+                                        config,
+                                        graph_id,
+                                        "blocker",
+                                        "materialization-authority-lost",
+                                        "atomic materialization lost graph or source authority",
+                                    )
+                                    .await?;
+                                }
+                            }
+                            coordinator.proposal = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut snapshot = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        load_planning_snapshot(&conn)?
+    };
+    if snapshot.is_none() {
+        coordinator.graph_id = None;
+        if coordinator.planner_slot.is_none() && coordinator.classifier_slot.is_none() {
+            let candidate = {
+                let conn = quorum_core::db::open(&config.db_path)?;
+                planning_candidate(&conn)?
+            };
+            if let Some((source_task_id, expected_revision)) = candidate {
+                let assignment_request = quorum_core::role_assignments::AssignmentRequest {
+                    responsibility_key: format!(
+                        "planner:task:{source_task_id}:revision:{expected_revision}"
+                    ),
+                    task_id: Some(source_task_id),
+                    pr_number: None,
+                    role: "planner".into(),
+                    review_stage: None,
+                    complexity: None,
+                };
+                let pool = configured_routing_pool(config, "planner", None, None)?;
+                let path = config.db_path.clone();
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&path)?;
+                    let seed =
+                        conn.query_row("SELECT random()", [], |row| row.get::<_, i64>(0))? as u64;
+                    quorum_core::decomposition::begin_routed_planning(
+                        &mut conn,
+                        &quorum_core::decomposition::BeginRoutedPlanning {
+                            source_task_id,
+                            expected_revision,
+                            assignment: &assignment_request,
+                            pool: &pool,
+                            seed,
+                            now: now_unix(),
+                        },
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| QuorumError::Io(format!("begin planning join: {error}")))??;
+                let conn = quorum_core::db::open(&config.db_path)?;
+                snapshot = load_planning_snapshot(&conn)?;
+            }
+        }
+    }
+    let Some(snapshot) = snapshot else {
+        return Ok(false);
+    };
+    coordinator.graph_id = Some(snapshot.graph_id);
+    if coordinator.proposal.is_none() {
+        coordinator.proposal = snapshot.accepted_proposal.clone();
+    }
+
+    if snapshot.state == "provider-backoff" {
+        if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
+            let path = config.db_path.clone();
+            let graph_id = snapshot.graph_id;
+            let reacquired = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::decomposition::reacquire_freeze(&mut conn, graph_id, now_unix())
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("freeze reacquire join: {error}")))??;
+            return Ok(reacquired);
+        }
+        return Ok(false);
+    }
+    if !snapshot.freeze_active {
+        return Ok(false);
+    }
+    let durable_in_flight = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row("SELECT count(*) FROM journal", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+    };
+    if snapshot.state == "freeze-requested" {
+        let path = config.db_path.clone();
+        let graph_id = snapshot.graph_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::decomposition::set_frozen_phase(
+                &mut conn,
+                graph_id,
+                "freeze-requested",
+                "draining",
+                None,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("draining phase join: {error}")))??;
+        return Ok(true);
+    }
+    if snapshot.state == "draining"
+        && decomposition_drain_ready(workers.len(), reviewers.len(), durable_in_flight, live)
+    {
+        let sha = repository_head_sha(&config.repo_dir).await?;
+        let path = config.db_path.clone();
+        let graph_id = snapshot.graph_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&path)?;
+            // A zero-row bind is an expected lost race (invariant #3): a concurrent
+            // block/cancel/recovery moved the graph off 'draining' during the head-SHA
+            // fetch above. Clean negative, not an internal error — the next tick re-reads
+            // the new state. Mirrors begin_planning's Ok(None)-is-expected contract.
+            quorum_core::decomposition::bind_frozen_base_and_enter_planning(
+                &mut conn,
+                graph_id,
+                &sha,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("planning phase join: {error}")))??;
+        return Ok(true);
+    }
+    if snapshot.state == "planning" && coordinator.planner_slot.is_none() {
+        let assignment = assign_role(
+            config,
+            quorum_core::role_assignments::AssignmentRequest {
+                responsibility_key: format!(
+                    "planner:task:{}:revision:{}",
+                    snapshot.source_task_id, snapshot.source_revision
+                ),
+                task_id: Some(snapshot.source_task_id),
+                pr_number: None,
+                role: "planner".into(),
+                review_stage: None,
+                complexity: None,
+            },
+            None,
+        )?;
+        let source = planner::PlanningSource {
+            task_id: snapshot.source_task_id,
+            revision: snapshot.source_revision,
+            title: &snapshot.title,
+            body: snapshot.body.as_deref(),
+            dependencies: &snapshot.dependencies,
+        };
+        let prompt = planner::build_prompt(&source, &snapshot.rejection_summaries);
+        let view = match frozen_planner_view(&config.repo_dir, &snapshot.frozen_base_sha).await {
+            Ok(view) => view,
+            Err(error) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "frozen-view",
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
+        let planner_kind = resolve_provider(&assignment.model)?;
+        match planner::spawn_planner(
+            planner_kind,
+            &assignment.model,
+            &assignment.effort,
+            view.path(),
+            &prompt,
+            config.bare_agent,
+            agent_bin_for_kind(config, planner_kind),
+        )
+        .await
+        {
+            Ok(slot) => {
+                if let Err(error) = journal_decomposition_process(
+                    config,
+                    snapshot.graph_id,
+                    snapshot.source_task_id,
+                    "planner",
+                    slot.pid(),
+                    Some(view.path()),
+                )
+                .await
+                {
+                    slot.kill_and_reap().await;
+                    return Err(error);
+                }
+                coordinator.planner_view = Some(view);
+                coordinator.planner_slot = Some(slot);
+            }
+            Err(error) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "planner-spawn",
+                    &error.to_string(),
+                )
+                .await?
+            }
+        }
+    } else if snapshot.state == "validating" {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            return Err(QuorumError::Io(
+                "validating decomposition lacks its durable accepted proposal".into(),
+            ));
+        };
+        match planner::validate_for_source(proposal, &snapshot.dependencies) {
+            Err(error) => {
+                reset_decomposition_to_planning(config, snapshot.graph_id, "validating").await?;
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "proposal",
+                    "deterministic-validation",
+                    &error.to_string(),
+                )
+                .await?;
+                coordinator.proposal = None;
+            }
+            Ok(()) => {
+                let path = config.db_path.clone();
+                let graph_id = snapshot.graph_id;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut conn = quorum_core::db::open(&path)?;
+                    quorum_core::decomposition::set_frozen_phase(
+                        &mut conn,
+                        graph_id,
+                        "validating",
+                        "preclassifying",
+                        None,
+                        now_unix(),
+                    )?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!("preclassification phase join: {error}"))
+                })??;
+            }
+        }
+    } else if snapshot.state == "preclassifying" && coordinator.classifier_slot.is_none() {
+        let Some(proposal) = coordinator.proposal.as_ref() else {
+            return Err(QuorumError::Io(
+                "preclassifying decomposition lacks its durable accepted proposal".into(),
+            ));
+        };
+        let tasks = proposed_classifier_tasks(proposal);
+        let classifier_assignment = assign_classifier_batch(config, &tasks)?;
+        let classifier_kind = resolve_provider(&classifier_assignment.model)?;
+        match classifier::spawn_classifier_configured(
+            &tasks,
+            &[],
+            agent_bin_for_kind(config, classifier_kind),
+            config.bare_agent,
+            &classifier_assignment.model,
+            &classifier_assignment.effort,
+            &config.codex_sandbox,
+            "",
+        )
+        .await
+        {
+            Ok(slot) => {
+                if let Err(error) = journal_decomposition_process(
+                    config,
+                    snapshot.graph_id,
+                    snapshot.source_task_id,
+                    "classifier",
+                    slot.proc.pid(),
+                    coordinator.planner_view.as_ref().map(|view| view.path()),
+                )
+                .await
+                {
+                    slot.kill_and_reap().await;
+                    return Err(error);
+                }
+                coordinator.classifier_slot = Some(slot);
+            }
+            Err(error) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "classifier-spawn",
+                    &error.to_string(),
+                )
+                .await?
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Resolves when a drain deadline should interrupt long-running work inside
@@ -3060,12 +4296,35 @@ async fn resume_reviewer_after_ci(
         return Ok(false);
     }
 
-    let rereview_turn = reviewer::build_rereview_turn(
+    let graph_context = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_graph_review_context(&db_path, task_id))
+            .await
+            .map_err(|error| QuorumError::Io(format!("graph review context join: {error}")))??
+    };
+    let rereview_turn = reviewer::build_rereview_turn_with_context(
         &reviewers[reviewer_index].agent_name,
         pr,
         &workers[worker_index].agent_name,
-        &config.effort,
+        &reviewers[reviewer_index].effort,
+        graph_context.as_deref(),
     );
+    // Revalidate at the external feed boundary. This second guarded read makes
+    // any cancellation/context change during CI/prompt preparation fail loud
+    // before the sticky reviewer receives another turn.
+    let current_graph_context = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || load_graph_review_context(&db_path, task_id))
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("graph rereview revalidation join: {error}"))
+            })??
+    };
+    if current_graph_context != graph_context {
+        return Err(QuorumError::Io(format!(
+            "graph review authority changed before re-review feed for task #{task_id}"
+        )));
+    }
     if let Err(error) = reviewers[reviewer_index]
         .proc
         .feed_turn(&rereview_turn)
@@ -3371,6 +4630,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut last_publication_ref_reconcile: Option<std::time::Instant> = None;
     let mut publication_ref_reconcile_cursor: Option<i64> = None;
     let mut classifier_slot: Option<classifier::ClassifierSlot> = None;
+    let mut decomposition_coordinator = DecompositionCoordinator::default();
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
@@ -3387,42 +4647,69 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         }
     }
 
+    // Decomposition authority is always reconstructed before any recovery
+    // pass that can complete, merge, reset, or provision task lifecycle.
+    let startup_decomposition =
+        reconcile_decomposition_startup(config, &mut decomposition_coordinator).await?;
+    let recovered_frozen_decomposition = startup_decomposition == StartupDecompositionState::Frozen;
+
+    // Cleanup is an authority gate, including frozen-decomposition restarts:
+    // no recovery path may discard its journal/provenance before all eligible
+    // intents have settled or exhausted.
+    cleanup::startup(config, &wt_mgr).await?;
+
+    if recovered_frozen_decomposition {
+        // A frozen restart must first terminate stale managed processes and
+        // empty the journal. Late completion and approval/network recovery are
+        // deliberately deferred to later ticks after planning releases authority.
+        if let Err(e) = recovery::recover(config, &wt_mgr).await {
+            log(&format!(
+                "frozen decomposition recovery failed: {e} — starting fresh"
+            ));
+        }
+    }
+
     // Fold outcomes that were committed by a managed process just before the
     // prior daemon died. These passes must run before approval and stateless
     // recovery: the latter may reset task state or delete the journal row that
     // supplies the exact managed-run identity.
-    if let Err(e) = recover_late_worker_completions(config).await {
-        log(&format!(
-            "late worker startup recovery failed: {e} — continuing"
-        ));
-    }
-    if let Err(e) = recover_late_reviewer_verdicts(config).await {
-        log(&format!(
-            "late reviewer startup recovery failed: {e} — continuing"
-        ));
-    }
+    if !recovered_frozen_decomposition {
+        if let Err(e) = recover_late_worker_completions(config).await {
+            log(&format!(
+                "late worker startup recovery failed: {e} — continuing"
+            ));
+        }
+        let late_reviewers = recover_late_reviewer_verdicts(config).await.map_err(|e| {
+            QuorumError::Io(format!(
+                "late reviewer startup recovery failed before generic recovery: {e}"
+            ))
+        })?;
+        ensure_late_reviewer_recovery_settled(late_reviewers)?;
 
-    // #228: approval recovery — merge already-approved PRs from durable,
-    // instance-independent state BEFORE stateless recovery, so a
-    // self-update-drain restart merges the approved PR instead of re-working it.
-    // Runs first so approved tasks are closed (and their journal rows dropped)
-    // before recovery::recover resets them to open.
-    if let Err(e) = approvals::recover(
-        &config.db_path,
-        &config.repo_dir,
-        &config.merge_executor,
-        config.merge_checks_timeout_secs,
-        config.merge_checks_poll_secs,
-    )
-    .await
-    {
-        log(&format!("approval recovery failed: {e} — continuing"));
+        // #228: approval recovery — merge already-approved PRs from durable,
+        // instance-independent state BEFORE stateless recovery, so a
+        // self-update-drain restart merges the approved PR instead of re-working it.
+        // Runs first so approved tasks are closed (and their journal rows dropped)
+        // before recovery::recover resets them to open.
+        if let Err(e) = approvals::recover(
+            &config.db_path,
+            &config.repo_dir,
+            &config.merge_executor,
+            config.merge_checks_timeout_secs,
+            config.merge_checks_poll_secs,
+        )
+        .await
+        {
+            log(&format!("approval recovery failed: {e} — continuing"));
+        }
     }
 
     // M7: stateless crash recovery — kill stale processes, wipe journal,
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
-    if let Err(e) = recovery::recover(config, &wt_mgr).await {
-        log(&format!("recovery failed: {e} — starting fresh"));
+    if !recovered_frozen_decomposition {
+        if let Err(e) = recovery::recover(config, &wt_mgr).await {
+            log(&format!("recovery failed: {e} — starting fresh"));
+        }
     }
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
     {
@@ -3514,6 +4801,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if let Some(slot) = classifier_slot.take() {
                 let _terminal_output = slot.proc.kill_and_reap().await;
             }
+            if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                slot.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                slot.kill_and_reap().await;
+            }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -3533,6 +4826,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             }
             if let Some(slot) = classifier_slot.take() {
                 let _terminal_output = slot.proc.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                slot.kill_and_reap().await;
+            }
+            if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                slot.kill_and_reap().await;
             }
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
@@ -3556,6 +4855,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                    slot.kill_and_reap().await;
                 }
                 for r in reviewers.drain(..) {
                     let _terminal_output = r.proc.kill_and_reap().await;
@@ -3612,6 +4917,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
                 }
+                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                    slot.kill_and_reap().await;
+                }
                 return Ok(exit);
             }
 
@@ -3626,6 +4937,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
                 }
+                if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                    slot.kill_and_reap().await;
+                }
+                if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                    slot.kill_and_reap().await;
+                }
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
                 }
@@ -3637,6 +4954,20 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                 return Ok(exit);
             }
         }
+
+        // Bound cleanup work so unrelated tasks continue to make progress.
+        // Each claim is settled before the next one and external I/O never
+        // overlaps a database transaction.
+        cleanup::drain_tick(
+            config,
+            &wt_mgr,
+            cleanup::LiveSlots {
+                workers: &mut workers,
+                reviewers: &mut reviewers,
+                names: &mut name_pool,
+            },
+        )
+        .await?;
 
         // ── Drift check: unbacked/twin PR detection (~15 min cadence) ──
         let should_drift_check = match last_drift_check {
@@ -3688,6 +5019,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
+            &mut decomposition_coordinator,
             &mut classifier_consec_errors,
             &mut classifier_backoff_until,
             &mut doctor_slot,
@@ -3712,6 +5044,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     // names. Journal recovery reclaims the tasks on restart.
                     if let Some(slot) = classifier_slot.take() {
                         let _terminal_output = slot.proc.kill_and_reap().await;
+                    }
+                    if let Some(slot) = decomposition_coordinator.planner_slot.take() {
+                        slot.kill_and_reap().await;
+                    }
+                    if let Some(slot) = decomposition_coordinator.classifier_slot.take() {
+                        slot.kill_and_reap().await;
                     }
                     for r in reviewers.drain(..) {
                         let _terminal_output = r.proc.kill_and_reap().await;
@@ -3744,6 +5082,7 @@ async fn tick(
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
+    decomposition_coordinator: &mut DecompositionCoordinator,
     classifier_consec_errors: &mut u32,
     classifier_backoff_until: &mut Option<std::time::Instant>,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
@@ -3751,6 +5090,21 @@ async fn tick(
     signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
+
+    let decomposition_freeze = tick_decomposition(
+        config,
+        decomposition_coordinator,
+        workers,
+        reviewers,
+        DecompositionLiveWork {
+            ordinary_classifier: classifier_slot.is_some(),
+            doctor: doctor_slot.is_some(),
+            pre_review_checks: pre_review_checks.values().any(|entry| {
+                matches!(&entry.state, PreReviewChecksState::Waiting(handle) if !handle.is_finished())
+            }),
+        },
+    )
+    .await?;
 
     // Reconcile policy-blocked classifications written by older daemons before
     // any mailbox recovery or provisioning path can regain authority.
@@ -3913,6 +5267,100 @@ async fn tick(
                 reviewers[ri].agent_name, row.pr, row.verdict
             ));
 
+            // A graph blocker is not an ordinary review verdict. The CLI
+            // carries the exact immutable run capability in a closed payload;
+            // this daemon boundary rechecks roster ownership and the current
+            // PR head before the core transaction is allowed to mutate state.
+            if row.verdict.as_deref() == Some("graph-blocker") {
+                let pr = row.pr.unwrap_or_default();
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let current = if pr > 0 {
+                    tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                let p = db_path.clone();
+                let row_owned = row.clone();
+                let mailbox_id = *id;
+                let live = LiveGraphBlockerAuthority {
+                    agent_run_id: reviewers[ri].agent_run_id,
+                    task_id: reviewers[ri].task_id,
+                    agent: &reviewers[ri].agent_name,
+                    cap_run_id: reviewers[ri].cap_run_id.as_deref(),
+                    pr: reviewers[ri].pr,
+                    head_sha: reviewers[ri].reviewed_head_sha.as_deref(),
+                };
+                let live_owned = (
+                    live.agent_run_id,
+                    live.task_id,
+                    live.agent.to_string(),
+                    live.cap_run_id.map(str::to_string),
+                    live.pr,
+                    live.head_sha.map(str::to_string),
+                );
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    let live = LiveGraphBlockerAuthority {
+                        agent_run_id: live_owned.0,
+                        task_id: live_owned.1,
+                        agent: &live_owned.2,
+                        cap_run_id: live_owned.3.as_deref(),
+                        pr: live_owned.4,
+                        head_sha: live_owned.5.as_deref(),
+                    };
+                    consume_graph_blocker_signal(
+                        &mut conn,
+                        mailbox_id,
+                        &row_owned,
+                        current.as_deref(),
+                        Some(&live),
+                        now_unix(),
+                    )
+                })
+                .await
+                .map_err(|error| QuorumError::Io(format!("graph blocker join: {error}")))??;
+
+                if outcome == GraphBlockerConsumeOutcome::Blocked {
+                    log(&format!(
+                        "graph blocker accepted from {} for task #{}",
+                        row.agent, reviewer_task_id
+                    ));
+                    let reviewer = reviewers.remove(ri);
+                    teardown_reviewer(config, wt_mgr, name_pool, reviewer, "graph-blocker").await;
+                    if let Some(wi) = workers
+                        .iter()
+                        .position(|worker| worker.task_id == reviewer_task_id)
+                    {
+                        let worker = workers.remove(wi);
+                        cleanup_slot_inner(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            worker,
+                            None,
+                            false,
+                            "graph-blocker",
+                        )
+                        .await;
+                    }
+                } else if outcome == GraphBlockerConsumeOutcome::Rejected {
+                    log(&format!(
+                        "graph blocker rejected without lifecycle mutation from {} for task {:?}",
+                        row.agent, row.task_id
+                    ));
+                } else {
+                    log(&format!(
+                        "graph blocker head unavailable for {} task {:?}; retaining mailbox row for retry",
+                        row.agent, row.task_id
+                    ));
+                }
+                break;
+            }
+
             // #206: gate the verdict before acting on it. An `approved` row
             // without the zero-blocking attestation payload (i.e. one that
             // did not come through the validated CLI, or that attests
@@ -4069,8 +5517,8 @@ async fn tick(
                                 enabled: config.r2_enabled,
                                 target_per_stratum: config.r2_target_per_stratum,
                                 steady_state_p: config.r2_steady_state_p,
-                                default_model: config.model.clone(),
-                                default_effort: config.effort.clone(),
+                                default_model: reviewers[ri].model.clone(),
+                                default_effort: reviewers[ri].effort.clone(),
                             };
                             tokio::task::spawn_blocking(move || -> Result<bool> {
                                 let mut conn = quorum_core::db::open(&p)?;
@@ -7226,7 +8674,7 @@ async fn tick(
     // Each worker that has a PR and no paired reviewer (and is not draining)
     // gets a reviewer spawned. Reviewers don't consume worker capacity.
     // Skip during drain — no new work, let existing agents finish.
-    if !drain_state.draining {
+    if !drain_state.draining && !decomposition_freeze {
         let active_in_review = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
@@ -7809,7 +9257,7 @@ async fn tick(
     // Gate on worker count, not total in_use_count() — reviewers must
     // not consume worker capacity (F16).
     // Skip during drain — no new tasks, let existing agents finish.
-    if !drain_state.draining {
+    if !drain_state.draining && !decomposition_freeze {
         while workers.len() < config.cap {
             if !spawn_worker(
                 config,
@@ -7853,6 +9301,7 @@ async fn tick(
             .expect("terminal classifier result requires an active slot");
         let pending_task_ids = slot.pending_task_ids.clone();
         let pending_inputs = slot.pending_inputs.clone();
+        let classifier_model = slot.model.clone();
         slot.kill_and_reap().await;
 
         match result {
@@ -7862,7 +9311,7 @@ async fn tick(
                     &text,
                     &pending_task_ids,
                     &pending_inputs,
-                    &config.classifier_model,
+                    &classifier_model,
                 )
                 .await
                 {
@@ -7911,7 +9360,11 @@ async fn tick(
             *classifier_backoff_until = None;
         }
     }
-    if classifier_slot.is_none() && !drain_state.draining && classifier_backoff_until.is_none() {
+    if classifier_slot.is_none()
+        && !drain_state.draining
+        && !decomposition_freeze
+        && classifier_backoff_until.is_none()
+    {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;
@@ -7932,18 +9385,21 @@ async fn tick(
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
 
         if let Ok((tasks, dup_context)) = unclassified {
+            // A classifier assignment belongs to one exact task revision. This
+            // keeps retry identity stable even as the unclassified queue changes.
+            let tasks = tasks.into_iter().take(1).collect::<Vec<_>>();
             if !tasks.is_empty() {
+                let classifier_assignment = assign_classifier_batch(config, &tasks)?;
+                let classifier_kind = resolve_provider(&classifier_assignment.model)?;
                 match classifier::spawn_classifier_configured(
                     &tasks,
                     &dup_context,
-                    config.agent_bin.as_deref(),
+                    agent_bin_for_kind(config, classifier_kind),
                     config.bare_agent,
-                    &config.classifier_model,
-                    &config.classifier_effort,
+                    &classifier_assignment.model,
+                    &classifier_assignment.effort,
                     &config.codex_sandbox,
-                    &quorum_core::complexity::recommendation_lines(recommendation_provider(
-                        config.runner_kind,
-                    )),
+                    "",
                 )
                 .await
                 {
@@ -7973,7 +9429,7 @@ async fn tick(
     // priority ready job (attempts asc, past backoff, under cap), and (c)
     // log dead-lettered rows so operators see poison PRs instead of silent
     // starvation. Never touches task lifecycle: analytics-only, retry-only.
-    if !drain_state.draining {
+    if !drain_state.draining && !decomposition_freeze {
         let p = db_path.clone();
         let now_ts = now_unix();
         let outcome = tokio::task::spawn_blocking(move || -> Result<InterpretTickOutcome> {
@@ -8055,7 +9511,21 @@ async fn tick(
             // on both success and failure, so the next tick's converge step
             // catches successes and the mark_error above blocks re-picking
             // until the backoff window elapses.
-            let request = collector::CollectionRequest::new(
+            let assignment = assign_role(
+                config,
+                quorum_core::role_assignments::AssignmentRequest {
+                    responsibility_key: format!("collector:pr:{}", job.pr_number),
+                    task_id: Some(job.task_id),
+                    pr_number: Some(job.pr_number),
+                    role: "collector".into(),
+                    review_stage: None,
+                    complexity: None,
+                },
+                None,
+            )?;
+            let collector_agent_bin =
+                agent_bin_for_kind(config, resolve_provider(&assignment.model)?).map(str::to_owned);
+            let mut request = collector::CollectionRequest::new(
                 job.pr_number,
                 Some(job.task_id),
                 job.repo.clone().or_else(|| {
@@ -8067,14 +9537,15 @@ async fn tick(
                 }),
                 config.db_path.clone(),
                 config.repo_dir.clone(),
-                config.agent_bin.clone(),
+                collector_agent_bin,
                 config.bare_agent,
             )
             .with_collector(
-                config.collector_model.clone(),
-                config.collector_effort.clone(),
+                assignment.model.clone(),
+                assignment.effort.clone(),
                 config.codex_sandbox.clone(),
             );
+            request.role_assignment_id = Some(assignment.id);
             collector::spawn_detached(request);
         }
     }
@@ -8108,7 +9579,11 @@ async fn tick(
     }
 
     // 8b: Spawn doctor if enabled, idle, not draining, and a stalled task exists.
-    if config.doctor_enabled && doctor_slot.is_none() && !drain_state.draining {
+    if config.doctor_enabled
+        && doctor_slot.is_none()
+        && !drain_state.draining
+        && !decomposition_freeze
+    {
         let p = db_path.clone();
         let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
         let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
@@ -8161,7 +9636,7 @@ async fn tick(
             match doctor::spawn_doctor(
                 evidence.task_id,
                 &config.repo_dir,
-                config.agent_bin.as_deref(),
+                agent_bin_for_kind(config, runner::AgentKind::Claude),
                 config.bare_agent,
                 allowed,
                 &config.repo,
@@ -8841,6 +10316,60 @@ impl<'a> From<&'a SlotState> for ReviewCounterpart<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn cleanup_failed_reviewer_provision(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    reviewer_name: &str,
+    worktree: &Path,
+    branch: &str,
+    capability_run_id: Option<&str>,
+    agent_run_id: Option<i64>,
+    process: Option<runner::RunnerProc>,
+) {
+    if let Some(process) = process {
+        let _ = process.kill_and_reap().await;
+    }
+    let path = config.db_path.clone();
+    let name = reviewer_name.to_string();
+    let capability = capability_run_id.map(str::to_string);
+    tokio::task::spawn_blocking(move || {
+        if let Ok(mut conn) = quorum_core::db::open(&path) {
+            cleanup_failed_reviewer_db(
+                &mut conn,
+                &name,
+                capability.as_deref(),
+                agent_run_id,
+                now_unix(),
+            );
+        }
+    })
+    .await
+    .ok();
+    wt_mgr.remove(&config.repo_dir, worktree).await.ok();
+    wt_mgr.delete_branch(&config.repo_dir, branch).await;
+    name_pool.release(reviewer_name);
+}
+
+fn cleanup_failed_reviewer_db(
+    conn: &mut quorum_core::Connection,
+    reviewer_name: &str,
+    capability_run_id: Option<&str>,
+    agent_run_id: Option<i64>,
+    now: i64,
+) {
+    // Each operation is independently idempotent and best-effort so one stale
+    // row cannot prevent retirement of the remaining authority records.
+    if let Some(run_id) = agent_run_id {
+        let _ = quorum_core::agent_runs::close(conn, run_id, now, "provision-failed");
+    }
+    if let Some(capability) = capability_run_id {
+        let _ = quorum_core::capabilities::revoke(conn, capability, now);
+    }
+    let _ = journal::delete(conn, reviewer_name);
+}
+
 fn reviewer_name_exclusions(
     worker_name: &str,
     role: &ReviewRole,
@@ -8876,30 +10405,75 @@ async fn provision_reviewer(
     head_sha: &str,
     recover_interrupted: bool,
 ) -> Result<()> {
-    // Defense in depth for every reviewer path (worker handoff, orphan
-    // recovery, and R2): incomplete legacy refs and policy-park
-    // classifications cannot acquire a reviewer identity or process.
-    let classification_dispatchable = {
-        let db_path = config.db_path.clone();
+    let reservation = uuid::Uuid::new_v4().to_string();
+    let reserved = {
+        let path = config.db_path.clone();
+        let token = reservation.clone();
         let task_id = worker.task_id;
+        let reservation_role = role.as_str().to_string();
         tokio::task::spawn_blocking(move || -> Result<bool> {
-            let conn = quorum_core::db::open(&db_path)?;
-            Ok(tasks::get(&conn, task_id)?
-                .is_some_and(|task| tasks::classification_is_dispatchable(&task.refs)))
+            let mut conn = quorum_core::db::open(&path)?;
+            tasks::reserve_reviewer_provision(
+                &mut conn,
+                task_id,
+                &token,
+                &reservation_role,
+                now_unix(),
+            )
         })
         .await
-        .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
+        .map_err(|error| QuorumError::Io(format!("review reservation join: {error}")))??
     };
-    if !classification_dispatchable {
+    if !reserved {
         log(&format!(
-            "{}: task #{} PR #{pr} lacks a complete dispatchable classification — \
-             reviewer not acquired or spawned",
+            "{}: task #{} has no reviewer provisioning authority (phase, classification, reservation, or planning freeze)",
             role.as_str().to_uppercase(),
-            worker.task_id,
+            worker.task_id
         ));
         return Ok(());
     }
+    let task_id = worker.task_id;
+    let result = provision_reviewer_reserved(
+        config,
+        wt_mgr,
+        name_pool,
+        reviewers,
+        lifetime_roster,
+        pr,
+        worker,
+        role,
+        head_sha,
+        recover_interrupted,
+    )
+    .await;
+    let path = config.db_path.clone();
+    let release = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&path)?;
+        tasks::release_reviewer_provision(&mut conn, task_id, &reservation)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("review reservation release join: {error}")))?;
+    if !release? {
+        return Err(QuorumError::Io(format!(
+            "reviewer reservation release lost token authority for task #{task_id}"
+        )));
+    }
+    result
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn provision_reviewer_reserved(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    reviewers: &mut Vec<SlotState>,
+    lifetime_roster: &mut LifetimeRoster,
+    pr: i64,
+    worker: ReviewCounterpart<'_>,
+    role: &ReviewRole,
+    head_sha: &str,
+    recover_interrupted: bool,
+) -> Result<()> {
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
     // acquiring a name or creating reviewer resources.
@@ -8971,18 +10545,47 @@ async fn provision_reviewer(
     } else {
         None
     };
+    let complexity = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        let task = tasks::get(&conn, worker.task_id)?.ok_or_else(|| {
+            QuorumError::Io(format!("review task #{} disappeared", worker.task_id))
+        })?;
+        classifier_complexity(&task.refs).ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "task #{} cannot dispatch reviewer without classifier-owned complexity",
+                worker.task_id
+            ))
+        })?
+    };
+    let assignment = assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!("reviewer:task:{}:{}", worker.task_id, role.as_str()),
+            task_id: Some(worker.task_id),
+            pr_number: Some(pr),
+            role: "reviewer".into(),
+            review_stage: Some(role.as_str().into()),
+            complexity: Some(complexity.to_string()),
+        },
+        Some(complexity),
+    )?;
+    let reviewer_model = assignment.model.clone();
+    let reviewer_effort = assignment.effort.clone();
+    let reviewer_kind = resolve_provider(&reviewer_model)?;
+    let reviewer_continuation_id = recovery
+        .as_ref()
+        .and_then(|recovery| recovery.continuation_id.clone());
     if let Some(recovery) = &recovery {
-        if let Err(error) = require_configured_reviewer_provider(
-            config,
-            recovery.kind,
-            &format!("interrupted {} reviewer", role.as_str().to_uppercase()),
-        ) {
-            record_reviewer_provision_failure(config, worker.task_id, pr, role, head_sha).await;
-            log(&format!(
-                "{}: refusing interrupted reviewer recovery: {error}",
-                role.as_str().to_uppercase()
-            ));
-            return Ok(());
+        if recovery.assignment_id != Some(assignment.id)
+            || recovery.model != reviewer_model
+            || recovery.effort != reviewer_effort
+            || recovery.kind != reviewer_kind
+        {
+            return Err(QuorumError::Io(format!(
+                "interrupted {} reviewer does not match durable role assignment {}",
+                role.as_str().to_uppercase(),
+                assignment.id
+            )));
         }
     }
     let reviewer_name = if let Some(recovery) = &recovery {
@@ -9029,13 +10632,24 @@ async fn provision_reviewer(
     {
         let p = config.db_path.clone();
         let name = reviewer_name.clone();
-        let stale = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let stale_result = tokio::task::spawn_blocking(move || -> Result<usize> {
             let mut conn = quorum_core::db::open(&p)?;
             mailbox::consume_all_for_agent(&mut conn, &name)
         })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-        .unwrap_or(0);
+        .await;
+        let stale = match stale_result {
+            Ok(Ok(stale)) => stale,
+            Ok(Err(error)) => {
+                name_pool.release(&reviewer_name);
+                return Err(error);
+            }
+            Err(error) => {
+                name_pool.release(&reviewer_name);
+                return Err(QuorumError::Io(format!(
+                    "reviewer mailbox cleanup join: {error}"
+                )));
+            }
+        };
         if stale > 0 {
             log(&format!(
                 "consumed {stale} stale mailbox row(s) for {reviewer_name}"
@@ -9140,7 +10754,18 @@ async fn provision_reviewer(
                 role.as_str().to_uppercase()
             ));
         }
-        name_pool.release(&reviewer_name);
+        cleanup_failed_reviewer_provision(
+            config,
+            wt_mgr,
+            name_pool,
+            &reviewer_name,
+            &wt_path,
+            &branch,
+            None,
+            None,
+            None,
+        )
+        .await;
         return Ok(());
     }
     log(&format!(
@@ -9181,89 +10806,94 @@ async fn provision_reviewer(
         pr: Some(pr),
         rework_count: 0,
     };
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let journal_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
         journal::upsert(&mut conn, &entry)
     })
     .await
-    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-    .ok();
-
-    let (reviewer_model, reviewer_effort, reviewer_kind, reviewer_continuation_id) =
-        if let Some(recovery) = &recovery {
-            log(&format!(
-                "recovering {} reviewer {} with persisted provider {} model {}",
-                role.as_str().to_uppercase(),
-                reviewer_name,
-                recovery.kind,
-                recovery.model
-            ));
-            (
-                recovery.model.clone(),
-                recovery.effort.clone(),
-                recovery.kind,
-                recovery.continuation_id.clone(),
+    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")));
+    match journal_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) | Err(error) => {
+            cleanup_failed_reviewer_provision(
+                config,
+                wt_mgr,
+                name_pool,
+                &reviewer_name,
+                &wt_path,
+                &branch,
+                None,
+                None,
+                None,
             )
-        } else {
-            let reviewer_model = if let Some((model, _)) = configured_reviewer_selection(
-                config.provider_explicit,
-                config.review_model_explicit,
-                &config.review_model,
-                &config.review_effort,
-            ) {
-                model.to_string()
-            } else {
-                let p = config.db_path.clone();
-                let tid = worker.task_id;
-                let cfg_model = config.model.clone();
-                tokio::task::spawn_blocking(move || -> Result<String> {
-                    let conn = quorum_core::db::open(&p)?;
-                    let worker_model = quorum_core::agent_runs::worker_model(&conn, tid)?
-                        .unwrap_or_else(|| cfg_model.clone());
-                    escalated_reviewer_model(&worker_model, &cfg_model)
-                })
-                .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
-            };
-            let kind = resolve_managed_provider(&reviewer_model, "reviewer")?;
-            let effort = if let Some((_, effort)) = configured_reviewer_selection(
-                config.provider_explicit,
-                config.review_model_explicit,
-                &config.review_model,
-                &config.review_effort,
-            ) {
-                effort.to_string()
-            } else {
-                config.effort.clone()
-            };
-            (reviewer_model, effort, kind, None)
-        };
+            .await;
+            return Err(error);
+        }
+    }
+
+    if let Some(recovery) = &recovery {
+        log(&format!(
+            "recovering {} reviewer {} with persisted provider {} model {}",
+            role.as_str().to_uppercase(),
+            reviewer_name,
+            recovery.kind,
+            recovery.model
+        ));
+    }
     log(&format!(
-        "reviewer model escalated to {reviewer_model} for task {}",
+        "reviewer model routed to {reviewer_model} for task {}",
         worker.task_id
     ));
 
-    // #130: issue the run capability BEFORE spawning so the reviewer inherits
-    // QUORUM_RUN_ID in its environment.
+    // Atomically load generated-child scope and issue reviewer authority.
+    // Source cancellation and provisioning serialize at this transaction;
+    // stale/corrupt membership leaves no capability and spawns no process.
     let cap_run_id = uuid::Uuid::new_v4().to_string();
-    {
+    let graph_context = {
         let p = config.db_path.clone();
+        let tid = worker.task_id;
         let rid = cap_run_id.clone();
         let name = reviewer_name.clone();
-        let tid = worker.task_id;
-        let issue_res = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::capabilities::issue(&mut conn, &rid, tid, &name, "reviewer", now_unix())
+        let loaded = tokio::task::spawn_blocking(move || {
+            prepare_reviewer_authority(&p, tid, &rid, &name, now_unix())
         })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-        if let Err(e) = issue_res {
-            log(&format!(
-                "reviewer capability issue failed for task {} agent {}: {e} — reviewer will fall back to compat auth",
-                worker.task_id, reviewer_name
-            ));
+        .await;
+        match loaded {
+            Ok(Ok(context)) => context,
+            Ok(Err(error)) => {
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+            Err(error) => {
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                return Err(QuorumError::Io(format!(
+                    "graph review context join: {error}"
+                )));
+            }
         }
-    }
+    };
 
     // Prompt composition remains role- and provider-aware; the runner adapter
     // owns how that neutral prompt reaches the CLI.
@@ -9274,7 +10904,12 @@ async fn provision_reviewer(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
+            reviewer::build_review_prompt_for_kind_with_context(
+                reviewer_kind,
+                &spec,
+                &reviewer_effort,
+                graph_context.as_deref(),
+            )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
             let spec = reviewer::R2ReviewSpec {
@@ -9283,7 +10918,12 @@ async fn provision_reviewer(
                 r1_reviewer: r1_reviewer.clone(),
                 r2_name: reviewer_name.clone(),
             };
-            reviewer::build_r2_review_prompt_for_kind(reviewer_kind, &spec, &reviewer_effort)
+            reviewer::build_r2_review_prompt_for_kind_with_context(
+                reviewer_kind,
+                &spec,
+                &reviewer_effort,
+                graph_context.as_deref(),
+            )
         }
     };
 
@@ -9335,13 +10975,30 @@ async fn provision_reviewer(
                     pr: Some(pr),
                     rework_count: 0,
                 };
-                tokio::task::spawn_blocking(move || -> Result<()> {
+                let pid_journal = tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
                     journal::upsert(&mut conn, &pid_entry)
                 })
                 .await
-                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
-                .ok();
+                .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")));
+                match pid_journal {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) | Err(error) => {
+                        cleanup_failed_reviewer_provision(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            &reviewer_name,
+                            &wt_path,
+                            &branch,
+                            Some(&cap_run_id),
+                            None,
+                            Some(proc),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
             }
 
             // Persist the run before attaching the reviewer. The run history is
@@ -9359,30 +11016,28 @@ async fn provision_reviewer(
                 let prov = reviewer_provider;
                 let tid = worker.task_id;
                 let is_r2 = role.is_r2();
+                let review_cap = cap_run_id.clone();
+                let review_head = head_sha.to_string();
+                let assignment_id = assignment.id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
-                    let conn = quorum_core::db::open(&p)?;
-                    if is_r2 {
-                        quorum_core::agent_runs::insert_r2(
-                            &conn,
-                            tid,
-                            &name,
-                            &m,
-                            &e,
-                            &prov,
-                            now_unix(),
-                        )
-                    } else {
-                        quorum_core::agent_runs::insert(
-                            &conn,
-                            tid,
-                            &name,
-                            "reviewer",
-                            &m,
-                            &e,
-                            &prov,
-                            now_unix(),
-                        )
-                    }
+                    let mut conn = quorum_core::db::open(&p)?;
+                    quorum_core::decomposition_review::persist_reviewer_run_if_current(
+                        &mut conn,
+                        tid,
+                        &name,
+                        &m,
+                        &e,
+                        &prov,
+                        Some(assignment_id),
+                        now_unix(),
+                        is_r2.then_some("r2"),
+                        &review_cap,
+                        pr,
+                        &review_head,
+                    )?
+                    .ok_or_else(|| {
+                        QuorumError::Io("invalid immutable reviewer launch authority".into())
+                    })
                 })
                 .await
                 .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
@@ -9462,7 +11117,7 @@ async fn provision_reviewer(
             .await
             .ok();
 
-            fire_event(
+            if let Err(e) = fire_event_result(
                 &config.db_path,
                 &reviewer_name,
                 worker.task_id,
@@ -9470,7 +11125,41 @@ async fn provision_reviewer(
                     agent: reviewer_name.clone(),
                 },
             )
-            .await;
+            .await
+            {
+                log(&format!(
+                    "{}: ReviewerAttached was rejected after provisioning: {e}",
+                    role.as_str().to_uppercase()
+                ));
+                let _terminal_output = proc.kill_and_reap().await;
+                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                name_pool.release(&reviewer_name);
+                let p = config.db_path.clone();
+                let rn = reviewer_name.clone();
+                let failed_cap_run_id = cap_run_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut conn) = quorum_core::db::open(&p) {
+                        let _ = journal::delete(&mut conn, &rn);
+                        let _ = quorum_core::capabilities::revoke(
+                            &mut conn,
+                            &failed_cap_run_id,
+                            now_unix(),
+                        );
+                        let _ = quorum_core::agent_runs::close(
+                            &conn,
+                            reviewer_run_id,
+                            now_unix(),
+                            "attachment-failed",
+                        );
+                    }
+                })
+                .await
+                .ok();
+                return Err(QuorumError::Io(format!(
+                    "reviewer attachment failed after provisioning: {e}"
+                )));
+            }
 
             // R2: stash metadata for audit recording when the reviewer finishes.
             if let ReviewRole::R2 {
@@ -9480,8 +11169,8 @@ async fn provision_reviewer(
             {
                 let p = config.db_path.clone();
                 let tid = worker.task_id;
-                let dm = config.model.clone();
-                let de = config.effort.clone();
+                let dm = reviewer_model.clone();
+                let de = reviewer_effort.clone();
                 let r1_rev = r1_reviewer.clone();
                 let r2n = reviewer_name.clone();
                 let r1_rid = *r1_run_id;
@@ -9567,9 +11256,15 @@ async fn provision_reviewer(
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
             let p = config.db_path.clone();
             let rn = reviewer_name.clone();
+            let failed_cap_run_id = cap_run_id.clone();
             tokio::task::spawn_blocking(move || {
                 if let Ok(mut conn) = quorum_core::db::open(&p) {
                     let _ = journal::delete(&mut conn, &rn);
+                    let _ = quorum_core::capabilities::revoke(
+                        &mut conn,
+                        &failed_cap_run_id,
+                        now_unix(),
+                    );
                 }
             })
             .await
@@ -9765,7 +11460,28 @@ async fn spawn_worker(
     // forking a duplicate PR (#340).
     let branch_agent = task.author.as_deref().unwrap_or(&agent_name);
     let session_id = agent::new_session_id();
-    let branch = if continue_target.is_some() {
+    let reserved_allocation = if continue_target.is_none() {
+        let allocation_db = db_path.clone();
+        let allocation_task = task.id;
+        tokio::task::spawn_blocking(move || {
+            let conn = quorum_core::db::open(&allocation_db)?;
+            let allocation = conn
+                .query_row(
+                    "SELECT branch,worktree FROM task_branches WHERE task_id=?1",
+                    [allocation_task],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            Ok::<_, QuorumError>(allocation)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("reserved allocation join: {e}")))??
+    } else {
+        None
+    };
+    let branch = if let Some((branch, _)) = &reserved_allocation {
+        branch.clone()
+    } else if continue_target.is_some() {
         reviewer::remediation_branch(&agent_name, task.id)
     } else {
         format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id)
@@ -9774,9 +11490,76 @@ async fn spawn_worker(
         .as_ref()
         .map(|target| target.head_ref.clone())
         .unwrap_or_else(|| branch.clone());
-    let wt_path = config
-        .worktree_base
-        .join(format!("{}-t{}", branch_agent, task.id));
+    let wt_path = reserved_allocation
+        .as_ref()
+        .map(|(_, path)| PathBuf::from(path))
+        .unwrap_or_else(|| {
+            config
+                .worktree_base
+                .join(format!("{}-t{}", branch_agent, task.id))
+        });
+
+    // Persist immutable allocation provenance before git creates anything.
+    // Ref resolution is external I/O and completes before the short DB write.
+    if continue_target.is_none() {
+        let base_ref = format!("origin/{}", config.base_branch);
+        let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
+            Ok(sha) => sha,
+            Err(error) => {
+                park_task(
+                    &db_path,
+                    task.id,
+                    &format!("branch provenance resolution failed: {error}"),
+                    "open",
+                )
+                .await;
+                name_pool.release(&agent_name);
+                return Ok(false);
+            }
+        };
+        let allocation_db = db_path.clone();
+        let allocation_branch = branch.clone();
+        let allocation_worktree = wt_path.to_string_lossy().into_owned();
+        let allocation_agent = agent_name.clone();
+        let allocation_task = task.id;
+        let recorded = tokio::task::spawn_blocking(move || {
+            let mut conn = quorum_core::db::open(&allocation_db)?;
+            let existing: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT allocated_by,provenance_sha FROM task_branches WHERE task_id=?1",
+                    [allocation_task],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (allocator, provenance) = match existing.as_ref() {
+                Some((allocator, Some(provenance))) => (allocator.as_str(), provenance.as_str()),
+                Some((allocator, None)) => (allocator.as_str(), resolved_provenance.as_str()),
+                None => (allocation_agent.as_str(), resolved_provenance.as_str()),
+            };
+            quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                allocation_task,
+                &allocation_branch,
+                &allocation_worktree,
+                allocator,
+                provenance,
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("branch allocation join: {e}")))??;
+        if !recorded {
+            park_task(
+                &db_path,
+                task.id,
+                "branch allocation provenance conflict",
+                "open",
+            )
+            .await;
+            name_pool.release(&agent_name);
+            return Ok(false);
+        }
+    }
 
     let provision_result = if let Some(target) = &continue_target {
         wt_mgr
@@ -9887,69 +11670,37 @@ async fn spawn_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let (complexity, resolved_model, resolved_effort) = classifier_worker_selection(
-        task.id,
-        &task.refs,
-        config.runner_kind,
-        &config.suggested_models,
-    )?;
-    log(&format!(
-        "classifier routing: task #{} complexity {} -> {}/{}",
-        task.id, complexity, resolved_model, resolved_effort
-    ));
-
-    // #172: enforce the operator-configured minimum after classifier routing and
-    // before runner launch. The floor may raise, but never lower, the
-    // classifier-owned selection.
-    let (floored_model, floored_effort) = apply_model_effort_floor(
-        &resolved_model,
-        &resolved_effort,
-        config.min_model.as_deref(),
-        config.min_effort.as_deref(),
-    );
-    if floored_model != resolved_model || floored_effort != resolved_effort {
-        log(&format!(
-            "model/effort floor: task #{} bumped {resolved_model}/{resolved_effort} -> {floored_model}/{floored_effort}",
+    let complexity = classifier_complexity(&task.refs).ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "task #{} cannot dispatch without classifier-owned complexity",
             task.id
-        ));
-    }
+        ))
+    })?;
+    let assignment = assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!("worker:task:{}", task.id),
+            task_id: Some(task.id),
+            pr_number: None,
+            role: "worker".into(),
+            review_stage: None,
+            complexity: Some(complexity.to_string()),
+        },
+        Some(complexity),
+    )?;
+    let resolved_model = assignment.model.clone();
+    let resolved_effort = assignment.effort.clone();
+    log(&format!(
+        "model routing: task #{} complexity {} -> profile {} ({}/{})",
+        task.id, complexity, assignment.profile_id, resolved_model, resolved_effort
+    ));
     let retry_turn = runner_retry_turn(task.refs.as_deref());
-    let (resolved_model, resolved_effort) = retry_turn
-        .as_ref()
-        .map(|retry| (retry.model.clone(), retry.effort.clone()))
-        .unwrap_or((floored_model, floored_effort));
-
-    if config.provider_explicit {
-        let expected = match config.runner_kind {
-            crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
-            crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
-            crate::serve_config::RunnerKind::Grok => runner::AgentKind::Grok,
-        };
-        let actual = resolve_worker_provider(&resolved_model)?;
-        if actual != expected {
-            let p = db_path.clone();
-            let name = agent_name.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = quorum_core::db::open(&p) {
-                    let _ = journal::delete(&mut conn, &name);
-                }
-            })
-            .await
-            .ok();
-            let strikes = poison_tracker.record_strike(task.id);
-            if strikes >= MAX_POISON_STRIKES {
-                poison_task(&db_path, &agent_name, task.id, strikes).await;
-            } else {
-                release_task(&db_path, &agent_name, task.id).await;
-            }
-            name_pool.release(&agent_name);
-            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
-            log(&format!(
-                "task #{} model '{}' resolved to {actual} and was rejected in provider '{}' mode",
-                task.id, resolved_model, expected
-            ));
-            return Ok(false);
+    if let Some(retry) = &retry_turn {
+        if retry.model != resolved_model || retry.effort != resolved_effort {
+            return Err(QuorumError::Io(format!(
+                "task #{} retry identity {}/{} does not match durable role assignment {}/{}",
+                task.id, retry.model, retry.effort, resolved_model, resolved_effort
+            )));
         }
     }
 
@@ -10099,9 +11850,10 @@ async fn spawn_worker(
                 let e = resolved_effort.clone();
                 let prov = provider_str.clone();
                 let tid = task.id;
+                let assignment_id = assignment.id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert(
+                    quorum_core::agent_runs::insert_with_assignment(
                         &conn,
                         tid,
                         &name,
@@ -10109,6 +11861,7 @@ async fn spawn_worker(
                         &m,
                         &e,
                         &prov,
+                        Some(assignment_id),
                         now_unix(),
                     )
                 })
@@ -10191,6 +11944,7 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
             refs: None,
             verdict: None,
             depends_on: None,
+            expected_revision: None,
         };
         tasks::update(&mut conn, &a, task_id, &fields, now)?;
         Ok(())
@@ -11342,29 +13096,56 @@ async fn spawn_remediation_worker(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
 
-    // Recover the original worker's provider and model from agent_runs so
-    // remediation cannot silently switch providers (e.g. a legacy Codex task reworked
-    // as Claude because the daemon default is Claude).
+    let remediation_complexity = {
+        let conn = quorum_core::db::open(db_path)?;
+        let task = tasks::get(&conn, task_id)?
+            .ok_or_else(|| QuorumError::Io(format!("remediation task #{task_id} disappeared")))?;
+        classifier_complexity(&task.refs).ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "task #{task_id} cannot dispatch remediation without classifier-owned complexity"
+            ))
+        })?
+    };
+    let remediation_assignment = assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!("worker:task:{task_id}"),
+            task_id: Some(task_id),
+            pr_number: None,
+            role: "worker".into(),
+            review_stage: None,
+            complexity: Some(remediation_complexity.to_string()),
+        },
+        Some(remediation_complexity),
+    )?;
+
+    // Recover the original assignment snapshot. Historical run rows are checked
+    // as evidence, but current configuration never reselects remediation.
     let (remediation_model, remediation_effort, remediation_kind, has_original_worker) = {
         let p = db_path.clone();
         let tid = task_id;
-        let cfg_model = config.model.clone();
-        let cfg_effort = config.effort.clone();
-        let cfg_kind = config.runner_kind;
+        let assigned_model = remediation_assignment.model.clone();
+        let assigned_effort = remediation_assignment.effort.clone();
+        let assigned_provider = remediation_assignment.provider.clone();
         let resolved = tokio::task::spawn_blocking(move || -> Result<_> {
             let conn = quorum_core::db::open(&p)?;
             let provider = quorum_core::agent_runs::worker_provider(&conn, tid)?;
             let model = quorum_core::agent_runs::worker_model(&conn, tid)?;
             let worker_runs = quorum_core::agent_runs::runs_for_task(&conn, tid)?;
             let has_original_worker = worker_runs.iter().any(|run| run.role == "worker");
-            let effort = worker_runs
-                .into_iter()
-                .find(|run| run.role == "worker")
-                .map(|run| run.effort)
-                .unwrap_or(cfg_effort);
-            let (model, kind) =
-                resolve_remediation_provider(provider.as_deref(), model, &cfg_model, cfg_kind)?;
-            Ok((model, effort, kind, has_original_worker))
+            if model
+                .as_deref()
+                .is_some_and(|model| model != assigned_model)
+                || provider
+                    .as_deref()
+                    .is_some_and(|provider| provider != assigned_provider)
+            {
+                return Err(QuorumError::Io(
+                    "historical worker run does not match durable routing assignment".into(),
+                ));
+            }
+            let kind = resolve_provider(&assigned_model)?;
+            Ok((assigned_model, assigned_effort, kind, has_original_worker))
         })
         .await;
         match resolved {
@@ -11546,9 +13327,10 @@ async fn spawn_remediation_worker(
                 let e = remediation_effort.clone();
                 let prov = remediation_provider_str;
                 let tid = task_id;
+                let assignment_id = remediation_assignment.id;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert(
+                    quorum_core::agent_runs::insert_with_assignment(
                         &conn,
                         tid,
                         &name,
@@ -11556,6 +13338,7 @@ async fn spawn_remediation_worker(
                         &m,
                         &e,
                         &prov,
+                        Some(assignment_id),
                         now_unix(),
                     )
                 })
@@ -11628,6 +13411,340 @@ async fn spawn_remediation_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn graph_blocker_fixture(
+        cap_role: &str,
+        bind_launch: bool,
+    ) -> (
+        tempfile::TempDir,
+        quorum_core::Connection,
+        i64,
+        i64,
+        i64,
+        mailbox::MailboxRow,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("blocker.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'source','decomposed','owner',1,1),
+                        (2,'child','in-review','owner',1,1),
+                        (3,'sibling','open','owner',1,1);
+             UPDATE tasks SET reviewer='R',assignee='R' WHERE id=2;
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+                 VALUES (1,1,'active',1,0,1,1,1);
+             INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (1,2,'child',1,1),(1,3,'sibling',1,1);
+             INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+                 VALUES (2,'daemon/child','/tmp/moved-review-worktree','daemon',1,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+             INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (2,71,'daemon/child','0123456789abcdef0123456789abcdef01234567',0,1);
+             INSERT INTO journal(agent,role,task_id,session_id,worktree,branch,phase,pr,updated_at)
+                 VALUES ('R','reviewer',2,'session','/tmp/moved-review-worktree','review/pr-71-r','reviewing',71,1);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES ('task#2','R',1,999,1)",
+            [],
+        )
+        .unwrap();
+        quorum_core::capabilities::issue(&mut conn, "cap-2", 2, "R", cap_role, 2).unwrap();
+        if bind_launch {
+            quorum_core::agent_runs::insert_reviewer_with_launch(
+                &conn, 2, "R", "model", "high", "codex", None, 2, None, "cap-2", 71, REVIEW_SHA,
+            )
+            .unwrap()
+            .unwrap();
+        } else {
+            quorum_core::agent_runs::insert(&conn, 2, "R", "reviewer", "model", "high", "codex", 2)
+                .unwrap();
+        }
+        let feedback = crate::graph_blocker::Feedback {
+            category: quorum_core::decomposition::GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION.into(),
+            affected_task: 2,
+            violated_assigned_boundary: "parser-only child".into(),
+            evidence: vec!["diff changes sibling-owned schema".into()],
+        };
+        let row = mailbox::MailboxRow {
+            agent: "R".into(),
+            kind: mailbox::MailboxKind::Done,
+            task_id: Some(2),
+            pr: Some(71),
+            verdict: Some("graph-blocker".into()),
+            feedback: None,
+            note: None,
+            to_agent: None,
+            payload: Some(crate::graph_blocker::encode("cap-2".into(), feedback).unwrap()),
+        };
+        let id = mailbox::append(&mut conn, &row).unwrap();
+        (dir, conn, 1, 2, id, row)
+    }
+
+    fn assert_blocked_convergence(conn: &mut quorum_core::Connection, mailbox_id: i64) {
+        assert!(mailbox::poll_unconsumed(conn).unwrap().is_empty());
+        let state: (String, String, String, i64) = conn
+            .query_row(
+                "SELECT d.state,child.status,source.status,
+                    (SELECT count(*) FROM decomposition_attempts WHERE graph_id=d.id)
+             FROM task_decompositions d JOIN tasks child ON child.id=2
+             JOIN tasks source ON source.id=1 WHERE d.id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            ("blocked".into(), "failed".into(), "decomposed".into(), 1)
+        );
+        let authority: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT c.revoked_at,r.ended_at FROM run_capabilities c
+             JOIN agent_runs r ON r.review_cap_run_id=c.run_id WHERE c.run_id='cap-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(authority.0.is_some() && authority.1.is_some());
+        assert!(tasks::claim(conn, "next", Some(3), &[], 60, 20)
+            .unwrap()
+            .is_none());
+        let preserved: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM task_branches WHERE task_id=2),
+                    (SELECT count(*) FROM pr_targets WHERE task_id=2)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1));
+        let consumed: i64 = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn graph_blocker_daemon_boundary_live_restart_and_replay_converge() {
+        for live_mode in [false, true] {
+            let (_dir, mut conn, _graph, _child, id, row) = graph_blocker_fixture("reviewer", true);
+            let live = LiveGraphBlockerAuthority {
+                agent_run_id: Some(1),
+                task_id: 2,
+                agent: "R",
+                cap_run_id: Some("cap-2"),
+                pr: Some(71),
+                head_sha: Some(REVIEW_SHA),
+            };
+            assert_eq!(
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    id,
+                    &row,
+                    None,
+                    live_mode.then_some(&live),
+                    9,
+                )
+                .unwrap(),
+                GraphBlockerConsumeOutcome::RetryHeadUnavailable
+            );
+            assert_eq!(mailbox::poll_unconsumed(&conn).unwrap().len(), 1);
+            assert_eq!(
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    id,
+                    &row,
+                    Some(REVIEW_SHA),
+                    live_mode.then_some(&live),
+                    10,
+                )
+                .unwrap(),
+                GraphBlockerConsumeOutcome::Blocked
+            );
+            assert_blocked_convergence(&mut conn, id);
+            let replay_id = mailbox::append(&mut conn, &row).unwrap();
+            assert_eq!(
+                consume_graph_blocker_signal(
+                    &mut conn,
+                    replay_id,
+                    &row,
+                    Some(REVIEW_SHA),
+                    None,
+                    11,
+                )
+                .unwrap(),
+                GraphBlockerConsumeOutcome::Rejected
+            );
+            assert_blocked_convergence(&mut conn, replay_id);
+        }
+    }
+
+    #[test]
+    fn graph_blocker_daemon_boundary_invalid_authority_is_consumed_without_mutation() {
+        enum Invalid {
+            MovedHead,
+            HistoricalNullLaunch,
+            Revoked,
+            WrongRole,
+            WrongTask,
+            WrongRun,
+            WrongPr,
+            WrongLiveHead,
+            MissingTask,
+            MissingPr,
+        }
+        for case in [
+            Invalid::MovedHead,
+            Invalid::HistoricalNullLaunch,
+            Invalid::Revoked,
+            Invalid::WrongRole,
+            Invalid::WrongTask,
+            Invalid::WrongRun,
+            Invalid::WrongPr,
+            Invalid::WrongLiveHead,
+            Invalid::MissingTask,
+            Invalid::MissingPr,
+        ] {
+            let role = if matches!(case, Invalid::WrongRole) {
+                "worker"
+            } else {
+                "reviewer"
+            };
+            let bind = !matches!(case, Invalid::HistoricalNullLaunch);
+            let (_dir, mut conn, _graph, _child, id, mut row) = graph_blocker_fixture(role, bind);
+            if matches!(case, Invalid::Revoked) {
+                quorum_core::capabilities::revoke(&mut conn, "cap-2", 5).unwrap();
+            }
+            if matches!(case, Invalid::WrongTask) {
+                row.task_id = Some(3);
+            }
+            if matches!(case, Invalid::MissingTask) {
+                row.task_id = None;
+            }
+            if matches!(case, Invalid::WrongRun) {
+                row.payload = Some(row.payload.unwrap().replace("cap-2", "other"));
+            }
+            if matches!(case, Invalid::WrongPr) {
+                row.pr = Some(72);
+            }
+            if matches!(case, Invalid::MissingPr) {
+                row.pr = None;
+            }
+            let current = if matches!(case, Invalid::MovedHead) {
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            } else {
+                Some(REVIEW_SHA)
+            };
+            let live = LiveGraphBlockerAuthority {
+                agent_run_id: Some(1),
+                task_id: 2,
+                agent: "R",
+                cap_run_id: Some("cap-2"),
+                pr: Some(71),
+                head_sha: if matches!(case, Invalid::WrongLiveHead) {
+                    Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                } else {
+                    Some(REVIEW_SHA)
+                },
+            };
+            let before: (String,String,i64)=conn.query_row("SELECT d.state,t.status,(SELECT count(*) FROM decomposition_attempts) FROM task_decompositions d JOIN tasks t ON t.id=2 WHERE d.id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(
+                consume_graph_blocker_signal(&mut conn, id, &row, current, Some(&live), 10)
+                    .unwrap(),
+                GraphBlockerConsumeOutcome::Rejected
+            );
+            let after: (String,String,i64)=conn.query_row("SELECT d.state,t.status,(SELECT count(*) FROM decomposition_attempts) FROM task_decompositions d JOIN tasks t ON t.id=2 WHERE d.id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+            assert_eq!(after, before);
+            assert!(mailbox::poll_unconsumed(&conn).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn graph_blocker_storage_error_retains_mailbox_for_retry() {
+        let (_dir, mut conn, _graph, _child, id, row) = graph_blocker_fixture("reviewer", true);
+        conn.execute(
+            "ALTER TABLE agent_runs RENAME TO unavailable_agent_runs",
+            [],
+        )
+        .unwrap();
+        assert!(
+            consume_graph_blocker_signal(&mut conn, id, &row, Some(REVIEW_SHA), None, 10,).is_err()
+        );
+        let consumed: Option<i64> = conn
+            .query_row("SELECT consumed_at FROM mailbox WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(consumed.is_none());
+    }
+
+    #[test]
+    fn startup_deferred_graph_blocker_preserves_identity_before_generic_recovery() {
+        let (_dir, mut conn, _graph, _child, id, row) = graph_blocker_fixture("reviewer", true);
+        let outcome = consume_graph_blocker_signal(&mut conn, id, &row, None, None, 9).unwrap();
+        assert_eq!(outcome, GraphBlockerConsumeOutcome::RetryHeadUnavailable);
+
+        let mut generic_recovery_called = false;
+        let startup: Result<()> = (|| {
+            ensure_late_reviewer_recovery_settled(LateReviewerRecovery::Deferred)?;
+            generic_recovery_called = true;
+            Ok(())
+        })();
+        assert!(startup.is_err());
+        assert!(!generic_recovery_called);
+        let preserved: (Option<i64>, Option<i64>, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT c.revoked_at,r.ended_at,
+                        (SELECT count(*) FROM journal WHERE agent='R'),m.consumed_at
+                 FROM run_capabilities c JOIN agent_runs r ON r.review_cap_run_id=c.run_id
+                 JOIN mailbox m ON m.id=?1 WHERE c.run_id='cap-2'",
+                [id],
+                |record| {
+                    Ok((
+                        record.get(0)?,
+                        record.get(1)?,
+                        record.get(2)?,
+                        record.get(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(preserved, (None, None, 1, None));
+
+        assert_eq!(
+            consume_graph_blocker_signal(&mut conn, id, &row, Some(REVIEW_SHA), None, 10).unwrap(),
+            GraphBlockerConsumeOutcome::Blocked
+        );
+        ensure_late_reviewer_recovery_settled(LateReviewerRecovery::Settled).unwrap();
+        assert_blocked_convergence(&mut conn, id);
+    }
+
+    #[test]
+    fn routing_generation_changes_with_executable_policy() {
+        let percentages = std::collections::BTreeMap::from([("primary".to_string(), 100)]);
+        let mut profiles = std::collections::BTreeMap::from([(
+            "primary".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let first =
+            crate::serve_config::routing_generation("worker.3", &percentages, &profiles).unwrap();
+        profiles.get_mut("primary").unwrap().effort = "medium".into();
+        let second =
+            crate::serve_config::routing_generation("worker.3", &percentages, &profiles).unwrap();
+        assert_ne!(first, second);
+        assert!(first.contains("gpt-5.6-terra"));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -15789,5 +17906,464 @@ mod tests {
         assert!(!transcript.contains("must-not-complete"));
         assert!(!transcript.contains("provider warning"));
         assert!(!transcript.contains("42"));
+    }
+
+    #[test]
+    fn planning_candidate_is_ready_large_implementation_priority_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("candidate.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('small','open',100,'owner',1,1,
+               '{\"cx_est\":2,\"cx_size\":\"S\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-low','open',5,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-high','open',9,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('review-large','open',99,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1);"
+        ).unwrap();
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((3, 1)));
+    }
+
+    #[test]
+    fn planning_snapshot_restores_durable_phase_and_bounded_rejections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("restart.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "large",
+            Some("outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "planning",
+            None,
+            3,
+        )
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "cycle",
+            "bounded cycle summary",
+            4,
+        )
+        .unwrap();
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.state, "planning");
+        assert!(snapshot.freeze_active);
+        assert_eq!(snapshot.rejection_summaries, vec!["bounded cycle summary"]);
+    }
+
+    #[test]
+    fn proposal_preclassification_requires_complete_ready_small_nonduplicate_batch() {
+        let proposal = vec![
+            planner::ProposedTask {
+                key: "a".into(),
+                title: "a".into(),
+                observable_outcome: "a works".into(),
+                acceptance_criteria: vec!["a".into()],
+                source_constraints: vec!["atomic".into()],
+                verification_expectations: vec!["test".into()],
+                prerequisites: vec![],
+            },
+            planner::ProposedTask {
+                key: "b".into(),
+                title: "b".into(),
+                observable_outcome: "b works".into(),
+                acceptance_criteria: vec!["b".into()],
+                source_constraints: vec!["atomic".into()],
+                verification_expectations: vec!["test".into()],
+                prerequisites: vec!["a".into()],
+            },
+        ];
+        let valid = vec![
+            quorum_core::classify::TaskClassification {
+                task_id: -1,
+                cx_est: 2,
+                size: "S".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            },
+            quorum_core::classify::TaskClassification {
+                task_id: -2,
+                cx_est: 3,
+                size: "M".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+            },
+        ];
+        assert_eq!(planned_children(&proposal, &valid).unwrap().len(), 2);
+        let mut large = valid.clone();
+        large[1].size = "L".into();
+        assert!(planned_children(&proposal, &large).is_err());
+        let mut duplicate = valid.clone();
+        duplicate[0].duplicate_of = vec![99];
+        assert!(planned_children(&proposal, &duplicate).is_err());
+        assert!(planned_children(&proposal, &valid[..1]).is_err());
+    }
+
+    #[test]
+    fn reviewer_post_resource_fault_matrix_retires_all_durable_authority() {
+        for stage in [
+            "journal",
+            "capability",
+            "spawn",
+            "feed",
+            "pid-journal",
+            "run",
+            "attachment",
+        ] {
+            let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+            quorum_core::db::migrate(&conn).unwrap();
+            let task_id = tasks::create(
+                &mut conn, "owner", stage, None, 0, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+                .unwrap();
+            let reviewer = format!("reviewer-{stage}");
+            let capability = format!("capability-{stage}");
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &capability,
+                task_id,
+                &reviewer,
+                "reviewer",
+                2,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                &reviewer,
+                "reviewer",
+                "claude-opus-4-7",
+                "high",
+                "claude",
+                2,
+            )
+            .unwrap();
+            journal::upsert(
+                &mut conn,
+                &JournalEntry {
+                    agent: reviewer.clone(),
+                    role: "reviewer".into(),
+                    task_id: Some(task_id),
+                    session_id: stage.into(),
+                    worktree: Some(format!("/tmp/reviewer-{stage}")),
+                    branch: Some(format!("review-{stage}")),
+                    phase: "reviewing".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: Some(999_999),
+                    pr: Some(1),
+                    rework_count: 0,
+                },
+            )
+            .unwrap();
+
+            cleanup_failed_reviewer_db(&mut conn, &reviewer, Some(&capability), Some(run_id), 3);
+            cleanup_failed_reviewer_db(&mut conn, &reviewer, Some(&capability), Some(run_id), 4);
+
+            let durable: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                       EXISTS(SELECT 1 FROM journal WHERE agent=?1),
+                       EXISTS(SELECT 1 FROM run_capabilities WHERE run_id=?2 AND revoked_at IS NULL),
+                       EXISTS(SELECT 1 FROM agent_runs WHERE id=?3 AND ended_at IS NULL)",
+                    rusqlite::params![reviewer, capability, run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(durable, (0, 0, 0), "fault stage {stage}");
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert!(task.reviewer.is_none(), "fault stage {stage}");
+        }
+    }
+
+    #[test]
+    fn decomposition_drain_waits_for_every_tick_owned_live_slot_class() {
+        assert!(decomposition_drain_ready(
+            0,
+            0,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            1,
+            0,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            0,
+            1,
+            0,
+            DecompositionLiveWork::default()
+        ));
+        assert!(!decomposition_drain_ready(
+            0,
+            0,
+            1,
+            DecompositionLiveWork::default()
+        ));
+        for live in [
+            DecompositionLiveWork {
+                ordinary_classifier: true,
+                ..Default::default()
+            },
+            DecompositionLiveWork {
+                doctor: true,
+                ..Default::default()
+            },
+            DecompositionLiveWork {
+                pre_review_checks: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(!decomposition_drain_ready(0, 0, 0, live));
+        }
+    }
+
+    #[test]
+    fn decomposition_attempt_truncation_is_utf8_byte_safe() {
+        let input = "é".repeat(2048);
+        let truncated = truncate_utf8_bytes(&input, 2048);
+        assert_eq!(truncated.len(), 2048);
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn startup_reconciliation_covers_every_planning_phase_without_budget_charge() {
+        for phase in [
+            "freeze-requested",
+            "draining",
+            "planning",
+            "validating",
+            "preclassifying",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = quorum_core::db::open(&dir.path().join(format!("{phase}.db"))).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "large",
+                Some("outcome"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            let graph = quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "abc",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            if phase != "freeze-requested" {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "freeze-requested",
+                    "draining",
+                    None,
+                    3,
+                )
+                .unwrap();
+            }
+            if !matches!(phase, "freeze-requested" | "draining") {
+                quorum_core::decomposition::set_frozen_phase(
+                    &mut conn, graph, "draining", "planning", None, 4,
+                )
+                .unwrap();
+            }
+            if matches!(phase, "validating" | "preclassifying") {
+                let proposal = serde_json::to_string(&vec![
+                    planner::ProposedTask {
+                        key: "a".into(),
+                        title: "a".into(),
+                        observable_outcome: "a".into(),
+                        acceptance_criteria: vec!["a".into()],
+                        source_constraints: vec!["a".into()],
+                        verification_expectations: vec!["a".into()],
+                        prerequisites: vec![],
+                    },
+                    planner::ProposedTask {
+                        key: "b".into(),
+                        title: "b".into(),
+                        observable_outcome: "b".into(),
+                        acceptance_criteria: vec!["b".into()],
+                        source_constraints: vec!["b".into()],
+                        verification_expectations: vec!["b".into()],
+                        prerequisites: vec!["a".into()],
+                    },
+                ])
+                .unwrap();
+                quorum_core::decomposition::accept_proposal(&mut conn, graph, &proposal, 5)
+                    .unwrap();
+                if phase == "preclassifying" {
+                    quorum_core::decomposition::set_frozen_phase(
+                        &mut conn,
+                        graph,
+                        "validating",
+                        "preclassifying",
+                        None,
+                        6,
+                    )
+                    .unwrap();
+                }
+            }
+            for _ in 0..5 {
+                assert_eq!(
+                    inspect_startup_decomposition(&conn).unwrap(),
+                    StartupDecompositionState::Frozen
+                );
+                let attempts: i64 = conn
+                    .query_row(
+                        "SELECT proposal_attempts FROM task_decompositions WHERE id=?1",
+                        [graph],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(attempts, 0, "restart inspection charged {phase}");
+            }
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_resets_aggregate_only_active_and_blocked_graphs() {
+        for phase in ["active", "blocked"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = quorum_core::db::open(&dir.path().join(format!("{phase}.db"))).unwrap();
+            let source = tasks::create(
+                &mut conn, "owner", "large", None, 1, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at) VALUES (?1,?2,?3,0,1,2,2)",
+                rusqlite::params![source, phase, 1],
+            )
+            .unwrap();
+            let outcome =
+                quorum_core::decomposition::reconcile_startup_graphs(&mut conn, 3).unwrap();
+            assert_eq!(outcome.reset, 1);
+            assert_eq!(
+                inspect_startup_decomposition(&conn).unwrap(),
+                StartupDecompositionState::Frozen
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn planner_view_is_exactly_frozen_and_rejects_head_drift() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("state.txt"), "frozen").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen = git(&["rev-parse", "HEAD"]);
+        let view = frozen_planner_view(repo.path(), &frozen).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("state.txt")).unwrap(),
+            "frozen"
+        );
+        assert!(!view.path().join(".git").exists());
+        std::fs::write(repo.path().join("state.txt"), "drifted").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "drift"]);
+        let drained_head = git(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            repository_head_sha(repo.path()).await.unwrap(),
+            drained_head
+        );
+        assert_ne!(drained_head, frozen);
+        assert!(frozen_planner_view(repo.path(), &frozen).await.is_err());
+
+        let not_a_repo = tempfile::tempdir().unwrap();
+        assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+    }
+
+    #[test]
+    fn reviewer_context_wiring_fails_closed_for_noncurrent_graph_plan() {
+        let (dir, conn, _graph, child, _mailbox_id, _row) = graph_blocker_fixture("reviewer", true);
+        drop(conn);
+        let db = dir.path().join("blocker.db");
+        assert!(prepare_reviewer_authority(&db, child, "new-cap", "NewReviewer", 10).is_err());
+        let conn = quorum_core::db::open(&db).unwrap();
+        let capabilities: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM run_capabilities WHERE run_id='new-cap'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let runs: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE agent_name='NewReviewer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let attached: Option<String> = conn
+            .query_row("SELECT reviewer FROM tasks WHERE id=?1", [child], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!((capabilities, runs, attached.as_deref()), (0, 0, Some("R")));
     }
 }

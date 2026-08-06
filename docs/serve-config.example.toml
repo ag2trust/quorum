@@ -14,28 +14,54 @@ repo_dir = "/home/user/dev/quorum"
 worktree_base = "/home/user/.quorum/serve/quorum/worktrees"
 log_dir       = "/home/user/.quorum/serve/quorum/logs"
 
-# ── agent spawn ───────────────────────────────────────────────────────
-# provider = "codex"  # optional: selects the Codex routing ladder below
-cap    = 4
-model  = "sonnet"
-effort = "high"
+# ── agent spawn and model routing ─────────────────────────────────────
+cap = 4
 # names_file = "/home/user/.quorum/serve/names.txt"
 # agent_bin  = "claude"
 
-# ── classifier-owned complexity routing policy ───────────────────────
-# The active provider selects one built-in ladder. These are Quorum's
-# operational routing policy, not a cross-vendor benchmark.
-# Claude: 1=sonnet-5/medium, 2=opus-46/medium, 3=opus-46/high,
-#         4=opus-47/high, 5=opus-48/high
-# Codex:  1=luna/high, 2=terra/high, 3=terra/high,
-#         4=sol/high, 5=sol/high
-# The daemon parks tasks classified not ready, XL, or complexity-5 with size L.
-# Focused complexity-5 tasks sized S or M remain dispatchable.
-# Task creators cannot override complexity, model, or effort. Optional operator
-# overrides must use a closed tier and medium|high.
-# [suggested_models]
-# "1" = "luna/high"
-# "4" = "sol/high"
+# Routing is a hard cutover: legacy fixed agent/provider/model/effort and
+# worker_model/review_model/classifier_model/collector_model keys are rejected.
+# Every pool uses positive integer percentages totaling exactly 100. Quorum
+# persists and shuffles a 100-slot epoch, then advances its position atomically
+# with assignment creation. R1 and R2 use independent bags.
+[model_profiles.terra]
+runner = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+
+[model_profiles.opus]
+runner = "claude"
+model = "claude-opus-4-8"
+effort = "high"
+
+[routing.classifier]
+terra = 100
+[routing.planner]
+opus = 100
+[routing.collector]
+terra = 100
+[routing.worker.1]
+terra = 100
+[routing.worker.2]
+terra = 100
+[routing.worker.3]
+terra = 80
+opus = 20
+[routing.worker.4]
+opus = 100
+[routing.worker.5]
+opus = 100
+[routing.reviewer.1]
+terra = 100
+[routing.reviewer.2]
+terra = 100
+[routing.reviewer.3]
+terra = 80
+opus = 20
+[routing.reviewer.4]
+opus = 100
+[routing.reviewer.5]
+opus = 100
 
 # ── cost ceilings ────────────────────────────────────────────────────
 # A turn longer than 45 min is almost certainly stuck; #56's auto-refeed

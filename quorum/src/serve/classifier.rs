@@ -10,6 +10,7 @@ pub const CLASSIFIER_EFFORT: &str = "low";
 #[allow(dead_code)]
 pub struct ClassifierSlot {
     pub proc: RunnerProc,
+    pub model: String,
     pub pending_task_ids: Vec<i64>,
     /// Internally-derived identity of each exact input sent to this provider
     /// turn.  Never accept a model-supplied revision/fingerprint.
@@ -90,6 +91,7 @@ pub async fn spawn_classifier_configured(
     .await?;
     Ok(ClassifierSlot {
         proc,
+        model: model.to_string(),
         pending_task_ids,
         pending_inputs,
         response_text: String::new(),
@@ -254,6 +256,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -310,6 +313,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -373,6 +377,7 @@ mod tests {
 
         let tasks = vec![TaskForClassification {
             id: 7,
+            revision: 1,
             title: "classify me".into(),
             body: None,
             dependencies: vec![],
@@ -391,9 +396,17 @@ mod tests {
         .await
         .unwrap();
         let pid = slot.proc.pid().expect("classifier pid");
-        let result = drain_classifier_events(&mut slot)
-            .await
-            .expect("terminal result");
+        // A saturated full-suite runner can delay the shell beyond one polling
+        // window. This test exercises terminal-result cleanup, so retry the
+        // bounded production poll instead of coupling it to scheduler latency.
+        let mut result = None;
+        for _ in 0..5 {
+            result = drain_classifier_events(&mut slot).await;
+            if result.is_some() {
+                break;
+            }
+        }
+        let result = result.expect("terminal result");
         assert!(matches!(result, ClassifierResult::Done(_)));
         assert_eq!(
             unsafe { libc::kill(pid, 0) },

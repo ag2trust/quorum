@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 38;
+pub const SCHEMA_VERSION: i64 = 42;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -478,11 +478,40 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // than sorting every historical review-only task. Bumping is required
         // for live v33 databases, where SCHEMA_SQL would otherwise be skipped.
 
-        // v35 = authoritative existing-PR implementation intent. Nullable preserves every
-        // historical task as ordinary/review-only; the positive check is enforced for fresh
-        // databases and the CLI/core boundary validates writes on upgraded databases.
-        if current < 35 && !column_exists(conn, "tasks", "continue_pr")? {
-            conn.execute("ALTER TABLE tasks ADD COLUMN continue_pr INTEGER", [])?;
+        // v36 reconciles the two independently shipped v35 additions: bounded task
+        // decomposition and authoritative existing-PR implementation intent. Check
+        // every column so a database created by either v35 lineage gains the other.
+        // The aggregate/member/attempt/cleanup
+        // tables are created by SCHEMA_SQL. Task revisions are additive so a
+        // populated database preserves every existing task at revision 1 with
+        // no accepted edits.
+        if current < 36 {
+            if !column_exists(conn, "tasks", "revision")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "tasks", "edit_count")? {
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN edit_count INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            // Nullable preserves every historical task as ordinary/review-only;
+            // the CLI/core boundary validates writes on upgraded databases.
+            if !column_exists(conn, "tasks", "continue_pr")? {
+                conn.execute("ALTER TABLE tasks ADD COLUMN continue_pr INTEGER", [])?;
+            }
+        }
+
+        // v37 persists an accepted bounded proposal across daemon restarts.
+        // The reservation table is created by SCHEMA_SQL.
+        if current < 37 && !column_exists(conn, "task_decompositions", "accepted_proposal_json")? {
+            conn.execute(
+                "ALTER TABLE task_decompositions ADD COLUMN accepted_proposal_json TEXT",
+                [],
+            )?;
         }
 
         // v36 = indexed corrupt terminal retry candidates (#270). The two
@@ -511,6 +540,91 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
             }
         }
 
+        // v39 makes decomposition cleanup crash-recoverable. SQLite cannot
+        // alter a CHECK constraint, so rebuild the table under the same write
+        // lock. Historical `complete` rows remain terminal; historical
+        // `failed` rows become retryable pending work.
+        if current < 39 {
+            conn.execute_batch(
+                "CREATE TABLE decomposition_cleanup_v39 (
+                     graph_id       INTEGER NOT NULL REFERENCES task_decompositions(id),
+                     task_id        INTEGER NOT NULL REFERENCES tasks(id),
+                     artifact_kind  TEXT NOT NULL,
+                     artifact_ref   TEXT NOT NULL,
+                     state          TEXT NOT NULL DEFAULT 'pending'
+                                          CHECK(state IN ('pending','running','done','exhausted')),
+                     attempts       INTEGER NOT NULL DEFAULT 0,
+                     last_error     TEXT,
+                     updated_at     INTEGER NOT NULL,
+                     PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
+                 );
+                 INSERT INTO decomposition_cleanup_v39(
+                     graph_id,task_id,artifact_kind,artifact_ref,state,attempts,last_error,updated_at)
+                 SELECT graph_id,task_id,artifact_kind,artifact_ref,
+                        CASE state WHEN 'complete' THEN 'done'
+                                   WHEN 'failed' THEN 'pending' ELSE state END,
+                        attempts,last_error,updated_at
+                 FROM decomposition_cleanup;
+                 DROP TABLE decomposition_cleanup;
+                 ALTER TABLE decomposition_cleanup_v39 RENAME TO decomposition_cleanup;",
+            )?;
+        }
+
+        // v40 binds a task-owned branch allocation to the immutable commit it
+        // was provisioned from. Historical allocations remain NULL and are
+        // deliberately ineligible for destructive branch discovery.
+        if current < 40 && !column_exists(conn, "task_branches", "provenance_sha")? {
+            conn.execute(
+                "ALTER TABLE task_branches ADD COLUMN provenance_sha TEXT",
+                [],
+            )?;
+        }
+
+        // v41 persists the immutable PR head assigned to an exact reviewer
+        // capability. Restart recovery must never infer review authority from
+        // a mutable worktree checkout.
+        if current < 41 {
+            if !column_exists(conn, "agent_runs", "review_cap_run_id")? {
+                conn.execute(
+                    "ALTER TABLE agent_runs ADD COLUMN review_cap_run_id TEXT",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "agent_runs", "review_pr")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN review_pr INTEGER", [])?;
+            }
+            if !column_exists(conn, "agent_runs", "review_head_sha")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN review_head_sha TEXT", [])?;
+            }
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_review_cap
+             ON agent_runs(review_cap_run_id) WHERE review_cap_run_id IS NOT NULL",
+            [],
+        )?;
+
+        // v42 = durable weighted model routing. Net-new authority tables are created by
+        // SCHEMA_SQL; these nullable links extend existing canonical evidence without
+        // reinterpreting historical rows.
+        if current < 42 {
+            if !column_exists(conn, "agent_runs", "role_assignment_id")? {
+                conn.execute("ALTER TABLE agent_runs ADD COLUMN role_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            if !column_exists(conn, "task_decompositions", "planner_assignment_id")? {
+                conn.execute("ALTER TABLE task_decompositions ADD COLUMN planner_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            if !column_exists(conn, "review_collection_runs", "role_assignment_id")? {
+                conn.execute("ALTER TABLE review_collection_runs ADD COLUMN role_assignment_id INTEGER REFERENCES role_assignments(id)", [])?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS agent_runs_role_assignment
+                     ON agent_runs(role_assignment_id);
+                 CREATE INDEX IF NOT EXISTS review_collection_runs_role_assignment
+                     ON review_collection_runs(role_assignment_id);
+                 CREATE INDEX IF NOT EXISTS task_decompositions_planner_assignment
+                     ON task_decompositions(planner_assignment_id);",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -574,6 +688,8 @@ mod tests {
             "journal",
             "daemon_lock",
             "agent_runs",
+            "role_assignments",
+            "routing_cursors",
             "task_messages",
             "task_message_deliveries",
         ] {
@@ -599,6 +715,64 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v38_to_v42_migration_adds_routing_authority_and_nullable_evidence_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v38.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_runs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+                    agent_name TEXT NOT NULL, role TEXT NOT NULL, model TEXT NOT NULL,
+                    effort TEXT NOT NULL, spawned_at INTEGER NOT NULL, ended_at INTEGER,
+                    end_reason TEXT, sub_role TEXT, provider TEXT
+                 );
+                 CREATE TABLE task_decompositions(
+                    id INTEGER PRIMARY KEY, active INTEGER NOT NULL DEFAULT 0,
+                    freeze_active INTEGER NOT NULL DEFAULT 0,
+                    accepted_proposal_json TEXT
+                 );
+                 CREATE TABLE review_collection_runs(
+                    pr_number INTEGER PRIMARY KEY, task_id INTEGER, status TEXT,
+                    error TEXT, collector_model TEXT, collector_version TEXT,
+                    findings_count INTEGER, attempted_at INTEGER, completed_at INTEGER
+                 );
+                 INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+                    VALUES (1,'old-worker','worker','old-model','high','codex',2);
+                 PRAGMA user_version=38;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for table in ["role_assignments", "routing_cursors"] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        assert!(column_exists(&conn, "agent_runs", "role_assignment_id").unwrap());
+        assert!(column_exists(&conn, "task_decompositions", "planner_assignment_id").unwrap());
+        assert!(column_exists(&conn, "review_collection_runs", "role_assignment_id").unwrap());
+        let historical: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT model,role_assignment_id FROM agent_runs WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(historical, ("old-model".into(), None));
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -836,6 +1010,58 @@ mod tests {
         let reopened = open(&path).unwrap();
         assert!(column_exists(&reopened, "tasks", "revision").unwrap());
         assert!(column_exists(&reopened, "tasks", "edit_count").unwrap());
+    }
+
+    #[test]
+    fn migrates_v39_branch_allocations_with_nullable_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v39-branch-provenance.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE task_branches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL UNIQUE,
+                    branch TEXT NOT NULL UNIQUE,
+                    worktree TEXT NOT NULL,
+                    allocated_by TEXT NOT NULL,
+                    allocated_at INTEGER NOT NULL
+                 );
+                 INSERT INTO task_branches(
+                    task_id,branch,worktree,allocated_by,allocated_at)
+                 VALUES (7,'daemon/legacy-t7','/tmp/legacy-t7','legacy',10);
+                 PRAGMA user_version = 39;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        let row: (i64, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT task_id,branch,worktree,provenance_sha FROM task_branches WHERE task_id=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (7, "daemon/legacy-t7".into(), "/tmp/legacy-t7".into(), None)
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "task_branches", "provenance_sha").unwrap());
+        assert!(reopened
+            .query_row(
+                "SELECT provenance_sha IS NULL FROM task_branches WHERE task_id=7",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]
@@ -2435,6 +2661,214 @@ mod tests {
             plan.matches("tasks_reviewing_newest").count(),
             2,
             "plan: {plan}"
+        );
+    }
+
+    #[test]
+    fn migrates_v34_to_v35_adds_decomposition_authority_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.db");
+        let raw = Connection::open(&path).unwrap();
+        apply_pragmas(&raw).unwrap();
+        raw.execute_batch(
+            "BEGIN;
+             CREATE TABLE tasks (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 title TEXT NOT NULL, body TEXT, status TEXT NOT NULL,
+                 priority INTEGER NOT NULL DEFAULT 0, labels TEXT, assignee TEXT,
+                 created_by TEXT NOT NULL, created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL, refs TEXT, depends_on TEXT,
+                 sticky_until INTEGER, orig TEXT, author TEXT, reviewer TEXT,
+                 rework_round INTEGER NOT NULL DEFAULT 0,
+                 review_only INTEGER NOT NULL DEFAULT 0,
+                 recovery_attempts INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('existing', 'open', 'owner', 100, 100);
+             PRAGMA user_version = 34;
+             COMMIT;",
+        )
+        .unwrap();
+        drop(raw);
+
+        let conn = open(&path).unwrap();
+        let task: (i64, i64) = conn
+            .query_row(
+                "SELECT revision,edit_count FROM tasks WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(task, (1, 0));
+        for table in [
+            "task_decompositions",
+            "task_graph_members",
+            "decomposition_attempts",
+            "decomposition_cleanup",
+            "reviewer_provision_reservations",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "{table} missing after v34 migration");
+        }
+        assert!(column_exists(&conn, "task_decompositions", "accepted_proposal_json").unwrap());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn populated_v36_to_v37_preserves_graph_and_matches_proposal_write_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v36.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                    source_task_id,state,freeze_active,planned_source_revision,
+                    planner_provider,planner_model,created_at,updated_at)
+                 VALUES (1,'planning',1,1,'claude','opus',2,2)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE task_decompositions DROP COLUMN accepted_proposal_json;
+                 PRAGMA user_version=36;",
+            )
+            .unwrap();
+        }
+
+        let mut upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "task_decompositions", "accepted_proposal_json").unwrap());
+        let preserved: (String, String, String, i64) = upgraded
+            .query_row(
+                "SELECT state,planner_provider,planner_model,planned_source_revision
+                 FROM task_decompositions WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            ("planning".into(), "claude".into(), "opus".into(), 1)
+        );
+
+        let exact = format!("\"{}\"", "a".repeat(65_534));
+        assert_eq!(exact.len(), 65_536);
+        assert!(crate::decomposition::accept_proposal(&mut upgraded, 1, &exact, 3).unwrap());
+        upgraded
+            .execute(
+                "UPDATE task_decompositions SET state='planning',accepted_proposal_json=NULL WHERE id=1",
+                [],
+            )
+            .unwrap();
+        let over = format!("\"{}\"", "é".repeat(32_768));
+        assert!(over.len() > 65_536);
+        assert!(crate::decomposition::accept_proposal(&mut upgraded, 1, &over, 4).is_err());
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(reopened);
+
+        let newer_path = dir.path().join("newer.db");
+        let newer = Connection::open(&newer_path).unwrap();
+        newer
+            .execute_batch(&format!("PRAGMA user_version={}", SCHEMA_VERSION + 1))
+            .unwrap();
+        drop(newer);
+        assert!(matches!(
+            open(&newer_path),
+            Err(QuorumError::SchemaTooNew { .. })
+        ));
+    }
+
+    #[test]
+    fn populated_v40_to_v41_adds_immutable_review_launch_authority_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v40-review-launch.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+                 VALUES (7,'historical','reviewer','model','high','codex',1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_review_cap;
+                 ALTER TABLE agent_runs DROP COLUMN review_cap_run_id;
+                 ALTER TABLE agent_runs DROP COLUMN review_pr;
+                 ALTER TABLE agent_runs DROP COLUMN review_head_sha;
+                 PRAGMA user_version=40;",
+            )
+            .unwrap();
+        }
+        let conn = open(&path).unwrap();
+        for column in ["review_cap_run_id", "review_pr", "review_head_sha"] {
+            assert!(column_exists(&conn, "agent_runs", column).unwrap());
+        }
+        assert!(
+            crate::agent_runs::review_launch_for_capability(&conn, "historical")
+                .unwrap()
+                .is_none()
+        );
+        let first =
+            crate::agent_runs::insert(&conn, 7, "R1", "reviewer", "model", "high", "codex", 2)
+                .unwrap();
+        assert!(crate::agent_runs::bind_review_launch(
+            &conn,
+            first,
+            "cap",
+            71,
+            "0123456789abcdef0123456789abcdef01234567"
+        )
+        .unwrap());
+        let second =
+            crate::agent_runs::insert(&conn, 8, "R2", "reviewer", "model", "high", "codex", 3)
+                .unwrap();
+        assert!(crate::agent_runs::bind_review_launch(
+            &conn,
+            second,
+            "cap",
+            72,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_err());
+        drop(conn);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            crate::agent_runs::review_launch_for_capability(&reopened, "cap")
+                .unwrap()
+                .unwrap()
+                .pr,
+            71
         );
     }
 }

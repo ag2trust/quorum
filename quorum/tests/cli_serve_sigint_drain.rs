@@ -233,7 +233,7 @@ fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     }
 }
 
-fn quorum_done(home: &std::path::Path, args: &[&str]) {
+fn quorum_done(home: &std::path::Path, args: &[&str]) -> std::process::Output {
     let agent = args
         .iter()
         .zip(args.iter().skip(1))
@@ -248,18 +248,13 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     let run_id = resolve_run_id(home, agent, role);
     let mut cmd_args = vec!["done"];
     cmd_args.extend_from_slice(args);
-    let out = Command::new(cargo_bin("quorum"))
+    Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
         .env("QUORUM_REPO", "test/repo")
         .env("QUORUM_RUN_ID", &run_id)
         .args(&cmd_args)
         .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "done failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .unwrap()
 }
 
 /// First SIGINT with an in-flight agent enters drain mode. The agent finishes
@@ -316,16 +311,20 @@ fn sigint_drains_in_flight_agent_and_exits_0() {
     );
 
     // Complete the agent's task so it becomes idle → drain tears it down.
-    quorum_done(home.path(), &["--agent", &agent_name]);
+    let done = quorum_done(home.path(), &["--agent", &agent_name]);
+    if !done.status.success() {
+        let stderr = String::from_utf8_lossy(&done.stderr);
+        assert!(
+            stderr.contains("has been revoked"),
+            "done failed before either valid teardown path: {stderr}"
+        );
+    }
 
-    // Daemon should tear down the idle worker and exit.
-    assert!(
-        handle.wait_for("DRAIN: tearing down idle worker", 10),
-        "did not see idle worker teardown: {:?}",
-        handle.lines
-    );
-
-    let status = handle.wait_exit(10).expect("serve did not exit");
+    // Depending on whether publication succeeds before the drain tick, the
+    // worker is removed either by the ordinary bounded teardown path or by
+    // drain's idle-slot cleanup. The authority/state result is identical; do
+    // not couple shutdown correctness to which log line wins that race.
+    let status = handle.wait_exit(15).expect("serve did not exit");
     assert_eq!(
         status.code(),
         Some(0),
@@ -339,6 +338,30 @@ fn sigint_drains_in_flight_agent_and_exits_0() {
         "SIGINT drain must NOT exit 75 (supervisor would relaunch). Lines: {:?}",
         handle.lines
     );
+    assert!(
+        handle.has_line_containing("DRAIN: tearing down idle worker")
+            || handle.has_line_containing(&format!("tearing down worker {agent_name}")),
+        "worker was not torn down by either valid bounded path: {:?}",
+        handle.lines
+    );
+
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    let (task_status, assignee, live_journal): (String, Option<String>, i64) = conn
+        .query_row(
+            "SELECT t.status,t.assignee,
+                    (SELECT count(*) FROM journal WHERE task_id=t.id)
+             FROM tasks t WHERE t.id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(
+        !matches!(task_status.as_str(), "working" | "rework" | "merging"),
+        "clean drain left task under live delivery authority: {task_status}"
+    );
+    assert!(assignee.is_none(), "clean drain left an assignee");
+    assert_eq!(live_journal, 0, "clean drain left process ownership");
 }
 
 /// Second SIGINT while already draining forces immediate teardown.

@@ -101,6 +101,9 @@ pub enum Command {
         agent: String,
         #[arg(long = "task-id")]
         task_id: i64,
+        /// Current task revision. Required when changing body, refs, or dependencies.
+        #[arg(long = "expected-revision")]
+        expected_revision: Option<i64>,
         #[arg(long)]
         status: Option<String>,
         #[arg(long)]
@@ -359,6 +362,9 @@ pub enum Command {
         /// compatibility --feedback flag is supplied.
         #[arg(long = "feedback-file")]
         feedback_file: Option<PathBuf>,
+        /// Closed bounded JSON evidence for `--verdict graph-blocker`.
+        #[arg(long = "feedback-json", conflicts_with_all = ["feedback", "feedback_file", "blocking"])]
+        feedback_json: Option<String>,
         /// Count of BLOCKING findings in your review. `--verdict approved`
         /// requires `--blocking 0` — any blocking finding requires
         /// `--verdict changes`.
@@ -388,18 +394,9 @@ pub enum Command {
         /// When absent, names are auto-generated.
         #[arg(long)]
         names_file: Option<String>,
-        /// Runner type: "claude" (default) or "codex".
-        #[arg(long)]
-        agent: Option<String>,
         /// Override the agent binary (default: "claude" or "codex" per runner).
         #[arg(long)]
         agent_bin: Option<String>,
-        /// Model to pass to spawned agents (default: sonnet).
-        #[arg(long)]
-        model: Option<String>,
-        /// Effort level to pass to spawned agents (default: high).
-        #[arg(long)]
-        effort: Option<String>,
         /// Path to a file containing a GitHub token for merging PRs.
         /// Read at merge time; never passed to agent processes.
         #[arg(long)]

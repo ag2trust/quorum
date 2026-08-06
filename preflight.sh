@@ -38,33 +38,59 @@ git fetch origin --quiet || fail "git fetch origin"
 git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BASE_REF=origin/main
+INTEGRATION=0
+case "$BRANCH" in
+  sync/develop-*)
+    git rev-parse --verify --quiet origin/develop >/dev/null \
+      || fail "origin/develop not found — integration gate cannot run"
+    git merge-base --is-ancestor origin/main HEAD \
+      || fail "integration branch does not contain current origin/main"
+    git merge-base --is-ancestor origin/develop HEAD \
+      || fail "integration branch does not contain current origin/develop"
+    BASE_REF=origin/develop
+    INTEGRATION=1
+    ;;
+esac
 if [ "$BRANCH" = "main" ]; then
   printf 'on main — nothing to compare, skipping\n'
 else
   # Every commit ahead of origin/main must be this PR's own work. Multiple
   # distinct Co-Authored-By sessions ahead of main means the branch was cut from
   # another feature branch (#114) — rebase onto origin/main before pushing.
-  printf 'commits ahead of origin/main:\n'
-  git log --oneline origin/main..HEAD
+  if [ "$INTEGRATION" -eq 1 ]; then
+    # Main's commits are inherited integration input, not work authored by the
+    # sync session. Inspect only commits belonging to neither remote history.
+    OWN_COMMITS=$(git rev-list HEAD --not origin/main origin/develop)
+    printf 'integration-only commits:\n'
+    if [ -n "$OWN_COMMITS" ]; then
+      git show -s --oneline $OWN_COMMITS
+    fi
+  else
+    OWN_COMMITS=$(git rev-list "$BASE_REF"..HEAD)
+    printf 'commits ahead of %s:\n' "$BASE_REF"
+    git log --oneline "$BASE_REF"..HEAD
+  fi
   # Dedupe on the session-name token only ("Flint-r3 (Claude Opus 4.6) <...>" →
   # "Flint-r3") — trailer model-string formats vary within one session.
-  N_SESSIONS=$(git log origin/main..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
-    | sed '/^$/d' | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
+  N_SESSIONS=$(if [ -n "$OWN_COMMITS" ]; then
+      git show -s --format='%(trailers:key=Co-Authored-By,valueonly)' $OWN_COMMITS
+    fi | sed '/^$/d' | awk '{print $1}' | sort -u | wc -l | tr -d ' ')
   if [ "$N_SESSIONS" -gt 1 ]; then
-    printf 'distinct co-author sessions ahead of origin/main:\n'
-    git log origin/main..HEAD --format='%(trailers:key=Co-Authored-By,valueonly)' \
+    printf 'distinct co-author sessions in branch-owned commits:\n'
+    git show -s --format='%(trailers:key=Co-Authored-By,valueonly)' $OWN_COMMITS \
       | sed '/^$/d' | awk '{print $1}' | sort -u
-    fail "branch base: ${N_SESSIONS} sessions in origin/main..HEAD — branched from a feature branch? Rebase onto origin/main"
+    fail "branch base: ${N_SESSIONS} sessions in branch-owned commits — branched from a feature branch?"
   fi
   # Heuristic limit: session attribution rides on Co-Authored-By trailers
   # (convention-mandatory on every commit, CLAUDE.md §Engineering practices 1).
   # Trailer-less commits can't be attributed — surface that instead of implying
   # a clean pass.
-  N_AHEAD=$(git rev-list --count origin/main..HEAD)
+  N_AHEAD=$(printf '%s\n' "$OWN_COMMITS" | sed '/^$/d' | wc -l | tr -d ' ')
   if [ "$N_SESSIONS" -eq 0 ] && [ "$N_AHEAD" -gt 0 ]; then
     printf 'note: %s commit(s) ahead carry no Co-Authored-By trailer — sessions unattributable; eyeball the commit list above\n' "$N_AHEAD"
   fi
-  printf 'branch base OK (%s session(s) ahead of origin/main)\n' "$N_SESSIONS"
+  printf 'branch base OK (%s session(s) ahead of %s)\n' "$N_SESSIONS" "$BASE_REF"
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------

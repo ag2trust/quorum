@@ -100,7 +100,7 @@ impl AgentProc {
     }
 
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, false)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::None)
     }
 
     /// Spawn a closed-book classifier while preserving the configured auth
@@ -108,13 +108,21 @@ impl AgentProc {
     /// credential restrictions of `--bare`; the empty tool surface prevents
     /// the classifier from acquiring context beyond its supplied turn.
     pub fn spawn_restricted(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, true)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook)
+    }
+
+    /// Spawn a read-only planning turn. Unlike the closed-book classifier,
+    /// the planner may inspect the frozen repository, but cannot invoke Bash,
+    /// write files, load customizations, or persist a provider session.
+    #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
+    pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner)
     }
 
     fn spawn_configured(
         spec: &AgentSpec,
         agent_bin: Option<&str>,
-        restricted: bool,
+        restricted: RestrictedMode,
     ) -> std::io::Result<Self> {
         let bin = agent_bin.unwrap_or("claude");
         let mut cmd = Command::new(bin);
@@ -131,12 +139,18 @@ impl AgentProc {
 
         cmd.arg("--session-id").arg(&spec.session_id);
 
-        if restricted {
+        if restricted != RestrictedMode::None {
             cmd.arg("--safe-mode")
                 .arg("--disable-slash-commands")
                 .arg("--tools")
-                .arg("")
+                .arg(match restricted {
+                    RestrictedMode::Planner => "Read,Glob,Grep",
+                    _ => "",
+                })
                 .arg("--no-session-persistence");
+            if restricted == RestrictedMode::Planner {
+                cmd.arg("--add-dir").arg(&spec.worktree);
+            }
         } else {
             cmd.arg("--add-dir").arg(&spec.worktree);
         }
@@ -157,6 +171,9 @@ impl AgentProc {
 
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
+        }
+        if restricted == RestrictedMode::Planner {
+            strip_coordination_env(&mut cmd);
         }
 
         cmd.current_dir(&spec.worktree);
@@ -354,6 +371,26 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestrictedMode {
+    None,
+    ClosedBook,
+    Planner,
+}
+
+fn strip_coordination_env(cmd: &mut Command) {
+    for name in [
+        "QUORUM_AGENT",
+        "QUORUM_HOME",
+        "QUORUM_REPO",
+        "QUORUM_RUN_ID",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ] {
+        cmd.env_remove(name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +530,35 @@ mod tests {
             event.is_some(),
             "claude exited without emitting any stream event — the restricted \
              classifier argument surface was rejected at CLI validation"
+        );
+    }
+
+    /// Planner-specific read-only arguments must clear the real CLI parser.
+    /// Blanked credentials make this a zero-token boundary test.
+    #[tokio::test]
+    async fn real_cli_accepts_restricted_planner_spec_args() {
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = classifier_spec(tmp.path(), false);
+        spec.model = "claude-opus-4-6".into();
+        spec.effort = "high".into();
+        spec.allowed_tools = "Read,Glob,Grep".into();
+        spec.env_vars = no_auth_env(tmp.path());
+
+        let mut proc = AgentProc::spawn_planner(&spec, None).expect("spawn planner claude");
+        proc.feed_turn(&user_turn("return an empty JSON object"))
+            .await
+            .expect("feed planner turn");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("planner claude produced no event within 60s");
+        let _ = proc.kill_and_reap().await;
+        assert!(
+            event.is_some(),
+            "claude rejected the planner argument boundary before authentication"
         );
     }
 

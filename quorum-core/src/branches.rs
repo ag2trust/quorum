@@ -29,6 +29,74 @@ pub struct BranchAllocation {
     pub existed: bool,
 }
 
+/// Persist an exact daemon-derived allocation and its immutable provisioning
+/// provenance before creating the Git branch/worktree. Replays succeed only
+/// for the identical tuple; collisions are clean negatives.
+#[allow(clippy::too_many_arguments)]
+pub fn record_exact_allocation(
+    conn: &mut Connection,
+    task_id: i64,
+    branch: &str,
+    worktree: &str,
+    allocator: &str,
+    provenance_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if [branch, worktree, allocator, provenance_sha]
+        .iter()
+        .any(|value| value.is_empty() || value.contains('\0'))
+        || !matches!(provenance_sha.len(), 40 | 64)
+        || !provenance_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(crate::error::QuorumError::Usage(
+            "invalid branch allocation provenance".into(),
+        ));
+    }
+    let tx = crate::db::begin_immediate(conn)?;
+    let existing: Option<(i64, String, String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT id,branch,worktree,allocated_by,provenance_sha FROM task_branches WHERE task_id=?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()?;
+    if let Some((id, existing_branch, existing_worktree, existing_allocator, existing_provenance)) =
+        existing
+    {
+        let exact_identity = existing_branch == branch
+            && existing_worktree == worktree
+            && existing_allocator == allocator;
+        let normalized = provenance_sha.to_ascii_lowercase();
+        if exact_identity && existing_provenance.is_none() {
+            let updated = tx.execute(
+                "UPDATE task_branches SET provenance_sha=?2
+                 WHERE id=?1 AND task_id=?3 AND branch=?4 AND worktree=?5
+                   AND allocated_by=?6 AND provenance_sha IS NULL",
+                params![id, normalized, task_id, branch, worktree, allocator],
+            )?;
+            tx.commit()?;
+            return Ok(updated == 1);
+        }
+        tx.commit()?;
+        return Ok(exact_identity && existing_provenance.as_deref() == Some(normalized.as_str()));
+    }
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO task_branches(
+             task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            task_id,
+            branch,
+            worktree,
+            allocator,
+            now,
+            provenance_sha.to_ascii_lowercase()
+        ],
+    )?;
+    tx.commit()?;
+    Ok(inserted == 1)
+}
+
 /// Maximum slugified-title length before the agent suffix is appended. Long enough to keep
 /// titles human-recognizable, short enough that the full branch fits comfortably below the
 /// 250-char Git ref limit even with a long agent name. (50 + slash + type + dash + agent =
@@ -283,6 +351,169 @@ mod tests {
     fn slugify_empty_falls_back_to_task() {
         assert_eq!(slugify(""), "task");
         assert_eq!(slugify("!!!"), "task");
+    }
+
+    #[test]
+    fn exact_allocation_binds_immutable_provenance_and_replays_exactly() {
+        let (_dir, mut conn) = fresh_db();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('task','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let sha = "a".repeat(40);
+        assert!(record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &sha,
+            2,
+        )
+        .unwrap());
+        assert!(record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &sha.to_uppercase(),
+            3,
+        )
+        .unwrap());
+        assert!(!record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &"b".repeat(40),
+            3,
+        )
+        .unwrap());
+        let stored: (String, String, String) = conn
+            .query_row(
+                "SELECT branch,worktree,provenance_sha FROM task_branches WHERE task_id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("daemon/worker-t1".into(), "/tmp/worker-t1".into(), sha)
+        );
+    }
+
+    #[test]
+    fn exact_reserved_allocation_fills_null_provenance_once() {
+        let (_dir, mut conn) = fresh_db();
+        conn.execute("INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES (1,'task','open','owner',1,1)", []).unwrap();
+        conn.execute("INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha) VALUES (1,'daemon/worker-t1','/tmp/worker-t1','worker',1,NULL)", []).unwrap();
+        let sha = "a".repeat(40);
+        assert!(record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &sha,
+            2
+        )
+        .unwrap());
+        assert!(record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &sha,
+            3
+        )
+        .unwrap());
+        assert!(!record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "other",
+            &sha,
+            3
+        )
+        .unwrap());
+        assert!(!record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/other",
+            "worker",
+            &sha,
+            3
+        )
+        .unwrap());
+        assert!(!record_exact_allocation(
+            &mut conn,
+            1,
+            "daemon/worker-t1",
+            "/tmp/worker-t1",
+            "worker",
+            &"b".repeat(40),
+            3
+        )
+        .unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT provenance_sha FROM task_branches WHERE task_id=1",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            sha
+        );
+    }
+
+    #[test]
+    fn concurrent_null_provenance_fill_has_one_winner() {
+        let (dir, conn) = fresh_db();
+        conn.execute("INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES (1,'task','open','owner',1,1)", []).unwrap();
+        conn.execute("INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha) VALUES (1,'daemon/worker-t1','/tmp/worker-t1','worker',1,NULL)", []).unwrap();
+        drop(conn);
+        let path = dir.path().join("q.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for sha in ["a".repeat(40), "b".repeat(40)] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            joins.push(std::thread::spawn(move || {
+                let mut conn = db::open(&path).unwrap();
+                barrier.wait();
+                (
+                    sha.clone(),
+                    record_exact_allocation(
+                        &mut conn,
+                        1,
+                        "daemon/worker-t1",
+                        "/tmp/worker-t1",
+                        "worker",
+                        &sha,
+                        2,
+                    )
+                    .unwrap(),
+                )
+            }));
+        }
+        let outcomes: Vec<_> = joins.into_iter().map(|join| join.join().unwrap()).collect();
+        assert_eq!(outcomes.iter().filter(|(_, won)| *won).count(), 1);
+        let conn = db::open(&path).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT provenance_sha FROM task_branches WHERE task_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, outcomes.iter().find(|(_, won)| *won).unwrap().0);
     }
 
     #[test]

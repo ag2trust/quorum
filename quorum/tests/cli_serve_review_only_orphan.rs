@@ -529,7 +529,7 @@ fn orphan_reviewer_waits_for_complete_v2_classification() {
     let task = get_task(home.path(), task_id);
     let refs: serde_json::Value =
         serde_json::from_str(task.refs.as_deref().expect("classified refs")).unwrap();
-    assert_eq!(refs["cx_by"], "claude-haiku-4-5-20251001:v2");
+    assert_eq!(refs["cx_by"], "claude-opus-4-6:v2");
     assert_eq!(refs["cx_size"], "S");
     assert_eq!(refs["cx_ready"], true);
     drop(handle);
