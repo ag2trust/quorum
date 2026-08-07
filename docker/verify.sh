@@ -6,6 +6,7 @@ log_dir="$(mktemp -d)"
 trap 'rm -rf "$log_dir"' EXIT
 
 "$(dirname "$0")/smoke.sh" "$image"
+"$(dirname "$0")/supervise.sh" "$image"
 
 if docker build \
   --platform linux/amd64 \
