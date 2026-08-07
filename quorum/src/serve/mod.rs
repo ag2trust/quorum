@@ -12221,15 +12221,17 @@ async fn spawn_worker(
                 let prov = provider_str.clone();
                 let tid = task.id;
                 let assignment_id = assignment.id;
+                let responsibility_key = worker_responsibility_key(task.id, task.revision);
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_with_assignment(
+                    quorum_core::agent_runs::insert_worker_with_assignment(
                         &conn,
                         tid,
                         &name,
-                        "worker",
+                        &responsibility_key,
                         &m,
                         &e,
+                        &prov,
                         &prov,
                         Some(assignment_id),
                         now_unix(),
@@ -13699,15 +13701,17 @@ async fn spawn_remediation_worker(
                 let prov = remediation_provider_str;
                 let tid = task_id;
                 let assignment_id = remediation_assignment.id;
+                let responsibility_key = worker_responsibility_key(task_id, remediation_revision);
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_with_assignment(
+                    quorum_core::agent_runs::insert_worker_with_assignment(
                         &conn,
                         tid,
                         &name,
-                        "worker",
+                        &responsibility_key,
                         &m,
                         &e,
+                        &prov,
                         &prov,
                         Some(assignment_id),
                         now_unix(),

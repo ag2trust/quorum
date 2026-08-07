@@ -137,36 +137,56 @@ pub fn insert(
     provider: &str,
     spawned_at: i64,
 ) -> Result<i64> {
-    insert_with_assignment(
-        conn, task_id, agent_name, role, model, effort, provider, None, spawned_at,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn insert_with_assignment(
-    conn: &Connection,
-    task_id: i64,
-    agent_name: &str,
-    role: &str,
-    model: &str,
-    effort: &str,
-    provider: &str,
-    role_assignment_id: Option<i64>,
-    spawned_at: i64,
-) -> Result<i64> {
     conn.execute(
         "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
              role_assignment_id, spawned_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            task_id,
-            agent_name,
-            role,
-            model,
-            effort,
-            provider,
-            role_assignment_id,
-            spawned_at
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+        params![task_id, agent_name, role, model, effort, provider, spawned_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Insert canonical worker-run evidence only when its assignment link matches
+/// the complete responsibility and executable profile used for the spawn.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_worker_with_assignment(
+    conn: &Connection,
+    task_id: i64,
+    agent_name: &str,
+    responsibility_key: &str,
+    model: &str,
+    effort: &str,
+    provider: &str,
+    runner: &str,
+    role_assignment_id: Option<i64>,
+    spawned_at: i64,
+) -> Result<i64> {
+    let context = crate::role_assignments::EvidenceAssignmentContext {
+        role_assignment_id,
+        task_id: Some(task_id),
+        responsibility_key,
+        role: "worker",
+        provider,
+        runner,
+        model,
+        effort,
+    };
+    crate::role_assignments::guarded_evidence_insert(
+        conn,
+        "worker agent run",
+        &context,
+        "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, provider,
+             role_assignment_id, spawned_at)
+         SELECT :task_id, :agent_name, 'worker', :model, :effort, :provider,
+                :quorum_assignment_id, :spawned_at
+         /* quorum-role-assignment-guard */",
+        &[
+            (":task_id", &task_id),
+            (":agent_name", &agent_name),
+            (":model", &model),
+            (":effort", &effort),
+            (":provider", &provider),
+            (":spawned_at", &spawned_at),
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -450,28 +470,30 @@ mod tests {
     }
 
     #[test]
-    fn assignment_aware_insert_round_trips_without_changing_run_identity() {
+    fn worker_assignment_insert_succeeds_for_matching_context() {
         let (_d, mut c) = open_tmp();
         let tid = crate::tasks::create(
             &mut c, "boss", "routed", None, 0, None, None, None, None, 100,
         )
         .unwrap();
+        let responsibility_key = format!("worker:task:{tid}:revision:1");
         c.execute(
             "INSERT INTO role_assignments(
                  id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
                  pool_key,policy_generation,created_at)
-             VALUES (42,'worker:task:routed',?1,'worker','sol','codex','codex',
-                     'gpt-5.6-sol','high','worker:M','g1',100)",
-            [tid],
+             VALUES (42,?1,?2,'worker','sol','codex','codex','gpt-5.6-sol','high',
+                     'worker:M','g1',100)",
+            params![responsibility_key, tid],
         )
         .unwrap();
-        let run_id = insert_with_assignment(
+        let run_id = insert_worker_with_assignment(
             &c,
             tid,
             "Routed",
-            "worker",
+            &responsibility_key,
             "gpt-5.6-sol",
             "high",
+            "codex",
             "codex",
             Some(42),
             101,
@@ -483,6 +505,78 @@ mod tests {
         assert_eq!(
             worker_model(&c, tid).unwrap().as_deref(),
             Some("gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn worker_assignment_insert_rejects_wrong_context_and_rolls_back_lifecycle() {
+        let (_d, mut c) = open_tmp();
+        let tid = crate::tasks::create(
+            &mut c, "boss", "guarded", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let other_tid = crate::tasks::create(
+            &mut c,
+            "boss",
+            "different worker context",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let other_responsibility = format!("worker:task:{other_tid}:revision:1");
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,?1,?2,'worker','sol','codex','codex','gpt-5.6-sol','high',
+                     'worker:M','g1',100)",
+            params![other_responsibility, other_tid],
+        )
+        .unwrap();
+
+        let result = (|| -> Result<()> {
+            let tx = crate::db::begin_immediate(&mut c)?;
+            tx.execute(
+                "UPDATE tasks SET status='working',updated_at=101 WHERE id=?1",
+                [tid],
+            )?;
+            insert_worker_with_assignment(
+                &tx,
+                tid,
+                "WrongContext",
+                &format!("worker:task:{tid}:revision:1"),
+                "gpt-5.6-sol",
+                "high",
+                "codex",
+                "codex",
+                Some(42),
+                101,
+            )?;
+            tx.commit().map_err(crate::db::map_sql_err)?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM agent_runs WHERE role='worker'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            c.query_row("SELECT status FROM tasks WHERE id=?1", [tid], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "open"
         );
     }
 
