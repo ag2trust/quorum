@@ -1339,7 +1339,7 @@ pub(crate) fn complete_graph_if_final_child(
         tx,
         "task_graph_completed",
         &format!("task#{source_id}"),
-        "all generated children merged",
+        "all generated children are done",
         now,
     )?;
     Ok(true)
@@ -2820,6 +2820,169 @@ mod tests {
         assert_eq!(completed, ("completed".into(), 0, "done".into()));
     }
 
+    fn assert_graph_completed(conn: &Connection, graph: i64, source: i64, children: &[i64]) {
+        let graph_state: (String, i64) = conn
+            .query_row(
+                "SELECT state,active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("completed".into(), 0));
+        let source_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [source], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_status, "done");
+        for child in children {
+            let status: String = conn
+                .query_row("SELECT status FROM tasks WHERE id=?1", [child], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(status, "done");
+        }
+    }
+
+    #[test]
+    fn merge_succeeded_event_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
+            .unwrap();
+
+        crate::tasks::apply_event(
+            &mut conn,
+            "system",
+            ids[1],
+            &crate::lifecycle::Event::MergeSucceeded,
+            5,
+        )
+        .unwrap();
+
+        assert_graph_completed(&conn, graph, 1, &ids);
+    }
+
+    #[test]
+    fn pr_found_merged_event_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [ids[1]])
+            .unwrap();
+
+        crate::tasks::apply_event(
+            &mut conn,
+            "system",
+            ids[1],
+            &crate::lifecycle::Event::PrFoundMerged,
+            5,
+        )
+        .unwrap();
+
+        assert_graph_completed(&conn, graph, 1, &ids);
+    }
+
+    #[test]
+    fn merge_succeeded_rolls_back_when_graph_source_authority_is_lost() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
+            .unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=1", [])
+            .unwrap();
+
+        let error = match crate::tasks::apply_event(
+            &mut conn,
+            "system",
+            ids[1],
+            &crate::lifecycle::Event::MergeSucceeded,
+            5,
+        ) {
+            Ok(_) => panic!("lost source authority must reject final child completion"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, QuorumError::Io(_)));
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=?2 WHERE d.id=?1",
+                params![graph, ids[1]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "merging".into()));
+    }
+
+    #[test]
+    fn manual_close_rejects_active_source_without_mutation() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+
+        let error = crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", 5).unwrap_err();
+        assert!(matches!(error, QuorumError::Usage(_)));
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "decomposed".into()));
+        assert!(ids.iter().all(|id| {
+            conn.query_row("SELECT status='open' FROM tasks WHERE id=?1", [id], |row| {
+                row.get::<_, bool>(0)
+            })
+            .unwrap()
+        }));
+    }
+
+    #[test]
+    fn manual_final_child_close_completes_graph_and_source_atomically() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+
+        crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", 5)
+            .unwrap()
+            .unwrap();
+        let midway: (String, String) = conn
+            .query_row(
+                "SELECT d.state,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(midway, ("active".into(), "decomposed".into()));
+
+        crate::tasks::close_manual(&mut conn, "owner", ids[1], "merged externally", 6)
+            .unwrap()
+            .unwrap();
+        assert_graph_completed(&conn, graph, 1, &ids);
+    }
+
     #[test]
     fn real_file_concurrent_child_claims_never_exceed_two() {
         use std::sync::{Arc, Barrier};
@@ -2970,13 +3133,14 @@ mod tests {
                     ),
                     "review" => ("reviewer", crate::lifecycle::Event::VerdictApprove),
                     "merge" => {
-                        let won = crate::tasks::close_after_merge(
+                        let won = crate::tasks::apply_event(
                             &mut conn,
+                            "system",
                             task_id,
-                            "merged by race test",
+                            &crate::lifecycle::Event::MergeSucceeded,
                             10,
                         )
-                        .unwrap();
+                        .is_ok();
                         std::fs::write(
                             result_path,
                             if won {

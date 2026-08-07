@@ -1940,6 +1940,15 @@ where
         now,
     )?;
 
+    // Generated children use the ordinary lifecycle, but the final transition
+    // to done also owns the decomposition aggregate. Keep child completion,
+    // graph completion, and source completion in this same write transaction
+    // for every event that can reach done (currently MergeSucceeded and
+    // PrFoundMerged).
+    if new_status == Status::Done {
+        crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
+    }
+
     before_commit(&tx)?;
 
     let mut result_task = tx.query_row(
@@ -3371,6 +3380,18 @@ pub fn close_manual(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let active_graph_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions
+         WHERE source_task_id=?1 AND active=1 AND state IN ('active','blocked'))",
+        [id],
+        |row| row.get(0),
+    )?;
+    if active_graph_source {
+        return Err(QuorumError::Usage(
+            "active decomposition sources cannot be manually closed; cancel the source graph"
+                .into(),
+        ));
+    }
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
          WHERE id=?1 AND status NOT IN ('done', 'cancelled')",
@@ -3392,6 +3413,7 @@ pub fn close_manual(
         &format!("by {agent}: {reason}"),
         now,
     )?;
+    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],

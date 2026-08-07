@@ -308,10 +308,12 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr`; that association is daemon-owned. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
-  state except `done`/`cancelled` — `failed` is included, because a task whose PR landed
-  outside the managed lifecycle has no other route to `done` and its dependents stay
-  parked until it gets there (`compute_ready` counts only `done`). Reason REQUIRED.
-  Sets `done` but emits `task_closed_manual` event
+  state except `done`/`cancelled`, but never an active decomposition source, which must use
+  graph cancellation — `failed` is included, because a task whose PR landed outside the
+  managed lifecycle has no other route to `done` and its dependents stay parked until it
+  gets there (`compute_ready` counts only `done`). Closing a generated child performs final
+  graph/source reconciliation in the same transaction. Reason REQUIRED. Sets `done` but
+  emits `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum submit` (`quorum done` is a deprecated alias).
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task

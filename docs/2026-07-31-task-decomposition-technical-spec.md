@@ -53,9 +53,11 @@ unsafe recovered state. A materialized graph blocker does not move the source ou
 `decomposed`; it marks the graph blocked and fails the affected child. Only source cancellation
 and a replacement source can recover a graph after generated delivery has started.
 
-The final child merge transaction marks the child done and, if every graph member is done,
-marks the source and graph done atomically. Source dependents remain blocked until that source
-transition commits.
+Every event transition that marks a generated child done, including the final child merge, and
+every permitted manual child close checks graph completion in the same transaction. If every
+graph member is done, that transaction marks the source and graph done atomically. Manual close
+rejects an active graph source, which must use graph cancellation. Source dependents remain
+blocked until the source transition commits.
 
 ## Durable model
 
