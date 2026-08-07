@@ -303,6 +303,7 @@ mod tests {
                 "#!/bin/sh\n\
                  pwd > '{}'\n\
                  for arg in \"$@\"; do printf '<%s>\\n' \"$arg\"; done > '{}'\n\
+                 IFS= read -r _turn\n\
                  printf '%s\\n' '{{\"type\":\"result\",\"result\":\"done\",\"is_error\":false}}'\n",
                 pwd_log.display(),
                 args_log.display(),
