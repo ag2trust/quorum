@@ -2824,6 +2824,7 @@ struct PlanningSnapshot {
     updated_at: i64,
     title: String,
     body: Option<String>,
+    source_bytes: usize,
     dependencies: Vec<i64>,
     rejection_summaries: Vec<String>,
     accepted_proposal: Option<Vec<planner::ProposedTask>>,
@@ -2835,6 +2836,8 @@ const PLANNER_VIEW_TIMEOUT: Duration = Duration::from_secs(30);
 const PLANNER_VIEW_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const PLANNER_ARCHIVE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const PLANNER_ARCHIVE_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const FROZEN_BASE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+const FROZEN_BASE_CAPTURE_PIPE_BYTES: usize = 4096;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct DecompositionLiveWork {
@@ -2873,6 +2876,7 @@ type PlanningSnapshotRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
 );
 
 fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<PlanningSnapshot>> {
@@ -2880,12 +2884,20 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     let row: Option<PlanningSnapshotRow> = conn
         .query_row(
             "SELECT d.id,d.source_task_id,d.planned_source_revision,d.plan_revision,d.state,d.freeze_active,
-                    d.updated_at,t.title,t.body,t.depends_on,d.accepted_proposal_json,
-                    d.frozen_base_sha
+                    d.updated_at,
+                    CASE WHEN length(CAST(t.title AS BLOB)) +
+                                   COALESCE(length(CAST(t.body AS BLOB)),0) <= ?1
+                         THEN t.title ELSE '' END,
+                    CASE WHEN length(CAST(t.title AS BLOB)) +
+                                   COALESCE(length(CAST(t.body AS BLOB)),0) <= ?1
+                         THEN t.body ELSE NULL END,
+                    t.depends_on,d.accepted_proposal_json,d.frozen_base_sha,
+                    length(CAST(t.title AS BLOB)) +
+                        COALESCE(length(CAST(t.body AS BLOB)),0)
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
              ORDER BY d.id LIMIT 1",
-            [],
+            [planner::MAX_PROMPT_BYTES as i64],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -2900,6 +2912,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                     row.get(9)?,
                     row.get(10)?,
                     row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
@@ -2917,6 +2930,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         depends_on,
         accepted_proposal_json,
         frozen_base_sha,
+        source_bytes,
     )) = row
     else {
         return Ok(None);
@@ -2927,6 +2941,8 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         .transpose()
         .map_err(|error| QuorumError::Io(format!("invalid planning source dependencies: {error}")))?
         .unwrap_or_default();
+    let source_bytes = usize::try_from(source_bytes)
+        .map_err(|_| QuorumError::Io("invalid planning source byte count".into()))?;
     let accepted_proposal = accepted_proposal_json
         .map(|json| serde_json::from_str(&json))
         .transpose()
@@ -2948,11 +2964,38 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         updated_at,
         title,
         body,
+        source_bytes,
         dependencies,
         rejection_summaries,
         accepted_proposal,
         frozen_base_sha: frozen_base_sha.unwrap_or_default(),
     }))
+}
+
+fn bounded_planning_prompt(snapshot: &PlanningSnapshot) -> std::result::Result<String, String> {
+    if snapshot.source_bytes > planner::MAX_PROMPT_BYTES {
+        return Err(format!(
+            "planning source is {} bytes; prompt limit is {} bytes",
+            snapshot.source_bytes,
+            planner::MAX_PROMPT_BYTES
+        ));
+    }
+    let source = planner::PlanningSource {
+        task_id: snapshot.source_task_id,
+        revision: snapshot.source_revision,
+        title: &snapshot.title,
+        body: snapshot.body.as_deref(),
+        dependencies: &snapshot.dependencies,
+    };
+    let prompt = planner::build_prompt(&source, &snapshot.rejection_summaries);
+    if prompt.len() > planner::MAX_PROMPT_BYTES {
+        return Err(format!(
+            "serialized planner prompt is {} bytes; limit is {} bytes",
+            prompt.len(),
+            planner::MAX_PROMPT_BYTES
+        ));
+    }
+    Ok(prompt)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3313,13 +3356,37 @@ async fn kill_and_reap_planner_view_processes(
 }
 
 async fn repository_head_sha(repo: &Path) -> Result<String> {
+    repository_head_sha_with_options(
+        repo,
+        Path::new("git"),
+        FROZEN_BASE_CAPTURE_TIMEOUT,
+        FROZEN_BASE_CAPTURE_PIPE_BYTES,
+    )
+    .await
+}
+
+async fn repository_head_sha_with_options(
+    repo: &Path,
+    git_bin: &Path,
+    timeout: Duration,
+    pipe_limit: usize,
+) -> Result<String> {
     let repo = repo.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<String> {
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(repo)
-            .output()
-            .map_err(|error| QuorumError::Io(format!("frozen-base capture failed: {error}")))?;
+    let git_bin = git_bin.to_path_buf();
+    // The detached owner retains the child if an awaiting daemon tick is
+    // cancelled during shutdown; it will still hit the deadline and reap.
+    tokio::spawn(async move {
+        let mut command = tokio::process::Command::new(git_bin);
+        command.args(["rev-parse", "HEAD"]).current_dir(repo);
+        configure_planner_view_process_group(&mut command);
+        let output = run_publication_gh_command_with_limit(
+            command,
+            timeout,
+            pipe_limit,
+            "frozen-base capture",
+        )
+        .await
+        .map_err(QuorumError::Io)?;
         let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !output.status.success()
             || !matches!(sha.len(), 40 | 64)
@@ -3332,7 +3399,7 @@ async fn repository_head_sha(repo: &Path) -> Result<String> {
         Ok(sha)
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("frozen-base capture join failed: {error}")))?
+    .map_err(|error| QuorumError::Io(format!("frozen-base capture owner join failed: {error}")))?
 }
 
 impl DrainState {
@@ -3931,6 +3998,20 @@ async fn tick_decomposition(
         return Ok(true);
     }
     if snapshot.state == "planning" && coordinator.planner_slot.is_none() {
+        let prompt = match bounded_planning_prompt(&snapshot) {
+            Ok(prompt) => prompt,
+            Err(summary) => {
+                record_decomposition_attempt(
+                    config,
+                    snapshot.graph_id,
+                    "provider",
+                    "planner-prompt",
+                    &summary,
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
         let assignment = assign_role(
             config,
             quorum_core::role_assignments::AssignmentRequest {
@@ -3946,14 +4027,6 @@ async fn tick_decomposition(
             },
             None,
         )?;
-        let source = planner::PlanningSource {
-            task_id: snapshot.source_task_id,
-            revision: snapshot.source_revision,
-            title: &snapshot.title,
-            body: snapshot.body.as_deref(),
-            dependencies: &snapshot.dependencies,
-        };
-        let prompt = planner::build_prompt(&source, &snapshot.rejection_summaries);
         let view = match frozen_planner_view(&config.repo_dir, &snapshot.frozen_base_sha).await {
             Ok(view) => view,
             Err(error) => {
@@ -18277,6 +18350,55 @@ mod tests {
     }
 
     #[test]
+    fn oversized_planning_source_materializes_only_its_byte_count_and_cannot_build_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("oversized.db")).unwrap();
+        let body = "x".repeat(planner::MAX_PROMPT_BYTES * 4);
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "large",
+            Some(&body),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "planning",
+            None,
+            3,
+        )
+        .unwrap();
+
+        let snapshot = load_planning_snapshot(&conn).unwrap().unwrap();
+        assert_eq!(snapshot.source_bytes, body.len() + "large".len());
+        assert!(snapshot.title.is_empty());
+        assert!(snapshot.body.is_none());
+        let error = bounded_planning_prompt(&snapshot).unwrap_err();
+        assert!(error.contains("prompt limit"), "{error}");
+    }
+
+    #[test]
     fn proposal_preclassification_requires_complete_ready_small_nonduplicate_batch() {
         let proposal = vec![
             planner::ProposedTask {
@@ -18812,6 +18934,82 @@ mod tests {
 
         let not_a_repo = tempfile::tempdir().unwrap();
         assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_base_capture_bounds_silent_and_continuous_git_and_reaps() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        for (case, body, expected) in [
+            ("silent", "exec sleep 30", "timed out"),
+            ("noisy", "exec yes x", "stdout exceeded"),
+        ] {
+            let pid_path = repo.path().join(format!("{case}.pid"));
+            let git = repo.path().join(format!("git-{case}"));
+            std::fs::write(
+                &git,
+                format!(
+                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\n{body}\n",
+                    pid_path.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let error =
+                repository_head_sha_with_options(repo.path(), &git, Duration::from_secs(5), 4096)
+                    .await
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+            let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "{case} frozen-base capture was not reaped"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_frozen_base_wait_retains_owner_until_kill_and_reap() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let pid_path = repo.path().join("cancelled.pid");
+        let git = repo.path().join("git-cancelled");
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo_path = repo.path().to_path_buf();
+        let capture = tokio::spawn(async move {
+            repository_head_sha_with_options(&repo_path, &git, Duration::from_secs(5), 4096).await
+        });
+        for _ in 0..500 {
+            if pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pid_path.exists(), "frozen-base child did not start");
+        let pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        capture.abort();
+        let _ = capture.await;
+        for _ in 0..500 {
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("cancelled frozen-base capture escaped bounded kill/reap");
     }
 
     #[cfg(unix)]

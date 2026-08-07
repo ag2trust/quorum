@@ -50,6 +50,32 @@ pub async fn spawn_classifier_configured(
     codex_sandbox: &str,
     recommendations: &str,
 ) -> std::io::Result<ClassifierSlot> {
+    spawn_classifier_configured_with_timeout(
+        tasks,
+        dup_context,
+        agent_bin,
+        bare,
+        model,
+        effort,
+        codex_sandbox,
+        recommendations,
+        CLASSIFIER_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_classifier_configured_with_timeout(
+    tasks: &[TaskForClassification],
+    dup_context: &[TaskForClassification],
+    agent_bin: Option<&str>,
+    bare: bool,
+    model: &str,
+    effort: &str,
+    codex_sandbox: &str,
+    recommendations: &str,
+    turn_timeout: Duration,
+) -> std::io::Result<ClassifierSlot> {
     if tasks.len() > classify::CLASSIFICATION_BATCH_LIMIT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -74,10 +100,12 @@ pub async fn spawn_classifier_configured(
     let pending_inputs = classify::classification_inputs(tasks);
     let dir = tempfile::tempdir()?;
     let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + turn_timeout;
     // Safe mode retains Claude's configured auth path while suppressing user
     // context; Codex retains its read-only sandbox without the normal bypass.
     // The empty temporary cwd is the only directory exposed to either runner.
-    let proc = RunnerProc::launch(
+    let proc = RunnerProc::launch_restricted_until(
         &LaunchRequest {
             model,
             effort,
@@ -94,6 +122,7 @@ pub async fn spawn_classifier_configured(
             codex_sandbox,
             grok: Default::default(),
         },
+        deadline,
     )
     .await?;
     Ok(ClassifierSlot {
@@ -103,7 +132,7 @@ pub async fn spawn_classifier_configured(
         pending_inputs,
         response_text: String::new(),
         isolation_dir: Some(dir),
-        started_at: tokio::time::Instant::now(),
+        started_at,
         stdout_bytes: 0,
     })
 }
@@ -488,6 +517,62 @@ mod tests {
         assert!(args.contains("exec --json"), "{args}");
         assert!(args.contains("--model gpt-5.6-terra"), "{args}");
         assert!(args.contains("-c model_reasoning_effort=medium"), "{args}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restricted_classifier_stdin_feed_timeout_kills_and_reaps_no_read_provider() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("pid");
+        let runner = temp.path().join("claude");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tasks = (1..=classify::CLASSIFICATION_BATCH_LIMIT)
+            .map(|id| TaskForClassification {
+                id: id as i64,
+                revision: 1,
+                title: format!("task {id}"),
+                body: Some("🦀".repeat(2_000)),
+                dependencies: vec![],
+                recovery_notes: vec![],
+            })
+            .collect::<Vec<_>>();
+
+        let error = match spawn_classifier_configured_with_timeout(
+            &tasks,
+            &[],
+            runner.to_str(),
+            false,
+            CLASSIFIER_MODEL,
+            CLASSIFIER_EFFORT,
+            "read-only",
+            "",
+            Duration::from_secs(2),
+        )
+        .await
+        {
+            Ok(slot) => {
+                slot.kill_and_reap().await;
+                panic!("a no-read classifier unexpectedly accepted the bounded prompt")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "classifier was not reaped"
+        );
     }
 
     #[cfg(unix)]

@@ -228,6 +228,37 @@ impl RunnerProc {
         }
     }
 
+    /// Restricted classifier launch whose deadline covers Claude's initial
+    /// stdin feed as well as the returned slot lifetime. Single-turn adapters
+    /// receive their prompt in argv and therefore have no pre-slot pipe wait.
+    pub async fn launch_restricted_until(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<Self> {
+        if request.mode != LaunchMode::Restricted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded restricted launch requires restricted mode",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "restricted provider launch timed out",
+            ));
+        }
+        let kind = AgentKind::for_model(request.model)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        match kind {
+            AgentKind::Claude => AgentProc::launch_restricted_until(request, config, deadline)
+                .await
+                .map(Self::Claude),
+            AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
+            AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
+        }
+    }
+
     pub fn kind(&self) -> AgentKind {
         match self {
             Self::Claude(_) => AgentKind::Claude,

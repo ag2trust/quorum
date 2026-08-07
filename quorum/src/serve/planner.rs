@@ -322,12 +322,38 @@ pub async fn spawn_planner(
     bare: bool,
     provider_bin: Option<&str>,
 ) -> std::io::Result<PlannerSlot> {
+    spawn_planner_with_timeout(
+        provider,
+        model,
+        effort,
+        repo,
+        prompt,
+        bare,
+        provider_bin,
+        PLANNER_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_planner_with_timeout(
+    provider: AgentKind,
+    model: &str,
+    effort: &str,
+    repo: &Path,
+    prompt: &str,
+    bare: bool,
+    provider_bin: Option<&str>,
+    turn_timeout: Duration,
+) -> std::io::Result<PlannerSlot> {
     if prompt.len() > MAX_PROMPT_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "planner prompt exceeds 128 KiB",
         ));
     }
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + turn_timeout;
     let proc = match provider {
         AgentKind::Codex => return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -349,7 +375,10 @@ pub async fn spawn_planner(
                 env_vars: vec![],
             };
             let mut proc = AgentProc::spawn_planner(&spec, provider_bin)?;
-            if let Err(error) = proc.feed_turn(&agent::user_turn(prompt)).await {
+            if let Err(error) = proc
+                .feed_turn_until(&agent::user_turn(prompt), deadline)
+                .await
+            {
                 let _ = proc.kill_and_reap().await;
                 return Err(error);
             }
@@ -359,7 +388,7 @@ pub async fn spawn_planner(
     Ok(PlannerSlot {
         proc,
         response_text: String::new(),
-        started_at: tokio::time::Instant::now(),
+        started_at,
         stdout_bytes: 0,
     })
 }
@@ -556,6 +585,48 @@ mod tests {
         .err()
         .expect("oversized prompt must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_stdin_feed_timeout_kills_and_reaps_no_read_provider() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("pid");
+        let runner = dir.path().join("claude");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let prompt = "x".repeat(MAX_PROMPT_BYTES - 1024);
+
+        let error = match spawn_planner_with_timeout(
+            AgentKind::Claude,
+            CLAUDE_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            &prompt,
+            false,
+            runner.to_str(),
+            Duration::from_secs(2),
+        )
+        .await
+        {
+            Ok(slot) => {
+                slot.kill_and_reap().await;
+                panic!("a no-read provider unexpectedly accepted the bounded prompt")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
     }
 
     #[cfg(unix)]

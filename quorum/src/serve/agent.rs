@@ -64,6 +64,32 @@ impl AgentProc {
         request: &LaunchRequest<'_>,
         config: &AdapterConfig<'_>,
     ) -> std::io::Result<Self> {
+        Self::launch_with_deadline(request, config, None).await
+    }
+
+    /// Launch a restricted role whose total turn deadline includes feeding
+    /// the initial stdin payload. A provider that never reads cannot strand
+    /// the caller before slot ownership exists: expiry kills and reaps the
+    /// child before returning.
+    pub async fn launch_restricted_until(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<Self> {
+        if request.mode != LaunchMode::Restricted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded restricted launch requires restricted mode",
+            ));
+        }
+        Self::launch_with_deadline(request, config, Some(deadline)).await
+    }
+
+    async fn launch_with_deadline(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::io::Result<Self> {
         let spec = AgentSpec {
             kind: AgentKind::Claude,
             model: request.model.to_string(),
@@ -81,7 +107,12 @@ impl AgentProc {
             LaunchMode::Normal => Self::spawn(&spec, config.executable)?,
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable)?,
         };
-        if let Err(error) = proc.feed_turn(&user_turn(request.prompt)).await {
+        let turn = user_turn(request.prompt);
+        let fed = match deadline {
+            Some(deadline) => proc.feed_turn_until(&turn, deadline).await,
+            None => proc.feed_turn(&turn).await,
+        };
+        if let Err(error) = fed {
             let _ = proc.kill_and_reap().await;
             return Err(error);
         }
@@ -216,6 +247,20 @@ impl AgentProc {
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
         Ok(())
+    }
+
+    pub async fn feed_turn_until(
+        &mut self,
+        json_turn: &str,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<()> {
+        match tokio::time::timeout_at(deadline, self.feed_turn(json_turn)).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "provider stdin feed timed out",
+            )),
+        }
     }
 
     /// Return the next raw stdout line, or `None` on EOF/error.
