@@ -10,7 +10,8 @@ const BAG_SLOTS: usize = 100;
 
 /// Marker replaced by [`guarded_evidence_insert`] with the assignment-match
 /// predicate. The SQL before this marker must be an `INSERT ... SELECT` without
-/// a `WHERE` clause; clauses such as `ON CONFLICT` may follow the marker.
+/// a `WHERE` clause; additional `AND` predicates and clauses such as
+/// `ON CONFLICT` may follow the marker.
 pub const EVIDENCE_ASSIGNMENT_GUARD: &str = "/* quorum-role-assignment-guard */";
 
 const EVIDENCE_ASSIGNMENT_ID_PARAM: &str = ":quorum_assignment_id";
@@ -22,7 +23,8 @@ const EVIDENCE_RUNNER_PARAM: &str = ":quorum_assignment_runner";
 const EVIDENCE_MODEL_PARAM: &str = ":quorum_assignment_model";
 const EVIDENCE_EFFORT_PARAM: &str = ":quorum_assignment_effort";
 
-const EVIDENCE_ASSIGNMENT_PREDICATE: &str = "WHERE :quorum_assignment_id IS NULL
+const EVIDENCE_ASSIGNMENT_PREDICATE: &str = "WHERE (
+    :quorum_assignment_id IS NULL
     OR EXISTS(
         SELECT 1 FROM role_assignments AS assignment
         WHERE assignment.id=:quorum_assignment_id
@@ -33,7 +35,8 @@ const EVIDENCE_ASSIGNMENT_PREDICATE: &str = "WHERE :quorum_assignment_id IS NULL
           AND assignment.runner=:quorum_assignment_runner
           AND assignment.model=:quorum_assignment_model
           AND assignment.effort=:quorum_assignment_effort
-    )";
+    )
+)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProfile {
@@ -592,12 +595,20 @@ mod tests {
         SELECT :quorum_assignment_id,:payload
         /* quorum-role-assignment-guard */";
 
+    const TEST_EVIDENCE_INSERT_WITH_AUTHORITY_GUARD: &str = "INSERT INTO canonical_evidence(
+            role_assignment_id,payload)
+        SELECT :quorum_assignment_id,:payload
+        /* quorum-role-assignment-guard */
+        AND EXISTS(SELECT 1 FROM lifecycle_authority WHERE allowed=1)";
+
     fn evidence_fixture() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("evidence.db")).unwrap();
         conn.execute_batch(
             "CREATE TABLE lifecycle_state(value TEXT NOT NULL);
              INSERT INTO lifecycle_state(value) VALUES ('before');
+             CREATE TABLE lifecycle_authority(allowed INTEGER NOT NULL);
+             INSERT INTO lifecycle_authority(allowed) VALUES (0);
              CREATE TABLE canonical_evidence(
                  id INTEGER PRIMARY KEY,
                  role_assignment_id INTEGER REFERENCES role_assignments(id),
@@ -668,6 +679,41 @@ mod tests {
         assert_eq!(
             rows,
             vec![(Some(7), "exact".into()), (None, "historical".into())]
+        );
+    }
+
+    #[test]
+    fn historical_null_link_cannot_bypass_an_additional_authority_guard() {
+        let (_dir, mut conn) = evidence_fixture();
+        let historical = evidence_context(None);
+        let payload = "must not persist";
+
+        let result = (|| -> Result<()> {
+            let tx = begin_immediate(&mut conn)?;
+            tx.execute("UPDATE lifecycle_state SET value='partial'", [])?;
+            guarded_evidence_insert(
+                &tx,
+                "test",
+                &historical,
+                TEST_EVIDENCE_INSERT_WITH_AUTHORITY_GUARD,
+                &[(":payload", &payload)],
+            )?;
+            tx.commit().map_err(map_sql_err)?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM canonical_evidence", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT value FROM lifecycle_state", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "before"
         );
     }
 
