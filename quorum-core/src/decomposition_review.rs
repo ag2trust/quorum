@@ -2,7 +2,8 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::role_assignments::{guarded_evidence_insert, EvidenceAssignmentContext};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -229,37 +230,82 @@ pub fn persist_reviewer_run_if_current(
         return Ok(None);
     }
     let tx = begin_immediate(conn)?;
-    let inserted = tx.execute(
+    let authority_current: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM run_capabilities c
+             WHERE c.run_id=?3 AND c.task_id=?1 AND c.agent=?2
+               AND c.role='reviewer' AND c.revoked_at IS NULL
+               AND (NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)
+                    OR EXISTS(SELECT 1 FROM task_graph_members m
+                              JOIN task_decompositions d ON d.id=m.graph_id
+                              JOIN tasks source ON source.id=d.source_task_id
+                              WHERE m.task_id=?1 AND m.active=1 AND d.active=1
+                                AND d.state='active' AND source.status='decomposed'
+                                AND d.accepted_plan_revision=m.plan_revision))
+         )",
+        params![task_id, agent, cap_run_id],
+        |row| row.get(0),
+    )?;
+    if !authority_current {
+        return Ok(None);
+    }
+
+    let review_stage = if sub_role == Some("r2") { "r2" } else { "r1" };
+    let responsibility_key = format!("reviewer:task:{task_id}:{review_stage}");
+    let context = EvidenceAssignmentContext {
+        role_assignment_id,
+        task_id: Some(task_id),
+        responsibility_key: &responsibility_key,
+        role: "reviewer",
+        provider,
+        runner: provider,
+        model,
+        effort,
+    };
+    let parameters: [(&str, &dyn ToSql); 10] = [
+        (":task_id", &task_id),
+        (":agent", &agent),
+        (":model", &model),
+        (":effort", &effort),
+        (":provider", &provider),
+        (":spawned_at", &spawned_at),
+        (":sub_role", &sub_role),
+        (":cap_run_id", &cap_run_id),
+        (":pr", &pr),
+        (":head_sha", &head_sha),
+    ];
+    guarded_evidence_insert(
+        &tx,
+        "reviewer run",
+        &context,
         "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
              role_assignment_id,spawned_at,sub_role,review_cap_run_id,review_pr,review_head_sha)
-         SELECT ?1,?2,'reviewer',?3,?4,?5,?6,?7,?8,?9,?10,?11
-         WHERE EXISTS(SELECT 1 FROM run_capabilities c
-                      WHERE c.run_id=?9 AND c.task_id=?1 AND c.agent=?2
+         SELECT :task_id,:agent,'reviewer',:model,:effort,:provider,
+                :quorum_assignment_id,:spawned_at,:sub_role,:cap_run_id,:pr,:head_sha
+         /* quorum-role-assignment-guard */
+           AND (:quorum_assignment_id IS NULL OR EXISTS(
+               SELECT 1 FROM role_assignments AS reviewer_assignment
+               WHERE reviewer_assignment.id=:quorum_assignment_id
+                 AND reviewer_assignment.pr_number=:pr
+                 AND reviewer_assignment.review_stage=CASE
+                     WHEN :sub_role='r2' THEN 'r2' ELSE 'r1' END
+                 AND reviewer_assignment.complexity IS NOT NULL
+           ))
+           AND EXISTS(SELECT 1 FROM run_capabilities c
+                      WHERE c.run_id=:cap_run_id AND c.task_id=:task_id AND c.agent=:agent
                         AND c.role='reviewer' AND c.revoked_at IS NULL)
-           AND (NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)
+           AND (NOT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=:task_id)
                 OR EXISTS(SELECT 1 FROM task_graph_members m
                           JOIN task_decompositions d ON d.id=m.graph_id
                           JOIN tasks source ON source.id=d.source_task_id
-                          WHERE m.task_id=?1 AND m.active=1 AND d.active=1
+                          WHERE m.task_id=:task_id AND m.active=1 AND d.active=1
                             AND d.state='active' AND source.status='decomposed'
                             AND d.accepted_plan_revision=m.plan_revision))",
-        params![
-            task_id,
-            agent,
-            model,
-            effort,
-            provider,
-            role_assignment_id,
-            spawned_at,
-            sub_role,
-            cap_run_id,
-            pr,
-            head_sha
-        ],
+        &parameters,
     )?;
-    let id = (inserted == 1).then(|| tx.last_insert_rowid());
+    let id = tx.last_insert_rowid();
     tx.commit()?;
-    Ok(id)
+    Ok(Some(id))
 }
 
 #[cfg(test)]
@@ -273,6 +319,13 @@ mod tests {
         crate::db::migrate(&conn).unwrap();
         seed(&conn);
         conn
+    }
+
+    fn file_fixture() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("review.db")).unwrap();
+        seed(&conn);
+        (dir, conn)
     }
 
     fn seed(conn: &Connection) {
@@ -377,6 +430,131 @@ mod tests {
             })
             .unwrap();
         assert_eq!(capabilities, 0);
+    }
+
+    #[test]
+    fn routed_r1_and_r2_runs_match_assignment_semantics() {
+        let (_dir, mut conn) = file_fixture();
+        for (id, agent, stage, cap, sub_role) in [
+            (41, "R1", "r1", "cap-r1", None),
+            (42, "R2", "r2", "cap-r2", Some("r2")),
+        ] {
+            load_and_issue_capability(&mut conn, 5, cap, agent, 10).unwrap();
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     id,responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                     profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,'reviewer:task:5:' || ?2,5,71,'reviewer',?2,'M',
+                         'profile','codex','codex','model','high',
+                         'reviewer.M.' || ?2,'g1',1)",
+                params![id, stage],
+            )
+            .unwrap();
+            assert!(persist_reviewer_run_if_current(
+                &mut conn,
+                5,
+                agent,
+                "model",
+                "high",
+                "codex",
+                Some(id),
+                11,
+                sub_role,
+                cap,
+                71,
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .unwrap()
+            .is_some());
+        }
+        let rows: Vec<(String, Option<String>, i64)> = conn
+            .prepare("SELECT agent_name,sub_role,role_assignment_id FROM agent_runs ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("R1".into(), None, 41),
+                ("R2".into(), Some("r2".into()), 42)
+            ]
+        );
+    }
+
+    #[test]
+    fn historical_null_assignment_reviewer_run_remains_valid() {
+        let (_dir, mut conn) = file_fixture();
+        load_and_issue_capability(&mut conn, 5, "historical-cap", "Historical-R1", 10).unwrap();
+
+        let run_id = persist_reviewer_run_if_current(
+            &mut conn,
+            5,
+            "Historical-R1",
+            "legacy-model",
+            "high",
+            "claude",
+            None,
+            11,
+            None,
+            "historical-cap",
+            71,
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap()
+        .unwrap();
+        let stored_assignment: Option<i64> = conn
+            .query_row(
+                "SELECT role_assignment_id FROM agent_runs WHERE id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_assignment, None);
+    }
+
+    #[test]
+    fn mismatched_reviewer_assignment_inserts_no_run_or_lifecycle_change() {
+        let (_dir, mut conn) = file_fixture();
+        load_and_issue_capability(&mut conn, 5, "cap", "R", 10).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (51,'reviewer:task:5:r2',5,71,'reviewer','r2','M',
+                     'profile','codex','codex','model','high','reviewer.M.r2','g1',1)",
+            [],
+        )
+        .unwrap();
+
+        assert!(persist_reviewer_run_if_current(
+            &mut conn,
+            5,
+            "R",
+            "model",
+            "high",
+            "codex",
+            Some(51),
+            11,
+            None,
+            "cap",
+            71,
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .is_err());
+        let state: (String, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT status,reviewer,
+                        (SELECT count(*) FROM agent_runs),
+                        (SELECT count(*) FROM run_capabilities
+                         WHERE run_id='cap' AND revoked_at IS NULL)
+                 FROM tasks WHERE id=5",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("in-review".into(), None, 0, 1));
     }
 
     #[test]

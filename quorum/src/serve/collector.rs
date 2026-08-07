@@ -17,7 +17,7 @@
 //!   record via `pr_number`-keyed UPSERT.
 
 use super::classifier::{CLASSIFIER_EFFORT, CLASSIFIER_MODEL};
-use super::runner::{AdapterConfig, AgentEvent, LaunchMode, LaunchRequest, RunnerProc};
+use super::runner::{AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::review_findings::{
@@ -55,6 +55,7 @@ pub struct CollectionRequest {
     pub repo_dir: PathBuf,
     pub agent_bin: Option<String>,
     pub bare_agent: bool,
+    pub collector_provider: String,
     pub collector_model: String,
     pub collector_effort: String,
     pub role_assignment_id: Option<i64>,
@@ -85,6 +86,9 @@ impl CollectionRequest {
             repo_dir,
             agent_bin,
             bare_agent,
+            collector_provider: AgentKind::for_model(CLASSIFIER_MODEL)
+                .map(|kind| kind.to_string())
+                .unwrap_or_default(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -100,6 +104,9 @@ impl CollectionRequest {
         codex_sandbox: impl Into<String>,
     ) -> Self {
         self.collector_model = model.into();
+        self.collector_provider = AgentKind::for_model(&self.collector_model)
+            .map(|kind| kind.to_string())
+            .unwrap_or_default();
         self.collector_effort = effort.into();
         self.codex_sandbox = codex_sandbox.into();
         self
@@ -178,21 +185,26 @@ pub async fn run_collection_with_inputs(
     let pr = request.pr_number;
     let task_id = request.task_id;
     let db_path = request.db_path.clone();
+    let collector_provider = request.collector_provider.clone();
     let collector_model = request.collector_model.clone();
+    let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
     let count = findings.len() as i64;
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
-        review_findings::replace_for_pr(&mut conn, pr, &findings)?;
         let now = clock::now();
-        review_findings::record_run(
-            &conn,
+        review_findings::replace_for_pr_and_record_run(
+            &mut conn,
+            pr,
+            &findings,
             &CollectionRun {
                 pr_number: pr,
                 task_id,
                 status: RunStatus::Success,
                 error: None,
                 collector_model,
+                collector_provider: Some(collector_provider),
+                collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: count,
                 attempted_at,
@@ -232,7 +244,9 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let pr = request.pr_number;
     let task_id = request.task_id;
     let error_text = error.to_string();
+    let collector_provider = request.collector_provider.clone();
     let collector_model = request.collector_model.clone();
+    let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = quorum_core::db::open(&db_path)?;
@@ -245,6 +259,8 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 status: RunStatus::Failed,
                 error: Some(error_text.clone()),
                 collector_model,
+                collector_provider: Some(collector_provider),
+                collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: 0,
                 attempted_at,
@@ -839,6 +855,7 @@ mod tests {
             repo_dir: dir.to_path_buf(),
             agent_bin: Some(fake_agent_path().to_string_lossy().to_string()),
             bare_agent: true,
+            collector_provider: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -1109,6 +1126,7 @@ mod tests {
             repo_dir: dir.path().to_path_buf(),
             agent_bin: Some("/nonexistent/quorum-fake-agent-t126".into()),
             bare_agent: true,
+            collector_provider: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
