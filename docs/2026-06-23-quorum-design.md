@@ -661,6 +661,15 @@ conversation. Concretely:
   Encouraged GitHub operations are normal comments, inline comments, and review
   summary comments. Formal APPROVE and REQUEST_CHANGES reviews remain daemon-owned
   because managed reviewers use the same GitHub account as PR authors.
+  Reviewers classify technical impact independently from merge disposition. A
+  concrete finding is BLOCKING only when it violates the current task outcome,
+  an applicable repository invariant or supported behavior, or a failure
+  introduced/materially worsened by the PR, and its assumptions fit the
+  established operating/threat model. Real pre-existing, adjacent,
+  defense-in-depth, future, or stronger-threat-model concerns are FOLLOW-UP
+  unless an explicit current contract makes them blocking. Follow-ups are
+  recorded on the PR but never increase `--blocking` or prevent an otherwise
+  valid approval.
 - **Author/rework agents** address findings on the PR. If disagreeing with a finding,
   the author replies to it on the PR with concrete evidence rather than silently
   ignoring it. The final PR history must let a later collector determine, for each
@@ -746,9 +755,14 @@ approval path merges; when it requires R2, the following dual-review flow applie
 
 No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
 
-**Severity contract** — both R1 and R2 prompts enforce that concrete failure classes
-(resource exhaustion, unbounded growth, network calls in DB txns, data loss, stuck paths)
-are BLOCKING unless evidence disproves the failure.
+**Severity and disposition contract** — both R1 and R2 prompts classify
+technical impact separately from merge disposition. Concrete resource
+exhaustion, unbounded growth, network calls in DB transactions, data loss,
+corruption, security-boundary failures, and stuck paths are presumptively major
+or critical impact. They are BLOCKING only when the demonstrated failure also
+belongs to the current task/repository contract and supported operating or threat
+model. Each blocker explains why this PR cannot merge; each follow-up explains
+why deferral is safe.
 
 ### Daemon-owned pre-review CI gate
 
@@ -1143,13 +1157,16 @@ Each invariant below requires both a positive and a negative test. Tests marked
     transient-empty-after-push (#3583). Verified by unit test structure; E2E
     coverage deferred (requires gh-shim, see #181 PR review discussion).
 
-### Post-merge review-analytics collector (#125)
+### Post-merge review interpretation and follow-up planning (#125)
 
 Every successful merge kicks off a detached `serve::collector::run_collection` task
-that classifies the finished PR into structured `review_findings`. The collector
-runs **after** `MergeSucceeded` fires — the task is already `done`, the verdict is
-already final — so its results are retrospective analytics only. Nothing it does
-can undo the merge or change the task.
+that classifies the finished PR into structured `review_findings` and an immutable
+set of evidence-backed Follow-up Artifacts. The collector runs **after**
+`MergeSucceeded` fires — the task is already `done` and the verdict is final — so
+nothing it does can undo the merge or change the originating task or Task Graph.
+Follow-up Artifacts may later produce separate future Managed Tasks through the
+Planning Agent and daemon-owned materialization described in
+`docs/2026-08-07-review-followup-planning-technical-spec.md`.
 
 **Pipeline:**
 1. **Deterministic input assembly** (Rust code, not the model): fetches PR
@@ -1176,15 +1193,19 @@ can undo the merge or change the task.
 2. **Bounded classifier turn** — a Haiku-class agent (`CLASSIFIER_MODEL` /
    `CLASSIFIER_EFFORT`) is spawned with an EMPTY tool allowlist (no Bash,
    Read, Write, Edit, gh — response-only). 3-minute wall-clock cap.
-3. **Structured output** — response must be `{"findings":[...]}` with each
+3. **Structured output** — response must be
+   `{"findings":[...],"followup_artifacts":[...]}` with each
    finding carrying `kind` (blocking/suggestion), `author_pushback`,
    `pushback_accepted` (true/false/null), `addressed_status`
    (addressed/unaddressed/partial/unclear), and an `evidence` array of
-   `{kind,id}` pointers to GitHub review/comment ids. Prose-only findings
-   are rejected by contract.
-4. **Idempotent write** — `replace_for_pr` deletes and re-inserts all findings
-   for the PR; `record_run` UPSERTs a single row in `review_collection_runs`
-   keyed on `pr_number`. Retrying overwrites; there is no history bloat.
+   `{kind,id}` pointers to GitHub review/comment ids. Each artifact carries
+   technical impact, scope relationship, concrete concern, non-blocking reason,
+   affected behavior, desired outcome, verification expectations, and evidence.
+   Prose-only or evidence-free findings/artifacts are rejected by contract.
+4. **Atomic idempotent write** — one transaction replaces analytics, inserts the
+   PR's immutable artifact batch only when absent, and UPSERTs the successful
+   `review_collection_runs` row. Re-interpretation may refresh analytics but
+   never rewrites, duplicates, or resurrects an existing artifact batch.
 5. **Loud failure surface** — any pipeline error (fetch, classifier timeout,
    classifier `is_error=true`, unparseable response, DB write) records a
    `review_collection_runs` row with `status='failed'` + error text and logs
@@ -1199,6 +1220,22 @@ can undo the merge or change the task.
   don't interfere.
 - `collector_model` and `collector_version` are stamped on every row so future
   analyses can filter by generation and re-interpretation replaces atomically.
+- Collection and follow-up planning never change the originating review verdict,
+  merge, task, or graph state. Reviewers and Planning Agents never create tasks;
+  only the daemon may apply a complete validated Follow-up Assessment.
+
+**Follow-up assessment:** ordinary merged tasks become eligible after successful
+interpretation. Generated-child artifacts wait and are assessed together only
+after the Task Graph completes, or after cancellation preserves a merged subset,
+and every merged PR in the batch has successful interpretation. A fresh bounded
+Planning Agent turn receives durable Planning Lineage, all active tasks, bounded
+related completed work, current instructions, and a read-only repository view. It
+must create, link, dismiss, or defer every artifact exactly once. There is no
+semantic fingerprint table: grouping and comparison are planner judgments, and
+ordinary task classification provides a second duplicate/readiness assessment.
+The daemon applies all dispositions and task creations atomically; any failure
+creates nothing. Detailed storage, retry, recovery, and evidence contracts are in
+the focused technical specification.
 
 **Retry surface:** `quorum review-interpret --pr N [--task-id N] [--repo owner/name]`
 re-runs the same pipeline manually. It calls `serve::collector::run_collection`
