@@ -19,7 +19,6 @@
 use crate::clock;
 use crate::db::begin_immediate;
 use crate::error::Result;
-use crate::role_assignments::{guarded_evidence_insert, EvidenceAssignmentContext};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -201,9 +200,10 @@ pub struct CollectionRun {
     pub status: RunStatus,
     pub error: Option<String>,
     pub collector_model: String,
-    /// Resolved launch identity used to validate a managed assignment link.
-    /// The durable assignment remains the canonical source for these fields.
+    /// Launch identity used only to validate a managed assignment link. The
+    /// durable assignment row remains the canonical source for these fields.
     pub collector_provider: Option<String>,
+    pub collector_runner: Option<String>,
     pub collector_effort: Option<String>,
     pub collector_version: String,
     pub findings_count: i64,
@@ -219,49 +219,48 @@ pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
     record_run_inner(conn, run)
 }
 
+const COLLECTION_RUN_INSERT: &str = "INSERT INTO review_collection_runs(
+        pr_number,task_id,status,error,collector_model,collector_version,
+        findings_count,attempted_at,completed_at,role_assignment_id)
+    SELECT :pr_number,:task_id,:status,:error,:collector_model,:collector_version,
+        :findings_count,:attempted_at,:completed_at,:quorum_assignment_id
+    /* quorum-role-assignment-guard */
+      AND (:quorum_assignment_id IS NULL OR EXISTS(
+          SELECT 1 FROM role_assignments AS collector_assignment
+          WHERE collector_assignment.id=:quorum_assignment_id
+            AND collector_assignment.pr_number=:pr_number
+            AND collector_assignment.review_stage IS NULL
+            AND collector_assignment.complexity IS NULL
+      ))
+    ON CONFLICT(pr_number) DO UPDATE SET
+        task_id=excluded.task_id,
+        status=excluded.status,
+        error=excluded.error,
+        collector_model=excluded.collector_model,
+        collector_version=excluded.collector_version,
+        findings_count=excluded.findings_count,
+        attempted_at=excluded.attempted_at,
+        completed_at=excluded.completed_at,
+        role_assignment_id=excluded.role_assignment_id";
+
 fn record_run_inner(conn: &Connection, run: &CollectionRun) -> Result<()> {
-    let responsibility_key = format!("collector:pr:{}", run.pr_number);
-    let provider = run.collector_provider.as_deref().unwrap_or("");
-    let effort = run.collector_effort.as_deref().unwrap_or("");
-    let context = EvidenceAssignmentContext {
+    let responsibility = format!("collector:pr:{}", run.pr_number);
+    let context = crate::role_assignments::EvidenceAssignmentContext {
         role_assignment_id: run.role_assignment_id,
         task_id: run.task_id,
-        responsibility_key: &responsibility_key,
+        responsibility_key: &responsibility,
         role: "collector",
-        provider,
-        runner: provider,
+        provider: run.collector_provider.as_deref().unwrap_or_default(),
+        runner: run.collector_runner.as_deref().unwrap_or_default(),
         model: &run.collector_model,
-        effort,
+        effort: run.collector_effort.as_deref().unwrap_or_default(),
     };
     let status = run.status.as_str();
-    guarded_evidence_insert(
+    crate::role_assignments::guarded_evidence_insert(
         conn,
         "collector run",
         &context,
-        "INSERT INTO review_collection_runs
-            (pr_number, task_id, status, error, collector_model, collector_version,
-             findings_count, attempted_at, completed_at, role_assignment_id)
-         SELECT :pr_number, :task_id, :status, :error, :collector_model,
-                :collector_version, :findings_count, :attempted_at, :completed_at,
-                :quorum_assignment_id
-         /* quorum-role-assignment-guard */
-           AND (:quorum_assignment_id IS NULL OR EXISTS(
-               SELECT 1 FROM role_assignments AS collector_assignment
-               WHERE collector_assignment.id=:quorum_assignment_id
-                 AND collector_assignment.pr_number=:pr_number
-                 AND collector_assignment.review_stage IS NULL
-                 AND collector_assignment.complexity IS NULL
-           ))
-         ON CONFLICT(pr_number) DO UPDATE SET
-            task_id = excluded.task_id,
-            status = excluded.status,
-            error = excluded.error,
-            collector_model = excluded.collector_model,
-            collector_version = excluded.collector_version,
-            findings_count = excluded.findings_count,
-            attempted_at = excluded.attempted_at,
-            completed_at = excluded.completed_at,
-            role_assignment_id = excluded.role_assignment_id",
+        COLLECTION_RUN_INSERT,
         &[
             (":pr_number", &run.pr_number),
             (":task_id", &run.task_id),
@@ -273,13 +272,12 @@ fn record_run_inner(conn: &Connection, run: &CollectionRun) -> Result<()> {
             (":attempted_at", &run.attempted_at),
             (":completed_at", &run.completed_at),
         ],
-    )?;
-    Ok(())
+    )
 }
 
-/// Replace a collector's findings and persist its successful run in one
-/// transaction. A semantically invalid assignment link rejects the guarded run
-/// insert and rolls back the findings replacement with it.
+/// Replace a collector's findings and persist its successful run as one
+/// canonical evidence write. A mismatched assignment aborts the guarded run
+/// insert and rolls the findings replacement back with it.
 pub fn replace_for_pr_and_record_run(
     conn: &mut Connection,
     pr_number: i64,
@@ -300,9 +298,9 @@ pub fn replace_for_pr_and_record_run(
 /// Read the run record for a PR (None if never collected).
 pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun>> {
     let mut stmt = conn.prepare(
-        "SELECT r.pr_number, r.task_id, r.status, r.error, r.collector_model,
-                r.collector_version, r.findings_count, r.attempted_at, r.completed_at,
-                r.role_assignment_id, a.provider, a.effort
+        "SELECT r.pr_number,r.task_id,r.status,r.error,r.collector_model,
+                r.collector_version,r.findings_count,r.attempted_at,r.completed_at,
+                r.role_assignment_id,a.provider,a.runner,a.effort
          FROM review_collection_runs r
          LEFT JOIN role_assignments a ON a.id=r.role_assignment_id
          WHERE r.pr_number = ?1",
@@ -321,7 +319,8 @@ pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun
             error: row.get(3)?,
             collector_model: row.get(4)?,
             collector_provider: row.get(10)?,
-            collector_effort: row.get(11)?,
+            collector_runner: row.get(11)?,
+            collector_effort: row.get(12)?,
             collector_version: row.get(5)?,
             findings_count: row.get(6)?,
             attempted_at: row.get(7)?,
@@ -739,6 +738,7 @@ mod tests {
             error: None,
             collector_model: "haiku".into(),
             collector_provider: Some("claude".into()),
+            collector_runner: Some("claude".into()),
             collector_effort: Some("high".into()),
             collector_version: "v1".into(),
             findings_count: 3,
@@ -753,12 +753,19 @@ mod tests {
         assert_eq!(got.error, None);
         assert_eq!(got.role_assignment_id, Some(77));
         assert_eq!(got.collector_provider.as_deref(), Some("claude"));
+        assert_eq!(got.collector_runner.as_deref(), Some("claude"));
         assert_eq!(got.collector_effort.as_deref(), Some("high"));
     }
 
     #[test]
-    fn mismatched_collector_assignment_rolls_back_findings_and_run_together() {
+    fn mismatched_collector_assignment_rolls_back_findings_and_run_atomically() {
         let (mut conn, _dir) = test_conn();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (90,'merged','done','owner',1,1)",
+            [],
+        )
+        .unwrap();
         let old = ReviewFinding {
             pr_number: 700,
             task_id: Some(90),
@@ -773,6 +780,7 @@ mod tests {
             error: Some("old failure".into()),
             collector_model: "haiku".into(),
             collector_provider: None,
+            collector_runner: None,
             collector_effort: None,
             collector_version: "v1".into(),
             findings_count: 0,
@@ -785,7 +793,7 @@ mod tests {
             "INSERT INTO role_assignments(
                  id,responsibility_key,task_id,pr_number,role,profile_id,provider,runner,model,effort,
                  pool_key,policy_generation,created_at)
-             VALUES (88,'collector:pr:700',90,700,'collector','profile','provider','other-runner',
+             VALUES (88,'collector:pr:700',90,700,'collector','profile','codex','claude',
                      'haiku','high','collector','g1',1)",
             [],
         )
@@ -803,7 +811,8 @@ mod tests {
             attempted_at: 3,
             completed_at: Some(4),
             role_assignment_id: Some(88),
-            collector_provider: Some("provider".into()),
+            collector_provider: Some("codex".into()),
+            collector_runner: Some("codex".into()),
             collector_effort: Some("high".into()),
             ..old_run
         };
@@ -818,6 +827,10 @@ mod tests {
         assert_eq!(stored.status, RunStatus::Failed);
         assert_eq!(stored.error.as_deref(), Some("old failure"));
         assert_eq!(stored.role_assignment_id, None);
+        let task_status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=90", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(task_status, "done");
     }
 
     #[test]
@@ -831,6 +844,7 @@ mod tests {
             error: Some("gh api rate-limited".into()),
             collector_model: "haiku".into(),
             collector_provider: None,
+            collector_runner: None,
             collector_effort: None,
             collector_version: "v1".into(),
             findings_count: 0,

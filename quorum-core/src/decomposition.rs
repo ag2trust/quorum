@@ -265,25 +265,11 @@ pub fn begin_routed_planning(
         input.seed,
         input.now,
     )?;
-    let inserted = tx.execute(
-        "INSERT INTO task_decompositions(
-             source_task_id,state,active,freeze_active,planned_source_revision,
-             planner_provider,planner_model,planner_assignment_id,frozen_base_sha,
-             created_at,updated_at)
-         VALUES (?1,'freeze-requested',0,1,?2,?3,?4,?5,NULL,?6,?6)",
-        params![
-            input.source_task_id,
-            input.expected_revision,
-            assignment.provider,
-            assignment.model,
-            assignment.id,
-            input.now
-        ],
-    );
-    if matches!(&inserted, Err(error) if is_unique_constraint(error)) {
+    let inserted = insert_routed_planning_evidence(&tx, input, &assignment);
+    if matches!(&inserted, Err(QuorumError::Db(error)) if is_unique_constraint(error)) {
         return Ok(None);
     }
-    inserted.map_err(map_sql_err)?;
+    inserted?;
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
         "UPDATE tasks SET status='planning',updated_at=?3
@@ -295,6 +281,48 @@ pub fn begin_routed_planning(
     }
     tx.commit().map_err(map_sql_err)?;
     Ok(Some((graph_id, assignment)))
+}
+
+const ROUTED_PLANNING_INSERT: &str = "INSERT INTO task_decompositions(
+        source_task_id,state,active,freeze_active,planned_source_revision,
+        planner_provider,planner_model,planner_assignment_id,frozen_base_sha,
+        created_at,updated_at)
+    SELECT :source_task_id,'freeze-requested',0,1,:source_revision,
+        :planner_provider,:planner_model,:quorum_assignment_id,NULL,:now,:now
+    /* quorum-role-assignment-guard */";
+
+fn insert_routed_planning_evidence(
+    tx: &Transaction<'_>,
+    input: &BeginRoutedPlanning<'_>,
+    assignment: &crate::role_assignments::RoleAssignment,
+) -> Result<()> {
+    let responsibility = format!(
+        "planner:task:{}:revision:{}",
+        input.source_task_id, input.expected_revision
+    );
+    let context = crate::role_assignments::EvidenceAssignmentContext {
+        role_assignment_id: Some(assignment.id),
+        task_id: Some(input.source_task_id),
+        responsibility_key: &responsibility,
+        role: "planner",
+        provider: &assignment.provider,
+        runner: &assignment.runner,
+        model: &assignment.model,
+        effort: &assignment.effort,
+    };
+    crate::role_assignments::guarded_evidence_insert(
+        tx,
+        "planner aggregate",
+        &context,
+        ROUTED_PLANNING_INSERT,
+        &[
+            (":source_task_id", &input.source_task_id),
+            (":source_revision", &input.expected_revision),
+            (":planner_provider", &assignment.provider),
+            (":planner_model", &assignment.model),
+            (":now", &input.now),
+        ],
+    )
 }
 
 /// Link a planning aggregate to the durable routing assignment that selected its
@@ -1435,6 +1463,18 @@ mod tests {
         conn
     }
 
+    fn file_setup() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("decomposition.db")).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
     fn begin(conn: &mut Connection) -> i64 {
         let graph = begin_planning(
             conn,
@@ -1485,7 +1525,7 @@ mod tests {
 
     #[test]
     fn routed_planning_binds_assignment_in_authority_transaction() {
-        let mut conn = setup();
+        let (_dir, mut conn) = file_setup();
         let request = planner_request();
         let pool = planner_pool();
         let (graph, assignment) = begin_routed_planning(
@@ -1510,6 +1550,49 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (assignment.id, "codex".into(), "sol".into()));
+    }
+
+    #[test]
+    fn routed_planning_rejects_wrong_context_assignment_without_partial_mutation() {
+        let (_dir, mut conn) = file_setup();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (71,'collector:pr:71',71,71,'collector','profile',
+                     'codex','codex','sol','high','collector','g1',1)",
+            [],
+        )
+        .unwrap();
+        let assignment = crate::role_assignments::get(&conn, 71).unwrap().unwrap();
+        let request = planner_request();
+        let pool = planner_pool();
+        let input = BeginRoutedPlanning {
+            source_task_id: 1,
+            expected_revision: 1,
+            assignment: &request,
+            pool: &pool,
+            seed: 7,
+            now: 2,
+        };
+        let result = (|| -> Result<()> {
+            let tx = begin_immediate(&mut conn)?;
+            tx.execute("UPDATE tasks SET status='planning' WHERE id=1", [])?;
+            insert_routed_planning_evidence(&tx, &input, &assignment)?;
+            tx.commit().map_err(map_sql_err)?;
+            Ok(())
+        })();
+
+        assert!(result.is_err());
+        let state: (String, i64) = conn
+            .query_row(
+                "SELECT status,(SELECT count(*) FROM task_decompositions)
+                 FROM tasks WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("open".into(), 0));
     }
 
     #[test]

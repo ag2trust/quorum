@@ -56,6 +56,7 @@ pub struct CollectionRequest {
     pub agent_bin: Option<String>,
     pub bare_agent: bool,
     pub collector_provider: String,
+    pub collector_runner: String,
     pub collector_model: String,
     pub collector_effort: String,
     pub role_assignment_id: Option<i64>,
@@ -78,6 +79,9 @@ impl CollectionRequest {
         agent_bin: Option<String>,
         bare_agent: bool,
     ) -> Self {
+        let default_provider = AgentKind::for_model(CLASSIFIER_MODEL)
+            .map(|kind| kind.to_string())
+            .unwrap_or_default();
         Self {
             pr_number,
             task_id,
@@ -86,9 +90,8 @@ impl CollectionRequest {
             repo_dir,
             agent_bin,
             bare_agent,
-            collector_provider: AgentKind::for_model(CLASSIFIER_MODEL)
-                .map(|kind| kind.to_string())
-                .unwrap_or_default(),
+            collector_provider: default_provider.clone(),
+            collector_runner: default_provider,
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -99,14 +102,15 @@ impl CollectionRequest {
 
     pub fn with_collector(
         mut self,
+        provider: impl Into<String>,
+        runner: impl Into<String>,
         model: impl Into<String>,
         effort: impl Into<String>,
         codex_sandbox: impl Into<String>,
     ) -> Self {
+        self.collector_provider = provider.into();
+        self.collector_runner = runner.into();
         self.collector_model = model.into();
-        self.collector_provider = AgentKind::for_model(&self.collector_model)
-            .map(|kind| kind.to_string())
-            .unwrap_or_default();
         self.collector_effort = effort.into();
         self.codex_sandbox = codex_sandbox.into();
         self
@@ -186,6 +190,7 @@ pub async fn run_collection_with_inputs(
     let task_id = request.task_id;
     let db_path = request.db_path.clone();
     let collector_provider = request.collector_provider.clone();
+    let collector_runner = request.collector_runner.clone();
     let collector_model = request.collector_model.clone();
     let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
@@ -204,6 +209,7 @@ pub async fn run_collection_with_inputs(
                 error: None,
                 collector_model,
                 collector_provider: Some(collector_provider),
+                collector_runner: Some(collector_runner),
                 collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: count,
@@ -245,6 +251,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let task_id = request.task_id;
     let error_text = error.to_string();
     let collector_provider = request.collector_provider.clone();
+    let collector_runner = request.collector_runner.clone();
     let collector_model = request.collector_model.clone();
     let collector_effort = request.collector_effort.clone();
     let role_assignment_id = request.role_assignment_id;
@@ -260,6 +267,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 error: Some(error_text.clone()),
                 collector_model,
                 collector_provider: Some(collector_provider),
+                collector_runner: Some(collector_runner),
                 collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: 0,
@@ -665,8 +673,16 @@ mod tests {
             None,
             false,
         )
-        .with_collector("gpt-5.6-terra", "high", "danger-full-access");
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "high",
+            "danger-full-access",
+        );
 
+        assert_eq!(request.collector_provider, "codex");
+        assert_eq!(request.collector_runner, "codex");
         assert_eq!(request.collector_model, "gpt-5.6-terra");
         assert_eq!(request.collector_effort, "high");
     }
@@ -717,7 +733,13 @@ mod tests {
             None,
             true,
         )
-        .with_collector("gpt-5.6-terra", "medium", "danger-full-access");
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
         record_failure(&request, "boom", 1000).await;
 
         let conn = db::open(&db_path).unwrap();
@@ -749,7 +771,13 @@ mod tests {
             None,
             true,
         )
-        .with_collector("gpt-5.6-terra", "medium", "danger-full-access");
+        .with_collector(
+            "codex",
+            "codex",
+            "gpt-5.6-terra",
+            "medium",
+            "danger-full-access",
+        );
         request.role_assignment_id = Some(77);
 
         let conn = db::open(&db_path).unwrap();
@@ -823,7 +851,13 @@ mod tests {
             Some("/bin/false".into()),
             true,
         )
-        .with_collector("unknown-provider-model", "medium", "danger-full-access");
+        .with_collector(
+            "unknown",
+            "unknown",
+            "unknown-provider-model",
+            "medium",
+            "danger-full-access",
+        );
 
         let error = run_collection_with_inputs(&request, synthetic_inputs(44), 1000)
             .await
@@ -901,6 +935,7 @@ mod tests {
             agent_bin: Some(fake_agent_path().to_string_lossy().to_string()),
             bare_agent: true,
             collector_provider: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
+            collector_runner: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
@@ -917,8 +952,19 @@ mod tests {
     async fn live_positive_run_stores_findings_and_run_row() {
         let dir = setup_git_dir();
         let db = dir.path().join("q.db");
-        let _ = db::open(&db).unwrap();
-        let request = live_request(dir.path(), &db, 42, Some(7), false);
+        let conn = db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (77,'collector:pr:42',7,42,'collector','profile',
+                     'claude','claude',?1,?2,'collector','g1',1)",
+            rusqlite::params![CLASSIFIER_MODEL, CLASSIFIER_EFFORT],
+        )
+        .unwrap();
+        drop(conn);
+        let mut request = live_request(dir.path(), &db, 42, Some(7), false);
+        request.role_assignment_id = Some(77);
 
         let outcome = run_live(&request)
             .await
@@ -932,6 +978,7 @@ mod tests {
         assert_eq!(run.findings_count, 2);
         assert!(run.error.is_none());
         assert_eq!(run.collector_version, COLLECTOR_VERSION);
+        assert_eq!(run.role_assignment_id, Some(77));
         assert!(run.completed_at.is_some());
 
         let findings = review_findings::list_for_pr(&conn, 42).unwrap();
@@ -1172,6 +1219,7 @@ mod tests {
             agent_bin: Some("/nonexistent/quorum-fake-agent-t126".into()),
             bare_agent: true,
             collector_provider: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
+            collector_runner: AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string(),
             collector_model: CLASSIFIER_MODEL.to_string(),
             collector_effort: CLASSIFIER_EFFORT.to_string(),
             role_assignment_id: None,
