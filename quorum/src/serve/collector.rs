@@ -251,7 +251,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
     let _ = tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = quorum_core::db::open(&db_path)?;
         let now = clock::now();
-        review_findings::record_run(
+        let record_result = review_findings::record_run(
             &conn,
             &CollectionRun {
                 pr_number: pr,
@@ -267,9 +267,12 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 completed_at: Some(now),
                 role_assignment_id,
             },
-        )?;
+        );
+        // The guarded evidence write may reject a stale or mismatched managed
+        // assignment. Preserve that failure while still reporting it through
+        // the existing canonical error telemetry.
         quorum_core::errlog::log_error(&conn, now, "review-collector", &error_text);
-        Ok(())
+        record_result
     })
     .await;
 }
@@ -729,6 +732,48 @@ mod tests {
                 "SELECT COUNT(*) FROM errors WHERE source='review-collector'",
                 [],
                 |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn record_failure_logs_error_when_guarded_run_rejects_assignment() {
+        let (_dir, db_path) = tmp_conn();
+        let mut request = CollectionRequest::new(
+            45,
+            Some(7),
+            None,
+            db_path.clone(),
+            std::env::current_dir().unwrap(),
+            None,
+            true,
+        )
+        .with_collector("gpt-5.6-terra", "medium", "danger-full-access");
+        request.role_assignment_id = Some(77);
+
+        let conn = db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (77,'collector:pr:45',7,45,'collector','collector-profile','codex',
+                     'claude','gpt-5.6-terra','medium','collector','g1',1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        record_failure(&request, "assignment mismatch", 1000).await;
+
+        let conn = db::open(&db_path).unwrap();
+        assert!(review_findings::get_run(&conn, 45).unwrap().is_none());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM errors
+                 WHERE source='review-collector' AND detail='assignment mismatch'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
         assert_eq!(n, 1);
