@@ -37,21 +37,22 @@ git fetch origin --quiet || fail "git fetch origin"
 # error mid-pipe, N_SESSIONS silently becomes 0, and the gate passes vacuously.
 git rev-parse --verify --quiet origin/main >/dev/null \
   || fail "origin/main not found — missing remote-tracking ref; gate cannot run"
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
 BASE_REF=origin/main
 INTEGRATION=0
-case "$BRANCH" in
-  sync/develop-*)
-    git rev-parse --verify --quiet origin/develop >/dev/null \
-      || fail "origin/develop not found — integration gate cannot run"
-    git merge-base --is-ancestor origin/main HEAD \
-      || fail "integration branch does not contain current origin/main"
-    git merge-base --is-ancestor origin/develop HEAD \
-      || fail "integration branch does not contain current origin/develop"
-    BASE_REF=origin/develop
-    INTEGRATION=1
-    ;;
-esac
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+# Detect an intentional develop -> main integration from immutable ancestry, not
+# from a branch-name convention. Daemon-owned branches are always named
+# `daemon/<agent>-t<task>` and therefore cannot preserve a caller's
+# `sync/develop-*` prefix. Require both *current* remote tips, and require
+# develop to contain commits not already in main, so ordinary feature branches
+# keep the stricter single-session check.
+if git rev-parse --verify --quiet origin/develop >/dev/null \
+  && ! git merge-base --is-ancestor origin/develop origin/main \
+  && git merge-base --is-ancestor origin/main HEAD \
+  && git merge-base --is-ancestor origin/develop HEAD; then
+  BASE_REF=origin/develop
+  INTEGRATION=1
+fi
 if [ "$BRANCH" = "main" ]; then
   printf 'on main — nothing to compare, skipping\n'
 else
