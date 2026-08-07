@@ -781,7 +781,7 @@ pub fn claim(
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
-                       AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+                       AND json_extract(refs, '$.cx_size') IN ('S','M')
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
@@ -806,7 +806,7 @@ pub fn claim(
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
-                   AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+                   AND json_extract(refs, '$.cx_size') IN ('S','M')
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
@@ -908,7 +908,7 @@ pub fn claim_provider_retry_rework(
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
-               AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+               AND json_extract(refs, '$.cx_size') IN ('S','M')
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
                AND NOT (json_extract(refs, '$.cx_est')=5
@@ -2731,7 +2731,7 @@ pub fn classification_is_dispatchable(refs: &Option<String>) -> bool {
         return false;
     };
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
-    ready && (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L") && !(cx == 5 && size == "L")
+    ready && (1..=5).contains(&cx) && matches!(size, "S" | "M")
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -5868,6 +5868,53 @@ mod tests {
         // merging → done (MergeSucceeded)
         let r = apply_event(&mut c, "system", id, &Event::MergeSucceeded, 1005).unwrap();
         assert_eq!(r.task.status, "done");
+    }
+
+    #[test]
+    fn large_tasks_are_planning_only_and_cannot_be_claimed() {
+        let (_d, mut conn) = open_tmp();
+        let large = create(
+            &mut conn,
+            "owner",
+            "large",
+            None,
+            100,
+            None,
+            Some(r#"{"cx_est":4,"cx_size":"L"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let small = create(
+            &mut conn,
+            "owner",
+            "small",
+            None,
+            1,
+            None,
+            Some(r#"{"cx_est":2,"cx_size":"S"}"#),
+            None,
+            None,
+            2,
+        )
+        .unwrap();
+
+        let large_refs = get(&conn, large).unwrap().unwrap().refs;
+        assert!(classification_is_complete(&large_refs));
+        assert!(!classification_is_dispatchable(&large_refs));
+        assert!(claim(&mut conn, "explicit", Some(large), &[], TTL, 3)
+            .unwrap()
+            .is_none());
+
+        let claimed = claim(&mut conn, "next", None, &[], TTL, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, small);
+        let untouched = get(&conn, large).unwrap().unwrap();
+        assert_eq!(untouched.status, "open");
+        assert_eq!(untouched.assignee, None);
+        assert!(!has_live_lease(&conn, large, 4));
     }
 
     #[test]

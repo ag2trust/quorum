@@ -1861,6 +1861,10 @@ fn classifier_complexity(refs: &Option<String>) -> Option<u8> {
         .filter(|value| (1..=5).contains(value))
 }
 
+fn worker_responsibility_key(task_id: i64, revision: i64) -> String {
+    format!("worker:task:{task_id}:revision:{revision}")
+}
+
 #[cfg(test)]
 fn effort_rank(effort: &str) -> u8 {
     match effort {
@@ -12045,7 +12049,7 @@ async fn spawn_worker(
     let assignment = assign_role(
         config,
         quorum_core::role_assignments::AssignmentRequest {
-            responsibility_key: format!("worker:task:{}", task.id),
+            responsibility_key: worker_responsibility_key(task.id, task.revision),
             task_id: Some(task.id),
             pr_number: None,
             role: "worker".into(),
@@ -13462,20 +13466,21 @@ async fn spawn_remediation_worker(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
 
-    let remediation_complexity = {
+    let (remediation_complexity, remediation_revision) = {
         let conn = quorum_core::db::open(db_path)?;
         let task = tasks::get(&conn, task_id)?
             .ok_or_else(|| QuorumError::Io(format!("remediation task #{task_id} disappeared")))?;
-        classifier_complexity(&task.refs).ok_or_else(|| {
+        let complexity = classifier_complexity(&task.refs).ok_or_else(|| {
             QuorumError::Usage(format!(
                 "task #{task_id} cannot dispatch remediation without classifier-owned complexity"
             ))
-        })?
+        })?;
+        (complexity, task.revision)
     };
     let remediation_assignment = assign_role(
         config,
         quorum_core::role_assignments::AssignmentRequest {
-            responsibility_key: format!("worker:task:{task_id}"),
+            responsibility_key: worker_responsibility_key(task_id, remediation_revision),
             task_id: Some(task_id),
             pr_number: None,
             role: "worker".into(),
@@ -19160,5 +19165,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!((capabilities, runs, attached.as_deref()), (0, 0, Some("R")));
+    }
+
+    #[test]
+    fn worker_responsibility_is_scoped_to_task_revision() {
+        assert_eq!(
+            worker_responsibility_key(42, 7),
+            "worker:task:42:revision:7"
+        );
+        assert_ne!(
+            worker_responsibility_key(42, 7),
+            worker_responsibility_key(42, 8)
+        );
     }
 }

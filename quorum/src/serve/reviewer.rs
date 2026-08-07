@@ -168,6 +168,11 @@ fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> Stri
     let Some(context) = context else {
         return String::new();
     };
+    // Use an indented Markdown code block instead of a fenced block. Generated
+    // task text may legitimately contain backtick fences; indentation keeps
+    // every context line inside the data block without needing a sentinel that
+    // task content could close.
+    let context = context.replace('\n', "\n    ");
     let category = quorum_core::decomposition::GRAPH_BLOCKER_CATEGORY_BOUNDARY_VIOLATION;
     let example = crate::graph_blocker::Feedback {
         category: category.into(),
@@ -179,7 +184,7 @@ fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> Stri
     format!(
         "\n\n## Generated-child review boundary\n\n\
          The following bounded JSON is authoritative for this generated child's assignment and \
-         direct prerequisites only:\n```json\n{context}\n```\n\
+         direct prerequisites only:\n\n    {context}\n\n\
          Review this child against its assigned requirements. Do not absorb, require, or move \
          unrelated sibling scope into this PR. A sibling is relevant only when it is listed above \
          as a direct prerequisite; inspect no transitive or unrelated sibling assignment as scope.\n\
@@ -1685,7 +1690,7 @@ mod tests {
 
     #[test]
     fn generated_context_is_present_for_r1_r2_and_rereview_only() {
-        let context = r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[{"task_id":2,"title":"types","status":"done"}]}"#;
+        let context = r#"{"task_id":7,"assigned_requirements":"parser only ``` do not escape scope","direct_prerequisites":[{"task_id":2,"title":"types","status":"done"}]}"#;
         let r1_spec = ReviewerSpec {
             pr: 42,
             worker_agent: "W".into(),
@@ -1726,6 +1731,7 @@ mod tests {
         ];
         for prompt in prompts {
             assert!(prompt.contains("parser only"));
+            assert!(!prompt.contains("```json"));
             assert!(prompt.contains("Do not absorb, require, or move unrelated sibling scope"));
             assert!(prompt.contains("--verdict graph-blocker"));
             assert!(prompt.contains("--verdict changes"));
@@ -1734,6 +1740,10 @@ mod tests {
             assert!(prompt.contains("violated_assigned_boundary"));
             assert!(prompt.contains("evidence"));
         }
+
+        let graph_contract = graph_review_contract("R1", 42, Some(context));
+        assert!(graph_contract.contains(&format!("\n    {context}\n")));
+        assert!(!graph_contract.contains("```json"));
 
         let ordinary = build_review_prompt_for_kind(AgentKind::Claude, &r1_spec, "high");
         assert!(!ordinary.contains("Generated-child review boundary"));

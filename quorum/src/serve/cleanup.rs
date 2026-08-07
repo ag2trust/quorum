@@ -14,6 +14,10 @@ use std::time::Duration;
 pub const CLEANUP_DRAIN_LIMIT: usize = 8;
 const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
+fn configured_remote_url(repo: &str) -> String {
+    format!("https://github.com/{repo}.git")
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcessRef {
@@ -120,6 +124,7 @@ async fn retire_settled_tombstones(
             .map_err(|e| QuorumError::BadInput(format!("invalid settled branch-delete: {e}")))?;
         wt.retire_cleanup_tombstone(
             &config.repo_dir,
+            &configured_remote_url(&config.repo),
             &intent.tombstone_ref,
             &intent.expected_sha,
         )
@@ -688,6 +693,7 @@ async fn cleanup_branch_delete(
     }
     wt.delete_branch_with_tombstone(
         &config.repo_dir,
+        &configured_remote_url(&config.repo),
         &expected.name,
         &expected.expected_sha,
         &expected.tombstone_ref,
@@ -1074,10 +1080,12 @@ mod tests {
     async fn startup_replays_interrupted_cancel_cleanup_and_preserves_done_history() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
         let worktree_base = dir.path().join("worktrees");
         let worker_tree = worktree_base.join("task-2");
         std::fs::create_dir(&repo).unwrap();
         std::fs::create_dir(&worktree_base).unwrap();
+        git(dir.path(), &["init", "--bare", remote.to_str().unwrap()]);
         git(&repo, &["init", "-b", "main"]);
         git(&repo, &["config", "user.email", "test@example.com"]);
         git(&repo, &["config", "user.name", "Test"]);
@@ -1098,6 +1106,22 @@ mod tests {
         git(&worker_tree, &["add", "result"]);
         git(&worker_tree, &["commit", "-m", "finished result"]);
         let worker_sha = git(&worker_tree, &["rev-parse", "HEAD"]);
+        git(
+            &repo,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                "https://github.com/owner/repo.git",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "push",
+                "https://github.com/owner/repo.git",
+                &format!("{worker_sha}:refs/heads/daemon/task-2"),
+            ],
+        );
 
         let db_path = dir.path().join("quorum.db");
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -1292,6 +1316,14 @@ mod tests {
         assert!(!std::process::Command::new("git")
             .arg("-C")
             .arg(&repo)
+            .args(["show-ref", "--verify", "refs/heads/daemon/task-2"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(!std::process::Command::new("git")
+            .arg("-C")
+            .arg(&remote)
             .args(["show-ref", "--verify", "refs/heads/daemon/task-2"])
             .output()
             .unwrap()
