@@ -2,11 +2,38 @@
 
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, ToSql, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const BAG_SLOTS: usize = 100;
+
+/// Marker replaced by [`guarded_evidence_insert`] with the assignment-match
+/// predicate. The SQL before this marker must be an `INSERT ... SELECT` without
+/// a `WHERE` clause; clauses such as `ON CONFLICT` may follow the marker.
+pub const EVIDENCE_ASSIGNMENT_GUARD: &str = "/* quorum-role-assignment-guard */";
+
+const EVIDENCE_ASSIGNMENT_ID_PARAM: &str = ":quorum_assignment_id";
+const EVIDENCE_TASK_ID_PARAM: &str = ":quorum_assignment_task_id";
+const EVIDENCE_RESPONSIBILITY_PARAM: &str = ":quorum_assignment_responsibility";
+const EVIDENCE_ROLE_PARAM: &str = ":quorum_assignment_role";
+const EVIDENCE_PROVIDER_PARAM: &str = ":quorum_assignment_provider";
+const EVIDENCE_RUNNER_PARAM: &str = ":quorum_assignment_runner";
+const EVIDENCE_MODEL_PARAM: &str = ":quorum_assignment_model";
+const EVIDENCE_EFFORT_PARAM: &str = ":quorum_assignment_effort";
+
+const EVIDENCE_ASSIGNMENT_PREDICATE: &str = "WHERE :quorum_assignment_id IS NULL
+    OR EXISTS(
+        SELECT 1 FROM role_assignments AS assignment
+        WHERE assignment.id=:quorum_assignment_id
+          AND assignment.task_id IS :quorum_assignment_task_id
+          AND assignment.responsibility_key=:quorum_assignment_responsibility
+          AND assignment.role=:quorum_assignment_role
+          AND assignment.provider=:quorum_assignment_provider
+          AND assignment.runner=:quorum_assignment_runner
+          AND assignment.model=:quorum_assignment_model
+          AND assignment.effort=:quorum_assignment_effort
+    )";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelProfile {
@@ -58,6 +85,27 @@ pub struct RoleAssignment {
     pub pool_key: String,
     pub policy_generation: String,
     pub created_at: i64,
+}
+
+/// Minimum semantic identity required when canonical evidence links to a role
+/// assignment.
+///
+/// `task_id` (compared NULL-safely) and `responsibility_key` jointly identify
+/// the assigned responsibility. `role`, `provider`, `runner`, `model`, and
+/// `effort` identify the executable profile. Evidence-specific fields such as a
+/// PR, review stage, or plan revision belong in the canonical responsibility
+/// key; evidence writers may enforce additional path-specific constraints.
+/// Historical evidence with a NULL `role_assignment_id` remains valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceAssignmentContext<'a> {
+    pub role_assignment_id: Option<i64>,
+    pub task_id: Option<i64>,
+    pub responsibility_key: &'a str,
+    pub role: &'a str,
+    pub provider: &'a str,
+    pub runner: &'a str,
+    pub model: &'a str,
+    pub effort: &'a str,
 }
 
 impl ValidatedPool {
@@ -291,6 +339,80 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<RoleAssignment>> {
     get_by_id(conn, id)
 }
 
+/// Execute a one-row canonical evidence `INSERT ... SELECT`, guarded by the
+/// minimum semantic assignment match in [`EvidenceAssignmentContext`].
+///
+/// `insert_select` must contain [`EVIDENCE_ASSIGNMENT_GUARD`] exactly once and
+/// use `:quorum_assignment_id` for the evidence row's nullable foreign key.
+/// Other values are supplied as named `parameters`; names beginning with
+/// `:quorum_assignment_` are reserved for this primitive. The guard and insert
+/// are one SQLite statement, so an existing but mismatched assignment can never
+/// become visible on the evidence row. A mismatch returns an internal error so
+/// propagation with `?` also rolls back any caller-owned lifecycle transaction.
+pub fn guarded_evidence_insert(
+    conn: &Connection,
+    evidence: &str,
+    context: &EvidenceAssignmentContext<'_>,
+    insert_select: &str,
+    parameters: &[(&str, &dyn ToSql)],
+) -> Result<()> {
+    if insert_select.matches(EVIDENCE_ASSIGNMENT_GUARD).count() != 1 {
+        return Err(QuorumError::Io(
+            "guarded evidence insert must contain exactly one assignment guard".into(),
+        ));
+    }
+    if parameters
+        .iter()
+        .any(|(name, _)| name.starts_with(":quorum_assignment_"))
+    {
+        return Err(QuorumError::Io(
+            "guarded evidence insert used a reserved assignment parameter".into(),
+        ));
+    }
+
+    let sql = insert_select.replace(EVIDENCE_ASSIGNMENT_GUARD, EVIDENCE_ASSIGNMENT_PREDICATE);
+    let assignment_parameters: [(&str, &dyn ToSql); 8] = [
+        (EVIDENCE_ASSIGNMENT_ID_PARAM, &context.role_assignment_id),
+        (EVIDENCE_TASK_ID_PARAM, &context.task_id),
+        (EVIDENCE_RESPONSIBILITY_PARAM, &context.responsibility_key),
+        (EVIDENCE_ROLE_PARAM, &context.role),
+        (EVIDENCE_PROVIDER_PARAM, &context.provider),
+        (EVIDENCE_RUNNER_PARAM, &context.runner),
+        (EVIDENCE_MODEL_PARAM, &context.model),
+        (EVIDENCE_EFFORT_PARAM, &context.effort),
+    ];
+    let mut all_parameters = Vec::with_capacity(parameters.len() + assignment_parameters.len());
+    all_parameters.extend_from_slice(parameters);
+    all_parameters.extend_from_slice(&assignment_parameters);
+
+    let mut statement = conn.prepare(&sql)?;
+    let mut names = HashSet::with_capacity(all_parameters.len());
+    for (name, _) in &all_parameters {
+        if !names.insert(*name) || statement.parameter_index(name)?.is_none() {
+            return Err(QuorumError::Io(
+                "guarded evidence insert has duplicate or unused named parameters".into(),
+            ));
+        }
+    }
+    if statement.parameter_count() != names.len() {
+        return Err(QuorumError::Io(
+            "guarded evidence insert has unbound named parameters".into(),
+        ));
+    }
+
+    let inserted = statement.execute(&all_parameters[..])?;
+    if inserted != 1 {
+        return Err(evidence_mismatch(evidence));
+    }
+    Ok(())
+}
+
+pub(crate) fn evidence_mismatch(evidence: &str) -> QuorumError {
+    QuorumError::Io(format!(
+        "role assignment does not match {evidence} evidence"
+    ))
+}
+
 fn shuffled_bag(pool: &ValidatedPool, seed: u64) -> Vec<String> {
     let mut bag = Vec::with_capacity(BAG_SLOTS);
     for entry in &pool.profiles {
@@ -462,6 +584,156 @@ mod tests {
             role: "worker".into(),
             review_stage: None,
             complexity: Some("M".into()),
+        }
+    }
+
+    const TEST_EVIDENCE_INSERT: &str = "INSERT INTO canonical_evidence(
+            role_assignment_id,payload)
+        SELECT :quorum_assignment_id,:payload
+        /* quorum-role-assignment-guard */";
+
+    fn evidence_fixture() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("evidence.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE lifecycle_state(value TEXT NOT NULL);
+             INSERT INTO lifecycle_state(value) VALUES ('before');
+             CREATE TABLE canonical_evidence(
+                 id INTEGER PRIMARY KEY,
+                 role_assignment_id INTEGER REFERENCES role_assignments(id),
+                 payload TEXT NOT NULL
+             );
+             INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,complexity,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (7,'worker:task:7',7,'worker','M','profile',
+                     'codex','codex','gpt-5.6-sol','high','worker.M','g1',1);",
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn evidence_context(role_assignment_id: Option<i64>) -> EvidenceAssignmentContext<'static> {
+        EvidenceAssignmentContext {
+            role_assignment_id,
+            task_id: Some(7),
+            responsibility_key: "worker:task:7",
+            role: "worker",
+            provider: "codex",
+            runner: "codex",
+            model: "gpt-5.6-sol",
+            effort: "high",
+        }
+    }
+
+    #[test]
+    fn guarded_evidence_insert_accepts_exact_match_and_historical_null_link() {
+        let (_dir, conn) = evidence_fixture();
+        let exact = evidence_context(Some(7));
+        let exact_payload = "exact";
+        guarded_evidence_insert(
+            &conn,
+            "test",
+            &exact,
+            TEST_EVIDENCE_INSERT,
+            &[(":payload", &exact_payload)],
+        )
+        .unwrap();
+
+        let mut historical = evidence_context(None);
+        historical.task_id = None;
+        historical.responsibility_key = "historical:responsibility";
+        historical.role = "collector";
+        historical.provider = "claude";
+        historical.runner = "claude";
+        historical.model = "historical-model";
+        historical.effort = "medium";
+        let historical_payload = "historical";
+        guarded_evidence_insert(
+            &conn,
+            "test",
+            &historical,
+            TEST_EVIDENCE_INSERT,
+            &[(":payload", &historical_payload)],
+        )
+        .unwrap();
+
+        let rows: Vec<(Option<i64>, String)> = conn
+            .prepare("SELECT role_assignment_id,payload FROM canonical_evidence ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(Some(7), "exact".into()), (None, "historical".into())]
+        );
+    }
+
+    #[test]
+    fn guarded_evidence_insert_rejects_every_semantic_mismatch_atomically() {
+        #[derive(Debug, Clone, Copy)]
+        enum Mismatch {
+            Task,
+            Responsibility,
+            Role,
+            Provider,
+            Runner,
+            Model,
+            Effort,
+        }
+
+        for mismatch in [
+            Mismatch::Task,
+            Mismatch::Responsibility,
+            Mismatch::Role,
+            Mismatch::Provider,
+            Mismatch::Runner,
+            Mismatch::Model,
+            Mismatch::Effort,
+        ] {
+            let (_dir, mut conn) = evidence_fixture();
+            let mut context = evidence_context(Some(7));
+            match mismatch {
+                Mismatch::Task => context.task_id = Some(8),
+                Mismatch::Responsibility => context.responsibility_key = "worker:task:8",
+                Mismatch::Role => context.role = "reviewer",
+                Mismatch::Provider => context.provider = "claude",
+                Mismatch::Runner => context.runner = "claude",
+                Mismatch::Model => context.model = "other-model",
+                Mismatch::Effort => context.effort = "medium",
+            }
+            let payload = "must not persist";
+            let result = (|| -> Result<()> {
+                let tx = begin_immediate(&mut conn)?;
+                tx.execute("UPDATE lifecycle_state SET value='partial'", [])?;
+                guarded_evidence_insert(
+                    &tx,
+                    "test",
+                    &context,
+                    TEST_EVIDENCE_INSERT,
+                    &[(":payload", &payload)],
+                )?;
+                tx.commit().map_err(map_sql_err)?;
+                Ok(())
+            })();
+
+            assert!(result.is_err(), "{mismatch:?} unexpectedly matched");
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM canonical_evidence", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "{mismatch:?} inserted evidence"
+            );
+            assert_eq!(
+                conn.query_row("SELECT value FROM lifecycle_state", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                "before",
+                "{mismatch:?} left a partial lifecycle mutation"
+            );
         }
     }
 
