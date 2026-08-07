@@ -25,6 +25,8 @@ pub mod session_log;
 pub mod stream;
 pub mod worktree;
 
+use std::io::Write;
+
 use names::Pool;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
@@ -36,7 +38,6 @@ use quorum_core::stats::DaemonLiveStats;
 use quorum_core::tasks;
 use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -172,34 +173,58 @@ fn assign_role(
 fn assign_classifier_batch(
     config: &ServeConfig,
     tasks: &[quorum_core::classify::TaskForClassification],
+    decomposition: Option<DecompositionClassifierResponsibility>,
 ) -> Result<quorum_core::role_assignments::RoleAssignment> {
+    let request = classifier_assignment_request(tasks, decomposition)?;
+    assign_role(config, request, None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecompositionClassifierResponsibility {
+    graph_id: i64,
+    source_task_id: i64,
+    plan_revision: i64,
+}
+
+fn classifier_assignment_request(
+    tasks: &[quorum_core::classify::TaskForClassification],
+    decomposition: Option<DecompositionClassifierResponsibility>,
+) -> Result<quorum_core::role_assignments::AssignmentRequest> {
+    if tasks.is_empty() {
+        return Err(QuorumError::Usage(
+            "classifier responsibility requires at least one task".into(),
+        ));
+    }
     let identity = tasks
         .iter()
         .map(|task| format!("{}:{}", task.id, task.revision))
         .collect::<Vec<_>>()
         .join(",");
-    let responsibility_key = if tasks.len() == 1 {
-        format!(
-            "classifier:task:{}:revision:{}",
-            tasks[0].id, tasks[0].revision
-        )
-    } else {
-        // Decomposition preclassification has one durably accepted proposal;
-        // its ordered synthetic task identities are stable across retries.
-        format!("classifier:decomposition-batch:{identity}")
+    let (responsibility_key, task_id) = match decomposition {
+        Some(identity) => (
+            format!(
+                "classifier:decomposition:graph:{}:source:{}:plan-revision:{}",
+                identity.graph_id, identity.source_task_id, identity.plan_revision
+            ),
+            Some(identity.source_task_id),
+        ),
+        None if tasks.len() == 1 => (
+            format!(
+                "classifier:task:{}:revision:{}",
+                tasks[0].id, tasks[0].revision
+            ),
+            Some(tasks[0].id),
+        ),
+        None => (format!("classifier:batch:{identity}"), None),
     };
-    assign_role(
-        config,
-        quorum_core::role_assignments::AssignmentRequest {
-            responsibility_key,
-            task_id: (tasks.len() == 1).then_some(tasks[0].id),
-            pr_number: None,
-            role: "classifier".into(),
-            review_stage: None,
-            complexity: None,
-        },
-        None,
-    )
+    Ok(quorum_core::role_assignments::AssignmentRequest {
+        responsibility_key,
+        task_id,
+        pr_number: None,
+        role: "classifier".into(),
+        review_stage: None,
+        complexity: None,
+    })
 }
 
 struct PoisonTracker {
@@ -2793,6 +2818,7 @@ struct PlanningSnapshot {
     graph_id: i64,
     source_task_id: i64,
     source_revision: i64,
+    plan_revision: i64,
     state: String,
     freeze_active: bool,
     updated_at: i64,
@@ -2805,6 +2831,10 @@ struct PlanningSnapshot {
 }
 
 const DECOMPOSITION_PROVIDER_BACKOFF_SECS: i64 = 5;
+const PLANNER_VIEW_TIMEOUT: Duration = Duration::from_secs(30);
+const PLANNER_VIEW_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+const PLANNER_ARCHIVE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const PLANNER_ARCHIVE_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct DecompositionLiveWork {
@@ -2834,6 +2864,7 @@ type PlanningSnapshotRow = (
     i64,
     i64,
     i64,
+    i64,
     String,
     bool,
     i64,
@@ -2848,7 +2879,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
     use rusqlite::OptionalExtension;
     let row: Option<PlanningSnapshotRow> = conn
         .query_row(
-            "SELECT d.id,d.source_task_id,d.planned_source_revision,d.state,d.freeze_active,
+            "SELECT d.id,d.source_task_id,d.planned_source_revision,d.plan_revision,d.state,d.freeze_active,
                     d.updated_at,t.title,t.body,t.depends_on,d.accepted_proposal_json,
                     d.frozen_base_sha
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
@@ -2868,6 +2899,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                     row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
+                    row.get(11)?,
                 ))
             },
         )
@@ -2876,6 +2908,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         graph_id,
         source_task_id,
         source_revision,
+        plan_revision,
         state,
         freeze_active,
         updated_at,
@@ -2909,6 +2942,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         graph_id,
         source_task_id,
         source_revision,
+        plan_revision,
         state,
         freeze_active,
         updated_at,
@@ -3014,56 +3048,268 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
 }
 
 async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::TempDir> {
+    frozen_planner_view_with_options(
+        repo,
+        frozen_sha,
+        Path::new("git"),
+        Path::new("tar"),
+        PLANNER_VIEW_TIMEOUT,
+        PLANNER_ARCHIVE_MAX_BYTES,
+    )
+    .await
+}
+
+async fn frozen_planner_view_with_options(
+    repo: &Path,
+    frozen_sha: &str,
+    git_bin: &Path,
+    tar_bin: &Path,
+    timeout: Duration,
+    archive_limit: usize,
+) -> Result<tempfile::TempDir> {
     let repo = repo.to_path_buf();
     let frozen_sha = frozen_sha.to_string();
-    tokio::task::spawn_blocking(move || -> Result<tempfile::TempDir> {
-        let head = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&repo)
-            .output()
-            .map_err(|error| QuorumError::Io(format!("planner HEAD check failed: {error}")))?;
+    let git_bin = git_bin.to_path_buf();
+    let tar_bin = tar_bin.to_path_buf();
+    // Dropping this JoinHandle detaches the process-owning task. Cancellation
+    // of the daemon tick therefore cannot skip its bounded kill/reap path.
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut head_command = tokio::process::Command::new(&git_bin);
+        head_command.args(["rev-parse", "HEAD"]).current_dir(&repo);
+        let head = run_publication_gh_command_with_limit(
+            head_command,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            4096,
+            "planner HEAD check",
+        )
+        .await
+        .map_err(QuorumError::Io)?;
         let current = String::from_utf8_lossy(&head.stdout).trim().to_string();
         if !head.status.success() || current != frozen_sha {
             return Err(QuorumError::Io(format!(
                 "planner source drifted from frozen base {frozen_sha} to {current}"
             )));
         }
-        let archive = std::process::Command::new("git")
+
+        let view = tempfile::Builder::new()
+            .prefix("quorum-planner-")
+            .tempdir()
+            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+
+        let mut archive_command = tokio::process::Command::new(&git_bin);
+        archive_command
             .args(["archive", "--format=tar", &frozen_sha])
             .current_dir(&repo)
-            .output()
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_planner_view_process_group(&mut archive_command);
+        let mut archive = archive_command
+            .spawn()
             .map_err(|error| QuorumError::Io(format!("planner archive failed: {error}")))?;
-        if !archive.status.success() {
-            return Err(QuorumError::Io("planner frozen archive was refused".into()));
-        }
-        let view = tempfile::tempdir()
-            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
-        let mut tar = std::process::Command::new("tar")
+
+        let mut tar_command = tokio::process::Command::new(&tar_bin);
+        tar_command
             .args(["-xf", "-", "-C"])
             .arg(view.path())
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| {
-                QuorumError::Io(format!("planner archive extraction failed: {error}"))
-            })?;
-        use std::io::Write;
-        tar.stdin
-            .take()
-            .ok_or_else(|| QuorumError::Io("planner archive stdin unavailable".into()))?
-            .write_all(&archive.stdout)
-            .map_err(|error| QuorumError::Io(format!("planner archive write failed: {error}")))?;
-        let status = tar
-            .wait()
-            .map_err(|error| QuorumError::Io(format!("planner archive wait failed: {error}")))?;
-        if !status.success() {
-            return Err(QuorumError::Io(
-                "planner archive extraction was refused".into(),
-            ));
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        configure_planner_view_process_group(&mut tar_command);
+        let mut tar = match tar_command.spawn() {
+            Ok(tar) => tar,
+            Err(error) => {
+                let cleanup = kill_and_reap_planner_view_processes(&mut archive, None).await;
+                return Err(QuorumError::Io(match cleanup {
+                    Ok(()) => format!("planner archive extraction failed: {error}"),
+                    Err(cleanup) => {
+                        format!("planner archive extraction failed: {error}; {cleanup}")
+                    }
+                }));
+            }
+        };
+
+        let (archive_stdout, archive_stderr, mut tar_stdin, tar_stderr) = match (
+            archive.stdout.take(),
+            archive.stderr.take(),
+            tar.stdin.take(),
+            tar.stderr.take(),
+        ) {
+            (Some(stdout), Some(archive_stderr), Some(tar_stdin), Some(tar_stderr)) => {
+                (stdout, archive_stderr, tar_stdin, tar_stderr)
+            }
+            _ => {
+                let cleanup =
+                    kill_and_reap_planner_view_processes(&mut archive, Some(&mut tar)).await;
+                return Err(QuorumError::Io(match cleanup {
+                    Ok(()) => "planner archive pipeline unavailable".into(),
+                    Err(cleanup) => format!("planner archive pipeline unavailable; {cleanup}"),
+                }));
+            }
+        };
+        let (diagnostic_tx, _diagnostic_rx) = tokio::sync::mpsc::channel(2);
+        let mut archive_diagnostics = tokio::spawn(drain_publication_pipe(
+            archive_stderr,
+            PLANNER_ARCHIVE_DIAGNOSTIC_BYTES,
+            "git stderr",
+            diagnostic_tx.clone(),
+        ));
+        let mut tar_diagnostics = tokio::spawn(drain_publication_pipe(
+            tar_stderr,
+            PLANNER_ARCHIVE_DIAGNOSTIC_BYTES,
+            "tar stderr",
+            diagnostic_tx,
+        ));
+
+        let mut limited_archive = archive_stdout.take(archive_limit.saturating_add(1) as u64);
+        let operation = async {
+            let copied = tokio::io::copy(&mut limited_archive, &mut tar_stdin)
+                .await
+                .map_err(|error| format!("planner archive stream failed: {error}"))?;
+            drop(tar_stdin);
+            if copied > archive_limit as u64 {
+                return Err(format!(
+                    "planner archive exceeded {archive_limit}-byte limit"
+                ));
+            }
+            let archive_status = archive
+                .wait()
+                .await
+                .map_err(|error| format!("planner archive wait failed: {error}"))?;
+            let tar_status = tar
+                .wait()
+                .await
+                .map_err(|error| format!("planner archive extraction wait failed: {error}"))?;
+            Ok::<_, String>((archive_status, tar_status))
+        };
+        let statuses = match tokio::time::timeout_at(deadline, operation).await {
+            Ok(Ok(statuses)) => statuses,
+            Ok(Err(error)) => {
+                let cleanup =
+                    kill_and_reap_planner_view_processes(&mut archive, Some(&mut tar)).await;
+                archive_diagnostics.abort();
+                tar_diagnostics.abort();
+                return Err(QuorumError::Io(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => format!("{error}; {cleanup}"),
+                }));
+            }
+            Err(_) => {
+                let cleanup =
+                    kill_and_reap_planner_view_processes(&mut archive, Some(&mut tar)).await;
+                archive_diagnostics.abort();
+                tar_diagnostics.abort();
+                let timeout_error =
+                    format!("planner archive timed out after {}s", timeout.as_secs_f64());
+                return Err(QuorumError::Io(match cleanup {
+                    Ok(()) => timeout_error,
+                    Err(cleanup) => format!("{timeout_error}; {cleanup}"),
+                }));
+            }
+        };
+
+        let diagnostics = tokio::time::timeout(PLANNER_VIEW_REAP_TIMEOUT, async {
+            let archive = (&mut archive_diagnostics)
+                .await
+                .map_err(|error| format!("planner archive diagnostic join: {error}"))?
+                .map_err(|error| format!("planner archive diagnostic read: {error}"))?;
+            let tar = (&mut tar_diagnostics)
+                .await
+                .map_err(|error| format!("planner tar diagnostic join: {error}"))?
+                .map_err(|error| format!("planner tar diagnostic read: {error}"))?;
+            Ok::<_, String>((archive, tar))
+        })
+        .await;
+        let (archive_diagnostic, tar_diagnostic) = match diagnostics {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => return Err(QuorumError::Io(error)),
+            Err(_) => {
+                archive_diagnostics.abort();
+                tar_diagnostics.abort();
+                return Err(QuorumError::Io(
+                    "planner archive diagnostics timed out".into(),
+                ));
+            }
+        };
+        if archive_diagnostic.exceeded_limit || tar_diagnostic.exceeded_limit {
+            return Err(QuorumError::Io(format!(
+                "planner archive diagnostics exceeded {PLANNER_ARCHIVE_DIAGNOSTIC_BYTES}-byte limit"
+            )));
+        }
+        if !statuses.0.success() || !statuses.1.success() {
+            return Err(QuorumError::Io(format!(
+                "planner frozen archive was refused (git: {}; tar: {})",
+                String::from_utf8_lossy(&archive_diagnostic.bytes).trim(),
+                String::from_utf8_lossy(&tar_diagnostic.bytes).trim()
+            )));
         }
         Ok(view)
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("planner view join failed: {error}")))?
+    .map_err(|error| QuorumError::Io(format!("planner view owner join failed: {error}")))?
+}
+
+fn configure_planner_view_process_group(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+async fn kill_and_reap_planner_view_processes(
+    archive: &mut tokio::process::Child,
+    tar: Option<&mut tokio::process::Child>,
+) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        for pid in [archive.id(), tar.as_ref().and_then(|child| child.id())]
+            .into_iter()
+            .flatten()
+        {
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = archive.start_kill();
+        if let Some(child) = tar.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+
+    async fn reap(
+        child: &mut tokio::process::Child,
+        label: &str,
+    ) -> std::result::Result<(), String> {
+        match tokio::time::timeout(PLANNER_VIEW_REAP_TIMEOUT, child.wait()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(format!("{label} kill/reap failed: {error}")),
+            Err(_) => Err(format!(
+                "{label} kill/reap timed out after {}s",
+                PLANNER_VIEW_REAP_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    let archive_result = reap(archive, "planner git archive").await;
+    let tar_result = match tar {
+        Some(tar) => reap(tar, "planner tar extraction").await,
+        None => Ok(()),
+    };
+    match (archive_result, tar_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(archive), Err(tar)) => Err(format!("{archive}; {tar}")),
+    }
 }
 
 async fn repository_head_sha(repo: &Path) -> Result<String> {
@@ -3207,7 +3453,11 @@ async fn delete_decomposition_process(
     graph_id: i64,
     role: &str,
 ) -> Result<()> {
-    let path = config.db_path.clone();
+    delete_decomposition_process_at(&config.db_path, graph_id, role).await
+}
+
+async fn delete_decomposition_process_at(db_path: &Path, graph_id: i64, role: &str) -> Result<()> {
+    let path = db_path.to_path_buf();
     let name = decomposition_process_name(graph_id, role);
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
@@ -3216,6 +3466,40 @@ async fn delete_decomposition_process(
     })
     .await
     .map_err(|error| QuorumError::Io(format!("decomposition journal delete join: {error}")))??;
+    Ok(())
+}
+
+/// Settle provider authority when a legal concurrent source edit removes the
+/// pre-materialization aggregate. The graph identity is retained until both
+/// process journals have been deleted, so a transient DB failure is retried on
+/// the next tick instead of leaving decomposition drain permanently occupied.
+async fn discard_removed_decomposition(
+    db_path: &Path,
+    coordinator: &mut DecompositionCoordinator,
+) -> Result<()> {
+    let had_live_provider =
+        coordinator.planner_slot.is_some() || coordinator.classifier_slot.is_some();
+    let graph_id = coordinator.graph_id;
+    if had_live_provider && graph_id.is_none() {
+        return Err(QuorumError::Io(
+            "live decomposition provider lost graph identity".into(),
+        ));
+    }
+    if let Some(slot) = coordinator.planner_slot.take() {
+        slot.kill_and_reap().await;
+    }
+    if let Some(slot) = coordinator.classifier_slot.take() {
+        slot.kill_and_reap().await;
+    }
+    coordinator.planner_view = None;
+    coordinator.proposal = None;
+    if let Some(graph_id) = graph_id {
+        // Both deletes are idempotent. Always attempt both: if a prior tick
+        // killed a slot but lost the DB write, the retained graph identity lets
+        // this tick finish settlement without an in-memory slot.
+        delete_decomposition_process_at(db_path, graph_id, "planner").await?;
+        delete_decomposition_process_at(db_path, graph_id, "classifier").await?;
+    }
     Ok(())
 }
 
@@ -3528,6 +3812,7 @@ async fn tick_decomposition(
         load_planning_snapshot(&conn)?
     };
     if snapshot.is_none() {
+        discard_removed_decomposition(&config.db_path, coordinator).await?;
         coordinator.graph_id = None;
         if coordinator.planner_slot.is_none() && coordinator.classifier_slot.is_none() {
             let candidate = {
@@ -3770,7 +4055,15 @@ async fn tick_decomposition(
             ));
         };
         let tasks = proposed_classifier_tasks(proposal);
-        let classifier_assignment = assign_classifier_batch(config, &tasks)?;
+        let classifier_assignment = assign_classifier_batch(
+            config,
+            &tasks,
+            Some(DecompositionClassifierResponsibility {
+                graph_id: snapshot.graph_id,
+                source_task_id: snapshot.source_task_id,
+                plan_revision: snapshot.plan_revision,
+            }),
+        )?;
         let classifier_kind = resolve_provider(&classifier_assignment.model)?;
         match classifier::spawn_classifier_configured(
             &tasks,
@@ -9389,7 +9682,7 @@ async fn tick(
             // keeps retry identity stable even as the unclassified queue changes.
             let tasks = tasks.into_iter().take(1).collect::<Vec<_>>();
             if !tasks.is_empty() {
-                let classifier_assignment = assign_classifier_batch(config, &tasks)?;
+                let classifier_assignment = assign_classifier_batch(config, &tasks, None)?;
                 let classifier_kind = resolve_provider(&classifier_assignment.model)?;
                 match classifier::spawn_classifier_configured(
                     &tasks,
@@ -14333,7 +14626,7 @@ mod tests {
 
     fn make_dummy_slot() -> SlotState {
         use std::time::Instant;
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::BufReader;
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let mut child = rt.block_on(async {
@@ -14345,7 +14638,7 @@ mod tests {
         });
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout);
         let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(child, stdin, reader));
         let now = Instant::now();
         SlotState {
@@ -18298,6 +18591,189 @@ mod tests {
         }
     }
 
+    #[test]
+    fn decomposition_classifier_responsibilities_are_graph_scoped_and_retry_stable() {
+        let tasks = vec![
+            quorum_core::classify::TaskForClassification {
+                id: -1,
+                revision: 1,
+                title: "a".into(),
+                body: None,
+                dependencies: vec![],
+                recovery_notes: vec![],
+            },
+            quorum_core::classify::TaskForClassification {
+                id: -2,
+                revision: 1,
+                title: "b".into(),
+                body: None,
+                dependencies: vec![],
+                recovery_notes: vec![],
+            },
+        ];
+        let first_identity = DecompositionClassifierResponsibility {
+            graph_id: 11,
+            source_task_id: 21,
+            plan_revision: 2,
+        };
+        let second_identity = DecompositionClassifierResponsibility {
+            graph_id: 12,
+            source_task_id: 22,
+            plan_revision: 1,
+        };
+        let first = classifier_assignment_request(&tasks, Some(first_identity)).unwrap();
+        let retry = classifier_assignment_request(&tasks, Some(first_identity)).unwrap();
+        let second = classifier_assignment_request(&tasks, Some(second_identity)).unwrap();
+        assert_eq!(first, retry);
+        assert_ne!(first.responsibility_key, second.responsibility_key);
+        assert_eq!(first.task_id, Some(21));
+        assert_eq!(second.task_id, Some(22));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("routing.db")).unwrap();
+        let pool = quorum_core::role_assignments::ValidatedPool {
+            pool_key: "classifier".into(),
+            policy_generation: "test-generation".into(),
+            profiles: vec![quorum_core::role_assignments::WeightedProfile {
+                profile: quorum_core::role_assignments::ModelProfile {
+                    id: "only".into(),
+                    provider: "claude".into(),
+                    runner: "claude".into(),
+                    model: "claude-opus-4-6".into(),
+                    effort: "high".into(),
+                },
+                percent: 100,
+            }],
+        };
+        let first_assignment =
+            quorum_core::role_assignments::assign_or_get_with_seed(&mut conn, &first, &pool, 7, 1)
+                .unwrap();
+        let retry_assignment =
+            quorum_core::role_assignments::assign_or_get_with_seed(&mut conn, &retry, &pool, 99, 2)
+                .unwrap();
+        let second_assignment = quorum_core::role_assignments::assign_or_get_with_seed(
+            &mut conn, &second, &pool, 11, 3,
+        )
+        .unwrap();
+        assert_eq!(first_assignment.id, retry_assignment.id);
+        assert_ne!(first_assignment.id, second_assignment.id);
+        let next_slot: i64 = conn
+            .query_row(
+                "SELECT next_slot FROM routing_cursors WHERE pool_key='classifier'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_slot, 2, "only distinct graphs consume routing turns");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn source_edits_settle_live_planner_and_classifier_journals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("decomposition.db");
+        let runner = dir.path().join("claude");
+        std::fs::write(
+            &runner,
+            "#!/bin/sh\nwhile IFS= read -r _turn; do sleep 30; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut planner_slot = planner::spawn_planner(
+            runner::AgentKind::Claude,
+            planner::CLAUDE_PLANNER_MODEL,
+            planner::PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let planner_pid = planner_slot.pid().unwrap();
+        // Confirm the child consumed its turn and is live before simulating the edit.
+        assert!(planner_slot.proc.try_wait().unwrap().is_none());
+
+        let classifier_tasks = vec![quorum_core::classify::TaskForClassification {
+            id: -1,
+            revision: 1,
+            title: "child".into(),
+            body: None,
+            dependencies: vec![],
+            recovery_notes: vec![],
+        }];
+        let mut classifier_slot = classifier::spawn_classifier_configured(
+            &classifier_tasks,
+            &[],
+            runner.to_str(),
+            false,
+            classifier::CLASSIFIER_MODEL,
+            classifier::CLASSIFIER_EFFORT,
+            "read-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let classifier_pid = classifier_slot.proc.pid().unwrap();
+        assert!(classifier_slot.proc.try_wait().unwrap().is_none());
+
+        let graph_id = 77;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            for (role, pid) in [("planner", planner_pid), ("classifier", classifier_pid)] {
+                journal::upsert(
+                    &mut conn,
+                    &JournalEntry {
+                        agent: decomposition_process_name(graph_id, role),
+                        role: role.into(),
+                        task_id: Some(1),
+                        session_id: agent::new_session_id(),
+                        worktree: None,
+                        branch: None,
+                        phase: role.into(),
+                        cost_tokens: 0,
+                        agent_state: None,
+                        cost_usd: 0.0,
+                        log_dir: None,
+                        pid: Some(pid),
+                        pr: None,
+                        rework_count: 0,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        let mut coordinator = DecompositionCoordinator {
+            graph_id: Some(graph_id),
+            proposal: Some(vec![]),
+            planner_slot: Some(planner_slot),
+            classifier_slot: Some(classifier_slot),
+            planner_view: None,
+        };
+
+        // An accepted pre-materialization edit removes the aggregate, so the
+        // next snapshot is absent. Settlement must not depend on that row.
+        discard_removed_decomposition(&db_path, &mut coordinator)
+            .await
+            .unwrap();
+        assert!(coordinator.planner_slot.is_none());
+        assert!(coordinator.classifier_slot.is_none());
+        assert!(coordinator.proposal.is_none());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM journal", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        for pid in [planner_pid, classifier_pid] {
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "provider {pid} survived");
+        }
+    }
+
     #[tokio::test]
     async fn planner_view_is_exactly_frozen_and_rejects_head_drift() {
         let repo = tempfile::tempdir().unwrap();
@@ -18336,6 +18812,127 @@ mod tests {
 
         let not_a_repo = tempfile::tempdir().unwrap();
         assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_view_streams_through_a_hard_archive_ceiling() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("large.txt"), "x".repeat(32 * 1024)).unwrap();
+        git(&["add", "large.txt"]);
+        git(&["commit", "-qm", "large"]);
+        let frozen = git(&["rev-parse", "HEAD"]);
+
+        let error = frozen_planner_view_with_options(
+            repo.path(),
+            &frozen,
+            Path::new("git"),
+            Path::new("tar"),
+            Duration::from_secs(5),
+            1024,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("archive exceeded 1024-byte limit"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_view_timeout_kills_and_reaps_git_and_tar_groups() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("state.txt"), "frozen").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen = git(&["rev-parse", "HEAD"]);
+
+        let tools = tempfile::tempdir().unwrap();
+        let archive_pid = tools.path().join("archive.pid");
+        let tar_pid = tools.path().join("tar.pid");
+        let real_git = String::from_utf8_lossy(
+            &std::process::Command::new("which")
+                .arg("git")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        let git_wrapper = tools.path().join("git");
+        std::fs::write(
+            &git_wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                real_git,
+                archive_pid.display()
+            ),
+        )
+        .unwrap();
+        let tar_wrapper = tools.path().join("tar");
+        std::fs::write(
+            &tar_wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                tar_pid.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&tar_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = frozen_planner_view_with_options(
+            repo.path(),
+            &frozen,
+            &git_wrapper,
+            &tar_wrapper,
+            // The full suite runs many real-process canaries concurrently;
+            // leave enough headroom for the preliminary git check and both
+            // wrappers to be scheduled before exercising the deadline path.
+            Duration::from_secs(5),
+            1024 * 1024,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out"), "{error}");
+        for pid_file in [&archive_pid, &tar_pid] {
+            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "{} was not reaped",
+                pid_file.display()
+            );
+        }
     }
 
     #[test]

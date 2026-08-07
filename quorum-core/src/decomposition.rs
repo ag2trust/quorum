@@ -112,8 +112,8 @@ pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<Start
                          AND m.plan_revision=d.accepted_plan_revision) BETWEEN 2 AND 8
                   AND NOT EXISTS(
                       SELECT 1 FROM task_graph_members m LEFT JOIN tasks child ON child.id=m.task_id
-                      WHERE m.graph_id=d.id AND
-                        (m.active!=1 OR m.plan_revision!=d.accepted_plan_revision OR child.id IS NULL)
+                      WHERE m.graph_id=d.id AND m.active=1 AND
+                        (m.plan_revision!=d.accepted_plan_revision OR child.id IS NULL)
                   )
             )",
             [graph_id],
@@ -2382,6 +2382,15 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(replacement.len(), 2);
+        let retained_history: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members
+                 WHERE graph_id=?1 AND active=0 AND plan_revision=1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_history, 2);
         let state: (String, i64, i64) = conn
             .query_row(
                 "SELECT state,active,freeze_active FROM task_decompositions WHERE id=?1",
@@ -2390,6 +2399,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("active".into(), 1, 0));
+
+        let before_delivery = reconcile_startup_graphs(&mut conn, 10).unwrap();
+        assert_eq!(
+            before_delivery,
+            StartupReconcileResult {
+                healthy: 1,
+                reset: 0,
+                held: 0,
+            }
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status='working' WHERE id=?1",
+            [replacement[0]],
+        )
+        .unwrap();
+        let after_delivery = reconcile_startup_graphs(&mut conn, 11).unwrap();
+        assert_eq!(
+            after_delivery,
+            StartupReconcileResult {
+                healthy: 1,
+                reset: 0,
+                held: 0,
+            }
+        );
+        let final_state: (String, i64) = conn
+            .query_row(
+                "SELECT state,active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(final_state, ("active".into(), 1));
     }
 
     #[test]

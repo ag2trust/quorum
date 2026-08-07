@@ -34,7 +34,8 @@ pub fn new_session_id() -> String {
 pub struct AgentProc {
     child: Child,
     stdin: tokio::process::ChildStdin,
-    reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    reader: BufReader<tokio::process::ChildStdout>,
+    line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -193,7 +194,7 @@ impl AgentProc {
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
-        let reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -204,6 +205,7 @@ impl AgentProc {
             child,
             stdin,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task: Some(stderr_task),
         })
@@ -219,15 +221,67 @@ impl AgentProc {
     /// Return the next raw stdout line, or `None` on EOF/error.
     /// Used by the daemon to preserve verbatim JSONL in session logs.
     pub async fn next_raw_line(&mut self) -> Option<String> {
-        match self.reader.next_line().await {
-            Ok(Some(line)) => Some(line),
-            _ => None,
+        self.read_raw_line(None).await.ok().flatten()
+    }
+
+    /// Read one provider line while bounding the partial, not-yet-delimited
+    /// allocation. The buffer lives on the process so cancelling a polling
+    /// future cannot discard bytes already consumed from the pipe.
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        self.read_raw_line(Some(max_bytes)).await
+    }
+
+    async fn read_raw_line(&mut self, max_bytes: Option<usize>) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.line_buffer.is_empty() {
+                    return Ok(None);
+                }
+                return self.take_buffered_line();
+            }
+
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if max_bytes
+                    .is_some_and(|limit| self.line_buffer.len().saturating_add(newline) > limit)
+                {
+                    return Err(line_limit_error(max_bytes.expect("checked limit")));
+                }
+                self.line_buffer.extend_from_slice(&available[..newline]);
+                self.reader.consume(newline + 1);
+                return self.take_buffered_line();
+            }
+
+            if max_bytes
+                .is_some_and(|limit| self.line_buffer.len().saturating_add(available.len()) > limit)
+            {
+                return Err(line_limit_error(max_bytes.expect("checked limit")));
+            }
+            let consumed = available.len();
+            self.line_buffer.extend_from_slice(available);
+            self.reader.consume(consumed);
         }
+    }
+
+    fn take_buffered_line(&mut self) -> std::io::Result<Option<String>> {
+        if self.line_buffer.last() == Some(&b'\r') {
+            self.line_buffer.pop();
+        }
+        let bytes = std::mem::take(&mut self.line_buffer);
+        String::from_utf8(bytes).map(Some).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("provider stdout is not UTF-8: {error}"),
+            )
+        })
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
         loop {
-            match self.reader.next_line().await {
+            match self.read_raw_line(None).await {
                 Ok(Some(line)) => {
                     if let Some(event) = stream::parse_line(&line) {
                         return Some(event);
@@ -258,13 +312,14 @@ impl AgentProc {
     pub fn from_parts(
         child: Child,
         stdin: tokio::process::ChildStdin,
-        reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        reader: BufReader<tokio::process::ChildStdout>,
     ) -> Self {
         let diagnostics = DiagnosticBuffer::default();
         Self {
             child,
             stdin,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task: None,
         }
@@ -279,7 +334,7 @@ impl AgentProc {
         // Reap the child to avoid zombie accumulation
         let _ = self.child.wait().await;
         let mut terminal = Vec::new();
-        while let Ok(Some(line)) = self.reader.next_line().await {
+        while let Ok(Some(line)) = self.read_raw_line(None).await {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
@@ -289,6 +344,13 @@ impl AgentProc {
         terminal.extend(diagnostics.drain());
         terminal
     }
+}
+
+fn line_limit_error(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("provider stdout line exceeded {limit}-byte limit"),
+    )
 }
 
 fn normalize_event(event: Event) -> Vec<AgentEvent> {
@@ -413,7 +475,7 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
-        let reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -423,6 +485,7 @@ mod tests {
             child,
             stdin,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task: Some(stderr_task),
         }

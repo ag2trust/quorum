@@ -372,7 +372,25 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerPoll> {
     }
     let remaining = PLANNER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
     let poll_for = remaining.min(Duration::from_secs(2));
-    while let Ok(Some(raw)) = tokio::time::timeout(poll_for, slot.proc.next_raw_line()).await {
+    loop {
+        // Reserve the byte previously charged for the line terminator. More
+        // importantly, enforce the remaining allowance while bytes are read;
+        // waiting for a newline would permit an unbounded internal allocation.
+        let line_limit = MAX_STDOUT_BYTES
+            .saturating_sub(slot.stdout_bytes)
+            .saturating_sub(1);
+        let raw = match tokio::time::timeout(poll_for, slot.proc.next_raw_line_bounded(line_limit))
+            .await
+        {
+            Err(_) => break,
+            Ok(Ok(Some(raw))) => raw,
+            Ok(Ok(None)) => break,
+            Ok(Err(_)) => {
+                return Some(PlannerPoll::ProviderFailed(
+                    "planner stdout exceeded 256 KiB".into(),
+                ));
+            }
+        };
         slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
         if slot.stdout_bytes > MAX_STDOUT_BYTES {
             return Some(PlannerPoll::ProviderFailed(
@@ -538,6 +556,51 @@ mod tests {
         .err()
         .expect("oversized prompt must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_newline_stdout_is_rejected_at_the_read_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runner = dir.path().join("claude");
+        let chunk = "x".repeat(8192);
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\nIFS= read -r _turn\nwhile :; do printf '%s' '{chunk}'; done\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut slot = spawn_planner(
+            AgentKind::Claude,
+            CLAUDE_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+        )
+        .await
+        .unwrap();
+        let pid = slot.pid().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(outcome) = poll_planner(&mut slot).await {
+                    break outcome;
+                }
+            }
+        })
+        .await
+        .expect("oversized unterminated line must fail promptly");
+        assert!(matches!(
+            outcome,
+            PlannerPoll::ProviderFailed(ref message) if message.contains("stdout exceeded")
+        ));
+
+        slot.kill_and_reap().await;
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
     }
 
     #[tokio::test]

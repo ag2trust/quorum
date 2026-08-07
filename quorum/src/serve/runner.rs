@@ -268,6 +268,22 @@ impl RunnerProc {
         }
     }
 
+    /// Read one line with a hard boundary on bytes accumulated before a line
+    /// terminator. Decomposition planning currently admits only Claude, whose
+    /// persistent transport exposes this cancellation-safe bounded reader.
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Codex(_) | Self::Grok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bounded persistent line reads require the Claude adapter",
+            )),
+        }
+    }
+
     pub fn normalize_line(&self, raw: &str) -> NormalizedLine {
         match self {
             Self::Claude(_) => AgentProc::normalize_line(raw),
