@@ -2,9 +2,14 @@
 
 use super::runner::{AdapterConfig, AgentEvent, LaunchMode, LaunchRequest, RunnerProc};
 use quorum_core::classify::{self, ClassifierResponse, TaskClassification, TaskForClassification};
+use std::time::Duration;
 
 pub const CLASSIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const CLASSIFIER_EFFORT: &str = "low";
+pub const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(120);
+pub const MAX_CLASSIFIER_STDOUT_BYTES: usize = 256 * 1024;
+pub const MAX_CLASSIFIER_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_CLASSIFIER_LINES_PER_POLL: usize = 64;
 
 /// In-flight classifier state, persisted across daemon ticks.
 #[allow(dead_code)]
@@ -18,6 +23,8 @@ pub struct ClassifierSlot {
     pub response_text: String,
     /// Keep the empty classifier-only workspace alive for the whole turn.
     pub isolation_dir: Option<tempfile::TempDir>,
+    started_at: tokio::time::Instant,
+    stdout_bytes: usize,
 }
 
 impl ClassifierSlot {
@@ -96,6 +103,8 @@ pub async fn spawn_classifier_configured(
         pending_inputs,
         response_text: String::new(),
         isolation_dir: Some(dir),
+        started_at: tokio::time::Instant::now(),
+        stdout_bytes: 0,
     })
 }
 
@@ -109,14 +118,63 @@ pub fn classifier_turn(
     super::agent::user_turn(&prompt)
 }
 
-/// Drain events from the classifier agent (non-blocking, bounded).
-/// Returns `Some(response_text)` when the agent produces a Result event.
+/// Drain a bounded slice of classifier output. The wall-clock and byte budgets
+/// belong to the slot, so repeated daemon ticks cannot reset them. Violations
+/// are provider failures for both ordinary and decomposition classification.
 pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<ClassifierResult> {
-    while let Ok(Some(raw)) =
-        tokio::time::timeout(std::time::Duration::from_secs(2), slot.proc.next_raw_line()).await
-    {
+    if slot.started_at.elapsed() >= CLASSIFIER_TIMEOUT {
+        return Some(ClassifierResult::Error("classifier timed out".into()));
+    }
+    let remaining = CLASSIFIER_TIMEOUT.saturating_sub(slot.started_at.elapsed());
+    let poll_for = remaining.min(Duration::from_secs(2));
+    let poll_deadline = tokio::time::Instant::now() + poll_for;
+    for _ in 0..MAX_CLASSIFIER_LINES_PER_POLL {
+        if slot.started_at.elapsed() >= CLASSIFIER_TIMEOUT {
+            return Some(ClassifierResult::Error("classifier timed out".into()));
+        }
+        if tokio::time::Instant::now() >= poll_deadline {
+            break;
+        }
+        let line_limit = MAX_CLASSIFIER_STDOUT_BYTES
+            .saturating_sub(slot.stdout_bytes)
+            .saturating_sub(1);
+        let raw = match tokio::time::timeout_at(
+            poll_deadline,
+            slot.proc.next_raw_line_bounded(line_limit),
+        )
+        .await
+        {
+            Err(_) if slot.started_at.elapsed() >= CLASSIFIER_TIMEOUT => {
+                return Some(ClassifierResult::Error("classifier timed out".into()));
+            }
+            Err(_) => break,
+            Ok(Ok(Some(raw))) => raw,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                let detail = if error.to_string().contains("exceeded") {
+                    "classifier stdout exceeded 256 KiB".into()
+                } else {
+                    format!(
+                        "classifier stdout read failed: {}",
+                        truncate_error(&error.to_string(), 300)
+                    )
+                };
+                return Some(ClassifierResult::Error(detail));
+            }
+        };
+        slot.stdout_bytes = slot.stdout_bytes.saturating_add(raw.len() + 1);
+        if slot.stdout_bytes > MAX_CLASSIFIER_STDOUT_BYTES {
+            return Some(ClassifierResult::Error(
+                "classifier stdout exceeded 256 KiB".into(),
+            ));
+        }
         let line = slot.proc.normalize_line(&raw);
         if let Some(text) = line.terminal_text.as_ref().filter(|text| !text.is_empty()) {
+            if text.len() > MAX_CLASSIFIER_RESPONSE_BYTES {
+                return Some(ClassifierResult::Error(
+                    "classifier response exceeded 64 KiB".into(),
+                ));
+            }
             slot.response_text = text.clone();
         }
         for event in line.events {
@@ -134,13 +192,21 @@ pub async fn drain_classifier_events(slot: &mut ClassifierSlot) -> Option<Classi
                     return Some(ClassifierResult::Done(slot.response_text.clone()));
                 }
                 AgentEvent::AssistantText { text } => {
+                    if slot.response_text.len().saturating_add(text.len())
+                        > MAX_CLASSIFIER_RESPONSE_BYTES
+                    {
+                        return Some(ClassifierResult::Error(
+                            "classifier response exceeded 64 KiB".into(),
+                        ));
+                    }
                     slot.response_text.push_str(&text);
                 }
                 _ => {}
             }
         }
     }
-    None
+    (slot.started_at.elapsed() >= CLASSIFIER_TIMEOUT)
+        .then(|| ClassifierResult::Error("classifier timed out".into()))
 }
 
 pub enum ClassifierResult {
@@ -233,6 +299,147 @@ fn extract_json(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    async fn spawn_scripted_classifier(
+        script: &str,
+        model: &str,
+    ) -> (tempfile::TempDir, ClassifierSlot, i32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("classifier-runner");
+        std::fs::write(&runner, script).unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tasks = vec![TaskForClassification {
+            id: 7,
+            revision: 1,
+            title: "classify me".into(),
+            body: None,
+            dependencies: vec![],
+            recovery_notes: vec![],
+        }];
+        let slot = spawn_classifier_configured(
+            &tasks,
+            &[],
+            runner.to_str(),
+            false,
+            model,
+            "low",
+            "read-only",
+            "",
+        )
+        .await
+        .unwrap();
+        let pid = slot.proc.pid().expect("classifier pid");
+        (temp, slot, pid)
+    }
+
+    #[cfg(unix)]
+    async fn assert_classifier_failure_reaped(
+        slot: ClassifierSlot,
+        pid: i32,
+        result: Option<ClassifierResult>,
+        expected: &str,
+    ) {
+        assert!(
+            matches!(result, Some(ClassifierResult::Error(ref error)) if error.contains(expected)),
+            "unexpected classifier result"
+        );
+        slot.kill_and_reap().await;
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "classifier was not reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_classifier_boundary_times_out_a_silent_provider() {
+        let (_temp, mut slot, pid) = spawn_scripted_classifier(
+            "#!/bin/sh\nIFS= read -r _turn\nexec sleep 30\n",
+            CLASSIFIER_MODEL,
+        )
+        .await;
+        slot.started_at = tokio::time::Instant::now() - CLASSIFIER_TIMEOUT;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), drain_classifier_events(&mut slot))
+                .await
+                .expect("expired classifier poll must return promptly");
+        assert_classifier_failure_reaped(slot, pid, result, "timed out").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_classifier_boundary_bounds_continuous_stdout_per_tick_and_turn() {
+        let chunk = "x".repeat(1024);
+        let script =
+            format!("#!/bin/sh\nIFS= read -r _turn\nwhile :; do printf '%s\\n' '{chunk}'; done\n");
+        let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, CLASSIFIER_MODEL).await;
+
+        let first =
+            tokio::time::timeout(Duration::from_secs(5), drain_classifier_events(&mut slot))
+                .await
+                .expect("one continuous-output poll must stay bounded");
+        assert!(
+            first.is_none(),
+            "one poll must yield before the turn ceiling"
+        );
+        assert_eq!(
+            slot.stdout_bytes,
+            (chunk.len() + 1) * MAX_CLASSIFIER_LINES_PER_POLL
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = drain_classifier_events(&mut slot).await {
+                    break Some(result);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuous output must reach its turn ceiling");
+        assert_classifier_failure_reaped(slot, pid, result, "stdout exceeded").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_classifier_boundary_rejects_unterminated_codex_stdout_before_allocation() {
+        let chunk = "x".repeat(8192);
+        let script = format!("#!/bin/sh\nwhile :; do printf '%s' '{chunk}'; done\n");
+        let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, "gpt-5.6-terra").await;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), drain_classifier_events(&mut slot))
+                .await
+                .expect("unterminated output must fail at the read boundary");
+        assert_classifier_failure_reaped(slot, pid, result, "stdout exceeded").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_classifier_boundary_caps_accumulated_response_text() {
+        let chunk = "x".repeat(8192);
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": chunk},
+        })
+        .to_string();
+        let script = format!(
+            "#!/bin/sh\nIFS= read -r _turn\nfor _i in 1 2 3 4 5 6 7 8 9; do printf '%s\\n' '{}'; done\nexec sleep 30\n",
+            line
+        );
+        let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, CLASSIFIER_MODEL).await;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), drain_classifier_events(&mut slot))
+                .await
+                .expect("oversized response must fail promptly");
+        assert_classifier_failure_reaped(slot, pid, result, "response exceeded").await;
+    }
 
     #[cfg(unix)]
     #[tokio::test]

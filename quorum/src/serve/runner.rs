@@ -269,17 +269,18 @@ impl RunnerProc {
     }
 
     /// Read one line with a hard boundary on bytes accumulated before a line
-    /// terminator. Decomposition planning currently admits only Claude, whose
-    /// persistent transport exposes this cancellation-safe bounded reader.
+    /// terminator. Classifier and planner roles use this cancellation-safe
+    /// boundary before accepting provider output into role-owned buffers.
     pub async fn next_raw_line_bounded(
         &mut self,
         max_bytes: usize,
     ) -> std::io::Result<Option<String>> {
         match self {
             Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
-            Self::Codex(_) | Self::Grok(_) => Err(std::io::Error::new(
+            Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Grok(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "bounded persistent line reads require the Claude adapter",
+                "bounded role reads are unavailable for the Grok adapter",
             )),
         }
     }

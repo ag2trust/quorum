@@ -1504,7 +1504,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
 
                     let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                        tokio::time::Instant::now() + serve::classifier::CLASSIFIER_TIMEOUT;
                     let response = loop {
                         if let Some(result) =
                             serve::classifier::drain_classifier_events(&mut slot).await
