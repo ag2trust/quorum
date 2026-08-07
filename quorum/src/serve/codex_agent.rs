@@ -93,13 +93,34 @@ pub fn restricted_exec_args(spec: &CodexSpec) -> Vec<String> {
     ]
 }
 
+/// Planner-specific Codex arguments. This pins the provider's mechanism-level
+/// read-only sandbox and never includes the worker escape hatch.
+pub fn planner_exec_args(spec: &CodexSpec) -> Vec<String> {
+    vec![
+        "exec".into(),
+        "--json".into(),
+        "--model".into(),
+        spec.model.clone(),
+        "-c".into(),
+        format!("model_reasoning_effort={}", spec.effort),
+        "-s".into(),
+        "read-only".into(),
+        "-C".into(),
+        spec.worktree.display().to_string(),
+        "--skip-git-repo-check".into(),
+        "--ignore-user-config".into(),
+        spec.prompt.clone(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Process wrapper
 // ---------------------------------------------------------------------------
 
 pub struct CodexProc {
     child: Child,
-    reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    reader: BufReader<tokio::process::ChildStdout>,
+    line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
     stderr_task: tokio::task::JoinHandle<()>,
 }
@@ -151,6 +172,44 @@ impl CodexProc {
         }
     }
 
+    /// Read-only, single-turn planner boundary. Kept separate from worker
+    /// spawning so future worker flags cannot silently weaken planning.
+    pub fn spawn_planner(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
+        let bin = codex_bin.unwrap_or("codex");
+        let mut cmd = Command::new(bin);
+        cmd.args(planner_exec_args(spec));
+        for (k, v) in &spec.env_vars {
+            cmd.env(k, v);
+        }
+        strip_planner_coordination_env(&mut cmd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .current_dir(&spec.worktree);
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn()?;
+        let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
+        let diagnostics = DiagnosticBuffer::default();
+        let stderr_diagnostics = diagnostics.clone();
+        let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
+        let stderr_task =
+            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
+        Ok(Self {
+            child,
+            reader,
+            line_buffer: Vec::new(),
+            diagnostics,
+            stderr_task,
+        })
+    }
+
     /// Restricted single-turn mode for classifiers.  It deliberately omits the
     /// normal worker escape hatch that disables Codex sandbox/approval policy.
     pub fn spawn_restricted(spec: &CodexSpec, codex_bin: Option<&str>) -> std::io::Result<Self> {
@@ -174,7 +233,7 @@ impl CodexProc {
             });
         }
         let mut child = cmd.spawn()?;
-        let reader = BufReader::new(child.stdout.take().expect("stdout was piped")).lines();
+        let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
@@ -183,6 +242,7 @@ impl CodexProc {
         Ok(Self {
             child,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task,
         })
@@ -222,7 +282,7 @@ impl CodexProc {
 
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
-        let reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -232,6 +292,7 @@ impl CodexProc {
         Ok(Self {
             child,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task,
         })
@@ -261,7 +322,7 @@ impl CodexProc {
 
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
-        let reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -271,6 +332,7 @@ impl CodexProc {
         Ok(Self {
             child,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task,
         })
@@ -278,7 +340,7 @@ impl CodexProc {
 
     pub async fn next_event(&mut self) -> Option<Event> {
         loop {
-            match self.reader.next_line().await {
+            match self.read_raw_line(None).await {
                 Ok(Some(line)) => {
                     if let Some(event) = codex_stream::parse_line(&line) {
                         return Some(event);
@@ -293,10 +355,62 @@ impl CodexProc {
     /// Return the next provider JSONL line verbatim. Normalization belongs at
     /// the shared runner boundary so logs retain fields Quorum does not parse.
     pub async fn next_raw_line(&mut self) -> Option<String> {
-        match self.reader.next_line().await {
-            Ok(Some(line)) => Some(line),
-            _ => None,
+        self.read_raw_line(None).await.ok().flatten()
+    }
+
+    /// Enforce the caller's remaining stdout allowance before an unterminated
+    /// JSONL record can allocate beyond it. The persistent buffer also makes
+    /// repeated timeout polling cancellation-safe.
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        self.read_raw_line(Some(max_bytes)).await
+    }
+
+    async fn read_raw_line(&mut self, max_bytes: Option<usize>) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.line_buffer.is_empty() {
+                    return Ok(None);
+                }
+                return self.take_buffered_line();
+            }
+
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if max_bytes
+                    .is_some_and(|limit| self.line_buffer.len().saturating_add(newline) > limit)
+                {
+                    return Err(codex_line_limit_error(max_bytes.expect("checked limit")));
+                }
+                self.line_buffer.extend_from_slice(&available[..newline]);
+                self.reader.consume(newline + 1);
+                return self.take_buffered_line();
+            }
+
+            if max_bytes
+                .is_some_and(|limit| self.line_buffer.len().saturating_add(available.len()) > limit)
+            {
+                return Err(codex_line_limit_error(max_bytes.expect("checked limit")));
+            }
+            let consumed = available.len();
+            self.line_buffer.extend_from_slice(available);
+            self.reader.consume(consumed);
         }
+    }
+
+    fn take_buffered_line(&mut self) -> std::io::Result<Option<String>> {
+        if self.line_buffer.last() == Some(&b'\r') {
+            self.line_buffer.pop();
+        }
+        let bytes = std::mem::take(&mut self.line_buffer);
+        String::from_utf8(bytes).map(Some).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Codex stdout is not UTF-8: {error}"),
+            )
+        })
     }
 
     pub fn pid(&self) -> Option<i32> {
@@ -319,7 +433,7 @@ impl CodexProc {
         }
         let _ = self.child.wait().await;
         let mut terminal = Vec::new();
-        while let Ok(Some(line)) = self.reader.next_line().await {
+        while let Ok(Some(line)) = self.read_raw_line(None).await {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
@@ -327,6 +441,13 @@ impl CodexProc {
         terminal.extend(diagnostics.drain());
         terminal
     }
+}
+
+fn codex_line_limit_error(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("Codex stdout line exceeded {limit}-byte limit"),
+    )
 }
 
 fn normalize_event(event: Event) -> Vec<AgentEvent> {
@@ -374,6 +495,19 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
     }
 }
 
+fn strip_planner_coordination_env(cmd: &mut Command) {
+    for name in [
+        "QUORUM_AGENT",
+        "QUORUM_HOME",
+        "QUORUM_REPO",
+        "QUORUM_RUN_ID",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ] {
+        cmd.env_remove(name);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -399,7 +533,7 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
-        let reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -408,6 +542,7 @@ mod tests {
         CodexProc {
             child,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task,
         }
@@ -509,6 +644,21 @@ mod tests {
             ]
         );
         assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+    }
+
+    #[test]
+    fn planner_exec_args_pin_read_only_frontier_boundary() {
+        let mut spec = test_spec();
+        spec.model = "gpt-5.6-sol".into();
+        spec.effort = "high".into();
+        let args = planner_exec_args(&spec);
+        assert_eq!(args[3], "gpt-5.6-sol");
+        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
+        assert!(args.contains(&"--ignore-user-config".into()));
     }
 
     // ── Pinned resume argument shape ─────────────────────────────────────

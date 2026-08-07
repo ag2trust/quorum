@@ -44,6 +44,36 @@ async fn await_process_exit(pid: i32, timeout: std::time::Duration) -> bool {
     }
 }
 
+fn remove_journaled_decomposition_views(entries: &[JournalEntry]) {
+    for entry in entries {
+        if !matches!(entry.role.as_str(), "planner" | "classifier") {
+            continue;
+        }
+        let Some(view) = entry.worktree.as_deref().map(std::path::Path::new) else {
+            continue;
+        };
+        let validated = view
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("quorum-planner-"));
+        if validated {
+            if let Err(error) = std::fs::remove_dir_all(view) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    log(&format!(
+                        "recovery: failed to remove stale decomposition view {}: {error}",
+                        view.display()
+                    ));
+                }
+            }
+        } else {
+            log(&format!(
+                "recovery: refused unvalidated decomposition view path {}",
+                view.display()
+            ));
+        }
+    }
+}
+
 pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> Result<()> {
     let db_path = config.db_path.clone();
 
@@ -83,6 +113,11 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
             }
         }
     }
+
+    // Decomposition planner views are ordinary temporary archives rather
+    // than Git worktrees. Their exact path is journaled with the provider
+    // process so abrupt daemon death cannot leak the frozen repository view.
+    remove_journaled_decomposition_views(&entries);
 
     // ── Phase 1b: Revoke run capabilities for stale agents (#130) ──────
     if !entries.is_empty() {
@@ -327,6 +362,110 @@ pub(crate) async fn recover(config: &ServeConfig, wt_mgr: &WorktreeManager) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn journaled_planner_and_classifier_process_groups_are_reaped_with_frozen_views() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("recovery.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph_id = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph_id,
+            "provider",
+            "before-restart",
+            "bounded",
+            3,
+        )
+        .unwrap();
+
+        let mut children = Vec::new();
+        let mut view_paths = Vec::new();
+        for role in ["planner", "classifier"] {
+            let view = tempfile::Builder::new()
+                .prefix("quorum-planner-")
+                .tempdir()
+                .unwrap()
+                .keep();
+            std::fs::write(view.join("frozen.txt"), role).unwrap();
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let pid = child.id() as i32;
+            journal::upsert(
+                &mut conn,
+                &JournalEntry {
+                    agent: format!("decomposition-{role}-{graph_id}"),
+                    role: role.into(),
+                    task_id: Some(1),
+                    session_id: format!("{role}-session"),
+                    worktree: Some(view.to_string_lossy().into_owned()),
+                    branch: None,
+                    phase: role.into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: Some(pid),
+                    pr: None,
+                    rework_count: 0,
+                },
+            )
+            .unwrap();
+            children.push((child, pid));
+            view_paths.push(view);
+        }
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            kill_stale_process_group(entry.pid);
+        }
+        let pids = children.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+        for (mut child, _) in children {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        for pid in &pids {
+            assert!(await_process_exit(*pid, std::time::Duration::from_secs(5)).await);
+        }
+        remove_journaled_decomposition_views(&entries);
+        assert!(view_paths.iter().all(|path| !path.exists()));
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "restart cleanup must not charge a provider attempt"
+        );
+    }
 
     #[tokio::test]
     async fn await_process_exit_returns_true_when_process_dies() {

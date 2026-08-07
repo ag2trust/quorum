@@ -58,3 +58,5 @@ jobs:
           git config --global user.name "CI"
       - run: scripts/test-serve-supervisor.sh
       - run: scripts/test-dev-install.sh
+      - run: scripts/test-dogfood-install.sh
+      - run: scripts/test-preflight.sh

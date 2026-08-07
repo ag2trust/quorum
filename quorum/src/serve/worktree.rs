@@ -170,6 +170,55 @@ async fn run_git_with_limit(
     })
 }
 
+/// Stdin-capable boundary. The owning task is detached on caller cancellation,
+/// so it still reaches bounded kill/reap instead of dropping a live child.
+async fn run_git_with_input(
+    mut cmd: Command,
+    input: Vec<u8>,
+    timeout: Duration,
+    label: &'static str,
+) -> Result<std::process::Output, String> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        cmd.kill_on_drop(true).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("{label}: {e}"))?;
+        let stdout = child.stdout.take().ok_or_else(|| format!("{label}: stdout unavailable"))?;
+        let stderr = child.stderr.take().ok_or_else(|| format!("{label}: stderr unavailable"))?;
+        let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
+        let mut stdout_reader = tokio::spawn(drain_git_pipe(stdout, GIT_PIPE_LIMIT, "stdout", overflow_tx.clone()));
+        let mut stderr_reader = tokio::spawn(drain_git_pipe(stderr, GIT_PIPE_LIMIT, "stderr", overflow_tx));
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(&input).await.map_err(|e| format!("{label}: stdin: {e}"))?;
+            stdin.shutdown().await.map_err(|e| format!("{label}: stdin shutdown: {e}"))?;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let status = tokio::select! {
+            result = child.wait() => result.map_err(|e| format!("{label}: wait: {e}"))?,
+            Some(pipe) = overflow_rx.recv() => {
+                let kill = child.kill().await.err();
+                stdout_reader.abort(); stderr_reader.abort();
+                return Err(match kill { Some(e) => format!("{label}: {pipe} overflow; kill/reap: {e}"), None => format!("{label}: {pipe} exceeded {GIT_PIPE_LIMIT}-byte limit") });
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let kill = child.kill().await.err();
+                stdout_reader.abort(); stderr_reader.abort();
+                return Err(match kill { Some(e) => format!("{label}: timeout; kill/reap: {e}"), None => format!("{label}: timed out after {}s", timeout.as_secs()) });
+            }
+        };
+        let readers = async {
+            let stdout = (&mut stdout_reader).await.map_err(|e| format!("{label}: stdout join: {e}"))?.map_err(|e| format!("{label}: stdout: {e}"))?;
+            let stderr = (&mut stderr_reader).await.map_err(|e| format!("{label}: stderr join: {e}"))?.map_err(|e| format!("{label}: stderr: {e}"))?;
+            Ok::<_, String>((stdout, stderr))
+        };
+        let (stdout, stderr) = match tokio::time::timeout_at(deadline, readers).await {
+            Ok(result) => result?,
+            Err(_) => { stdout_reader.abort(); stderr_reader.abort(); return Err(format!("{label}: output collection timed out")); }
+        };
+        if stdout.exceeded_limit || stderr.exceeded_limit { return Err(format!("{label}: output exceeded {GIT_PIPE_LIMIT}-byte limit")); }
+        Ok(std::process::Output { status, stdout: stdout.bytes, stderr: stderr.bytes })
+    }).await.map_err(|e| format!("{label}: owner join: {e}"))?
+}
+
 impl WorktreeManager {
     pub fn new() -> Self {
         Self {
@@ -1009,6 +1058,433 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Remove only when git still reports the exact path/branch binding captured
+    /// by a durable cleanup intent. A missing worktree is idempotent success.
+    pub async fn remove_exact(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let mut list = self.git_cmd(repo_dir);
+        list.args(["worktree", "list", "--porcelain"]);
+        let out = run_git(list, self.local_timeout, "git worktree list").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let expected_ref = format!("refs/heads/{branch}");
+        let expected_path = std::fs::canonicalize(worktree_dir).ok();
+        let mut found = None;
+        let mut path = None;
+        let mut bound_branch = None;
+        for line in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .chain(std::iter::once(""))
+        {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                bound_branch = Some(value.to_string());
+            } else if line.is_empty() {
+                if path.as_deref().is_some_and(|listed| {
+                    let listed = std::fs::canonicalize(listed).ok();
+                    listed.is_some() && listed == expected_path
+                }) {
+                    found = Some(bound_branch.clone());
+                }
+                path = None;
+                bound_branch = None;
+            }
+        }
+        let Some(actual) = found else {
+            return match std::fs::symlink_metadata(worktree_dir) {
+                Ok(_) => Err("worktree path exists without exact git registration".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("cannot prove worktree path absence: {error}")),
+            };
+        };
+        if actual.as_deref() != Some(expected_ref.as_str()) {
+            return Err(format!(
+                "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
+            ));
+        }
+        let mut rm = self.git_cmd(repo_dir);
+        rm.args(["worktree", "remove"])
+            .arg(worktree_dir)
+            .arg("--force");
+        let out = run_git(rm, self.local_timeout, "git worktree remove").await?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git worktree remove failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    }
+
+    /// Delete an exact local branch object. Missing is success; moved refs fail.
+    #[cfg(test)]
+    pub async fn delete_branch_exact(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        expected_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+        let out = run_git(resolve, self.local_timeout, "git rev-parse cleanup branch").await?;
+        if !out.status.success() {
+            return Ok(());
+        }
+        let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if actual != expected_sha {
+            return Err(format!(
+                "branch SHA mismatch: expected {expected_sha}, found {actual}"
+            ));
+        }
+        let mut del = self.git_cmd(repo_dir);
+        del.args([
+            "update-ref",
+            "-d",
+            &format!("refs/heads/{branch}"),
+            expected_sha,
+        ]);
+        let out = run_git(
+            del,
+            self.local_timeout,
+            "git update-ref delete cleanup branch",
+        )
+        .await?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git update-ref delete {branch} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    }
+
+    /// Resolve a daemon branch only when its current head descends from the
+    /// immutable allocation provenance. Missing branches are idempotent.
+    pub async fn discover_branch_head(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        provenance_sha: &str,
+    ) -> Result<Option<String>, String> {
+        let _guard = self.lock.lock().await;
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+        let out = run_git(resolve, self.local_timeout, "git resolve cleanup branch").await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let mut ancestry = self.git_cmd(repo_dir);
+        ancestry.args(["merge-base", "--is-ancestor", provenance_sha, &current]);
+        let out = run_git(
+            ancestry,
+            self.local_timeout,
+            "git validate cleanup ancestry",
+        )
+        .await?;
+        if !out.status.success() {
+            return Err(format!(
+                "branch {branch} is not a descendant of allocation provenance {provenance_sha}"
+            ));
+        }
+        Ok(Some(current))
+    }
+
+    pub async fn resolve_ref_sha(
+        &self,
+        repo_dir: &Path,
+        reference: &str,
+    ) -> Result<String, String> {
+        let _guard = self.lock.lock().await;
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", reference]);
+        let out = run_git(
+            resolve,
+            self.local_timeout,
+            "git resolve provisioning provenance",
+        )
+        .await?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot resolve provisioning provenance {reference}"
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .to_ascii_lowercase())
+    }
+
+    /// Atomically tombstone the exact old object and delete its branch. A
+    /// replay consumes the tombstone without touching a recreated branch.
+    pub async fn delete_branch_with_tombstone(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        branch: &str,
+        expected_sha: &str,
+        tombstone_ref: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{branch}");
+        let remote_tombstone_ref = format!(
+            "refs/heads/quorum-cleanup/{}",
+            tombstone_ref
+                .strip_prefix("refs/quorum/cleanup/")
+                .ok_or_else(|| "invalid cleanup tombstone namespace".to_string())?
+        );
+        let mut remote_refs = self.git_cmd(repo_dir);
+        remote_refs.args(["ls-remote", remote_url, &remote_ref, &remote_tombstone_ref]);
+        let remote_out = run_git(
+            remote_refs,
+            self.fetch_timeout,
+            "git resolve remote cleanup refs",
+        )
+        .await?;
+        if !remote_out.status.success() {
+            return Err(format!(
+                "cannot resolve remote cleanup refs: {}",
+                String::from_utf8_lossy(&remote_out.stderr)
+            ));
+        }
+        let mut remote_branch_sha = None;
+        let mut remote_tombstone_sha = None;
+        for line in String::from_utf8_lossy(&remote_out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let sha = fields.next().unwrap_or_default();
+            match fields.next().unwrap_or_default() {
+                name if name == remote_ref => remote_branch_sha = Some(sha.to_string()),
+                name if name == remote_tombstone_ref => {
+                    remote_tombstone_sha = Some(sha.to_string())
+                }
+                _ => return Err("unexpected remote cleanup ref response".into()),
+            }
+        }
+        if let Some(actual) = remote_tombstone_sha {
+            if actual != expected_sha {
+                return Err("remote cleanup tombstone identity mismatch".into());
+            }
+        } else {
+            if let Some(actual) = remote_branch_sha.as_deref() {
+                if actual != expected_sha {
+                    return Err(format!(
+                        "remote branch SHA mismatch: expected {expected_sha}, found {actual}"
+                    ));
+                }
+            }
+            let tombstone_refspec = format!("{expected_sha}:{remote_tombstone_ref}");
+            let tombstone_lease = format!("--force-with-lease={remote_tombstone_ref}:");
+            let branch_lease = remote_branch_sha
+                .as_ref()
+                .map(|_| format!("--force-with-lease={remote_ref}:{expected_sha}"));
+            let mut remote_delete = self.git_cmd(repo_dir);
+            remote_delete.arg("push").arg("--atomic").arg(remote_url);
+            remote_delete.arg(&tombstone_lease);
+            if let Some(lease) = &branch_lease {
+                remote_delete.arg(lease);
+            }
+            remote_delete.arg(&tombstone_refspec);
+            if remote_branch_sha.is_some() {
+                remote_delete.arg(format!(":{remote_ref}"));
+            }
+            let deleted = run_git(
+                remote_delete,
+                self.fetch_timeout,
+                "git tombstone and delete remote cleanup branch",
+            )
+            .await?;
+            if !deleted.status.success() {
+                return Err(format!(
+                    "remote cleanup branch CAS deletion failed: {}",
+                    String::from_utf8_lossy(&deleted.stderr)
+                ));
+            }
+        }
+        let mut tombstone = self.git_cmd(repo_dir);
+        tombstone.args(["rev-parse", "--verify", tombstone_ref]);
+        let tombstone_out = run_git(
+            tombstone,
+            self.local_timeout,
+            "git resolve cleanup tombstone",
+        )
+        .await?;
+        if tombstone_out.status.success() {
+            let actual = String::from_utf8_lossy(&tombstone_out.stdout)
+                .trim()
+                .to_string();
+            if actual != expected_sha {
+                return Err("cleanup tombstone identity mismatch".into());
+            }
+            // The atomic transaction already deleted the leased branch. Keep
+            // the tombstone through durable DB settlement so a same-name
+            // recreation can never be mistaken for the original lease.
+            return Ok(());
+        }
+        let mut branch_ref = self.git_cmd(repo_dir);
+        branch_ref.args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
+        let branch_out = run_git(
+            branch_ref,
+            self.local_timeout,
+            "git resolve cleanup branch delete",
+        )
+        .await?;
+        let branch_present = branch_out.status.success();
+        if branch_present {
+            let actual = String::from_utf8_lossy(&branch_out.stdout)
+                .trim()
+                .to_string();
+            if actual != expected_sha {
+                return Err(format!(
+                    "branch SHA mismatch: expected {expected_sha}, found {actual}"
+                ));
+            }
+        }
+        let mut command = self.git_cmd(repo_dir);
+        command.args(["update-ref", "--stdin"]);
+        let null_oid = "0".repeat(expected_sha.len());
+        let branch_op = if branch_present {
+            format!("delete refs/heads/{branch} {expected_sha}\n")
+        } else {
+            format!("verify refs/heads/{branch} {null_oid}\n")
+        };
+        let input =
+            format!("start\ncreate {tombstone_ref} {expected_sha}\n{branch_op}prepare\ncommit\n")
+                .into_bytes();
+        let out = run_git_with_input(
+            command,
+            input,
+            self.local_timeout,
+            "git update-ref cleanup transaction",
+        )
+        .await?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git update-ref transaction failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ))
+        }
+    }
+
+    /// Retire a settled cleanup tombstone only at its exact leased object.
+    pub async fn retire_cleanup_tombstone(
+        &self,
+        repo_dir: &Path,
+        remote_url: &str,
+        tombstone_ref: &str,
+        expected_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let remote_tombstone_ref = format!(
+            "refs/heads/quorum-cleanup/{}",
+            tombstone_ref
+                .strip_prefix("refs/quorum/cleanup/")
+                .ok_or_else(|| "invalid cleanup tombstone namespace".to_string())?
+        );
+        let mut remote_resolve = self.git_cmd(repo_dir);
+        remote_resolve.args(["ls-remote", remote_url, &remote_tombstone_ref]);
+        let resolved = run_git(
+            remote_resolve,
+            self.fetch_timeout,
+            "git resolve settled remote cleanup tombstone",
+        )
+        .await?;
+        if !resolved.status.success() {
+            return Err(format!(
+                "cannot resolve settled remote cleanup tombstone: {}",
+                String::from_utf8_lossy(&resolved.stderr)
+            ));
+        }
+        let actual = String::from_utf8_lossy(&resolved.stdout)
+            .split_whitespace()
+            .next()
+            .map(str::to_string);
+        if let Some(actual) = actual.as_deref() {
+            if actual != expected_sha {
+                return Err(format!(
+                    "settled remote cleanup tombstone mismatch: expected {expected_sha}, found {actual}"
+                ));
+            }
+        } else {
+            return self
+                .retire_local_cleanup_tombstone(repo_dir, tombstone_ref, expected_sha)
+                .await;
+        }
+        let mut remote_delete = self.git_cmd(repo_dir);
+        remote_delete
+            .arg("push")
+            .arg(remote_url)
+            .arg(format!(
+                "--force-with-lease={remote_tombstone_ref}:{expected_sha}"
+            ))
+            .arg(format!(":{remote_tombstone_ref}"));
+        let remote_out = run_git(
+            remote_delete,
+            self.fetch_timeout,
+            "git retire remote cleanup tombstone",
+        )
+        .await?;
+        if !remote_out.status.success() {
+            return Err(format!(
+                "remote cleanup tombstone CAS deletion failed: {}",
+                String::from_utf8_lossy(&remote_out.stderr)
+            ));
+        }
+        self.retire_local_cleanup_tombstone(repo_dir, tombstone_ref, expected_sha)
+            .await
+    }
+
+    async fn retire_local_cleanup_tombstone(
+        &self,
+        repo_dir: &Path,
+        tombstone_ref: &str,
+        expected_sha: &str,
+    ) -> Result<(), String> {
+        let mut resolve = self.git_cmd(repo_dir);
+        resolve.args(["rev-parse", "--verify", tombstone_ref]);
+        let out = run_git(
+            resolve,
+            self.local_timeout,
+            "git resolve settled cleanup tombstone",
+        )
+        .await?;
+        if !out.status.success() {
+            return Ok(());
+        }
+        let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if actual != expected_sha {
+            return Err(format!(
+                "settled cleanup tombstone mismatch: expected {expected_sha}, found {actual}"
+            ));
+        }
+        let mut delete = self.git_cmd(repo_dir);
+        delete.args(["update-ref", "-d", tombstone_ref, expected_sha]);
+        let out = run_git(
+            delete,
+            self.local_timeout,
+            "git retire settled cleanup tombstone",
+        )
+        .await?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err("settled cleanup tombstone CAS deletion failed".into())
+        }
+    }
+
     /// Delete a local branch. Best-effort: logs but does not propagate errors
     /// (the branch may not exist if the worktree was never fully provisioned).
     pub async fn delete_branch(&self, repo_dir: &Path, branch: &str) {
@@ -1457,6 +1933,98 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "timed-out git subprocess {pid:?} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_git_boundary_timeout_kills_and_reaps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("stdin-child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 3600"])
+            .env("PID_FILE", &pid_file);
+        let error = run_git_with_input(
+            cmd,
+            b"transaction\n".to_vec(),
+            Duration::from_millis(300),
+            "stdin fake git",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "stdin-boundary subprocess was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_git_boundary_cancellation_retains_process_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("cancel-child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$PID_FILE\"; exec sleep 3600"])
+            .env("PID_FILE", &pid_file);
+        let owner = tokio::spawn(run_git_with_input(
+            cmd,
+            Vec::new(),
+            Duration::from_millis(300),
+            "cancel fake git",
+        ));
+        while !pid_file.exists() {
+            tokio::task::yield_now().await;
+        }
+        owner.abort();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "cancelled caller orphaned stdin-boundary subprocess"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_git_boundary_continuous_output_is_bounded_and_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("noisy-stdin-child.pid");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "echo $$ > \"$PID_FILE\"; while :; do printf 0123456789; printf abcdefghij >&2; done",
+        ])
+        .env("PID_FILE", &pid_file);
+        let error = run_git_with_input(
+            cmd,
+            b"transaction\n".to_vec(),
+            Duration::from_secs(5),
+            "noisy stdin fake git",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("exceeded") || error.contains("overflow"),
+            "unexpected error: {error}"
+        );
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = StdCommand::new("kill")
+            .args(["-0", pid.trim()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !alive,
+            "overflowing stdin-boundary subprocess was not reaped"
+        );
     }
 
     #[cfg(unix)]
@@ -2415,5 +2983,291 @@ mod tests {
         assert_eq!(wt_head, feature_head, "worktree must be at PR head");
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn remove_exact_rejects_branch_mismatch_then_replays_absent() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("owned");
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo.path(), "daemon/owned", &path, "main")
+            .await
+            .unwrap();
+        let error = mgr
+            .remove_exact(repo.path(), &path, "daemon/other")
+            .await
+            .unwrap_err();
+        assert!(error.contains("identity mismatch"));
+        assert!(path.exists(), "mismatched binding must survive");
+        mgr.remove_exact(repo.path(), &path, "daemon/owned")
+            .await
+            .unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(mgr
+            .remove_exact(repo.path(), &path, "daemon/owned")
+            .await
+            .unwrap_err()
+            .contains("without exact git registration"));
+        std::fs::remove_dir(&path).unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned")
+            .await
+            .unwrap();
+        assert!(!path.exists());
+        mgr.remove_exact(repo.path(), &path, "daemon/owned")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_branch_exact_requires_unchanged_sha_and_missing_replays() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let d = repo.path().to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["-C", &d, "branch", "daemon/owned"])
+            .status()
+            .unwrap();
+        let expected = git_rev_parse(repo.path(), "daemon/owned");
+        let mgr = WorktreeManager::new();
+        let error = mgr
+            .delete_branch_exact(
+                repo.path(),
+                "daemon/owned",
+                "0000000000000000000000000000000000000000",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("SHA mismatch"));
+        assert_eq!(git_rev_parse(repo.path(), "daemon/owned"), expected);
+        mgr.delete_branch_exact(repo.path(), "daemon/owned", &expected)
+            .await
+            .unwrap();
+        mgr.delete_branch_exact(repo.path(), "daemon/owned", &expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            git_rev_parse(repo.path(), "main"),
+            expected,
+            "base must survive feature cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_and_tombstone_delete_are_cas_safe_and_replay_safe() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let d = repo.path().to_string_lossy().to_string();
+        let provenance = git_rev_parse(repo.path(), "main");
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "daemon/discovery"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "worker commit"])
+            .status()
+            .unwrap();
+        let worker_sha = git_rev_parse(repo.path(), "daemon/discovery");
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+        let mgr = WorktreeManager::new();
+        assert_eq!(
+            mgr.discover_branch_head(repo.path(), "daemon/discovery", &provenance)
+                .await
+                .unwrap(),
+            Some(worker_sha.clone())
+        );
+        let tombstone = "refs/quorum/cleanup/1/2/3";
+        mgr.delete_branch_with_tombstone(
+            repo.path(),
+            &d,
+            "daemon/discovery",
+            &worker_sha,
+            tombstone,
+        )
+        .await
+        .unwrap();
+        // Simulate crash before DB settlement followed by same-name recreation.
+        StdCommand::new("git")
+            .args(["-C", &d, "branch", "daemon/discovery", "main"])
+            .status()
+            .unwrap();
+        mgr.delete_branch_with_tombstone(
+            repo.path(),
+            &d,
+            "daemon/discovery",
+            &worker_sha,
+            tombstone,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git_rev_parse(repo.path(), "daemon/discovery"),
+            provenance,
+            "tombstone replay must not touch recreated branch"
+        );
+        // Simulate restart after DB completion but before best-effort retire.
+        mgr.retire_cleanup_tombstone(repo.path(), &d, tombstone, &worker_sha)
+            .await
+            .unwrap();
+        assert_eq!(git_rev_parse(repo.path(), "daemon/discovery"), provenance);
+        let moved = mgr
+            .delete_branch_with_tombstone(
+                repo.path(),
+                &d,
+                "daemon/discovery",
+                &worker_sha,
+                "refs/quorum/cleanup/1/2/4",
+            )
+            .await
+            .unwrap_err();
+        assert!(moved.contains("SHA mismatch"));
+    }
+
+    #[tokio::test]
+    async fn remote_tombstone_delete_is_cas_safe_and_replay_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        let d = repo.to_string_lossy().to_string();
+        let remote_url = remote.to_string_lossy().to_string();
+        StdCommand::new("git")
+            .args(["init", "--bare", &remote_url])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "daemon/remote"])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "remote worker"])
+            .status()
+            .unwrap();
+        let expected = git_rev_parse(&repo, "daemon/remote");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "push",
+                &remote_url,
+                "daemon/remote:refs/heads/daemon/remote",
+            ])
+            .status()
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap();
+
+        let manager = WorktreeManager::new();
+        let tombstone = "refs/quorum/cleanup/4/5/6";
+        manager
+            .delete_branch_with_tombstone(&repo, &remote_url, "daemon/remote", &expected, tombstone)
+            .await
+            .unwrap();
+        assert!(!git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/daemon/remote"]
+        )
+        .status
+        .success());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(&remote, &["rev-parse", "refs/heads/quorum-cleanup/4/5/6"]).stdout
+            )
+            .trim(),
+            expected
+        );
+
+        // A crash before DB settlement may be followed by same-name recreation,
+        // even at the same object. The durable remote tombstone makes replay inert.
+        StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "push",
+                &remote_url,
+                &format!("{expected}:refs/heads/daemon/remote"),
+            ])
+            .status()
+            .unwrap();
+        manager
+            .delete_branch_with_tombstone(&repo, &remote_url, "daemon/remote", &expected, tombstone)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(&remote, &["rev-parse", "refs/heads/daemon/remote"]).stdout
+            )
+            .trim(),
+            expected
+        );
+        manager
+            .retire_cleanup_tombstone(&repo, &remote_url, tombstone, &expected)
+            .await
+            .unwrap();
+        assert!(!git_output(
+            &remote,
+            &["show-ref", "--verify", "refs/heads/quorum-cleanup/4/5/6"]
+        )
+        .status
+        .success());
+
+        let replacement = git_rev_parse(&repo, "main");
+        StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "push",
+                "--force",
+                &remote_url,
+                &format!("{replacement}:refs/heads/daemon/remote"),
+            ])
+            .status()
+            .unwrap();
+        let error = manager
+            .delete_branch_with_tombstone(
+                &repo,
+                &remote_url,
+                "daemon/remote",
+                &expected,
+                "refs/quorum/cleanup/4/5/7",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("remote branch SHA mismatch"));
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_output(&remote, &["rev-parse", "refs/heads/daemon/remote"]).stdout
+            )
+            .trim(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_finalized_branch_gets_tombstone_before_recreation() {
+        let repo = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let d = repo.path().to_string_lossy().to_string();
+        let expected = git_rev_parse(repo.path(), "main");
+        let mgr = WorktreeManager::new();
+        let tombstone = "refs/quorum/cleanup/9/8/7";
+        mgr.delete_branch_with_tombstone(repo.path(), &d, "daemon/absent", &expected, tombstone)
+            .await
+            .unwrap();
+        StdCommand::new("git")
+            .args(["-C", &d, "branch", "daemon/absent", "main"])
+            .status()
+            .unwrap();
+        mgr.delete_branch_with_tombstone(repo.path(), &d, "daemon/absent", &expected, tombstone)
+            .await
+            .unwrap();
+        assert_eq!(git_rev_parse(repo.path(), "daemon/absent"), expected);
     }
 }

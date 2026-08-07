@@ -6,10 +6,40 @@
 
 use quorum_core::error::{QuorumError, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
+fn default_profile_effort() -> String {
+    "high".to_string()
+}
+
+/// Stable, owner-defined executable model identity.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProfile {
+    pub runner: String,
+    pub model: String,
+    #[serde(default = "default_profile_effort")]
+    pub effort: String,
+}
+
+/// Integer percentages keyed by model-profile identity.
+pub type PercentagePool = BTreeMap<String, u8>;
+
+/// Complete routing policy. R1 and R2 use the same reviewer pool but keep
+/// independent allocation state in the persistence layer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingPolicy {
+    pub classifier: PercentagePool,
+    pub planner: PercentagePool,
+    pub collector: PercentagePool,
+    pub worker: BTreeMap<String, PercentagePool>,
+    pub reviewer: BTreeMap<String, PercentagePool>,
+}
+
 /// Which CLI runner the daemon uses for all spawned agents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RunnerKind {
     Claude,
     Codex,
@@ -60,8 +90,9 @@ macro_rules! declare_serve_file_config {
             pub test_only_unconsumed: Option<bool>,
         }
 
+        #[allow(unused_doc_comments)]
         const DECLARED_SERVE_FILE_CONFIG_KEYS: &[&str] = &[
-            $(stringify!($field),)*
+            $($(#[$meta])* stringify!($field),)*
             #[cfg(test)]
             "test_only_unconsumed",
         ];
@@ -69,24 +100,38 @@ macro_rules! declare_serve_file_config {
 }
 
 declare_serve_file_config! {
+    /// Named executable models referenced by the routing policy.
+    model_profiles: Option<BTreeMap<String, ModelProfile>>,
+    /// Required, coherent routing policy for every managed role.
+    routing: Option<RoutingPolicy>,
     /// Optional provider-wide runner selection. Unlike the legacy `agent`
     /// setting, this also constrains every role-specific model.
+    #[cfg(test)]
     provider: Option<String>,
+    #[cfg(test)]
     agent: Option<String>,
     cap: Option<usize>,
     repo_dir: Option<String>,
     worktree_base: Option<String>,
     names_file: Option<String>,
     agent_bin: Option<String>,
+    #[cfg(test)]
     model: Option<String>,
-    effort: Option<String>,
+    #[cfg(test)]
     worker_model: Option<String>,
+    #[cfg(test)]
     worker_effort: Option<String>,
+    #[cfg(test)]
     review_model: Option<String>,
+    #[cfg(test)]
     review_effort: Option<String>,
+    #[cfg(test)]
     classifier_model: Option<String>,
+    #[cfg(test)]
     classifier_effort: Option<String>,
+    #[cfg(test)]
     collector_model: Option<String>,
+    #[cfg(test)]
     collector_effort: Option<String>,
     merge_token_file: Option<String>,
     no_bare_agent: Option<bool>,
@@ -117,13 +162,6 @@ declare_serve_file_config! {
     r2_target_per_stratum: Option<i64>,
     /// Sampling probability once a stratum reaches its coverage floor.
     r2_steady_state_p: Option<f64>,
-    /// Per-complexity suggested model/effort (keys "1".."5", values "tier/effort").
-    suggested_models: Option<std::collections::HashMap<String, String>>,
-    /// #172: minimum worker model tier floor ("sonnet-5"|"opus-46"|"opus-47"|"opus-48").
-    /// A worker resolving below this is bumped up to it at spawn. None = no floor.
-    min_model: Option<String>,
-    /// #172: minimum worker effort floor ("medium"|"high"). None = no floor.
-    min_effort: Option<String>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
     /// Transport-only Grok adapter configuration. Managed Grok roles remain disabled.
@@ -140,22 +178,34 @@ enum ConfigKeyDisposition {
 // paths in `main.rs` / `resolve_roles`. A deprecated key remains parseable for
 // compatibility, but startup warns that it has no effect.
 const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
+    ("model_profiles", ConfigKeyDisposition::Runtime),
+    ("routing", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("provider", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("agent", ConfigKeyDisposition::Runtime),
     ("cap", ConfigKeyDisposition::Runtime),
     ("repo_dir", ConfigKeyDisposition::Runtime),
     ("worktree_base", ConfigKeyDisposition::Runtime),
     ("names_file", ConfigKeyDisposition::Runtime),
     ("agent_bin", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("model", ConfigKeyDisposition::Runtime),
-    ("effort", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("worker_model", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("worker_effort", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("review_model", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("review_effort", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("classifier_model", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("classifier_effort", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("collector_model", ConfigKeyDisposition::Runtime),
+    #[cfg(test)]
     ("collector_effort", ConfigKeyDisposition::Runtime),
     ("merge_token_file", ConfigKeyDisposition::Runtime),
     ("no_bare_agent", ConfigKeyDisposition::Runtime),
@@ -183,9 +233,6 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("r2_enabled", ConfigKeyDisposition::Runtime),
     ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
-    ("suggested_models", ConfigKeyDisposition::Runtime),
-    ("min_model", ConfigKeyDisposition::Runtime),
-    ("min_effort", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
     ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -226,6 +273,7 @@ fn validate_serve_file_config_key_registry() -> Result<()> {
     )
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleConfig {
     pub provider: RunnerKind,
@@ -244,6 +292,7 @@ pub struct RoleConfig {
     pub collector_effort: String,
 }
 
+#[cfg(test)]
 pub fn resolve_roles(
     file: &ServeFileConfig,
     cli_agent: Option<&str>,
@@ -448,10 +497,12 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
     validate_serve_file_config_key_registry()?;
     match std::fs::read_to_string(path) {
         Ok(s) => {
+            reject_legacy_routing_keys(&s, path)?;
             let cfg: ServeFileConfig = toml::from_str(&s).map_err(|e| {
                 QuorumError::Usage(format!("bad serve config {}: {e}", path.display()))
             })?;
             resolve_grok_adapter(cfg.grok.as_ref())?;
+            validate_model_routing(&cfg)?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
@@ -470,6 +521,242 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             path.display()
         ))),
     }
+}
+
+const LEGACY_ROUTING_KEYS: &[&str] = &[
+    "provider",
+    "agent",
+    "model",
+    "effort",
+    "worker_model",
+    "worker_effort",
+    "review_model",
+    "review_effort",
+    "classifier_model",
+    "classifier_effort",
+    "collector_model",
+    "collector_effort",
+    "suggested_models",
+    "min_model",
+    "min_effort",
+];
+
+fn reject_legacy_routing_keys(toml_source: &str, path: &Path) -> Result<()> {
+    let value: toml::Value = toml::from_str(toml_source)
+        .map_err(|e| QuorumError::Usage(format!("bad serve config {}: {e}", path.display())))?;
+    let Some(table) = value.as_table() else {
+        return Err(QuorumError::Usage(
+            "serve config must be a TOML table".into(),
+        ));
+    };
+    if let Some(key) = LEGACY_ROUTING_KEYS
+        .iter()
+        .find(|key| table.contains_key(**key))
+    {
+        return Err(QuorumError::Usage(format!(
+            "legacy routing key \"{key}\" is not supported; configure model_profiles and routing"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the hard-cutover model-routing configuration before the daemon can
+/// claim work.
+pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
+    let profiles = config
+        .model_profiles
+        .as_ref()
+        .ok_or_else(|| QuorumError::Usage("serve config requires [model_profiles]".into()))?;
+    if profiles.is_empty() {
+        return Err(QuorumError::Usage(
+            "model_profiles must contain at least one profile".into(),
+        ));
+    }
+    let mut configured_runners = std::collections::BTreeSet::new();
+    for (name, profile) in profiles {
+        validate_durable_routing_text("model profile name", name)?;
+        validate_durable_routing_text("model", &profile.model)?;
+        validate_durable_routing_text("effort", &profile.effort)?;
+        let expected = RunnerKind::from_str_opt(Some(&profile.runner))?;
+        configured_runners.insert(expected);
+        let actual = crate::serve::runner::AgentKind::for_model(&profile.model)
+            .map_err(|error| QuorumError::Usage(format!("model profile \"{name}\": {error}")))?;
+        let expected = match expected {
+            RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
+            RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
+            RunnerKind::Grok => {
+                return Err(QuorumError::Usage(format!(
+                    "model profile \"{name}\" selects Grok, but managed Grok lifecycle roles are not enabled"
+                )))
+            }
+        };
+        if actual != expected {
+            return Err(QuorumError::Usage(format!(
+                "model profile \"{name}\" model \"{}\" does not match runner \"{}\"",
+                profile.model, profile.runner
+            )));
+        }
+        let effort_supported = match expected {
+            crate::serve::runner::AgentKind::Claude => {
+                matches!(profile.effort.as_str(), "low" | "medium" | "high")
+            }
+            crate::serve::runner::AgentKind::Codex => {
+                matches!(profile.effort.as_str(), "low" | "medium" | "high" | "xhigh")
+            }
+            crate::serve::runner::AgentKind::Grok => false,
+        };
+        if !effort_supported {
+            return Err(QuorumError::Usage(format!(
+                "model profile \"{name}\" has unsupported effort \"{}\" for runner \"{}\"",
+                profile.effort, profile.runner
+            )));
+        }
+    }
+    if config.agent_bin.is_some() && configured_runners.len() > 1 {
+        return Err(QuorumError::Usage(
+            "agent_bin cannot be used when model_profiles span multiple runners".into(),
+        ));
+    }
+
+    let routing = config
+        .routing
+        .as_ref()
+        .ok_or_else(|| QuorumError::Usage("serve config requires [routing]".into()))?;
+    validate_percentage_pool("classifier", &routing.classifier, profiles)?;
+    validate_percentage_pool("planner", &routing.planner, profiles)?;
+    for profile_id in routing.planner.keys() {
+        if profiles[profile_id].runner == "codex" {
+            return Err(QuorumError::Usage(format!(
+                "routing.planner profile \"{profile_id}\" uses unsupported runner \"codex\""
+            )));
+        }
+    }
+    validate_percentage_pool("collector", &routing.collector, profiles)?;
+    validate_complexity_pools("worker", &routing.worker, profiles)?;
+    validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
+    validate_routed_cost_limits(config, config.max_turn_cost_usd, config.max_task_cost_usd)?;
+    Ok(())
+}
+
+pub fn validate_routed_cost_limits(
+    config: &ServeFileConfig,
+    max_turn_cost_usd: Option<f64>,
+    max_task_cost_usd: Option<f64>,
+) -> Result<()> {
+    let Some(profiles) = config.model_profiles.as_ref() else {
+        return Ok(());
+    };
+    let Some(routing) = config.routing.as_ref() else {
+        return Ok(());
+    };
+    if (max_turn_cost_usd.is_some() || max_task_cost_usd.is_some())
+        && referenced_profile_ids(routing).any(|profile_id| profiles[profile_id].runner == "codex")
+    {
+        return Err(QuorumError::Usage(
+            "USD cost limits are unsupported when routing can select a Codex profile".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn referenced_profile_ids(routing: &RoutingPolicy) -> impl Iterator<Item = &String> {
+    routing
+        .classifier
+        .keys()
+        .chain(routing.planner.keys())
+        .chain(routing.collector.keys())
+        .chain(routing.worker.values().flat_map(|pool| pool.keys()))
+        .chain(routing.reviewer.values().flat_map(|pool| pool.keys()))
+}
+
+fn validate_complexity_pools(
+    role: &str,
+    pools: &BTreeMap<String, PercentagePool>,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<()> {
+    for level in 1..=5 {
+        let key = level.to_string();
+        let pool = pools.get(&key).ok_or_else(|| {
+            QuorumError::Usage(format!("routing.{role} requires complexity pool \"{key}\""))
+        })?;
+        validate_percentage_pool(&format!("{role}.{key}"), pool, profiles)?;
+    }
+    if let Some(extra) = pools
+        .keys()
+        .find(|key| !matches!(key.as_str(), "1" | "2" | "3" | "4" | "5"))
+    {
+        return Err(QuorumError::Usage(format!(
+            "routing.{role} has unsupported complexity pool \"{extra}\""
+        )));
+    }
+    Ok(())
+}
+
+fn validate_percentage_pool(
+    name: &str,
+    pool: &PercentagePool,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<()> {
+    if pool.is_empty() {
+        return Err(QuorumError::Usage(format!(
+            "routing.{name} must not be empty"
+        )));
+    }
+    let mut total = 0_u16;
+    for (profile, percentage) in pool {
+        if !profiles.contains_key(profile) {
+            return Err(QuorumError::Usage(format!(
+                "routing.{name} references unknown model profile \"{profile}\""
+            )));
+        }
+        if *percentage == 0 {
+            return Err(QuorumError::Usage(format!(
+                "routing.{name} profile \"{profile}\" must have a positive percentage"
+            )));
+        }
+        total += u16::from(*percentage);
+    }
+    if total != 100 {
+        return Err(QuorumError::Usage(format!(
+            "routing.{name} percentages total {total}, expected 100"
+        )));
+    }
+    let generation = routing_generation(name, pool, profiles)?;
+    validate_durable_routing_text("routing policy generation", &generation)?;
+    Ok(())
+}
+
+fn validate_durable_routing_text(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 1024 || value.contains('\0') {
+        return Err(QuorumError::Usage(format!(
+            "{label} must be non-empty, contain no NUL, and be at most 1024 bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn routing_generation(
+    pool_key: &str,
+    percentages: &BTreeMap<String, u8>,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<String> {
+    let mut entries = Vec::with_capacity(percentages.len());
+    for (profile_id, percentage) in percentages {
+        let profile = profiles.get(profile_id).ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "routing pool {pool_key} references unknown profile {profile_id}"
+            ))
+        })?;
+        entries.push(serde_json::json!({
+            "profile": profile_id,
+            "percentage": percentage,
+            "runner": profile.runner,
+            "model": profile.model,
+            "effort": profile.effort,
+        }));
+    }
+    serde_json::to_string(&serde_json::json!({"pool": pool_key, "entries": entries}))
+        .map_err(|error| QuorumError::Io(format!("routing policy identity failed: {error}")))
 }
 
 fn warn_for_deprecated_keys(toml_source: &str) -> Result<()> {
@@ -492,6 +779,7 @@ fn warn_for_deprecated_keys(toml_source: &str) -> Result<()> {
 /// Validate explicit per-complexity routing overrides. The accepted tier
 /// vocabulary is owned by `quorum_core::model_tiers`, shared with task labels.
 /// Only Quorum's supported medium/high efforts are valid.
+#[cfg(test)]
 pub fn validate_suggested_models(
     suggested_models: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
@@ -659,20 +947,13 @@ pub fn resolve_bool(flag: bool, file: Option<bool>, default: bool) -> Sourced<bo
 #[allow(clippy::struct_field_names)]
 pub struct BannerData<'a> {
     pub config_path: Option<&'a str>,
-    pub agent: RunnerKind,
     pub repo: &'a Sourced<String>,
     pub repo_dir: &'a Sourced<String>,
     pub worktree_base: &'a Sourced<String>,
     pub base_branch: &'a Sourced<String>,
     pub cap: &'a Sourced<usize>,
-    pub model: &'a Sourced<String>,
-    pub effort: &'a Sourced<String>,
-    pub review_model: &'a str,
-    pub review_effort: &'a str,
-    pub classifier_model: &'a str,
-    pub classifier_effort: &'a str,
-    pub collector_model: &'a str,
-    pub collector_effort: &'a str,
+    pub model_profiles: &'a BTreeMap<String, ModelProfile>,
+    pub routing: &'a RoutingPolicy,
     pub log_dir: &'a Sourced<Option<String>>,
     pub no_bare_agent: &'a Sourced<bool>,
     pub self_update_drain: &'a Sourced<bool>,
@@ -689,9 +970,6 @@ pub struct BannerData<'a> {
     pub master_ci_gate: &'a Sourced<bool>,
     pub master_ci_timeout_secs: &'a Sourced<u64>,
     pub doctor_enabled: &'a Sourced<bool>,
-    /// #172: worker model/effort floor (full model id + effort), or None = off.
-    pub min_model: Option<&'a str>,
-    pub min_effort: Option<&'a str>,
 }
 
 /// Format the startup banner showing resolved config + sources.
@@ -703,31 +981,20 @@ pub fn banner(d: &BannerData<'_>) -> String {
     } else {
         lines.push("  config file:               (none)".to_string());
     }
-    lines.push(format!("  agent:                     {}", d.agent));
     lines.push(format!("  repo:                      {}", d.repo));
     lines.push(format!("  repo_dir:                  {}", d.repo_dir));
     lines.push(format!("  worktree_base:             {}", d.worktree_base));
     lines.push(format!("  base_branch:               {}", d.base_branch));
     lines.push(format!("  cap:                       {}", d.cap));
-    lines.push(format!("  model:                     {}", d.model));
-    lines.push(format!("  effort:                    {}", d.effort));
-    lines.push(format!("  review_model:              {}", d.review_model));
-    lines.push(format!("  review_effort:             {}", d.review_effort));
     lines.push(format!(
-        "  classifier_model:          {}",
-        d.classifier_model
+        "  model_profiles:            {}",
+        d.model_profiles.len()
     ));
     lines.push(format!(
-        "  classifier_effort:         {}",
-        d.classifier_effort
-    ));
-    lines.push(format!(
-        "  collector_model:           {}",
-        d.collector_model
-    ));
-    lines.push(format!(
-        "  collector_effort:          {}",
-        d.collector_effort
+        "  routing pools:             classifier={}, planner={}, collector={}, worker=5, reviewer=5",
+        d.routing.classifier.len(),
+        d.routing.planner.len(),
+        d.routing.collector.len()
     ));
     match &d.log_dir.value {
         Some(v) => lines.push(format!(
@@ -815,14 +1082,6 @@ pub fn banner(d: &BannerData<'_>) -> String {
         d.master_ci_timeout_secs
     ));
     lines.push(format!("  doctor_enabled:            {}", d.doctor_enabled));
-    lines.push(format!(
-        "  min_model:                 {}",
-        d.min_model.unwrap_or("(none)")
-    ));
-    lines.push(format!(
-        "  min_effort:                {}",
-        d.min_effort.unwrap_or("(none)")
-    ));
     lines.push("─────────────────────────────".to_string());
     lines.join("\n")
 }
@@ -831,6 +1090,7 @@ pub fn banner(d: &BannerData<'_>) -> String {
 /// `min_model` tier → full model id; `min_effort` must be "medium"|"high".
 /// Bad values → Usage error (exit 2), consistent with the rest of serve config.
 /// Returns (model_id, effort); either is None when its input is None (no floor).
+#[cfg(test)]
 pub fn resolve_floor(
     min_model: Option<&str>,
     min_effort: Option<&str>,
@@ -863,6 +1123,7 @@ pub fn resolve_floor(
 /// `min_model` is a Claude tier floor. Strict Codex mode cannot apply it
 /// without silently switching providers, so reject that configuration at
 /// startup instead of poisoning every worker task.
+#[cfg(test)]
 pub fn validate_provider_floor(
     kind: RunnerKind,
     provider_explicit: bool,
@@ -872,30 +1133,6 @@ pub fn validate_provider_floor(
         return Err(QuorumError::Usage(
             "provider=\"codex\" cannot use min_model — min_model accepts Claude tiers only".into(),
         ));
-    }
-    Ok(())
-}
-
-/// Validate that Codex runner is not combined with USD safety limits.
-/// Codex does not expose reliable per-turn USD cost; fabricating it would be unsafe.
-pub fn validate_codex_limits(
-    kind: RunnerKind,
-    max_turn_cost_usd: Option<f64>,
-    max_task_cost_usd: Option<f64>,
-) -> Result<()> {
-    if kind == RunnerKind::Codex {
-        if let Some(v) = max_turn_cost_usd {
-            return Err(QuorumError::Usage(format!(
-                "agent=codex cannot use max_turn_cost_usd ({v}) — \
-                 Codex does not expose per-turn USD cost; use token or wall-clock limits"
-            )));
-        }
-        if let Some(v) = max_task_cost_usd {
-            return Err(QuorumError::Usage(format!(
-                "agent=codex cannot use max_task_cost_usd ({v}) — \
-                 Codex does not expose per-turn USD cost; use token or wall-clock limits"
-            )));
-        }
     }
     Ok(())
 }
@@ -911,6 +1148,43 @@ pub fn default_config_path(repo: &str) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_ROUTING: &str = r#"
+[model_profiles.primary]
+runner = "codex"
+model = "gpt-5.6-sol"
+
+[model_profiles.planner]
+runner = "claude"
+model = "claude-opus-4-8"
+
+[routing.classifier]
+primary = 100
+[routing.planner]
+planner = 100
+[routing.collector]
+primary = 100
+[routing.worker.1]
+primary = 100
+[routing.worker.2]
+primary = 100
+[routing.worker.3]
+primary = 100
+[routing.worker.4]
+primary = 100
+[routing.worker.5]
+primary = 100
+[routing.reviewer.1]
+primary = 100
+[routing.reviewer.2]
+primary = 100
+[routing.reviewer.3]
+primary = 100
+[routing.reviewer.4]
+primary = 100
+[routing.reviewer.5]
+primary = 100
+"#;
 
     #[test]
     fn load_missing_implicit_returns_defaults() {
@@ -969,7 +1243,11 @@ mod tests {
     fn deprecated_key_warns_and_still_loads_for_compatibility() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.toml");
-        std::fs::write(&path, "test_only_unconsumed = true\n").unwrap();
+        std::fs::write(
+            &path,
+            format!("test_only_unconsumed = true\n{VALID_ROUTING}"),
+        )
+        .unwrap();
 
         let cfg = load(&path, true).unwrap();
         assert_eq!(cfg.test_only_unconsumed, Some(true));
@@ -981,22 +1259,25 @@ mod tests {
         let path = dir.path().join("serve.toml");
         std::fs::write(
             &path,
-            r#"
+            format!(
+                r#"
 cap = 8
-model = "opus-48"
-effort = "max"
 max_turn_wall_secs = 2700
 max_task_wall_secs = 14400
 repo = "ag2trust/quorum"
 repo_dir = "/home/user/dev/quorum"
 worktree_base = "/home/user/.quorum/serve/quorum/worktrees"
 log_dir = "/home/user/.quorum/serve/quorum/logs"
-"#,
+{VALID_ROUTING}"#
+            ),
         )
         .unwrap();
         let cfg = load(&path, true).unwrap();
         assert_eq!(cfg.cap, Some(8));
-        assert_eq!(cfg.model.as_deref(), Some("opus-48"));
+        assert_eq!(
+            cfg.model_profiles.as_ref().unwrap()["primary"].effort,
+            "high"
+        );
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
         assert!(cfg.doctor_enabled.is_none());
     }
@@ -1007,7 +1288,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         let path = dir.path().join("serve.toml");
         std::fs::write(
             &path,
-            "repo = \"test/repo\"\nrepo_dir = \"/tmp\"\nworktree_base = \"/tmp/wt\"\ndoctor_enabled = true\n",
+            format!("repo = \"test/repo\"\nrepo_dir = \"/tmp\"\nworktree_base = \"/tmp/wt\"\ndoctor_enabled = true\n{VALID_ROUTING}"),
         )
         .unwrap();
         let cfg = load(&path, true).unwrap();
@@ -1235,7 +1516,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
     }
 
     #[test]
-    fn load_suggested_models_valid() {
+    fn load_rejects_legacy_suggested_models() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.toml");
         std::fs::write(
@@ -1251,10 +1532,198 @@ worktree_base = "/tmp/wt"
 "#,
         )
         .unwrap();
-        let cfg = load(&path, true).unwrap();
-        let sm = cfg.suggested_models.unwrap();
-        assert_eq!(sm.get("3").unwrap(), "opus-48/high");
-        assert_eq!(sm.get("5").unwrap(), "opus-47/medium");
+        let err = load(&path, true).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("legacy routing key"), "{err}");
+    }
+
+    #[test]
+    fn malformed_config_error_keeps_file_path_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken-serve.toml");
+        std::fs::write(&path, "routing = [").unwrap();
+        let err = load(&path, true).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn routing_accepts_integer_percentages_and_defaults_effort() {
+        let cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        validate_model_routing(&cfg).unwrap();
+        assert_eq!(cfg.model_profiles.unwrap()["primary"].effort, "high");
+    }
+
+    #[test]
+    fn routing_rejects_profile_ids_that_durable_assignments_cannot_store() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let oversized = "p".repeat(1025);
+        let profiles = cfg.model_profiles.as_mut().unwrap();
+        let profile = profiles.remove("primary").unwrap();
+        profiles.insert(oversized.clone(), profile);
+        let routing = cfg.routing.as_mut().unwrap();
+        for pool in std::iter::once(&mut routing.classifier)
+            .chain(std::iter::once(&mut routing.collector))
+            .chain(routing.worker.values_mut())
+            .chain(routing.reviewer.values_mut())
+        {
+            pool.remove("primary");
+            pool.insert(oversized.clone(), 100);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("at most 1024 bytes"), "{err}");
+    }
+
+    #[test]
+    fn routing_rejects_policy_identity_that_durable_assignments_cannot_store() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profiles = cfg.model_profiles.as_mut().unwrap();
+        let template = profiles["primary"].clone();
+        let classifier = &mut cfg.routing.as_mut().unwrap().classifier;
+        classifier.clear();
+        for index in 0..20 {
+            let id = format!("classifier-profile-{index:02}");
+            profiles.insert(id.clone(), template.clone());
+            classifier.insert(id, 5);
+        }
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("routing policy generation")
+                && err.to_string().contains("at most 1024 bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn routing_rejects_usd_limits_when_any_pool_can_select_codex() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.max_turn_cost_usd = Some(1.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("USD cost limits"));
+
+        cfg.max_turn_cost_usd = None;
+        cfg.max_task_cost_usd = Some(10.0);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("USD cost limits"));
+    }
+
+    #[test]
+    fn routing_rejects_missing_role_and_complexity_pools() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.routing.as_mut().unwrap().collector.clear();
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("collector must not be empty"),
+            "{err}"
+        );
+
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.routing.as_mut().unwrap().worker.remove("4");
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("complexity pool \"4\""), "{err}");
+    }
+
+    #[test]
+    fn routing_rejects_bad_percentages_and_unknown_profiles() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.routing
+            .as_mut()
+            .unwrap()
+            .classifier
+            .insert("primary".into(), 99);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("total 99"), "{err}");
+
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let pool = &mut cfg.routing.as_mut().unwrap().planner;
+        pool.clear();
+        pool.insert("missing".into(), 100);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("unknown model profile"), "{err}");
+    }
+
+    #[test]
+    fn routing_rejects_runner_model_mismatch() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap()
+            .runner = "claude".into();
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("does not match runner"), "{err}");
+    }
+
+    #[test]
+    fn routing_rejects_effort_unsupported_by_runner() {
+        let mut codex: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        codex
+            .model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap()
+            .effort = "max".into();
+        let err = validate_model_routing(&codex).unwrap_err();
+        assert!(err.to_string().contains("unsupported effort"), "{err}");
+
+        let mut claude: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profile = claude
+            .model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap();
+        profile.runner = "claude".into();
+        profile.model = "claude-opus-4-8".into();
+        profile.effort = "xhigh".into();
+        let err = validate_model_routing(&claude).unwrap_err();
+        assert!(err.to_string().contains("unsupported effort"), "{err}");
+    }
+
+    #[test]
+    fn routing_accepts_codex_xhigh_and_shared_efforts() {
+        for effort in ["low", "medium", "high", "xhigh"] {
+            let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+            cfg.model_profiles
+                .as_mut()
+                .unwrap()
+                .get_mut("primary")
+                .unwrap()
+                .effort = effort.into();
+            validate_model_routing(&cfg).unwrap();
+        }
+    }
+
+    #[test]
+    fn agent_bin_rejects_profiles_spanning_runners() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        cfg.agent_bin = Some("/custom/provider-cli".into());
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("span multiple runners"), "{err}");
+
+        cfg.agent_bin = None;
+        validate_model_routing(&cfg).unwrap();
+    }
+
+    #[test]
+    fn planner_rejects_codex_profile_until_launch_boundary_supports_it() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let planner = &mut cfg.routing.as_mut().unwrap().planner;
+        planner.clear();
+        planner.insert("primary".into(), 100);
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("routing.planner")
+                && err.to_string().contains("unsupported runner \"codex\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1354,12 +1823,14 @@ worktree_base = "/tmp/wt"
 
     #[test]
     fn default_serve_scaffold_parses_cleanly() {
-        // The scaffold written by `quorum init` is all-comments — it must parse as
-        // empty defaults (no unknown keys, no syntax errors).
+        // `quorum init` emits a complete active routing policy so a fresh repository
+        // can start after only its repository paths are supplied.
         let cfg: ServeFileConfig = toml::from_str(crate::DEFAULT_SERVE_TOML).unwrap();
         assert!(cfg.cap.is_none());
         assert!(cfg.r2_enabled.is_none());
-        assert!(cfg.model.is_none());
+        assert!(cfg.model_profiles.is_some());
+        assert!(cfg.routing.is_some());
+        validate_model_routing(&cfg).unwrap();
     }
 
     #[test]
@@ -1374,9 +1845,9 @@ worktree_base = "/tmp/wt"
 
     #[test]
     fn banner_shows_config_path() {
+        let routing_cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         let b = banner(&BannerData {
             config_path: Some("/path/to/config.toml"),
-            agent: RunnerKind::Claude,
             repo: &Sourced {
                 value: "test/repo".into(),
                 source: Source::Flag,
@@ -1397,20 +1868,8 @@ worktree_base = "/tmp/wt"
                 value: 8,
                 source: Source::File,
             },
-            model: &Sourced {
-                value: "sonnet".into(),
-                source: Source::Default,
-            },
-            effort: &Sourced {
-                value: "high".into(),
-                source: Source::Default,
-            },
-            review_model: "sonnet",
-            review_effort: "high",
-            classifier_model: "claude-haiku-4-5-20251001",
-            classifier_effort: "low",
-            collector_model: "claude-haiku-4-5-20251001",
-            collector_effort: "low",
+            model_profiles: routing_cfg.model_profiles.as_ref().unwrap(),
+            routing: routing_cfg.routing.as_ref().unwrap(),
             log_dir: &Sourced {
                 value: None,
                 source: Source::Default,
@@ -1472,8 +1931,6 @@ worktree_base = "/tmp/wt"
                 value: false,
                 source: Source::Default,
             },
-            min_model: None,
-            min_effort: None,
         });
         assert!(
             b.contains("config file:               /path/to/config.toml"),

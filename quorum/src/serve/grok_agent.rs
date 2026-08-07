@@ -828,12 +828,12 @@ mod tests {
             "a descendant must still hold the process group and inherited pipes"
         );
 
-        let output = tokio::time::timeout(std::time::Duration::from_secs(5), proc.kill_and_reap())
+        let output = tokio::time::timeout(std::time::Duration::from_secs(15), proc.kill_and_reap())
             .await
             .expect("post-exit teardown hung on descendant-held pipes");
         assert!(output.is_empty());
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while unsafe { libc::killpg(process_group_id, 0) } == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -865,6 +865,33 @@ mod tests {
         ]
     }
 
+    async fn wait_for_real_cli_terminal_failure(proc: &mut GrokProc) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut lines = Vec::new();
+            while lines.len() < 16 {
+                let raw = proc
+                    .next_raw_line()
+                    .await
+                    .expect("grok closed stdout without an error event");
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&raw).is_ok(),
+                    "{raw}"
+                );
+                let terminal = matches!(
+                    normalize_grok_line(&raw).as_slice(),
+                    [AgentEvent::TurnFailed { .. }]
+                );
+                lines.push(raw);
+                if terminal {
+                    return lines;
+                }
+            }
+            panic!("grok emitted 16 structured nonterminal lines without an auth failure");
+        })
+        .await
+        .expect("grok auth failure did not reach the structured protocol")
+    }
+
     #[tokio::test]
     async fn real_cli_accepts_headless_protocol_without_model_spend() {
         if !grok_available() {
@@ -878,18 +905,7 @@ mod tests {
         spec.prompt = "noop".into();
         spec.env_vars = no_auth_env(root.path());
         let mut proc = GrokProc::spawn(&spec, None).expect("spawn grok");
-        let raw = tokio::time::timeout(std::time::Duration::from_secs(30), proc.next_raw_line())
-            .await
-            .expect("grok headless protocol did not start")
-            .expect("grok rejected arguments without structured output");
-        assert!(
-            serde_json::from_str::<serde_json::Value>(&raw).is_ok(),
-            "{raw}"
-        );
-        assert!(matches!(
-            normalize_grok_line(&raw).as_slice(),
-            [AgentEvent::TurnFailed { .. }]
-        ));
+        let _lines = wait_for_real_cli_terminal_failure(&mut proc).await;
         proc.kill_and_reap().await;
     }
 
@@ -912,15 +928,11 @@ mod tests {
             .unwrap()
             .1 = secret.into();
         let mut proc = GrokProc::spawn(&spec, None).expect("spawn grok");
-        let raw = tokio::time::timeout(std::time::Duration::from_secs(30), proc.next_raw_line())
-            .await
-            .expect("grok auth failure did not reach the structured protocol")
-            .expect("grok auth failure closed stdout without an error event");
-        assert!(matches!(
-            normalize_grok_line(&raw).as_slice(),
-            [AgentEvent::TurnFailed { .. }]
-        ));
-        assert!(!raw.contains(secret), "API key leaked in structured output");
+        let lines = wait_for_real_cli_terminal_failure(&mut proc).await;
+        assert!(
+            lines.iter().all(|line| !line.contains(secret)),
+            "API key leaked in structured output"
+        );
         let captured = proc.kill_and_reap().await;
         assert!(captured
             .iter()

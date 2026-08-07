@@ -194,6 +194,8 @@ pub struct CollectionRun {
     pub findings_count: i64,
     pub attempted_at: i64,
     pub completed_at: Option<i64>,
+    /// Durable routing decision for the collector responsibility, when managed.
+    pub role_assignment_id: Option<i64>,
 }
 
 /// UPSERT a run record for a PR — the primary-key REPLACE keeps at most one row
@@ -202,8 +204,8 @@ pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
     conn.execute(
         "INSERT INTO review_collection_runs
             (pr_number, task_id, status, error, collector_model, collector_version,
-             findings_count, attempted_at, completed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             findings_count, attempted_at, completed_at, role_assignment_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(pr_number) DO UPDATE SET
             task_id = excluded.task_id,
             status = excluded.status,
@@ -212,7 +214,8 @@ pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
             collector_version = excluded.collector_version,
             findings_count = excluded.findings_count,
             attempted_at = excluded.attempted_at,
-            completed_at = excluded.completed_at",
+            completed_at = excluded.completed_at,
+            role_assignment_id = excluded.role_assignment_id",
         params![
             run.pr_number,
             run.task_id,
@@ -223,6 +226,7 @@ pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
             run.findings_count,
             run.attempted_at,
             run.completed_at,
+            run.role_assignment_id,
         ],
     )?;
     Ok(())
@@ -232,7 +236,7 @@ pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
 pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun>> {
     let mut stmt = conn.prepare(
         "SELECT pr_number, task_id, status, error, collector_model, collector_version,
-                findings_count, attempted_at, completed_at
+                findings_count, attempted_at, completed_at, role_assignment_id
          FROM review_collection_runs WHERE pr_number = ?1",
     )?;
     let mut rows = stmt.query(params![pr_number])?;
@@ -252,6 +256,7 @@ pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun
             findings_count: row.get(6)?,
             attempted_at: row.get(7)?,
             completed_at: row.get(8)?,
+            role_assignment_id: row.get(9)?,
         }))
     } else {
         Ok(None)
@@ -648,6 +653,15 @@ mod tests {
     fn record_and_get_run_success() {
         let (conn, _dir) = test_conn();
         let now = clock::now();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,pr_number,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (77,'collector:pr:500',500,'collector','collector-profile','claude',
+                     'claude','haiku','high','collector','g1',?1)",
+            [now],
+        )
+        .unwrap();
         let run = CollectionRun {
             pr_number: 500,
             task_id: Some(80),
@@ -658,12 +672,14 @@ mod tests {
             findings_count: 3,
             attempted_at: now,
             completed_at: Some(now + 1),
+            role_assignment_id: Some(77),
         };
         record_run(&conn, &run).unwrap();
         let got = get_run(&conn, 500).unwrap().unwrap();
         assert_eq!(got.status, RunStatus::Success);
         assert_eq!(got.findings_count, 3);
         assert_eq!(got.error, None);
+        assert_eq!(got.role_assignment_id, Some(77));
     }
 
     #[test]
@@ -680,6 +696,7 @@ mod tests {
             findings_count: 0,
             attempted_at: now,
             completed_at: None,
+            role_assignment_id: None,
         };
         record_run(&conn, &failed).unwrap();
         let got = get_run(&conn, 600).unwrap().unwrap();

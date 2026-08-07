@@ -155,6 +155,8 @@ pub struct Task {
     pub rework_round: i64,
     pub review_only: bool,
     pub recovery_attempts: i64,
+    pub revision: i64,
+    pub edit_count: i64,
     pub continue_pr: Option<i64>,
     pub ready: bool,
 }
@@ -262,6 +264,8 @@ pub struct TaskUpdate<'a> {
     pub refs: Option<&'a str>,
     pub verdict: Option<&'a str>,
     pub depends_on: Option<&'a str>,
+    /// Required compare-and-swap token for externally editable task fields.
+    pub expected_revision: Option<i64>,
 }
 
 pub struct TransitionResult {
@@ -287,7 +291,7 @@ pub fn effect_name(e: &Effect) -> String {
 
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
-                    rework_round, review_only, recovery_attempts, continue_pr";
+                    rework_round, review_only, recovery_attempts, revision, edit_count, continue_pr";
 
 const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
@@ -315,7 +319,9 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         rework_round: r.get(14)?,
         review_only: r.get::<_, i64>(15)? != 0,
         recovery_attempts: r.get(16)?,
-        continue_pr: r.get(17)?,
+        revision: r.get(17)?,
+        edit_count: r.get(18)?,
+        continue_pr: r.get(19)?,
         ready: false,
     })
 }
@@ -726,6 +732,38 @@ pub fn claim(
                AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
                     OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
     ))";
+    const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
+        SELECT 1 FROM task_decompositions WHERE freeze_active=1
+    )";
+    // Generated implementation work has additional graph authority. Keep this
+    // predicate in the same BEGIN IMMEDIATE transaction as the task update so
+    // sibling claims, failures, and graph blockers cannot race provisioning.
+    // Review/rework authority for an already-started child is intentionally not
+    // gated: active children may finish after a sibling fails or blocks the graph.
+    const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
+        SELECT 1 FROM task_graph_members own_member
+        WHERE own_member.task_id=tasks.id
+    ) OR EXISTS (
+        SELECT 1
+        FROM task_graph_members own_member
+        JOIN task_decompositions graph ON graph.id=own_member.graph_id
+        JOIN tasks source ON source.id=graph.source_task_id
+        WHERE own_member.task_id=tasks.id AND own_member.active=1
+          AND graph.state='active' AND graph.active=1
+          AND source.status='decomposed'
+          AND NOT EXISTS (
+              SELECT 1 FROM task_graph_members sibling_member
+              JOIN tasks sibling ON sibling.id=sibling_member.task_id
+              WHERE sibling_member.graph_id=own_member.graph_id
+                AND sibling_member.active=1 AND sibling.status='failed'
+          )
+          AND 2 > (
+              SELECT COUNT(*) FROM task_graph_members sibling_member
+              JOIN tasks sibling ON sibling.id=sibling_member.task_id
+              WHERE sibling_member.graph_id=own_member.graph_id
+                AND sibling_member.active=1 AND sibling.status='working'
+          )
+    ))";
 
     let mut task = match task_id {
         Some(id) => tx
@@ -738,17 +776,19 @@ pub fn claim(
                         reviewer = CASE WHEN status='in-review' THEN ?1 ELSE reviewer END,
                         updated_at = ?2
                      WHERE id = ?3
+                       AND {NO_PLANNING_FREEZE_CLAUSE}
                        AND json_valid(refs)
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
-                       AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+                       AND json_extract(refs, '$.cx_size') IN ('S','M')
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                        AND {CONTINUE_PR_UNOWNED_CLAUSE}
                        AND (
-                         (status='open' AND {DEP_READY_CLAUSE})
+                         (status='open' AND {DEP_READY_CLAUSE}
+                            AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
                          OR (status='in-review' AND reviewer IS NULL \
                              AND (author IS NULL OR author != ?1))
                      )
@@ -762,16 +802,18 @@ pub fn claim(
             let mut selector = format!(
                 "SELECT id FROM tasks
                  WHERE json_valid(refs)
+                   AND {NO_PLANNING_FREEZE_CLAUSE}
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
-                   AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+                   AND json_extract(refs, '$.cx_size') IN ('S','M')
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                    AND {CONTINUE_PR_UNOWNED_CLAUSE}
                    AND (
-                    (status='open' AND {DEP_READY_CLAUSE})
+                    (status='open' AND {DEP_READY_CLAUSE}
+                       AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
                     OR (status='in-review' AND reviewer IS NULL \
                         AND (author IS NULL OR author != ?1))
                 )"
@@ -787,7 +829,14 @@ pub fn claim(
                 }
                 selector.push(')');
             }
-            selector.push_str(" ORDER BY priority DESC, id ASC LIMIT 1");
+            selector.push_str(
+                " ORDER BY
+                    CASE WHEN status='open' AND EXISTS (
+                        SELECT 1 FROM task_graph_members graph_priority
+                        WHERE graph_priority.task_id=tasks.id AND graph_priority.active=1
+                    ) THEN 0 ELSE 1 END,
+                    priority DESC, id ASC LIMIT 1",
+            );
 
             let sql = format!(
                 "UPDATE tasks SET
@@ -854,11 +903,12 @@ pub fn claim_provider_retry_rework(
             "UPDATE tasks SET assignee=?1, updated_at=?2
          WHERE id=?3 AND status='rework' AND assignee IS NULL
            AND {DEP_READY_CLAUSE}
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
-               AND json_extract(refs, '$.cx_size') IN ('S','M','L')
+               AND json_extract(refs, '$.cx_size') IN ('S','M')
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
                AND NOT (json_extract(refs, '$.cx_est')=5
@@ -957,7 +1007,10 @@ pub fn claim_remediation_rework_with_feedback(
 
     let status: Option<String> = tx
         .query_row(
-            &format!("SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}"),
+            &format!(
+                "SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}
+                 AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)"
+            ),
             params![id],
             |r| r.get(0),
         )
@@ -1034,6 +1087,79 @@ pub fn claim_remediation_rework_with_feedback(
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     tx.commit()?;
     Ok(Some(task))
+}
+
+/// Atomically reserve reviewer provisioning authority against the repository
+/// planning freeze. The daemon must release the opaque token after either
+/// attaching the reviewer or cleaning up a failed external provision.
+pub fn reserve_reviewer_provision(
+    conn: &mut Connection,
+    task_id: i64,
+    token: &str,
+    role: &str,
+    now: i64,
+) -> Result<bool> {
+    if token.is_empty() || token.len() > 128 || token.contains('\0') || !matches!(role, "r1" | "r2")
+    {
+        return Err(QuorumError::Usage(
+            "invalid reviewer reservation token".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let eligible: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks t
+             WHERE t.id=?1
+               AND ?2 IN ('r1','r2') AND t.status='in-review'
+               AND json_valid(t.refs)
+               AND json_type(t.refs,'$.cx_est')='integer'
+               AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
+               AND json_extract(t.refs,'$.cx_size') IN ('S','M')
+               AND json_extract(t.refs,'$.cx_ready')=1
+               AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
+               AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
+         )",
+        params![task_id, role],
+        |row| row.get(0),
+    )?;
+    if !eligible {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let inserted = tx.execute(
+        "INSERT INTO reviewer_provision_reservations(task_id,token,role,created_at)
+         VALUES (?1,?2,?3,?4)",
+        params![task_id, token, role, now],
+    );
+    if matches!(&inserted, Err(error) if crate::claims::is_unique_violation_pub(error)) {
+        return Ok(false);
+    }
+    inserted?;
+    tx.commit()?;
+    Ok(true)
+}
+
+pub fn release_reviewer_provision(
+    conn: &mut Connection,
+    task_id: i64,
+    token: &str,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "DELETE FROM reviewer_provision_reservations WHERE task_id=?1 AND token=?2",
+        params![task_id, token],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+/// Startup-only crash cleanup. The daemon lock guarantees there is no live
+/// provisioning owner when the replacement daemon calls this.
+pub fn clear_reviewer_provision_reservations(conn: &mut Connection) -> Result<usize> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute("DELETE FROM reviewer_provision_reservations", [])?;
+    tx.commit()?;
+    Ok(changed)
 }
 
 /// Daemon-private: revalidate that a remediation worker still owns the exact
@@ -1583,6 +1709,15 @@ where
     let status = task.status.parse::<Status>().map_err(QuorumError::Usage)?;
 
     match event {
+        Event::PlanningStarted
+        | Event::PlanMaterialized
+        | Event::PlanningBlocked { .. }
+        | Event::GraphCompleted => {
+            tx.commit()?;
+            return Err(QuorumError::Usage(
+                "decomposition lifecycle events require daemon authority".into(),
+            ));
+        }
         Event::SignaledDone { .. } | Event::ReworkPushed => {
             // Authorize by current assignee (fast path), then by active run
             // capability (handles replacement workers whose author field was
@@ -1805,6 +1940,15 @@ where
         now,
     )?;
 
+    // Generated children use the ordinary lifecycle, but the final transition
+    // to done also owns the decomposition aggregate. Keep child completion,
+    // graph completion, and source completion in this same write transaction
+    // for every event that can reach done (currently MergeSucceeded and
+    // PrFoundMerged).
+    if new_status == Status::Done {
+        crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
+    }
+
     before_commit(&tx)?;
 
     let mut result_task = tx.query_row(
@@ -1889,6 +2033,38 @@ pub fn update(
     fields: &TaskUpdate,
     now: i64,
 ) -> Result<Task> {
+    let edit_requested =
+        fields.body.is_some() || fields.refs.is_some() || fields.depends_on.is_some();
+    if fields.status == Some("cancelled") && !edit_requested {
+        match crate::decomposition::cancel_source_graph(
+            conn,
+            agent,
+            id,
+            fields.expected_revision,
+            now,
+        )? {
+            crate::decomposition::SourceCancellation::Cancelled => {
+                return get(conn, id)?.ok_or(QuorumError::NotHolder);
+            }
+            crate::decomposition::SourceCancellation::Rejected => {
+                return Err(QuorumError::NotHolder);
+            }
+            crate::decomposition::SourceCancellation::NotGraphSource => {}
+        }
+    }
+    struct EditableSnapshot {
+        body: Option<String>,
+        depends_on: Option<String>,
+        refs: Option<String>,
+        revision: i64,
+        edit_count: i64,
+    }
+
+    if edit_requested && fields.expected_revision.is_none() {
+        return Err(QuorumError::Usage(
+            "task edits require --expected-revision".into(),
+        ));
+    }
     if let Some(s) = fields.status {
         if !STATUSES.contains(&s) {
             return Err(QuorumError::Usage(format!("invalid status: {s}")));
@@ -1912,14 +2088,29 @@ pub fn update(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
-    let existing: Option<(Option<String>, Option<String>, Option<String>)> = tx
+    let existing: Option<EditableSnapshot> = tx
         .query_row(
-            "SELECT body, depends_on, refs FROM tasks WHERE id=?1",
+            "SELECT body, depends_on, refs, revision, edit_count FROM tasks WHERE id=?1",
             params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(EditableSnapshot {
+                    body: row.get(0)?,
+                    depends_on: row.get(1)?,
+                    refs: row.get(2)?,
+                    revision: row.get(3)?,
+                    edit_count: row.get(4)?,
+                })
+            },
         )
         .optional()?;
-    let (existing_body, existing_depends_on, existing_refs) = existing.unwrap_or_default();
+    let Some(existing) = existing else {
+        return Err(QuorumError::NotHolder);
+    };
+    let existing_body = existing.body;
+    let existing_depends_on = existing.depends_on;
+    let existing_refs = existing.refs;
+    let revision = existing.revision;
+    let edit_count = existing.edit_count;
     let classifier_input_changed = fields
         .body
         .is_some_and(|body| existing_body.as_deref() != Some(body))
@@ -1931,8 +2122,51 @@ pub fn update(
     } else {
         preserve_creator_protected_refs(&existing_refs, fields.refs)
     };
+    let edit_changed = fields
+        .body
+        .is_some_and(|body| existing_body.as_deref() != Some(body))
+        || fields
+            .depends_on
+            .is_some_and(|depends_on| existing_depends_on.as_deref() != Some(depends_on))
+        || (fields.refs.is_some() && preserved_refs != existing_refs);
 
-    let n = match fields.status {
+    if edit_requested
+        && (fields.expected_revision != Some(revision) || !edit_changed || edit_count >= 3)
+    {
+        return Err(QuorumError::NotHolder);
+    }
+
+    let generated_member: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_graph_members WHERE task_id=?1)",
+        [id],
+        |row| row.get(0),
+    )?;
+    let graph_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions
+         WHERE source_task_id=?1 AND state NOT IN ('completed','cancelled'))",
+        [id],
+        |row| row.get(0),
+    )?;
+    if fields.status == Some("cancelled") && (generated_member || graph_source) {
+        return Err(QuorumError::Usage(
+            "decomposed tasks must be cancelled through graph cancellation".into(),
+        ));
+    }
+    if edit_requested
+        && (generated_member
+            || tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_decompositions
+                 WHERE source_task_id=?1 AND accepted_plan_revision IS NOT NULL)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )?)
+    {
+        return Err(QuorumError::Usage(
+            "materialized decomposition tasks are immutable".into(),
+        ));
+    }
+
+    let mut n = match fields.status {
         Some("open") => tx.execute(
             "UPDATE tasks SET
                     status='open', assignee=NULL,
@@ -1989,7 +2223,8 @@ pub fn update(
                         body     = COALESCE(?2, body),
                         refs     = COALESCE(?3, refs),
                         updated_at = ?4
-                     WHERE id=?1 AND created_by=?5 AND assignee IS NULL AND status='open'",
+                     WHERE id=?1 AND created_by=?5 AND assignee IS NULL
+                       AND status IN ('open','planning')",
                     params![id, fields.body, preserved_refs.as_deref(), now, agent],
                 )?
             } else {
@@ -1997,6 +2232,22 @@ pub fn update(
             }
         }
     };
+    if n == 0 && edit_requested && graph_source && fields.status.is_none() {
+        n = tx.execute(
+            "UPDATE tasks SET body=COALESCE(?2,body),refs=COALESCE(?3,refs),
+                    depends_on=COALESCE(?4,depends_on),updated_at=?5
+             WHERE id=?1 AND created_by=?6 AND assignee IS NULL
+               AND status IN ('planning','failed')",
+            params![
+                id,
+                fields.body,
+                preserved_refs.as_deref(),
+                fields.depends_on,
+                now,
+                agent
+            ],
+        )?;
+    }
     if n == 0 && fields.depends_on.is_none() {
         tx.commit()?;
         return Err(QuorumError::NotHolder);
@@ -2019,6 +2270,44 @@ pub fn update(
         if dep_rows == 0 && n == 0 {
             tx.commit()?;
             return Err(QuorumError::NotHolder);
+        }
+    }
+
+    if edit_requested {
+        let revision_rows = tx.execute(
+            "UPDATE tasks SET revision=revision+1,edit_count=edit_count+1,updated_at=?3
+             WHERE id=?1 AND revision=?2 AND edit_count < 3",
+            params![id, revision, now],
+        )?;
+        if revision_rows != 1 {
+            return Err(QuorumError::NotHolder);
+        }
+        // An accepted edit before materialization cancels the pending admission
+        // aggregate and returns the new revision to ordinary classification.
+        if graph_source {
+            let graph_id: i64 = tx.query_row(
+                "SELECT id FROM task_decompositions WHERE source_task_id=?1
+                 AND accepted_plan_revision IS NULL AND active=0",
+                [id],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "DELETE FROM decomposition_attempts WHERE graph_id=?1",
+                [graph_id],
+            )?;
+            tx.execute(
+                "DELETE FROM decomposition_cleanup WHERE graph_id=?1",
+                [graph_id],
+            )?;
+            tx.execute(
+                "DELETE FROM task_graph_members WHERE graph_id=?1",
+                [graph_id],
+            )?;
+            tx.execute("DELETE FROM task_decompositions WHERE id=?1", [graph_id])?;
+            tx.execute(
+                "UPDATE tasks SET status='open',assignee=NULL WHERE id=?1",
+                [id],
+            )?;
         }
     }
 
@@ -2442,7 +2731,7 @@ pub fn classification_is_dispatchable(refs: &Option<String>) -> bool {
         return false;
     };
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
-    ready && (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L") && !(cx == 5 && size == "L")
+    ready && (1..=5).contains(&cx) && matches!(size, "S" | "M")
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -2589,9 +2878,10 @@ pub(crate) fn park_complexity_five_tx(
     Ok(true)
 }
 
-/// Reconcile category-5 rows classified by an older daemon or changed while
-/// this daemon was stopped. Each tick parks at most [`SWEEP_LIMIT`] rows in
-/// stable ID order, bounding the write transaction while guaranteeing progress.
+/// Reconcile non-admissible classifications written by an older daemon or
+/// changed while this daemon was stopped. Admission-ready L/XL implementation
+/// tasks are intentionally left open for decomposition; review-only large work
+/// is held for an external split.
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
@@ -2600,8 +2890,7 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
                AND (json_extract(refs, '$.cx_ready')!=1
-                    OR json_extract(refs, '$.cx_size')='XL'
-                    OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L'))
+                    OR (review_only=1 AND json_extract(refs, '$.cx_size') IN ('L','XL')))
              ORDER BY id
              LIMIT ?1",
         )?;
@@ -3057,6 +3346,7 @@ pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -
         &format!("closed on merge (recovery): {note}"),
         now,
     )?;
+    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
     tx.commit()?;
     Ok(true)
 }
@@ -3090,6 +3380,18 @@ pub fn close_manual(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let active_graph_source: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions
+         WHERE source_task_id=?1 AND active=1 AND state IN ('active','blocked'))",
+        [id],
+        |row| row.get(0),
+    )?;
+    if active_graph_source {
+        return Err(QuorumError::Usage(
+            "active decomposition sources cannot be manually closed; cancel the source graph"
+                .into(),
+        ));
+    }
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
          WHERE id=?1 AND status NOT IN ('done', 'cancelled')",
@@ -3111,6 +3413,7 @@ pub fn close_manual(
         &format!("by {agent}: {reason}"),
         now,
     )?;
+    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -5065,6 +5368,7 @@ mod tests {
             &TaskUpdate {
                 status: Some("cancelled"),
                 body: Some("daemon:parked:merge-blocked"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5174,6 +5478,7 @@ mod tests {
             child,
             &TaskUpdate {
                 depends_on: Some("[]"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1003,
@@ -5264,6 +5569,7 @@ mod tests {
             child,
             &TaskUpdate {
                 depends_on: Some("[]"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5295,6 +5601,7 @@ mod tests {
             id,
             &TaskUpdate {
                 depends_on: Some("[]"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -5561,6 +5868,53 @@ mod tests {
         // merging → done (MergeSucceeded)
         let r = apply_event(&mut c, "system", id, &Event::MergeSucceeded, 1005).unwrap();
         assert_eq!(r.task.status, "done");
+    }
+
+    #[test]
+    fn large_tasks_are_planning_only_and_cannot_be_claimed() {
+        let (_d, mut conn) = open_tmp();
+        let large = create(
+            &mut conn,
+            "owner",
+            "large",
+            None,
+            100,
+            None,
+            Some(r#"{"cx_est":4,"cx_size":"L"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let small = create(
+            &mut conn,
+            "owner",
+            "small",
+            None,
+            1,
+            None,
+            Some(r#"{"cx_est":2,"cx_size":"S"}"#),
+            None,
+            None,
+            2,
+        )
+        .unwrap();
+
+        let large_refs = get(&conn, large).unwrap().unwrap().refs;
+        assert!(classification_is_complete(&large_refs));
+        assert!(!classification_is_dispatchable(&large_refs));
+        assert!(claim(&mut conn, "explicit", Some(large), &[], TTL, 3)
+            .unwrap()
+            .is_none());
+
+        let claimed = claim(&mut conn, "next", None, &[], TTL, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, small);
+        let untouched = get(&conn, large).unwrap().unwrap();
+        assert_eq!(untouched.status, "open");
+        assert_eq!(untouched.assignee, None);
+        assert!(!has_live_lease(&conn, large, 4));
     }
 
     #[test]
@@ -6280,6 +6634,7 @@ mod tests {
             &TaskUpdate {
                 body: Some("new body"),
                 refs: Some(r#"{"pr":42}"#),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6316,6 +6671,7 @@ mod tests {
             id,
             &TaskUpdate {
                 body: Some("revised spec"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6350,6 +6706,7 @@ mod tests {
             id,
             &TaskUpdate {
                 body: Some("hijack"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6380,6 +6737,7 @@ mod tests {
             id,
             &TaskUpdate {
                 body: Some("nope"),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1001,
@@ -6654,6 +7012,7 @@ mod tests {
         .unwrap();
         let fields = TaskUpdate {
             refs: Some(r#"{"pr":42,"ticket":"ABC"}"#),
+            expected_revision: Some(1),
             ..Default::default()
         };
         let updated = update(&mut c, "boss", id, &fields, 1001).unwrap();
@@ -6719,6 +7078,7 @@ mod tests {
             id,
             &TaskUpdate {
                 refs: Some(r#"{"ticket":"ABC"}"#),
+                expected_revision: Some(1),
                 ..Default::default()
             },
             1004,
@@ -8842,7 +9202,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
+            "UPDATE tasks SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
             params![id],
         )
         .unwrap();
@@ -8889,7 +9249,7 @@ mod tests {
             .unwrap();
             c.execute(
                 "UPDATE tasks
-                 SET refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
+                 SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
                  WHERE id=?1",
                 params![id],
             )
@@ -8932,6 +9292,306 @@ mod tests {
         assert_eq!(
             events, total as i64,
             "repeated ticks must not duplicate audit events"
+        );
+    }
+
+    #[test]
+    fn external_edits_are_revision_bound_and_capped_without_counting_replays() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "owner", "editable", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+
+        for (revision, body) in [(1, "one"), (2, "two"), (3, "three")] {
+            let task = update(
+                &mut c,
+                "owner",
+                id,
+                &TaskUpdate {
+                    body: Some(body),
+                    expected_revision: Some(revision),
+                    ..Default::default()
+                },
+                10 + revision,
+            )
+            .unwrap();
+            assert_eq!(task.revision, revision + 1);
+            assert_eq!(task.edit_count, revision);
+        }
+
+        let replay = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("three"),
+                expected_revision: Some(3),
+                ..Default::default()
+            },
+            20,
+        );
+        assert!(matches!(replay, Err(QuorumError::NotHolder)));
+        let fourth = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("four"),
+                expected_revision: Some(4),
+                ..Default::default()
+            },
+            21,
+        );
+        assert!(matches!(fourth, Err(QuorumError::NotHolder)));
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.body.as_deref(), Some("three"));
+        assert_eq!((task.revision, task.edit_count), (4, 3));
+    }
+
+    #[test]
+    fn accepted_planning_edit_atomically_restarts_admission() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "owner", "large", None, 0, None, None, None, None, 1).unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: id,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        for now in 3..=5 {
+            crate::decomposition::record_attempt(
+                &mut c, graph, "proposal", "invalid", "retry", now,
+            )
+            .unwrap();
+        }
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "failed");
+
+        let task = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("clarified"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            (task.status.as_str(), task.revision, task.edit_count),
+            ("open", 2, 1)
+        );
+        let graphs: i64 = c
+            .query_row("SELECT count(*) FROM task_decompositions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let attempts: i64 = c
+            .query_row("SELECT count(*) FROM decomposition_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((graphs, attempts), (0, 0));
+    }
+
+    #[test]
+    fn generated_child_rejects_direct_cancel_and_scope_edit() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "owner", "large", None, 0, None, None, None, None, 1).unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        crate::decomposition::set_frozen_phase(
+            &mut c,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            3,
+        )
+        .unwrap();
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids =
+            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
+                .unwrap()
+                .unwrap();
+
+        assert!(update(
+            &mut c,
+            "owner",
+            ids[0],
+            &TaskUpdate {
+                status: Some("cancelled"),
+                ..Default::default()
+            },
+            5,
+        )
+        .is_err());
+        assert!(update(
+            &mut c,
+            "owner",
+            ids[0],
+            &TaskUpdate {
+                body: Some("changed"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            6,
+        )
+        .is_err());
+        assert_eq!(get(&c, ids[0]).unwrap().unwrap().status, "open");
+    }
+
+    #[test]
+    fn creator_cancels_materialized_graph_through_source_update() {
+        let (_d, mut c) = open_tmp();
+        let source = create(&mut c, "owner", "large", None, 0, None, None, None, None, 1).unwrap();
+        let graph = crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        crate::decomposition::set_frozen_phase(
+            &mut c,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            3,
+        )
+        .unwrap();
+        let child = |key: &str| {
+            crate::decomposition::PlannedChild {
+            local_key: key.into(),
+            title: key.into(),
+            body: format!("deliver {key}"),
+            labels: None,
+            classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+            prerequisite_keys: vec![],
+            source_dependency_ids: vec![],
+        }
+        };
+        let ids =
+            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
+                .unwrap()
+                .unwrap();
+
+        let cancelled = update(
+            &mut c,
+            "owner",
+            source,
+            &TaskUpdate {
+                status: Some("cancelled"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(ids
+            .iter()
+            .all(|id| get(&c, *id).unwrap().unwrap().status == "cancelled"));
+        assert!(matches!(
+            update(
+                &mut c,
+                "owner",
+                source,
+                &TaskUpdate {
+                    status: Some("cancelled"),
+                    expected_revision: Some(1),
+                    ..Default::default()
+                },
+                6,
+            ),
+            Err(QuorumError::NotHolder)
+        ));
+    }
+
+    #[test]
+    fn planning_freeze_atomically_blocks_all_new_task_authority() {
+        let (_dir, mut c) = open_tmp();
+        let source = create(&mut c, "owner", "large", None, 1, None,
+            Some(r#"{"cx_est":4,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1).unwrap();
+        let implementation = create(&mut c, "owner", "small", None, 1, None,
+            Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1).unwrap();
+        let review = create_with_continue_pr(&mut c, "owner", "review", None, 1, None,
+            Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, Some(42), None, 1).unwrap();
+        crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(claim(&mut c, "worker", Some(implementation), &[], 60, 3)
+            .unwrap()
+            .is_none());
+        assert!(claim(&mut c, "reviewer", Some(review), &[], 60, 3)
+            .unwrap()
+            .is_none());
+        c.execute(
+            "UPDATE tasks SET status='rework',assignee=NULL,
+            refs=json_set(refs,'$.daemon_rework_retry_requested',json('true')) WHERE id=?1",
+            [implementation],
+        )
+        .unwrap();
+        assert!(
+            claim_provider_retry_rework(&mut c, "retry", implementation, 60, 4)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            claim_remediation_rework(&mut c, "remediation", implementation, 60, 4)
+                .unwrap()
+                .is_none()
         );
     }
 }

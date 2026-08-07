@@ -8,6 +8,7 @@ mod cheatsheet;
 mod cli;
 mod cockpit;
 mod config;
+mod graph_blocker;
 mod input;
 mod output;
 mod paths;
@@ -22,46 +23,51 @@ use quorum_core::error::{QuorumError, Result};
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 
 const DEFAULT_SERVE_TOML: &str = "\
-# quorum serve config — uncomment and edit values as needed.
-# CLI flags override these; missing keys use built-in defaults.
-# See `quorum serve --help` for flag equivalents.
+# quorum serve config — edit repository paths and routing percentages as needed.
 
 ## Required — no defaults (serve will error without these or equivalent flags)
 # repo = \"owner/name\"
 # repo_dir = \"/path/to/checkout\"
 # worktree_base = \"/path/to/worktrees\"
 
-## Worker / model
-# provider = \"codex\"       # optional ChatGPT-only mode; legacy default remains Claude
-# worker_model = \"gpt-5.6-terra\"
-# worker_effort = \"medium\"
-# review_model = \"gpt-5.6-terra\"
-# review_effort = \"high\"
-# classifier_model = \"gpt-5.6-luna\"
-# classifier_effort = \"medium\"
-# collector_model = \"gpt-5.6-luna\"   # defaults to classifier_model when absent
-# collector_effort = \"medium\"        # defaults to classifier_effort when absent
-#
-# ## Advisory complexity routing policy
-# Claude: 1=sonnet-5/medium, 2=opus-46/medium, 3=opus-46/high,
-#         4=opus-47/high, 5=opus-48/high
-# Codex:  1=luna/medium, 2=terra/medium, 3=terra/high,
-#         4=sol/medium, 5=sol/high
-# The active provider selects its ladder. This is Quorum operational routing
-# policy, not a cross-vendor benchmark. Explicit task tier:/effort: labels win.
-# [suggested_models]
-# \"1\" = \"luna/medium\"  # closed tiers: sonnet-5|opus-46|opus-47|opus-48|luna|terra|sol
-# agent = \"claude\"        # managed runner: \"claude\" or \"codex\"; Grok is transport-only
+## Required model routing — every percentage pool must total exactly 100.
+[model_profiles.primary]
+runner = \"claude\"
+model = \"claude-opus-4-6\"
+effort = \"high\"
+
+[routing.classifier]
+primary = 100
+[routing.planner]
+primary = 100
+[routing.collector]
+primary = 100
+[routing.worker.\"1\"]
+primary = 100
+[routing.worker.\"2\"]
+primary = 100
+[routing.worker.\"3\"]
+primary = 100
+[routing.worker.\"4\"]
+primary = 100
+[routing.worker.\"5\"]
+primary = 100
+[routing.reviewer.\"1\"]
+primary = 100
+[routing.reviewer.\"2\"]
+primary = 100
+[routing.reviewer.\"3\"]
+primary = 100
+[routing.reviewer.\"4\"]
+primary = 100
+[routing.reviewer.\"5\"]
+primary = 100
 # cap = 4
-# model = \"sonnet\"
-# effort = \"high\"
 # names_file = \"/path/to/names.txt\"
-# agent_bin = \"claude\"
+# agent_bin = \"/path/to/provider-cli\"
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\"
-# min_model = \"opus-47\"   # floor: bump workers below this tier up to it
-# min_effort = \"high\"     # floor: medium|high
 
 ## Grok Build transport validation only; managed Grok roles are not enabled.
 # [grok]
@@ -491,6 +497,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::TaskUpdate {
             agent,
             task_id,
+            expected_revision,
             status,
             refs,
             body_stdin,
@@ -519,6 +526,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     refs: refs.as_deref(),
                     verdict: None,
                     depends_on: depends_on.as_deref(),
+                    expected_revision,
                 };
                 quorum_core::tasks::update(&mut conn, &agent, task_id, &fields, now)?
             } else {
@@ -928,18 +936,34 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             verdict,
             mut feedback,
             feedback_file,
+            feedback_json,
             blocking,
             run_id,
         } => {
             if let Some(ref v) = verdict {
                 match v.as_str() {
-                    "approved" | "changes" => {}
+                    "approved" | "changes" | "graph-blocker" => {}
                     _ => {
                         return Err(QuorumError::Usage(format!(
-                            "--verdict must be 'approved' or 'changes', got '{v}'"
+                            "--verdict must be 'approved', 'changes', or 'graph-blocker', got '{v}'"
                         )));
                     }
                 }
+            }
+            if verdict.as_deref() == Some("graph-blocker") && feedback_json.is_none() {
+                return Err(QuorumError::Usage(
+                    "--verdict graph-blocker requires --feedback-json".into(),
+                ));
+            }
+            if verdict.as_deref() == Some("graph-blocker") && pr.is_none() {
+                return Err(QuorumError::Usage(
+                    "--verdict graph-blocker requires --pr".into(),
+                ));
+            }
+            if feedback_json.is_some() && verdict.as_deref() != Some("graph-blocker") {
+                return Err(QuorumError::Usage(
+                    "--feedback-json requires --verdict graph-blocker".into(),
+                ));
             }
             if (feedback.is_some() || feedback_file.is_some())
                 && verdict.as_deref() != Some("changes")
@@ -951,8 +975,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             if let Some(path) = feedback_file {
                 feedback = Some(input::read_text(input::TextSource::File(path))?);
             }
-            verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
-                .map_err(QuorumError::Usage)?;
+            if verdict.as_deref() != Some("graph-blocker") {
+                verdict::validate(verdict.as_deref(), blocking, feedback.as_deref(), true)
+                    .map_err(QuorumError::Usage)?;
+            } else if blocking.is_some() || feedback.is_some() {
+                return Err(QuorumError::Usage(
+                    "graph-blocker uses only --feedback-json, not ordinary review feedback or --blocking"
+                        .into(),
+                ));
+            }
             let rid = resolve_run_id(run_id, "submit")?;
             let db = paths::db_path()?;
             let mut conn = quorum_core::db::open(&db)?;
@@ -964,6 +995,19 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let cap = quorum_core::capabilities::validate(&conn, &rid, &agent, expected_role, None)
                 .map_err(|e| QuorumError::Usage(format!("run-id validation: {e}")))?;
             let kind = quorum_core::mailbox::MailboxKind::Done;
+            let payload = if let Some(raw) = feedback_json {
+                let graph_feedback =
+                    graph_blocker::parse_feedback(&raw).map_err(QuorumError::Usage)?;
+                if graph_feedback.affected_task != cap.task_id {
+                    return Err(QuorumError::Usage(format!(
+                        "graph-blocker affected_task {} does not match reviewer task {}",
+                        graph_feedback.affected_task, cap.task_id
+                    )));
+                }
+                Some(graph_blocker::encode(rid, graph_feedback).map_err(QuorumError::Usage)?)
+            } else {
+                verdict::attestation_payload(blocking)
+            };
             let row = quorum_core::mailbox::MailboxRow {
                 agent,
                 kind,
@@ -973,7 +1017,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 feedback,
                 note: summary,
                 to_agent: None,
-                payload: verdict::attestation_payload(blocking),
+                payload,
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
@@ -1059,10 +1103,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo_dir,
             worktree_base,
             names_file,
-            agent,
             agent_bin,
-            model,
-            effort,
             merge_token_file,
             merge_cmd,
             merge_checks_cmd,
@@ -1135,6 +1176,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     (file_cfg, config_path_used)
                 };
 
+            // Routing is a coherent hard cutover: even an absent default file
+            // must fail before the daemon can claim work.
+            serve_config::validate_model_routing(&file_cfg)?;
+
             let r_repo_dir = resolve_str(repo_dir.as_deref(), file_cfg.repo_dir.as_deref(), "");
             if r_repo_dir.value.is_empty() {
                 return Err(QuorumError::Usage(
@@ -1152,8 +1197,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 ));
             }
             let r_cap = resolve_val(cap, file_cfg.cap, 4);
-            let r_model = resolve_str(model.as_deref(), file_cfg.model.as_deref(), "sonnet");
-            let r_effort = resolve_str(effort.as_deref(), file_cfg.effort.as_deref(), "high");
             let r_names = resolve_opt_str(names_file.as_deref(), file_cfg.names_file.as_deref());
             let r_agent_bin = resolve_opt_str(agent_bin.as_deref(), file_cfg.agent_bin.as_deref());
             let r_merge_token = resolve_opt_str(
@@ -1165,6 +1208,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_max_task_tokens = resolve_opt(max_task_tokens, file_cfg.max_task_tokens);
             let r_max_turn_cost = resolve_opt(max_turn_cost_usd, file_cfg.max_turn_cost_usd);
             let r_max_task_cost = resolve_opt(max_task_cost_usd, file_cfg.max_task_cost_usd);
+            serve_config::validate_routed_cost_limits(
+                &file_cfg,
+                r_max_turn_cost.value,
+                r_max_task_cost.value,
+            )?;
             let r_max_turn_wall = resolve_opt(max_turn_wall_secs, file_cfg.max_turn_wall_secs);
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
             let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);
@@ -1199,41 +1247,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_r2_steady_state_p = file_cfg.r2_steady_state_p.unwrap_or(1.0);
             serve_config::validate_r2_sampling(r_r2_target_per_stratum, r_r2_steady_state_p)?;
 
-            let r_suggested_models = file_cfg.suggested_models.clone().unwrap_or_default();
-            serve_config::validate_suggested_models(&r_suggested_models)?;
-
-            // #172: worker model/effort floor. Validate + convert tier→model id at load;
-            // bad tier or effort → exit 2 (Usage), consistent with serve_config style.
-            let (r_min_model, r_min_effort) = serve_config::resolve_floor(
-                file_cfg.min_model.as_deref(),
-                file_cfg.min_effort.as_deref(),
-            )?;
-
-            let roles =
-                resolve_roles(&file_cfg, agent.as_deref(), &r_model.value, &r_effort.value)?;
-            let runner_kind = roles.provider;
-            let r_model = Sourced {
-                value: roles.worker_model.clone(),
-                source: if file_cfg.worker_model.is_some() {
-                    Source::File
-                } else {
-                    r_model.source
-                },
-            };
-            let r_effort = Sourced {
-                value: roles.worker_effort.clone(),
-                source: if file_cfg.worker_effort.is_some() {
-                    Source::File
-                } else {
-                    r_effort.source
-                },
-            };
-            serve_config::validate_provider_floor(
-                runner_kind,
-                roles.provider_explicit,
-                file_cfg.min_model.as_deref(),
-            )?;
-            validate_codex_limits(runner_kind, r_max_turn_cost.value, r_max_task_cost.value)?;
+            let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
+                QuorumError::Usage("serve config requires [model_profiles]".into())
+            })?;
+            let routing = file_cfg
+                .routing
+                .clone()
+                .ok_or_else(|| QuorumError::Usage("serve config requires [routing]".into()))?;
             let codex_sandbox = file_cfg
                 .codex
                 .as_ref()
@@ -1243,20 +1263,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
                 config_path: config_path_used.as_deref(),
-                agent: runner_kind,
                 repo: &r_repo,
                 repo_dir: &r_repo_dir,
                 worktree_base: &r_wt,
                 base_branch: &r_base_branch,
                 cap: &r_cap,
-                model: &r_model,
-                effort: &r_effort,
-                review_model: &roles.review_model,
-                review_effort: &roles.review_effort,
-                classifier_model: &roles.classifier_model,
-                classifier_effort: &roles.classifier_effort,
-                collector_model: &roles.collector_model,
-                collector_effort: &roles.collector_effort,
+                model_profiles: &model_profiles,
+                routing: &routing,
                 log_dir: &r_log_dir,
                 no_bare_agent: &r_no_bare,
                 self_update_drain: &r_self_update,
@@ -1273,8 +1286,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 master_ci_gate: &r_master_ci_gate,
                 master_ci_timeout_secs: &r_master_ci_timeout,
                 doctor_enabled: &r_doctor_enabled,
-                min_model: r_min_model.as_deref(),
-                min_effort: r_min_effort.as_deref(),
             });
             eprintln!(
                 "quorum serve: {}",
@@ -1321,19 +1332,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 repo_dir: std::path::PathBuf::from(r_repo_dir.value),
                 worktree_base: std::path::PathBuf::from(r_wt.value),
                 names_file: r_names.value.map(std::path::PathBuf::from),
-                runner_kind,
                 agent_bin: r_agent_bin.value,
                 codex_sandbox,
-                model: r_model.value,
-                effort: r_effort.value,
-                provider_explicit: roles.provider_explicit,
-                review_model_explicit: roles.review_model_explicit,
-                review_model: roles.review_model,
-                review_effort: roles.review_effort,
-                classifier_model: roles.classifier_model,
-                classifier_effort: roles.classifier_effort,
-                collector_model: roles.collector_model,
-                collector_effort: roles.collector_effort,
+                model_profiles,
+                routing,
                 merge_executor,
                 bare_agent: !r_no_bare.value,
                 limits: serve::CostLimits {
@@ -1363,9 +1365,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_enabled: r_r2_enabled,
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
-                suggested_models: r_suggested_models,
-                min_model: r_min_model,
-                min_effort: r_min_effort,
             };
             Ok(serve::run_serve(config)?)
         }
@@ -1441,14 +1440,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     )));
                 }
             };
-            let repo = paths::resolve_repo()?;
-            let cfg_path = serve_config::default_config_path(&repo)?;
-            let file_cfg = serve_config::load(&cfg_path, false)?;
-            let default_model = file_cfg.model.as_deref().unwrap_or("sonnet");
-            let default_effort = file_cfg.effort.as_deref().unwrap_or("high");
             let conn = quorum_core::db::open(&paths::db_path()?)?;
-            let report =
-                quorum_core::perf::perf_with(&conn, cut, default_model, default_effort, all)?;
+            let report = quorum_core::perf::perf_with(&conn, cut, "pending", "pending", all)?;
             if json {
                 output::emit(&report);
             } else {
@@ -1511,7 +1504,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
 
                     let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                        tokio::time::Instant::now() + serve::classifier::CLASSIFIER_TIMEOUT;
                     let response = loop {
                         if let Some(result) =
                             serve::classifier::drain_classifier_events(&mut slot).await

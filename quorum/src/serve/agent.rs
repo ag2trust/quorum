@@ -34,7 +34,8 @@ pub fn new_session_id() -> String {
 pub struct AgentProc {
     child: Child,
     stdin: tokio::process::ChildStdin,
-    reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    reader: BufReader<tokio::process::ChildStdout>,
+    line_buffer: Vec<u8>,
     diagnostics: DiagnosticBuffer,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -63,6 +64,32 @@ impl AgentProc {
         request: &LaunchRequest<'_>,
         config: &AdapterConfig<'_>,
     ) -> std::io::Result<Self> {
+        Self::launch_with_deadline(request, config, None).await
+    }
+
+    /// Launch a restricted role whose total turn deadline includes feeding
+    /// the initial stdin payload. A provider that never reads cannot strand
+    /// the caller before slot ownership exists: expiry kills and reaps the
+    /// child before returning.
+    pub async fn launch_restricted_until(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<Self> {
+        if request.mode != LaunchMode::Restricted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded restricted launch requires restricted mode",
+            ));
+        }
+        Self::launch_with_deadline(request, config, Some(deadline)).await
+    }
+
+    async fn launch_with_deadline(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> std::io::Result<Self> {
         let spec = AgentSpec {
             kind: AgentKind::Claude,
             model: request.model.to_string(),
@@ -80,7 +107,12 @@ impl AgentProc {
             LaunchMode::Normal => Self::spawn(&spec, config.executable)?,
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable)?,
         };
-        if let Err(error) = proc.feed_turn(&user_turn(request.prompt)).await {
+        let turn = user_turn(request.prompt);
+        let fed = match deadline {
+            Some(deadline) => proc.feed_turn_until(&turn, deadline).await,
+            None => proc.feed_turn(&turn).await,
+        };
+        if let Err(error) = fed {
             let _ = proc.kill_and_reap().await;
             return Err(error);
         }
@@ -100,7 +132,7 @@ impl AgentProc {
     }
 
     pub fn spawn(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, false)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::None)
     }
 
     /// Spawn a closed-book classifier while preserving the configured auth
@@ -108,13 +140,21 @@ impl AgentProc {
     /// credential restrictions of `--bare`; the empty tool surface prevents
     /// the classifier from acquiring context beyond its supplied turn.
     pub fn spawn_restricted(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
-        Self::spawn_configured(spec, agent_bin, true)
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::ClosedBook)
+    }
+
+    /// Spawn a read-only planning turn. Unlike the closed-book classifier,
+    /// the planner may inspect the frozen repository, but cannot invoke Bash,
+    /// write files, load customizations, or persist a provider session.
+    #[allow(dead_code)] // consumed by the pending daemon decomposition coordinator
+    pub fn spawn_planner(spec: &AgentSpec, agent_bin: Option<&str>) -> std::io::Result<Self> {
+        Self::spawn_configured(spec, agent_bin, RestrictedMode::Planner)
     }
 
     fn spawn_configured(
         spec: &AgentSpec,
         agent_bin: Option<&str>,
-        restricted: bool,
+        restricted: RestrictedMode,
     ) -> std::io::Result<Self> {
         let bin = agent_bin.unwrap_or("claude");
         let mut cmd = Command::new(bin);
@@ -131,12 +171,18 @@ impl AgentProc {
 
         cmd.arg("--session-id").arg(&spec.session_id);
 
-        if restricted {
+        if restricted != RestrictedMode::None {
             cmd.arg("--safe-mode")
                 .arg("--disable-slash-commands")
                 .arg("--tools")
-                .arg("")
+                .arg(match restricted {
+                    RestrictedMode::Planner => "Read,Glob,Grep",
+                    _ => "",
+                })
                 .arg("--no-session-persistence");
+            if restricted == RestrictedMode::Planner {
+                cmd.arg("--add-dir").arg(&spec.worktree);
+            }
         } else {
             cmd.arg("--add-dir").arg(&spec.worktree);
         }
@@ -158,6 +204,9 @@ impl AgentProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        if restricted == RestrictedMode::Planner {
+            strip_coordination_env(&mut cmd);
+        }
 
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
@@ -176,7 +225,7 @@ impl AgentProc {
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
-        let reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -187,6 +236,7 @@ impl AgentProc {
             child,
             stdin,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task: Some(stderr_task),
         })
@@ -199,18 +249,84 @@ impl AgentProc {
         Ok(())
     }
 
+    pub async fn feed_turn_until(
+        &mut self,
+        json_turn: &str,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<()> {
+        match tokio::time::timeout_at(deadline, self.feed_turn(json_turn)).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "provider stdin feed timed out",
+            )),
+        }
+    }
+
     /// Return the next raw stdout line, or `None` on EOF/error.
     /// Used by the daemon to preserve verbatim JSONL in session logs.
     pub async fn next_raw_line(&mut self) -> Option<String> {
-        match self.reader.next_line().await {
-            Ok(Some(line)) => Some(line),
-            _ => None,
+        self.read_raw_line(None).await.ok().flatten()
+    }
+
+    /// Read one provider line while bounding the partial, not-yet-delimited
+    /// allocation. The buffer lives on the process so cancelling a polling
+    /// future cannot discard bytes already consumed from the pipe.
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        self.read_raw_line(Some(max_bytes)).await
+    }
+
+    async fn read_raw_line(&mut self, max_bytes: Option<usize>) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.line_buffer.is_empty() {
+                    return Ok(None);
+                }
+                return self.take_buffered_line();
+            }
+
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if max_bytes
+                    .is_some_and(|limit| self.line_buffer.len().saturating_add(newline) > limit)
+                {
+                    return Err(line_limit_error(max_bytes.expect("checked limit")));
+                }
+                self.line_buffer.extend_from_slice(&available[..newline]);
+                self.reader.consume(newline + 1);
+                return self.take_buffered_line();
+            }
+
+            if max_bytes
+                .is_some_and(|limit| self.line_buffer.len().saturating_add(available.len()) > limit)
+            {
+                return Err(line_limit_error(max_bytes.expect("checked limit")));
+            }
+            let consumed = available.len();
+            self.line_buffer.extend_from_slice(available);
+            self.reader.consume(consumed);
         }
+    }
+
+    fn take_buffered_line(&mut self) -> std::io::Result<Option<String>> {
+        if self.line_buffer.last() == Some(&b'\r') {
+            self.line_buffer.pop();
+        }
+        let bytes = std::mem::take(&mut self.line_buffer);
+        String::from_utf8(bytes).map(Some).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("provider stdout is not UTF-8: {error}"),
+            )
+        })
     }
 
     pub async fn next_event(&mut self) -> Option<Event> {
         loop {
-            match self.reader.next_line().await {
+            match self.read_raw_line(None).await {
                 Ok(Some(line)) => {
                     if let Some(event) = stream::parse_line(&line) {
                         return Some(event);
@@ -241,13 +357,14 @@ impl AgentProc {
     pub fn from_parts(
         child: Child,
         stdin: tokio::process::ChildStdin,
-        reader: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        reader: BufReader<tokio::process::ChildStdout>,
     ) -> Self {
         let diagnostics = DiagnosticBuffer::default();
         Self {
             child,
             stdin,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task: None,
         }
@@ -262,7 +379,7 @@ impl AgentProc {
         // Reap the child to avoid zombie accumulation
         let _ = self.child.wait().await;
         let mut terminal = Vec::new();
-        while let Ok(Some(line)) = self.reader.next_line().await {
+        while let Ok(Some(line)) = self.read_raw_line(None).await {
             terminal.push(CapturedOutput::Stdout(line));
         }
         let diagnostics = self.diagnostics.clone();
@@ -272,6 +389,13 @@ impl AgentProc {
         terminal.extend(diagnostics.drain());
         terminal
     }
+}
+
+fn line_limit_error(limit: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("provider stdout line exceeded {limit}-byte limit"),
+    )
 }
 
 fn normalize_event(event: Event) -> Vec<AgentEvent> {
@@ -354,6 +478,26 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RestrictedMode {
+    None,
+    ClosedBook,
+    Planner,
+}
+
+fn strip_coordination_env(cmd: &mut Command) {
+    for name in [
+        "QUORUM_AGENT",
+        "QUORUM_HOME",
+        "QUORUM_REPO",
+        "QUORUM_RUN_ID",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ] {
+        cmd.env_remove(name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,7 +520,7 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
-        let reader = BufReader::new(child.stdout.take().unwrap()).lines();
+        let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let diagnostics = DiagnosticBuffer::default();
         let stderr_diagnostics = diagnostics.clone();
@@ -386,6 +530,7 @@ mod tests {
             child,
             stdin,
             reader,
+            line_buffer: Vec::new(),
             diagnostics,
             stderr_task: Some(stderr_task),
         }
@@ -493,6 +638,35 @@ mod tests {
             event.is_some(),
             "claude exited without emitting any stream event — the restricted \
              classifier argument surface was rejected at CLI validation"
+        );
+    }
+
+    /// Planner-specific read-only arguments must clear the real CLI parser.
+    /// Blanked credentials make this a zero-token boundary test.
+    #[tokio::test]
+    async fn real_cli_accepts_restricted_planner_spec_args() {
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = classifier_spec(tmp.path(), false);
+        spec.model = "claude-opus-4-6".into();
+        spec.effort = "high".into();
+        spec.allowed_tools = "Read,Glob,Grep".into();
+        spec.env_vars = no_auth_env(tmp.path());
+
+        let mut proc = AgentProc::spawn_planner(&spec, None).expect("spawn planner claude");
+        proc.feed_turn(&user_turn("return an empty JSON object"))
+            .await
+            .expect("feed planner turn");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("planner claude produced no event within 60s");
+        let _ = proc.kill_and_reap().await;
+        assert!(
+            event.is_some(),
+            "claude rejected the planner argument boundary before authentication"
         );
     }
 

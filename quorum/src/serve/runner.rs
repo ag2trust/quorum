@@ -228,6 +228,37 @@ impl RunnerProc {
         }
     }
 
+    /// Restricted classifier launch whose deadline covers Claude's initial
+    /// stdin feed as well as the returned slot lifetime. Single-turn adapters
+    /// receive their prompt in argv and therefore have no pre-slot pipe wait.
+    pub async fn launch_restricted_until(
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<Self> {
+        if request.mode != LaunchMode::Restricted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bounded restricted launch requires restricted mode",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "restricted provider launch timed out",
+            ));
+        }
+        let kind = AgentKind::for_model(request.model)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        match kind {
+            AgentKind::Claude => AgentProc::launch_restricted_until(request, config, deadline)
+                .await
+                .map(Self::Claude),
+            AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
+            AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
+        }
+    }
+
     pub fn kind(&self) -> AgentKind {
         match self {
             Self::Claude(_) => AgentKind::Claude,
@@ -265,6 +296,23 @@ impl RunnerProc {
             Self::Claude(proc) => proc.next_raw_line().await,
             Self::Codex(proc) => proc.next_raw_line().await,
             Self::Grok(proc) => proc.next_raw_line().await,
+        }
+    }
+
+    /// Read one line with a hard boundary on bytes accumulated before a line
+    /// terminator. Classifier and planner roles use this cancellation-safe
+    /// boundary before accepting provider output into role-owned buffers.
+    pub async fn next_raw_line_bounded(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::Grok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bounded role reads are unavailable for the Grok adapter",
+            )),
         }
     }
 
