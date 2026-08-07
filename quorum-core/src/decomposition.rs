@@ -87,10 +87,22 @@ pub struct StartupReconcileResult {
     pub held: usize,
 }
 
-/// Reconcile every materialized active/blocked graph before generic daemon
-/// recovery. Incomplete graphs with no delivery evidence reset safely; once
-/// evidence exists, inconsistency is held for owner intervention.
+/// Reconcile durable decomposition state before generic daemon recovery.
+/// Provider retries created before the frozen-base reset fix may retain a SHA
+/// in `draining`; clear only that impossible retry state so the guarded bind
+/// can capture a fresh base. Incomplete materialized graphs with no delivery
+/// evidence reset safely; once evidence exists, inconsistency is held for
+/// owner intervention.
 pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<StartupReconcileResult> {
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE task_decompositions SET frozen_base_sha=NULL,updated_at=?1
+         WHERE state='draining' AND active=0 AND freeze_active=1
+           AND provider_failures>0 AND frozen_base_sha IS NOT NULL",
+        [now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+
     let graph_ids = {
         let mut stmt = conn.prepare(
             "SELECT id FROM task_decompositions WHERE state IN ('active','blocked') ORDER BY id",
@@ -431,7 +443,7 @@ pub fn record_attempt(
     } else if kind == "provider" {
         tx.execute(
             "UPDATE task_decompositions SET state='provider-backoff',freeze_active=0,
-                 updated_at=?2 WHERE id=?1",
+                 frozen_base_sha=NULL,updated_at=?2 WHERE id=?1",
             params![graph_id, now],
         )?;
     }
@@ -1958,6 +1970,176 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_rebinds_a_fresh_frozen_base_after_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider-retry-frozen-base.db");
+        {
+            let conn = crate::db::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let graph = {
+            let mut conn = crate::db::open(&path).unwrap();
+            begin_planning(
+                &mut conn,
+                &BeginPlanning {
+                    source_task_id: 1,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "sol",
+                    frozen_base_sha: "ignored-until-drained",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first_sha = "0123456789abcdef0123456789abcdef01234567";
+        {
+            let mut conn = crate::db::open(&path).unwrap();
+            assert!(
+                set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3,)
+                    .unwrap()
+            );
+            assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, first_sha, 4).unwrap());
+        }
+        {
+            let mut conn = crate::db::open(&path).unwrap();
+            assert_eq!(
+                record_attempt(
+                    &mut conn,
+                    graph,
+                    "provider",
+                    "timeout",
+                    "planner timed out",
+                    5,
+                )
+                .unwrap(),
+                Some(1)
+            );
+        }
+        {
+            let conn = crate::db::open(&path).unwrap();
+            let state: (String, i64, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT state,freeze_active,frozen_base_sha,provider_failures
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("provider-backoff".into(), 0, None, 1));
+        }
+        {
+            let mut conn = crate::db::open(&path).unwrap();
+            assert!(reacquire_freeze(&mut conn, graph, 6).unwrap());
+            assert!(
+                set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 7,)
+                    .unwrap()
+            );
+            let retry_sha = "fedcba9876543210fedcba9876543210fedcba98";
+            assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, retry_sha, 8).unwrap());
+        }
+        let conn = crate::db::open(&path).unwrap();
+        let rebound: (String, String, i64) = conn
+            .query_row(
+                "SELECT state,frozen_base_sha,provider_failures
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            rebound,
+            (
+                "planning".into(),
+                "fedcba9876543210fedcba9876543210fedcba98".into(),
+                1,
+            )
+        );
+    }
+
+    #[test]
+    fn concurrent_provider_retry_reacquire_has_one_clean_winner() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider-retry-reacquire-race.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "ignored-until-drained",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+        bind_frozen_base_and_enter_planning(
+            &mut conn,
+            graph,
+            "0123456789abcdef0123456789abcdef01234567",
+            4,
+        )
+        .unwrap();
+        record_attempt(
+            &mut conn,
+            graph,
+            "provider",
+            "timeout",
+            "planner timed out",
+            5,
+        )
+        .unwrap();
+        drop(conn);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    reacquire_freeze(&mut conn, graph, 6).unwrap()
+                })
+            })
+            .collect();
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(winners, 1);
+
+        let conn = crate::db::open(&path).unwrap();
+        let state: (String, i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state,freeze_active,frozen_base_sha,provider_failures
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("freeze-requested".into(), 1, None, 1));
+    }
+
+    #[test]
     fn cancellation_preserves_done_member_and_revokes_unfinished() {
         let mut conn = setup();
         let graph = begin(&mut conn);
@@ -2329,6 +2511,85 @@ mod tests {
             assert_eq!(result.reset, 0);
             assert_eq!(result.held, 0);
         }
+    }
+
+    #[test]
+    fn startup_reconciliation_repairs_pre_fix_provider_retry_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale-provider-retry.db");
+        let graph = {
+            let mut conn = crate::db::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('large','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            let graph = begin_planning(
+                &mut conn,
+                &BeginPlanning {
+                    source_task_id: 1,
+                    expected_revision: 1,
+                    provider: "claude",
+                    model: "opus",
+                    frozen_base_sha: "ignored-until-drained",
+                    now: 2,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap();
+            bind_frozen_base_and_enter_planning(
+                &mut conn,
+                graph,
+                "0123456789abcdef0123456789abcdef01234567",
+                4,
+            )
+            .unwrap();
+            record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "protocol",
+                "missing outcome",
+                5,
+            )
+            .unwrap();
+            reacquire_freeze(&mut conn, graph, 6).unwrap();
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 7).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET frozen_base_sha=?2 WHERE id=?1",
+                params![graph, "0123456789abcdef0123456789abcdef01234567"],
+            )
+            .unwrap();
+            graph
+        };
+
+        let mut conn = crate::db::open(&path).unwrap();
+        reconcile_startup_graphs(&mut conn, 8).unwrap();
+        assert!(bind_frozen_base_and_enter_planning(
+            &mut conn,
+            graph,
+            "fedcba9876543210fedcba9876543210fedcba98",
+            9,
+        )
+        .unwrap());
+        let state: (String, String, i64) = conn
+            .query_row(
+                "SELECT state,frozen_base_sha,provider_failures
+                 FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "planning".into(),
+                "fedcba9876543210fedcba9876543210fedcba98".into(),
+                1,
+            )
+        );
     }
 
     #[test]

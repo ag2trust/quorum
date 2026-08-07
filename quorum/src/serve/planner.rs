@@ -20,6 +20,8 @@ pub const MAX_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
+const MAX_REJECTION_SUMMARIES: usize = 3;
+const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
@@ -65,8 +67,8 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
     let retry_json = serde_json::to_string(
         &rejection_summaries
             .iter()
-            .take(3)
-            .map(|summary| summary.chars().take(1024).collect::<String>())
+            .take(MAX_REJECTION_SUMMARIES)
+            .map(|summary| truncate_utf8(summary, MAX_REJECTION_SUMMARY_BYTES).to_owned())
             .collect::<Vec<_>>(),
     )
     .expect("rejection summaries serialize");
@@ -75,9 +77,27 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          closed DAG of 2-8 independently deliverable implementation tasks, each size S or M. \
          Preserve every source constraint. Do not create synthetic integration work, recursive \
          planning, or unrelated scope. Dependencies must be real delivery prerequisites and may \
-         reference another task key or source:<dependency-id>. Return exactly one closed JSON \
-         object matching the PLAN/BLOCKER protocol; no markdown or commentary.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+         reference another task key or source:<dependency-id>. Return exactly one valid JSON \
+         object, with no markdown or commentary. The object must be exactly one of these closed \
+         shapes: do not omit, rename, or add fields.\n\
+         PLAN={{\"outcome\":\"plan\",\"tasks\":[{{\"key\":\"<lowercase-ascii-key>\",\"title\":\"<title>\",\"observable_outcome\":\"<observable-outcome>\",\"acceptance_criteria\":[\"<criterion>\"],\"source_constraints\":[\"<constraint>\"],\"verification_expectations\":[\"<verification>\"],\"prerequisites\":[\"<task-key-or-source:positive-id>\"]}}]}}\n\
+         BLOCKER={{\"outcome\":\"blocker\",\"category\":\"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>\",\"evidence\":[\"<evidence>\"],\"required_decision\":\"<decision>\",\"why_no_safe_split\":\"<reason>\"}}\n\
+         `outcome` must be exactly `plan` or `blocker`; use PLAN only when it has 2-8 tasks. \
+         PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated \
+         to {MAX_REJECTION_SUMMARY_BYTES} bytes. On retry, use only those summaries to correct \
+         the cited semantic defect; do not discuss them or request more context.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 /// Recheck proposal dependencies against the authoritative source snapshot.
@@ -753,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_prompt_is_bounded_and_contains_only_structured_retry_summaries() {
+    fn planner_prompt_declares_the_exact_closed_plan_and_blocker_shapes() {
         let dependencies = vec![3, 4];
         let source = PlanningSource {
             task_id: 7,
@@ -762,10 +782,53 @@ mod tests {
             body: Some("preserve atomicity"),
             dependencies: &dependencies,
         };
-        let prompt = build_prompt(&source, &["cycle detected".into(), "x".repeat(5000)]);
+        let prompt = build_prompt(&source, &[]);
+        assert!(prompt.contains("do not omit, rename, or add fields"));
+        assert!(prompt.contains(
+            r#"PLAN={"outcome":"plan","tasks":[{"key":"<lowercase-ascii-key>","title":"<title>","observable_outcome":"<observable-outcome>","acceptance_criteria":["<criterion>"],"source_constraints":["<constraint>"],"verification_expectations":["<verification>"],"prerequisites":["<task-key-or-source:positive-id>"]}]}"#
+        ));
+        assert!(prompt.contains(
+            r#"BLOCKER={"outcome":"blocker","category":"<ambiguous_scope|missing_decision|external_constraint|no_safe_split>","evidence":["<evidence>"],"required_decision":"<decision>","why_no_safe_split":"<reason>"}"#
+        ));
+        assert!(prompt.contains("`outcome` must be exactly `plan` or `blocker`"));
+    }
+
+    #[test]
+    fn planner_prompt_bounds_retry_feedback_and_instructs_its_use() {
+        let dependencies = vec![3, 4];
+        let source = PlanningSource {
+            task_id: 7,
+            revision: 2,
+            title: "large outcome",
+            body: Some("preserve atomicity"),
+            dependencies: &dependencies,
+        };
+        let prompt = build_prompt(
+            &source,
+            &[
+                "cycle detected".into(),
+                "bad field".into(),
+                "x".repeat(MAX_REJECTION_SUMMARY_BYTES + 1),
+                "must not be included".into(),
+            ],
+        );
         assert!(prompt.len() < MAX_PROMPT_BYTES);
         assert!(prompt.contains("cycle detected"));
-        assert!(!prompt.contains(&"x".repeat(1025)));
-        assert!(!prompt.contains("transcript"));
+        assert!(!prompt.contains(&"x".repeat(MAX_REJECTION_SUMMARY_BYTES + 1)));
+        assert!(!prompt.contains("must not be included"));
+        assert!(prompt.contains(&format!(
+            "PRIOR_REJECTIONS contains at most {MAX_REJECTION_SUMMARIES} summaries, each truncated to {MAX_REJECTION_SUMMARY_BYTES} bytes"
+        )));
+        assert!(prompt
+            .contains("On retry, use only those summaries to correct the cited semantic defect"));
+    }
+
+    #[test]
+    fn retry_summary_truncation_preserves_utf8_at_the_byte_limit() {
+        let summary = "😀".repeat(300);
+        let truncated = truncate_utf8(&summary, MAX_REJECTION_SUMMARY_BYTES);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.len() <= MAX_REJECTION_SUMMARY_BYTES);
+        assert_eq!(truncated, "😀".repeat(256));
     }
 }
