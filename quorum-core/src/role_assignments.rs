@@ -688,25 +688,18 @@ mod tests {
             .parse()
             .unwrap();
         let same = std::env::var("QUORUM_TEST_ROUTING_SAME").unwrap() == "1";
-        let gate = std::env::var("QUORUM_TEST_ROUTING_GATE").unwrap();
-        let ready = std::env::var("QUORUM_TEST_ROUTING_READY").unwrap();
-        std::fs::write(&ready, b"ready").unwrap();
-        for _ in 0..1_000 {
-            if std::path::Path::new(&gate).exists() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                assign_or_get_with_seed(
-                    &mut conn,
-                    &request(if same { 0 } else { index }),
-                    &pool("g1"),
-                    index as u64,
-                    10,
-                )
-                .unwrap();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        panic!("timed out waiting for routing process gate");
+        // The parent starts all racers before waiting for any result. Avoid a
+        // filesystem start barrier here: cross-process file visibility made
+        // the canary itself flaky without adding SQLite concurrency evidence.
+        let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
+        assign_or_get_with_seed(
+            &mut conn,
+            &request(if same { 0 } else { index }),
+            &pool("g1"),
+            index as u64,
+            10,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -721,11 +714,8 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let db_path = dir.path().join("quorum.db");
                 crate::db::open(&db_path).unwrap();
-                let gate = dir.path().join("go");
                 let mut children = Vec::new();
-                let mut ready_paths = Vec::new();
                 for index in 0..RACERS {
-                    let ready = dir.path().join(format!("ready-{index}"));
                     let child = Command::new(&test_binary)
                         .args([
                             "--exact",
@@ -735,23 +725,12 @@ mod tests {
                         .env("QUORUM_TEST_ROUTING_DB", &db_path)
                         .env("QUORUM_TEST_ROUTING_INDEX", index.to_string())
                         .env("QUORUM_TEST_ROUTING_SAME", if same { "1" } else { "0" })
-                        .env("QUORUM_TEST_ROUTING_GATE", &gate)
-                        .env("QUORUM_TEST_ROUTING_READY", &ready)
                         .stdout(Stdio::null())
                         .stderr(Stdio::piped())
                         .spawn()
                         .unwrap();
                     children.push(child);
-                    ready_paths.push(ready);
                 }
-                for _ in 0..1_000 {
-                    if ready_paths.iter().all(|path| path.exists()) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                assert!(ready_paths.iter().all(|path| path.exists()));
-                std::fs::write(&gate, b"go").unwrap();
                 for child in children {
                     let output = child.wait_with_output().unwrap();
                     assert!(

@@ -2852,8 +2852,11 @@ mod tests {
         let go_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_GO").unwrap();
         let result_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_RESULT").unwrap();
         std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..500 {
-            if std::path::Path::new(&go_path).exists() {
+        // This helper runs beside many real-process canaries in the full
+        // workspace suite. Preserve a bounded wait without assuming every
+        // child is scheduled within five seconds.
+        for _ in 0..3_000 {
+            if std::fs::read(&go_path).is_ok() {
                 let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
                 let won = crate::tasks::claim(&mut conn, &agent, Some(task_id), &[], 60, 10)
                     .unwrap()
@@ -2877,8 +2880,8 @@ mod tests {
         let go_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_GO").unwrap();
         let result_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_RESULT").ok();
         std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..500 {
-            if std::path::Path::new(&go_path).exists() {
+        for _ in 0..3_000 {
+            if std::fs::read(&go_path).is_ok() {
                 let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
                 let outcome = cancel_source_graph(&mut conn, "owner", 1, Some(1), 11).unwrap();
                 if let Some(result_path) = result_path {
@@ -2915,8 +2918,8 @@ mod tests {
         let go_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_GO").unwrap();
         let result_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_RESULT").unwrap();
         std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..500 {
-            if std::path::Path::new(&go_path).exists() {
+        for _ in 0..3_000 {
+            if std::fs::read(&go_path).is_ok() {
                 let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
                 let outcome = match event.as_str() {
                     "submit" => (

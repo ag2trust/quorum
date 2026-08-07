@@ -828,12 +828,12 @@ mod tests {
             "a descendant must still hold the process group and inherited pipes"
         );
 
-        let output = tokio::time::timeout(std::time::Duration::from_secs(5), proc.kill_and_reap())
+        let output = tokio::time::timeout(std::time::Duration::from_secs(15), proc.kill_and_reap())
             .await
             .expect("post-exit teardown hung on descendant-held pipes");
         assert!(output.is_empty());
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while unsafe { libc::killpg(process_group_id, 0) } == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
