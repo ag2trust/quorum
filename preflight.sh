@@ -20,18 +20,62 @@
 set -u
 
 QUICK=0
+CONTINUATION_FROM=
+CONTINUATION_SET=0
+PROPOSED_SHA=
+PROPOSED_SET=0
+HOOK_FORMAT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
+    --continuation-from=*)
+      [ "$CONTINUATION_SET" -eq 0 ] \
+        || { printf 'preflight.sh: duplicate --continuation-from\n' >&2; exit 2; }
+      CONTINUATION_FROM=${arg#*=}
+      CONTINUATION_SET=1
+      ;;
+    --proposed-sha=*)
+      [ "$PROPOSED_SET" -eq 0 ] \
+        || { printf 'preflight.sh: duplicate --proposed-sha\n' >&2; exit 2; }
+      PROPOSED_SHA=${arg#*=}
+      PROPOSED_SET=1
+      ;;
+    --hook-format-only) HOOK_FORMAT_ONLY=1 ;;
     -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) printf 'preflight.sh: unknown arg: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
 
+if [ "$CONTINUATION_SET" -eq 1 ] && [ -z "$CONTINUATION_FROM" ]; then
+  printf 'preflight.sh: --continuation-from requires a commit\n' >&2
+  exit 2
+fi
+if [ "$PROPOSED_SET" -eq 1 ] && [ -z "$PROPOSED_SHA" ]; then
+  printf 'preflight.sh: --proposed-sha requires a commit\n' >&2
+  exit 2
+fi
+if { [ "$CONTINUATION_SET" -eq 1 ] || [ "$PROPOSED_SET" -eq 1 ] \
+  || [ "$HOOK_FORMAT_ONLY" -eq 1 ]; } && [ "$QUICK" -ne 1 ]; then
+  printf 'preflight.sh: hook-only options require --quick\n' >&2
+  exit 2
+fi
+if [ "$CONTINUATION_SET" -eq 1 ] && [ "$PROPOSED_SET" -ne 1 ]; then
+  printf 'preflight.sh: --continuation-from requires --proposed-sha\n' >&2
+  exit 2
+fi
+if [ "$HOOK_FORMAT_ONLY" -eq 1 ] \
+  && { [ "$CONTINUATION_SET" -eq 1 ] || [ "$PROPOSED_SET" -eq 1 ]; }; then
+  printf 'preflight.sh: --hook-format-only conflicts with publication options\n' >&2
+  exit 2
+fi
+
 fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
 
 # --- Gate 1: branch base ------------------------------------------------------
 printf '=== preflight 1/4: branch base ===\n'
+if [ "$HOOK_FORMAT_ONLY" -eq 1 ]; then
+  printf 'non-publication push — branch base not applicable\n'
+else
 git fetch origin --quiet || fail "git fetch origin"
 # Fail loud if origin/main is absent — otherwise the git log pipelines below
 # error mid-pipe, N_SESSIONS silently becomes 0, and the gate passes vacuously.
@@ -40,6 +84,12 @@ git rev-parse --verify --quiet origin/main >/dev/null \
 BASE_REF=origin/main
 INTEGRATION=0
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
+TIP=HEAD
+if [ "$PROPOSED_SET" -eq 1 ]; then
+  git cat-file -e "$PROPOSED_SHA^{commit}" 2>/dev/null \
+    || fail "proposed SHA is not a local commit"
+  TIP=$PROPOSED_SHA
+fi
 # Detect an intentional develop -> main integration from immutable ancestry, not
 # from a branch-name convention. Daemon-owned branches are always named
 # `daemon/<agent>-t<task>` and therefore cannot preserve a caller's
@@ -48,29 +98,38 @@ BRANCH=$(git rev-parse --abbrev-ref HEAD)
 # keep the stricter single-session check.
 if git rev-parse --verify --quiet origin/develop >/dev/null \
   && ! git merge-base --is-ancestor origin/develop origin/main \
-  && git merge-base --is-ancestor origin/main HEAD \
-  && git merge-base --is-ancestor origin/develop HEAD; then
+  && git merge-base --is-ancestor origin/main "$TIP" \
+  && git merge-base --is-ancestor origin/develop "$TIP"; then
   BASE_REF=origin/develop
   INTEGRATION=1
 fi
-if [ "$BRANCH" = "main" ]; then
+if [ "$BRANCH" = "main" ] && [ "$PROPOSED_SET" -eq 0 ]; then
   printf 'on main — nothing to compare, skipping\n'
 else
-  # Every commit ahead of origin/main must be this PR's own work. Multiple
-  # distinct Co-Authored-By sessions ahead of main means the branch was cut from
-  # another feature branch (#114) — rebase onto origin/main before pushing.
-  if [ "$INTEGRATION" -eq 1 ]; then
+  # Every branch-owned commit must be this push's own work. Multiple distinct
+  # Co-Authored-By sessions in that range mean the branch was cut from another
+  # feature branch (#114) — rebase onto the applicable base before pushing.
+  if [ -n "$CONTINUATION_FROM" ]; then
+    git cat-file -e "$CONTINUATION_FROM^{commit}" 2>/dev/null \
+      || fail "continuation base is not a local commit"
+    git merge-base --is-ancestor "$CONTINUATION_FROM" "$TIP" \
+      || fail "continuation base is not an ancestor of proposed SHA"
+    BASE_REF=$CONTINUATION_FROM
+    OWN_COMMITS=$(git rev-list "$CONTINUATION_FROM".."$TIP")
+    printf 'continuation commits after published remote head:\n'
+    git log --oneline "$CONTINUATION_FROM".."$TIP"
+  elif [ "$INTEGRATION" -eq 1 ]; then
     # Main's commits are inherited integration input, not work authored by the
     # sync session. Inspect only commits belonging to neither remote history.
-    OWN_COMMITS=$(git rev-list HEAD --not origin/main origin/develop)
+    OWN_COMMITS=$(git rev-list "$TIP" --not origin/main origin/develop)
     printf 'integration-only commits:\n'
     if [ -n "$OWN_COMMITS" ]; then
       git show -s --oneline $OWN_COMMITS
     fi
   else
-    OWN_COMMITS=$(git rev-list "$BASE_REF"..HEAD)
+    OWN_COMMITS=$(git rev-list "$BASE_REF".."$TIP")
     printf 'commits ahead of %s:\n' "$BASE_REF"
-    git log --oneline "$BASE_REF"..HEAD
+    git log --oneline "$BASE_REF".."$TIP"
   fi
   # Dedupe on the session-name token only ("Flint-r3 (Claude Opus 4.6) <...>" →
   # "Flint-r3") — trailer model-string formats vary within one session.
@@ -92,6 +151,7 @@ else
     printf 'note: %s commit(s) ahead carry no Co-Authored-By trailer — sessions unattributable; eyeball the commit list above\n' "$N_AHEAD"
   fi
   printf 'branch base OK (%s session(s) ahead of %s)\n' "$N_SESSIONS" "$BASE_REF"
+fi
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------
