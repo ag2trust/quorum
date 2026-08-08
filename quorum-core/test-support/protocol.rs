@@ -77,6 +77,7 @@ pub struct AllocateRoleInput {
     pub db_path: PathBuf,
     pub index: usize,
     pub same_responsibility: bool,
+    pub barrier: Barrier,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -122,4 +123,5 @@ pub struct ApplyGraphEventInput {
 pub struct ClaimCleanupInput {
     pub db_path: PathBuf,
     pub now: i64,
+    pub barrier: Barrier,
 }

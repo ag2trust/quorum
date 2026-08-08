@@ -474,8 +474,6 @@ fn deterministic_tombstone(key: &CleanupKey, object: &Map<String, Value>) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-    use std::process::Stdio;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -752,64 +750,6 @@ mod tests {
             .unwrap(),
             "exhausted"
         );
-    }
-
-    #[test]
-    #[ignore]
-    fn process_claim_helper() {
-        let Ok(path) = std::env::var("QUORUM_CLEANUP_CLAIM_DB") else {
-            return;
-        };
-        let mut conn = crate::db::open(std::path::Path::new(&path)).unwrap();
-        let won = claim_next(&mut conn, 20).unwrap().is_some();
-        println!("CLEANUP_CLAIM_WIN={}", i32::from(won));
-    }
-
-    #[test]
-    fn concurrent_processes_have_exactly_one_claim_winner() {
-        let binary = std::env::current_exe().unwrap();
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join(format!("quorum-{iteration}.db"));
-            let conn = crate::db::open(&path).unwrap();
-            seed(&conn);
-            insert(&conn, "process", process_ref(), 1);
-            drop(conn);
-            let spawn = || {
-                Command::new(&binary)
-                    .args([
-                        "--ignored",
-                        "--exact",
-                        "decomposition_cleanup::tests::process_claim_helper",
-                        "--nocapture",
-                    ])
-                    .env("QUORUM_CLEANUP_CLAIM_DB", &path)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            };
-            let a = spawn();
-            let b = spawn();
-            let outputs = [a.wait_with_output().unwrap(), b.wait_with_output().unwrap()];
-            assert!(outputs.iter().all(|output| output.status.success()));
-            let winners = outputs
-                .iter()
-                .filter(|output| {
-                    String::from_utf8_lossy(&output.stdout).contains("CLEANUP_CLAIM_WIN=1")
-                })
-                .count();
-            assert_eq!(winners, 1, "iteration {iteration}");
-            let conn = crate::db::open(&path).unwrap();
-            let state: (String, i64) = conn
-                .query_row(
-                    "SELECT state,attempts FROM decomposition_cleanup",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(state, ("running".into(), 1), "iteration {iteration}");
-        }
     }
 
     #[test]
