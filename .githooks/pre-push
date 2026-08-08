@@ -18,6 +18,9 @@ fail() {
 
 [ "$#" -eq 2 ] || fail "expected remote name and URL arguments"
 
+REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$REPO_ROOT" || exit 1
+
 # Git supplies one line per proposed ref update:
 #   <local-ref> <local-sha> <remote-ref> <remote-sha>
 # Read at most two so the daemon's atomic cleanup transaction can be recognized
@@ -28,8 +31,11 @@ REMOTE_REF_1=
 REMOTE_SHA_1=
 EXTRA_1=
 if ! read -r LOCAL_REF_1 LOCAL_SHA_1 REMOTE_REF_1 REMOTE_SHA_1 EXTRA_1; then
-  [ -n "$LOCAL_REF_1$LOCAL_SHA_1$REMOTE_REF_1$REMOTE_SHA_1$EXTRA_1" ] \
-    || fail "missing pre-push ref update"
+  if [ -z "$LOCAL_REF_1$LOCAL_SHA_1$REMOTE_REF_1$REMOTE_SHA_1$EXTRA_1" ]; then
+    # Git omits up-to-date refs from the hook feed, so a valid no-op push has
+    # empty stdin. Preserve the ordinary quick gate, including formatting.
+    exec ./preflight.sh --quick
+  fi
 fi
 [ -z "$EXTRA_1" ] || fail "malformed pre-push ref update"
 
@@ -58,9 +64,6 @@ is_oid() {
 is_zero_oid() {
   printf '%s\n' "$1" | grep -Eq '^(0{40}|0{64})$'
 }
-
-REPO_ROOT=$(git rev-parse --show-toplevel) || exit 1
-cd "$REPO_ROOT" || exit 1
 
 validate_update() {
   local_ref=$1
@@ -124,7 +127,9 @@ fi
 # push still keeps the formatting half of the mandatory quick gate.
 case "$REMOTE_REF_1" in
   refs/heads/quorum-cleanup/*)
-    if is_zero_oid "$LOCAL_SHA_1" && ! is_zero_oid "$REMOTE_SHA_1"; then
+    if is_cleanup_create "$LOCAL_REF_1" "$LOCAL_SHA_1" \
+      "$REMOTE_REF_1" "$REMOTE_SHA_1" \
+      || { is_zero_oid "$LOCAL_SHA_1" && ! is_zero_oid "$REMOTE_SHA_1"; }; then
       exec ./preflight.sh --quick --hook-format-only
     fi
     fail "invalid cleanup ref update"

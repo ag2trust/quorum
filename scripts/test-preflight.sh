@@ -75,6 +75,18 @@ cp "$ROOT/.githooks/pre-push" .githooks/pre-push
 chmod +x .githooks/pre-push
 git config core.hooksPath .githooks
 
+# Git invokes pre-push with empty stdin when every selected ref is already up
+# to date. The no-op must still run the ordinary quick gate and formatting.
+git switch -q main
+if PREFLIGHT_CARGO_FAIL=1 PATH="$BIN:$PATH" git push -q origin main \
+  >"$TMP/noop-format.out" 2>&1; then
+  echo 'expected formatting failure to reject an up-to-date push' >&2
+  exit 1
+fi
+grep -q 'PREFLIGHT: FAIL (cargo fmt)' "$TMP/noop-format.out"
+PATH="$BIN:$PATH" git push -q origin main >"$TMP/noop.out" 2>&1
+grep -q 'PREFLIGHT: PASS (quick' "$TMP/noop.out"
+
 # The daemon may replay an exact durable source SHA after mutable HEAD moves.
 # Prove both an initial publication and an existing-branch continuation use the
 # proposed tuple SHA throughout instead of silently substituting HEAD.
@@ -182,6 +194,21 @@ PATH="$BIN:$PATH" git push -q origin ':refs/heads/quorum-cleanup/preflight-t3'
 if git --git-dir="$REMOTE" rev-parse --verify -q \
   refs/heads/quorum-cleanup/preflight-t3 >/dev/null; then
   echo 'cleanup tombstone deletion did not reach the remote' >&2
+  exit 1
+fi
+
+# If the publication branch is already absent, production records cleanup by
+# creating only the tombstone ref. That single-ref sibling must also settle.
+PATH="$BIN:$PATH" git push -q origin \
+  "$WORKER_B_SHA:refs/heads/quorum-cleanup/preflight-absent-t3"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
+  refs/heads/quorum-cleanup/preflight-absent-t3)
+[ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+PATH="$BIN:$PATH" git push -q origin \
+  ':refs/heads/quorum-cleanup/preflight-absent-t3'
+if git --git-dir="$REMOTE" rev-parse --verify -q \
+  refs/heads/quorum-cleanup/preflight-absent-t3 >/dev/null; then
+  echo 'single-ref cleanup tombstone did not retire' >&2
   exit 1
 fi
 
