@@ -108,7 +108,9 @@ pub fn planner_exec_args(spec: &CodexSpec) -> Vec<String> {
         "-C".into(),
         spec.worktree.display().to_string(),
         "--skip-git-repo-check".into(),
+        "--ephemeral".into(),
         "--ignore-user-config".into(),
+        "--ignore-rules".into(),
         spec.prompt.clone(),
     ]
 }
@@ -652,13 +654,41 @@ mod tests {
         spec.model = "gpt-5.6-sol".into();
         spec.effort = "high".into();
         let args = planner_exec_args(&spec);
-        assert_eq!(args[3], "gpt-5.6-sol");
-        assert!(args.windows(2).any(|pair| pair == ["-s", "read-only"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-c", "model_reasoning_effort=high"]));
-        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".into()));
-        assert!(args.contains(&"--ignore-user-config".into()));
+        assert_eq!(
+            args,
+            [
+                "exec",
+                "--json",
+                "--model",
+                "gpt-5.6-sol",
+                "-c",
+                "model_reasoning_effort=high",
+                "-s",
+                "read-only",
+                "-C",
+                "/tmp",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "say hello",
+            ]
+        );
+        for forbidden in [
+            "--approve-for-me",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            "--add-dir",
+            "workspace-write",
+            "danger-full-access",
+            "resume",
+            "--last",
+        ] {
+            assert!(
+                !args.iter().any(|arg| arg == forbidden),
+                "planner boundary contains forbidden argument {forbidden}"
+            );
+        }
     }
 
     // ── Pinned resume argument shape ─────────────────────────────────────
@@ -726,6 +756,61 @@ mod tests {
             ..test_spec()
         };
         assert_eq!(spec.env_vars[0], ("FOO".into(), "bar".into()));
+    }
+
+    #[tokio::test]
+    async fn planner_spawn_strips_coordination_authority_but_preserves_provider_auth() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_codex = tmp.path().join("fake-codex");
+        std::fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_id":"%s","gh_token":"%s","github_token":"%s","openai_api_key":"%s","codex_home":"%s","harmless":"%s"}\n' "$QUORUM_AGENT" "$QUORUM_HOME" "$QUORUM_REPO" "$QUORUM_RUN_ID" "$GH_TOKEN" "$GITHUB_TOKEN" "$OPENAI_API_KEY" "$CODEX_HOME" "$HARMLESS"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let spec = CodexSpec {
+            worktree: tmp.path().to_path_buf(),
+            env_vars: vec![
+                ("QUORUM_AGENT".into(), "agent-authority".into()),
+                ("QUORUM_HOME".into(), "home-authority".into()),
+                ("QUORUM_REPO".into(), "repo-authority".into()),
+                ("QUORUM_RUN_ID".into(), "run-authority".into()),
+                ("GH_TOKEN".into(), "gh-authority".into()),
+                ("GITHUB_TOKEN".into(), "github-authority".into()),
+                ("OPENAI_API_KEY".into(), "provider-auth".into()),
+                ("CODEX_HOME".into(), "provider-home".into()),
+                ("HARMLESS".into(), "preserved".into()),
+            ],
+            ..test_spec()
+        };
+        let mut proc = CodexProc::spawn_planner(&spec, fake_codex.to_str()).unwrap();
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
+            .await
+            .expect("fake Codex did not emit its environment")
+            .expect("fake Codex exited without emitting its environment");
+        let _ = proc.kill_and_reap().await;
+        let env: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        for stripped in [
+            "quorum_agent",
+            "quorum_home",
+            "quorum_repo",
+            "quorum_run_id",
+            "gh_token",
+            "github_token",
+        ] {
+            assert_eq!(env[stripped], "", "{stripped} reached the planner child");
+        }
+        assert_eq!(env["openai_api_key"], "provider-auth");
+        assert_eq!(env["codex_home"], "provider-home");
+        assert_eq!(env["harmless"], "preserved");
     }
 
     // ── Zero-token real-binary contract tests ────────────────────────────
@@ -812,6 +897,36 @@ mod tests {
         assert!(
             event.is_some(),
             "codex exited without JSONL — restricted classifier arguments were rejected"
+        );
+    }
+
+    /// Positive zero-token contract for the planner-specific launch shape.
+    /// An emitted JSONL event proves the installed CLI accepted every pinned
+    /// isolation flag before the blank authentication environment stops work.
+    #[tokio::test]
+    async fn real_cli_accepts_planner_args() {
+        if !codex_available() {
+            eprintln!("skipped: no codex binary on PATH");
+            return;
+        }
+        let codex_home = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let spec = CodexSpec {
+            model: "gpt-5.6-sol".into(),
+            effort: "high".into(),
+            sandbox: "read-only".into(),
+            worktree: worktree.path().to_path_buf(),
+            prompt: "return an empty JSON object".into(),
+            env_vars: no_auth_env(codex_home.path()),
+        };
+        let mut proc = CodexProc::spawn_planner(&spec, None).expect("spawn planner codex");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
+            .await
+            .expect("planner codex produced no event within 60s");
+        let _ = proc.kill_and_reap().await;
+        assert!(
+            event.is_some(),
+            "codex rejected the planner isolation arguments before authentication"
         );
     }
 
