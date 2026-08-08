@@ -15,6 +15,7 @@ pub mod collector;
 pub mod doctor;
 pub mod grok_agent;
 pub mod merge;
+pub mod merged_continuation;
 pub mod names;
 pub mod planner;
 pub mod recovery;
@@ -4940,6 +4941,47 @@ async fn reconcile_remediation_retries(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergedContinuationTrigger {
+    Startup,
+    Tick,
+}
+
+/// Production policy seam for merged-continuation recovery. Startup is
+/// deliberately fail-open so unrelated daemon recovery can proceed; a normal
+/// tick propagates the error to the tick loop's standard error policy.
+async fn reconcile_merged_continuations(
+    db_path: &Path,
+    trigger: MergedContinuationTrigger,
+) -> Result<merged_continuation::ReconcileOutcome> {
+    let result = match trigger {
+        MergedContinuationTrigger::Startup => merged_continuation::startup(db_path).await,
+        MergedContinuationTrigger::Tick => merged_continuation::tick(db_path).await,
+    };
+    match result {
+        Ok(outcome) => {
+            if outcome.adopted > 0 {
+                let phase = match trigger {
+                    MergedContinuationTrigger::Startup => "startup",
+                    MergedContinuationTrigger::Tick => "tick",
+                };
+                log(&format!(
+                    "merged-continuation {phase} reconciliation adopted {}/{} candidate(s) while scanning {} event(s)",
+                    outcome.adopted, outcome.examined, outcome.scanned
+                ));
+            }
+            Ok(outcome)
+        }
+        Err(error) if trigger == MergedContinuationTrigger::Startup => {
+            log(&format!(
+                "merged-continuation startup reconciliation failed: {error} — continuing"
+            ));
+            Ok(merged_continuation::ReconcileOutcome::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -5075,6 +5117,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             log(&format!("approval recovery failed: {e} — continuing"));
         }
     }
+
+    reconcile_merged_continuations(&config.db_path, MergedContinuationTrigger::Startup).await?;
 
     // M7: stateless crash recovery — kill stale processes, wipe journal,
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
@@ -5477,6 +5521,11 @@ async fn tick(
         },
     )
     .await?;
+
+    // Graph consistency authority runs first. Exact merged-continuation
+    // adoption is then settled before any ordinary recovery or provisioning
+    // can observe the failed member.
+    reconcile_merged_continuations(&db_path, MergedContinuationTrigger::Tick).await?;
 
     // Reconcile policy-blocked classifications written by older daemons before
     // any mailbox recovery or provisioning path can regain authority.
