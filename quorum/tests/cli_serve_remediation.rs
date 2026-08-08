@@ -2545,6 +2545,46 @@ fn terminal_parked_retry_markers_reconcile_once_without_provisioning() {
         "{:?}",
         restarted.lines
     );
+    // Task updates are consumed in Phase 2. Once this row is consumed, SIGINT
+    // can only be acted on between ticks, after Phase 5c has run.
+    let tick_witness = {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::mailbox::append(
+            &mut conn,
+            &quorum_core::mailbox::MailboxRow {
+                agent: "restart-tick-witness".into(),
+                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                task_id: None,
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: Some("prove restarted tick reached Phase 2".into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap()
+    };
+    restarted.wait_until("restarted tick to consume its mailbox witness", 15, || {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+            [tick_witness],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        unsafe { libc::kill(restarted.child.id() as libc::pid_t, libc::SIGINT) },
+        0,
+        "signal daemon after witnessed tick: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        restarted.wait_for("shutting down (signal, no in-flight agents)", 15),
+        "restart did not finish its witnessed tick before graceful shutdown: {:?}",
+        restarted.lines
+    );
     restarted.terminate_and_drain();
     assert!(
         restarted
