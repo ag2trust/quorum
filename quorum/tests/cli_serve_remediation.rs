@@ -1572,6 +1572,13 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
         "create gh release FIFO: {}",
         std::io::Error::last_os_error()
     );
+    // Retain both ends before the daemon starts so releasing cannot block on
+    // opening a writer if the bounded gh child exits after publishing started.
+    let mut release_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&release_fifo)
+        .expect("open retained gh release FIFO handle");
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
 
@@ -1671,7 +1678,7 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
         String::from_utf8_lossy(&cancelled.stderr)
     );
 
-    std::fs::write(&release_fifo, "release\n").unwrap();
+    release_handle.write_all(b"release\n").unwrap();
     assert!(
         handle.wait_for("claim lost after PR lookup", 15),
         "post-lookup claim loss was not observed: {:?}",
