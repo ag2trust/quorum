@@ -1809,13 +1809,17 @@ only the failed child, records recovery provenance while preserving the PR, then
 final-child completion. Missing or expired evidence, replay, and losing concurrent callers are
 clean no-ops with no events; the winner emits bounded completion events once. After graph
 consistency reconciliation and before generic stateless lifecycle recovery or provisioning, the
-daemon automatically discovers eligible deliveries at startup and on ordinary ticks. Discovery consumes
-at most eight physical rows from the durable lifecycle-event sequence in ascending `seq` order,
+daemon automatically discovers eligible deliveries at startup and on ordinary ticks. Discovery
+consumes at most eight physical rows from the durable lifecycle-event sequence in ascending `seq` order,
 then resolves explicit `source_task`, graph membership, PR targets, and live publication/merge
 evidence using short reads only. It never scans terminal-task history or performs network I/O.
-A dedicated monotonic cursor is acknowledged only after every guarded adoption call in the page;
-durable rejections therefore cannot starve later events, and a crash before application or after
-the core commit replays safely. Startup discovery failure is logged and fail-open; tick failure
+A dedicated monotonic cursor is acknowledged only after every guarded adoption call and durable
+retry-marker write in the page. If the short read observes an unfinished sibling and the core
+remains a clean negative, the daemon records one idempotent, TTL-bounded marker for the exact
+child/recovery pair. A later sibling `task_done` event uses that marker to rediscover the recovery
+without scanning terminal-task history. Every settled page advances, so a stalled graph cannot
+starve later deliveries. A crash before application or after the core or marker commit replays
+safely. Startup discovery failure is logged and fail-open; tick failure
 uses the ordinary tick error policy without advancing the cursor. The guarded transaction remains
 the sole adoption authority. The complete predicate is specified in the decomposition technical
 specification.

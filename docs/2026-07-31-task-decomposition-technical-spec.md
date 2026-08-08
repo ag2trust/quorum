@@ -69,16 +69,21 @@ bounded child and graph completion events exactly once.
 
 The daemon invokes this primitive automatically after graph consistency reconciliation and before
 generic stateless lifecycle recovery or provisioning, once at startup and once per ordinary tick.
-Discovery reads at most eight physical lifecycle-event rows in ascending sequence order from a dedicated
-persisted cursor. It filters for a live terminal `task_done` record, then resolves the candidate's
+Discovery reads at most eight physical lifecycle-event rows in ascending sequence order from a
+dedicated persisted cursor. It filters for a live terminal `task_done` record, then resolves the candidate's
 explicit `source_task`, active graph membership, PR targets, and live publication/merge evidence
 through primary-key/subject-indexed short reads. It neither scans all done tasks nor performs
 network I/O. The read connection closes before any guarded core write begins.
 
 The daemon acknowledges the event page monotonically only after every candidate application
-returns successfully. Permanent core rejections therefore advance rather than starving later
-deliveries. A crash before application leaves the cursor unchanged; a crash after core commit but
-before acknowledgement replays an idempotent no-op. A startup-pass error is logged and does not
+and retry-marker write returns successfully. The short read also records whether another active
+sibling is unfinished. If that snapshot is partial and the guarded call remains a clean negative,
+the daemon records one idempotent, TTL-bounded event marker for the exact child/recovery pair. A
+later sibling `task_done` event follows that marker back to the recovery through bounded
+active-graph and subject-indexed reads. Every settled page advances rather than letting a stalled
+graph starve later deliveries. A crash before application leaves the cursor unchanged; a crash
+after the core or marker commit but before acknowledgement replays an idempotent no-op. A
+startup-pass error is logged and does not
 block other recovery, while a normal-tick error follows the ordinary tick error policy; neither
 advances the page. Candidate discovery grants no authority beyond the guarded core predicate and
 cannot recover a `blocked` graph: graph-blocker scope defects still require source cancellation

@@ -2,9 +2,11 @@
 //!
 //! Discovery consumes a fixed-size page of the durable lifecycle-event stream.
 //! Its persisted monotonic cursor makes rejected deliveries unable to starve
-//! later ones, while advancing only after the guarded core calls gives crash
-//! replay at-least-once semantics. The evidence connection is dropped before
-//! any adoption transaction is opened.
+//! later ones. A clean negative observed while another graph sibling is still
+//! unfinished records a bounded, durable retry marker; a later sibling-done
+//! event rediscovers that exact recovery. Every settled page advances only
+//! after the guarded core calls. The evidence connection is dropped before any
+//! adoption transaction is opened.
 
 use std::path::{Path, PathBuf};
 
@@ -17,12 +19,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 const EVENT_PAGE_LIMIT: i64 = 8;
 const CURSOR_AGENT: &str = "quorum-serve";
 const CURSOR_TOPIC: &str = "events:merged-continuation:v1";
+const PENDING_EVENT_KIND: &str = "merged_continuation_pending";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Candidate {
     original_child_id: i64,
     recovery_task_id: i64,
     pr_number: i64,
+    has_unfinished_sibling: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,24 +77,31 @@ fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
     };
     for candidate in page.candidates {
         let mut conn = quorum_core::db::open(db_path)?;
-        if quorum_core::decomposition::adopt_recovery_delivery(
+        let adopted = quorum_core::decomposition::adopt_recovery_delivery(
             &mut conn,
             candidate.original_child_id,
             candidate.recovery_task_id,
             now,
-        )? {
+        )?;
+        if adopted {
             outcome.adopted += 1;
             super::log(&format!(
                 "merged-continuation: adopted task #{} from recovery task #{} on PR #{}",
                 candidate.original_child_id, candidate.recovery_task_id, candidate.pr_number
             ));
+        } else if candidate.has_unfinished_sibling {
+            // This is the one clean-negative predicate that can become true
+            // later without another event for the recovery task. Persist the
+            // exact pair so an ordinary sibling completion can trigger it.
+            persist_pending_candidate(&mut conn, candidate, now)?;
         }
     }
 
-    // Ack only after every core application in the page succeeds. A crash or
-    // error before this point replays the page; a crash after an adoption but
-    // before this ack replays a clean core no-op. MAX preserves monotonicity if
-    // a stale caller ever races a newer pass.
+    // Ack only after every core application and pending-marker write in the
+    // page succeeds. A crash before this point replays the page; a crash after
+    // an adoption or marker commit but before this ack replays an idempotent
+    // no-op. MAX preserves monotonicity if a stale caller ever races a newer
+    // pass.
     if let Some(through_seq) = page.through_seq {
         let mut conn = quorum_core::db::open(db_path)?;
         advance_cursor(&mut conn, through_seq)?;
@@ -141,7 +152,11 @@ fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
         else {
             continue;
         };
-        if let Some(candidate) = select_candidate(conn, recovery_task_id, now)? {
+        let candidate = match select_candidate(conn, recovery_task_id, now)? {
+            some @ Some(_) => some,
+            None => select_pending_candidate(conn, recovery_task_id, now)?,
+        };
+        if let Some(candidate) = candidate {
             candidates.push(candidate);
         }
     }
@@ -151,6 +166,53 @@ fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
         scanned: events.len(),
         candidates,
     })
+}
+
+/// A graph member's `task_done` event is the bounded retry trigger for a
+/// recovery that arrived before all siblings were done. The active graph is
+/// globally unique and contains at most eight members; the marker lookup uses
+/// the `(subject, seq)` event index and then re-enters the exact candidate
+/// prefilter by primary key.
+fn select_pending_candidate(
+    conn: &Connection,
+    completed_task_id: i64,
+    now: i64,
+) -> Result<Option<Candidate>> {
+    let pending: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT original.id,pending.body
+             FROM task_graph_members completed
+             JOIN task_decompositions graph ON graph.id=completed.graph_id
+             JOIN task_graph_members member
+               ON member.graph_id=graph.id
+              AND member.active=1
+              AND member.plan_revision=graph.accepted_plan_revision
+             JOIN tasks original ON original.id=member.task_id
+             JOIN events pending ON pending.subject='task#' || original.id
+             WHERE completed.task_id=?1
+               AND completed.active=1
+               AND completed.plan_revision=graph.accepted_plan_revision
+               AND graph.state='active' AND graph.active=1
+               AND original.status='failed'
+               AND pending.kind=?2 AND pending.expires_at>?3
+             ORDER BY original.id ASC,pending.seq DESC
+             LIMIT 1",
+            params![completed_task_id, PENDING_EVENT_KIND, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((original_child_id, body)) = pending else {
+        return Ok(None);
+    };
+    let Some(recovery_task_id) = body
+        .strip_prefix("task#")
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|task_id| *task_id > 0)
+    else {
+        return Ok(None);
+    };
+    Ok(select_candidate(conn, recovery_task_id, now)?
+        .filter(|candidate| candidate.original_child_id == original_child_id))
 }
 
 /// Resolve one event-identified delivery using persisted graph, PR-target,
@@ -163,7 +225,14 @@ fn select_candidate(
     now: i64,
 ) -> Result<Option<Candidate>> {
     conn.query_row(
-        "SELECT original.id,recovery.id,recovery_target.pr_number
+        "SELECT original.id,recovery.id,recovery_target.pr_number,
+                EXISTS (
+                    SELECT 1 FROM task_graph_members sibling
+                    JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
+                    WHERE sibling.graph_id=graph.id AND sibling.active=1
+                      AND sibling.task_id!=original.id
+                      AND sibling_task.status!='done'
+                )
          FROM tasks recovery
          JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
          JOIN tasks original
@@ -209,11 +278,35 @@ fn select_candidate(
                 original_child_id: row.get(0)?,
                 recovery_task_id: row.get(1)?,
                 pr_number: row.get(2)?,
+                has_unfinished_sibling: row.get(3)?,
             })
         },
     )
     .optional()
     .map_err(Into::into)
+}
+
+fn persist_pending_candidate(conn: &mut Connection, candidate: Candidate, now: i64) -> Result<()> {
+    let subject = format!("task#{}", candidate.original_child_id);
+    let body = format!("task#{}", candidate.recovery_task_id);
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    tx.execute(
+        "INSERT INTO events(ts,kind,subject,body,expires_at)
+         SELECT ?1,?2,?3,?4,?5
+         WHERE NOT EXISTS (
+             SELECT 1 FROM events
+             WHERE kind=?2 AND subject=?3 AND body=?4 AND expires_at>?1
+         )",
+        params![
+            now,
+            PENDING_EVENT_KIND,
+            subject,
+            body,
+            now + quorum_core::events::EVENT_TTL_SECS
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn advance_cursor(conn: &mut Connection, through_seq: i64) -> Result<()> {
@@ -493,6 +586,74 @@ mod tests {
             adopted,
             "nine durable rejected pairs must not hide the later valid delivery"
         );
+        assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
+    async fn recovery_done_before_sibling_completion_is_retried_and_releases_graph() {
+        let fixture = IncidentFixture::new();
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='working' WHERE id=304", [])
+            .unwrap();
+        drop(conn);
+
+        let partial = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(partial.examined, 1);
+        assert_eq!(partial.adopted, 0);
+        assert!(fixture.cursor().is_some(), "the bounded page must advance");
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind=?1 AND subject='task#307' AND body='task#320'",
+                [PENDING_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "the partial graph must retain retry authority");
+        drop(conn);
+        assert_eq!(fixture.status(307), "failed");
+        assert_eq!(fixture.status(299), "decomposed");
+
+        // Model a crash after the marker commit but before the page ack. The
+        // replay must not append a second marker.
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE cursors SET last_seq=0 WHERE agent_id=?1 AND topic=?2",
+            params![CURSOR_AGENT, CURSOR_TOPIC],
+        )
+        .unwrap();
+        drop(conn);
+        let replay = reconcile(fixture.db_path.clone(), NOW + 1).await.unwrap();
+        assert_eq!(replay.adopted, 0);
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let pending_after_replay: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind=?1 AND subject='task#307' AND body='task#320'",
+                [PENDING_EVENT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_after_replay, 1);
+        drop(conn);
+
+        // The later event identifies sibling #304, not recovery #320. A fresh
+        // reconciliation call models daemon restart and must rediscover #320
+        // from the durable pending marker without rewinding the event cursor.
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=304", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (?1,'task_done','task#304','by system',?2)",
+            params![NOW + 2, LIVE_UNTIL],
+        )
+        .unwrap();
+        drop(conn);
+
+        let completed = reconcile(fixture.db_path.clone(), NOW + 2).await.unwrap();
+        assert_eq!(completed.adopted, 1);
         assert_incident_released(&fixture);
     }
 
