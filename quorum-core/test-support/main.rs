@@ -148,6 +148,7 @@ fn allocate_role(input: AllocateRoleInput) -> Result<OperationResult, HelperErro
     if input.index > 100_000 {
         return Err(HelperError::usage("allocation index exceeds 100000"));
     }
+    wait_at_barrier(&input.barrier)?;
     let index = if input.same_responsibility {
         0
     } else {
@@ -264,6 +265,7 @@ fn apply_graph_event(input: ApplyGraphEventInput) -> Result<OperationResult, Hel
 
 fn claim_cleanup(input: ClaimCleanupInput) -> Result<OperationResult, HelperError> {
     validate_path("database", &input.db_path)?;
+    wait_at_barrier(&input.barrier)?;
     let mut conn = quorum_core::db::open(&input.db_path)?;
     let work = quorum_core::decomposition_cleanup::claim_next(&mut conn, input.now)?;
     Ok(match work {
