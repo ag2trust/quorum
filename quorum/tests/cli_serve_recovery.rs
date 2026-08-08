@@ -212,6 +212,42 @@ fi
         }
     }
 
+    /// Wait until the daemon has completed at least one full scheduling tick.
+    ///
+    /// Phase 2 consumes each mailbox marker. Inserting the second marker only
+    /// after the first is consumed makes its observation prove that the prior
+    /// tick reached the later recovery and provisioning phases.
+    fn wait_for_completed_tick(&mut self, home: &std::path::Path) {
+        let db_path = home.join("repos/test__repo/quorum.db");
+        for marker in ["RecoveryTick0", "RecoveryTick1"] {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::mailbox::append(
+                &mut conn,
+                &quorum_core::mailbox::MailboxRow {
+                    agent: marker.into(),
+                    kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                    task_id: None,
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: Some("readiness barrier".into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            drop(conn);
+            assert!(
+                self.wait_for(
+                    &format!("consuming unmatched task_update from {marker}"),
+                    15,
+                ),
+                "daemon did not consume readiness marker {marker}. Lines: {:?}",
+                self.lines
+            );
+        }
+    }
+
     fn extract_agent_name(&self, prefix: &str) -> Option<String> {
         for line in &self.lines {
             if let Some(rest) = line.split(prefix).nth(1) {
@@ -431,8 +467,6 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
         "reviewer not provisioned for in-review task after restart. Lines: {:?}",
         handle2.lines
     );
-
-    std::thread::sleep(Duration::from_millis(500));
     handle2.drain_pending_lines();
 
     // ── Invariant: NO fresh worker spawn for task #1 after restart. ──
@@ -748,9 +782,7 @@ fn exit75_in_review_recovered_without_worker_respawn() {
         "recovery did not complete. Lines: {:?}",
         handle.lines
     );
-
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    handle.wait_for_completed_tick(home.path());
 
     // Task stays in-review.
     let conn = quorum_core::db::open(&db_path).unwrap();
@@ -1090,17 +1122,20 @@ fn recovery_stale_mailbox_drained_on_respawn() {
 
     let mut handle = env.start_serve();
 
-    // Recovery resets task to open, then Phase 6 spawns Agent0. The tick loop
-    // consumes stale mailbox rows (either via F9 drain or message processing).
+    // Recovery resets task to open. With no live Agent0 slot yet, Phase 4c
+    // consumes both stale messages before Phase 6 logs the replacement spawn.
+    for _ in 0..2 {
+        assert!(
+            handle.wait_for("consuming message from Agent0 with no to_agent", 15),
+            "stale mailbox row was not consumed. Lines: {:?}",
+            handle.lines
+        );
+    }
     assert!(
         handle.wait_for("spawning agent Agent0", 15),
         "Phase 6 did not re-spawn Agent0. Lines: {:?}",
         handle.lines
     );
-
-    // Give the spawn + mailbox processing a moment to settle.
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
 
     // Verify the stale mailbox rows are consumed (no unconsumed rows remain).
     {

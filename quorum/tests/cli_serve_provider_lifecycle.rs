@@ -67,7 +67,10 @@ if [ "$1" = "exec" ]; then
   printf '{"type":"turn.started"}\n'
   printf '{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"done"}}\n'
   printf '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n'
-  sleep 30
+  hold="$RUNNER_LOG.hold.$$"
+  mkfifo "$hold"
+  trap 'rm -f "$hold"' EXIT
+  read -r _ < "$hold"
 else
   while IFS= read -r line; do
     printf '{"type":"assistant","message":{"content":"done"}}\n'
@@ -423,6 +426,36 @@ fi
 
     fn db(&self) -> rusqlite::Connection {
         quorum_core::db::open(&self.home.path().join("repos/test__repo/quorum.db")).unwrap()
+    }
+
+    /// Wait until the daemon has completed at least one full scheduling tick.
+    ///
+    /// A single mailbox marker is observed in Phase 2, before reviewer and
+    /// worker provisioning. Appending the second marker only after the first
+    /// is consumed forces it into a later tick, proving that every phase of
+    /// the prior tick ran without relying on its 500ms cadence.
+    fn wait_for_completed_tick(&mut self) {
+        for marker in ["ProviderLifecycleTick0", "ProviderLifecycleTick1"] {
+            let mut conn = self.db();
+            quorum_core::mailbox::append(
+                &mut conn,
+                &quorum_core::mailbox::MailboxRow {
+                    agent: marker.into(),
+                    kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                    task_id: None,
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: Some("readiness barrier".into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            drop(conn);
+            self.handle
+                .wait_for(&format!("consuming unmatched task_update from {marker}"));
+        }
     }
 
     fn restart(&mut self, default_provider: &str, model: &str) {
@@ -1213,7 +1246,6 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
         ],
     );
     case.handle.wait_for("PARKED: task #1");
-    std::thread::sleep(Duration::from_millis(500));
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
@@ -1615,7 +1647,7 @@ fn drain_park_of_remediation_stays_owner_gated_on_restart() {
     let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     case.restart_after_stop("claude", "claude-opus-4-6", None);
     case.handle.wait_for("recovery: complete");
-    std::thread::sleep(Duration::from_millis(750));
+    case.wait_for_completed_tick();
     let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     assert_eq!(
         runner_log_after_restart, runner_log_before_restart,
@@ -1713,7 +1745,6 @@ fn remediation_retry_for_implementation_task_preserves_feedback_and_codex_thread
         ],
     );
     case.handle.wait_for("PARKED: task #1");
-    std::thread::sleep(Duration::from_millis(250));
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
@@ -1851,7 +1882,7 @@ fn strict_codex_restart_does_not_resume_interrupted_claude_reviewer() {
     let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     case.restart_with_role_config("codex", "gpt-5.6-terra", Some(CHATGPT_ONLY_ROLE_CONFIG));
     case.handle.wait_for("recovery: complete");
-    std::thread::sleep(Duration::from_millis(750));
+    case.wait_for_completed_tick();
 
     let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     assert_eq!(
