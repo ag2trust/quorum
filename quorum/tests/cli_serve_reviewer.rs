@@ -1559,9 +1559,16 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         handle.lines
     );
 
-    // Teardown is complete only after the journal row is removed. At that
-    // point the terminal task state cannot be considered for review spawning.
+    // Journal deletion happens before reviewer reconciliation in the same
+    // tick, so it is only the starting point for the negative-path barrier.
     wait_for_journal_absent(home.path(), &worker_name);
+
+    // Done rows are processed one per tick. Seeing the second phantom barrier
+    // consumed proves a complete intervening tick reached Phase 5/5b after
+    // teardown; a forbidden reviewer spawn would now be durable and logged.
+    append_done_barrier(home.path(), "CancelledBarrier1");
+    let second_barrier = append_done_barrier(home.path(), "CancelledBarrier2");
+    wait_for_mailbox_consumed(home.path(), second_barrier);
     assert_eq!(journal_role_count(home.path(), "reviewer"), 0);
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);

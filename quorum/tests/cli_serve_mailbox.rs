@@ -221,6 +221,25 @@ fi
         None
     }
 
+    fn suspend(&mut self) {
+        let pid = self.child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGSTOP) },
+            0,
+            "failed to suspend daemon process {pid}"
+        );
+        wait_for_process_suspended(pid);
+    }
+
+    fn resume(&mut self) {
+        let pid = self.child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGCONT) },
+            0,
+            "failed to resume daemon process {pid}"
+        );
+    }
+
     fn stop(mut self) {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
@@ -289,6 +308,23 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         "done failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn append_phase4c_barrier(home: &std::path::Path, target: &str) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db_path).unwrap();
+    let row = quorum_core::mailbox::MailboxRow {
+        agent: "ReworkPhaseBarrier".to_string(),
+        kind: quorum_core::mailbox::MailboxKind::Message,
+        task_id: None,
+        pr: None,
+        verdict: None,
+        feedback: None,
+        note: None,
+        to_agent: Some(target.to_string()),
+        payload: Some("phase barrier".to_string()),
+    };
+    quorum_core::mailbox::append(&mut conn, &row).unwrap();
 }
 
 /// Insert a raw mailbox row directly via the quorum DB (bypasses CLI).
@@ -378,6 +414,89 @@ fn wait_for_process_terminated(pid: i32) {
                 Err(error) => {
                     WaitState::Pending(format!("could not inspect process {pid} state: {error}"))
                 }
+            }
+        },
+    );
+}
+
+fn wait_for_process_suspended(pid: i32) {
+    wait_until(
+        &format!("daemon process {pid} to suspend"),
+        Duration::from_secs(15),
+        || {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output();
+            match output {
+                Ok(output) if !output.status.success() || output.stdout.is_empty() => {
+                    WaitState::Pending(format!("daemon process {pid} was absent"))
+                }
+                Ok(output) => {
+                    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if state.starts_with('T') {
+                        WaitState::Ready(())
+                    } else {
+                        WaitState::Pending(format!("daemon process {pid} state was {state:?}"))
+                    }
+                }
+                Err(error) => WaitState::Pending(format!(
+                    "could not inspect daemon process {pid} state: {error}"
+                )),
+            }
+        },
+    );
+}
+
+fn wait_for_task_status(home: &std::path::Path, task_id: i64, expected: &str) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("task #{task_id} status {expected:?}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db_path) {
+            Ok(conn) => {
+                let status = conn
+                    .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .ok();
+                if status.as_deref() == Some(expected) {
+                    WaitState::Ready(())
+                } else {
+                    WaitState::Pending(format!("task #{task_id} status was {status:?}"))
+                }
+            }
+            Err(error) => {
+                WaitState::Pending(format!("could not open {}: {error}", db_path.display()))
+            }
+        },
+    );
+}
+
+fn wait_for_journal_absent(home: &std::path::Path, agent: &str) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("journal teardown for agent {agent}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db_path) {
+            Ok(conn) => {
+                let count = conn.query_row(
+                    "SELECT COUNT(*) FROM journal WHERE agent=?1",
+                    [agent],
+                    |row| row.get::<_, i64>(0),
+                );
+                match count {
+                    Ok(0) => WaitState::Ready(()),
+                    Ok(count) => {
+                        WaitState::Pending(format!("journal still has {count} row(s) for {agent}"))
+                    }
+                    Err(error) => WaitState::Pending(format!(
+                        "could not query {}: {error}",
+                        db_path.display()
+                    )),
+                }
+            }
+            Err(error) => {
+                WaitState::Pending(format!("could not open {}: {error}", db_path.display()))
             }
         },
     );
@@ -823,8 +942,23 @@ fn rework_feed_failure_releases_task() {
         handle.lines
     );
 
-    // Kill this test's worker so its stdin pipe breaks, but keep the reviewer
-    // alive long enough to submit the changes verdict with its original cap.
+    // A message to an absent agent is handled in Phase 4c, after Phase 4b.
+    // Suspend from that late-tick marker while the worker is still alive, so
+    // the next Phase 2 must see the verdict before any later death scan.
+    let phase_barrier_target = "MissingReworkPhaseBarrier";
+    append_phase4c_barrier(home.path(), phase_barrier_target);
+    assert!(
+        handle.wait_for(
+            &format!("consuming message to {phase_barrier_target} (no active worker)"),
+            15,
+        ),
+        "daemon did not reach the post-death-scan barrier. Lines: {:?}",
+        handle.lines
+    );
+    handle.suspend();
+
+    // The paused daemon retains this worker slot while the process dies and
+    // the reviewer verdict is atomically appended to the mailbox.
     let worker_pid = managed_pid(home.path(), "worker");
     assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
     wait_for_process_terminated(worker_pid);
@@ -844,28 +978,29 @@ fn rework_feed_failure_releases_task() {
             "Fix the tests",
         ],
     );
+    handle.resume();
 
-    // The daemon should detect the feed failure and tear down the worker.
-    // Either: "rework feed_turn failed" + "tearing down broken worker"
-    // or: the death detection in Phase 4b catches it first and logs
-    // "died mid-task".
-    let saw_feed_failure = handle.wait_for("tearing down", 15);
-    let saw_death = handle.lines.iter().any(|l| {
-        l.contains("tearing down broken worker")
-            || l.contains("died mid-task")
-            || l.contains("tearing down worker")
-    });
+    // The specific failure proves the changes verdict reached the dead
+    // worker's rework-feed path, rather than a Phase 4b teardown winning first.
     assert!(
-        saw_feed_failure || saw_death,
-        "daemon did not handle dead worker. Lines: {:?}",
+        handle.wait_for("rework feed_turn failed", 15),
+        "daemon did not exercise the failed rework-feed path. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for(&format!("tearing down worker {worker_name}"), 15),
+        "dead worker teardown not seen after rework-feed failure. Lines: {:?}",
         handle.lines
     );
 
+    // VerdictChanges moves the task to rework, then AgentFailed from the
+    // failed feed releases it to open. Journal absence proves cleanup finished.
+    wait_for_task_status(home.path(), 1, "open");
+    wait_for_journal_absent(home.path(), &worker_name);
+
     handle.stop();
 
-    // With lifecycle, AgentFailed from in-review stays in-review (the code
-    // was pushed, task just needs a new reviewer). Depending on whether death
-    // detection or the failed rework feed wins, the task is in-review or open.
+    // The failed rework delivery releases the task for a replacement worker.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -874,11 +1009,10 @@ fn rework_feed_failure_releases_task() {
         .unwrap();
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
-    assert!(
-        stdout.contains("\"status\":\"in-review\"")
-            || stdout.contains("\"status\": \"in-review\"")
-            || stdout.contains("\"status\":\"open\"")
-            || stdout.contains("\"status\": \"open\""),
-        "task was not in a recoverable state after rework feed failure: {stdout}"
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        task["status"].as_str(),
+        Some("open"),
+        "task was not released after rework feed failure: {stdout}"
     );
 }
