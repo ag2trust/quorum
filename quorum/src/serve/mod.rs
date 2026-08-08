@@ -1384,6 +1384,8 @@ fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
         config.bare_agent,
     )
     .with_collector(
+        assignment.provider.clone(),
+        assignment.runner.clone(),
         assignment.model.clone(),
         assignment.effort.clone(),
         config.codex_sandbox.clone(),
@@ -9911,6 +9913,8 @@ async fn tick(
                 config.bare_agent,
             )
             .with_collector(
+                assignment.provider.clone(),
+                assignment.runner.clone(),
                 assignment.model.clone(),
                 assignment.effort.clone(),
                 config.codex_sandbox.clone(),
