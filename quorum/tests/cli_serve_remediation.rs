@@ -569,6 +569,35 @@ fn failed_checks_absent_worker_spawns_remediation() {
         "remediation worker was not spawned. Lines: {:?}",
         handle.lines
     );
+    assert!(
+        handle.wait_for("spawned for task", 20),
+        "remediation worker never finished provisioning. Lines: {:?}",
+        handle.lines
+    );
+    let remediation_agent = handle
+        .extract_agent_name("spawning remediation worker ")
+        .expect("remediation agent name after completed provisioning");
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    handle.wait_until("durable remediation journal and run", 15, || {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        let journal_ready = quorum_core::journal::list_in_flight(&conn)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.agent == remediation_agent
+                    && entry.role == "worker"
+                    && entry.task_id == Some(task_id)
+                    && entry.phase == "working"
+            });
+        let run_ready = quorum_core::agent_runs::runs_for_task(&conn, task_id)
+            .unwrap()
+            .iter()
+            .any(|run| {
+                run.agent == remediation_agent && run.role == "worker" && run.ended_at.is_none()
+            });
+        task.status == "rework" && journal_ready && run_ready
+    });
 
     // Verify the old AgentFailed("no worker for rework") path did NOT fire.
     // The new path logs "spawning remediation worker" — that's correct, not an error.
@@ -2229,6 +2258,11 @@ fn pending_checks_no_remediation() {
     assert!(
         handle.wait_for("timed out", 30) || handle.wait_for("checks timeout", 30),
         "checks timeout not detected. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for_count("merge wait:", 2, 15),
+        "second pending-CI merge-wait tick not observed. Lines: {:?}",
         handle.lines
     );
 
