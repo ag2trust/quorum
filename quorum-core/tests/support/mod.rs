@@ -10,8 +10,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const HELPER_PATH: &str = env!("CARGO_BIN_EXE_quorum-core-test-helper");
+#[allow(dead_code)] // The race target supplies a longer contention timeout directly.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[allow(dead_code)] // The race target must spawn every contender before waiting.
 pub fn run<T: Serialize>(operation: Operation, input: &T) -> Result<HelperOutput, LaunchError> {
     spawn(operation, input)?.wait(DEFAULT_TIMEOUT)
 }

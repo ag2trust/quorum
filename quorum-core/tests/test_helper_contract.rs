@@ -44,6 +44,7 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
                     db_path: db_path.clone(),
                     index: 0,
                     same_responsibility: false,
+                    barrier: open_barrier(dir.path(), "allocate"),
                 },
             )
             .unwrap(),
@@ -94,7 +95,11 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
         (
             support::run(
                 Operation::ClaimCleanup,
-                &ClaimCleanupInput { db_path, now: 10 },
+                &ClaimCleanupInput {
+                    db_path,
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "cleanup"),
+                },
             )
             .unwrap(),
             EXIT_NEGATIVE,
