@@ -1403,6 +1403,7 @@ pub fn adopt_recovery_delivery(
                     JOIN events published
                       ON published.subject='task#' || recovery.id
                      AND published.kind='task_in_review'
+                     AND published.expires_at>?3
                      AND published.body='by ' || worker.agent_name
                      AND published.ts BETWEEN worker.spawned_at AND worker.ended_at
                     WHERE worker.task_id=recovery.id AND worker.role='worker'
@@ -1415,6 +1416,7 @@ pub fn adopt_recovery_delivery(
                            SELECT 1 FROM events merging
                            WHERE merging.subject=published.subject
                              AND merging.kind='task_merging'
+                             AND merging.expires_at>?3
                              AND merging.seq>published.seq
                       )
                )
@@ -1439,11 +1441,13 @@ pub fn adopt_recovery_delivery(
                     SELECT 1 FROM events merging
                     JOIN events done ON done.subject=merging.subject
                                     AND done.kind='task_done'
+                                    AND done.expires_at>?3
                                     AND done.seq>merging.seq
                     WHERE merging.subject='task#' || recovery.id
                       AND merging.kind='task_merging'
+                      AND merging.expires_at>?3
                )",
-            params![original_child_id, recovery_task_id],
+            params![original_child_id, recovery_task_id, now],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -3675,6 +3679,45 @@ mod tests {
                         .conn
                         .execute(
                             "DELETE FROM events WHERE subject=?1 AND kind='task_merging'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_in_review'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "merging event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_merging'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "done event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_done'",
                             [format!("task#{}", fixture.recovery)],
                         )
                         .unwrap();
