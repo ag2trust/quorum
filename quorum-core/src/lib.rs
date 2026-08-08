@@ -36,6 +36,7 @@ pub mod pr_targets;
 pub mod provision_attempts;
 pub mod review_audits;
 pub mod review_findings;
+pub mod review_followups;
 pub mod review_interpret_jobs;
 pub mod role_assignments;
 pub mod runner_state;
