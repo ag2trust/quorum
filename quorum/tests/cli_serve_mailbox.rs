@@ -12,6 +12,8 @@
 //! 6. Rework feed failure tears down the broken worker and releases the task
 //!    back to open — F8.
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -19,6 +21,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+use common::{wait_until, WaitState};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -310,6 +314,75 @@ fn count_unconsumed(home: &std::path::Path, agent: &str) -> usize {
     .unwrap()
 }
 
+fn wait_for_unconsumed_count(home: &std::path::Path, agent: &str, expected: usize) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("{expected} unconsumed mailbox row(s) for {agent}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db_path) {
+            Ok(conn) => {
+                let actual = conn.query_row(
+                    "SELECT COUNT(*) FROM mailbox WHERE agent=?1 AND consumed_at IS NULL",
+                    [agent],
+                    |row| row.get::<_, usize>(0),
+                );
+                match actual {
+                    Ok(actual) if actual == expected => WaitState::Ready(()),
+                    Ok(actual) => WaitState::Pending(format!(
+                        "agent {agent} still had {actual} unconsumed mailbox row(s)"
+                    )),
+                    Err(error) => WaitState::Pending(format!(
+                        "could not query {}: {error}",
+                        db_path.display()
+                    )),
+                }
+            }
+            Err(error) => {
+                WaitState::Pending(format!("could not open {}: {error}", db_path.display()))
+            }
+        },
+    );
+}
+
+fn managed_pid(home: &std::path::Path, role: &str) -> i32 {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    conn.query_row(
+        "SELECT pid FROM journal WHERE role=?1 AND pid IS NOT NULL",
+        [role],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn wait_for_process_terminated(pid: i32) {
+    wait_until(
+        &format!("managed process {pid} to terminate"),
+        Duration::from_secs(15),
+        || {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output();
+            match output {
+                Ok(output) if !output.status.success() || output.stdout.is_empty() => {
+                    WaitState::Ready(())
+                }
+                Ok(output) => {
+                    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if state.starts_with('Z') {
+                        WaitState::Ready(())
+                    } else {
+                        WaitState::Pending(format!("process {pid} state was {state:?}"))
+                    }
+                }
+                Err(error) => {
+                    WaitState::Pending(format!("could not inspect process {pid} state: {error}"))
+                }
+            }
+        },
+    );
+}
+
 // ── Unmatched Done row is consumed (#130) ────────────────────────────
 //
 // daemon_lock (invariant 11) guarantees one daemon per DB. A Done row from
@@ -345,7 +418,7 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "GhostAgent", 0);
 
     handle.stop();
 
@@ -394,7 +467,7 @@ fn unmatched_done_row_does_not_drive_lifecycle() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "GhostAgent", 0);
     handle.stop();
 
     // Row consumed as phantom.
@@ -549,7 +622,8 @@ fn non_roster_done_rows_consumed_as_phantoms() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "Aardvark0", 0);
+    wait_for_unconsumed_count(home.path(), "Beluga0", 0);
     handle.stop();
 
     assert_eq!(
@@ -597,8 +671,7 @@ fn non_done_mailbox_rows_dont_block_daemon() {
         handle.lines
     );
 
-    // Wait 2 ticks for the daemon to finish processing the two mailbox rows.
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "SomeAgent", 0);
 
     handle.stop();
 
@@ -750,24 +823,11 @@ fn rework_feed_failure_releases_task() {
         handle.lines
     );
 
-    // Kill ALL fake-agent processes so the worker's stdin pipe breaks.
-    // This also kills the reviewer, so Phase 4b fires AgentFailed on both.
-    let pgrep_out = Command::new("pgrep")
-        .args(["-f", "fake-agent.*--session-id"])
-        .output();
-    if let Ok(out) = pgrep_out {
-        let pids = String::from_utf8_lossy(&out.stdout);
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
-
-    // Give the worker a moment to actually die.
-    std::thread::sleep(Duration::from_secs(1));
+    // Kill this test's worker so its stdin pipe breaks, but keep the reviewer
+    // alive long enough to submit the changes verdict with its original cap.
+    let worker_pid = managed_pid(home.path(), "worker");
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+    wait_for_process_terminated(worker_pid);
 
     // Reviewer signals "changes" verdict — daemon will try to feed rework
     // to the (now dead) worker, which should fail.
@@ -804,8 +864,8 @@ fn rework_feed_failure_releases_task() {
     handle.stop();
 
     // With lifecycle, AgentFailed from in-review stays in-review (the code
-    // was pushed, task just needs a new reviewer). The pgrep kills both
-    // agents, so the task lands in in-review — not open.
+    // was pushed, task just needs a new reviewer). Depending on whether death
+    // detection or the failed rework feed wins, the task is in-review or open.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")

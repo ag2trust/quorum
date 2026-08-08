@@ -7,6 +7,8 @@
 //! 3. merge failure: approved verdict but merge fails → treated as changes,
 //!    worker gets rework turn with merge error
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -14,6 +16,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+use common::{wait_until, WaitState};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -25,21 +29,28 @@ fn cargo_bin(name: &str) -> std::path::PathBuf {
 /// output (like the fake-agent's "Fixing…" rework response) is observed here.
 fn wait_session_log(home: &std::path::Path, needle: &str, timeout_secs: u64) -> bool {
     let logs = home.join("logs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if let Ok(entries) = std::fs::read_dir(&logs) {
-            for entry in entries.flatten() {
-                let stream = entry.path().join("stream.jsonl");
-                if let Ok(content) = std::fs::read_to_string(&stream) {
-                    if content.contains(needle) {
-                        return true;
+    wait_until(
+        &format!("session log containing {needle:?}"),
+        Duration::from_secs(timeout_secs),
+        || {
+            let mut searched = 0;
+            if let Ok(entries) = std::fs::read_dir(&logs) {
+                for entry in entries.flatten() {
+                    let stream = entry.path().join("stream.jsonl");
+                    if let Ok(content) = std::fs::read_to_string(&stream) {
+                        searched += 1;
+                        if content.contains(needle) {
+                            return WaitState::Ready(true);
+                        }
                     }
                 }
             }
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    false
+            WaitState::Pending(format!(
+                "searched {searched} readable stream.jsonl file(s) under {}",
+                logs.display()
+            ))
+        },
+    )
 }
 
 fn wait_for_task_status(
@@ -49,21 +60,104 @@ fn wait_for_task_status(
     timeout_secs: u64,
 ) -> bool {
     let db = home.join("repos/test__repo/quorum.db");
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if let Ok(conn) = rusqlite::Connection::open(&db) {
-            let status: Option<String> = conn
-                .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |r| {
-                    r.get(0)
-                })
-                .ok();
-            if status.as_deref() == Some(expected) {
-                return true;
+    wait_until(
+        &format!("task #{task_id} status {expected:?}"),
+        Duration::from_secs(timeout_secs),
+        || match quorum_core::db::open(&db) {
+            Ok(conn) => {
+                let status: Option<String> = conn
+                    .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |r| {
+                        r.get(0)
+                    })
+                    .ok();
+                if status.as_deref() == Some(expected) {
+                    WaitState::Ready(true)
+                } else {
+                    WaitState::Pending(format!("task #{task_id} status was {status:?}"))
+                }
             }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+            Err(error) => WaitState::Pending(format!("could not open {}: {error}", db.display())),
+        },
+    )
+}
+
+fn wait_for_journal_absent(home: &std::path::Path, agent: &str) {
+    let db = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("journal teardown for agent {agent}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db) {
+            Ok(conn) => {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM journal WHERE agent=?1",
+                        [agent],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if count == 0 {
+                    WaitState::Ready(())
+                } else {
+                    WaitState::Pending(format!("journal still has {count} row(s) for {agent}"))
+                }
+            }
+            Err(error) => WaitState::Pending(format!("could not open {}: {error}", db.display())),
+        },
+    );
+}
+
+fn journal_role_count(home: &std::path::Path, role: &str) -> i64 {
+    let db = home.join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM journal WHERE role=?1",
+        [role],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn append_done_barrier(home: &std::path::Path, agent: &str) -> i64 {
+    let db = home.join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db).unwrap();
+    let row = quorum_core::mailbox::MailboxRow {
+        agent: agent.to_string(),
+        kind: quorum_core::mailbox::MailboxKind::Done,
+        task_id: None,
+        pr: None,
+        verdict: None,
+        feedback: None,
+        note: None,
+        to_agent: None,
+        payload: None,
+    };
+    quorum_core::mailbox::append(&mut conn, &row).unwrap()
+}
+
+fn wait_for_mailbox_consumed(home: &std::path::Path, id: i64) {
+    let db = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("mailbox barrier row {id} to be consumed"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db) {
+            Ok(conn) => {
+                let consumed: Option<bool> = conn
+                    .query_row(
+                        "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                match consumed {
+                    Some(true) => WaitState::Ready(()),
+                    state => WaitState::Pending(format!(
+                        "mailbox barrier row {id} consumed state was {state:?}"
+                    )),
+                }
+            }
+            Err(error) => WaitState::Pending(format!("could not open {}: {error}", db.display())),
+        },
+    );
 }
 
 fn write_names_file(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1103,8 +1197,17 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
         handle.lines
     );
 
-    // Wait 2 ticks — if w.pr was NOT cleared, a second reviewer would spawn.
-    std::thread::sleep(Duration::from_secs(1));
+    // Done rows are processed one per tick. Seeing the second barrier consumed
+    // proves a complete intervening tick ran after teardown; if w.pr was not
+    // cleared, that tick would have spawned another reviewer.
+    append_done_barrier(home.path(), "NoVerdictBarrier1");
+    let second_barrier = append_done_barrier(home.path(), "NoVerdictBarrier2");
+    wait_for_mailbox_consumed(home.path(), second_barrier);
+    assert_eq!(
+        journal_role_count(home.path(), "reviewer"),
+        0,
+        "reviewer journal row reappeared after the no-verdict barrier"
+    );
 
     // Drain any remaining log lines
     while let Ok(line) = handle.rx.try_recv() {
@@ -1456,8 +1559,10 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
         handle.lines
     );
 
-    // Wait 2 ticks to confirm no reviewer spawns
-    std::thread::sleep(Duration::from_secs(1));
+    // Teardown is complete only after the journal row is removed. At that
+    // point the terminal task state cannot be considered for review spawning.
+    wait_for_journal_absent(home.path(), &worker_name);
+    assert_eq!(journal_role_count(home.path(), "reviewer"), 0);
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
@@ -1544,8 +1649,11 @@ fn already_merged_pr_closes_task_without_reviewer() {
         handle.lines
     );
 
-    // Wait 2 ticks to confirm no reviewer spawns
-    std::thread::sleep(Duration::from_secs(1));
+    // The merged transition and worker teardown are the durable/process
+    // barriers after which reviewer provisioning is no longer possible.
+    wait_for_task_status(home.path(), 1, "done", 15);
+    wait_for_journal_absent(home.path(), &worker_name);
+    assert_eq!(journal_role_count(home.path(), "reviewer"), 0);
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);
     }
