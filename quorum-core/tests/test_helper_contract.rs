@@ -133,6 +133,25 @@ fn helper_internal_failures_use_the_stable_internal_exit() {
 }
 
 #[test]
+fn absent_graph_event_task_is_a_stable_usage_error() {
+    let (dir, db_path) = file_db();
+    let output = support::run(
+        Operation::ApplyGraphEvent,
+        &ApplyGraphEventInput {
+            db_path,
+            task_id: 404,
+            event: GraphEvent::Merge,
+            now: 10,
+            barrier: open_barrier(dir.path(), "absent-event"),
+        },
+    )
+    .unwrap();
+    assert_eq!(output.status.code(), Some(EXIT_USAGE));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("task 404 not found"));
+}
+
+#[test]
 fn unknown_operation_is_a_stable_usage_error() {
     let output = Command::new(env!("CARGO_BIN_EXE_quorum-core-test-helper"))
         .arg("not-an-operation")

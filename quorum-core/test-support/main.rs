@@ -248,7 +248,15 @@ fn apply_graph_event(input: ApplyGraphEventInput) -> Result<OperationResult, Hel
     let won =
         match quorum_core::tasks::apply_event(&mut conn, actor, input.task_id, &event, input.now) {
             Ok(_) => true,
-            Err(QuorumError::NotHolder | QuorumError::Usage(_) | QuorumError::BadInput(_)) => false,
+            Err(QuorumError::NotHolder) => false,
+            Err(error @ QuorumError::Usage(_)) => {
+                let cancelled = quorum_core::tasks::get(&conn, input.task_id)?
+                    .is_some_and(|task| task.status == "cancelled");
+                if !cancelled {
+                    return Err(error.into());
+                }
+                false
+            }
             Err(error) => return Err(error.into()),
         };
     Ok(OperationResult::race(json!({"won": won}), won))
