@@ -5,7 +5,7 @@
 //! shape, and the at-most-once cursor advance via the public `quorum read` path so a
 //! second `sync` invocation doesn't re-show the same direct messages.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 
