@@ -1,6 +1,131 @@
 #![allow(dead_code)]
 
 use std::path::Path;
+use std::process::Child;
+use std::sync::mpsc;
+use std::time::Duration;
+
+pub fn record_process_state(child: &mut Child, lines: &mut Vec<String>, context: &str) {
+    let state = match child.try_wait() {
+        Ok(Some(status)) => format!("exited with {status}"),
+        Ok(None) => "still running".to_string(),
+        Err(error) => format!("status unavailable: {error}"),
+    };
+    lines.push(format!("[test diagnostic] {context}; daemon {state}"));
+}
+
+pub fn drain_pending_lines(rx: &mpsc::Receiver<String>, lines: &mut Vec<String>) {
+    while let Ok(line) = rx.try_recv() {
+        lines.push(line);
+    }
+}
+
+pub fn wait_for_count(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    lines: &mut Vec<String>,
+    needle: &str,
+    count: usize,
+    timeout_secs: u64,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        drain_pending_lines(rx, lines);
+        if lines.iter().filter(|line| line.contains(needle)).count() >= count {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            record_process_state(child, lines, "output-count wait deadline elapsed");
+            return false;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(line) => lines.push(line),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                record_process_state(child, lines, "output-count wait timed out");
+                return false;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                record_process_state(child, lines, "stderr disconnected");
+                return false;
+            }
+        }
+    }
+}
+
+pub fn wait_until<F>(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    lines: &mut Vec<String>,
+    description: &str,
+    timeout_secs: u64,
+    mut ready: F,
+) where
+    F: FnMut() -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        drain_pending_lines(rx, lines);
+        if ready() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            record_process_state(child, lines, "observable-state wait deadline elapsed");
+            panic!("timed out waiting for {description}; process/output diagnostics: {lines:?}");
+        }
+        match rx.recv_timeout((deadline - now).min(Duration::from_millis(50))) {
+            Ok(line) => lines.push(line),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                record_process_state(child, lines, "stderr disconnected");
+                panic!(
+                    "daemon exited while waiting for {description}; process/output diagnostics: {lines:?}"
+                );
+            }
+        }
+    }
+}
+
+pub fn terminate_and_drain(
+    child: &mut Child,
+    rx: &mpsc::Receiver<String>,
+    lines: &mut Vec<String>,
+) {
+    if child.try_wait().unwrap().is_none() {
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll terminated daemon") {
+                break status;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                drain_pending_lines(rx, lines);
+                panic!("daemon did not terminate within 5s after SIGKILL; output: {lines:?}");
+            }
+            match rx.recv_timeout((deadline - now).min(Duration::from_millis(50))) {
+                Ok(line) => lines.push(line),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
+        };
+        lines.push(format!("[test diagnostic] daemon terminated with {status}"));
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(line) => lines.push(line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("timed out draining daemon stderr after termination: {lines:?}");
+            }
+        }
+    }
+}
 
 fn now() -> i64 {
     std::time::SystemTime::now()
