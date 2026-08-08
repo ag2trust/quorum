@@ -467,6 +467,7 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
         "reviewer not provisioned for in-review task after restart. Lines: {:?}",
         handle2.lines
     );
+    handle2.wait_for_completed_tick(home.path());
     handle2.drain_pending_lines();
 
     // ── Invariant: NO fresh worker spawn for task #1 after restart. ──
