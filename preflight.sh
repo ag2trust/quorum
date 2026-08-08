@@ -20,13 +20,30 @@
 set -u
 
 QUICK=0
+CONTINUATION_FROM=
+CONTINUATION_SET=0
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
+    --continuation-from=*)
+      [ "$CONTINUATION_SET" -eq 0 ] \
+        || { printf 'preflight.sh: duplicate --continuation-from\n' >&2; exit 2; }
+      CONTINUATION_FROM=${arg#*=}
+      CONTINUATION_SET=1
+      ;;
     -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) printf 'preflight.sh: unknown arg: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
+
+if [ "$CONTINUATION_SET" -eq 1 ] && [ -z "$CONTINUATION_FROM" ]; then
+  printf 'preflight.sh: --continuation-from requires a commit\n' >&2
+  exit 2
+fi
+if [ "$CONTINUATION_SET" -eq 1 ] && [ "$QUICK" -ne 1 ]; then
+  printf 'preflight.sh: --continuation-from requires --quick\n' >&2
+  exit 2
+fi
 
 fail() { printf '\nPREFLIGHT: FAIL (%s)\n' "$1"; exit 1; }
 
@@ -53,13 +70,22 @@ if git rev-parse --verify --quiet origin/develop >/dev/null \
   BASE_REF=origin/develop
   INTEGRATION=1
 fi
-if [ "$BRANCH" = "main" ]; then
+if [ "$BRANCH" = "main" ] && [ -z "$CONTINUATION_FROM" ]; then
   printf 'on main — nothing to compare, skipping\n'
 else
-  # Every commit ahead of origin/main must be this PR's own work. Multiple
-  # distinct Co-Authored-By sessions ahead of main means the branch was cut from
-  # another feature branch (#114) — rebase onto origin/main before pushing.
-  if [ "$INTEGRATION" -eq 1 ]; then
+  # Every branch-owned commit must be this push's own work. Multiple distinct
+  # Co-Authored-By sessions in that range mean the branch was cut from another
+  # feature branch (#114) — rebase onto the applicable base before pushing.
+  if [ -n "$CONTINUATION_FROM" ]; then
+    git cat-file -e "$CONTINUATION_FROM^{commit}" 2>/dev/null \
+      || fail "continuation base is not a local commit"
+    git merge-base --is-ancestor "$CONTINUATION_FROM" HEAD \
+      || fail "continuation base is not an ancestor of HEAD"
+    BASE_REF=$CONTINUATION_FROM
+    OWN_COMMITS=$(git rev-list "$CONTINUATION_FROM"..HEAD)
+    printf 'continuation commits after published remote head:\n'
+    git log --oneline "$CONTINUATION_FROM"..HEAD
+  elif [ "$INTEGRATION" -eq 1 ]; then
     # Main's commits are inherited integration input, not work authored by the
     # sync session. Inspect only commits belonging to neither remote history.
     OWN_COMMITS=$(git rev-list HEAD --not origin/main origin/develop)
