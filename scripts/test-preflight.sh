@@ -17,6 +17,9 @@ mkdir -p "$BIN"
 cat >"$BIN/cargo" <<'EOF'
 #!/bin/sh
 [ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || exit 1
+if [ -n "${PREFLIGHT_CARGO_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$PREFLIGHT_CARGO_LOG"
+fi
 exit 0
 EOF
 chmod +x "$BIN/cargo"
@@ -297,5 +300,18 @@ if PATH="$BIN:$PATH" ./preflight.sh \
   exit 1
 fi
 grep -q 'require --quick' "$TMP/full-continuation.out"
+
+# The full author gate must enable the private helper feature so its process
+# canaries cannot disappear from required runs while remaining absent from
+# production builds.
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/full.out"
+grep -Fqx 'fmt --all -- --check' "$TMP/full-cargo.log"
+grep -Fqx \
+  'clippy --workspace --all-targets --features quorum-core/test-support -- -D warnings' \
+  "$TMP/full-cargo.log"
+grep -Fqx 'test --workspace --features quorum-core/test-support' \
+  "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/full.out"
 
 echo 'test-preflight: PASS'
