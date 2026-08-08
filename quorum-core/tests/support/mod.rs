@@ -10,8 +10,10 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 const HELPER_PATH: &str = env!("CARGO_BIN_EXE_quorum-core-test-helper");
+#[allow(dead_code)] // Each integration target uses a subset of the shared launcher surface.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[allow(dead_code)] // The process canaries use spawn so they can coordinate start barriers.
 pub fn run<T: Serialize>(operation: Operation, input: &T) -> Result<HelperOutput, LaunchError> {
     spawn(operation, input)?.wait(DEFAULT_TIMEOUT)
 }
@@ -126,7 +128,20 @@ pub struct HelperOutput {
 
 impl HelperOutput {
     pub fn json(&self) -> serde_json::Value {
-        serde_json::from_slice(&self.stdout).expect("helper stdout must be one JSON value")
+        serde_json::from_slice(&self.stdout)
+            .unwrap_or_else(|error| panic!("helper stdout must be one JSON value: {error}; {self}"))
+    }
+}
+
+impl fmt::Display for HelperOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "status={:?}, stdout={:?}, stderr={:?}",
+            self.status.code(),
+            String::from_utf8_lossy(&self.stdout),
+            String::from_utf8_lossy(&self.stderr),
+        )
     }
 }
 
