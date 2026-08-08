@@ -5,6 +5,7 @@
 //! reads reject partial or internally inconsistent batches. This module deliberately
 //! exposes no update, disposition, reassessment, or lifecycle API.
 
+use crate::db::map_sql_err;
 use crate::error::{QuorumError, Result};
 use crate::review_followups::{
     ReviewFollowupArtifact, ReviewFollowupBatch, MAX_FOLLOWUP_ARTIFACTS,
@@ -74,10 +75,12 @@ pub fn get_batch(
         ));
     }
 
-    let batch = read_batch(conn, pr_number)?;
-    batch
-        .map(|batch| inspection_for_batch(conn, batch))
-        .transpose()
+    with_read_snapshot(conn, |snapshot| {
+        let batch = read_batch(snapshot, pr_number)?;
+        batch
+            .map(|batch| inspection_for_batch(snapshot, batch))
+            .transpose()
+    })
 }
 
 /// List complete batches in deterministic newest-first order.
@@ -93,24 +96,26 @@ pub fn list_batches(conn: &Connection, limit: usize) -> Result<Vec<ReviewFollowu
     }
     let sql_limit = i64::try_from(limit)
         .map_err(|_| QuorumError::Usage("follow-up batch read limit is invalid".into()))?;
-    let mut stmt = conn.prepare(
-        "SELECT pr_number,task_id,graph_id,source_task_id,collector_version,
-                artifact_count,state,created_at,updated_at
-         FROM review_followup_batches
-         ORDER BY created_at DESC,pr_number DESC LIMIT ?1",
-    )?;
-    let mut rows = stmt.query([sql_limit])?;
-    let mut batches = Vec::with_capacity(limit);
-    while let Some(row) = rows.next()? {
-        batches.push(batch_from_row(row)?);
-    }
-    drop(rows);
-    drop(stmt);
+    with_read_snapshot(conn, |snapshot| {
+        let mut stmt = snapshot.prepare(
+            "SELECT pr_number,task_id,graph_id,source_task_id,collector_version,
+                    artifact_count,state,created_at,updated_at
+             FROM review_followup_batches
+             ORDER BY created_at DESC,pr_number DESC LIMIT ?1",
+        )?;
+        let mut rows = stmt.query([sql_limit])?;
+        let mut batches = Vec::with_capacity(limit);
+        while let Some(row) = rows.next()? {
+            batches.push(batch_from_row(row)?);
+        }
+        drop(rows);
+        drop(stmt);
 
-    batches
-        .into_iter()
-        .map(|batch| inspection_for_batch(conn, batch))
-        .collect()
+        batches
+            .into_iter()
+            .map(|batch| inspection_for_batch(snapshot, batch))
+            .collect()
+    })
 }
 
 /// Read one artifact by its durable ID, reconstructed through closed domain types.
@@ -140,6 +145,25 @@ fn read_batch(conn: &Connection, pr_number: i64) -> Result<Option<ReviewFollowup
     )?;
     let mut rows = stmt.query([pr_number])?;
     rows.next()?.map(batch_from_row).transpose()
+}
+
+/// Run one bounded aggregate read against one WAL snapshot.
+///
+/// `unchecked_transaction` preserves the public `&Connection` read surface while
+/// still issuing a short `BEGIN DEFERRED`. The first SELECT establishes the
+/// snapshot; commit ends it before the inspection value is returned. If the
+/// caller already owns a transaction, its existing snapshot is reused.
+fn with_read_snapshot<T>(
+    conn: &Connection,
+    read: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    if !conn.is_autocommit() {
+        return read(conn);
+    }
+    let transaction = conn.unchecked_transaction().map_err(map_sql_err)?;
+    let value = read(&transaction)?;
+    transaction.commit().map_err(map_sql_err)?;
+    Ok(value)
 }
 
 fn inspection_for_batch(
@@ -432,6 +456,52 @@ mod tests {
             )
             .unwrap(),
             before
+        );
+        assert!(
+            conn.is_autocommit(),
+            "aggregate read left a transaction open"
+        );
+    }
+
+    #[test]
+    fn aggregate_read_uses_one_snapshot_across_concurrent_atomic_application() {
+        let (dir, mut writer) = database();
+        insert_batch(&mut writer, 108, 1, 100);
+        let reader = crate::db::open(&dir.path().join("followup-reads.db")).unwrap();
+
+        // Establish the reader's snapshot with the batch row, atomically advance
+        // both durable rows on another WAL connection, then finish the aggregate
+        // read. The inspection must contain the complete pre-application state,
+        // never the impossible collected+disposed combination.
+        let inspection = with_read_snapshot(&reader, |snapshot| {
+            let batch = read_batch(snapshot, 108)?.unwrap();
+            let transaction = crate::db::begin_immediate(&mut writer)?;
+            transaction.execute(
+                "UPDATE review_followup_artifacts
+                 SET disposition='linked',disposition_reason='already tracked',
+                     linked_task_id=2,updated_at=200
+                 WHERE pr_number=108",
+                [],
+            )?;
+            transaction.execute(
+                "UPDATE review_followup_batches
+                 SET state='resolved',updated_at=200 WHERE pr_number=108",
+                [],
+            )?;
+            transaction.commit()?;
+            inspection_for_batch(snapshot, batch)
+        })
+        .unwrap();
+
+        assert_eq!(inspection.batch().state(), FollowupBatchState::Collected);
+        assert!(inspection.artifacts()[0].disposition().is_none());
+        assert!(reader.is_autocommit());
+
+        let after = get_batch(&reader, 108).unwrap().unwrap();
+        assert_eq!(after.batch().state(), FollowupBatchState::Resolved);
+        assert_eq!(
+            after.artifacts()[0].disposition().unwrap().kind(),
+            FollowupDisposition::Linked
         );
     }
 
