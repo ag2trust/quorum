@@ -1197,12 +1197,12 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
         handle.lines
     );
 
-    // Done rows are processed one per tick. Seeing the second barrier consumed
-    // proves a complete intervening tick ran after teardown; if w.pr was not
-    // cleared, that tick would have spawned another reviewer.
-    append_done_barrier(home.path(), "NoVerdictBarrier1");
-    let second_barrier = append_done_barrier(home.path(), "NoVerdictBarrier2");
-    wait_for_mailbox_consumed(home.path(), second_barrier);
+    // Phase 1 already snapshotted the tick handling reviewer teardown, so a
+    // barrier appended now cannot be consumed until a later tick. Observing it
+    // proves the teardown tick completed Phase 5/5b; if w.pr was not cleared,
+    // that reconciliation pass would have spawned another reviewer.
+    let barrier = append_done_barrier(home.path(), "NoVerdictBarrier");
+    wait_for_mailbox_consumed(home.path(), barrier);
     assert_eq!(
         journal_role_count(home.path(), "reviewer"),
         0,
@@ -1563,12 +1563,11 @@ fn cancelled_task_done_signal_no_reviewer_spawn() {
     // tick, so it is only the starting point for the negative-path barrier.
     wait_for_journal_absent(home.path(), &worker_name);
 
-    // Done rows are processed one per tick. Seeing the second phantom barrier
-    // consumed proves a complete intervening tick reached Phase 5/5b after
-    // teardown; a forbidden reviewer spawn would now be durable and logged.
-    append_done_barrier(home.path(), "CancelledBarrier1");
-    let second_barrier = append_done_barrier(home.path(), "CancelledBarrier2");
-    wait_for_mailbox_consumed(home.path(), second_barrier);
+    // Phase 1 already snapshotted the tick that removed the journal row, so a
+    // barrier appended now can only be consumed by a later tick. That proves
+    // the teardown tick completed Phase 5/5b before the negative assertions.
+    let barrier = append_done_barrier(home.path(), "CancelledBarrier");
+    wait_for_mailbox_consumed(home.path(), barrier);
     assert_eq!(journal_role_count(home.path(), "reviewer"), 0);
     while let Ok(line) = handle.rx.try_recv() {
         handle.lines.push(line);

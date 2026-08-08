@@ -310,9 +310,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
-fn append_phase4c_barrier(home: &std::path::Path, target: &str) {
-    let db_path = home.join("repos/test__repo/quorum.db");
-    let mut conn = quorum_core::db::open(&db_path).unwrap();
+fn append_phase4c_barrier(conn: &mut rusqlite::Connection, target: &str) {
     let row = quorum_core::mailbox::MailboxRow {
         agent: "ReworkPhaseBarrier".to_string(),
         kind: quorum_core::mailbox::MailboxKind::Message,
@@ -324,7 +322,7 @@ fn append_phase4c_barrier(home: &std::path::Path, target: &str) {
         to_agent: Some(target.to_string()),
         payload: Some("phase barrier".to_string()),
     };
-    quorum_core::mailbox::append(&mut conn, &row).unwrap();
+    quorum_core::mailbox::append(conn, &row).unwrap();
 }
 
 /// Insert a raw mailbox row directly via the quorum DB (bypasses CLI).
@@ -943,10 +941,12 @@ fn rework_feed_failure_releases_task() {
     );
 
     // A message to an absent agent is handled in Phase 4c, after Phase 4b.
-    // Suspend from that late-tick marker while the worker is still alive, so
-    // the next Phase 2 must see the verdict before any later death scan.
+    // Its log precedes the marker-consumption write, so first observe the log,
+    // then serialize behind that write before suspending the daemon.
     let phase_barrier_target = "MissingReworkPhaseBarrier";
-    append_phase4c_barrier(home.path(), phase_barrier_target);
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let mut barrier_conn = quorum_core::db::open(&db_path).unwrap();
+    append_phase4c_barrier(&mut barrier_conn, phase_barrier_target);
     assert!(
         handle.wait_for(
             &format!("consuming message to {phase_barrier_target} (no active worker)"),
@@ -955,7 +955,22 @@ fn rework_feed_failure_releases_task() {
         "daemon did not reach the post-death-scan barrier. Lines: {:?}",
         handle.lines
     );
+
+    // BEGIN IMMEDIATE cannot succeed until marker consumption commits. Once it
+    // does, no daemon thread owns a write transaction, and the barrier prevents
+    // any later writer from starting before SIGSTOP becomes observable.
+    let db_write_barrier =
+        quorum_core::db::begin_immediate(&mut barrier_conn).unwrap_or_else(|error| {
+            panic!(
+                "could not acquire post-consumption SQLite writer barrier before daemon \
+                 suspension: {error}"
+            )
+        });
     handle.suspend();
+    db_write_barrier.commit().unwrap_or_else(|error| {
+        panic!("could not release Phase 4c SQLite writer barrier: {error}")
+    });
+    drop(barrier_conn);
 
     // The paused daemon retains this worker slot while the process dies and
     // the reviewer verdict is atomically appended to the mailbox.
