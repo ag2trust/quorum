@@ -1,19 +1,22 @@
 //! Bounded daemon reconciliation for merged continuation deliveries.
 //!
-//! Candidate discovery uses one short read connection and only durable Quorum
-//! records. The connection is dropped before the guarded core write is invoked
-//! for each candidate, so no external lookup or long read can overlap an
-//! adoption transaction.
+//! Discovery consumes a fixed-size page of the durable lifecycle-event stream.
+//! Its persisted monotonic cursor makes rejected deliveries unable to starve
+//! later ones, while advancing only after the guarded core calls gives crash
+//! replay at-least-once semantics. The evidence connection is dropped before
+//! any adoption transaction is opened.
 
 use std::path::{Path, PathBuf};
 
 use quorum_core::error::{QuorumError, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
-/// One active graph has at most eight generated children. Keep the pass to one
-/// graph-sized batch so ordinary daemon work cannot be delayed by historical
-/// recovery rows.
-const RECONCILE_BATCH_LIMIT: i64 = 8;
+/// Page the append-only event sequence itself, rather than applying a limit
+/// after a join over terminal task history. This bounds both rows inspected and
+/// candidate applications on every startup/tick pass.
+const EVENT_PAGE_LIMIT: i64 = 8;
+const CURSOR_AGENT: &str = "quorum-serve";
+const CURSOR_TOPIC: &str = "events:merged-continuation:v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Candidate {
@@ -24,8 +27,16 @@ struct Candidate {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ReconcileOutcome {
+    pub(crate) scanned: usize,
     pub(crate) examined: usize,
     pub(crate) adopted: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventPage {
+    through_seq: Option<i64>,
+    scanned: usize,
+    candidates: Vec<Candidate>,
 }
 
 pub(crate) async fn startup(db_path: &Path) -> Result<ReconcileOutcome> {
@@ -47,18 +58,20 @@ async fn reconcile(db_path: PathBuf, now: i64) -> Result<ReconcileOutcome> {
 }
 
 fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
-    // Finish the entire bounded evidence read, finalize its statement, and
-    // close the connection before acquiring any write authority below.
-    let candidates = {
+    // Finish the fixed event page and all persisted-evidence prefiltering,
+    // finalize every statement, and close the connection before acquiring any
+    // write authority below.
+    let page = {
         let conn = quorum_core::db::open(db_path)?;
-        select_candidates(&conn, now)?
+        select_event_page(&conn, now)?
     };
 
     let mut outcome = ReconcileOutcome {
-        examined: candidates.len(),
+        scanned: page.scanned,
+        examined: page.candidates.len(),
         adopted: 0,
     };
-    for candidate in candidates {
+    for candidate in page.candidates {
         let mut conn = quorum_core::db::open(db_path)?;
         if quorum_core::decomposition::adopt_recovery_delivery(
             &mut conn,
@@ -73,33 +86,101 @@ fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
             ));
         }
     }
+
+    // Ack only after every core application in the page succeeds. A crash or
+    // error before this point replays the page; a crash after an adoption but
+    // before this ack replays a clean core no-op. MAX preserves monotonicity if
+    // a stale caller ever races a newer pass.
+    if let Some(through_seq) = page.through_seq {
+        let mut conn = quorum_core::db::open(db_path)?;
+        advance_cursor(&mut conn, through_seq)?;
+    }
     Ok(outcome)
 }
 
-/// Find only incident-shaped pairs using persisted graph, PR-target,
+/// Read at most [`EVENT_PAGE_LIMIT`] physical rows in sequence order. Filtering
+/// happens after that limit, so a large terminal-task history cannot turn one
+/// daemon pass into an unbounded scan. `task_done` is the terminal durable
+/// lifecycle record: all publication, review, merge, and PR-target evidence for
+/// a legitimate managed delivery precedes it.
+fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
+    let cursor = conn
+        .query_row(
+            "SELECT last_seq FROM cursors WHERE agent_id=?1 AND topic=?2",
+            params![CURSOR_AGENT, CURSOR_TOPIC],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let events = {
+        let mut stmt = conn.prepare(
+            "SELECT seq,kind,subject,expires_at FROM events
+             WHERE seq>?1 ORDER BY seq ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cursor, EVENT_PAGE_LIMIT], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let through_seq = events.last().map(|event| event.0);
+    let mut candidates = Vec::new();
+    for (_, kind, subject, expires_at) in &events {
+        if kind != "task_done" || *expires_at <= now {
+            continue;
+        }
+        let Some(recovery_task_id) = subject
+            .strip_prefix("task#")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|task_id| *task_id > 0)
+        else {
+            continue;
+        };
+        if let Some(candidate) = select_candidate(conn, recovery_task_id, now)? {
+            candidates.push(candidate);
+        }
+    }
+
+    Ok(EventPage {
+        through_seq,
+        scanned: events.len(),
+        candidates,
+    })
+}
+
+/// Resolve one event-identified delivery using persisted graph, PR-target,
 /// publication, and merge evidence. This is deliberately a prefilter rather
 /// than lifecycle authority: `adopt_recovery_delivery` revalidates every core
 /// invariant under its own `BEGIN IMMEDIATE` transaction.
-fn select_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
-    let mut stmt = conn.prepare(
+fn select_candidate(
+    conn: &Connection,
+    recovery_task_id: i64,
+    now: i64,
+) -> Result<Option<Candidate>> {
+    conn.query_row(
         "SELECT original.id,recovery.id,recovery_target.pr_number
-         FROM task_graph_members member
+         FROM tasks recovery
+         JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
+         JOIN tasks original
+           ON original.id=json_extract(recovery.refs,'$.source_task')
+         JOIN pr_targets original_target
+           ON original_target.task_id=original.id
+          AND original_target.pr_number=recovery_target.pr_number
+         JOIN task_graph_members member ON member.task_id=original.id
          JOIN task_decompositions graph ON graph.id=member.graph_id
          JOIN tasks source ON source.id=graph.source_task_id
-         JOIN tasks original ON original.id=member.task_id
-         JOIN pr_targets original_target ON original_target.task_id=original.id
-         JOIN tasks recovery
-           ON recovery.status='done'
-          AND recovery.review_only=0
-          AND recovery.continue_pr IS NOT NULL
-          AND json_valid(recovery.refs)
-          AND json_type(recovery.refs,'$.source_task')='integer'
-          AND json_extract(recovery.refs,'$.source_task')=original.id
-         JOIN pr_targets recovery_target
-           ON recovery_target.task_id=recovery.id
-          AND recovery_target.pr_number=recovery.continue_pr
-          AND recovery_target.pr_number=original_target.pr_number
-         WHERE original.status='failed'
+         WHERE recovery.id=?1
+           AND recovery.status='done'
+           AND recovery.review_only=0
+           AND recovery.continue_pr=recovery_target.pr_number
+           AND json_valid(recovery.refs)
+           AND json_type(recovery.refs,'$.source_task')='integer'
+           AND original.status='failed'
            AND member.active=1
            AND member.plan_revision=graph.accepted_plan_revision
            AND graph.state='active' AND graph.active=1
@@ -110,31 +191,41 @@ fn select_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
                SELECT 1 FROM events published
                WHERE published.subject='task#' || recovery.id
                  AND published.kind='task_in_review'
-                 AND published.expires_at>?1
+                 AND published.expires_at>?2
            )
            AND EXISTS (
                SELECT 1 FROM events merging
                JOIN events done ON done.subject=merging.subject
                                AND done.kind='task_done'
-                               AND done.expires_at>?1
+                               AND done.expires_at>?2
                                AND done.seq>merging.seq
                WHERE merging.subject='task#' || recovery.id
                  AND merging.kind='task_merging'
-                 AND merging.expires_at>?1
-           )
-         ORDER BY original.id ASC,recovery.id ASC
-         LIMIT ?2",
-    )?;
-    let candidates = stmt
-        .query_map(params![now, RECONCILE_BATCH_LIMIT], |row| {
+                 AND merging.expires_at>?2
+           )",
+        params![recovery_task_id, now],
+        |row| {
             Ok(Candidate {
                 original_child_id: row.get(0)?,
                 recovery_task_id: row.get(1)?,
                 pr_number: row.get(2)?,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(candidates)
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn advance_cursor(conn: &mut Connection, through_seq: i64) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    tx.execute(
+        "INSERT INTO cursors(agent_id,topic,last_seq) VALUES (?1,?2,?3)
+         ON CONFLICT(agent_id,topic)
+         DO UPDATE SET last_seq=MAX(last_seq,excluded.last_seq)",
+        params![CURSOR_AGENT, CURSOR_TOPIC, through_seq],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -218,6 +309,18 @@ mod tests {
                 })
                 .unwrap()
         }
+
+        fn cursor(&self) -> Option<i64> {
+            quorum_core::db::open(&self.db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT last_seq FROM cursors WHERE agent_id=?1 AND topic=?2",
+                    params![CURSOR_AGENT, CURSOR_TOPIC],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap()
+        }
     }
 
     fn assert_incident_released(fixture: &IncidentFixture) {
@@ -244,10 +347,16 @@ mod tests {
     #[tokio::test]
     async fn startup_reconciles_incident_307_and_releases_299_300() {
         let fixture = IncidentFixture::new();
-        let outcome = startup(&fixture.db_path).await.unwrap();
+        let outcome = super::super::reconcile_merged_continuations(
+            &fixture.db_path,
+            super::super::MergedContinuationTrigger::Startup,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             ReconcileOutcome {
+                scanned: 3,
                 examined: 1,
                 adopted: 1
             }
@@ -258,15 +367,70 @@ mod tests {
     #[tokio::test]
     async fn normal_tick_reconciles_incident_shaped_state() {
         let fixture = IncidentFixture::new();
-        let outcome = tick(&fixture.db_path).await.unwrap();
+        let outcome = super::super::reconcile_merged_continuations(
+            &fixture.db_path,
+            super::super::MergedContinuationTrigger::Tick,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.adopted, 1);
         assert_incident_released(&fixture);
     }
 
+    #[tokio::test]
+    async fn production_wiring_is_startup_fail_open_and_tick_error_propagating() {
+        let directory_instead_of_database = tempfile::tempdir().unwrap();
+        let startup = super::super::reconcile_merged_continuations(
+            directory_instead_of_database.path(),
+            super::super::MergedContinuationTrigger::Startup,
+        )
+        .await
+        .unwrap();
+        assert_eq!(startup, ReconcileOutcome::default());
+
+        let tick = super::super::reconcile_merged_continuations(
+            directory_instead_of_database.path(),
+            super::super::MergedContinuationTrigger::Tick,
+        )
+        .await;
+        assert!(tick.is_err());
+    }
+
     #[test]
-    fn candidate_batch_is_bounded_and_deterministically_ordered() {
+    fn event_page_driver_uses_sequence_primary_key_without_sorting_history() {
         let fixture = IncidentFixture::new();
         let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT seq,kind,subject,expires_at FROM events
+                 WHERE seq>?1 ORDER BY seq ASC LIMIT ?2",
+            )
+            .unwrap();
+        let details = stmt
+            .query_map(params![0, EVENT_PAGE_LIMIT], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("INTEGER PRIMARY KEY") && detail.contains("rowid>?")),
+            "event page must seek the monotonic sequence: {details:?}"
+        );
+        assert!(
+            details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "event page must not sort task/event history: {details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_pages_are_bounded_deterministic_and_rejected_pairs_cannot_starve_valid_later_delivery(
+    ) {
+        let fixture = IncidentFixture::new();
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("DELETE FROM events WHERE subject='task#320'", [])
+            .unwrap();
         for task_id in 321..330 {
             conn.execute(
                 "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs,continue_pr)
@@ -289,21 +453,47 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (15,'task_in_review','task#320','by worker',?1),
+                    (30,'task_merging','task#320','by reviewer',?1),
+                    (40,'task_done','task#320','by system',?1)",
+            [LIVE_UNTIL],
+        )
+        .unwrap();
 
-        let first = select_candidates(&conn, NOW).unwrap();
-        let second = select_candidates(&conn, NOW).unwrap();
+        let first = select_event_page(&conn, NOW).unwrap();
+        let second = select_event_page(&conn, NOW).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.len(), RECONCILE_BATCH_LIMIT as usize);
+        assert_eq!(first.scanned, EVENT_PAGE_LIMIT as usize);
         assert_eq!(
             first
+                .candidates
                 .iter()
                 .map(|candidate| candidate.recovery_task_id)
                 .collect::<Vec<_>>(),
-            (320..328).collect::<Vec<_>>()
+            vec![321, 322]
         );
-        assert!(first
-            .iter()
-            .all(|candidate| candidate.original_child_id == 307));
+        drop(conn);
+
+        let mut previous_cursor = 0;
+        let mut adopted = false;
+        for _ in 0..8 {
+            let outcome = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+            assert!(outcome.scanned <= EVENT_PAGE_LIMIT as usize);
+            let cursor = fixture.cursor().unwrap();
+            assert!(cursor > previous_cursor, "each nonempty page must advance");
+            previous_cursor = cursor;
+            if outcome.adopted == 1 {
+                adopted = true;
+                break;
+            }
+        }
+        assert!(
+            adopted,
+            "nine durable rejected pairs must not hide the later valid delivery"
+        );
+        assert_incident_released(&fixture);
     }
 
     #[tokio::test]
@@ -336,6 +526,7 @@ mod tests {
         assert_eq!(
             outcome,
             ReconcileOutcome {
+                scanned: 6,
                 examined: 1,
                 adopted: 0
             },
@@ -352,19 +543,34 @@ mod tests {
 
         // A crash after the short read but before core application leaves no
         // cursor or mutation to repair; the restarted pass finds the same row.
-        {
+        let page = {
             let conn = quorum_core::db::open(&fixture.db_path).unwrap();
-            assert_eq!(select_candidates(&conn, NOW).unwrap().len(), 1);
-        }
+            select_event_page(&conn, NOW).unwrap()
+        };
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(fixture.cursor(), None);
         assert_eq!(fixture.status(307), "failed");
 
         let first_restart = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
         assert_eq!(first_restart.adopted, 1);
+        assert_eq!(fixture.cursor(), page.through_seq);
 
-        // A crash after commit replays as a clean no-op because #345 changed
-        // the failed child and graph in the same transaction.
+        // Model a crash after the core commit but before the page ack by
+        // rewinding only this daemon-owned cursor. The restarted page is a
+        // clean no-op because #345 committed child and graph completion
+        // together, then it is acknowledged again.
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute(
+            "UPDATE cursors SET last_seq=0 WHERE agent_id=?1 AND topic=?2",
+            params![CURSOR_AGENT, CURSOR_TOPIC],
+        )
+        .unwrap();
+        drop(conn);
         let second_restart = reconcile(fixture.db_path.clone(), NOW + 1).await.unwrap();
-        assert_eq!(second_restart, ReconcileOutcome::default());
+        assert_eq!(second_restart.adopted, 0);
+        assert!(second_restart.scanned >= 3);
+        assert!(second_restart.scanned <= EVENT_PAGE_LIMIT as usize);
+        assert!(fixture.cursor() >= page.through_seq);
         assert_eq!(fixture.status(307), "done");
         assert_eq!(fixture.status(299), "done");
     }
@@ -372,14 +578,14 @@ mod tests {
     #[test]
     fn candidate_evidence_read_is_autocommit_and_releases_connection_before_apply() {
         let fixture = IncidentFixture::new();
-        let candidates = {
+        let page = {
             let conn = quorum_core::db::open(&fixture.db_path).unwrap();
             assert!(conn.is_autocommit());
-            let candidates = select_candidates(&conn, NOW).unwrap();
+            let page = select_event_page(&conn, NOW).unwrap();
             assert!(conn.is_autocommit());
-            candidates
+            page
         };
-        assert_eq!(candidates.len(), 1);
+        assert_eq!(page.candidates.len(), 1);
 
         // The evidence connection is gone before a writer is acquired. The
         // production path has no network-capable dependency between these

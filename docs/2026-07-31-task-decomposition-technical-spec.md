@@ -65,9 +65,24 @@ housekeeping has swept it. One `BEGIN IMMEDIATE` transaction rechecks all eviden
 the failed child done with explicit recovery provenance, preserves its PR association, and runs
 ordinary final-child graph completion. The continuation row remains unchanged. No match, replay,
 or losing concurrent caller changes state or emits an event; the winner emits the ordinary
-bounded child and graph completion events exactly once. This exception is not automatic startup
-reconciliation or scheduling authority and cannot recover a `blocked` graph: graph-blocker scope
-defects still require source cancellation and a replacement source.
+bounded child and graph completion events exactly once.
+
+The daemon invokes this primitive automatically after graph consistency reconciliation and before
+generic stateless lifecycle recovery or provisioning, once at startup and once per ordinary tick.
+Discovery reads at most eight physical lifecycle-event rows in ascending sequence order from a dedicated
+persisted cursor. It filters for a live terminal `task_done` record, then resolves the candidate's
+explicit `source_task`, active graph membership, PR targets, and live publication/merge evidence
+through primary-key/subject-indexed short reads. It neither scans all done tasks nor performs
+network I/O. The read connection closes before any guarded core write begins.
+
+The daemon acknowledges the event page monotonically only after every candidate application
+returns successfully. Permanent core rejections therefore advance rather than starving later
+deliveries. A crash before application leaves the cursor unchanged; a crash after core commit but
+before acknowledgement replays an idempotent no-op. A startup-pass error is logged and does not
+block other recovery, while a normal-tick error follows the ordinary tick error policy; neither
+advances the page. Candidate discovery grants no authority beyond the guarded core predicate and
+cannot recover a `blocked` graph: graph-blocker scope defects still require source cancellation
+and a replacement source.
 
 Every event transition that marks a generated child done, including the final child merge, and
 every permitted manual child close checks graph completion in the same transaction. If every
@@ -368,9 +383,10 @@ Decomposition reconciliation runs before generic lifecycle recovery or provision
 - An inconsistent graph may replan only if no child has ever been claimed, created a proposed
   change, or merged and proposal budget remains.
 - Any evidence of generated delivery forbids automatic replanning and requires cancellation plus
-  replacement. The explicit exact-continuation adoption exception described under Lifecycle is
-  a separate, caller-selected transaction for an otherwise consistent active graph; startup
-  reconciliation never invokes or infers it.
+  replacement except for the exact-continuation adoption predicate described under Lifecycle.
+  After consistency checks, startup and tick reconciliation discover that case through the
+  bounded monotonic event cursor and invoke the guarded transaction; no shared-PR or inferred
+  provenance match is sufficient.
 - Generic recovery must not reset planning/decomposed sources or treat children as unrelated.
 - Pre-feature unrelated tasks enter the current admission policy when next eligible. A complete
   existing graph resumes; incomplete/inconsistent graphs are held with a visible reason.

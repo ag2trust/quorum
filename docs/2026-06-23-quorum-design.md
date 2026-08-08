@@ -1807,9 +1807,18 @@ explicit `source_task` provenance, live daemon publication and merge events (`ex
 immutable managed-review authority, and one consistent PR target/approved head SHA. It changes
 only the failed child, records recovery provenance while preserving the PR, then invokes ordinary
 final-child completion. Missing or expired evidence, replay, and losing concurrent callers are
-clean no-ops with no events; the winner emits bounded completion events once. No startup scan or
-scheduler infers this exception. The complete predicate is specified in the decomposition
-technical specification.
+clean no-ops with no events; the winner emits bounded completion events once. After graph
+consistency reconciliation and before generic stateless lifecycle recovery or provisioning, the
+daemon automatically discovers eligible deliveries at startup and on ordinary ticks. Discovery consumes
+at most eight physical rows from the durable lifecycle-event sequence in ascending `seq` order,
+then resolves explicit `source_task`, graph membership, PR targets, and live publication/merge
+evidence using short reads only. It never scans terminal-task history or performs network I/O.
+A dedicated monotonic cursor is acknowledged only after every guarded adoption call in the page;
+durable rejections therefore cannot starve later events, and a crash before application or after
+the core commit replays safely. Startup discovery failure is logged and fail-open; tick failure
+uses the ordinary tick error policy without advancing the cursor. The guarded transaction remains
+the sole adoption authority. The complete predicate is specified in the decomposition technical
+specification.
 
 The final child merge marks the source and graph done in the same transaction that marks that
 child done. Source dependents remain blocked until then. Cancelling a source atomically makes the
@@ -1829,13 +1838,16 @@ pending classification/planning and restarts admission; stale/replayed edits do 
 fourth accepted edit is rejected. Materialized source/child scope and graph dependencies cannot be
 edited. Daemon-owned lifecycle evidence remains writable.
 
-Decomposition reconciliation runs before ordinary recovery and provisioning. A durable freeze
+Decomposition reconciliation runs before merged-continuation adoption, ordinary recovery, and
+provisioning. A durable freeze
 resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
 nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
-path, while any delivery evidence requires cancellation and replacement. The exact-continuation
-exception above is an explicit transaction on a consistent active graph, never a reconciliation
-action. Read-only status exposes bounded membership, edges, progress, attempts, provenance, and
-blockers. The complete storage, protocol, and recovery contract is in
+path, while any delivery evidence requires cancellation and replacement except for the
+evidence-complete exact-continuation case above. Its automatic daemon discovery is a bounded
+reconciliation action on a consistent active graph; the core transaction remains fail-closed and
+does not broaden graph-blocker recovery. Read-only status exposes bounded membership, edges,
+progress, attempts, provenance, and blockers. The complete storage, protocol, and recovery
+contract is in
 `docs/2026-07-31-task-decomposition-technical-spec.md`.
 
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
