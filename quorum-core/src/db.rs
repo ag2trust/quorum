@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 42;
+pub const SCHEMA_VERSION: i64 = 43;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -625,6 +625,16 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                      ON task_decompositions(planner_assignment_id);",
             )?;
         }
+
+        // v43 adds dormant durable review follow-up batches and artifacts via
+        // SCHEMA_SQL. The run-count column is additive; historical collection
+        // rows retain the default zero without reinterpretation or backfill.
+        if current < 43 && !column_exists(conn, "review_collection_runs", "followup_count")? {
+            conn.execute(
+                "ALTER TABLE review_collection_runs ADD COLUMN followup_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -715,6 +725,344 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn fresh_schema_has_exact_dormant_review_followup_shape_and_constraints() {
+        fn columns(
+            conn: &Connection,
+            table: &str,
+        ) -> Vec<(String, String, i64, Option<String>, i64)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name,type,\"notnull\",dflt_value,pk
+                     FROM pragma_table_info(?1) ORDER BY cid",
+                )
+                .unwrap();
+            stmt.query_map([table], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+        }
+
+        fn foreign_keys(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT \"from\",\"table\",\"to\"
+                     FROM pragma_foreign_key_list(?1) ORDER BY \"from\"",
+                )
+                .unwrap();
+            stmt.query_map([table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("followups.db")).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+
+        assert_eq!(
+            columns(&conn, "review_followup_batches"),
+            vec![
+                ("pr_number".into(), "INTEGER".into(), 0, None, 1),
+                ("task_id".into(), "INTEGER".into(), 1, None, 0),
+                ("graph_id".into(), "INTEGER".into(), 0, None, 0),
+                ("source_task_id".into(), "INTEGER".into(), 1, None, 0),
+                ("collector_version".into(), "TEXT".into(), 1, None, 0),
+                ("artifact_count".into(), "INTEGER".into(), 1, None, 0),
+                ("state".into(), "TEXT".into(), 1, None, 0),
+                ("created_at".into(), "INTEGER".into(), 1, None, 0),
+                ("updated_at".into(), "INTEGER".into(), 1, None, 0),
+            ]
+        );
+        assert_eq!(
+            columns(&conn, "review_followup_artifacts"),
+            vec![
+                ("id".into(), "INTEGER".into(), 0, None, 1),
+                ("pr_number".into(), "INTEGER".into(), 1, None, 0),
+                ("ordinal".into(), "INTEGER".into(), 1, None, 0),
+                ("technical_impact".into(), "TEXT".into(), 1, None, 0),
+                ("scope_relationship".into(), "TEXT".into(), 1, None, 0),
+                ("concern".into(), "TEXT".into(), 1, None, 0),
+                ("non_blocking_reason".into(), "TEXT".into(), 1, None, 0),
+                ("affected_behavior".into(), "TEXT".into(), 1, None, 0),
+                ("desired_outcome".into(), "TEXT".into(), 1, None, 0),
+                (
+                    "verification_expectations".into(),
+                    "TEXT".into(),
+                    1,
+                    None,
+                    0,
+                ),
+                ("evidence_ids".into(), "TEXT".into(), 1, None, 0),
+                ("disposition".into(), "TEXT".into(), 0, None, 0),
+                ("disposition_reason".into(), "TEXT".into(), 0, None, 0),
+                ("linked_task_id".into(), "INTEGER".into(), 0, None, 0),
+                ("created_task_id".into(), "INTEGER".into(), 0, None, 0),
+                ("created_at".into(), "INTEGER".into(), 1, None, 0),
+                ("updated_at".into(), "INTEGER".into(), 1, None, 0),
+            ]
+        );
+        assert_eq!(
+            foreign_keys(&conn, "review_followup_batches"),
+            vec![
+                ("graph_id".into(), "task_decompositions".into(), "id".into()),
+                ("source_task_id".into(), "tasks".into(), "id".into()),
+                ("task_id".into(), "tasks".into(), "id".into()),
+            ]
+        );
+        assert_eq!(
+            foreign_keys(&conn, "review_followup_artifacts"),
+            vec![
+                ("created_task_id".into(), "tasks".into(), "id".into()),
+                ("linked_task_id".into(), "tasks".into(), "id".into()),
+                (
+                    "pr_number".into(),
+                    "review_followup_batches".into(),
+                    "pr_number".into(),
+                ),
+            ]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT type,\"notnull\",dflt_value
+                 FROM pragma_table_info('review_collection_runs')
+                 WHERE name='followup_count'",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?
+                )),
+            )
+            .unwrap(),
+            ("INTEGER".into(), 1, "0".into())
+        );
+
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
+                 (1,'source','done','owner',1,1),
+                 (2,'linked','open','owner',1,1),
+                 (3,'created','open','owner',1,1);
+             INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (10,1,'completed',0,0,1,1,1);",
+        )
+        .unwrap();
+
+        let insert_batch = |pr_number: i64,
+                            task_id: i64,
+                            graph_id: Option<i64>,
+                            source_task_id: i64,
+                            state: &str| {
+            conn.execute(
+                "INSERT INTO review_followup_batches(
+                     pr_number,task_id,graph_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,'followups-v1',6,?5,1,1)",
+                rusqlite::params![pr_number, task_id, graph_id, source_task_id, state],
+            )
+        };
+        insert_batch(100, 1, Some(10), 1, "collected").unwrap();
+        conn.execute(
+            "UPDATE review_followup_batches SET state='assessing' WHERE pr_number=100",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE review_followup_batches SET state='resolved' WHERE pr_number=100",
+            [],
+        )
+        .unwrap();
+        assert!(insert_batch(101, 1, None, 1, "invalid").is_err());
+        assert!(insert_batch(102, 999, None, 1, "collected").is_err());
+        assert!(insert_batch(103, 1, Some(999), 1, "collected").is_err());
+        assert!(insert_batch(104, 1, None, 999, "collected").is_err());
+
+        let insert_artifact = |ordinal: i64,
+                               impact: &str,
+                               scope: &str,
+                               disposition: Option<&str>,
+                               linked_task_id: Option<i64>,
+                               created_task_id: Option<i64>| {
+            conn.execute(
+                "INSERT INTO review_followup_artifacts(
+                     pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,disposition,
+                     disposition_reason,linked_task_id,created_task_id,created_at,updated_at)
+                 VALUES (100,?1,?2,?3,'concern','reason','behavior','outcome',
+                         '[\"verify\"]','[1]',?4,NULL,?5,?6,1,1)",
+                rusqlite::params![
+                    ordinal,
+                    impact,
+                    scope,
+                    disposition,
+                    linked_task_id,
+                    created_task_id
+                ],
+            )
+        };
+
+        for (ordinal, impact, scope, disposition, linked, created) in [
+            (0, "critical", "pre_existing", None, None, None),
+            (1, "major", "out_of_scope", Some("linked"), Some(2), None),
+            (
+                2,
+                "minor",
+                "threat_model_expansion",
+                Some("created"),
+                None,
+                Some(3),
+            ),
+            (3, "nit", "defense_in_depth", Some("dismissed"), None, None),
+            (
+                4,
+                "critical",
+                "future_requirement",
+                Some("deferred"),
+                None,
+                None,
+            ),
+            (5, "major", "design_debt", None, None, None),
+        ] {
+            insert_artifact(ordinal, impact, scope, disposition, linked, created).unwrap();
+        }
+
+        assert!(insert_artifact(6, "invalid", "pre_existing", None, None, None).is_err());
+        assert!(insert_artifact(6, "major", "invalid", None, None, None).is_err());
+        assert!(insert_artifact(6, "major", "pre_existing", Some("invalid"), None, None).is_err());
+        assert!(insert_artifact(6, "major", "pre_existing", None, Some(2), None).is_err());
+        assert!(insert_artifact(6, "major", "pre_existing", Some("linked"), None, None).is_err());
+        assert!(insert_artifact(
+            6,
+            "major",
+            "pre_existing",
+            Some("created"),
+            Some(2),
+            Some(3)
+        )
+        .is_err());
+        assert!(
+            insert_artifact(6, "major", "pre_existing", Some("dismissed"), None, Some(3)).is_err()
+        );
+        assert!(
+            insert_artifact(6, "major", "pre_existing", Some("linked"), Some(999), None).is_err()
+        );
+        assert!(insert_artifact(0, "major", "pre_existing", None, None, None).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_artifacts(
+                     pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES (999,0,'major','pre_existing','c','r','b','o','[]','[]',1,1)",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn populated_v42_migration_adds_dormant_followups_without_changing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v42-followups.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,body,status,priority,labels,assignee,created_by,
+                     created_at,updated_at,refs,author,reviewer,rework_round,review_only)
+                 VALUES (41,'historical task','body','done',7,'[\"old\"]','worker','owner',
+                         10,20,'{\"pr\":410}','worker','reviewer',2,0);
+                 INSERT INTO review_findings(
+                     id,pr_number,task_id,reviewer,kind,author_pushback,pushback_accepted,
+                     severity,text,source_endpoint,created_at,addressed_status,evidence_ids,
+                     collector_model,collector_version)
+                 VALUES (51,410,41,'reviewer','suggestion',1,0,'minor','historical finding',
+                         'pulls',30,'unaddressed','[{\"kind\":\"review\",\"id\":1}]',
+                         'old-model','old-v1');
+                 INSERT INTO review_collection_runs(
+                     pr_number,task_id,status,error,collector_model,collector_version,
+                     findings_count,attempted_at,completed_at,role_assignment_id)
+                 VALUES (410,41,'success',NULL,'old-model','old-v1',1,30,31,NULL);
+                 DROP TABLE review_followup_artifacts;
+                 DROP TABLE review_followup_batches;
+                 ALTER TABLE review_collection_runs DROP COLUMN followup_count;
+                 PRAGMA user_version=42;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert!(column_exists(&conn, "review_collection_runs", "followup_count").unwrap());
+        for table in ["review_followup_batches", "review_followup_artifacts"] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        let historical_json = |sql| {
+            conn.query_row(sql, [], |row| row.get::<_, String>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            historical_json(
+                "SELECT json_array(id,title,body,status,priority,labels,assignee,created_by,
+                        created_at,updated_at,refs,author,reviewer,rework_round,review_only)
+                 FROM tasks WHERE id=41"
+            ),
+            r#"[41,"historical task","body","done",7,"[\"old\"]","worker","owner",10,20,"{\"pr\":410}","worker","reviewer",2,0]"#
+        );
+        assert_eq!(
+            historical_json(
+                "SELECT json_array(id,pr_number,task_id,reviewer,kind,author_pushback,
+                        pushback_accepted,severity,text,source_endpoint,created_at,
+                        addressed_status,evidence_ids,collector_model,collector_version)
+                 FROM review_findings WHERE id=51"
+            ),
+            r#"[51,410,41,"reviewer","suggestion",1,0,"minor","historical finding","pulls",30,"unaddressed","[{\"kind\":\"review\",\"id\":1}]","old-model","old-v1"]"#
+        );
+        assert_eq!(
+            historical_json(
+                "SELECT json_array(pr_number,task_id,status,error,collector_model,
+                        collector_version,findings_count,followup_count,attempted_at,
+                        completed_at,role_assignment_id)
+                 FROM review_collection_runs WHERE pr_number=410"
+            ),
+            r#"[410,41,"success",null,"old-model","old-v1",1,0,30,31,null]"#
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT findings_count,followup_count FROM review_collection_runs
+                     WHERE pr_number=410",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (1, 0)
+        );
     }
 
     #[test]

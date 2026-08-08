@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 42). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 43). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -558,11 +558,64 @@ CREATE TABLE IF NOT EXISTS review_collection_runs (
     collector_model     TEXT NOT NULL,
     collector_version   TEXT NOT NULL,
     findings_count      INTEGER NOT NULL DEFAULT 0,
+    followup_count      INTEGER NOT NULL DEFAULT 0,
     attempted_at        INTEGER NOT NULL,
     completed_at        INTEGER,
     role_assignment_id  INTEGER REFERENCES role_assignments(id)
 );
 CREATE INDEX IF NOT EXISTS review_collection_runs_task ON review_collection_runs(task_id);
+
+-- v43: dormant durable review follow-up storage. A batch is the immutable first
+-- successful artifact snapshot for a merged PR. Later phases may advance its
+-- state, but re-interpretation never replaces the batch or its artifacts.
+CREATE TABLE IF NOT EXISTS review_followup_batches (
+    pr_number          INTEGER PRIMARY KEY,
+    task_id            INTEGER NOT NULL REFERENCES tasks(id),
+    graph_id           INTEGER REFERENCES task_decompositions(id),
+    source_task_id     INTEGER NOT NULL REFERENCES tasks(id),
+    collector_version  TEXT NOT NULL,
+    artifact_count     INTEGER NOT NULL,
+    state              TEXT NOT NULL CHECK(state IN ('collected', 'assessing', 'resolved')),
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_followup_artifacts (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    pr_number                  INTEGER NOT NULL REFERENCES review_followup_batches(pr_number),
+    ordinal                    INTEGER NOT NULL,
+    technical_impact           TEXT NOT NULL CHECK(technical_impact IN ('critical', 'major', 'minor', 'nit')),
+    scope_relationship         TEXT NOT NULL CHECK(scope_relationship IN (
+                                   'pre_existing', 'out_of_scope', 'threat_model_expansion',
+                                   'defense_in_depth', 'future_requirement', 'design_debt')),
+    concern                    TEXT NOT NULL,
+    non_blocking_reason        TEXT NOT NULL,
+    affected_behavior          TEXT NOT NULL,
+    desired_outcome            TEXT NOT NULL,
+    verification_expectations  TEXT NOT NULL,
+    evidence_ids               TEXT NOT NULL,
+    disposition                TEXT CHECK(disposition IS NULL OR disposition IN (
+                                   'created', 'linked', 'dismissed', 'deferred')),
+    disposition_reason         TEXT,
+    linked_task_id             INTEGER REFERENCES tasks(id),
+    created_task_id            INTEGER REFERENCES tasks(id),
+    created_at                 INTEGER NOT NULL,
+    updated_at                 INTEGER NOT NULL,
+    UNIQUE(pr_number, ordinal),
+    CHECK(
+        CASE
+            WHEN disposition IS NULL
+                THEN linked_task_id IS NULL AND created_task_id IS NULL
+            WHEN disposition = 'linked'
+                THEN linked_task_id IS NOT NULL AND created_task_id IS NULL
+            WHEN disposition = 'created'
+                THEN linked_task_id IS NULL AND created_task_id IS NOT NULL
+            WHEN disposition IN ('dismissed', 'deferred')
+                THEN linked_task_id IS NULL AND created_task_id IS NULL
+            ELSE 0
+        END
+    )
+);
 
 -- v24 (#127): durable post-merge collector retry queue. Each row is a pending
 -- collector invocation — the daemon enqueues one at MergeSucceeded and drains
