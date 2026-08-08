@@ -8,9 +8,9 @@
 //! warm worker (changes).
 //!
 //! Responsibility boundary (agents own PR collaboration):
-//! - The GitHub PR is the source of truth for findings, advisory suggestions,
+//! - The GitHub PR is the source of truth for findings and follow-ups,
 //!   author pushback, reviewer resolution, and evidence. Reviewers post all
-//!   blockers and advisory findings to the PR (inline where location matters)
+//!   BLOCKING and FOLLOW-UP findings to the PR (inline where location matters)
 //!   and respond to author pushback there. Authors address findings on the PR
 //!   and reply with concrete evidence when disagreeing rather than silently
 //!   ignoring a finding.
@@ -42,8 +42,45 @@ For cross-cutting changes, derive a small affected-path matrix/checklist from th
 (for example, producers × success/error/shutdown) and audit every applicable cell together. \
 Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
 Before submitting, publish one complete PR review summary for this reviewed SHA, with inline \
-comments where needed, that reports the complete blocker and advisory set discovered. \
+comments where needed, that reports the complete BLOCKING and FOLLOW-UP set discovered. \
 `--blocking` must equal the complete BLOCKING count for that SHA.\n";
+
+/// Shared two-axis finding policy. Keeping this in one bounded block prevents
+/// R1, R2, generated-child, and re-review prompts from drifting apart.
+const REVIEW_FINDING_CONTRACT: &str = "\
+## Finding impact and merge disposition\n\n\
+Classify every substantive finding on two independent axes:\n\
+1. Technical impact: critical, major, minor, or nit — how serious the concrete failure is \
+if its stated assumptions hold.\n\
+2. Merge disposition: BLOCKING or FOLLOW-UP — whether this Proposed Change must resolve \
+the finding before merge.\n\
+Critical or major technical impact does not by itself make a finding BLOCKING. Resource \
+exhaustion, unbounded growth, network or model calls in a database transaction, data loss, \
+corruption, security-boundary failures, and stuck processing are presumptively major or \
+critical impact, but their category alone never decides merge disposition.\n\n\
+A finding is BLOCKING only when its concrete failure violates at least one of: the current \
+task's outcome or acceptance boundary; an applicable repository invariant or established \
+supported behavior; or behavior this PR introduced or materially worsened. Its assumptions \
+must also fit the applicable established operating or threat model. Do not ignore applicable \
+repository invariants.\n\n\
+Classify a real issue as FOLLOW-UP when it is pre-existing and not materially worsened, \
+adjacent to or outside the current task, defense-in-depth, a future requirement, or dependent \
+on a materially stronger threat model, unless an explicit current contract makes it BLOCKING.\n\n\
+Evidence and PR-summary requirements:\n\
+- Every finding must cite a concrete code path (file:line or function), explain the \
+demonstrated failure and assumptions, and identify the affected product behavior.\n\
+- Every BLOCKING finding must explain why this PR cannot merge under the current contract.\n\
+- Every FOLLOW-UP finding must explain why deferral is safe; identify its scope relationship \
+(pre-existing, out-of-scope/adjacent, threat-model expansion, defense-in-depth, future \
+requirement, or design debt); and give a desired future outcome and verification. Include \
+enough concrete context for later collector extraction.\n\
+- The review summary must report `BLOCKING: <N>` and `FOLLOW-UP: <N>`, then record each \
+finding's technical impact, merge disposition, failure and assumptions, scope relationship, \
+and blocking or safe-deferral reason.\n\n\
+Post both dispositions to the PR. Only BLOCKING findings contribute to `--blocking`; FOLLOW-UP \
+findings never do and never force a changes verdict. With zero BLOCKING findings and one or \
+more FOLLOW-UP findings, submit `approved --blocking 0`. Reviewers do not create or modify \
+Managed Tasks for follow-ups.\n";
 
 /// CI and author-side verification are daemon concerns, never review findings.
 /// This wording is shared by every reviewer prompt.
@@ -63,12 +100,11 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
          invariants — then apply the contract below.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
-         valid outcome — do not manufacture findings to justify requesting changes. \
-         Every BLOCKING finding must cite a concrete code path and explain a \
-         reproducible or logically demonstrated failure.\n\n\
+         valid outcome — do not manufacture findings to justify requesting changes.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -81,19 +117,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -117,6 +141,7 @@ pub fn build_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -188,7 +213,9 @@ fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> Stri
          Review this child against its assigned requirements. Do not absorb, require, or move \
          unrelated sibling scope into this PR. A sibling is relevant only when it is listed above \
          as a direct prerequisite; inspect no transitive or unrelated sibling assignment as scope.\n\
-         Use ordinary `--verdict changes` for defects within this child's implementation. Use the \
+         Use ordinary `--verdict changes` only for BLOCKING defects within this child's \
+         implementation. FOLLOW-UP findings follow the contract above and never trigger a \
+         graph-blocker verdict. Use the \
          distinct `--verdict graph-blocker` only when concrete diff/repository evidence proves the \
          decomposition boundary itself is invalid (for example the assigned outcome necessarily \
          requires forbidden sibling scope). The only supported category is `{category}`. Signal it \
@@ -206,12 +233,11 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          Read the full PR diff and surrounding code (never the diff hunks alone), \
          check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          Calibration: review with independent judgment. Zero blocking findings is a \
-         valid outcome — do not manufacture findings to justify requesting changes. \
-         Every BLOCKING finding must cite a concrete code path and explain a \
-         reproducible or logically demonstrated failure.\n\n\
+         valid outcome — do not manufacture findings to justify requesting changes.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -224,19 +250,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -260,6 +274,7 @@ fn build_codex_review_prompt(spec: &ReviewerSpec, effort: &str) -> String {
         worker = spec.worker_agent,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -313,17 +328,16 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
          and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
-         Zero blocking findings is a valid outcome after a thorough review. Every \
-         BLOCKING finding must cite a concrete code path (file:line or function) and \
-         explain a reproducible or logically demonstrated failure. Speculative, \
-         contrarian, or \"what if\" findings without a concrete failure scenario are \
-         not blocking.\n\n\
+         Zero blocking findings is a valid outcome after a thorough review. Speculative, \
+         contrarian, or \"what if\" concerns without a concrete failure scenario are not \
+         findings.\n\n\
          Follow the repository AGENTS.md instructions for the review methodology. \
          Read the full PR diff and surrounding code (never the diff hunks alone), \
          check the repo CLAUDE.md/AGENTS.md invariants. Review at effort level {effort}.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -336,19 +350,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -373,6 +375,7 @@ fn build_codex_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -402,19 +405,18 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          2. Resolve differences by checking surrounding code and tests. Agreement with R1 \
          and no additional findings are both valid outcomes.\n\n\
          ## Evidence-bound requirement\n\n\
-         Zero blocking findings is a valid outcome after a thorough review. Every \
-         BLOCKING finding must cite a concrete code path (file:line or function) and \
-         explain a reproducible or logically demonstrated failure. Speculative, \
-         contrarian, or \"what if\" findings without a concrete failure scenario are \
-         not blocking.\n\n\
+         Zero blocking findings is a valid outcome after a thorough review. Speculative, \
+         contrarian, or \"what if\" concerns without a concrete failure scenario are not \
+         findings.\n\n\
          Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
          for the review methodology (full diff + surrounding code, severity classification). \
          If the builtin skill is unavailable, run the review directly: read the full PR diff \
          and surrounding code (never the diff hunks alone), and check the repo CLAUDE.md \
          invariants — then apply the contract below.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
-         - Post every BLOCKING and advisory finding to the PR. Use inline review comments \
+         - Post every BLOCKING and FOLLOW-UP finding to the PR. Use inline review comments \
          where a specific file/line is involved, and a review summary comment for cross-cutting \
          findings. The `submit` verdict is a lifecycle signal — the PR is where findings, \
          evidence, and the back-and-forth actually live.\n\
@@ -427,19 +429,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
          --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
-         Severity contract (#159 — concrete failure classes are BLOCKING unless you \
-         cite evidence disproving the failure):\n\
-         - Resource exhaustion (unbounded allocations, leaked handles, missing limits)\n\
-         - Unbounded prompt or context growth\n\
-         - Network or model API calls while holding a database transaction\n\
-         - Data loss, corruption, or security boundary violations\n\
-         - Stuck-processing paths (deadlocks, infinite loops, missing timeouts)\n\
-         A reviewer may not describe one of these concrete failures and then submit it \
-         as advisory without an explicit evidence-backed reason.\n\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING (correctness, security, data loss, \
-         regression, invariant violation — anything that must be fixed before merge) \
-         or advisory (quality/follow-up).\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -464,6 +454,7 @@ pub fn build_r2_review_prompt(spec: &R2ReviewSpec, effort: &str) -> String {
         r1 = spec.r1_reviewer,
         effort = effort,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
     )
 }
@@ -565,6 +556,7 @@ pub fn build_rereview_turn_with_context(
          full current diff and relevant sibling paths; do not narrowly inspect only the last \
          remediation commit.\n\n\
          {complete_review_contract}\n\
+         {finding_contract}\n\
          The PR is the source of truth for this review:\n\
          - Read the prior review thread on the PR. For each earlier finding, resolve it on \
          the PR — mark it fixed, downgrade it, or reaffirm it — so a later reader can \
@@ -579,7 +571,6 @@ pub fn build_rereview_turn_with_context(
          your verdict as the merge account and owns merge.\n\n\
          {verification_boundary}\n\
          Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Classify every finding as BLOCKING or advisory.\n\
          - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
          --verdict approved --blocking 0\n\
          - One or more blocking findings: write a short blocker summary to a temp file, then \
@@ -595,6 +586,7 @@ pub fn build_rereview_turn_with_context(
         name = reviewer_name,
         pr = pr,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
+        finding_contract = REVIEW_FINDING_CONTRACT,
         verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
         graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
     ))
@@ -922,7 +914,7 @@ mod tests {
                 "{name} must require cross-cutting path coverage"
             );
             assert!(
-                prompt.contains("complete blocker and advisory set"),
+                prompt.contains("complete BLOCKING and FOLLOW-UP set"),
                 "{name} must report the full finding set"
             );
             assert!(
@@ -945,6 +937,141 @@ mod tests {
                     "{name} must not narrow re-review to the latest remediation"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_reviewer_variant_separates_impact_from_merge_disposition() {
+        let context =
+            r#"{"task_id":7,"assigned_requirements":"parser only","direct_prerequisites":[]}"#;
+        let r1_spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            r1_reviewer: "Reviewer-1".into(),
+            r2_name: "Reviewer-2".into(),
+        };
+        let prompts = [
+            ("Claude R1", build_review_prompt(&r1_spec, "high")),
+            (
+                "Codex R1",
+                build_review_prompt_for_kind(AgentKind::Codex, &r1_spec, "high"),
+            ),
+            ("Claude R2", build_r2_review_prompt(&r2_spec, "high")),
+            (
+                "Codex R2",
+                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "high"),
+            ),
+            (
+                "generated-child Claude R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "generated-child Codex R1",
+                build_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r1_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "generated-child Claude R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Claude,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "generated-child Codex R2",
+                build_r2_review_prompt_for_kind_with_context(
+                    AgentKind::Codex,
+                    &r2_spec,
+                    "high",
+                    Some(context),
+                ),
+            ),
+            (
+                "ordinary re-review",
+                build_rereview_turn("Reviewer-1", 42, "Worker-1", "high"),
+            ),
+            (
+                "generated-child re-review",
+                build_rereview_turn_with_context(
+                    "Reviewer-1",
+                    42,
+                    "Worker-1",
+                    "high",
+                    Some(context),
+                ),
+            ),
+        ];
+
+        for (name, prompt) in prompts {
+            assert!(
+                prompt.contains("Classify every substantive finding on two independent axes")
+                    && prompt.contains("Technical impact: critical, major, minor, or nit")
+                    && prompt.contains("Merge disposition: BLOCKING or FOLLOW-UP"),
+                "{name} must classify technical impact independently from merge disposition"
+            );
+            assert!(
+                prompt.contains(
+                    "Critical or major technical impact does not by itself make a finding BLOCKING"
+                ) && prompt.contains("their category alone never decides merge disposition"),
+                "{name} must not turn high technical impact into an automatic blocker"
+            );
+            assert!(
+                prompt.contains("the current task's outcome or acceptance boundary")
+                    && prompt.contains("applicable repository invariant")
+                    && prompt.contains("introduced or materially worsened")
+                    && prompt.contains("applicable established operating or threat model"),
+                "{name} must carry the complete current-contract blocker boundary"
+            );
+            assert!(
+                prompt.contains("pre-existing and not materially worsened")
+                    && prompt.contains("defense-in-depth")
+                    && prompt.contains("a future requirement")
+                    && prompt.contains("materially stronger threat model"),
+                "{name} must preserve real adjacent concerns as follow-ups"
+            );
+            assert!(
+                prompt.contains("why this PR cannot merge")
+                    && prompt.contains("why deferral is safe")
+                    && prompt.contains("desired future outcome and verification")
+                    && prompt.contains("later collector extraction"),
+                "{name} must make both dispositions evidence-rich and collector-readable"
+            );
+            assert!(
+                prompt.contains("Only BLOCKING findings contribute to `--blocking`")
+                    && prompt.contains("FOLLOW-UP findings never do")
+                    && prompt.contains("never force a changes verdict"),
+                "{name} must exclude follow-ups from lifecycle blocking"
+            );
+            assert!(
+                prompt.contains("zero BLOCKING findings and one or more FOLLOW-UP findings")
+                    && prompt.contains("submit `approved --blocking 0`"),
+                "{name} must approve a follow-up-only review with zero blockers"
+            );
+            assert!(
+                prompt.contains("Reviewers do not create or modify Managed Tasks"),
+                "{name} must preserve daemon ownership of future work"
+            );
+            assert!(
+                !prompt.contains("concrete failure classes are BLOCKING unless")
+                    && !prompt.contains("or advisory (quality/follow-up)"),
+                "{name} must not retain the collapsed severity/disposition policy"
+            );
         }
     }
 
