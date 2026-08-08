@@ -1816,10 +1816,14 @@ evidence using short reads only. It never scans terminal-task history or perform
 A dedicated monotonic cursor is acknowledged only after every guarded adoption call and durable
 retry-marker write in the page. If the short read observes an unfinished sibling and the core
 remains a clean negative, the daemon records one idempotent, TTL-bounded marker for the exact
-child/recovery pair. A later sibling `task_done` event uses that marker to rediscover the recovery
-without scanning terminal-task history. Every settled page advances, so a stalled graph cannot
-starve later deliveries. A crash before application or after the core or marker commit replays
-safely. Startup discovery failure is logged and fail-open; tick failure
+child/recovery pair. A later sibling `task_done` event drains live markers oldest-first through a
+second monotonic cursor, with at most eight candidate applications per pass. If the marker batch
+fills that capacity, the sibling trigger remains unacknowledged while the pending cursor advances,
+so later pairs receive a bounded subsequent pass. Partial graphs consume the current sibling
+trigger without advancing pending markers and wait for the next sibling completion. Every settled
+page advances, so a stalled graph cannot starve later deliveries. A crash before application or
+after the core, marker, or pending-cursor commit replays safely. Startup discovery failure is
+logged and fail-open; tick failure
 uses the ordinary tick error policy without advancing the cursor. The guarded transaction remains
 the sole adoption authority. The complete predicate is specified in the decomposition technical
 specification.

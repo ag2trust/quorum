@@ -79,11 +79,14 @@ The daemon acknowledges the event page monotonically only after every candidate 
 and retry-marker write returns successfully. The short read also records whether another active
 sibling is unfinished. If that snapshot is partial and the guarded call remains a clean negative,
 the daemon records one idempotent, TTL-bounded event marker for the exact child/recovery pair. A
-later sibling `task_done` event follows that marker back to the recovery through bounded
-active-graph and subject-indexed reads. Every settled page advances rather than letting a stalled
-graph starve later deliveries. A crash before application leaves the cursor unchanged; a crash
-after the core or marker commit but before acknowledgement replays an idempotent no-op. A
-startup-pass error is logged and does not
+later sibling `task_done` event drains live markers in ascending event sequence through bounded
+active-graph and subject-indexed reads. A second monotonic cursor advances after each settled pair;
+at most eight pairs are applied per pass, and a full batch retains the sibling trigger so the next
+pass continues with the next-oldest marker. If another sibling remains unfinished, the trigger is
+consumed without advancing pending markers and the next sibling completion retries them. Every
+settled page advances rather than letting a stalled graph starve later deliveries. A crash before
+application leaves the cursor unchanged; a crash after the core, marker, or pending-cursor commit
+but before acknowledgement replays an idempotent no-op. A startup-pass error is logged and does not
 block other recovery, while a normal-tick error follows the ordinary tick error policy; neither
 advances the page. Candidate discovery grants no authority beyond the guarded core predicate and
 cannot recover a `blocked` graph: graph-blocker scope defects still require source cancellation

@@ -4,9 +4,9 @@
 //! Its persisted monotonic cursor makes rejected deliveries unable to starve
 //! later ones. A clean negative observed while another graph sibling is still
 //! unfinished records a bounded, durable retry marker; a later sibling-done
-//! event rediscovers that exact recovery. Every settled page advances only
-//! after the guarded core calls. The evidence connection is dropped before any
-//! adoption transaction is opened.
+//! event drains those markers oldest-first through a second monotonic cursor.
+//! Every settled page advances only after the guarded core calls. The evidence
+//! connection is dropped before any adoption transaction is opened.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 const EVENT_PAGE_LIMIT: i64 = 8;
 const CURSOR_AGENT: &str = "quorum-serve";
 const CURSOR_TOPIC: &str = "events:merged-continuation:v1";
+const PENDING_CURSOR_TOPIC: &str = "events:merged-continuation:pending:v1";
 const PENDING_EVENT_KIND: &str = "merged_continuation_pending";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,7 @@ struct Candidate {
     recovery_task_id: i64,
     pr_number: i64,
     has_unfinished_sibling: bool,
+    pending_marker_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,7 +42,20 @@ pub(crate) struct ReconcileOutcome {
 struct EventPage {
     through_seq: Option<i64>,
     scanned: usize,
-    candidates: Vec<Candidate>,
+    work: Vec<ReconcileWork>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileWork {
+    Candidate(Candidate),
+    StalePending(i64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSelection {
+    work: Vec<ReconcileWork>,
+    filled_capacity: bool,
+    deferred_for_graph_progress: bool,
 }
 
 pub(crate) async fn startup(db_path: &Path) -> Result<ReconcileOutcome> {
@@ -72,10 +87,22 @@ fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
 
     let mut outcome = ReconcileOutcome {
         scanned: page.scanned,
-        examined: page.candidates.len(),
+        examined: page
+            .work
+            .iter()
+            .filter(|work| matches!(work, ReconcileWork::Candidate(_)))
+            .count(),
         adopted: 0,
     };
-    for candidate in page.candidates {
+    for work in page.work {
+        let candidate = match work {
+            ReconcileWork::Candidate(candidate) => candidate,
+            ReconcileWork::StalePending(marker_seq) => {
+                let mut conn = quorum_core::db::open(db_path)?;
+                advance_cursor(&mut conn, PENDING_CURSOR_TOPIC, marker_seq)?;
+                continue;
+            }
+        };
         let mut conn = quorum_core::db::open(db_path)?;
         let adopted = quorum_core::decomposition::adopt_recovery_delivery(
             &mut conn,
@@ -95,6 +122,9 @@ fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
             // exact pair so an ordinary sibling completion can trigger it.
             persist_pending_candidate(&mut conn, candidate, now)?;
         }
+        if let Some(marker_seq) = candidate.pending_marker_seq {
+            advance_cursor(&mut conn, PENDING_CURSOR_TOPIC, marker_seq)?;
+        }
     }
 
     // Ack only after every core application and pending-marker write in the
@@ -104,7 +134,7 @@ fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
     // pass.
     if let Some(through_seq) = page.through_seq {
         let mut conn = quorum_core::db::open(db_path)?;
-        advance_cursor(&mut conn, through_seq)?;
+        advance_cursor(&mut conn, CURSOR_TOPIC, through_seq)?;
     }
     Ok(outcome)
 }
@@ -115,14 +145,7 @@ fn reconcile_blocking(db_path: &Path, now: i64) -> Result<ReconcileOutcome> {
 /// lifecycle record: all publication, review, merge, and PR-target evidence for
 /// a legitimate managed delivery precedes it.
 fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
-    let cursor = conn
-        .query_row(
-            "SELECT last_seq FROM cursors WHERE agent_id=?1 AND topic=?2",
-            params![CURSOR_AGENT, CURSOR_TOPIC],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
+    let cursor = read_cursor(conn, CURSOR_TOPIC)?;
     let events = {
         let mut stmt = conn.prepare(
             "SELECT seq,kind,subject,expires_at FROM events
@@ -139,10 +162,14 @@ fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let through_seq = events.last().map(|event| event.0);
-    let mut candidates = Vec::new();
-    for (_, kind, subject, expires_at) in &events {
+    let mut through_seq = None;
+    let mut work = Vec::new();
+    for (seq, kind, subject, expires_at) in &events {
+        if work.len() == EVENT_PAGE_LIMIT as usize {
+            break;
+        }
         if kind != "task_done" || *expires_at <= now {
+            through_seq = Some(*seq);
             continue;
         }
         let Some(recovery_task_id) = subject
@@ -150,21 +177,35 @@ fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|task_id| *task_id > 0)
         else {
+            through_seq = Some(*seq);
             continue;
         };
-        let candidate = match select_candidate(conn, recovery_task_id, now)? {
-            some @ Some(_) => some,
-            None => select_pending_candidate(conn, recovery_task_id, now)?,
-        };
-        if let Some(candidate) = candidate {
-            candidates.push(candidate);
+        if let Some(candidate) = select_candidate(conn, recovery_task_id, now)? {
+            work.push(ReconcileWork::Candidate(candidate));
+            through_seq = Some(*seq);
+            continue;
         }
+
+        let remaining = EVENT_PAGE_LIMIT as usize - work.len();
+        let pending = select_pending_candidates(conn, recovery_task_id, now, remaining)?;
+        if pending.deferred_for_graph_progress {
+            through_seq = Some(*seq);
+            continue;
+        }
+        work.extend(pending.work);
+        if pending.filled_capacity {
+            // Conservatively replay this trigger. Applications advance the
+            // pending cursor, so the next bounded pass starts with the next
+            // oldest marker; if the batch was exact, that pass simply acks it.
+            break;
+        }
+        through_seq = Some(*seq);
     }
 
     Ok(EventPage {
         through_seq,
         scanned: events.len(),
-        candidates,
+        work,
     })
 }
 
@@ -173,14 +214,17 @@ fn select_event_page(conn: &Connection, now: i64) -> Result<EventPage> {
 /// globally unique and contains at most eight members; the marker lookup uses
 /// the `(subject, seq)` event index and then re-enters the exact candidate
 /// prefilter by primary key.
-fn select_pending_candidate(
+fn select_pending_candidates(
     conn: &Connection,
     completed_task_id: i64,
     now: i64,
-) -> Result<Option<Candidate>> {
-    let pending: Option<(i64, String)> = conn
-        .query_row(
-            "SELECT original.id,pending.body
+    limit: usize,
+) -> Result<PendingSelection> {
+    debug_assert!(limit > 0);
+    let pending_cursor = read_cursor(conn, PENDING_CURSOR_TOPIC)?;
+    let rows = {
+        let mut stmt = conn.prepare(
+            "SELECT pending.seq,original.id,pending.body
              FROM task_graph_members completed
              JOIN task_decompositions graph ON graph.id=completed.graph_id
              JOIN task_graph_members member
@@ -195,24 +239,65 @@ fn select_pending_candidate(
                AND graph.state='active' AND graph.active=1
                AND original.status='failed'
                AND pending.kind=?2 AND pending.expires_at>?3
-             ORDER BY original.id ASC,pending.seq DESC
-             LIMIT 1",
-            params![completed_task_id, PENDING_EVENT_KIND, now],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((original_child_id, body)) = pending else {
-        return Ok(None);
+               AND pending.seq>?4
+             ORDER BY pending.seq ASC
+             LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                completed_task_id,
+                PENDING_EVENT_KIND,
+                now,
+                pending_cursor,
+                limit as i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let Some(recovery_task_id) = body
-        .strip_prefix("task#")
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|task_id| *task_id > 0)
-    else {
-        return Ok(None);
-    };
-    Ok(select_candidate(conn, recovery_task_id, now)?
-        .filter(|candidate| candidate.original_child_id == original_child_id))
+
+    let filled_capacity = rows.len() == limit;
+    let mut work = Vec::new();
+    for (marker_seq, original_child_id, body) in rows {
+        let recovery_task_id = body
+            .strip_prefix("task#")
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|task_id| *task_id > 0);
+        let candidate = match recovery_task_id {
+            Some(task_id) => select_candidate(conn, task_id, now)?,
+            None => None,
+        };
+        match candidate.filter(|candidate| candidate.original_child_id == original_child_id) {
+            Some(mut candidate) => {
+                candidate.pending_marker_seq = Some(marker_seq);
+                work.push(ReconcileWork::Candidate(candidate));
+            }
+            None => work.push(ReconcileWork::StalePending(marker_seq)),
+        }
+    }
+
+    // Trying a pending delivery before the graph's last ordinary sibling is
+    // done cannot distinguish a permanently rejected pair from one that merely
+    // arrived early. Consume this completion trigger without advancing the
+    // pending cursor; the next sibling completion will retry the same pairs.
+    let deferred_for_graph_progress = work
+        .iter()
+        .any(|work| matches!(work, ReconcileWork::Candidate(candidate) if candidate.has_unfinished_sibling));
+    if deferred_for_graph_progress {
+        work.clear();
+    }
+
+    Ok(PendingSelection {
+        work,
+        filled_capacity: filled_capacity && !deferred_for_graph_progress,
+        deferred_for_graph_progress,
+    })
 }
 
 /// Resolve one event-identified delivery using persisted graph, PR-target,
@@ -279,6 +364,7 @@ fn select_candidate(
                 recovery_task_id: row.get(1)?,
                 pr_number: row.get(2)?,
                 has_unfinished_sibling: row.get(3)?,
+                pending_marker_seq: None,
             })
         },
     )
@@ -309,13 +395,24 @@ fn persist_pending_candidate(conn: &mut Connection, candidate: Candidate, now: i
     Ok(())
 }
 
-fn advance_cursor(conn: &mut Connection, through_seq: i64) -> Result<()> {
+fn read_cursor(conn: &Connection, topic: &str) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT last_seq FROM cursors WHERE agent_id=?1 AND topic=?2",
+            params![CURSOR_AGENT, topic],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+fn advance_cursor(conn: &mut Connection, topic: &str, through_seq: i64) -> Result<()> {
     let tx = quorum_core::db::begin_immediate(conn)?;
     tx.execute(
         "INSERT INTO cursors(agent_id,topic,last_seq) VALUES (?1,?2,?3)
          ON CONFLICT(agent_id,topic)
          DO UPDATE SET last_seq=MAX(last_seq,excluded.last_seq)",
-        params![CURSOR_AGENT, CURSOR_TOPIC, through_seq],
+        params![CURSOR_AGENT, topic, through_seq],
     )?;
     tx.commit()?;
     Ok(())
@@ -561,9 +658,12 @@ mod tests {
         assert_eq!(first.scanned, EVENT_PAGE_LIMIT as usize);
         assert_eq!(
             first
-                .candidates
+                .work
                 .iter()
-                .map(|candidate| candidate.recovery_task_id)
+                .filter_map(|work| match work {
+                    ReconcileWork::Candidate(candidate) => Some(candidate.recovery_task_id),
+                    ReconcileWork::StalePending(_) => None,
+                })
                 .collect::<Vec<_>>(),
             vec![321, 322]
         );
@@ -658,6 +758,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn older_valid_pending_pair_is_not_hidden_by_newer_guarded_rejection() {
+        let fixture = IncidentFixture::new();
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='working' WHERE id=304", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(
+                 id,title,status,created_by,created_at,updated_at,refs,continue_pr)
+             VALUES (321,'newer coarse match','done','owner',41,44,?1,526)",
+            [json!({"pr": PR, "source_task": 307}).to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+             VALUES (321,526,'daemon/original',?1,0,42)",
+            [RECOVERY_HEAD],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (42,'task_in_review','task#321','by unmanaged',?1),
+                    (43,'task_merging','task#321','by unmanaged',?1),
+                    (44,'task_done','task#321','by system',?1)",
+            [LIVE_UNTIL],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Both deliveries arrive before the ordinary sibling. #320 has full
+        // managed authority; newer #321 passes only the coarse read prefilter
+        // and must be rejected by the guarded core.
+        let partial = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(partial.examined, 2);
+        assert_eq!(partial.adopted, 0);
+
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        conn.execute("UPDATE tasks SET status='done' WHERE id=304", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (?1,'task_done','task#304','by system',?2)",
+            params![NOW + 1, LIVE_UNTIL],
+        )
+        .unwrap();
+        let page = select_event_page(&conn, NOW + 1).unwrap();
+        let pending_order = page
+            .work
+            .iter()
+            .filter_map(|work| match work {
+                ReconcileWork::Candidate(candidate) => Some(candidate.recovery_task_id),
+                ReconcileWork::StalePending(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pending_order, vec![320, 321]);
+        drop(conn);
+
+        let completed = reconcile(fixture.db_path.clone(), NOW + 1).await.unwrap();
+        assert_eq!(completed.adopted, 1);
+        assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
+    async fn pending_pair_overflow_drains_in_bounded_oldest_first_batches() {
+        let fixture = IncidentFixture::new();
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        for task_id in 321..330 {
+            conn.execute(
+                "INSERT INTO tasks(
+                     id,title,status,created_by,created_at,updated_at,refs,continue_pr)
+                 VALUES (?1,'coarse-only recovery','done','owner',41,44,?2,526)",
+                params![task_id, json!({"pr": PR, "source_task": 307}).to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pr_targets(
+                     task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,526,'daemon/original',?2,0,42)",
+                params![task_id, RECOVERY_HEAD],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events(ts,kind,subject,body,expires_at)
+                 VALUES (42,'task_in_review',?1,'by unmanaged',?2),
+                        (43,'task_merging',?1,'by unmanaged',?2),
+                        (44,'task_done',?1,'by system',?2)",
+                params![format!("task#{task_id}"), LIVE_UNTIL],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO events(ts,kind,subject,body,expires_at)
+                 VALUES (44,?1,'task#307',?2,?3)",
+                params![PENDING_EVENT_KIND, format!("task#{task_id}"), LIVE_UNTIL],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (44,?1,'task#307','task#320',?2)",
+            params![PENDING_EVENT_KIND, LIVE_UNTIL],
+        )
+        .unwrap();
+        let marker_through = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO cursors(agent_id,topic,last_seq) VALUES (?1,?2,?3)",
+            params![CURSOR_AGENT, CURSOR_TOPIC, marker_through],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (45,'task_done','task#304','by system',?1)",
+            [LIVE_UNTIL],
+        )
+        .unwrap();
+        let trigger_seq = conn.last_insert_rowid();
+        drop(conn);
+
+        let first = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(first.examined, EVENT_PAGE_LIMIT as usize);
+        assert_eq!(first.adopted, 0);
+        assert_eq!(
+            fixture.cursor(),
+            Some(marker_through),
+            "overflow must retain the sibling trigger while the pending cursor advances"
+        );
+
+        let second = reconcile(fixture.db_path.clone(), NOW).await.unwrap();
+        assert_eq!(second.examined, 2);
+        assert_eq!(second.adopted, 1);
+        assert_eq!(fixture.cursor(), Some(trigger_seq));
+        assert_incident_released(&fixture);
+    }
+
+    #[tokio::test]
     async fn unrelated_and_incomplete_candidates_remain_unchanged() {
         let fixture = IncidentFixture::new();
         let conn = quorum_core::db::open(&fixture.db_path).unwrap();
@@ -708,7 +941,13 @@ mod tests {
             let conn = quorum_core::db::open(&fixture.db_path).unwrap();
             select_event_page(&conn, NOW).unwrap()
         };
-        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(
+            page.work
+                .iter()
+                .filter(|work| matches!(work, ReconcileWork::Candidate(_)))
+                .count(),
+            1
+        );
         assert_eq!(fixture.cursor(), None);
         assert_eq!(fixture.status(307), "failed");
 
@@ -746,7 +985,13 @@ mod tests {
             assert!(conn.is_autocommit());
             page
         };
-        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(
+            page.work
+                .iter()
+                .filter(|work| matches!(work, ReconcileWork::Candidate(_)))
+                .count(),
+            1
+        );
 
         // The evidence connection is gone before a writer is acquired. The
         // production path has no network-capable dependency between these
