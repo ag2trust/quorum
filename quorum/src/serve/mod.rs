@@ -15,6 +15,7 @@ pub mod collector;
 pub mod doctor;
 pub mod grok_agent;
 pub mod merge;
+pub mod merged_continuation;
 pub mod names;
 pub mod planner;
 pub mod recovery;
@@ -5076,6 +5077,17 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         }
     }
 
+    match merged_continuation::startup(&config.db_path).await {
+        Ok(outcome) if outcome.adopted > 0 => log(&format!(
+            "merged-continuation startup reconciliation adopted {}/{} candidate(s)",
+            outcome.adopted, outcome.examined
+        )),
+        Ok(_) => {}
+        Err(e) => log(&format!(
+            "merged-continuation startup reconciliation failed: {e} — continuing"
+        )),
+    }
+
     // M7: stateless crash recovery — kill stale processes, wipe journal,
     // GC worktrees, and reset non-terminal tasks for the tick loop to handle.
     if !recovered_frozen_decomposition {
@@ -5462,6 +5474,14 @@ async fn tick(
     signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
+
+    let merged_continuations = merged_continuation::tick(&db_path).await?;
+    if merged_continuations.adopted > 0 {
+        log(&format!(
+            "merged-continuation tick reconciliation adopted {}/{} candidate(s)",
+            merged_continuations.adopted, merged_continuations.examined
+        ));
+    }
 
     let decomposition_freeze = tick_decomposition(
         config,
