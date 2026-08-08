@@ -1,65 +1,23 @@
 //! Cross-process canary for the daemon-private provider-rework claim.
-//!
-//! The helper is an entry point in this integration-test executable, not a
-//! Cargo binary or production CLI command, so it cannot become public surface.
 
-use std::process::{Command, Stdio};
-use std::time::Duration;
+mod support;
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use support::protocol::{Barrier, ClaimProviderRetryInput, Operation, EXIT_NEGATIVE, EXIT_SUCCESS};
 
 const RACERS: usize = 12;
 const ROUNDS: usize = 3;
 const TTL: i64 = 300;
-
-#[test]
-fn retry_claim_subprocess() {
-    let Ok(db_path) = std::env::var("QUORUM_TEST_RETRY_DB") else {
-        return;
-    };
-    let task_id: i64 = std::env::var("QUORUM_TEST_RETRY_TASK")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let agent = std::env::var("QUORUM_TEST_RETRY_AGENT").unwrap();
-    let gate = std::env::var("QUORUM_TEST_RETRY_GATE").unwrap();
-    let now: i64 = std::env::var("QUORUM_TEST_RETRY_NOW")
-        .unwrap()
-        .parse()
-        .unwrap();
-
-    while !std::path::Path::new(&gate).exists() {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    let result = quorum_core::db::open(std::path::Path::new(&db_path)).and_then(|mut conn| {
-        quorum_core::tasks::claim_provider_retry_rework(&mut conn, &agent, task_id, TTL, now)
-    });
-    match result {
-        Ok(Some(_)) => {
-            println!("{}", serde_json::json!({"ok": true, "agent": agent}));
-            std::process::exit(0);
-        }
-        Ok(None) => {
-            println!("{}", serde_json::json!({"ok": false, "agent": agent}));
-            std::process::exit(1);
-        }
-        Err(error) => {
-            println!(
-                "{}",
-                serde_json::json!({"error": error.to_string(), "agent": agent})
-            );
-            std::process::exit(3);
-        }
-    }
-}
+const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+const BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[test]
 fn n_process_provider_rework_claim_exactly_one_winner() {
-    let test_exe = std::env::current_exe().unwrap();
-
     for round in 0..ROUNDS {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("quorum.db");
-        let gate_path = dir.path().join("start");
+        let go_path = dir.path().join("start");
         let now = 10_000 + round as i64;
         let mut conn = quorum_core::db::open(&db_path).unwrap();
         let task_id = quorum_core::tasks::create(
@@ -99,32 +57,47 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
         let agents: Vec<String> = (0..RACERS)
             .map(|index| format!("retry-{round}-{index}"))
             .collect();
+        let ready_paths: Vec<PathBuf> = agents
+            .iter()
+            .map(|agent| dir.path().join(format!("{agent}-ready")))
+            .collect();
         let children: Vec<_> = agents
             .iter()
-            .map(|agent| {
-                Command::new(&test_exe)
-                    .args(["--exact", "retry_claim_subprocess", "--nocapture"])
-                    .env("QUORUM_TEST_RETRY_DB", &db_path)
-                    .env("QUORUM_TEST_RETRY_TASK", task_id.to_string())
-                    .env("QUORUM_TEST_RETRY_AGENT", agent)
-                    .env("QUORUM_TEST_RETRY_GATE", &gate_path)
-                    .env("QUORUM_TEST_RETRY_NOW", now.to_string())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap()
+            .zip(&ready_paths)
+            .map(|(agent, ready_path)| {
+                support::spawn(
+                    Operation::ClaimProviderRetry,
+                    &ClaimProviderRetryInput {
+                        db_path: db_path.clone(),
+                        task_id,
+                        agent: agent.clone(),
+                        ttl: TTL,
+                        now,
+                        barrier: Barrier {
+                            ready_path: ready_path.clone(),
+                            go_path: go_path.clone(),
+                            timeout_ms: BARRIER_TIMEOUT.as_millis() as u64,
+                        },
+                    },
+                )
+                .unwrap_or_else(|error| panic!("round {round}: spawn helper {agent}: {error}"))
             })
             .collect();
-        std::fs::write(&gate_path, b"go").unwrap();
+        release_when_ready(round, &ready_paths, &go_path);
 
         let outcomes: Vec<_> = agents
             .iter()
             .zip(children)
-            .map(|(agent, child)| (agent, child.wait_with_output().unwrap()))
+            .map(|(agent, child)| {
+                let output = child.wait(CHILD_TIMEOUT).unwrap_or_else(|error| {
+                    panic!("round {round}: helper {agent} failed or was reaped: {error}")
+                });
+                (agent, output)
+            })
             .collect();
         let winners: Vec<_> = outcomes
             .iter()
-            .filter(|(_, output)| output.status.code() == Some(0))
+            .filter(|(_, output)| output.status.code() == Some(EXIT_SUCCESS))
             .map(|(agent, _)| (*agent).clone())
             .collect();
         assert_eq!(
@@ -134,22 +107,28 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
             render_outcomes(&outcomes)
         );
         assert!(
-            outcomes
-                .iter()
-                .all(|(_, output)| matches!(output.status.code(), Some(0 | 1))),
+            outcomes.iter().all(|(_, output)| matches!(
+                output.status.code(),
+                Some(EXIT_SUCCESS | EXIT_NEGATIVE)
+            )),
             "round {round}: losers must be clean; outcomes={}",
             render_outcomes(&outcomes)
         );
         for (agent, output) in &outcomes {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let expected = serde_json::json!({
-                "ok": output.status.code() == Some(0),
-                "agent": agent,
-            })
-            .to_string();
             assert!(
-                stdout.lines().any(|line| line == expected),
-                "round {round}: missing stable helper JSON {expected:?}; stdout={stdout:?}"
+                output.stderr.is_empty(),
+                "round {round}: helper {agent} wrote stderr; outcomes={}",
+                render_outcomes(&outcomes)
+            );
+            let expected = serde_json::json!({
+                "ok": output.status.code() == Some(EXIT_SUCCESS),
+                "agent": agent,
+            });
+            assert_eq!(
+                output.json(),
+                expected,
+                "round {round}: helper {agent} returned unstable JSON; outcomes={}",
+                render_outcomes(&outcomes)
             );
         }
 
@@ -178,7 +157,26 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
     }
 }
 
-fn render_outcomes(outcomes: &[(&String, std::process::Output)]) -> String {
+fn release_when_ready(round: usize, ready_paths: &[PathBuf], go_path: &Path) {
+    let deadline = Instant::now() + BARRIER_TIMEOUT;
+    loop {
+        let missing = ready_paths
+            .iter()
+            .filter(|path| !path.is_file())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            std::fs::write(go_path, b"go").unwrap();
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "round {round}: helpers did not reach simultaneous-start barrier; missing={missing:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn render_outcomes(outcomes: &[(&String, support::HelperOutput)]) -> String {
     outcomes
         .iter()
         .map(|(agent, output)| {

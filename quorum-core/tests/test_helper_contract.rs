@@ -4,8 +4,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use support::protocol::{
     AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
-    MAX_INPUT_BYTES,
+    ClaimProviderRetryInput, ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE,
+    EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -13,9 +13,10 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
     let path = dir.path().join("quorum.db");
     let conn = quorum_core::db::open(&path).unwrap();
     conn.execute(
-        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
-         VALUES (1,'allocation target','open','owner',1,1),
-                (999,'event target','merging','owner',1,1)",
+        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs)
+         VALUES (1,'allocation target','rework','owner',1,1,
+                   '{\"cx_est\":3,\"cx_size\":\"M\",\"cx_ready\":true,\"cx_not_ready_reason\":null,\"codex_retry_requested\":true}'),
+                (999,'event target','merging','owner',1,1,NULL)",
         [],
     )
     .unwrap();
@@ -61,6 +62,21 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
             )
             .unwrap(),
             EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::ClaimProviderRetry,
+                &ClaimProviderRetryInput {
+                    db_path: db_path.clone(),
+                    task_id: 1,
+                    agent: "retry-worker".into(),
+                    ttl: 60,
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "provider-retry"),
+                },
+            )
+            .unwrap(),
+            EXIT_SUCCESS,
         ),
         (
             support::run(

@@ -30,3 +30,8 @@ doc = false
 name = "test_helper_contract"
 path = "tests/test_helper_contract.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "provider_retry_race"
+path = "tests/provider_retry_race.rs"
+required-features = ["test-support"]

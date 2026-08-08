@@ -2,8 +2,8 @@ mod protocol;
 
 use protocol::{
     AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
-    MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    ClaimProviderRetryInput, ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE,
+    EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -67,6 +67,7 @@ fn run() -> Result<i32, HelperError> {
     let result = match operation {
         Operation::AllocateRole => allocate_role(parse(&input)?)?,
         Operation::ClaimTask => claim_task(parse(&input)?)?,
+        Operation::ClaimProviderRetry => claim_provider_retry(parse(&input)?)?,
         Operation::CancelSourceGraph => cancel_source_graph(parse(&input)?)?,
         Operation::ApplyGraphEvent => apply_graph_event(parse(&input)?)?,
         Operation::ClaimCleanup => claim_cleanup(parse(&input)?)?,
@@ -211,6 +212,30 @@ fn claim_task(input: ClaimTaskInput) -> Result<OperationResult, HelperError> {
     let won = quorum_core::tasks::claim(&mut conn, &input.agent, Some(input.task_id), &[], 60, 10)?
         .is_some();
     Ok(OperationResult::race(json!({"won": won}), won))
+}
+
+fn claim_provider_retry(input: ClaimProviderRetryInput) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    validate_positive("task id", input.task_id)?;
+    validate_text("agent", &input.agent)?;
+    validate_positive("ttl", input.ttl)?;
+    if input.now.checked_add(input.ttl).is_none() {
+        return Err(HelperError::usage("ttl overflows expiry"));
+    }
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let won = quorum_core::tasks::claim_provider_retry_rework(
+        &mut conn,
+        &input.agent,
+        input.task_id,
+        input.ttl,
+        input.now,
+    )?
+    .is_some();
+    Ok(OperationResult::race(
+        json!({"ok": won, "agent": input.agent}),
+        won,
+    ))
 }
 
 fn cancel_source_graph(input: CancelSourceGraphInput) -> Result<OperationResult, HelperError> {
