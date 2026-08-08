@@ -16,6 +16,7 @@ mkdir -p "$BIN"
 
 cat >"$BIN/cargo" <<'EOF'
 #!/bin/sh
+[ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || exit 1
 exit 0
 EOF
 chmod +x "$BIN/cargo"
@@ -74,6 +75,38 @@ cp "$ROOT/.githooks/pre-push" .githooks/pre-push
 chmod +x .githooks/pre-push
 git config core.hooksPath .githooks
 
+# The daemon may replay an exact durable source SHA after mutable HEAD moves.
+# Prove both an initial publication and an existing-branch continuation use the
+# proposed tuple SHA throughout instead of silently substituting HEAD.
+git switch -q --detach origin/main
+git switch -qc daemon/durable-local-t3
+printf 'durable A\n' > durable
+git add durable
+git commit -qm 'durable initial publication' \
+  -m 'Co-Authored-By: Durable-A <durable-a@example.invalid>'
+DURABLE_A_SHA=$(git rev-parse HEAD)
+printf 'local drift\n' >> durable
+git commit -qam 'unpublished local drift' \
+  -m 'Co-Authored-By: Drift-A <drift-a@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin \
+  "$DURABLE_A_SHA:refs/heads/daemon/durable-t3"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/durable-t3)
+[ "$REMOTE_SHA" = "$DURABLE_A_SHA" ]
+
+git switch -q --detach "$DURABLE_A_SHA"
+git switch -qc daemon/durable-replay-t4
+printf 'durable B\n' >> durable
+git commit -qam 'durable remediation' \
+  -m 'Co-Authored-By: Durable-B <durable-b@example.invalid>'
+DURABLE_B_SHA=$(git rev-parse HEAD)
+printf 'more local drift\n' >> durable
+git commit -qam 'second unpublished local drift' \
+  -m 'Co-Authored-By: Drift-B <drift-b@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin \
+  "$DURABLE_B_SHA:refs/heads/daemon/durable-t3"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/durable-t3)
+[ "$REMOTE_SHA" = "$DURABLE_B_SHA" ]
+
 git switch -q --detach origin/main
 git switch -qc daemon/continuation-t3
 printf 'worker A\n' > remediation
@@ -92,6 +125,65 @@ PATH="$BIN:$PATH" git push -q origin \
   "$WORKER_B_SHA:refs/heads/daemon/continuation-t3"
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
 [ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+
+# Continuations only exempt already-published history. Multiple new worker
+# sessions after the authoritative remote tip remain genuine stacking.
+git switch -q --detach "$WORKER_B_SHA"
+git switch -qc daemon/stacked-continuation-t6
+printf 'continue A\n' >> remediation
+git commit -qam 'first continuation session' \
+  -m 'Co-Authored-By: Continue-A <continue-a@example.invalid>'
+printf 'continue B\n' >> remediation
+git commit -qam 'stacked continuation session' \
+  -m 'Co-Authored-By: Continue-B <continue-b@example.invalid>'
+STACKED_CONTINUATION_SHA=$(git rev-parse HEAD)
+if PATH="$BIN:$PATH" git push -q origin \
+  "$STACKED_CONTINUATION_SHA:refs/heads/daemon/continuation-t3" \
+  >"$TMP/stacked-continuation.out" 2>&1; then
+  echo 'expected stacked continuation sessions to fail pre-push' >&2
+  exit 1
+fi
+grep -q 'sessions in branch-owned commits' "$TMP/stacked-continuation.out"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
+[ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+
+# Supported non-publication pushes keep their existing shapes. Formatting is
+# still mandatory, but branch/session policy is irrelevant to tags and the
+# daemon's cleanup tombstones.
+git tag preflight-supported-tag "$STACKED_CONTINUATION_SHA"
+PATH="$BIN:$PATH" git push -q origin refs/tags/preflight-supported-tag
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/tags/preflight-supported-tag)
+[ "$REMOTE_SHA" = "$STACKED_CONTINUATION_SHA" ]
+
+git tag preflight-format-must-run "$STACKED_CONTINUATION_SHA"
+if PREFLIGHT_CARGO_FAIL=1 PATH="$BIN:$PATH" git push -q origin \
+  refs/tags/preflight-format-must-run >"$TMP/tag-format.out" 2>&1; then
+  echo 'expected formatting failure to reject a supported tag push' >&2
+  exit 1
+fi
+if git --git-dir="$REMOTE" rev-parse --verify -q \
+  refs/tags/preflight-format-must-run >/dev/null; then
+  echo 'format-rejected tag unexpectedly reached the remote' >&2
+  exit 1
+fi
+
+PATH="$BIN:$PATH" git push --atomic -q origin \
+  "$WORKER_B_SHA:refs/heads/quorum-cleanup/preflight-t3" \
+  ':refs/heads/daemon/continuation-t3'
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/quorum-cleanup/preflight-t3)
+[ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+if git --git-dir="$REMOTE" rev-parse --verify -q \
+  refs/heads/daemon/continuation-t3 >/dev/null; then
+  echo 'cleanup transaction did not delete the publication branch' >&2
+  exit 1
+fi
+
+PATH="$BIN:$PATH" git push -q origin ':refs/heads/quorum-cleanup/preflight-t3'
+if git --git-dir="$REMOTE" rev-parse --verify -q \
+  refs/heads/quorum-cleanup/preflight-t3 >/dev/null; then
+  echo 'cleanup tombstone deletion did not reach the remote' >&2
+  exit 1
+fi
 
 # A genuinely stacked new branch still exposes both sessions because a zero
 # remote SHA keeps the original origin/main..HEAD quick-gate range.
@@ -122,7 +214,7 @@ git commit -qm 'stale replacement' \
   -m 'Co-Authored-By: Stale-agent <stale@example.invalid>'
 STALE_SHA=$(git rev-parse HEAD)
 if PATH="$BIN:$PATH" git push --force -q origin \
-  "$STALE_SHA:refs/heads/daemon/continuation-t3" >"$TMP/stale.out" 2>&1; then
+  "$STALE_SHA:refs/heads/daemon/durable-t3" >"$TMP/stale.out" 2>&1; then
   echo 'expected stale/non-fast-forward update to fail pre-push' >&2
   exit 1
 fi
@@ -168,7 +260,7 @@ if {
   echo 'expected multiple ref mappings to fail pre-push' >&2
   exit 1
 fi
-grep -q 'expected exactly one ref update' "$TMP/multi-ref.out"
+grep -q 'multiple ref updates are not a cleanup transaction' "$TMP/multi-ref.out"
 
 # Continuation ranges are hook-only quick-gate input and cannot weaken the
 # mandatory full preflight invocation.
@@ -177,6 +269,6 @@ if PATH="$BIN:$PATH" ./preflight.sh \
   echo 'expected full preflight to reject continuation range input' >&2
   exit 1
 fi
-grep -q 'requires --quick' "$TMP/full-continuation.out"
+grep -q 'require --quick' "$TMP/full-continuation.out"
 
 echo 'test-preflight: PASS'
