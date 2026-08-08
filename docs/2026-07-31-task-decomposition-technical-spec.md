@@ -51,7 +51,23 @@ open -> planning -> decomposed -> done
 used for a valid Planning Blocker, exhausted proposal attempts, exhausted provider failures, or
 unsafe recovered state. A materialized graph blocker does not move the source out of
 `decomposed`; it marks the graph blocked and fails the affected child. Only source cancellation
-and a replacement source can recover a graph after generated delivery has started.
+and a replacement source can normally recover a graph after generated delivery has started.
+
+There is one narrow incident-recovery exception for a failed generated child whose exact work
+was subsequently delivered by a separate managed continuation task. An explicit core call may
+adopt that delivery only when the failed task is the final unfinished member of the still-active
+graph; both tasks identify the same repository and PR; the continuation has creator-selected
+`continue_pr` authority and explicit `source_task` provenance; and its daemon publication,
+managed approval, merge transition, PR target, and approved head SHA all agree. Publication and
+merge events are short-lived evidence: every required event must be live at the transaction's
+`now` (`expires_at > now`), so an event at its expiry boundary is rejected regardless of whether
+housekeeping has swept it. One `BEGIN IMMEDIATE` transaction rechecks all evidence, marks only
+the failed child done with explicit recovery provenance, preserves its PR association, and runs
+ordinary final-child graph completion. The continuation row remains unchanged. No match, replay,
+or losing concurrent caller changes state or emits an event; the winner emits the ordinary
+bounded child and graph completion events exactly once. This exception is not automatic startup
+reconciliation or scheduling authority and cannot recover a `blocked` graph: graph-blocker scope
+defects still require source cancellation and a replacement source.
 
 Every event transition that marks a generated child done, including the final child merge, and
 every permitted manual child close checks graph completion in the same transaction. If every
@@ -352,7 +368,9 @@ Decomposition reconciliation runs before generic lifecycle recovery or provision
 - An inconsistent graph may replan only if no child has ever been claimed, created a proposed
   change, or merged and proposal budget remains.
 - Any evidence of generated delivery forbids automatic replanning and requires cancellation plus
-  replacement.
+  replacement. The explicit exact-continuation adoption exception described under Lifecycle is
+  a separate, caller-selected transaction for an otherwise consistent active graph; startup
+  reconciliation never invokes or infers it.
 - Generic recovery must not reset planning/decomposed sources or treat children as unrelated.
 - Pre-feature unrelated tasks enter the current admission policy when next eligible. A complete
   existing graph resumes; incomplete/inconsistent graphs are held with a visible reason.

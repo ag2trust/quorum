@@ -1799,6 +1799,18 @@ affected child and blocks the graph without consuming ordinary rework. The sourc
 decomposed and the blocked graph remains active until source cancellation; recovery requires a
 replacement source, not automatic replanning after delivery has begun.
 
+A separate, explicit incident-recovery primitive may adopt the exact merged delivery of a done
+managed continuation task for the final failed member of an otherwise complete active graph.
+This is not graph-blocker recovery: blocked graphs still require cancellation and replacement.
+The immediate transaction requires the same repository and PR, creator-selected `continue_pr`,
+explicit `source_task` provenance, live daemon publication and merge events (`expires_at > now`),
+immutable managed-review authority, and one consistent PR target/approved head SHA. It changes
+only the failed child, records recovery provenance while preserving the PR, then invokes ordinary
+final-child completion. Missing or expired evidence, replay, and losing concurrent callers are
+clean no-ops with no events; the winner emits bounded completion events once. No startup scan or
+scheduler infers this exception. The complete predicate is specified in the decomposition
+technical specification.
+
 The final child merge marks the source and graph done in the same transaction that marks that
 child done. Source dependents remain blocked until then. Cancelling a source atomically makes the
 graph non-runnable, cancels unfinished children, revokes authority, and records idempotent cleanup
@@ -1820,9 +1832,11 @@ edited. Daemon-owned lifecycle evidence remains writable.
 Decomposition reconciliation runs before ordinary recovery and provisioning. A durable freeze
 resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
 nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
-path, while any delivery evidence requires cancellation and replacement. Read-only status exposes
-bounded membership, edges, progress, attempts, provenance, and blockers. The complete storage,
-protocol, and recovery contract is in `docs/2026-07-31-task-decomposition-technical-spec.md`.
+path, while any delivery evidence requires cancellation and replacement. The exact-continuation
+exception above is an explicit transaction on a consistent active graph, never a reconciliation
+action. Read-only status exposes bounded membership, edges, progress, attempts, provenance, and
+blockers. The complete storage, protocol, and recovery contract is in
+`docs/2026-07-31-task-decomposition-technical-spec.md`.
 
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
 constraints, and verification but have no routing authority. `task-create` rejects every
