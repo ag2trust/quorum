@@ -234,6 +234,7 @@ struct PoisonTracker {
 
 enum PreReviewChecksState {
     Waiting(tokio::task::JoinHandle<merge::ChecksOutcome>),
+    Retry,
     Ready,
 }
 
@@ -241,6 +242,8 @@ struct PreReviewChecksEntry {
     pr: i64,
     head_sha: String,
     state: PreReviewChecksState,
+    consecutive_timeouts: u8,
+    timeout_alerted: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -249,6 +252,8 @@ enum PreReviewChecksGate {
     Ready,
     Failed { failing_checks: Vec<String> },
 }
+
+const PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER: u8 = 3;
 
 impl PoisonTracker {
     fn new() -> Self {
@@ -4488,6 +4493,18 @@ async fn poll_pre_review_checks(
                 return Ok(PreReviewChecksGate::Waiting);
             }
             PreReviewChecksState::Waiting(_) => {}
+            PreReviewChecksState::Retry => {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let timeout = config.merge_checks_timeout_secs;
+                let poll = config.merge_checks_poll_secs;
+                let handle = tokio::task::spawn_blocking(move || {
+                    executor.wait_for_checks(pr, &repo, timeout, poll)
+                });
+                waits.get_mut(&task_id).expect("retry entry present").state =
+                    PreReviewChecksState::Waiting(handle);
+                return Ok(PreReviewChecksGate::Waiting);
+            }
         }
     } else {
         let repo = config.repo_dir.clone();
@@ -4502,6 +4519,8 @@ async fn poll_pre_review_checks(
                 pr,
                 head_sha: head_sha.to_string(),
                 state: PreReviewChecksState::Waiting(handle),
+                consecutive_timeouts: 0,
+                timeout_alerted: false,
             },
         );
         log(&format!(
@@ -4513,12 +4532,39 @@ async fn poll_pre_review_checks(
     let Some(entry) = waits.remove(&task_id) else {
         return Ok(PreReviewChecksGate::Waiting);
     };
-    let PreReviewChecksState::Waiting(handle) = entry.state else {
+    let PreReviewChecksEntry {
+        pr: entry_pr,
+        head_sha: entry_head_sha,
+        state,
+        mut consecutive_timeouts,
+        mut timeout_alerted,
+    } = entry;
+    let PreReviewChecksState::Waiting(handle) = state else {
         return Ok(PreReviewChecksGate::Ready);
     };
     let checks = handle
         .await
         .map_err(|error| QuorumError::Io(format!("pre-review checks join: {error}")))?;
+
+    let timed_out = matches!(&checks, merge::ChecksOutcome::TimedOut);
+    if timed_out {
+        consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+        if consecutive_timeouts >= PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER && !timeout_alerted {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let pending_checks =
+                tokio::task::spawn_blocking(move || executor.pending_check_names(pr, &repo))
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("pre-review pending checks join: {error}"))
+                    })?;
+            notify_pre_review_checks_timeout(config, task_id, pr, head_sha, &pending_checks)
+                .await?;
+            timeout_alerted = true;
+        }
+    } else {
+        consecutive_timeouts = 0;
+    }
 
     let gate = match checks {
         merge::ChecksOutcome::Ready if config.required_jobs.is_empty() => {
@@ -4569,16 +4615,68 @@ async fn poll_pre_review_checks(
         waits.insert(
             task_id,
             PreReviewChecksEntry {
-                pr,
-                head_sha: head_sha.to_string(),
+                pr: entry_pr,
+                head_sha: entry_head_sha,
                 state: PreReviewChecksState::Ready,
+                consecutive_timeouts,
+                timeout_alerted,
             },
         );
         log(&format!(
             "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — checks ready"
         ));
+    } else if gate == PreReviewChecksGate::Waiting {
+        waits.insert(
+            task_id,
+            PreReviewChecksEntry {
+                pr: entry_pr,
+                head_sha: entry_head_sha,
+                state: PreReviewChecksState::Retry,
+                consecutive_timeouts,
+                timeout_alerted,
+            },
+        );
     }
     Ok(gate)
+}
+
+async fn notify_pre_review_checks_timeout(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    pending_checks: &[String],
+) -> Result<()> {
+    let db_path = config.db_path.clone();
+    let head_sha = head_sha.to_string();
+    let checks = if pending_checks.is_empty() {
+        "unavailable".to_string()
+    } else {
+        pending_checks.join(", ")
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let now = now_unix();
+        let body = format!(
+            "task #{task_id} PR #{pr} head {head_sha}: pre-review CI timed out {} consecutive times; pending checks: {checks}",
+            PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER
+        );
+        let refs = format!("task:{task_id},pr:{pr},head:{head_sha}");
+        quorum_core::feed::post(
+            &mut conn,
+            "daemon",
+            "alert",
+            None,
+            &body,
+            Some(&refs),
+            Some("owner"),
+            quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
+            now,
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review timeout alert join: {error}")))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13977,6 +14075,160 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct TimedOutPreReviewChecks;
+
+    impl merge::MergeExecutor for TimedOutPreReviewChecks {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            merge::ChecksOutcome::TimedOut
+        }
+
+        fn pending_check_names(&self, _pr: i64, _repo_dir: &Path) -> Vec<String> {
+            vec!["shell-tests".to_string()]
+        }
+    }
+
+    fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        let profile = crate::serve_config::ModelProfile {
+            runner: "codex".into(),
+            model: "test".into(),
+            effort: "medium".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
+        ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            worktree_base: repo_dir.clone(),
+            repo_dir,
+            names_file: None,
+            agent_bin: None,
+            merge_executor: Arc::new(TimedOutPreReviewChecks),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            codex_sandbox: "danger-full-access".into(),
+        }
+    }
+
+    async fn complete_pre_review_timeout_cycle(
+        config: &ServeConfig,
+        waits: &mut HashMap<i64, PreReviewChecksEntry>,
+        task_id: i64,
+        pr: i64,
+        head_sha: &str,
+    ) {
+        for _ in 0..100 {
+            assert_eq!(
+                poll_pre_review_checks(config, waits, task_id, pr, head_sha)
+                    .await
+                    .unwrap(),
+                PreReviewChecksGate::Waiting
+            );
+            if matches!(
+                waits.get(&task_id).map(|entry| &entry.state),
+                Some(PreReviewChecksState::Retry)
+            ) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("pre-review timeout cycle did not complete");
+    }
+
+    #[tokio::test]
+    async fn pre_review_check_timeouts_alert_once_and_reset_for_a_new_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        let mut waits = HashMap::new();
+
+        for _ in 0..2 {
+            complete_pre_review_timeout_cycle(&config, &mut waits, 377, 549, "head-a").await;
+        }
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alerts, 0, "the threshold must not alert early");
+        drop(conn);
+
+        for _ in 0..PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER {
+            complete_pre_review_timeout_cycle(&config, &mut waits, 377, 549, "head-b").await;
+        }
+        for _ in 0..2 {
+            complete_pre_review_timeout_cycle(&config, &mut waits, 377, 549, "head-b").await;
+        }
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (count, body): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(body), '') FROM messages \
+                 WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one alert per task and head");
+        assert!(body.contains("task #377"));
+        assert!(body.contains("PR #549"));
+        assert!(body.contains("head-b"));
+        assert!(body.contains("shell-tests"));
+        assert!(matches!(
+            waits.get(&377).map(|entry| &entry.state),
+            Some(PreReviewChecksState::Retry)
+        ));
+    }
 
     fn graph_blocker_fixture(
         cap_role: &str,
