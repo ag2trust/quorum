@@ -2371,12 +2371,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let preflight = repo.join("preflight.sh");
-        std::fs::write(&preflight, "#!/bin/sh\nexit 0\n").unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../preflight.sh");
+        std::fs::copy(&source, &preflight)
+            .unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
         std::fs::set_permissions(&preflight, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"continuation-hook-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn formatted() {}\n").unwrap();
         std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
-        assert!(git_output(repo, &["add", "preflight.sh", "shared.txt"])
-            .status
-            .success());
+        assert!(git_output(repo, &["add", "."]).status.success());
         assert!(git_output(repo, &["commit", "-m", "continuation fixture"])
             .status
             .success());
@@ -2407,13 +2414,38 @@ mod tests {
         let remote_pr_head = git_rev_parse(&repo, "HEAD");
 
         assert!(git_output(&repo, &["checkout", "main"]).status.success());
-        std::fs::write(repo.join("base-only.txt"), "advanced base\n").unwrap();
-        assert!(git_output(&repo, &["add", "base-only.txt"])
+        std::fs::write(repo.join("base-only-a.txt"), "advanced base A\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only-a.txt"])
             .status
             .success());
-        assert!(git_output(&repo, &["commit", "-m", "advance base cleanly"])
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base cleanly A",
+                "-m",
+                "Co-Authored-By: Base-A <base-a@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        std::fs::write(repo.join("base-only-b.txt"), "advanced base B\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only-b.txt"])
             .status
             .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base cleanly B",
+                "-m",
+                "Co-Authored-By: Base-B <base-b@example.invalid>",
+            ]
+        )
+        .status
+        .success());
         assert!(git_output(&repo, &["push", "origin", "main"])
             .status
             .success());
@@ -2433,6 +2465,22 @@ mod tests {
                 .expect("clean base integration"),
             ContinuationBaseMerge::Clean
         );
+        std::fs::write(worktree.join("worker.txt"), "worker continuation\n").unwrap();
+        assert!(git_output(&worktree, &["add", "worker.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &worktree,
+            &[
+                "commit",
+                "-m",
+                "finish clean continuation",
+                "-m",
+                "Co-Authored-By: Continue-Worker <continue-worker@example.invalid>",
+            ]
+        )
+        .status
+        .success());
         let integrated_head = git_rev_parse(&worktree, "HEAD");
         for ancestor in [&remote_pr_head, &base_head] {
             assert!(
@@ -2478,13 +2526,36 @@ mod tests {
         let remote_pr_head = git_rev_parse(&repo, "HEAD");
 
         assert!(git_output(&repo, &["checkout", "main"]).status.success());
+        std::fs::write(repo.join("base-only.txt"), "base session A\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base session A",
+                "-m",
+                "Co-Authored-By: Base-A <base-a@example.invalid>",
+            ]
+        )
+        .status
+        .success());
         std::fs::write(repo.join("shared.txt"), "base version\n").unwrap();
         assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
-        assert!(
-            git_output(&repo, &["commit", "-m", "advance base conflict"])
-                .status
-                .success()
-        );
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base conflict",
+                "-m",
+                "Co-Authored-By: Base-B <base-b@example.invalid>",
+            ]
+        )
+        .status
+        .success());
         assert!(git_output(&repo, &["push", "origin", "main"])
             .status
             .success());
@@ -2519,7 +2590,13 @@ mod tests {
             .success());
         assert!(git_output(
             &worktree,
-            &["commit", "-m", "Merge origin/main into continuation"]
+            &[
+                "commit",
+                "-m",
+                "Merge origin/main into continuation",
+                "-m",
+                "Co-Authored-By: Continue-Worker <continue-worker@example.invalid>",
+            ]
         )
         .status
         .success());

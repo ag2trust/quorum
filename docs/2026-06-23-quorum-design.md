@@ -573,7 +573,10 @@ only through an explicit outside request)
   branch before worker launch. Git completes a clean integration (creating a merge commit when
   histories diverge); a conflicting merge remains in progress for the worker to resolve and
   commit. This preserves the recorded PR head as an ancestor so later publication is
-  fast-forward-only. Publication targets only that branch under the recorded SHA lease.
+  fast-forward-only. The publication gate attributes sessions only to commits reachable from
+  the proposed tip but from neither the recorded PR head nor the freshly fetched base; inherited
+  base commits do not become worker-owned. Publication targets only that branch under the
+  recorded SHA lease.
   Ownership ambiguity, closure,
   branch replacement, or SHA movement fails closed; Quorum neither rebases onto the new
   head nor silently falls back to fresh implementation or a new PR. Existing same-task

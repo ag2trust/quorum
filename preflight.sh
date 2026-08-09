@@ -114,10 +114,16 @@ else
       || fail "continuation base is not a local commit"
     git merge-base --is-ancestor "$CONTINUATION_FROM" "$TIP" \
       || fail "continuation base is not an ancestor of proposed SHA"
-    BASE_REF=$CONTINUATION_FROM
-    OWN_COMMITS=$(git rev-list "$CONTINUATION_FROM".."$TIP")
-    printf 'continuation commits after published remote head:\n'
-    git log --oneline "$CONTINUATION_FROM".."$TIP"
+    # A continuation may merge the freshly fetched base to preserve the
+    # published PR head as an ancestor. Commits already reachable from the
+    # base are inherited integration input, not work authored by this worker.
+    # Exclude both histories while retaining the merge and worker commits.
+    BASE_REF="$CONTINUATION_FROM + origin/main"
+    OWN_COMMITS=$(git rev-list "$TIP" --not "$CONTINUATION_FROM" origin/main)
+    printf 'continuation-owned commits excluding published head and origin/main:\n'
+    if [ -n "$OWN_COMMITS" ]; then
+      git show -s --oneline $OWN_COMMITS
+    fi
   elif [ "$INTEGRATION" -eq 1 ]; then
     # Main's commits are inherited integration input, not work authored by the
     # sync session. Inspect only commits belonging to neither remote history.
