@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 44). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 46). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -629,6 +629,7 @@ CREATE TABLE IF NOT EXISTS review_followup_assessments (
     state                 TEXT NOT NULL CHECK(state IN (
                               'pending', 'planning', 'provider-backoff', 'held', 'completed')),
     active                INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    membership_sealed     INTEGER NOT NULL DEFAULT 1 CHECK(membership_sealed IN (0, 1)),
     proposal_attempts     INTEGER NOT NULL DEFAULT 0 CHECK(proposal_attempts BETWEEN 0 AND 3),
     provider_failures     INTEGER NOT NULL DEFAULT 0 CHECK(provider_failures BETWEEN 0 AND 3),
     planner_provider      TEXT,
@@ -644,9 +645,11 @@ CREATE TABLE IF NOT EXISTS review_followup_assessments (
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_followup_assessment
     ON review_followup_assessments(target) WHERE active = 1;
 
--- Membership is immutable once materialized. The artifact-level UNIQUE is
--- separate from the composite primary key so one artifact cannot participate
--- in two different assessments.
+-- Membership is immutable once materialized. Fresh aggregate rows are sealed
+-- by default; the core materializer explicitly opens and irreversibly seals
+-- membership inside its BEGIN IMMEDIATE transaction. The artifact-level UNIQUE
+-- is separate from the composite primary key so one artifact cannot
+-- participate in two different assessments.
 CREATE TABLE IF NOT EXISTS review_followup_assessment_artifacts (
     assessment_id INTEGER NOT NULL REFERENCES review_followup_assessments(id),
     artifact_id   INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),

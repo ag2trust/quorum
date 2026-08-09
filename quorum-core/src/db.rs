@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 45;
+pub const SCHEMA_VERSION: i64 = 46;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -659,8 +659,41 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         }
         // v44 adds dormant follow-up assessment aggregates and artifact
         // membership via SCHEMA_SQL. v45 adds counter-bound and membership-
-        // immutability triggers, also via SCHEMA_SQL. The guarded core write
-        // APIs remain dormant until later daemon activation work.
+        // immutability triggers, also via SCHEMA_SQL. v46 adds a durable,
+        // irreversible membership seal. Existing assessments are sealed by
+        // default; only the atomic materializer explicitly creates an open row.
+        if current < 46 && !column_exists(conn, "review_followup_assessments", "membership_sealed")?
+        {
+            conn.execute(
+                "ALTER TABLE review_followup_assessments
+                 ADD COLUMN membership_sealed INTEGER NOT NULL DEFAULT 1
+                 CHECK(membership_sealed IN (0,1))",
+                [],
+            )?;
+        }
+        if current < 46 {
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS review_followup_membership_insert_unsealed
+                 BEFORE INSERT ON review_followup_assessment_artifacts
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_followup_assessments
+                     WHERE id=NEW.assessment_id AND membership_sealed=0
+                       AND state='pending' AND active=0
+                 )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'follow-up assessment membership is sealed');
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_unseal
+                 BEFORE UPDATE OF membership_sealed ON review_followup_assessments
+                 WHEN OLD.membership_sealed=1 AND NEW.membership_sealed!=1
+                 BEGIN
+                     SELECT RAISE(ABORT, 'follow-up assessment membership seal is irreversible');
+                 END;",
+            )?;
+        }
+        // Guarded core write APIs remain dormant until later daemon activation
+        // work.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1185,17 +1218,17 @@ mod tests {
             conn.execute(
                 "INSERT INTO review_followup_assessments(
                      id,target,scope_kind,scope_id,source_task_id,state,active,
-                     created_at,updated_at)
-                 VALUES (?1,?2,?3,?4,?5,'pending',?6,1,1)",
+                     membership_sealed,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'pending',?6,0,1,1)",
                 rusqlite::params![id, target, scope_kind, scope_id, source_task_id, active],
             )
         };
-        insert_assessment(21, "shared-authority", "task", 1, 1, 1).unwrap();
+        insert_assessment(21, "shared-authority", "task", 1, 1, 0).unwrap();
         assert!(insert_assessment(22, "another-target", "task", 1, 1, 0).is_err());
-        insert_assessment(22, "shared-authority", "graph", 10, 1, 0).unwrap();
+        insert_assessment(22, "shared-authority", "graph", 10, 1, 1).unwrap();
         assert!(conn
             .execute(
-                "UPDATE review_followup_assessments SET active=1 WHERE id=22",
+                "UPDATE review_followup_assessments SET active=1 WHERE id=21",
                 [],
             )
             .is_err());
@@ -1230,6 +1263,18 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE review_followup_assessments SET membership_sealed=1
+             WHERE id IN (21,23)",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=21",
+                [],
+            )
+            .is_err());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -1238,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn populated_v44_migration_makes_existing_membership_immutable_and_bounds_counters() {
+    fn populated_v44_migration_seals_existing_membership_and_bounds_counters() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v44-assessment-guards.db");
         {
@@ -1248,18 +1293,26 @@ mod tests {
                  DROP TRIGGER review_followup_membership_no_delete;
                  DROP TRIGGER review_followup_assessment_counter_insert_bound;
                  DROP TRIGGER review_followup_assessment_counter_update_bound;
+                 DROP TRIGGER review_followup_membership_insert_unsealed;
+                 DROP TRIGGER review_followup_membership_no_unseal;
+                 ALTER TABLE review_followup_assessments DROP COLUMN membership_sealed;
                  INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
-                 VALUES (1,'source','done','owner',1,1);
+                 VALUES (1,'source','done','owner',1,1),
+                        (2,'other','done','owner',1,1);
                  INSERT INTO review_followup_batches(
                      pr_number,task_id,source_task_id,collector_version,
                      artifact_count,state,created_at,updated_at)
-                 VALUES (100,1,1,'followups-v1',1,'collected',1,1);
+                 VALUES (100,1,1,'followups-v1',1,'collected',1,1),
+                        (200,2,2,'followups-v1',1,'collected',1,1);
                  INSERT INTO review_followup_artifacts(
                      id,pr_number,ordinal,technical_impact,scope_relationship,concern,
                      non_blocking_reason,affected_behavior,desired_outcome,
                      verification_expectations,evidence_ids,created_at,updated_at)
-                 VALUES (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
-                         '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);
+                 VALUES
+                     (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+                     (12,200,0,'minor','design_debt','two','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);
                  INSERT INTO review_followup_assessments(
                      id,target,scope_kind,scope_id,source_task_id,state,active,
                      proposal_attempts,provider_failures,created_at,updated_at)
@@ -1274,7 +1327,7 @@ mod tests {
         let conn = open(&path).unwrap();
         assert_eq!(
             conn.query_row(
-                "SELECT state,proposal_attempts,provider_failures,
+                "SELECT state,membership_sealed,proposal_attempts,provider_failures,
                         (SELECT artifact_id FROM review_followup_assessment_artifacts
                          WHERE assessment_id=21)
                  FROM review_followup_assessments WHERE id=21",
@@ -1284,10 +1337,11 @@ mod tests {
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 )),
             )
             .unwrap(),
-            ("pending".into(), 2, 1, 11)
+            ("pending".into(), 1, 2, 1, 11)
         );
         assert_eq!(
             conn.query_row(
@@ -1296,12 +1350,14 @@ mod tests {
                      'review_followup_membership_no_update',
                      'review_followup_membership_no_delete',
                      'review_followup_assessment_counter_insert_bound',
-                     'review_followup_assessment_counter_update_bound')",
+                     'review_followup_assessment_counter_update_bound',
+                     'review_followup_membership_insert_unsealed',
+                     'review_followup_membership_no_unseal')",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-            4
+            6
         );
         assert!(conn
             .execute(
@@ -1313,6 +1369,19 @@ mod tests {
         assert!(conn
             .execute(
                 "DELETE FROM review_followup_assessment_artifacts WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (21,12)",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=21",
                 [],
             )
             .is_err());

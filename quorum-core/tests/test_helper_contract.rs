@@ -15,6 +15,7 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
     conn.execute(
         "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
          VALUES (1,'allocation target','open','owner',1,1),
+                (2,'assessment source','done','owner',1,1),
                 (999,'event target','merging','owner',1,1)",
         [],
     )
@@ -23,7 +24,11 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
         "INSERT INTO review_followup_batches(
              pr_number,task_id,source_task_id,collector_version,
              artifact_count,state,created_at,updated_at)
-         VALUES (100,1,1,'followups-v1',1,'collected',1,1);
+         VALUES (100,2,2,'followups-v1',1,'collected',1,1);
+         INSERT INTO review_collection_runs(
+             pr_number,task_id,status,error,collector_model,collector_version,
+             findings_count,followup_count,attempted_at,completed_at)
+         VALUES (100,2,'success',NULL,'collector','followups-v1',0,1,1,1);
          INSERT INTO review_followup_artifacts(
              id,pr_number,ordinal,technical_impact,scope_relationship,concern,
              non_blocking_reason,affected_behavior,desired_outcome,
@@ -32,6 +37,8 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
                  '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);",
     )
     .unwrap();
+    conn.execute("UPDATE tasks SET refs='{\"pr\":100}' WHERE id=2", [])
+        .unwrap();
     (dir, path)
 }
 
@@ -123,8 +130,8 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
                 &MaterializeAssessmentInput {
                     db_path,
                     scope_kind: "task".into(),
-                    scope_id: 1,
-                    source_task_id: 1,
+                    scope_id: 2,
+                    source_task_id: 2,
                     artifact_ids: vec![11],
                     now: 10,
                     barrier: open_barrier(dir.path(), "assessment"),

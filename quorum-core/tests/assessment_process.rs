@@ -14,18 +14,28 @@ fn seed(path: &Path) {
     let conn = quorum_core::db::open(path).unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
     conn.execute_batch(
-        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
-         VALUES (1,'source','done','owner',1,1);
+        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs)
+         VALUES (1,'source','done','owner',1,1,'{\"pr\":100}'),
+                (2,'other','done','owner',1,1,'{\"pr\":200}');
          INSERT INTO review_followup_batches(
              pr_number,task_id,source_task_id,collector_version,
              artifact_count,state,created_at,updated_at)
-         VALUES (100,1,1,'followups-v1',1,'collected',1,1);
+         VALUES (100,1,1,'followups-v1',1,'collected',1,1),
+                (200,2,2,'followups-v1',1,'collected',1,1);
+         INSERT INTO review_collection_runs(
+             pr_number,task_id,status,error,collector_model,collector_version,
+             findings_count,followup_count,attempted_at,completed_at)
+         VALUES (100,1,'success',NULL,'collector','followups-v1',0,1,1,1),
+                (200,2,'success',NULL,'collector','followups-v1',0,1,1,1);
          INSERT INTO review_followup_artifacts(
              id,pr_number,ordinal,technical_impact,scope_relationship,concern,
              non_blocking_reason,affected_behavior,desired_outcome,
              verification_expectations,evidence_ids,created_at,updated_at)
-         VALUES (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
-                 '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);",
+         VALUES
+             (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+              '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+             (12,200,0,'minor','design_debt','two','reason','behavior','outcome',
+              '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);",
     )
     .unwrap();
 }
@@ -124,6 +134,13 @@ fn repeated_process_race_materializes_exactly_one_assessment_and_membership() {
             )
             .unwrap();
         assert_eq!(materialized, (1, 1, 1, 0), "round {round}");
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 SELECT id,12 FROM review_followup_assessments WHERE scope_id=1",
+                [],
+            )
+            .is_err());
         assert!(conn
             .execute(
                 "DELETE FROM review_followup_assessment_artifacts WHERE artifact_id=11",

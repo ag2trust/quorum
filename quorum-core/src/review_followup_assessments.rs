@@ -102,6 +102,7 @@ pub struct ReviewFollowupAssessment {
     source_task_id: i64,
     state: FollowupAssessmentState,
     active: bool,
+    membership_sealed: bool,
     proposal_attempts: usize,
     provider_failures: usize,
     planner_provider: Option<String>,
@@ -124,6 +125,7 @@ impl ReviewFollowupAssessment {
         source_task_id: i64,
         state: FollowupAssessmentState,
         active: bool,
+        membership_sealed: bool,
         proposal_attempts: usize,
         provider_failures: usize,
         planner_provider: Option<String>,
@@ -182,6 +184,7 @@ impl ReviewFollowupAssessment {
             source_task_id,
             state,
             active,
+            membership_sealed,
             proposal_attempts,
             provider_failures,
             planner_provider,
@@ -206,6 +209,7 @@ impl ReviewFollowupAssessment {
         source_task_id: i64,
         state: &str,
         active: i64,
+        membership_sealed: i64,
         proposal_attempts: i64,
         provider_failures: i64,
         planner_provider: Option<String>,
@@ -226,6 +230,15 @@ impl ReviewFollowupAssessment {
                 ))
             }
         };
+        let membership_sealed = match membership_sealed {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(QuorumError::Usage(
+                    "invalid follow-up assessment membership seal".into(),
+                ))
+            }
+        };
         let proposal_attempts = usize::try_from(proposal_attempts).map_err(|_| {
             QuorumError::Usage("follow-up proposal attempts cannot be negative".into())
         })?;
@@ -240,6 +253,7 @@ impl ReviewFollowupAssessment {
             source_task_id,
             state.parse()?,
             active,
+            membership_sealed,
             proposal_attempts,
             provider_failures,
             planner_provider,
@@ -273,6 +287,9 @@ impl ReviewFollowupAssessment {
     }
     pub fn active(&self) -> bool {
         self.active
+    }
+    pub fn membership_sealed(&self) -> bool {
+        self.membership_sealed
     }
     pub fn proposal_attempts(&self) -> usize {
         self.proposal_attempts
@@ -447,21 +464,32 @@ impl FollowupPlanningInput<'_> {
 
 /// Atomically create one pending assessment and every immutable membership row.
 ///
-/// A duplicate scope, an artifact already assigned elsewhere, or an artifact
-/// that is absent/disposed is an expected clean negative. In all three cases
-/// the transaction leaves neither the new assessment nor any partial membership.
+/// The exact scope-specific eligibility and artifact set are rechecked after
+/// taking the write lock. A stale or incomplete set, duplicate scope, or
+/// artifact already assigned elsewhere is an expected clean negative. In all
+/// cases the transaction leaves neither a new assessment nor partial membership.
 pub fn materialize_assessment(
     conn: &mut Connection,
     value: &NewReviewFollowupAssessment,
 ) -> Result<Option<ReviewFollowupAssessment>> {
     let target = assessment_target(value.scope_kind, value.scope_id)?;
     let tx = begin_immediate(conn)?;
+    let Some(eligible_artifact_ids) = eligible_artifact_ids(&tx, value)? else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(None);
+    };
+    let mut requested_artifact_ids = value.artifact_ids.clone();
+    requested_artifact_ids.sort_unstable();
+    if requested_artifact_ids != eligible_artifact_ids {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(None);
+    }
     let inserted = tx
         .execute(
             "INSERT INTO review_followup_assessments(
-                 target,scope_kind,scope_id,source_task_id,state,active,
+                 target,scope_kind,scope_id,source_task_id,state,active,membership_sealed,
                  proposal_attempts,provider_failures,created_at,updated_at)
-             SELECT ?1,?2,?3,id,'pending',0,0,0,?5,?5 FROM tasks WHERE id=?4
+             SELECT ?1,?2,?3,id,'pending',0,0,0,0,?5,?5 FROM tasks WHERE id=?4
              ON CONFLICT DO NOTHING",
             params![
                 target,
@@ -478,11 +506,10 @@ pub fn materialize_assessment(
     }
 
     let assessment_id = tx.last_insert_rowid();
-    for artifact_id in &value.artifact_ids {
+    for artifact_id in &eligible_artifact_ids {
         let inserted = tx.execute(
             "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
-             SELECT ?1,id FROM review_followup_artifacts
-             WHERE id=?2 AND disposition IS NULL
+             VALUES (?1,?2)
              ON CONFLICT DO NOTHING",
             params![assessment_id, artifact_id],
         );
@@ -501,11 +528,161 @@ pub fn materialize_assessment(
         }
     }
 
+    let sealed = tx
+        .execute(
+            "UPDATE review_followup_assessments SET membership_sealed=1
+             WHERE id=?1 AND membership_sealed=0
+               AND (SELECT count(*) FROM review_followup_assessment_artifacts
+                    WHERE assessment_id=?1)=?2",
+            params![assessment_id, eligible_artifact_ids.len() as i64],
+        )
+        .map_err(map_sql_err)?;
+    if sealed != 1 {
+        tx.rollback().map_err(map_sql_err)?;
+        return Ok(None);
+    }
+
     let assessment = read_assessment_tx(&tx, assessment_id)?.ok_or_else(|| {
         QuorumError::Usage("new follow-up assessment disappeared before commit".into())
     })?;
     tx.commit().map_err(map_sql_err)?;
     Ok(Some(assessment))
+}
+
+/// Recheck complete task/graph eligibility while the caller owns the write
+/// lock. The returned IDs are the only membership that may be materialized.
+fn eligible_artifact_ids(
+    tx: &Transaction<'_>,
+    value: &NewReviewFollowupAssessment,
+) -> Result<Option<Vec<i64>>> {
+    let eligible = match value.scope_kind {
+        FollowupScopeKind::Task => tx
+            .query_row(
+                "SELECT b.pr_number
+                 FROM tasks t
+                 JOIN review_followup_batches b
+                   ON b.task_id=t.id AND b.graph_id IS NULL
+                  AND b.source_task_id=t.id
+                 JOIN review_collection_runs r ON r.pr_number=b.pr_number
+                 WHERE t.id=?1 AND t.id=?2 AND t.status='done'
+                   AND json_valid(t.refs)
+                   AND json_extract(t.refs,'$.pr') IS NOT NULL
+                   AND CAST(json_extract(t.refs,'$.pr') AS TEXT)=CAST(b.pr_number AS TEXT)
+                   AND b.state='collected'
+                   AND b.artifact_count BETWEEN 1 AND ?3
+                   AND r.task_id=b.task_id AND r.status='success'
+                   AND r.error IS NULL
+                   AND r.collector_version=b.collector_version
+                   AND r.followup_count=b.artifact_count
+                   AND (SELECT count(*) FROM review_followup_artifacts a
+                        WHERE a.pr_number=b.pr_number)=b.artifact_count
+                   AND NOT EXISTS (
+                       SELECT 1 FROM review_followup_artifacts a
+                       WHERE a.pr_number=b.pr_number AND a.disposition IS NOT NULL)",
+                params![
+                    value.scope_id,
+                    value.source_task_id,
+                    MAX_FOLLOWUP_ARTIFACTS as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_sql_err)?,
+        FollowupScopeKind::Graph => {
+            let complete: bool = tx
+                .query_row(
+                    "WITH graph AS (
+                         SELECT id,state,source_task_id FROM task_decompositions
+                         WHERE id=?1 AND source_task_id=?2
+                           AND state IN ('completed','cancelled')
+                     ),
+                     delivered AS (
+                         SELECT m.task_id,
+                                CAST(json_extract(t.refs,'$.pr') AS TEXT) AS pr_number
+                         FROM graph g
+                         JOIN task_graph_members m ON m.graph_id=g.id
+                         JOIN tasks t ON t.id=m.task_id
+                         WHERE t.status='done' AND json_valid(t.refs)
+                           AND json_extract(t.refs,'$.pr') IS NOT NULL
+                     ),
+                     eligible_batches AS (
+                         SELECT b.pr_number,b.task_id
+                         FROM graph g
+                         JOIN review_followup_batches b ON b.graph_id=g.id
+                         JOIN delivered d ON d.task_id=b.task_id
+                           AND d.pr_number=CAST(b.pr_number AS TEXT)
+                         JOIN review_collection_runs r ON r.pr_number=b.pr_number
+                         WHERE b.source_task_id=g.source_task_id
+                           AND b.state='collected'
+                           AND b.artifact_count BETWEEN 0 AND ?3
+                           AND r.task_id=b.task_id AND r.status='success'
+                           AND r.error IS NULL
+                           AND r.collector_version=b.collector_version
+                           AND r.followup_count=b.artifact_count
+                           AND (SELECT count(*) FROM review_followup_artifacts a
+                                WHERE a.pr_number=b.pr_number)=b.artifact_count
+                           AND NOT EXISTS (
+                               SELECT 1 FROM review_followup_artifacts a
+                               WHERE a.pr_number=b.pr_number
+                                 AND a.disposition IS NOT NULL)
+                     )
+                     SELECT EXISTS(SELECT 1 FROM graph)
+                        AND EXISTS(SELECT 1 FROM delivered)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM graph g
+                            JOIN task_graph_members m ON m.graph_id=g.id
+                            JOIN tasks t ON t.id=m.task_id
+                            WHERE (g.state='completed' AND (
+                                      t.status!='done' OR NOT json_valid(t.refs)
+                                      OR json_extract(t.refs,'$.pr') IS NULL))
+                               OR (g.state='cancelled' AND t.status='done' AND (
+                                      NOT json_valid(t.refs)
+                                      OR json_extract(t.refs,'$.pr') IS NULL))
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM delivered d
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM eligible_batches b
+                                WHERE b.task_id=d.task_id
+                                  AND CAST(b.pr_number AS TEXT)=d.pr_number)
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM review_followup_batches b
+                            WHERE b.graph_id=?1 AND NOT EXISTS (
+                                SELECT 1 FROM eligible_batches e
+                                WHERE e.pr_number=b.pr_number)
+                        )",
+                    params![
+                        value.scope_id,
+                        value.source_task_id,
+                        MAX_FOLLOWUP_ARTIFACTS as i64
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(map_sql_err)?;
+            complete.then_some(value.scope_id)
+        }
+    };
+    let Some(scope_key) = eligible else {
+        return Ok(None);
+    };
+
+    let (scope_column, scope_value) = match value.scope_kind {
+        FollowupScopeKind::Task => ("b.pr_number", scope_key),
+        FollowupScopeKind::Graph => ("b.graph_id", scope_key),
+    };
+    let mut statement = tx.prepare(&format!(
+        "SELECT a.id FROM review_followup_batches b
+         JOIN review_followup_artifacts a ON a.pr_number=b.pr_number
+         WHERE {scope_column}=?1 AND a.disposition IS NULL ORDER BY a.id"
+    ))?;
+    let artifact_ids = statement
+        .query_map([scope_value], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if artifact_ids.is_empty() || artifact_ids.len() > MAX_FOLLOWUP_ARTIFACTS {
+        return Ok(None);
+    }
+    Ok(Some(artifact_ids))
 }
 
 /// Read one closed assessment record, including both independent counters.
@@ -563,6 +740,7 @@ pub fn begin_planning(
                  planner_assignment_id=?4,base_sha=?5,hold_code=NULL,hold_summary=NULL,
                  updated_at=?6
              WHERE id=?1 AND state IN ('pending','provider-backoff') AND active=0
+               AND membership_sealed=1
                AND proposal_attempts < {MAX_SEMANTIC_PROPOSALS}
                AND provider_failures < {MAX_ASSESSMENT_PROVIDER_FAILURES}
                AND (?4 IS NULL OR EXISTS(
@@ -608,6 +786,7 @@ pub fn record_semantic_rejection(
                                    THEN ?3 ELSE NULL END,
                  updated_at=?4
              WHERE id=?1 AND state='planning' AND active=1
+               AND membership_sealed=1
                AND proposal_attempts < {MAX_SEMANTIC_PROPOSALS}
                AND updated_at <= ?4
              RETURNING {ASSESSMENT_COLUMNS}"
@@ -642,6 +821,7 @@ pub fn record_provider_failure(
                                    THEN ?3 ELSE NULL END,
                  updated_at=?4
              WHERE id=?1 AND state='planning' AND active=1
+               AND membership_sealed=1
                AND provider_failures < {MAX_ASSESSMENT_PROVIDER_FAILURES}
                AND updated_at <= ?4
              RETURNING {ASSESSMENT_COLUMNS}"
@@ -677,7 +857,8 @@ pub fn hold_assessment(
     let result = tx.query_row(
         &format!(
             "UPDATE review_followup_assessments
-             SET state='held',active=0,hold_code=?3,hold_summary=?4,updated_at=?5
+             SET state='held',active=0,membership_sealed=1,
+                 hold_code=?3,hold_summary=?4,updated_at=?5
              WHERE id=?1 AND state=?2 AND updated_at <= ?5
              RETURNING {ASSESSMENT_COLUMNS}"
         ),
@@ -700,7 +881,8 @@ pub fn complete_assessment(
         &format!(
             "UPDATE review_followup_assessments
              SET state='completed',active=0,hold_code=NULL,hold_summary=NULL,updated_at=?2
-             WHERE id=?1 AND state='planning' AND active=1 AND updated_at <= ?2
+             WHERE id=?1 AND state='planning' AND active=1
+               AND membership_sealed=1 AND updated_at <= ?2
              RETURNING {ASSESSMENT_COLUMNS}"
         ),
         params![assessment_id, now],
@@ -710,7 +892,7 @@ pub fn complete_assessment(
 }
 
 const ASSESSMENT_COLUMNS: &str = "id,target,scope_kind,scope_id,source_task_id,state,active,
-    proposal_attempts,provider_failures,planner_provider,planner_model,
+    membership_sealed,proposal_attempts,provider_failures,planner_provider,planner_model,
     planner_assignment_id,base_sha,hold_code,hold_summary,created_at,updated_at";
 
 fn read_assessment(
@@ -752,6 +934,7 @@ fn assessment_from_row(row: &Row<'_>) -> rusqlite::Result<ReviewFollowupAssessme
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
     )
     .map_err(|error| {
         SqlError::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
@@ -840,11 +1023,36 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
                  (1,'source one','done','owner',1,1),
-                 (2,'source two','done','owner',1,1);
+                 (2,'source two','done','owner',1,1),
+                 (3,'graph source','done','owner',1,1),
+                 (4,'graph child one','done','owner',1,1),
+                 (5,'graph child two','done','owner',1,1);
+             UPDATE tasks SET refs='{\"pr\":100}' WHERE id=1;
+             UPDATE tasks SET refs='{\"pr\":200}' WHERE id=2;
+             UPDATE tasks SET refs='{\"pr\":300}' WHERE id=4;
+             UPDATE tasks SET refs='{\"pr\":301}' WHERE id=5;
+             INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (9,3,'completed',0,0,1,1,1);
+             INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (9,4,'child-one',1,1),(9,5,'child-two',1,1);
              INSERT INTO review_followup_batches(
-                 pr_number,task_id,source_task_id,collector_version,
+                 pr_number,task_id,graph_id,source_task_id,collector_version,
                  artifact_count,state,created_at,updated_at)
-             VALUES (100,1,1,'followups-v1',3,'collected',1,1);
+             VALUES
+                 (100,1,NULL,1,'followups-v1',2,'collected',1,1),
+                 (200,2,NULL,2,'followups-v1',1,'collected',1,1),
+                 (300,4,9,3,'followups-v1',1,'collected',1,1),
+                 (301,5,9,3,'followups-v1',1,'collected',1,1);
+             INSERT INTO review_collection_runs(
+                 pr_number,task_id,status,error,collector_model,collector_version,
+                 findings_count,followup_count,attempted_at,completed_at)
+             VALUES
+                 (100,1,'success',NULL,'collector','followups-v1',0,2,1,1),
+                 (200,2,'success',NULL,'collector','followups-v1',0,1,1,1),
+                 (300,4,'success',NULL,'collector','followups-v1',0,1,1,1),
+                 (301,5,'success',NULL,'collector','followups-v1',0,1,1,1);
              INSERT INTO review_followup_artifacts(
                  id,pr_number,ordinal,technical_impact,scope_relationship,concern,
                  non_blocking_reason,affected_behavior,desired_outcome,
@@ -854,8 +1062,12 @@ mod tests {
                   '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
                  (12,100,1,'minor','design_debt','two','reason','behavior','outcome',
                   '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1),
-                 (13,100,2,'minor','future_requirement','three','reason','behavior','outcome',
-                  '[\"verify\"]','[{\"kind\":\"review\",\"id\":3}]',1,1);",
+                 (21,200,0,'minor','future_requirement','three','reason','behavior','outcome',
+                  '[\"verify\"]','[{\"kind\":\"review\",\"id\":3}]',1,1),
+                 (31,300,0,'major','out_of_scope','four','reason','behavior','outcome',
+                  '[\"verify\"]','[{\"kind\":\"review\",\"id\":4}]',1,1),
+                 (32,301,0,'minor','design_debt','five','reason','behavior','outcome',
+                  '[\"verify\"]','[{\"kind\":\"review\",\"id\":5}]',1,1);",
         )
         .unwrap();
         (dir, conn)
@@ -921,6 +1133,7 @@ mod tests {
             3,
             "provider-backoff",
             1,
+            1,
             2,
             1,
             Some("openai".into()),
@@ -945,6 +1158,7 @@ mod tests {
         assert_eq!(value.source_task_id(), 3);
         assert_eq!(value.state(), FollowupAssessmentState::ProviderBackoff);
         assert!(value.active());
+        assert!(value.membership_sealed());
         assert_eq!(value.proposal_attempts(), 2);
         assert_eq!(value.provider_failures(), 1);
         assert_eq!(value.planner_provider(), Some("openai"));
@@ -975,6 +1189,7 @@ mod tests {
             value.source_task_id,
             value.state,
             value.active,
+            value.membership_sealed,
             value.proposal_attempts,
             value.provider_failures,
             value.planner_provider,
@@ -997,6 +1212,7 @@ mod tests {
                 7,
                 "pending",
                 active,
+                1,
                 attempts,
                 0,
                 None,
@@ -1031,6 +1247,7 @@ mod tests {
 
         assert_eq!(assessment.state(), FollowupAssessmentState::Pending);
         assert!(!assessment.active());
+        assert!(assessment.membership_sealed());
         assert_eq!(assessment.proposal_attempts(), 0);
         assert_eq!(assessment.provider_failures(), 0);
         assert_eq!(
@@ -1041,8 +1258,21 @@ mod tests {
 
         assert!(conn
             .execute(
-                "UPDATE review_followup_assessment_artifacts SET artifact_id=13
+                "UPDATE review_followup_assessment_artifacts SET artifact_id=21
                  WHERE assessment_id=?1 AND artifact_id=12",
+                [assessment.id()],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (?1,21)",
+                [assessment.id()],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=?1",
                 [assessment.id()],
             )
             .is_err());
@@ -1068,13 +1298,13 @@ mod tests {
         assert!(materialize_assessment(&mut conn, &first).unwrap().is_none());
         assert_eq!(counts(&conn), (1, 2, 0));
 
-        let overlapping = new_assessment(FollowupScopeKind::Task, 2, 2, vec![12, 13]);
+        let overlapping = new_assessment(FollowupScopeKind::Task, 2, 2, vec![12, 21]);
         assert!(materialize_assessment(&mut conn, &overlapping)
             .unwrap()
             .is_none());
         assert_eq!(counts(&conn), (1, 2, 0));
 
-        let missing = new_assessment(FollowupScopeKind::Graph, 9, 1, vec![13, 999]);
+        let missing = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![31, 999]);
         assert!(materialize_assessment(&mut conn, &missing)
             .unwrap()
             .is_none());
@@ -1083,14 +1313,82 @@ mod tests {
         conn.execute(
             "UPDATE review_followup_artifacts
              SET disposition='dismissed',disposition_reason='not actionable'
-             WHERE id=13",
+             WHERE id=31",
             [],
         )
         .unwrap();
-        let disposed = new_assessment(FollowupScopeKind::Graph, 10, 1, vec![13]);
+        let disposed = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![31, 32]);
         assert!(materialize_assessment(&mut conn, &disposed)
             .unwrap()
             .is_none());
+        assert_eq!(counts(&conn), (1, 2, 0));
+    }
+
+    #[test]
+    fn ordinary_scope_rechecks_exact_complete_membership_and_stale_eligibility() {
+        let (_dir, mut conn) = database();
+        let partial = new_assessment(FollowupScopeKind::Task, 1, 1, vec![11]);
+        assert!(materialize_assessment(&mut conn, &partial)
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&conn), (0, 0, 0));
+
+        let foreign = new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 21]);
+        assert!(materialize_assessment(&mut conn, &foreign)
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&conn), (0, 0, 0));
+
+        conn.execute(
+            "UPDATE review_collection_runs SET status='failed',error='stale'
+             WHERE pr_number=100",
+            [],
+        )
+        .unwrap();
+        let stale = new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 12]);
+        assert!(materialize_assessment(&mut conn, &stale).unwrap().is_none());
+        assert_eq!(counts(&conn), (0, 0, 0));
+    }
+
+    #[test]
+    fn graph_scope_rechecks_union_lineage_completeness_and_stale_eligibility() {
+        let (_dir, mut conn) = database();
+        let partial = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![31]);
+        assert!(materialize_assessment(&mut conn, &partial)
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&conn), (0, 0, 0));
+
+        let foreign = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![31, 21]);
+        assert!(materialize_assessment(&mut conn, &foreign)
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&conn), (0, 0, 0));
+
+        conn.execute("DELETE FROM review_collection_runs WHERE pr_number=301", [])
+            .unwrap();
+        let incomplete = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![31, 32]);
+        assert!(materialize_assessment(&mut conn, &incomplete)
+            .unwrap()
+            .is_none());
+        assert_eq!(counts(&conn), (0, 0, 0));
+    }
+
+    #[test]
+    fn graph_scope_materializes_the_complete_union() {
+        let (_dir, mut conn) = database();
+        let assessment = materialize_assessment(
+            &mut conn,
+            &new_assessment(FollowupScopeKind::Graph, 9, 3, vec![32, 31]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(assessment.membership_sealed());
+        assert_eq!(assessment.source_task_id(), 3);
+        assert_eq!(
+            assessment_artifact_ids(&conn, assessment.id()).unwrap(),
+            vec![31, 32]
+        );
         assert_eq!(counts(&conn), (1, 2, 0));
     }
 
@@ -1108,7 +1406,7 @@ mod tests {
         let (_dir, mut conn) = database();
         let assessment = materialize_assessment(
             &mut conn,
-            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11]),
+            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 12]),
         )
         .unwrap()
         .unwrap();
@@ -1184,7 +1482,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state(&conn, id), terminal);
-        assert_eq!(counts(&conn), (1, 1, 0));
+        assert_eq!(counts(&conn), (1, 2, 0));
     }
 
     #[test]
@@ -1192,7 +1490,7 @@ mod tests {
         let (_dir, mut conn) = database();
         let semantic = materialize_assessment(
             &mut conn,
-            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11]),
+            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 12]),
         )
         .unwrap()
         .unwrap();
@@ -1243,7 +1541,7 @@ mod tests {
 
         let provider = materialize_assessment(
             &mut conn,
-            &new_assessment(FollowupScopeKind::Task, 2, 2, vec![12]),
+            &new_assessment(FollowupScopeKind::Task, 2, 2, vec![21]),
         )
         .unwrap()
         .unwrap();
@@ -1306,7 +1604,7 @@ mod tests {
         let (_dir, mut conn) = database();
         let assessment = materialize_assessment(
             &mut conn,
-            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11]),
+            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 12]),
         )
         .unwrap()
         .unwrap();
@@ -1361,7 +1659,7 @@ mod tests {
         let (_dir, mut conn) = database();
         let assessment = materialize_assessment(
             &mut conn,
-            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11]),
+            &new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 12]),
         )
         .unwrap()
         .unwrap();
@@ -1377,6 +1675,6 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(state(&conn, assessment.id()), before);
-        assert_eq!(counts(&conn), (2, 1, 0));
+        assert_eq!(counts(&conn), (2, 2, 0));
     }
 }
