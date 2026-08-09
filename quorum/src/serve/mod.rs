@@ -4647,58 +4647,79 @@ async fn handle_pre_review_checks_failure(
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
-                let prompt = reviewer::build_rework_prompt(
-                    &workers[worker_index].agent_name,
+                if !install_live_worker_remediation_lease(
+                    config,
+                    workers[worker_index].agent_name.clone(),
                     task_id,
                     pr,
                     &feedback,
-                    workers[worker_index].cost_usd,
-                    config.limits.max_task_cost_usd,
-                );
-                if let Err(error) =
-                    feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                )
+                .await
                 {
-                    log(&format!(
-                        "pre-review CI rework feed failed for task #{task_id}: {error}; \
-                         preserving durable remediation intent"
-                    ));
                     let worker = workers.remove(worker_index);
-                    let p = config.db_path.clone();
-                    let agent = worker.agent_name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut conn) = quorum_core::db::open(&p) {
-                            let _ = tasks::release_remediation_lease(
-                                &mut conn,
-                                &agent,
-                                task_id,
-                                now_unix(),
-                            );
-                        }
-                    })
-                    .await
-                    .ok();
-                    cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                    cleanup_slot(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        worker,
+                        None,
+                        "remediation_lease_unavailable",
+                    )
+                    .await;
                 } else {
-                    let worker = &mut workers[worker_index];
-                    worker.draining = true;
-                    worker.pr = None;
-                    worker.rework_count += 1;
-                    worker.turn_started_at = std::time::Instant::now();
-                    if let Some(ref mut session_log) = worker.session_log {
-                        session_log.log_rework(worker.rework_count);
+                    let prompt = reviewer::build_rework_prompt(
+                        &workers[worker_index].agent_name,
+                        task_id,
+                        pr,
+                        &feedback,
+                        workers[worker_index].cost_usd,
+                        config.limits.max_task_cost_usd,
+                    );
+                    if let Err(error) =
+                        feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                    {
+                        log(&format!(
+                            "pre-review CI rework feed failed for task #{task_id}: {error}; \
+                         preserving durable remediation intent"
+                        ));
+                        let worker = workers.remove(worker_index);
+                        let p = config.db_path.clone();
+                        let agent = worker.agent_name.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                let _ = tasks::release_remediation_lease(
+                                    &mut conn,
+                                    &agent,
+                                    task_id,
+                                    now_unix(),
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                        cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                    } else {
+                        let worker = &mut workers[worker_index];
+                        worker.draining = true;
+                        worker.pr = None;
+                        worker.rework_count += 1;
+                        worker.turn_started_at = std::time::Instant::now();
+                        if let Some(ref mut session_log) = worker.session_log {
+                            session_log.log_rework(worker.rework_count);
+                        }
+                        let p = config.db_path.clone();
+                        let entry = slot_journal_entry(worker, "worker", "working");
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            journal::upsert(&mut conn, &entry)
+                        })
+                        .await
+                        .ok();
+                        log(&format!(
+                            "worker {} rework #{} (pre-review CI failure)",
+                            worker.agent_name, worker.rework_count
+                        ));
                     }
-                    let p = config.db_path.clone();
-                    let entry = slot_journal_entry(worker, "worker", "working");
-                    tokio::task::spawn_blocking(move || -> Result<()> {
-                        let mut conn = quorum_core::db::open(&p)?;
-                        journal::upsert(&mut conn, &entry)
-                    })
-                    .await
-                    .ok();
-                    log(&format!(
-                        "worker {} rework #{} (pre-review CI failure)",
-                        worker.agent_name, worker.rework_count
-                    ));
                 }
             } else {
                 log(&format!(
@@ -6519,64 +6540,88 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_prompt = reviewer::build_rework_prompt(
-                                            &workers[wi].agent_name,
-                                            workers[wi].task_id,
+                                        if !install_live_worker_remediation_lease(
+                                            config,
+                                            workers[wi].agent_name.clone(),
+                                            reviewer_task_id,
                                             pr_num,
                                             &rework_msg,
-                                            workers[wi].cost_usd,
-                                            config.limits.max_task_cost_usd,
-                                        );
-                                        if let Err(e) = feed_worker_turn(
-                                            &mut workers[wi],
-                                            &rework_prompt,
-                                            config,
                                         )
                                         .await
                                         {
-                                            log(&format!(
-                                                "conflict rework feed failed: {e} — cleaning up"
-                                            ));
                                             let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
                                             cleanup_slot(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "agent_failed",
+                                                "remediation_lease_unavailable",
                                             )
                                             .await;
                                         } else {
-                                            let w = &mut workers[wi];
-                                            w.draining = true;
-                                            w.pr = None;
-                                            w.rework_count += 1;
-                                            w.turn_started_at = std::time::Instant::now();
-                                            if let Some(ref mut sl) = w.session_log {
-                                                sl.log_rework(w.rework_count);
-                                            }
-                                            let p = db_path.clone();
-                                            let entry = slot_journal_entry(w, "worker", "working");
-                                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                                let mut conn = quorum_core::db::open(&p)?;
-                                                journal::upsert(&mut conn, &entry)
-                                            })
+                                            let rework_prompt = reviewer::build_rework_prompt(
+                                                &workers[wi].agent_name,
+                                                workers[wi].task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                                workers[wi].cost_usd,
+                                                config.limits.max_task_cost_usd,
+                                            );
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
                                             .await
-                                            .ok();
-                                            log(&format!(
-                                                "worker {} rework #{} (pre-merge conflict)",
-                                                w.agent_name, w.rework_count
+                                            {
+                                                log(&format!(
+                                                "conflict rework feed failed: {e} — cleaning up"
                                             ));
+                                                let w = workers.remove(wi);
+                                                fire_event(
+                                                    &db_path,
+                                                    &w.agent_name,
+                                                    w.task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: format!("rework feed failed: {e}"),
+                                                    },
+                                                )
+                                                .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                w.draining = true;
+                                                w.pr = None;
+                                                w.rework_count += 1;
+                                                w.turn_started_at = std::time::Instant::now();
+                                                if let Some(ref mut sl) = w.session_log {
+                                                    sl.log_rework(w.rework_count);
+                                                }
+                                                let p = db_path.clone();
+                                                let entry =
+                                                    slot_journal_entry(w, "worker", "working");
+                                                tokio::task::spawn_blocking(
+                                                    move || -> Result<()> {
+                                                        let mut conn = quorum_core::db::open(&p)?;
+                                                        journal::upsert(&mut conn, &entry)
+                                                    },
+                                                )
+                                                .await
+                                                .ok();
+                                                log(&format!(
+                                                    "worker {} rework #{} (pre-merge conflict)",
+                                                    w.agent_name, w.rework_count
+                                                ));
+                                            }
                                         }
                                     } else {
                                         // #175: no live worker — spawn remediation
@@ -6794,64 +6839,88 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_prompt = reviewer::build_rework_prompt(
-                                            &workers[wi].agent_name,
-                                            workers[wi].task_id,
+                                        if !install_live_worker_remediation_lease(
+                                            config,
+                                            workers[wi].agent_name.clone(),
+                                            reviewer_task_id,
                                             pr_num,
                                             &rework_msg,
-                                            workers[wi].cost_usd,
-                                            config.limits.max_task_cost_usd,
-                                        );
-                                        if let Err(e) = feed_worker_turn(
-                                            &mut workers[wi],
-                                            &rework_prompt,
-                                            config,
                                         )
                                         .await
                                         {
-                                            log(&format!(
-                                                "checks-failure rework feed failed: {e} — cleaning up"
-                                            ));
                                             let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
                                             cleanup_slot(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "agent_failed",
+                                                "remediation_lease_unavailable",
                                             )
                                             .await;
                                         } else {
-                                            let w = &mut workers[wi];
-                                            w.draining = true;
-                                            w.pr = None;
-                                            w.rework_count += 1;
-                                            w.turn_started_at = std::time::Instant::now();
-                                            if let Some(ref mut sl) = w.session_log {
-                                                sl.log_rework(w.rework_count);
-                                            }
-                                            let p = db_path.clone();
-                                            let entry = slot_journal_entry(w, "worker", "working");
-                                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                                let mut conn = quorum_core::db::open(&p)?;
-                                                journal::upsert(&mut conn, &entry)
-                                            })
+                                            let rework_prompt = reviewer::build_rework_prompt(
+                                                &workers[wi].agent_name,
+                                                workers[wi].task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                                workers[wi].cost_usd,
+                                                config.limits.max_task_cost_usd,
+                                            );
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
                                             .await
-                                            .ok();
-                                            log(&format!(
-                                                "worker {} rework #{} (checks failure)",
-                                                w.agent_name, w.rework_count
+                                            {
+                                                log(&format!(
+                                                "checks-failure rework feed failed: {e} — cleaning up"
                                             ));
+                                                let w = workers.remove(wi);
+                                                fire_event(
+                                                    &db_path,
+                                                    &w.agent_name,
+                                                    w.task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: format!("rework feed failed: {e}"),
+                                                    },
+                                                )
+                                                .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                w.draining = true;
+                                                w.pr = None;
+                                                w.rework_count += 1;
+                                                w.turn_started_at = std::time::Instant::now();
+                                                if let Some(ref mut sl) = w.session_log {
+                                                    sl.log_rework(w.rework_count);
+                                                }
+                                                let p = db_path.clone();
+                                                let entry =
+                                                    slot_journal_entry(w, "worker", "working");
+                                                tokio::task::spawn_blocking(
+                                                    move || -> Result<()> {
+                                                        let mut conn = quorum_core::db::open(&p)?;
+                                                        journal::upsert(&mut conn, &entry)
+                                                    },
+                                                )
+                                                .await
+                                                .ok();
+                                                log(&format!(
+                                                    "worker {} rework #{} (checks failure)",
+                                                    w.agent_name, w.rework_count
+                                                ));
+                                            }
                                         }
                                     } else {
                                         // #175: no live worker — spawn remediation
@@ -6998,69 +7067,93 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            let rework_prompt = reviewer::build_rework_prompt(
-                                                &workers[wi].agent_name,
-                                                workers[wi].task_id,
+                                            if !install_live_worker_remediation_lease(
+                                                config,
+                                                workers[wi].agent_name.clone(),
+                                                reviewer_task_id,
                                                 pr_num,
                                                 &rework_msg,
-                                                workers[wi].cost_usd,
-                                                config.limits.max_task_cost_usd,
-                                            );
-                                            if let Err(e) = feed_worker_turn(
-                                                &mut workers[wi],
-                                                &rework_prompt,
-                                                config,
                                             )
                                             .await
                                             {
-                                                log(&format!(
-                                                    "timeout-conflict rework feed failed: \
-                                                     {e} — cleaning up"
-                                                ));
                                                 let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
-                                                )
-                                                .await;
                                                 cleanup_slot(
                                                     config,
                                                     wt_mgr,
                                                     name_pool,
                                                     w,
                                                     None,
-                                                    "agent_failed",
+                                                    "remediation_lease_unavailable",
                                                 )
                                                 .await;
                                             } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
+                                                let rework_prompt = reviewer::build_rework_prompt(
+                                                    &workers[wi].agent_name,
+                                                    workers[wi].task_id,
+                                                    pr_num,
+                                                    &rework_msg,
+                                                    workers[wi].cost_usd,
+                                                    config.limits.max_task_cost_usd,
+                                                );
+                                                if let Err(e) = feed_worker_turn(
+                                                    &mut workers[wi],
+                                                    &rework_prompt,
+                                                    config,
                                                 )
                                                 .await
-                                                .ok();
-                                                log(&format!(
-                                                    "worker {} rework #{} \
+                                                {
+                                                    log(&format!(
+                                                        "timeout-conflict rework feed failed: \
+                                                     {e} — cleaning up"
+                                                    ));
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    let w = &mut workers[wi];
+                                                    w.draining = true;
+                                                    w.pr = None;
+                                                    w.rework_count += 1;
+                                                    w.turn_started_at = std::time::Instant::now();
+                                                    if let Some(ref mut sl) = w.session_log {
+                                                        sl.log_rework(w.rework_count);
+                                                    }
+                                                    let p = db_path.clone();
+                                                    let entry =
+                                                        slot_journal_entry(w, "worker", "working");
+                                                    tokio::task::spawn_blocking(
+                                                        move || -> Result<()> {
+                                                            let mut conn =
+                                                                quorum_core::db::open(&p)?;
+                                                            journal::upsert(&mut conn, &entry)
+                                                        },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                    log(&format!(
+                                                        "worker {} rework #{} \
                                                      (timeout + conflict)",
-                                                    w.agent_name, w.rework_count
-                                                ));
+                                                        w.agent_name, w.rework_count
+                                                    ));
+                                                }
                                             }
                                         } else {
                                             // #175: no live worker — spawn remediation
@@ -7335,66 +7428,90 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_prompt = reviewer::build_rework_prompt(
-                                            &workers[wi].agent_name,
-                                            workers[wi].task_id,
+                                        if !install_live_worker_remediation_lease(
+                                            config,
+                                            workers[wi].agent_name.clone(),
+                                            reviewer_task_id,
                                             pr_num,
                                             &rework_msg,
-                                            workers[wi].cost_usd,
-                                            config.limits.max_task_cost_usd,
-                                        );
-                                        if let Err(e) = feed_worker_turn(
-                                            &mut workers[wi],
-                                            &rework_prompt,
-                                            config,
                                         )
                                         .await
                                         {
-                                            log(&format!(
-                                                "pre-merge conflict rework feed failed: \
-                                                 {e} — cleaning up"
-                                            ));
                                             let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
                                             cleanup_slot(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "agent_failed",
+                                                "remediation_lease_unavailable",
                                             )
                                             .await;
                                         } else {
-                                            let w = &mut workers[wi];
-                                            w.draining = true;
-                                            w.pr = None;
-                                            w.rework_count += 1;
-                                            w.turn_started_at = std::time::Instant::now();
-                                            if let Some(ref mut sl) = w.session_log {
-                                                sl.log_rework(w.rework_count);
-                                            }
-                                            let p = db_path.clone();
-                                            let entry = slot_journal_entry(w, "worker", "working");
-                                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                                let mut conn = quorum_core::db::open(&p)?;
-                                                journal::upsert(&mut conn, &entry)
-                                            })
+                                            let rework_prompt = reviewer::build_rework_prompt(
+                                                &workers[wi].agent_name,
+                                                workers[wi].task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                                workers[wi].cost_usd,
+                                                config.limits.max_task_cost_usd,
+                                            );
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
                                             .await
-                                            .ok();
-                                            log(&format!(
-                                                "worker {} rework #{} \
+                                            {
+                                                log(&format!(
+                                                    "pre-merge conflict rework feed failed: \
+                                                 {e} — cleaning up"
+                                                ));
+                                                let w = workers.remove(wi);
+                                                fire_event(
+                                                    &db_path,
+                                                    &w.agent_name,
+                                                    w.task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: format!("rework feed failed: {e}"),
+                                                    },
+                                                )
+                                                .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                w.draining = true;
+                                                w.pr = None;
+                                                w.rework_count += 1;
+                                                w.turn_started_at = std::time::Instant::now();
+                                                if let Some(ref mut sl) = w.session_log {
+                                                    sl.log_rework(w.rework_count);
+                                                }
+                                                let p = db_path.clone();
+                                                let entry =
+                                                    slot_journal_entry(w, "worker", "working");
+                                                tokio::task::spawn_blocking(
+                                                    move || -> Result<()> {
+                                                        let mut conn = quorum_core::db::open(&p)?;
+                                                        journal::upsert(&mut conn, &entry)
+                                                    },
+                                                )
+                                                .await
+                                                .ok();
+                                                log(&format!(
+                                                    "worker {} rework #{} \
                                                  (pre-merge conflict recheck)",
-                                                w.agent_name, w.rework_count
-                                            ));
+                                                    w.agent_name, w.rework_count
+                                                ));
+                                            }
                                         }
                                     } else {
                                         // #175: no live worker — spawn remediation
@@ -7715,70 +7832,94 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                let rework_prompt = reviewer::build_rework_prompt(
-                                                    &workers[wi].agent_name,
-                                                    workers[wi].task_id,
+                                                if !install_live_worker_remediation_lease(
+                                                    config,
+                                                    workers[wi].agent_name.clone(),
+                                                    reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
-                                                    workers[wi].cost_usd,
-                                                    config.limits.max_task_cost_usd,
-                                                );
-                                                if let Err(e) = feed_worker_turn(
-                                                    &mut workers[wi],
-                                                    &rework_prompt,
-                                                    config,
                                                 )
                                                 .await
                                                 {
-                                                    log(&format!(
-                                                    "merge-failure rework feed failed: {e} — cleaning up"
-                                                ));
                                                     let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
-                                                    )
-                                                    .await;
                                                     cleanup_slot(
                                                         config,
                                                         wt_mgr,
                                                         name_pool,
                                                         w,
                                                         None,
-                                                        "agent_failed",
+                                                        "remediation_lease_unavailable",
                                                     )
                                                     .await;
                                                 } else {
-                                                    let w = &mut workers[wi];
-                                                    w.draining = true;
-                                                    w.pr = None;
-                                                    w.rework_count += 1;
-                                                    w.turn_started_at = std::time::Instant::now();
-                                                    if let Some(ref mut sl) = w.session_log {
-                                                        sl.log_rework(w.rework_count);
-                                                    }
-                                                    let p = db_path.clone();
-                                                    let entry =
-                                                        slot_journal_entry(w, "worker", "working");
-                                                    tokio::task::spawn_blocking(
-                                                        move || -> Result<()> {
-                                                            let mut conn =
-                                                                quorum_core::db::open(&p)?;
-                                                            journal::upsert(&mut conn, &entry)
-                                                        },
+                                                    let rework_prompt =
+                                                        reviewer::build_rework_prompt(
+                                                            &workers[wi].agent_name,
+                                                            workers[wi].task_id,
+                                                            pr_num,
+                                                            &rework_msg,
+                                                            workers[wi].cost_usd,
+                                                            config.limits.max_task_cost_usd,
+                                                        );
+                                                    if let Err(e) = feed_worker_turn(
+                                                        &mut workers[wi],
+                                                        &rework_prompt,
+                                                        config,
                                                     )
                                                     .await
-                                                    .ok();
-                                                    log(&format!(
-                                                        "worker {} rework #{} (merge failure)",
-                                                        w.agent_name, w.rework_count
-                                                    ));
+                                                    {
+                                                        log(&format!(
+                                                    "merge-failure rework feed failed: {e} — cleaning up"
+                                                ));
+                                                        let w = workers.remove(wi);
+                                                        fire_event(
+                                                            &db_path,
+                                                            &w.agent_name,
+                                                            w.task_id,
+                                                            &Event::AgentFailed {
+                                                                reason: format!(
+                                                                    "rework feed failed: {e}"
+                                                                ),
+                                                            },
+                                                        )
+                                                        .await;
+                                                        cleanup_slot(
+                                                            config,
+                                                            wt_mgr,
+                                                            name_pool,
+                                                            w,
+                                                            None,
+                                                            "agent_failed",
+                                                        )
+                                                        .await;
+                                                    } else {
+                                                        let w = &mut workers[wi];
+                                                        w.draining = true;
+                                                        w.pr = None;
+                                                        w.rework_count += 1;
+                                                        w.turn_started_at =
+                                                            std::time::Instant::now();
+                                                        if let Some(ref mut sl) = w.session_log {
+                                                            sl.log_rework(w.rework_count);
+                                                        }
+                                                        let p = db_path.clone();
+                                                        let entry = slot_journal_entry(
+                                                            w, "worker", "working",
+                                                        );
+                                                        tokio::task::spawn_blocking(
+                                                            move || -> Result<()> {
+                                                                let mut conn =
+                                                                    quorum_core::db::open(&p)?;
+                                                                journal::upsert(&mut conn, &entry)
+                                                            },
+                                                        )
+                                                        .await
+                                                        .ok();
+                                                        log(&format!(
+                                                            "worker {} rework #{} (merge failure)",
+                                                            w.agent_name, w.rework_count
+                                                        ));
+                                                    }
                                                 }
                                             } else {
                                                 // #175: no live worker — spawn remediation
@@ -7984,58 +8125,80 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                let rework_prompt = reviewer::build_rework_prompt(
-                                    &workers[wi].agent_name,
-                                    workers[wi].task_id,
+                                if !install_live_worker_remediation_lease(
+                                    config,
+                                    workers[wi].agent_name.clone(),
+                                    reviewer_task_id,
                                     rework_pr,
                                     feedback,
-                                    workers[wi].cost_usd,
-                                    config.limits.max_task_cost_usd,
-                                );
-                                if let Err(e) =
-                                    feed_worker_turn(&mut workers[wi], &rework_prompt, config).await
+                                )
+                                .await
                                 {
-                                    log(&format!("rework feed_turn failed: {e} — cleaning up"));
                                     let w = workers.remove(wi);
-                                    fire_event(
-                                        &db_path,
-                                        &w.agent_name,
-                                        w.task_id,
-                                        &Event::AgentFailed {
-                                            reason: format!("rework feed failed: {e}"),
-                                        },
-                                    )
-                                    .await;
                                     cleanup_slot(
                                         config,
                                         wt_mgr,
                                         name_pool,
                                         w,
                                         None,
-                                        "agent_failed",
+                                        "remediation_lease_unavailable",
                                     )
                                     .await;
                                 } else {
-                                    let w = &mut workers[wi];
-                                    w.draining = true;
-                                    w.pr = None;
-                                    w.rework_count += 1;
-                                    w.turn_started_at = std::time::Instant::now();
-                                    if let Some(ref mut sl) = w.session_log {
-                                        sl.log_rework(w.rework_count);
+                                    let rework_prompt = reviewer::build_rework_prompt(
+                                        &workers[wi].agent_name,
+                                        workers[wi].task_id,
+                                        rework_pr,
+                                        feedback,
+                                        workers[wi].cost_usd,
+                                        config.limits.max_task_cost_usd,
+                                    );
+                                    if let Err(e) =
+                                        feed_worker_turn(&mut workers[wi], &rework_prompt, config)
+                                            .await
+                                    {
+                                        log(&format!("rework feed_turn failed: {e} — cleaning up"));
+                                        let w = workers.remove(wi);
+                                        fire_event(
+                                            &db_path,
+                                            &w.agent_name,
+                                            w.task_id,
+                                            &Event::AgentFailed {
+                                                reason: format!("rework feed failed: {e}"),
+                                            },
+                                        )
+                                        .await;
+                                        cleanup_slot(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            w,
+                                            None,
+                                            "agent_failed",
+                                        )
+                                        .await;
+                                    } else {
+                                        let w = &mut workers[wi];
+                                        w.draining = true;
+                                        w.pr = None;
+                                        w.rework_count += 1;
+                                        w.turn_started_at = std::time::Instant::now();
+                                        if let Some(ref mut sl) = w.session_log {
+                                            sl.log_rework(w.rework_count);
+                                        }
+                                        let p = db_path.clone();
+                                        let entry = slot_journal_entry(w, "worker", "working");
+                                        tokio::task::spawn_blocking(move || -> Result<()> {
+                                            let mut conn = quorum_core::db::open(&p)?;
+                                            journal::upsert(&mut conn, &entry)
+                                        })
+                                        .await
+                                        .ok();
+                                        log(&format!(
+                                            "worker {} rework #{} started",
+                                            w.agent_name, w.rework_count
+                                        ));
                                     }
-                                    let p = db_path.clone();
-                                    let entry = slot_journal_entry(w, "worker", "working");
-                                    tokio::task::spawn_blocking(move || -> Result<()> {
-                                        let mut conn = quorum_core::db::open(&p)?;
-                                        journal::upsert(&mut conn, &entry)
-                                    })
-                                    .await
-                                    .ok();
-                                    log(&format!(
-                                        "worker {} rework #{} started",
-                                        w.agent_name, w.rework_count
-                                    ));
                                 }
                             } else {
                                 // #159: no live worker — spawn a remediation
@@ -13239,7 +13402,7 @@ enum RemediationSpawnOutcome {
     ProvisionFailed,
 }
 
-async fn claim_remediation_for_spawn(
+async fn claim_remediation_for_worker(
     db_path: PathBuf,
     agent: String,
     task_id: i64,
@@ -13262,6 +13425,40 @@ async fn claim_remediation_for_spawn(
             "remediation claim join for task #{task_id}: {error}"
         ))
     })?
+}
+
+/// Install a fresh remediation lease for a still-live worker before feeding it
+/// a rework turn. `VerdictChanges` and `MergeConflict` release the prior lease
+/// as part of their lifecycle transition, so renewal cannot protect this gap.
+///
+/// A lost guarded claim is a clean race: the worker is not fed. An abnormal
+/// claim failure parks and notifies through the same path as failed remediation
+/// provisioning, rather than running an unleased turn.
+async fn install_live_worker_remediation_lease(
+    config: &ServeConfig,
+    agent: String,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
+    match claim_remediation_for_worker(config.db_path.clone(), agent, task_id, feedback.to_string())
+        .await
+    {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            log(&format!(
+                "live remediation: claim lost for task #{task_id} — task no longer eligible"
+            ));
+            false
+        }
+        Err(error) => {
+            log(&format!(
+                "live remediation: lease install failed for task #{task_id}: {error} — parking task"
+            ));
+            park_remediation_provision_failure(config, task_id, pr, feedback).await;
+            false
+        }
+    }
 }
 
 async fn retain_blocked_remediation_retry_for_spawn(
@@ -13344,7 +13541,7 @@ async fn spawn_remediation_worker(
     // sweep. Without this, an intervening sweep_on_write sees a rework task
     // with no active claim and reaps it to open (#199).
     {
-        match claim_remediation_for_spawn(
+        match claim_remediation_for_worker(
             db_path.clone(),
             agent_name.clone(),
             task_id,
@@ -14347,13 +14544,191 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let error = claim_remediation_for_spawn(db_path, "worker".into(), 1, "feedback".into())
+        let error = claim_remediation_for_worker(db_path, "worker".into(), 1, "feedback".into())
             .await
             .expect_err("abnormal database failure must propagate");
         assert!(
             matches!(error, QuorumError::SchemaTooNew { .. }),
             "database failure was collapsed into a claim loss: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_worker_rework_claim_survives_reaper_past_provisioning_grace() {
+        // A sticky worker survives review, so VerdictChanges releases its old
+        // lease and this path must install a replacement before refeeding it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-worker-rework.db");
+        let now = now_unix();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "live rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "live-worker", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("live worker must claim the task");
+            tasks::apply_event(
+                &mut conn,
+                "live-worker",
+                task_id,
+                &Event::SignaledDone { pr: "551".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "reviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                task_id,
+                &Event::VerdictChanges,
+                now + 3,
+            )
+            .unwrap();
+            task_id
+        };
+
+        assert!(
+            claim_remediation_for_worker(
+                db_path.clone(),
+                "live-worker".into(),
+                task_id,
+                "fix the blocking finding".into(),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "the live worker must reacquire the released remediation lease"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
+            .unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let claim: (String, i64) = conn
+            .query_row(
+                "SELECT holder, active FROM claims
+                 WHERE target=?1 ORDER BY id DESC LIMIT 1",
+                [format!("task#{task_id}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, ("live-worker".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn live_worker_pre_review_ci_rework_claim_survives_reaper_past_provisioning_grace() {
+        // Drive the real pre-review CI failure handler. Failed CI moves an
+        // awaiting-review worker directly to rework and releases its original
+        // lease; the handler must replace it before feeding the worker.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-worker-pre-review-ci-rework.db");
+        let now = now_unix();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "live pre-review CI rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "live-worker", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("live worker must claim the task");
+            tasks::apply_event(
+                &mut conn,
+                "live-worker",
+                task_id,
+                &Event::SignaledDone { pr: "553".into() },
+                now + 1,
+            )
+            .unwrap();
+            task_id
+        };
+
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut name_pool = Pool::new_generated();
+        let wt_mgr = WorktreeManager::new();
+        let mut workers =
+            vec![make_live_pre_review_ci_slot(task_id, dir.path().to_path_buf()).await];
+        let mut roster = LifetimeRoster::new();
+        handle_pre_review_checks_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut roster,
+            task_id,
+            553,
+            "0123456789abcdef0123456789abcdef01234567",
+            &["test".into()],
+        )
+        .await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "the live worker must remain after a successful feed"
+        );
+        assert!(workers[0].draining, "the rework turn must be fed");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
+            .unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let claim: (String, i64) = conn
+            .query_row(
+                "SELECT holder, active FROM claims
+                 WHERE target=?1 ORDER BY id DESC LIMIT 1",
+                [format!("task#{task_id}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, ("live-worker".into(), 1));
+
+        let worker = workers.remove(0);
+        worker.proc.kill_and_reap().await;
     }
 
     #[test]
@@ -14941,6 +15316,110 @@ mod tests {
             reviewed_head_sha: None,
             continuation_id: None,
             pending_prompt: "test prompt".into(),
+            pending_turn_kind: "initial".into(),
+        }
+    }
+
+    fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        let profile = crate::serve_config::ModelProfile {
+            runner: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
+        ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            repo_dir: repo_dir.clone(),
+            worktree_base: repo_dir,
+            names_file: None,
+            agent_bin: None,
+            merge_executor: Arc::new(merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            codex_sandbox: "danger-full-access".into(),
+        }
+    }
+
+    async fn make_live_pre_review_ci_slot(task_id: i64, worktree_path: PathBuf) -> SlotState {
+        use tokio::io::BufReader;
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let now = std::time::Instant::now();
+        SlotState {
+            agent_name: "live-worker".into(),
+            proc: runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                BufReader::new(stdout),
+            )),
+            task_id,
+            session_id: agent::new_session_id(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+            worktree_path,
+            branch: "test-branch".into(),
+            remote_branch: "test-branch".into(),
+            draining: false,
+            pr: Some(553),
+            rework_count: 0,
+            cost_tokens: 0,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: None,
+            cap_run_id: None,
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "initial".into(),
             pending_turn_kind: "initial".into(),
         }
     }
