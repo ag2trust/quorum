@@ -23,6 +23,13 @@ const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerOperation {
+    DecomposeSource,
+    ReconcileReviewFollowups,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
 pub enum PlannerResponse {
@@ -57,6 +64,33 @@ pub struct PlanningSource<'a> {
     pub title: &'a str,
     pub body: Option<&'a str>,
     pub dependencies: &'a [i64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowupReconcileRequest {
+    pub assessment_id: i64,
+    pub source_task_id: i64,
+    pub artifact_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
+pub enum FollowupReconcileResponse {
+    Reconciled {
+        dispositions: Vec<ProposedFollowupDisposition>,
+    },
+    Blocked {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposedFollowupDisposition {
+    pub artifact_id: i64,
+    pub action: String,
+    pub rationale: String,
 }
 
 /// Build one bounded, closed-book planner turn. Retry context is deliberately
@@ -830,5 +864,76 @@ mod tests {
         assert!(truncated.is_char_boundary(truncated.len()));
         assert!(truncated.len() <= MAX_REJECTION_SUMMARY_BYTES);
         assert_eq!(truncated, "😀".repeat(256));
+    }
+
+    #[test]
+    fn planner_operation_round_trips_both_variants() {
+        for (op, expected_json) in [
+            (PlannerOperation::DecomposeSource, "\"decompose_source\""),
+            (
+                PlannerOperation::ReconcileReviewFollowups,
+                "\"reconcile_review_followups\"",
+            ),
+        ] {
+            let json = serde_json::to_string(&op).unwrap();
+            assert_eq!(json, expected_json);
+            let back: PlannerOperation = serde_json::from_str(&json).unwrap();
+            assert_eq!(op, back);
+        }
+    }
+
+    #[test]
+    fn followup_reconcile_request_round_trips_closed_shape() {
+        let request = FollowupReconcileRequest {
+            assessment_id: 5,
+            source_task_id: 3,
+            artifact_ids: vec![10, 11, 12],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let back: FollowupReconcileRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, back);
+
+        let extra = r#"{"assessment_id":5,"source_task_id":3,"artifact_ids":[10],"extra":true}"#;
+        assert!(serde_json::from_str::<FollowupReconcileRequest>(extra).is_err());
+    }
+
+    #[test]
+    fn followup_reconcile_response_round_trips_reconciled_and_blocked() {
+        let reconciled = FollowupReconcileResponse::Reconciled {
+            dispositions: vec![
+                ProposedFollowupDisposition {
+                    artifact_id: 10,
+                    action: "create".into(),
+                    rationale: "needs new task".into(),
+                },
+                ProposedFollowupDisposition {
+                    artifact_id: 11,
+                    action: "dismiss".into(),
+                    rationale: "already addressed".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&reconciled).unwrap();
+        let back: FollowupReconcileResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(reconciled, back);
+
+        let blocked = FollowupReconcileResponse::Blocked {
+            reason: "upstream dependency unresolved".into(),
+        };
+        let json = serde_json::to_string(&blocked).unwrap();
+        let back: FollowupReconcileResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(blocked, back);
+    }
+
+    #[test]
+    fn followup_reconcile_response_rejects_unknown_fields() {
+        assert!(serde_json::from_str::<FollowupReconcileResponse>(
+            r#"{"outcome":"reconciled","dispositions":[],"extra":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ProposedFollowupDisposition>(
+            r#"{"artifact_id":1,"action":"create","rationale":"x","extra":true}"#
+        )
+        .is_err());
     }
 }
