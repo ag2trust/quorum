@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 43;
+pub const SCHEMA_VERSION: i64 = 44;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -635,6 +635,9 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 [],
             )?;
         }
+        // v44 adds dormant follow-up assessment aggregates and immutable
+        // artifact membership via SCHEMA_SQL. No runtime path reads or writes
+        // the new tables before the later activation migration.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1062,6 +1065,152 @@ mod tests {
                 )
                 .unwrap(),
             (1, 0)
+        );
+    }
+
+    #[test]
+    fn populated_v43_migration_adds_assessment_tables_and_enforces_all_authority() {
+        fn unique_indexes(conn: &Connection, table: &str) -> Vec<(String, bool, Vec<String>)> {
+            let mut stmt = conn
+                .prepare("SELECT name,partial FROM pragma_index_list(?1) WHERE \"unique\"=1")
+                .unwrap();
+            let indexes = stmt
+                .query_map([table], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            indexes
+                .into_iter()
+                .map(|(name, partial)| {
+                    let columns = conn
+                        .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                        .unwrap()
+                        .query_map([&name], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap();
+                    (name, partial, columns)
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v43-assessments.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
+                     (1,'source one','done','owner',1,1),
+                     (2,'source two','done','owner',1,1);
+                 INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (100,1,1,'followups-v1',2,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                     id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES
+                     (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+                     (12,100,1,'minor','design_debt','two','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);
+                 DROP TABLE review_followup_assessment_artifacts;
+                 DROP TABLE review_followup_assessments;
+                 PRAGMA user_version=43;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for table in [
+            "review_followup_assessments",
+            "review_followup_assessment_artifacts",
+        ] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+
+        let assessment_indexes = unique_indexes(&conn, "review_followup_assessments");
+        assert!(assessment_indexes
+            .iter()
+            .any(|(_, partial, columns)| !partial && columns == &["scope_kind", "scope_id"]));
+        assert!(assessment_indexes.iter().any(|(name, partial, columns)| {
+            name == "one_active_followup_assessment" && *partial && columns == &["target"]
+        }));
+        let membership_indexes = unique_indexes(&conn, "review_followup_assessment_artifacts");
+        assert!(membership_indexes
+            .iter()
+            .any(|(_, _, columns)| columns == &["artifact_id"]));
+
+        let insert_assessment = |id: i64,
+                                 target: &str,
+                                 scope_kind: &str,
+                                 scope_id: i64,
+                                 source_task_id: i64,
+                                 active: i64| {
+            conn.execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'pending',?6,1,1)",
+                rusqlite::params![id, target, scope_kind, scope_id, source_task_id, active],
+            )
+        };
+        insert_assessment(21, "shared-authority", "task", 1, 1, 1).unwrap();
+        assert!(insert_assessment(22, "another-target", "task", 1, 1, 0).is_err());
+        insert_assessment(22, "shared-authority", "graph", 10, 1, 0).unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET active=1 WHERE id=22",
+                [],
+            )
+            .is_err());
+        insert_assessment(23, "followup:task:2", "task", 2, 2, 0).unwrap();
+        assert!(insert_assessment(24, "invalid-scope", "repo", 3, 1, 0).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     created_at,updated_at)
+                 VALUES (24,'invalid-state','graph',11,1,'retrying',0,1,1)",
+                [],
+            )
+            .is_err());
+
+        conn.execute(
+            "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+             VALUES (21,11)",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (23,11)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+             VALUES (23,12)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
         );
     }
 
@@ -1877,9 +2026,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("q.db");
         {
-            let c = open(&p).unwrap();
-            c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-                .unwrap();
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(&format!(
+                "CREATE TABLE newer_marker(value TEXT NOT NULL);
+                 INSERT INTO newer_marker(value) VALUES ('untouched');
+                 PRAGMA user_version={};",
+                SCHEMA_VERSION + 1
+            ))
+            .unwrap();
         }
         match open(&p) {
             Err(QuorumError::SchemaTooNew { db, bin }) => {
@@ -1887,6 +2041,32 @@ mod tests {
                 assert_eq!(bin, SCHEMA_VERSION);
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+        let c = Connection::open(&p).unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION + 1
+        );
+        assert_eq!(
+            c.query_row("SELECT value FROM newer_marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "untouched"
+        );
+        for table in [
+            "review_followup_assessments",
+            "review_followup_assessment_artifacts",
+        ] {
+            assert!(!c
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
         }
     }
 

@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 43). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 44). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -615,6 +615,42 @@ CREATE TABLE IF NOT EXISTS review_followup_artifacts (
             ELSE 0
         END
     )
+);
+
+-- v44: dormant follow-up assessment storage. The aggregate is unique by
+-- semantic scope; `active` is an explicit per-target authority sentinel. No
+-- daemon or planner path consumes these rows until the final activation task.
+CREATE TABLE IF NOT EXISTS review_followup_assessments (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    target                TEXT NOT NULL,
+    scope_kind            TEXT NOT NULL CHECK(scope_kind IN ('task', 'graph')),
+    scope_id              INTEGER NOT NULL CHECK(scope_id > 0),
+    source_task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    state                 TEXT NOT NULL CHECK(state IN (
+                              'pending', 'planning', 'provider-backoff', 'held', 'completed')),
+    active                INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    proposal_attempts     INTEGER NOT NULL DEFAULT 0 CHECK(proposal_attempts >= 0),
+    provider_failures     INTEGER NOT NULL DEFAULT 0 CHECK(provider_failures >= 0),
+    planner_provider      TEXT,
+    planner_model         TEXT,
+    planner_assignment_id INTEGER REFERENCES role_assignments(id),
+    base_sha              TEXT,
+    hold_code             TEXT,
+    hold_summary          TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE(scope_kind, scope_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_followup_assessment
+    ON review_followup_assessments(target) WHERE active = 1;
+
+-- Membership is immutable once materialized. The artifact-level UNIQUE is
+-- separate from the composite primary key so one artifact cannot participate
+-- in two different assessments.
+CREATE TABLE IF NOT EXISTS review_followup_assessment_artifacts (
+    assessment_id INTEGER NOT NULL REFERENCES review_followup_assessments(id),
+    artifact_id   INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),
+    PRIMARY KEY (assessment_id, artifact_id)
 );
 
 -- v24 (#127): durable post-merge collector retry queue. Each row is a pending
