@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 44;
+pub const SCHEMA_VERSION: i64 = 45;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -657,9 +657,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 [],
             )?;
         }
-        // v44 adds dormant follow-up assessment aggregates and immutable
-        // artifact membership via SCHEMA_SQL. No runtime path reads or writes
-        // the new tables before the later activation migration.
+        // v44 adds dormant follow-up assessment aggregates and artifact
+        // membership via SCHEMA_SQL. v45 adds counter-bound and membership-
+        // immutability triggers, also via SCHEMA_SQL. The guarded core write
+        // APIs remain dormant until later daemon activation work.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1229,6 +1230,98 @@ mod tests {
             [],
         )
         .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn populated_v44_migration_makes_existing_membership_immutable_and_bounds_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v44-assessment-guards.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER review_followup_membership_no_update;
+                 DROP TRIGGER review_followup_membership_no_delete;
+                 DROP TRIGGER review_followup_assessment_counter_insert_bound;
+                 DROP TRIGGER review_followup_assessment_counter_update_bound;
+                 INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'source','done','owner',1,1);
+                 INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (100,1,1,'followups-v1',1,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                     id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                         '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);
+                 INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     proposal_attempts,provider_failures,created_at,updated_at)
+                 VALUES (21,'followup:task:1','task',1,1,'pending',0,2,1,2,2);
+                 INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (21,11);
+                 PRAGMA user_version=44;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state,proposal_attempts,provider_failures,
+                        (SELECT artifact_id FROM review_followup_assessment_artifacts
+                         WHERE assessment_id=21)
+                 FROM review_followup_assessments WHERE id=21",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                )),
+            )
+            .unwrap(),
+            ("pending".into(), 2, 1, 11)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='trigger' AND name IN (
+                     'review_followup_membership_no_update',
+                     'review_followup_membership_no_delete',
+                     'review_followup_assessment_counter_insert_bound',
+                     'review_followup_assessment_counter_update_bound')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            4
+        );
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessment_artifacts
+                 SET artifact_id=12 WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM review_followup_assessment_artifacts WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET proposal_attempts=4 WHERE id=21",
+                [],
+            )
+            .is_err());
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),

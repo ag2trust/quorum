@@ -24,15 +24,17 @@ pub enum Operation {
     CancelSourceGraph,
     ApplyGraphEvent,
     ClaimCleanup,
+    MaterializeAssessment,
 }
 
 impl Operation {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::CancelSourceGraph,
         Self::ApplyGraphEvent,
         Self::ClaimCleanup,
+        Self::MaterializeAssessment,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -42,6 +44,7 @@ impl Operation {
             Self::CancelSourceGraph => "cancel-source-graph",
             Self::ApplyGraphEvent => "apply-graph-event",
             Self::ClaimCleanup => "claim-cleanup",
+            Self::MaterializeAssessment => "materialize-assessment",
         }
     }
 }
@@ -122,6 +125,18 @@ pub struct ApplyGraphEventInput {
 #[serde(deny_unknown_fields)]
 pub struct ClaimCleanupInput {
     pub db_path: PathBuf,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeAssessmentInput {
+    pub db_path: PathBuf,
+    pub scope_kind: String,
+    pub scope_id: i64,
+    pub source_task_id: i64,
+    pub artifact_ids: Vec<i64>,
     pub now: i64,
     pub barrier: Barrier,
 }

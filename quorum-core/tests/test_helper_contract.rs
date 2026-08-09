@@ -4,8 +4,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use support::protocol::{
     AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
-    MAX_INPUT_BYTES,
+    ClaimTaskInput, GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL,
+    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -17,6 +17,19 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
          VALUES (1,'allocation target','open','owner',1,1),
                 (999,'event target','merging','owner',1,1)",
         [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "INSERT INTO review_followup_batches(
+             pr_number,task_id,source_task_id,collector_version,
+             artifact_count,state,created_at,updated_at)
+         VALUES (100,1,1,'followups-v1',1,'collected',1,1);
+         INSERT INTO review_followup_artifacts(
+             id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+             non_blocking_reason,affected_behavior,desired_outcome,
+             verification_expectations,evidence_ids,created_at,updated_at)
+         VALUES (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                 '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);",
     )
     .unwrap();
     (dir, path)
@@ -96,13 +109,29 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
             support::run(
                 Operation::ClaimCleanup,
                 &ClaimCleanupInput {
-                    db_path,
+                    db_path: db_path.clone(),
                     now: 10,
                     barrier: open_barrier(dir.path(), "cleanup"),
                 },
             )
             .unwrap(),
             EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::MaterializeAssessment,
+                &MaterializeAssessmentInput {
+                    db_path,
+                    scope_kind: "task".into(),
+                    scope_id: 1,
+                    source_task_id: 1,
+                    artifact_ids: vec![11],
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "assessment"),
+                },
+            )
+            .unwrap(),
+            EXIT_SUCCESS,
         ),
     ];
 
