@@ -1,6 +1,11 @@
 //! Deterministic production-path coverage for mixed provider lifecycle routing.
 
+mod common;
+
+use common::{wait_until, WaitState};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
@@ -67,7 +72,8 @@ if [ "$1" = "exec" ]; then
   printf '{"type":"turn.started"}\n'
   printf '{"type":"item.completed","item":{"id":"i","type":"agent_message","text":"done"}}\n'
   printf '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}\n'
-  sleep 30
+  printf 'hold-pid|%s\n' "$$" >> "$RUNNER_LOG"
+  read -r _ < "/dev/fd/$RUNNER_HOLD_FD" || true
 else
   while IFS= read -r line; do
     printf '{"type":"assistant","message":{"content":"done"}}\n'
@@ -85,11 +91,29 @@ fi
     path
 }
 
+fn runner_hold_pipe() -> (File, File) {
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+
+    // The daemon and every provider process inherit only the read end. The
+    // fixture retains the close-on-exec writer, so dropping the ServeHandle
+    // broadcasts EOF to every sticky fake provider without a timer.
+    let writer_flags = unsafe { libc::fcntl(fds[1], libc::F_GETFD) };
+    assert_ne!(writer_flags, -1);
+    assert_ne!(
+        unsafe { libc::fcntl(fds[1], libc::F_SETFD, writer_flags | libc::FD_CLOEXEC) },
+        -1
+    );
+
+    unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+}
+
 struct ServeHandle {
     child: std::process::Child,
     rx: mpsc::Receiver<String>,
     lines: Vec<String>,
     _sentinel: tempfile::TempDir,
+    runner_hold_writer: Option<File>,
 }
 
 impl Drop for ServeHandle {
@@ -98,10 +122,15 @@ impl Drop for ServeHandle {
             unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL) };
             let _ = self.child.wait();
         }
+        self.release_runner_hold();
     }
 }
 
 impl ServeHandle {
+    fn release_runner_hold(&mut self) {
+        drop(self.runner_hold_writer.take());
+    }
+
     fn wait_for(&mut self, needle: &str) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while std::time::Instant::now() < deadline {
@@ -135,17 +164,20 @@ impl ServeHandle {
     fn stop(mut self) {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
         assert!(self.child.wait().unwrap().success());
+        self.release_runner_hold();
     }
 
     fn stop_mut(&mut self) {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGINT) };
         assert!(self.child.wait().unwrap().success());
+        self.release_runner_hold();
     }
 
     fn crash_mut(&mut self) {
         unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGKILL) };
         let status = self.child.wait().unwrap();
         assert!(!status.success());
+        self.release_runner_hold();
     }
 }
 
@@ -357,11 +389,13 @@ fi
         }
         let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", gh_shim.path().display());
         let sentinel = tempfile::tempdir().unwrap();
+        let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &runner_log)
+            .env("RUNNER_HOLD_FD", runner_hold_reader.as_raw_fd().to_string())
             .env("PATH", path)
             .env("QUORUM_TEST_GH_STATE", &gh_state)
             .env("QUORUM_TEST_REPO", repo.path())
@@ -417,12 +451,43 @@ fi
                 rx,
                 lines: Vec::new(),
                 _sentinel: sentinel,
+                runner_hold_writer: Some(runner_hold_writer),
             },
         }
     }
 
     fn db(&self) -> rusqlite::Connection {
         quorum_core::db::open(&self.home.path().join("repos/test__repo/quorum.db")).unwrap()
+    }
+
+    /// Wait until the daemon has completed at least one full scheduling tick.
+    ///
+    /// A single mailbox marker is observed in Phase 2, before reviewer and
+    /// worker provisioning. Appending the second marker only after the first
+    /// is consumed forces it into a later tick, proving that every phase of
+    /// the prior tick ran without relying on its 500ms cadence.
+    fn wait_for_completed_tick(&mut self) {
+        for marker in ["ProviderLifecycleTick0", "ProviderLifecycleTick1"] {
+            let mut conn = self.db();
+            quorum_core::mailbox::append(
+                &mut conn,
+                &quorum_core::mailbox::MailboxRow {
+                    agent: marker.into(),
+                    kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                    task_id: None,
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: Some("readiness barrier".into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            drop(conn);
+            self.handle
+                .wait_for(&format!("consuming unmatched task_update from {marker}"));
+        }
     }
 
     fn restart(&mut self, default_provider: &str, model: &str) {
@@ -459,11 +524,13 @@ fi
             .unwrap_or_else(|| routing_config(default_provider, model));
         std::fs::write(&config_path, &config_contents).unwrap();
         let sentinel = tempfile::tempdir().unwrap();
+        let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
         let mut serve = Command::new(cargo_bin("quorum"));
         serve
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &self.runner_log)
+            .env("RUNNER_HOLD_FD", runner_hold_reader.as_raw_fd().to_string())
             .env(
                 "PATH",
                 format!(
@@ -519,6 +586,7 @@ fi
             rx,
             lines: Vec::new(),
             _sentinel: sentinel,
+            runner_hold_writer: Some(runner_hold_writer),
         };
     }
 
@@ -759,6 +827,42 @@ fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {
         !gh_calls.lines().any(|line| line.starts_with("pr create")
             || (line.starts_with("pr list") && line.contains("--head"))),
         "continuation publication must never enter initial-PR routing: {gh_calls}"
+    );
+}
+
+#[test]
+fn dropping_serve_handle_releases_sticky_codex_runner() {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    case.handle.wait_for("turn");
+
+    let runner_pid = wait_until("sticky Codex runner PID", Duration::from_secs(5), || {
+        let log = std::fs::read_to_string(&case.runner_log).unwrap();
+        match log.lines().find_map(|line| {
+            line.strip_prefix("hold-pid|")
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+        }) {
+            Some(pid) => WaitState::Ready(pid),
+            None => WaitState::Pending(log),
+        }
+    });
+    assert_eq!(unsafe { libc::kill(runner_pid, 0) }, 0);
+
+    // Implicit fixture teardown hard-kills only the daemon. Closing the
+    // fixture-owned hold pipe must also let the provider process exit.
+    drop(case);
+    wait_until(
+        "sticky Codex runner cleanup after ServeHandle drop",
+        Duration::from_secs(5),
+        || {
+            if unsafe { libc::kill(runner_pid, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                WaitState::Ready(())
+            } else {
+                WaitState::Pending(format!("runner PID {runner_pid} is still alive"))
+            }
+        },
     );
 }
 
@@ -1213,7 +1317,7 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
         ],
     );
     case.handle.wait_for("PARKED: task #1");
-    std::thread::sleep(Duration::from_millis(500));
+    case.wait_for_completed_tick();
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
@@ -1615,7 +1719,7 @@ fn drain_park_of_remediation_stays_owner_gated_on_restart() {
     let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     case.restart_after_stop("claude", "claude-opus-4-6", None);
     case.handle.wait_for("recovery: complete");
-    std::thread::sleep(Duration::from_millis(750));
+    case.wait_for_completed_tick();
     let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     assert_eq!(
         runner_log_after_restart, runner_log_before_restart,
@@ -1713,7 +1817,6 @@ fn remediation_retry_for_implementation_task_preserves_feedback_and_codex_thread
         ],
     );
     case.handle.wait_for("PARKED: task #1");
-    std::thread::sleep(Duration::from_millis(250));
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
@@ -1851,7 +1954,7 @@ fn strict_codex_restart_does_not_resume_interrupted_claude_reviewer() {
     let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     case.restart_with_role_config("codex", "gpt-5.6-terra", Some(CHATGPT_ONLY_ROLE_CONFIG));
     case.handle.wait_for("recovery: complete");
-    std::thread::sleep(Duration::from_millis(750));
+    case.wait_for_completed_tick();
 
     let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
     assert_eq!(
