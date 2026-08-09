@@ -59,7 +59,7 @@ pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<Classificat
             revision: task.revision,
             // `TaskForClassification` is a struct (not a map), so serde emits
             // a stable field order.  Keep the entire bounded prompt input,
-            // including dependency titles/statuses and recovery notes, in the
+            // including stable dependency context and recovery notes, in the
             // identity rather than relying on generic `updated_at`.
             fingerprint: serde_json::to_string(task)
                 .expect("TaskForClassification always serializes"),
@@ -154,7 +154,7 @@ fn enrich_task(
     )?;
     if let Some(deps) = deps {
         let mut stmt = conn.prepare(
-            "SELECT id, substr(title, 1, ?2), status FROM tasks
+            "SELECT id, substr(title, 1, ?2) FROM tasks
              WHERE id IN (SELECT value FROM json_each(?1))
              ORDER BY id LIMIT ?3",
         )?;
@@ -167,10 +167,9 @@ fn enrich_task(
                 ],
                 |r| {
                     Ok(format!(
-                        "#{} {} ({})",
+                        "#{} {}",
                         r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?
+                        r.get::<_, String>(1)?
                     ))
                 },
             )?
@@ -609,7 +608,7 @@ pub fn build_prompt_with_recommendations(
         prompt.push('\n');
         if !t.dependencies.is_empty() {
             prompt.push_str(&format!(
-                "**Dependencies:** {}\n",
+                "**Dependencies (scheduler-enforced assumptions):** {}\n",
                 t.dependencies
                     .iter()
                     .take(DEPENDENCY_LIMIT)
@@ -665,7 +664,7 @@ The active daemon's operational routing policy for these levels is:
 {recommendations}
 This is not a cross-vendor benchmark and does not change the required output.
 2. **size**: execution surface only: S focused/local; M bounded coherent work; L broad cross-component coherent delivery; XL compound work needing decomposition. Do not estimate human time.
-3. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. If false, provide a concrete **not_ready_reason**; if true, it must be null.
+3. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
 4. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
 
 You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
@@ -769,7 +768,7 @@ mod tests {
             revision: 1,
             title: "Fix bug".into(),
             body: Some("Fix the thing".into()),
-            dependencies: vec![],
+            dependencies: vec!["#3 Establish prerequisite".into()],
             recovery_notes: vec![],
         }];
         let ctx = vec![TaskForClassification {
@@ -783,6 +782,8 @@ mod tests {
         let prompt = build_prompt(&tasks, &ctx);
         assert!(prompt.contains("Task #1"));
         assert!(prompt.contains("Fix bug"));
+        assert!(prompt.contains("Dependencies (scheduler-enforced assumptions)"));
+        assert!(prompt.contains("#3 Establish prerequisite"));
         assert!(prompt.contains("#2: Other task"));
     }
 
@@ -880,6 +881,29 @@ mod tests {
         .unwrap()
     }
 
+    fn create_dependent_task(
+        conn: &mut rusqlite::Connection,
+        title: &str,
+        body: &str,
+        dependency: i64,
+        seq: i64,
+    ) -> i64 {
+        let dependencies = serde_json::json!([dependency]).to_string();
+        crate::tasks::create(
+            conn,
+            "test-agent",
+            title,
+            Some(body),
+            5,
+            None,
+            None,
+            Some(&dependencies),
+            None,
+            1_000_000 + seq,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn store_and_query_classification() {
         let (_dir, mut conn) = open_tmp();
@@ -907,6 +931,139 @@ mod tests {
             .unwrap()
             .notes;
         assert_eq!(notes.len(), 0);
+    }
+
+    #[test]
+    fn ready_classification_with_open_dependency_remains_dependency_gated() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "Establish stable prerequisite", 1);
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Implement the dependent behavior",
+            "Observed: behavior is absent. Expected: add the specified behavior and focused regression coverage.",
+            dependency,
+            2,
+        );
+
+        assert_eq!(
+            store_classifications(&mut conn, &[classified(task_id, 3)], "test:v2", 2_000_000,)
+                .unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["cx_ready"], true);
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_001)
+                .unwrap()
+                .is_none(),
+            "open dependency must remain the scheduling authority"
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_001],
+        )
+        .unwrap();
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_002)
+                .unwrap()
+                .is_some(),
+            "completed dependency must release the already-ready task"
+        );
+    }
+
+    #[test]
+    fn dependency_lifecycle_changes_do_not_stale_or_invalidate_classification() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "Produce prerequisite outcome", 1);
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Consume prerequisite outcome",
+            "Use the prerequisite outcome to implement the fully specified consumer behavior.",
+            dependency,
+            2,
+        );
+
+        let before_task = unclassified_tasks(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        assert_eq!(
+            before_task.dependencies,
+            vec![format!("#{dependency} Produce prerequisite outcome")]
+        );
+        let before = classification_inputs(std::slice::from_ref(&before_task));
+
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_000],
+        )
+        .unwrap();
+        let after_task = unclassified_tasks(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .unwrap();
+        let after = classification_inputs(std::slice::from_ref(&after_task));
+        assert_eq!(before[0].fingerprint, after[0].fingerprint);
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &before,
+                "test:v2",
+                2_000_000,
+            )
+            .unwrap(),
+            1,
+            "dependency completion during a classifier turn must not stale its result"
+        );
+
+        conn.execute(
+            "UPDATE tasks SET status='open', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_001],
+        )
+        .unwrap();
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(crate::tasks::classification_is_complete(&task.refs));
+        assert!(!unclassified_tasks(&conn)
+            .unwrap()
+            .iter()
+            .any(|task| task.id == task_id));
+    }
+
+    #[test]
+    fn ambiguous_task_with_done_dependency_remains_not_ready() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "Finished prerequisite", 1);
+        conn.execute(
+            "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+            params![dependency, 2_000_000],
+        )
+        .unwrap();
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Change product behavior",
+            "Change the behavior, but no desired outcome or decision is specified.",
+            dependency,
+            2,
+        );
+        let reason = "desired product behavior is not specified";
+        let mut result = classified(task_id, 2);
+        result.ready = false;
+        result.not_ready_reason = Some(reason.into());
+
+        assert_eq!(
+            store_classifications(&mut conn, &[result], "test:v2", 2_000_000).unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["cx_ready"], false);
+        assert_eq!(refs["cx_not_ready_reason"], reason);
+        assert_eq!(task.status, "failed");
     }
 
     #[test]
@@ -1700,5 +1857,10 @@ mod redesigned_tests {
         let p = classifier_rubric("");
         assert!(p.contains("closed-book"));
         assert!(p.contains("Never reject merely because files"));
+        assert!(p.contains("Declared dependencies are scheduler-enforced assumptions"));
+        assert!(p.contains(
+            "never return ready=false merely because a dependency is currently incomplete"
+        ));
+        assert!(p.contains("intended outcome cannot be determined"));
     }
 }
