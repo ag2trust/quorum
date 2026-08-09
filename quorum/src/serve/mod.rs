@@ -1137,7 +1137,11 @@ async fn load_publication_pr_baseline(
 fn existing_pr_lease_baseline<'a>(
     intent: &'a PublicationIntent,
     target: &PrTarget,
+    base_branch: &str,
 ) -> std::result::Result<Option<&'a str>, String> {
+    if target.state.as_deref() != Some("OPEN") {
+        return Err(format!("PR #{} is not open", target.pr));
+    }
     if target.is_fork {
         return Err(format!(
             "PR #{} is a fork head; daemon has no supported safe push mechanism",
@@ -1148,6 +1152,12 @@ fn existing_pr_lease_baseline<'a>(
         return Err(format!(
             "PR #{} head branch changed: expected {}, got {}",
             target.pr, intent.branch, target.head_ref
+        ));
+    }
+    if target.base_ref.as_deref() != Some(base_branch) {
+        return Err(format!(
+            "PR #{} targets base {:?}, expected {base_branch}",
+            target.pr, target.base_ref
         ));
     }
     if target.head_sha == intent.local_sha {
@@ -1273,7 +1283,9 @@ async fn publish_worker_completion(
                 source_sha: intent.local_sha,
             });
         }
-        let Some(expected_remote_sha) = existing_pr_lease_baseline(&intent, &target)? else {
+        let Some(expected_remote_sha) =
+            existing_pr_lease_baseline(&intent, &target, &config.base_branch)?
+        else {
             intent.stage = "verified".into();
             persist_publication_intent(&config.db_path, task_id, &intent).await?;
             return Ok(PublishedCompletion {
@@ -1543,10 +1555,10 @@ fn continuation_worker_context(
 ) -> String {
     let merge_state = match base_merge {
         ContinuationBaseMerge::Clean => format!(
-            "The daemon already ran `git merge --no-edit origin/{base_branch}` in this worktree and the merge completed cleanly."
+            "The daemon already ran `git merge --ff --no-edit origin/{base_branch}` in this worktree and the merge completed cleanly."
         ),
         ContinuationBaseMerge::Conflicted => format!(
-            "The daemon already started `git merge --no-edit origin/{base_branch}` in this worktree, and it is still in progress because of conflicts. Resolve every conflict, stage the resolutions, and commit the merge before doing the remaining task work. Do not abort the prepared merge."
+            "The daemon already started `git merge --ff --no-edit origin/{base_branch}` in this worktree, and it is still in progress because of conflicts. Resolve every conflict, stage the resolutions, and commit the merge before doing the remaining task work. Do not abort the prepared merge."
         ),
     };
     format!(
@@ -16316,7 +16328,7 @@ mod tests {
             state: Some("OPEN".into()),
         };
         let clean = continuation_worker_context(&target, "main", ContinuationBaseMerge::Clean);
-        assert!(clean.contains("git merge --no-edit origin/main"));
+        assert!(clean.contains("git merge --ff --no-edit origin/main"));
         assert!(clean.contains("Never rebase, squash-rebuild"));
         assert!(clean.contains("must remain an ancestor"));
 
@@ -16426,29 +16438,40 @@ mod tests {
             state: Some("OPEN".into()),
         };
         assert_eq!(
-            existing_pr_lease_baseline(&intent, &target).unwrap(),
+            existing_pr_lease_baseline(&intent, &target, "main").unwrap(),
             Some("spawn-x")
         );
 
         target.head_sha = "source-a".into();
         assert_eq!(
-            existing_pr_lease_baseline(&intent, &target).unwrap(),
+            existing_pr_lease_baseline(&intent, &target, "main").unwrap(),
             None,
             "a crash after the exact source landed must recover idempotently"
         );
         let mut legacy_intent = intent.clone();
         legacy_intent.expected_remote_sha = None;
         assert_eq!(
-            existing_pr_lease_baseline(&legacy_intent, &target).unwrap(),
+            existing_pr_lease_baseline(&legacy_intent, &target, "main").unwrap(),
             None,
             "missing historical baseline is safe only when the source already landed"
         );
 
+        target.base_ref = Some("develop".into());
+        assert!(existing_pr_lease_baseline(&intent, &target, "main")
+            .unwrap_err()
+            .contains("targets base"));
+        target.base_ref = Some("main".into());
+        target.state = Some("CLOSED".into());
+        assert!(existing_pr_lease_baseline(&intent, &target, "main")
+            .unwrap_err()
+            .contains("not open"));
+        target.state = Some("OPEN".into());
+
         target.head_sha = "unrelated-b".into();
-        let error = existing_pr_lease_baseline(&intent, &target)
+        let error = existing_pr_lease_baseline(&intent, &target, "main")
             .expect_err("a pre-resolution or retry-window writer must be preserved");
         assert!(error.contains("outside publication lease"));
-        assert!(existing_pr_lease_baseline(&legacy_intent, &target)
+        assert!(existing_pr_lease_baseline(&legacy_intent, &target, "main")
             .unwrap_err()
             .contains("no durable spawn-time"));
     }

@@ -570,15 +570,17 @@ only through an explicit outside request)
   the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal
   ownership, and persists its exact head branch and SHA. The daemon checks out and verifies
   that exact commit, then merges the freshly fetched configured base into the continuation
-  branch before worker launch. Git completes a clean integration (creating a merge commit when
-  histories diverge); a conflicting merge remains in progress for the worker to resolve and
-  commit. This preserves the recorded PR head as an ancestor so later publication is
+  branch before worker launch. The daemon explicitly overrides `merge.ff=only` for this operation;
+  Git completes a clean integration (creating a merge commit when histories diverge), while a
+  conflicting merge remains in progress for the worker to resolve and commit. This preserves the
+  recorded PR head as an ancestor so later publication is
   fast-forward-only. The daemon supplies the configured base identity at the push boundary, and
   the publication gate attributes sessions only to commits reachable from the proposed tip but
   from neither the recorded PR head nor that freshly fetched base; inherited base commits do not
-  become worker-owned. Publication targets only that branch under the recorded SHA lease.
-  Ownership ambiguity, closure,
-  branch replacement, or SHA movement fails closed; Quorum neither rebases onto the new
+  become worker-owned. Before publication, the daemon revalidates the live PR as open and still
+  targeting the configured base, then targets only its recorded branch under the recorded SHA
+  lease. Ownership ambiguity, closure, base retargeting, branch replacement, or SHA movement fails
+  closed; Quorum neither rebases onto the new
   head nor silently falls back to fresh implementation or a new PR. Existing same-task
   rework continues through the established PR association and does not create a new entry.
 - **Entry authority:** task creators select exactly one of fresh implementation (neither

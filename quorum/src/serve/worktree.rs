@@ -636,7 +636,11 @@ impl WorktreeManager {
 
         let base_ref = format!("origin/{base_branch}");
         let mut merge = self.git_cmd(worktree_dir);
-        merge.args(["merge", "--no-edit", &base_ref]);
+        // Repository policy may set merge.ff=only. Explicit --ff restores
+        // normal merge behavior for this daemon-owned integration: Git may
+        // fast-forward when possible, but divergent clean histories still
+        // produce the ancestry-preserving merge commit required here.
+        merge.args(["merge", "--ff", "--no-edit", &base_ref]);
         let merged = run_git(merge, self.local_timeout, "git merge continuation base").await?;
         if merged.status.success() {
             return Ok(ContinuationBaseMerge::Clean);
@@ -2400,6 +2404,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, bare) = init_repo_with_bare_remote(tmp.path());
         add_continuation_fixture_files(&repo);
+        assert!(git_output(&repo, &["config", "merge.ff", "only"])
+            .status
+            .success());
         let pr_head = "fix/clean-continuation";
 
         assert!(git_output(&repo, &["checkout", "-b", "develop"])
@@ -2473,6 +2480,18 @@ mod tests {
                 .expect("clean base integration"),
             ContinuationBaseMerge::Clean
         );
+        let merge_head = git_rev_parse(&worktree, "HEAD");
+        let merge_parents = git_output(&worktree, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert!(merge_parents.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&merge_parents.stdout)
+                .split_whitespace()
+                .count(),
+            3,
+            "a divergent clean continuation must retain both parents even with merge.ff=only"
+        );
+        assert_ne!(merge_head, remote_pr_head);
+        assert_ne!(merge_head, base_head);
         std::fs::write(worktree.join("worker.txt"), "worker continuation\n").unwrap();
         assert!(git_output(&worktree, &["add", "worker.txt"])
             .status

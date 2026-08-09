@@ -134,7 +134,7 @@ elif [ "$cmd" = "pr view" ]; then
   if [ -z "$sha" ]; then
     sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
