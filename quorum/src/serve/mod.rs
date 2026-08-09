@@ -5016,7 +5016,7 @@ async fn reconcile_remediation_retries(
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
             let conn = quorum_core::db::open(&p)?;
-            Ok(tasks::list(&conn, Some("rework"), None, None)?
+            Ok(tasks::list_dependency_ready_rework(&conn)?
                 .into_iter()
                 .filter(|task| {
                     tasks::classification_is_dispatchable(&task.refs)
