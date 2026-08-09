@@ -112,7 +112,7 @@ pub fn classify_graph_assessment(
                 member.task_id,member.status,member.pr_number,
                 run.task_id,run.status,run.collector_version,
                 batch.task_id,batch.graph_id,batch.source_task_id,
-                batch.collector_version,batch.artifact_count,batch.state,
+                batch.artifact_count,batch.state,
                 artifact.id,artifact.disposition,
                 assessment.id,membership.assessment_id
          FROM graph_scope graph
@@ -150,8 +150,8 @@ pub fn classify_graph_assessment(
         let graph_state: String = row.get(2)?;
         let source_status: String = row.get(3)?;
         graph.get_or_insert((source_task_id, graph_state, source_status));
-        assessment_exists |= row.get::<_, Option<i64>>(18)?.is_some();
-        membership_exists |= row.get::<_, Option<i64>>(19)?.is_some();
+        assessment_exists |= row.get::<_, Option<i64>>(17)?.is_some();
+        membership_exists |= row.get::<_, Option<i64>>(18)?.is_some();
 
         let Some(child_id) = row.get::<_, Option<i64>>(4)? else {
             continue;
@@ -164,9 +164,8 @@ pub fn classify_graph_assessment(
         let batch_task_id: Option<i64> = row.get(10)?;
         let batch_graph_id: Option<i64> = row.get(11)?;
         let batch_source_task_id: Option<i64> = row.get(12)?;
-        let batch_version: Option<String> = row.get(13)?;
-        let batch_count: Option<i64> = row.get(14)?;
-        let batch_state: Option<String> = row.get(15)?;
+        let batch_count: Option<i64> = row.get(13)?;
+        let batch_state: Option<String> = row.get(14)?;
         let expected_artifacts = batch_count
             .map(|count| {
                 usize::try_from(count).map_err(|_| {
@@ -186,7 +185,6 @@ pub fn classify_graph_assessment(
             && batch_task_id == Some(child_id)
             && batch_graph_id == Some(graph_id)
             && batch_source_task_id == Some(source_task_id)
-            && batch_version.as_deref() == Some(collector_version)
             && expected_artifacts.is_some();
 
         let child = children.entry(child_id).or_insert_with(|| ChildRead {
@@ -197,7 +195,7 @@ pub fn classify_graph_assessment(
             expected_artifacts,
             actual_artifacts: 0,
         });
-        let artifact_id: Option<i64> = row.get(16)?;
+        let artifact_id: Option<i64> = row.get(15)?;
         if let Some(artifact_id) = artifact_id {
             if artifact_id <= 0 || !artifact_ids.insert(artifact_id) {
                 return Err(QuorumError::Usage(
@@ -205,7 +203,7 @@ pub fn classify_graph_assessment(
                 ));
             }
             child.actual_artifacts += 1;
-            if row.get::<_, Option<String>>(17)?.is_none() {
+            if row.get::<_, Option<String>>(16)?.is_none() {
                 unresolved_ids.insert(artifact_id);
             }
         }
@@ -604,6 +602,55 @@ mod tests {
                 "case {setup}"
             );
         }
+    }
+
+    #[test]
+    fn immutable_batch_version_is_provenance_after_current_generation_run_advances() {
+        let (_dir, mut connection) = database();
+        let (graph_id, source_id, child_ids) = graph(
+            &connection,
+            "completed",
+            &[ChildSpec {
+                status: "done",
+                pr_number: Some(136),
+            }],
+        );
+        interpreted(
+            &mut connection,
+            graph_id,
+            source_id,
+            child_ids[0],
+            136,
+            1,
+            "followups-v1",
+        );
+        connection
+            .execute(
+                "UPDATE review_collection_runs
+                 SET collector_version='followups-v2',attempted_at=20,completed_at=21
+                 WHERE pr_number=136",
+                [],
+            )
+            .unwrap();
+
+        let scope = eligible_scope(
+            classify_graph_assessment(&connection, graph_id, "followups-v2").unwrap(),
+        );
+
+        assert_eq!(scope.graph_id(), graph_id);
+        assert_eq!(scope.artifact_ids().len(), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT collector_version FROM review_followup_batches
+                     WHERE pr_number=136",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "followups-v1",
+            "the absent-only batch version remains immutable provenance"
+        );
     }
 
     #[test]
