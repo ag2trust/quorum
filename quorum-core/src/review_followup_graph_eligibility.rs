@@ -4,7 +4,7 @@
 //! their immutable follow-up artifacts into the accepted terminal graph and
 //! returns only a classification; it creates no assessment or membership rows.
 
-use crate::decomposition::MAX_CHILDREN;
+use crate::decomposition::{MAX_CHILDREN, MIN_CHILDREN};
 use crate::error::{QuorumError, Result};
 use crate::review_followups::{MAX_FOLLOWUP_ARTIFACTS, MAX_FOLLOWUP_TEXT_BYTES};
 use rusqlite::{params, Connection};
@@ -92,7 +92,11 @@ pub fn classify_graph_assessment(
     let mut statement = conn.prepare(
         "WITH graph_scope AS (
              SELECT graph.id,graph.source_task_id,graph.state,
-                    graph.accepted_plan_revision,source.status AS source_status
+                    graph.accepted_plan_revision,source.status AS source_status,
+                    (SELECT count(*) FROM task_graph_members member
+                     WHERE member.graph_id=graph.id
+                       AND member.plan_revision=graph.accepted_plan_revision)
+                      AS accepted_member_count
              FROM task_decompositions graph
              JOIN tasks source ON source.id=graph.source_task_id
              WHERE graph.id=?1
@@ -114,7 +118,8 @@ pub fn classify_graph_assessment(
                 batch.task_id,batch.graph_id,batch.source_task_id,
                 batch.artifact_count,batch.state,
                 artifact.id,artifact.disposition,
-                assessment.id,membership.assessment_id
+                assessment.id,membership.assessment_id,
+                graph.accepted_member_count
          FROM graph_scope graph
          LEFT JOIN accepted_members member ON member.graph_id=graph.id
          LEFT JOIN review_collection_runs run
@@ -149,6 +154,14 @@ pub fn classify_graph_assessment(
         let source_task_id: i64 = row.get(1)?;
         let graph_state: String = row.get(2)?;
         let source_status: String = row.get(3)?;
+        let accepted_member_count = usize::try_from(row.get::<_, i64>(19)?).map_err(|_| {
+            QuorumError::Usage("stored follow-up graph member count is invalid".into())
+        })?;
+        if !(MIN_CHILDREN..=MAX_CHILDREN).contains(&accepted_member_count) {
+            return Err(QuorumError::Usage(
+                "stored follow-up graph must have 2 to 8 accepted members".into(),
+            ));
+        }
         graph.get_or_insert((source_task_id, graph_state, source_status));
         assessment_exists |= row.get::<_, Option<i64>>(17)?.is_some();
         membership_exists |= row.get::<_, Option<i64>>(18)?.is_some();
@@ -506,10 +519,16 @@ mod tests {
         let (graph_id, _, _) = graph(
             &connection,
             "cancelled",
-            &[ChildSpec {
-                status: "cancelled",
-                pr_number: None,
-            }],
+            &[
+                ChildSpec {
+                    status: "cancelled",
+                    pr_number: None,
+                },
+                ChildSpec {
+                    status: "cancelled",
+                    pr_number: None,
+                },
+            ],
         );
         assert_eq!(
             classify_graph_assessment(&connection, graph_id, CURRENT_VERSION).unwrap(),
@@ -523,10 +542,16 @@ mod tests {
         let (active_graph, _, _) = graph(
             &connection,
             "active",
-            &[ChildSpec {
-                status: "done",
-                pr_number: Some(121),
-            }],
+            &[
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(121),
+                },
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(122),
+                },
+            ],
         );
         assert_eq!(
             classify_graph_assessment(&connection, active_graph, CURRENT_VERSION).unwrap(),
@@ -537,15 +562,63 @@ mod tests {
         let (missing_pr_graph, _, _) = graph(
             &connection,
             "completed",
-            &[ChildSpec {
-                status: "done",
-                pr_number: None,
-            }],
+            &[
+                ChildSpec {
+                    status: "done",
+                    pr_number: None,
+                },
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(123),
+                },
+            ],
         );
         assert_eq!(
             classify_graph_assessment(&connection, missing_pr_graph, CURRENT_VERSION).unwrap(),
             GraphAssessmentEligibility::Ineligible
         );
+    }
+
+    #[test]
+    fn terminal_graphs_with_invalid_accepted_member_counts_fail_closed() {
+        let undersized = [ChildSpec {
+            status: "done",
+            pr_number: Some(125),
+        }];
+        let oversized = (0..=MAX_CHILDREN)
+            .map(|ordinal| ChildSpec {
+                status: "done",
+                pr_number: Some(130 + ordinal as i64),
+            })
+            .collect::<Vec<_>>();
+
+        for (case, children) in [
+            ("undersized", undersized.as_slice()),
+            ("oversized", oversized.as_slice()),
+        ] {
+            let (_dir, mut connection) = database();
+            let (graph_id, source_id, child_ids) = graph(&connection, "completed", children);
+            for (child, child_id) in children.iter().zip(child_ids) {
+                interpreted(
+                    &mut connection,
+                    graph_id,
+                    source_id,
+                    child_id,
+                    child.pr_number.unwrap(),
+                    0,
+                    CURRENT_VERSION,
+                );
+            }
+
+            assert!(
+                matches!(
+                    classify_graph_assessment(&connection, graph_id, CURRENT_VERSION),
+                    Err(QuorumError::Usage(message))
+                        if message == "stored follow-up graph must have 2 to 8 accepted members"
+                ),
+                "case {case}"
+            );
+        }
     }
 
     #[test]
@@ -555,10 +628,16 @@ mod tests {
             let (graph_id, source_id, child_ids) = graph(
                 &connection,
                 "completed",
-                &[ChildSpec {
-                    status: "done",
-                    pr_number: Some(131),
-                }],
+                &[
+                    ChildSpec {
+                        status: "done",
+                        pr_number: Some(131),
+                    },
+                    ChildSpec {
+                        status: "done",
+                        pr_number: Some(132),
+                    },
+                ],
             );
             match setup {
                 "missing-run" => {}
@@ -610,10 +689,16 @@ mod tests {
         let (graph_id, source_id, child_ids) = graph(
             &connection,
             "completed",
-            &[ChildSpec {
-                status: "done",
-                pr_number: Some(136),
-            }],
+            &[
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(136),
+                },
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(137),
+                },
+            ],
         );
         interpreted(
             &mut connection,
@@ -623,6 +708,15 @@ mod tests {
             136,
             1,
             "followups-v1",
+        );
+        interpreted(
+            &mut connection,
+            graph_id,
+            source_id,
+            child_ids[1],
+            137,
+            0,
+            "followups-v2",
         );
         connection
             .execute(
@@ -659,10 +753,16 @@ mod tests {
         let (graph_id, source_id, child_ids) = graph(
             &connection,
             "completed",
-            &[ChildSpec {
-                status: "done",
-                pr_number: Some(141),
-            }],
+            &[
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(141),
+                },
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(142),
+                },
+            ],
         );
         interpreted(
             &mut connection,
@@ -670,6 +770,15 @@ mod tests {
             source_id,
             child_ids[0],
             141,
+            0,
+            CURRENT_VERSION,
+        );
+        interpreted(
+            &mut connection,
+            graph_id,
+            source_id,
+            child_ids[1],
+            142,
             0,
             CURRENT_VERSION,
         );
@@ -698,10 +807,16 @@ mod tests {
         let (graph_id, source_id, child_ids) = graph(
             &connection,
             "completed",
-            &[ChildSpec {
-                status: "done",
-                pr_number: Some(151),
-            }],
+            &[
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(151),
+                },
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(152),
+                },
+            ],
         );
         interpreted(
             &mut connection,
@@ -710,6 +825,15 @@ mod tests {
             child_ids[0],
             151,
             1,
+            CURRENT_VERSION,
+        );
+        interpreted(
+            &mut connection,
+            graph_id,
+            source_id,
+            child_ids[1],
+            152,
+            0,
             CURRENT_VERSION,
         );
         connection
