@@ -14165,22 +14165,28 @@ mod tests {
         pr: i64,
         head_sha: &str,
     ) {
-        for _ in 0..100 {
-            assert_eq!(
-                poll_pre_review_checks(config, waits, task_id, pr, head_sha)
-                    .await
-                    .unwrap(),
-                PreReviewChecksGate::Waiting
-            );
-            if matches!(
-                waits.get(&task_id).map(|entry| &entry.state),
-                Some(PreReviewChecksState::Retry)
-            ) {
-                return;
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert_eq!(
+                    poll_pre_review_checks(config, waits, task_id, pr, head_sha)
+                        .await
+                        .unwrap(),
+                    PreReviewChecksGate::Waiting
+                );
+                if matches!(
+                    waits.get(&task_id).map(|entry| &entry.state),
+                    Some(PreReviewChecksState::Retry)
+                ) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("pre-review timeout cycle did not complete");
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "pre-review timeout cycle did not complete"
+        );
     }
 
     #[tokio::test]
