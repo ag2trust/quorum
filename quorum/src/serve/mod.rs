@@ -3639,10 +3639,25 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
 }
 
 const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = 2048;
-// Keep each untrusted variable field bounded below the durable attempt ceiling so
-// a combined rejection always retains the later size and duplicate dimensions.
-const CHILD_REJECTION_REASON_MAX_BYTES: usize = 1024;
-const CHILD_REJECTION_DUPLICATES_MAX_BYTES: usize = 768;
+const MAX_PLANNED_CHILD_KEY_BYTES: usize = 64;
+const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 2;
+const CHILD_REJECTION_PREFIX_MAX_BYTES: usize =
+    "child ".len() + MAX_PLANNED_CHILD_KEY_BYTES + " rejected by preclassification: ".len();
+const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
+    "ready=false (not_ready_reason: ".len() + ")".len();
+const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
+const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
+const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
+// Keep the complete combined rejection within the planner retry-feedback
+// consumer's bound. Reserve fixed space for every dimension, then divide the
+// variable space between the readiness reason and duplicate task IDs.
+const CHILD_REJECTION_DUPLICATES_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES
+    - CHILD_REJECTION_PREFIX_MAX_BYTES
+    - CHILD_REJECTION_READY_WRAPPER_BYTES
+    - CHILD_REJECTION_REASON_MAX_BYTES
+    - CHILD_REJECTION_SIZE_MAX_BYTES
+    - CHILD_REJECTION_DUPLICATE_LABEL_BYTES
+    - CHILD_REJECTION_SEPARATORS_MAX_BYTES;
 
 fn bounded_with_ellipsis(value: &str, limit: usize) -> String {
     const ELLIPSIS: &str = "…";
@@ -3709,7 +3724,7 @@ fn child_preclassification_rejection(
         "child {task_key} rejected by preclassification: {}",
         failed_dimensions.join("; ")
     );
-    debug_assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+    debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
     Some(summary)
 }
 
@@ -18700,7 +18715,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_preclassification_rejection_rendering_stays_within_attempt_bounds() {
+    fn proposal_preclassification_rejection_rendering_survives_planner_retry_bounds() {
         let proposal = vec![planner::ProposedTask {
             key: "bounded-child".into(),
             title: "bounded child".into(),
@@ -18721,10 +18736,25 @@ mod tests {
 
         let summary = planned_children(&proposal, &classifications).unwrap_err();
         assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
         assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
         assert!(summary.contains("ready=false (not_ready_reason: é"));
         assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
         assert!(summary.ends_with("...]"), "{summary}");
+
+        let source = planner::PlanningSource {
+            task_id: 301,
+            revision: 1,
+            title: "source",
+            body: None,
+            dependencies: &[],
+        };
+        let retry_json = serde_json::to_string(&vec![summary.clone()]).unwrap();
+        let prompt = planner::build_prompt(&source, std::slice::from_ref(&summary));
+        assert!(
+            prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")),
+            "planner retry feedback altered the bounded rejection summary: {prompt}"
+        );
     }
 
     #[test]
