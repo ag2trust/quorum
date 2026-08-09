@@ -2662,6 +2662,29 @@ pub(crate) fn set_parked_refs(
     serde_json::to_string(&value).map_err(|e| QuorumError::Io(format!("serialize task refs: {e}")))
 }
 
+/// Record the owner-facing half of a terminal daemon park. Callers perform
+/// this in the same write transaction as the task, lease, note, and event
+/// changes so a park can never become visible without its failure alert.
+pub(crate) fn alert_owner_of_park(
+    conn: &Connection,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+         VALUES (?1, 'daemon', ?2, 'alert', ?3, ?4, ?5, 'owner')",
+        params![
+            now,
+            crate::feed::DEFAULT_TOPIC,
+            format!("task #{id}: {reason}; parked — resume with `quorum task-retry`"),
+            format!("task:{id}"),
+            now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+        ],
+    )?;
+    Ok(())
+}
+
 fn set_classifier_policy_parked_refs(
     refs: Option<&str>,
     reason: &str,
@@ -2777,6 +2800,7 @@ pub(crate) fn park_classified_task_tx(
         params![id, now, format!("parked: {effective_reason}")],
     )?;
     crate::events::emit(tx, "task_parked", &lease_target(id), &effective_reason, now)?;
+    alert_owner_of_park(tx, id, &effective_reason, now)?;
     Ok(true)
 }
 
@@ -2875,6 +2899,7 @@ pub(crate) fn park_complexity_five_tx(
         COMPLEXITY_FIVE_PARK_REASON,
         now,
     )?;
+    alert_owner_of_park(tx, id, COMPLEXITY_FIVE_PARK_REASON, now)?;
     Ok(true)
 }
 
@@ -2953,6 +2978,7 @@ pub fn park(
         params![id, now, format!("parked: {reason}")],
     )?;
     crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
+    alert_owner_of_park(&tx, id, reason, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -8045,6 +8071,45 @@ mod tests {
             serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 419);
         assert!(refs.get("daemon_parked").is_none());
+    }
+
+    #[test]
+    fn daemon_owned_push_rejection_park_alerts_owner() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        let reason = "daemon-owned push rejected: worker signaled unbound PR #10; daemon creates initial PRs";
+
+        park(&mut conn, task_id, reason, "open", 11)
+            .unwrap()
+            .expect("active task must park");
+
+        let alert: (String, String, String, String, i64, String) = conn
+            .query_row(
+                "SELECT author, kind, body, refs, expires_at, recipient
+                 FROM messages WHERE refs=?1",
+                params![format!("task:{task_id}")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("push-rejection park must alert the owner");
+        assert_eq!(alert.0, "daemon");
+        assert_eq!(alert.1, "alert");
+        assert!(alert.2.contains(reason));
+        assert!(alert.2.contains("quorum task-retry"));
+        assert_eq!(alert.3, format!("task:{task_id}"));
+        assert_eq!(alert.4, 11 + crate::feed::DEFAULT_MESSAGE_TTL_SECS);
+        assert_eq!(alert.5, "owner");
     }
 
     #[test]
