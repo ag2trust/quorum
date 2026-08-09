@@ -31,6 +31,13 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 pub fn apply_pragmas(conn: &Connection) -> Result<()> {
     // busy_timeout MUST be first so every subsequent lock acquisition honors it.
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    apply_persistent_pragmas(conn)
+}
+
+/// Apply the PRAGMAs that follow `busy_timeout`. Kept separate so open can
+/// perform its read-only schema compatibility check before the persistent WAL
+/// switch without moving that check ahead of the mandatory timeout.
+fn apply_persistent_pragmas(conn: &Connection) -> Result<()> {
     set_journal_wal(conn)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
@@ -100,11 +107,14 @@ pub struct MigrateResult {
     pub schema_version: i64,
 }
 
-/// Open the store at `path`, applying PRAGMAs and running migrations. The returned
-/// connection is ready for use.
+/// Open the store at `path`, refusing an unsupported newer schema before applying
+/// any persistent PRAGMA, then applying PRAGMAs and running migrations. The
+/// returned connection is ready for use.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    ensure_schema_supported(&conn)?;
+    apply_persistent_pragmas(&conn)?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -112,9 +122,27 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Like [`open`], but also returns the migration outcome so callers can report what changed.
 pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    ensure_schema_supported(&conn)?;
+    apply_persistent_pragmas(&conn)?;
     let info = migrate(&conn)?;
     Ok((conn, info))
+}
+
+/// Read the on-disk version and reject unsupported schemas without changing
+/// connection or database state. This must run before
+/// [`apply_persistent_pragmas`]: switching `journal_mode` to WAL is persistent
+/// and would otherwise mutate a newer database that this binary has no
+/// authority to open.
+fn ensure_schema_supported(conn: &Connection) -> Result<i64> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(QuorumError::SchemaTooNew {
+            db: current,
+            bin: SCHEMA_VERSION,
+        });
+    }
+    Ok(current)
 }
 
 /// Bring the on-disk schema up to [`SCHEMA_VERSION`].
@@ -122,13 +150,7 @@ pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
 /// Forward-only and idempotent. Runs under `BEGIN IMMEDIATE` so concurrent first-runs are
 /// safe. Refuses (fails loud) if the DB was written by a newer binary.
 pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if current > SCHEMA_VERSION {
-        return Err(QuorumError::SchemaTooNew {
-            db: current,
-            bin: SCHEMA_VERSION,
-        });
-    }
+    let current = ensure_schema_supported(conn)?;
     if current == SCHEMA_VERSION {
         return Ok(MigrateResult {
             migrated_from: current,
@@ -2034,7 +2056,13 @@ mod tests {
                 SCHEMA_VERSION + 1
             ))
             .unwrap();
+            assert_eq!(
+                c.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "delete"
+            );
         }
+        let bytes_before = std::fs::read(&p).unwrap();
         match open(&p) {
             Err(QuorumError::SchemaTooNew { db, bin }) => {
                 assert_eq!(db, SCHEMA_VERSION + 1);
@@ -2042,7 +2070,18 @@ mod tests {
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            bytes_before,
+            "newer-schema refusal must not modify the database file"
+        );
         let c = Connection::open(&p).unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete",
+            "newer-schema refusal must not persistently switch journal mode"
+        );
         assert_eq!(
             c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
