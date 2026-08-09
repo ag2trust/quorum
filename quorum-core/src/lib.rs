@@ -37,6 +37,7 @@ pub mod provision_attempts;
 pub mod review_audits;
 pub mod review_findings;
 pub mod review_followup_assessments;
+pub mod review_followup_graph_eligibility;
 pub mod review_followup_reads;
 pub mod review_followup_writes;
 pub mod review_followups;
