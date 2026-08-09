@@ -3494,6 +3494,26 @@ pub fn list(
     Ok(tasks)
 }
 
+/// List rework tasks whose dependencies satisfy the same SQL eligibility
+/// predicate used by remediation claims. Durable remediation reconciliation
+/// uses this read before provisioning so dependency-blocked retries retain
+/// their marker without repeatedly attempting a claim.
+pub fn list_dependency_ready_rework(conn: &Connection) -> Result<Vec<Task>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM tasks
+         WHERE status='rework' AND {DEP_READY_CLAUSE}
+         ORDER BY priority DESC, id ASC"
+    ))?;
+    let mut tasks: Vec<Task> = stmt
+        .query_map([], row_to_task)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The SQL predicate above is authoritative for every returned row.
+    for task in &mut tasks {
+        task.ready = true;
+    }
+    Ok(tasks)
+}
+
 /// Minimal, cursor-bounded input for publication-ref reconciliation.
 ///
 /// Tasks never expire, so every daemon-created task-scoped ref has a task row.
@@ -8224,6 +8244,85 @@ mod tests {
             .unwrap()
             .expect("done dependency must allow provider retry rework claim");
         assert_eq!(claimed.id, task_id);
+    }
+
+    #[test]
+    fn dependency_ready_rework_listing_defers_retained_remediation_retry() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create(
+            &mut conn,
+            "owner",
+            "dependency",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        let dependencies = format!("[{dependency}]");
+        let task_id = create(
+            &mut conn,
+            "owner",
+            "retained remediation retry",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null}"#),
+            Some(&dependencies),
+            None,
+            11,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework' WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+        assert!(
+            retain_blocked_remediation_retry(&mut conn, task_id, "fix the blocker", 12).unwrap()
+        );
+
+        assert!(
+            list_dependency_ready_rework(&conn)
+                .unwrap()
+                .into_iter()
+                .all(|task| task.id != task_id),
+            "the retry scan must not select a dependency-blocked task"
+        );
+        let blocked = get(&conn, task_id).unwrap().unwrap();
+        let blocked_refs: serde_json::Value =
+            serde_json::from_str(blocked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(blocked_refs[PARKED_REWORK_RETRY_REF], true);
+        assert_eq!(blocked_refs["remediation_feedback"], "fix the blocker");
+        let claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1",
+                params![lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 0, "the scan must not attempt a remediation claim");
+
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?1",
+            params![dependency],
+        )
+        .unwrap();
+        let selected = list_dependency_ready_rework(&conn).unwrap();
+        assert!(selected.iter().any(|task| task.id == task_id));
+        assert!(claim_remediation_rework_with_feedback(
+            &mut conn,
+            "replacement",
+            task_id,
+            TTL,
+            13,
+            Some("fix the blocker"),
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
