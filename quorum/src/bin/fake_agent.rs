@@ -140,7 +140,8 @@ fn emit_collector_result(fail: bool) {
                     "addressed_status": "unaddressed",
                     "evidence": [{"kind": "issue_comment", "id": 202}]
                 }
-            ]
+            ],
+            "followup_artifacts": []
         });
         (serde_json::Value::String(findings.to_string()), false)
     };

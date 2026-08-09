@@ -342,6 +342,11 @@ pub struct CollectorInputs {
     pub reviews_json: String,
     pub review_comments_json: String,
     pub issue_comments_json: String,
+    /// Deterministic evidence index captured before bounded prompt truncation.
+    /// `None` keeps hand-built/legacy inputs compatible with validation that
+    /// derives IDs directly from their JSON payloads.
+    #[serde(skip)]
+    pub fetched_evidence: Option<Vec<EvidenceId>>,
     pub commits_json: String,
     pub checks_summary: String,
     pub diff_stat: String,
@@ -447,6 +452,24 @@ Fields per finding:
    objects. Include at least one; use the GitHub numeric `id` field from the raw
    comment/review JSON above. Threaded replies count as separate evidence rows.
 
+Also emit a `followup_artifacts` entry for each concrete, evidence-backed
+non-blocking concern that remains valid after merge. Every artifact must share
+at least one evidence row with a `suggestion` finding above. Do not emit an
+artifact for a finding that was fixed, withdrawn, or accepted as invalid.
+
+Fields per follow-up artifact:
+
+1. `technical_impact` — `"critical" | "major" | "minor" | "nit"`.
+2. `scope_relationship` — `"pre_existing" | "out_of_scope" |
+   "threat_model_expansion" | "defense_in_depth" | "future_requirement" |
+   "design_debt"`.
+3. `concern` — the concrete failure under stated assumptions.
+4. `non_blocking_reason` — why the merged PR did not need to resolve it.
+5. `affected_behavior` — the affected product behavior.
+6. `desired_outcome` — an observable future outcome, not a vague improvement.
+7. `verification_expectations` — one through eight concrete checks.
+8. `evidence` — one or more unique GitHub evidence rows, all present above.
+
 ## Output
 
 Respond with ONLY a JSON object:
@@ -456,12 +479,21 @@ Respond with ONLY a JSON object:
    "severity":"major","text":"...","source_endpoint":"pulls",
    "addressed_status":"addressed",
    "evidence":[{{"kind":"review_comment","id":12345}}]}}
+],"followup_artifacts":[
+  {{"technical_impact":"major","scope_relationship":"out_of_scope",
+   "concern":"Concrete failure under the stated assumptions",
+   "non_blocking_reason":"Why the merged PR did not need to resolve it",
+   "affected_behavior":"Product behavior affected by the concern",
+   "desired_outcome":"Observable future outcome",
+   "verification_expectations":["Evidence that proves the outcome"],
+   "evidence":[{{"kind":"review_comment","id":12345}}]}}
 ]}}
 ```
 
 If the PR has no substantive reviewer findings (only bot noise, "LGTM", or merge
-notifications), return `{{"findings":[]}}`. Do NOT invent findings. Do NOT wrap the
-JSON in prose."#,
+notifications), return `{{"findings":[],"followup_artifacts":[]}}`. A PR may have
+findings and still have zero valid artifacts. Do NOT invent findings or artifacts.
+Do NOT wrap the JSON in prose."#,
         pr = inputs.pr_number,
         meta = inputs.pr_metadata_json,
         diff = inputs.diff_stat,
@@ -488,6 +520,7 @@ pub fn build_prompt(
         reviews_json: "[]".into(),
         review_comments_json: pulls_comments_json.to_string(),
         issue_comments_json: issues_comments_json.to_string(),
+        fetched_evidence: None,
         commits_json: "[]".into(),
         checks_summary: "unknown".into(),
         diff_stat: "unknown".into(),
@@ -891,6 +924,7 @@ mod tests {
             reviews_json: r#"[{"id":1,"state":"APPROVED"}]"#.into(),
             review_comments_json: r#"[{"id":10,"in_reply_to_id":null}]"#.into(),
             issue_comments_json: r#"[{"id":20,"body":"nit"}]"#.into(),
+            fetched_evidence: None,
             commits_json: r#"[{"sha":"deadbeef"}]"#.into(),
             checks_summary: "all-passed".into(),
             diff_stat: "3 files, 20 additions".into(),
@@ -932,5 +966,8 @@ mod tests {
         assert!(prompt.contains("Alpha"));
         assert!(prompt.contains("addressed_status"));
         assert!(prompt.contains("evidence"));
+        assert!(prompt.contains("followup_artifacts"));
+        assert!(prompt.contains("technical_impact"));
+        assert!(prompt.contains("scope_relationship"));
     }
 }
