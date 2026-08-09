@@ -138,10 +138,86 @@ PATH="$BIN:$PATH" git push -q origin \
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
 [ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
 
+# A continuation prepared by the daemon merges the advanced base into the
+# exact published PR head. Multiple sessions inherited from main must not be
+# attributed to the continuation worker.
+git switch -q main
+printf 'base session A\n' > inherited-a
+git add inherited-a
+git commit -qm 'advance base from session A' \
+  -m 'Co-Authored-By: Base-A <base-a@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin main
+printf 'base session B\n' > inherited-b
+git add inherited-b
+git commit -qm 'advance base from session B' \
+  -m 'Co-Authored-By: Base-B <base-b@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin main
+
+git switch -q --detach "$WORKER_B_SHA"
+git switch -qc daemon/inherited-base-continuation-t6
+git merge -q --no-ff origin/main -m 'merge advanced main into continuation'
+printf 'continuation worker\n' >> remediation
+git commit -qam 'finish ancestry-preserving continuation' \
+  -m 'Co-Authored-By: Continue-Worker <continue-worker@example.invalid>'
+CONTINUATION_HEAD_SHA=$(git rev-parse HEAD)
+PATH="$BIN:$PATH" git push -q origin \
+  "$CONTINUATION_HEAD_SHA:refs/heads/daemon/continuation-t3"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
+[ "$REMOTE_SHA" = "$CONTINUATION_HEAD_SHA" ]
+
+# The daemon supports repositories configured with a non-main base. Seed an
+# existing PR head on develop, advance that base with two inherited sessions,
+# and prove the daemon-supplied base identity reaches the real hook.
+git switch -q --detach origin/develop
+git switch -qc daemon/develop-pr-source-t8
+printf 'develop PR\n' > develop-remediation
+git add develop-remediation
+git commit -qm 'develop PR head' \
+  -m 'Co-Authored-By: Develop-Worker <develop-worker@example.invalid>'
+DEVELOP_PR_HEAD=$(git rev-parse HEAD)
+git --git-dir="$REMOTE" fetch -q "$REPO" \
+  "$DEVELOP_PR_HEAD:refs/heads/daemon/develop-continuation-t8"
+
+git switch -q develop
+printf 'develop base A\n' > develop-inherited-a
+git add develop-inherited-a
+git commit -qm 'advance develop from session A' \
+  -m 'Co-Authored-By: Develop-Base-A <develop-base-a@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin develop
+printf 'develop base B\n' > develop-inherited-b
+git add develop-inherited-b
+git commit -qm 'advance develop from session B' \
+  -m 'Co-Authored-By: Develop-Base-B <develop-base-b@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin develop
+
+git switch -q --detach "$DEVELOP_PR_HEAD"
+git switch -qc daemon/develop-continuation-worker-t9
+git merge -q --no-ff origin/develop -m 'merge configured develop base'
+printf 'develop continuation worker\n' >> develop-remediation
+git commit -qam 'finish develop continuation' \
+  -m 'Co-Authored-By: Develop-Continue <develop-continue@example.invalid>'
+DEVELOP_CONTINUATION_SHA=$(git rev-parse HEAD)
+if PATH="$BIN:$PATH" git push -q origin \
+  "$DEVELOP_CONTINUATION_SHA:refs/heads/daemon/develop-continuation-t8" \
+  >"$TMP/develop-default-base.out" 2>&1; then
+  echo 'expected main-default continuation attribution to reject develop history' >&2
+  exit 1
+fi
+grep -q 'sessions in branch-owned commits' "$TMP/develop-default-base.out"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
+  refs/heads/daemon/develop-continuation-t8)
+[ "$REMOTE_SHA" = "$DEVELOP_PR_HEAD" ]
+
+QUORUM_CONTINUATION_BASE_BRANCH=develop PATH="$BIN:$PATH" git push -q origin \
+  "$DEVELOP_CONTINUATION_SHA:refs/heads/daemon/develop-continuation-t8"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
+  refs/heads/daemon/develop-continuation-t8)
+[ "$REMOTE_SHA" = "$DEVELOP_CONTINUATION_SHA" ]
+
 # Continuations only exempt already-published history. Multiple new worker
 # sessions after the authoritative remote tip remain genuine stacking.
-git switch -q --detach "$WORKER_B_SHA"
-git switch -qc daemon/stacked-continuation-t6
+git switch -q --detach "$CONTINUATION_HEAD_SHA"
+git switch -qc daemon/stacked-continuation-t7
 printf 'continue A\n' >> remediation
 git commit -qam 'first continuation session' \
   -m 'Co-Authored-By: Continue-A <continue-a@example.invalid>'
@@ -157,7 +233,7 @@ if PATH="$BIN:$PATH" git push -q origin \
 fi
 grep -q 'sessions in branch-owned commits' "$TMP/stacked-continuation.out"
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
-[ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+[ "$REMOTE_SHA" = "$CONTINUATION_HEAD_SHA" ]
 
 # Supported non-publication pushes keep their existing shapes. Formatting is
 # still mandatory, but branch/session policy is irrelevant to tags and the
@@ -180,10 +256,10 @@ if git --git-dir="$REMOTE" rev-parse --verify -q \
 fi
 
 PATH="$BIN:$PATH" git push --atomic -q origin \
-  "$WORKER_B_SHA:refs/heads/quorum-cleanup/preflight-t3" \
+  "$CONTINUATION_HEAD_SHA:refs/heads/quorum-cleanup/preflight-t3" \
   ':refs/heads/daemon/continuation-t3'
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/quorum-cleanup/preflight-t3)
-[ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+[ "$REMOTE_SHA" = "$CONTINUATION_HEAD_SHA" ]
 if git --git-dir="$REMOTE" rev-parse --verify -q \
   refs/heads/daemon/continuation-t3 >/dev/null; then
   echo 'cleanup transaction did not delete the publication branch' >&2
@@ -200,10 +276,10 @@ fi
 # If the publication branch is already absent, production records cleanup by
 # creating only the tombstone ref. That single-ref sibling must also settle.
 PATH="$BIN:$PATH" git push -q origin \
-  "$WORKER_B_SHA:refs/heads/quorum-cleanup/preflight-absent-t3"
+  "$CONTINUATION_HEAD_SHA:refs/heads/quorum-cleanup/preflight-absent-t3"
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
   refs/heads/quorum-cleanup/preflight-absent-t3)
-[ "$REMOTE_SHA" = "$WORKER_B_SHA" ]
+[ "$REMOTE_SHA" = "$CONTINUATION_HEAD_SHA" ]
 PATH="$BIN:$PATH" git push -q origin \
   ':refs/heads/quorum-cleanup/preflight-absent-t3'
 if git --git-dir="$REMOTE" rev-parse --verify -q \

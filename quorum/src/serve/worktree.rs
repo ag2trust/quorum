@@ -19,6 +19,12 @@ pub struct WorktreeManager {
     local_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationBaseMerge {
+    Clean,
+    Conflicted,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublicationRefReconcileResult {
     pub kept: usize,
@@ -604,6 +610,69 @@ impl WorktreeManager {
         Ok(wt_path)
     }
 
+    /// Refresh and merge the configured base into an exact continuation PR
+    /// checkout. A content conflict is a prepared worker state, not a setup
+    /// failure: Git leaves `MERGE_HEAD` plus the index/worktree conflicts for
+    /// the worker to resolve. Every other non-zero merge result fails loud.
+    pub async fn integrate_continuation_base(
+        &self,
+        worktree_dir: &Path,
+        base_branch: &str,
+    ) -> Result<ContinuationBaseMerge, String> {
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{base_branch}");
+        let tracking_ref = format!("refs/remotes/origin/{base_branch}");
+        let refspec = format!("+{remote_ref}:{tracking_ref}");
+
+        let mut fetch = self.git_cmd(worktree_dir);
+        fetch.args(["fetch", "origin", &refspec]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch continuation base").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                String::from_utf8_lossy(&fetched.stderr)
+            ));
+        }
+
+        let base_ref = format!("origin/{base_branch}");
+        let mut merge = self.git_cmd(worktree_dir);
+        // Repository policy may set merge.ff=only. Explicit --ff restores
+        // normal merge behavior for this daemon-owned integration: Git may
+        // fast-forward when possible, but divergent clean histories still
+        // produce the ancestry-preserving merge commit required here.
+        merge.args(["merge", "--ff", "--no-edit", &base_ref]);
+        let merged = run_git(merge, self.local_timeout, "git merge continuation base").await?;
+        if merged.status.success() {
+            return Ok(ContinuationBaseMerge::Clean);
+        }
+
+        let mut merge_head = self.git_cmd(worktree_dir);
+        merge_head.args(["rev-parse", "--verify", "MERGE_HEAD"]);
+        let merge_head = run_git(
+            merge_head,
+            self.local_timeout,
+            "git verify continuation merge conflict",
+        )
+        .await?;
+        let mut conflicts = self.git_cmd(worktree_dir);
+        conflicts.args(["diff", "--name-only", "--diff-filter=U"]);
+        let conflicts = run_git(
+            conflicts,
+            self.local_timeout,
+            "git list continuation merge conflicts",
+        )
+        .await?;
+        if merge_head.status.success() && conflicts.status.success() && !conflicts.stdout.is_empty()
+        {
+            Ok(ContinuationBaseMerge::Conflicted)
+        } else {
+            Err(format!(
+                "git merge {base_ref} failed without leaving a resolvable merge: {}",
+                String::from_utf8_lossy(&merged.stderr)
+            ))
+        }
+    }
+
     /// Fetch a PR head via `refs/pull/<pr>/head` and provision a worktree.
     /// Works for both same-repo and fork PRs (GitHub exposes this ref
     /// regardless of head repository).
@@ -823,6 +892,7 @@ impl WorktreeManager {
         remote_branch: &str,
         expected_remote_sha: &str,
         source_sha: &str,
+        base_branch: &str,
     ) -> Result<String, String> {
         let _guard = self.lock.lock().await;
         let remote_ref = format!("refs/heads/{remote_branch}");
@@ -876,7 +946,8 @@ impl WorktreeManager {
 
         let refspec = format!("{source_sha}:{remote_ref}");
         let lease = format!("--force-with-lease={remote_ref}:{expected_remote_sha}");
-        let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        let mut push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        push.env("QUORUM_CONTINUATION_BASE_BRANCH", base_branch);
         let pushed = run_git(push, self.fetch_timeout, "git push PR head").await?;
         if !pushed.status.success() {
             let mut refresh = self.git_cmd(worktree_dir);
@@ -2282,6 +2353,309 @@ mod tests {
         cmd.output().unwrap()
     }
 
+    #[cfg(unix)]
+    fn install_repository_pre_push_hook(repo: &Path, base: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks = base.join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.githooks/pre-push");
+        let installed = hooks.join("pre-push");
+        std::fs::copy(&source, &installed)
+            .unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
+        std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(git_output(
+            repo,
+            &["config", "core.hooksPath", &hooks.to_string_lossy()]
+        )
+        .status
+        .success());
+    }
+
+    #[cfg(unix)]
+    fn add_continuation_fixture_files(repo: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let preflight = repo.join("preflight.sh");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../preflight.sh");
+        std::fs::copy(&source, &preflight)
+            .unwrap_or_else(|error| panic!("copy {}: {error}", source.display()));
+        std::fs::set_permissions(&preflight, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"continuation-hook-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn formatted() {}\n").unwrap();
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        assert!(git_output(repo, &["add", "."]).status.success());
+        assert!(git_output(repo, &["commit", "-m", "continuation fixture"])
+            .status
+            .success());
+        assert!(git_output(repo, &["push", "origin", "main"])
+            .status
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_clean_non_main_base_publishes_fast_forward_through_real_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        add_continuation_fixture_files(&repo);
+        assert!(git_output(&repo, &["config", "merge.ff", "only"])
+            .status
+            .success());
+        let pr_head = "fix/clean-continuation";
+
+        assert!(git_output(&repo, &["checkout", "-b", "develop"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["checkout", "-b", pr_head])
+            .status
+            .success());
+        std::fs::write(repo.join("feature.txt"), "feature\n").unwrap();
+        assert!(git_output(&repo, &["add", "feature.txt"]).status.success());
+        assert!(git_output(&repo, &["commit", "-m", "PR work"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", pr_head])
+            .status
+            .success());
+        let remote_pr_head = git_rev_parse(&repo, "HEAD");
+
+        assert!(git_output(&repo, &["checkout", "develop"]).status.success());
+        std::fs::write(repo.join("base-only-a.txt"), "advanced base A\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only-a.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base cleanly A",
+                "-m",
+                "Co-Authored-By: Base-A <base-a@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        std::fs::write(repo.join("base-only-b.txt"), "advanced base B\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only-b.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base cleanly B",
+                "-m",
+                "Co-Authored-By: Base-B <base-b@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
+        let base_head = git_rev_parse(&repo, "HEAD");
+
+        let mgr = WorktreeManager::new();
+        let worktree = tmp.path().join("clean-continuation-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Clean-t353", &worktree, pr_head)
+            .await
+            .expect("provision exact PR head");
+        mgr.verify_head_sha(&worktree, &remote_pr_head)
+            .await
+            .expect("verify exact PR head before integration");
+        assert_eq!(
+            mgr.integrate_continuation_base(&worktree, "develop")
+                .await
+                .expect("clean base integration"),
+            ContinuationBaseMerge::Clean
+        );
+        let merge_head = git_rev_parse(&worktree, "HEAD");
+        let merge_parents = git_output(&worktree, &["rev-list", "--parents", "-n", "1", "HEAD"]);
+        assert!(merge_parents.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&merge_parents.stdout)
+                .split_whitespace()
+                .count(),
+            3,
+            "a divergent clean continuation must retain both parents even with merge.ff=only"
+        );
+        assert_ne!(merge_head, remote_pr_head);
+        assert_ne!(merge_head, base_head);
+        std::fs::write(worktree.join("worker.txt"), "worker continuation\n").unwrap();
+        assert!(git_output(&worktree, &["add", "worker.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &worktree,
+            &[
+                "commit",
+                "-m",
+                "finish clean continuation",
+                "-m",
+                "Co-Authored-By: Continue-Worker <continue-worker@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        let integrated_head = git_rev_parse(&worktree, "HEAD");
+        for ancestor in [&remote_pr_head, &base_head] {
+            assert!(
+                git_output(
+                    &worktree,
+                    &["merge-base", "--is-ancestor", ancestor, &integrated_head]
+                )
+                .status
+                .success(),
+                "integrated continuation must contain {ancestor}"
+            );
+        }
+
+        install_repository_pre_push_hook(&repo, tmp.path());
+        mgr.disable_push(&worktree)
+            .await
+            .expect("worker push lockout");
+        mgr.push_to_pr_head(
+            &worktree,
+            pr_head,
+            &remote_pr_head,
+            &integrated_head,
+            "develop",
+        )
+        .await
+        .expect("daemon publication must pass the real ff-only pre-push hook");
+        assert_eq!(git_rev_parse(&bare, pr_head), integrated_head);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_conflict_remains_mergeable_and_publishes_through_real_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        add_continuation_fixture_files(&repo);
+        let pr_head = "fix/conflicting-continuation";
+
+        assert!(git_output(&repo, &["checkout", "-b", pr_head])
+            .status
+            .success());
+        std::fs::write(repo.join("shared.txt"), "PR version\n").unwrap();
+        assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
+        assert!(git_output(&repo, &["commit", "-m", "PR conflicting work"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", pr_head])
+            .status
+            .success());
+        let remote_pr_head = git_rev_parse(&repo, "HEAD");
+
+        assert!(git_output(&repo, &["checkout", "main"]).status.success());
+        std::fs::write(repo.join("base-only.txt"), "base session A\n").unwrap();
+        assert!(git_output(&repo, &["add", "base-only.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base session A",
+                "-m",
+                "Co-Authored-By: Base-A <base-a@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        std::fs::write(repo.join("shared.txt"), "base version\n").unwrap();
+        assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "advance base conflict",
+                "-m",
+                "Co-Authored-By: Base-B <base-b@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        assert!(git_output(&repo, &["push", "origin", "main"])
+            .status
+            .success());
+        let base_head = git_rev_parse(&repo, "HEAD");
+
+        let mgr = WorktreeManager::new();
+        let worktree = tmp.path().join("conflicting-continuation-wt");
+        mgr.fetch_and_provision(&repo, "remediation/Conflict-t353", &worktree, pr_head)
+            .await
+            .expect("provision exact PR head");
+        mgr.verify_head_sha(&worktree, &remote_pr_head)
+            .await
+            .expect("verify exact PR head before integration");
+        assert_eq!(
+            mgr.integrate_continuation_base(&worktree, "main")
+                .await
+                .expect("conflict is a prepared continuation state"),
+            ContinuationBaseMerge::Conflicted
+        );
+        assert_eq!(git_rev_parse(&worktree, "HEAD"), remote_pr_head);
+        assert_eq!(git_rev_parse(&worktree, "MERGE_HEAD"), base_head);
+        assert!(
+            !git_output(&worktree, &["diff", "--quiet", "--diff-filter=U"])
+                .status
+                .success(),
+            "prepared worktree must retain unresolved conflict state"
+        );
+
+        std::fs::write(worktree.join("shared.txt"), "resolved continuation\n").unwrap();
+        assert!(git_output(&worktree, &["add", "shared.txt"])
+            .status
+            .success());
+        assert!(git_output(
+            &worktree,
+            &[
+                "commit",
+                "-m",
+                "Merge origin/main into continuation",
+                "-m",
+                "Co-Authored-By: Continue-Worker <continue-worker@example.invalid>",
+            ]
+        )
+        .status
+        .success());
+        let resolved_head = git_rev_parse(&worktree, "HEAD");
+        for ancestor in [&remote_pr_head, &base_head] {
+            assert!(
+                git_output(
+                    &worktree,
+                    &["merge-base", "--is-ancestor", ancestor, &resolved_head]
+                )
+                .status
+                .success(),
+                "resolved merge must contain {ancestor}"
+            );
+        }
+
+        install_repository_pre_push_hook(&repo, tmp.path());
+        mgr.disable_push(&worktree)
+            .await
+            .expect("worker push lockout");
+        mgr.push_to_pr_head(&worktree, pr_head, &remote_pr_head, &resolved_head, "main")
+            .await
+            .expect("resolved conflict must publish without parking");
+        assert_eq!(git_rev_parse(&bare, pr_head), resolved_head);
+    }
+
     /// Regression (2026-07-29 mass rework burn): a PR head branch held in
     /// someone else's worktree must not block remediation provisioning. The
     /// daemon checks out a run-unique local name and only fetches the PR head.
@@ -2354,7 +2728,13 @@ mod tests {
         let source_sha = git_rev_parse(&wt_path, "HEAD");
 
         let result = mgr
-            .push_to_pr_head(&wt_path, pr_head, "not-the-authoritative-sha", &source_sha)
+            .push_to_pr_head(
+                &wt_path,
+                pr_head,
+                "not-the-authoritative-sha",
+                &source_sha,
+                "main",
+            )
             .await;
         assert!(
             result.is_err(),
@@ -2395,7 +2775,7 @@ mod tests {
         let mutable_head = git_rev_parse(&wt_path, "HEAD");
         assert_ne!(intent_sha, mutable_head);
 
-        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha)
+        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha, "main")
             .await
             .expect("exact durable source must publish");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
@@ -2460,7 +2840,7 @@ mod tests {
         let replacement_head = git_rev_parse(&retry_wt, "HEAD");
         assert_ne!(replacement_head, intent_sha);
 
-        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha)
+        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha, "main")
             .await
             .expect("task retry must replay the durable intent source");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
@@ -2608,7 +2988,7 @@ mod tests {
             WorktreeManager::with_config(shim, Duration::from_secs(10), Duration::from_secs(10));
         let source_sha = git_rev_parse(&wt_path, "HEAD");
         let result = mgr
-            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha)
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha, "main")
             .await;
         assert!(result.is_err(), "racing writer must defeat the lease");
         assert_eq!(
@@ -2752,7 +3132,7 @@ mod tests {
         );
 
         let pushed = mgr
-            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip)
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip, "main")
             .await
             .expect("daemon push must succeed");
         assert_eq!(pushed, new_tip);

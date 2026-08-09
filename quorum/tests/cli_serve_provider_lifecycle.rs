@@ -371,7 +371,15 @@ elif [ "$cmd" = "pr view" ]; then
   if [ -z "$sha" ]; then
     sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+  base=main
+  state=OPEN
+  if [ -f "$QUORUM_TEST_GH_STATE/base-$pr" ]; then
+    base="$(cat "$QUORUM_TEST_GH_STATE/base-$pr")"
+  fi
+  if [ -f "$QUORUM_TEST_GH_STATE/state-$pr" ]; then
+    state="$(cat "$QUORUM_TEST_GH_STATE/state-$pr")"
+  fi
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"%s"}\n' "$branch" "$sha" "$base" "$state"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -1040,6 +1048,87 @@ fn continuation_publication_rejects_a_head_moved_after_spawn() {
             || (line.starts_with("pr list") && line.contains("--head"))),
         "a lease failure must not fall back to initial publication: {gh_calls}"
     );
+}
+
+fn assert_continuation_publication_rejects_live_target_change(
+    metadata: &str,
+    value: &str,
+    expected_error: &str,
+) {
+    let mut case = Case::start_continue("codex", "gpt-5.6-terra", 10);
+    case.handle.wait_for("spawning agent");
+    let worker = case.handle.agent_after("spawning agent ");
+    case.handle.wait_for("turn");
+
+    let (worktree, baseline_sha) = {
+        let conn = case.db();
+        let worktree: String = conn
+            .query_row(
+                "SELECT worktree FROM journal WHERE agent=?1",
+                [&worker],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+        (worktree, target.head_sha)
+    };
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "continuation work",
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    std::fs::write(
+        case.gh_shim.path().join(format!("state/{metadata}-10")),
+        value,
+    )
+    .unwrap();
+    case.done(&worker, &[]);
+    case.handle.wait_for(expected_error);
+    case.handle.wait_for("PARKED: task #1");
+
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/continue-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(
+        remote_sha, baseline_sha,
+        "live PR metadata drift must prevent any remote update"
+    );
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+}
+
+#[test]
+fn continuation_publication_rejects_same_sha_base_retarget() {
+    assert_continuation_publication_rejects_live_target_change("base", "develop", "targets base");
+}
+
+#[test]
+fn continuation_publication_rejects_same_sha_closed_pr() {
+    assert_continuation_publication_rejects_live_target_change("state", "CLOSED", "is not open");
 }
 
 #[test]
