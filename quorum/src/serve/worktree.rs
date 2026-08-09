@@ -37,6 +37,18 @@ struct GitPipeOutput {
     exceeded_limit: bool,
 }
 
+/// Render captured git stderr only when it is safe to carry into a durable
+/// diagnostic. Git output is untrusted process output: replacement-decoding
+/// malformed bytes would make an operator believe the captured text was exact,
+/// and SQLite text must never receive an embedded NUL.
+fn git_stderr(stderr: &[u8]) -> String {
+    match std::str::from_utf8(stderr) {
+        Ok(value) if !value.contains('\0') => value.trim().to_string(),
+        Ok(_) => "git stderr rejected: contains embedded NUL".into(),
+        Err(_) => "git stderr rejected: invalid UTF-8".into(),
+    }
+}
+
 async fn drain_git_pipe<R>(
     mut pipe: R,
     limit: usize,
@@ -538,7 +550,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add (reuse branch) failed: {}",
-                    String::from_utf8_lossy(&add.stderr)
+                    git_stderr(&add.stderr)
                 ));
             }
         } else {
@@ -549,7 +561,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add failed: {}",
-                    String::from_utf8_lossy(&add.stderr)
+                    git_stderr(&add.stderr)
                 ));
             }
         }
@@ -573,7 +585,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {remote_branch} failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
+                git_stderr(&fetch.stderr)
             ));
         }
 
@@ -603,7 +615,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
+                git_stderr(&add.stderr)
             ));
         }
 
@@ -630,7 +642,7 @@ impl WorktreeManager {
         if !fetched.status.success() {
             return Err(format!(
                 "git fetch origin {remote_ref} failed: {}",
-                String::from_utf8_lossy(&fetched.stderr)
+                git_stderr(&fetched.stderr)
             ));
         }
 
@@ -668,7 +680,7 @@ impl WorktreeManager {
         } else {
             Err(format!(
                 "git merge {base_ref} failed without leaving a resolvable merge: {}",
-                String::from_utf8_lossy(&merged.stderr)
+                git_stderr(&merged.stderr)
             ))
         }
     }
@@ -692,7 +704,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {refspec} failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
+                git_stderr(&fetch.stderr)
             ));
         }
 
@@ -720,7 +732,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
+                git_stderr(&add.stderr)
             ));
         }
 
@@ -736,7 +748,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git config {} failed: {}",
                 args.join(" "),
-                String::from_utf8_lossy(&out.stderr)
+                git_stderr(&out.stderr)
             ));
         }
         Ok(())
@@ -776,7 +788,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --get core.worktree failed: {}",
-                    String::from_utf8_lossy(&worktree.stderr)
+                    git_stderr(&worktree.stderr)
                 ));
             }
         }
@@ -805,7 +817,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --bool --get core.bare failed: {}",
-                    String::from_utf8_lossy(&bare.stderr)
+                    git_stderr(&bare.stderr)
                 ));
             }
         }
@@ -849,7 +861,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                String::from_utf8_lossy(&out.stderr)
+                git_stderr(&out.stderr)
             ));
         }
         let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -869,7 +881,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                String::from_utf8_lossy(&out.stderr)
+                git_stderr(&out.stderr)
             ));
         }
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -2283,6 +2295,19 @@ mod tests {
         );
 
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
+    }
+
+    #[test]
+    fn captured_git_stderr_rejects_invalid_utf8_and_nul() {
+        assert_eq!(
+            git_stderr(b"fatal: cannot lock ref\0detail"),
+            "git stderr rejected: contains embedded NUL"
+        );
+        assert_eq!(
+            git_stderr(&[b'f', b'a', 0x80]),
+            "git stderr rejected: invalid UTF-8"
+        );
+        assert_eq!(git_stderr(b" fatal: missing ref\n"), "fatal: missing ref");
     }
 
     /// Repo with a real bare `origin` remote and `main` pushed. Returns
