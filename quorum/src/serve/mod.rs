@@ -73,6 +73,9 @@ const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
+/// One error row is enough for an operator to diagnose a failed provision;
+/// keep it safely below every downstream status/rendering limit.
+const MAX_PROVISIONING_CAUSE_BYTES: usize = 2048;
 
 #[derive(Debug, Clone)]
 enum ReviewRole {
@@ -3673,6 +3676,71 @@ fn bounded_with_ellipsis(value: &str, limit: usize) -> String {
     format!("{prefix}{ELLIPSIS}")
 }
 
+/// Produce text that is safe to retain in task state and the errors table.
+/// Git stderr reaches this boundary only after `worktree::git_stderr` rejects
+/// malformed UTF-8 and NUL bytes. Keep this defensive check for other
+/// provisioning errors, which may originate outside that subprocess boundary.
+fn bounded_provisioning_cause(cause: &str) -> String {
+    if cause.contains('\0') {
+        return "provisioning cause rejected: contains embedded NUL".into();
+    }
+    let cause = cause.trim();
+    if cause.is_empty() {
+        return "provisioning failed without a diagnostic".into();
+    }
+    bounded_with_ellipsis(cause, MAX_PROVISIONING_CAUSE_BYTES)
+}
+
+/// Add a cheap operational classification without attempting to turn every
+/// git diagnostic into a policy decision. The raw named cause remains intact;
+/// this prefix merely makes retry-versus-repair visible in `status`.
+fn classified_provisioning_cause(cause: &str) -> String {
+    let cause = bounded_provisioning_cause(cause);
+    if cause.starts_with("structural:") || cause.starts_with("transient:") {
+        return cause;
+    }
+    let lower = cause.to_ascii_lowercase();
+    let class = if lower.contains("branch collision")
+        || lower.contains("head-sha mismatch")
+        || lower.contains("couldn't find remote ref")
+        || lower.contains("not our ref")
+        || lower.contains("no such ref")
+        || lower.contains("no pushable remote")
+    {
+        "structural"
+    } else if lower.contains(".lock")
+        || lower.contains(" lock")
+        || lower.contains("git fetch")
+        || lower.contains("timed out")
+        || lower.contains("network")
+        || lower.contains("connection")
+    {
+        "transient"
+    } else {
+        "unknown"
+    };
+    bounded_provisioning_cause(&format!("{class}: {cause}"))
+}
+
+/// Append the concrete provision failure independently of the lifecycle
+/// transition. This is deliberately a short local write after all git I/O;
+/// failure to write telemetry must not alter the existing park/release flow.
+async fn persist_provisioning_failure(db_path: &Path, task_id: i64, detail: &str) {
+    let path = db_path.to_path_buf();
+    let detail = classified_provisioning_cause(detail);
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&path) {
+            quorum_core::errlog::log_error(
+                &conn,
+                now_unix(),
+                "provisioning",
+                &format!("task #{task_id}: {detail}"),
+            );
+        }
+    })
+    .await;
+}
+
 fn bounded_duplicate_ids(ids: &[i64], limit: usize) -> String {
     let mut rendered = String::from("[");
     for (index, id) in ids.iter().enumerate() {
@@ -5040,7 +5108,7 @@ async fn reconcile_ci_remediations(
             intent.pr,
             &intent.head_sha[..12.min(intent.head_sha.len())]
         ));
-        match spawn_remediation_worker(
+        let cause = match spawn_remediation_worker(
             config,
             wt_mgr,
             name_pool,
@@ -5053,8 +5121,17 @@ async fn reconcile_ci_remediations(
         .await?
         {
             RemediationSpawnOutcome::Spawned | RemediationSpawnOutcome::ClaimLost => continue,
-            RemediationSpawnOutcome::ProvisionFailed => {}
-        }
+            RemediationSpawnOutcome::ProvisionFailed { cause } => cause,
+        };
+        persist_provisioning_failure(
+            &config.db_path,
+            task_id,
+            &format!(
+                "CI remediation provisioning failed for PR #{}: {cause}",
+                intent.pr
+            ),
+        )
+        .await;
 
         let p = config.db_path.clone();
         let attempts = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
@@ -5075,7 +5152,7 @@ async fn reconcile_ci_remediations(
             ));
             if attempts >= MAX_CI_REMEDIATION_PROVISION_STRIKES {
                 let reason = format!(
-                    "CI remediation provisioning exhausted for PR #{} head {} after {attempts} attempts",
+                    "CI remediation provisioning exhausted for PR #{} head {} after {attempts} attempts: {cause}",
                     intent.pr,
                     &intent.head_sha[..12.min(intent.head_sha.len())]
                 );
@@ -5175,7 +5252,7 @@ async fn reconcile_remediation_retries(
             "durable remediation retry: provisioning task #{} on PR #{pr}",
             task.id
         ));
-        if spawn_remediation_worker(
+        let spawn_outcome = spawn_remediation_worker(
             config,
             wt_mgr,
             name_pool,
@@ -5185,10 +5262,9 @@ async fn reconcile_remediation_retries(
             pr,
             &feedback,
         )
-        .await?
-            == RemediationSpawnOutcome::ProvisionFailed
-        {
-            park_remediation_provision_failure(config, task.id, pr, &feedback).await;
+        .await?;
+        if let Some(cause) = spawn_outcome.provision_failure_cause() {
+            park_remediation_provision_failure(config, task.id, pr, &feedback, cause).await;
         }
     }
     Ok(())
@@ -6739,13 +6815,14 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await?;
-                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            if let Some(cause) = spawn_ok.provision_failure_cause()
                                             {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
+                                                    cause,
                                                 )
                                                 .await;
                                             }
@@ -7038,13 +7115,14 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await?;
-                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            if let Some(cause) = spawn_ok.provision_failure_cause()
                                             {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
+                                                    cause,
                                                 )
                                                 .await;
                                             }
@@ -7271,14 +7349,15 @@ async fn tick(
                                                     &rework_msg,
                                                 )
                                                 .await?;
-                                                if spawn_ok
-                                                    == RemediationSpawnOutcome::ProvisionFailed
+                                                if let Some(cause) =
+                                                    spawn_ok.provision_failure_cause()
                                                 {
                                                     park_remediation_provision_failure(
                                                         config,
                                                         reviewer_task_id,
                                                         pr_num,
                                                         &rework_msg,
+                                                        cause,
                                                     )
                                                     .await;
                                                 }
@@ -7629,13 +7708,14 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await?;
-                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            if let Some(cause) = spawn_ok.provision_failure_cause()
                                             {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
+                                                    cause,
                                                 )
                                                 .await;
                                             }
@@ -8037,14 +8117,15 @@ async fn tick(
                                                         &rework_msg,
                                                     )
                                                     .await?;
-                                                    if spawn_ok
-                                                        == RemediationSpawnOutcome::ProvisionFailed
+                                                    if let Some(cause) =
+                                                        spawn_ok.provision_failure_cause()
                                                     {
                                                         park_remediation_provision_failure(
                                                             config,
                                                             reviewer_task_id,
                                                             pr_num,
                                                             &rework_msg,
+                                                            cause,
                                                         )
                                                         .await;
                                                     }
@@ -8319,12 +8400,13 @@ async fn tick(
                                         feedback,
                                     )
                                     .await?;
-                                    if spawn_ok == RemediationSpawnOutcome::ProvisionFailed {
+                                    if let Some(cause) = spawn_ok.provision_failure_cause() {
                                         park_remediation_provision_failure(
                                             config,
                                             reviewer_task_id,
                                             rework_pr,
                                             feedback,
+                                            cause,
                                         )
                                         .await;
                                     }
@@ -12264,6 +12346,7 @@ async fn spawn_worker(
             Ok(target) => Some(target),
             Err(error) => {
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
                 name_pool.release(&agent_name);
                 return Ok(false);
@@ -12324,13 +12407,9 @@ async fn spawn_worker(
         let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
             Ok(sha) => sha,
             Err(error) => {
-                park_task(
-                    &db_path,
-                    task.id,
-                    &format!("branch provenance resolution failed: {error}"),
-                    "open",
-                )
-                .await;
+                let reason = format!("branch provenance resolution failed: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(&db_path, task.id, &reason, "open").await;
                 name_pool.release(&agent_name);
                 return Ok(false);
             }
@@ -12411,11 +12490,15 @@ async fn spawn_worker(
         }
         Err(e) => {
             log(&format!("worktree provision failed: {e}"));
-            if task.continue_pr.is_some() {
+            let cause = classified_provisioning_cause(&format!(
+                "initial worker worktree provisioning failed: {e}"
+            ));
+            persist_provisioning_failure(&db_path, task.id, &cause).await;
+            if let Some(pr) = task.continue_pr {
                 park_task(
                     &db_path,
                     task.id,
-                    &format!("continue PR worktree provisioning failed: {e}"),
+                    &format!("initial worker provisioning failed for continue PR #{pr}: {cause}"),
                     "open",
                 )
                 .await;
@@ -12426,7 +12509,7 @@ async fn spawn_worker(
             }
             let strikes = poison_tracker.record_strike(task.id);
             if strikes >= MAX_POISON_STRIKES {
-                poison_task(&db_path, &agent_name, task.id, strikes).await;
+                poison_task(&db_path, &agent_name, task.id, strikes, Some(&cause)).await;
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
@@ -12440,9 +12523,12 @@ async fn spawn_worker(
     // the daemon-owned publish boundary while preserving their read/fetch use.
     if let Err(e) = wt_mgr.disable_push(&wt_path).await {
         log(&format!("worker push lockout failed: {e}"));
+        let cause =
+            classified_provisioning_cause(&format!("initial worker push lockout failed: {e}"));
+        persist_provisioning_failure(&db_path, task.id, &cause).await;
         let strikes = poison_tracker.record_strike(task.id);
         if strikes >= MAX_POISON_STRIKES {
-            poison_task(&db_path, &agent_name, task.id, strikes).await;
+            poison_task(&db_path, &agent_name, task.id, strikes, Some(&cause)).await;
         } else {
             release_task(&db_path, &agent_name, task.id).await;
         }
@@ -12600,7 +12686,7 @@ async fn spawn_worker(
             .ok();
         } else {
             // Initial open task: poison — this won't resolve on retry.
-            poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES).await;
+            poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES, None).await;
         }
         name_pool.release(&agent_name);
         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
@@ -12740,7 +12826,7 @@ async fn spawn_worker(
             log(&format!("agent spawn failed: {e}"));
             let strikes = poison_tracker.record_strike(task.id);
             if strikes >= MAX_POISON_STRIKES {
-                poison_task(&db_path, &agent_name, task.id, strikes).await;
+                poison_task(&db_path, &agent_name, task.id, strikes, None).await;
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
@@ -12775,8 +12861,18 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
     .ok();
 }
 
-async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strikes: u32) {
-    let reason = format!("worker {agent} died {strikes} time(s) without producing output");
+async fn poison_task(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    strikes: u32,
+    provision_cause: Option<&str>,
+) {
+    let mut reason = format!("worker {agent} died {strikes} time(s) without producing output");
+    if let Some(cause) = provision_cause {
+        reason.push_str(": ");
+        reason.push_str(&classified_provisioning_cause(cause));
+    }
     park_task(db_path, task_id, &reason, "open").await;
 }
 
@@ -13145,20 +13241,19 @@ async fn park_remediation_provision_failure(
     task_id: i64,
     pr: i64,
     feedback: &str,
+    cause: &str,
 ) {
     // `task-retry` restores a parked rework task without the original reviewer
     // process or mailbox row. Preserve the accepted blocking feedback so the
     // replacement remediation turn remains tied to the unresolved finding.
     persist_remediation_feedback(&config.db_path, task_id, feedback).await;
-    let reason = format!("remediation worker provisioning failed for PR #{pr}");
+    let reason = format!(
+        "remediation provisioning failed for PR #{pr}: {}",
+        classified_provisioning_cause(cause)
+    );
+    persist_provisioning_failure(&config.db_path, task_id, &reason).await;
     if park_task(&config.db_path, task_id, &reason, "rework").await {
-        notify_provision_failure(
-            &config.db_path,
-            task_id,
-            "remediation worker provisioning failed",
-            &format!("#{pr}"),
-        )
-        .await;
+        notify_provision_failure(&config.db_path, task_id, &reason, &format!("#{pr}")).await;
     }
 }
 
@@ -13489,15 +13584,27 @@ static R2_META: std::sync::LazyLock<std::sync::Mutex<HashMap<String, R2Meta>>> =
 
 // ── Remediation worker (#159) ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemediationSpawnOutcome {
     Spawned,
     /// The authoritative guarded DB claim lost because the task was no longer
     /// eligible.  This is a clean race outcome: callers must not park, notify,
     /// or charge a provisioning strike.
     ClaimLost,
-    /// Eligibility was claimed, but external worker provisioning failed.
-    ProvisionFailed,
+    /// Eligibility was claimed, but external worker provisioning failed. The
+    /// bounded cause must be preserved by callers that park the task.
+    ProvisionFailed {
+        cause: String,
+    },
+}
+
+impl RemediationSpawnOutcome {
+    fn provision_failure_cause(&self) -> Option<&str> {
+        match self {
+            Self::ProvisionFailed { cause } => Some(cause),
+            Self::Spawned | Self::ClaimLost => None,
+        }
+    }
 }
 
 async fn claim_remediation_for_worker(
@@ -13553,7 +13660,10 @@ async fn install_live_worker_remediation_lease(
             log(&format!(
                 "live remediation: lease install failed for task #{task_id}: {error} — parking task"
             ));
-            park_remediation_provision_failure(config, task_id, pr, feedback).await;
+            let cause = classified_provisioning_cause(&format!(
+                "remediation lease installation failed: {error}"
+            ));
+            park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
             false
         }
     }
@@ -13766,7 +13876,9 @@ async fn spawn_remediation_worker(
             })
             .await;
             name_pool.release(&agent_name);
-            return Ok(RemediationSpawnOutcome::ProvisionFailed);
+            return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: "structural: remediation PR target is unavailable and no safe fallback branch exists".into(),
+            });
         }
         fb
     } else {
@@ -13833,33 +13945,40 @@ async fn spawn_remediation_worker(
             .await;
         (result, None)
     };
-    let provision_ok = match provision_result {
+    let provision_failure = match provision_result {
         Ok(_) => {
-            let head_ok = match sha_to_verify {
-                Some(expected_sha) => wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok(),
-                None => true,
-            };
-            // Workers commit only. The daemon owns the later explicit push to
-            // the PR head and verifies it before advancing lifecycle.
-            head_ok
-                && match wt_mgr.disable_push(&wt_path).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log(&format!(
-                            "remediation: push lockout failed for PR #{pr}: {e}"
-                        ));
-                        false
+            if let Some(expected_sha) = sha_to_verify {
+                if let Err(error) = wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
+                    Some(format!(
+                        "structural head-SHA mismatch for remediation PR #{pr}: {error}"
+                    ))
+                } else {
+                    match wt_mgr.disable_push(&wt_path).await {
+                        Ok(()) => None,
+                        Err(error) => Some(format!(
+                            "remediation push lockout failed for PR #{pr}: {error}"
+                        )),
                     }
                 }
+            } else {
+                match wt_mgr.disable_push(&wt_path).await {
+                    Ok(()) => None,
+                    Err(error) => Some(format!(
+                        "remediation push lockout failed for PR #{pr}: {error}"
+                    )),
+                }
+            }
         }
-        Err(e) => {
+        Err(error) => {
             log(&format!(
-                "remediation: worktree provision failed for PR #{pr}: {e}"
+                "remediation: worktree provision failed for PR #{pr}: {error}"
             ));
-            false
+            Some(format!(
+                "remediation worktree provisioning failed for PR #{pr}: {error}"
+            ))
         }
     };
-    if !provision_ok {
+    if let Some(cause) = provision_failure {
         log(&format!(
             "remediation: worktree provision failed for PR #{pr} — giving up"
         ));
@@ -13877,7 +13996,9 @@ async fn spawn_remediation_worker(
             .await;
         }
         name_pool.release(&agent_name);
-        return Ok(RemediationSpawnOutcome::ProvisionFailed);
+        return Ok(RemediationSpawnOutcome::ProvisionFailed {
+            cause: classified_provisioning_cause(&cause),
+        });
     }
 
     // Inspection surfaces report the PR branch this run continues, not the
@@ -14024,7 +14145,11 @@ async fn spawn_remediation_worker(
                     name_pool.release(&agent_name);
                     wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                     wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return Ok(RemediationSpawnOutcome::ProvisionFailed);
+                    return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                        cause: classified_provisioning_cause(&format!(
+                            "remediation provider recovery failed: {error}"
+                        )),
+                    });
                 }
                 resolved
             }
@@ -14043,7 +14168,11 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return Ok(RemediationSpawnOutcome::ProvisionFailed);
+                return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                    cause: classified_provisioning_cause(&format!(
+                        "remediation provider recovery failed: {error}"
+                    )),
+                });
             }
             Err(error) => {
                 log(&format!(
@@ -14060,7 +14189,11 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return Ok(RemediationSpawnOutcome::ProvisionFailed);
+                return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                    cause: classified_provisioning_cause(&format!(
+                        "remediation provider recovery join failed: {error}"
+                    )),
+                });
             }
         }
     };
@@ -14106,7 +14239,9 @@ async fn spawn_remediation_worker(
         name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
-        return Ok(RemediationSpawnOutcome::ProvisionFailed);
+        return Ok(RemediationSpawnOutcome::ProvisionFailed {
+            cause: "remediation provider policy rejected launch: Codex cannot report USD cost while max_*_cost_usd is configured".into(),
+        });
     }
 
     // Turn-oriented rework resumes the exact provider-tagged continuation.
@@ -14154,7 +14289,11 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            return Ok(RemediationSpawnOutcome::ProvisionFailed);
+            return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: classified_provisioning_cause(&format!(
+                    "remediation continuation recovery failed: {error}"
+                )),
+            });
         }
     };
 
@@ -14262,7 +14401,11 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            Ok(RemediationSpawnOutcome::ProvisionFailed)
+            Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: classified_provisioning_cause(&format!(
+                    "remediation worker process launch failed: {e}"
+                )),
+            })
         }
     }
 }
@@ -20293,5 +20436,139 @@ mod tests {
             worker_responsibility_key(42, 7),
             worker_responsibility_key(42, 8)
         );
+    }
+
+    #[test]
+    fn provisioning_causes_are_bounded_safe_and_operationally_classified() {
+        assert!(classified_provisioning_cause(
+            "git fetch origin deleted-head failed: fatal: couldn't find remote ref deleted-head"
+        )
+        .starts_with("structural:"));
+        assert!(classified_provisioning_cause(
+            "git worktree add failed: fatal: Unable to create '.git/index.lock': File exists"
+        )
+        .starts_with("transient:"));
+        assert!(classified_provisioning_cause(
+            "structural head-SHA mismatch for remediation PR #37: expected abc, got def"
+        )
+        .starts_with("structural:"));
+        let rejected = classified_provisioning_cause("git stderr\0must not persist");
+        assert!(!rejected.contains('\0'));
+        assert!(rejected.contains("rejected"));
+        let long = classified_provisioning_cause(&"x".repeat(MAX_PROVISIONING_CAUSE_BYTES + 1));
+        assert!(long.len() <= MAX_PROVISIONING_CAUSE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn initial_provision_failure_parks_with_cause_and_surfaces_in_status_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("initial-provision.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "initial provision diagnostic",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+        let cause = classified_provisioning_cause(
+            "git fetch origin deleted-head failed: fatal: couldn't find remote ref deleted-head",
+        );
+        persist_provisioning_failure(
+            &db_path,
+            task_id,
+            &format!("initial worker worktree provisioning failed: {cause}"),
+        )
+        .await;
+        poison_task(
+            &db_path,
+            "Initial",
+            task_id,
+            MAX_POISON_STRIKES,
+            Some(&cause),
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT json_extract(refs, '$.daemon_parked_reason') FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(reason.contains("structural:"), "{reason}");
+        assert!(reason.contains("couldn't find remote ref"), "{reason}");
+        let stats = quorum_core::stats::stats(&conn, now_unix(), 60).unwrap();
+        assert!(stats.last_errors.iter().any(|error| {
+            error.source == "provisioning"
+                && error
+                    .detail
+                    .contains("initial worker worktree provisioning failed")
+                && error.detail.contains("couldn't find remote ref")
+        }));
+    }
+
+    #[tokio::test]
+    async fn remediation_provision_failure_parks_with_transient_cause_and_error_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("remediation-provision.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "remediation provision diagnostic",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+                .unwrap();
+            task_id
+        };
+        let config = pre_review_checks_config(db_path.clone(), dir.path().join("repo"));
+        park_remediation_provision_failure(
+            &config,
+            task_id,
+            37,
+            "fix the blocker",
+            "git worktree add failed: fatal: Unable to create '.git/index.lock': File exists",
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT json_extract(refs, '$.daemon_parked_reason') FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            reason.contains("remediation provisioning failed for PR #37"),
+            "{reason}"
+        );
+        assert!(reason.contains("transient:"), "{reason}");
+        assert!(reason.contains("index.lock"), "{reason}");
+        let stats = quorum_core::stats::stats(&conn, now_unix(), 60).unwrap();
+        assert!(stats.last_errors.iter().any(|error| {
+            error.source == "provisioning"
+                && error.detail.contains("PR #37")
+                && error.detail.contains("index.lock")
+        }));
     }
 }
