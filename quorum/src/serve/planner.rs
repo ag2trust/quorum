@@ -21,7 +21,7 @@ pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
-const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
+pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
