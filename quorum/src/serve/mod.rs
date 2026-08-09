@@ -3515,7 +3515,7 @@ async fn record_decomposition_attempt(
 ) -> Result<()> {
     let path = config.db_path.clone();
     let code = code.to_string();
-    let summary = truncate_utf8_bytes(summary, 2048).to_string();
+    let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
         quorum_core::decomposition::record_attempt(
@@ -3638,6 +3638,81 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
     &value[..end]
 }
 
+const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = 2048;
+// Keep each untrusted variable field bounded below the durable attempt ceiling so
+// a combined rejection always retains the later size and duplicate dimensions.
+const CHILD_REJECTION_REASON_MAX_BYTES: usize = 1024;
+const CHILD_REJECTION_DUPLICATES_MAX_BYTES: usize = 768;
+
+fn bounded_with_ellipsis(value: &str, limit: usize) -> String {
+    const ELLIPSIS: &str = "…";
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let prefix = truncate_utf8_bytes(value, limit.saturating_sub(ELLIPSIS.len()));
+    format!("{prefix}{ELLIPSIS}")
+}
+
+fn bounded_duplicate_ids(ids: &[i64], limit: usize) -> String {
+    let mut rendered = String::from("[");
+    for (index, id) in ids.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let item = format!("{separator}{id}");
+        let more_follow = index + 1 < ids.len();
+        let reserved_suffix = if more_follow {
+            if index == 0 {
+                "...]"
+            } else {
+                ", ...]"
+            }
+        } else {
+            "]"
+        };
+        if rendered.len() + item.len() + reserved_suffix.len() > limit {
+            rendered.push_str(if index == 0 { "...]" } else { ", ...]" });
+            return rendered;
+        }
+        rendered.push_str(&item);
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn child_preclassification_rejection(
+    task_key: &str,
+    result: &quorum_core::classify::TaskClassification,
+) -> Option<String> {
+    let mut failed_dimensions = Vec::new();
+    if !result.ready {
+        let reason = bounded_with_ellipsis(
+            result
+                .not_ready_reason
+                .as_deref()
+                .unwrap_or("missing not_ready_reason"),
+            CHILD_REJECTION_REASON_MAX_BYTES,
+        );
+        failed_dimensions.push(format!("ready=false (not_ready_reason: {reason})"));
+    }
+    if !matches!(result.size.as_str(), "S" | "M") {
+        failed_dimensions.push(format!("size={}", result.size));
+    }
+    if !result.duplicate_of.is_empty() {
+        failed_dimensions.push(format!(
+            "duplicate_of={}",
+            bounded_duplicate_ids(&result.duplicate_of, CHILD_REJECTION_DUPLICATES_MAX_BYTES)
+        ));
+    }
+    if failed_dimensions.is_empty() {
+        return None;
+    }
+    let summary = format!(
+        "child {task_key} rejected by preclassification: {}",
+        failed_dimensions.join("; ")
+    );
+    debug_assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+    Some(summary)
+}
+
 async fn reset_decomposition_to_planning(
     config: &ServeConfig,
     graph_id: i64,
@@ -3704,14 +3779,8 @@ fn planned_children(
             let result = by_id
                 .get(&id)
                 .ok_or_else(|| format!("missing classification for {}", task.key))?;
-            if !result.ready
-                || !matches!(result.size.as_str(), "S" | "M")
-                || !result.duplicate_of.is_empty()
-            {
-                return Err(format!(
-                    "child {} is not an admission-ready nonduplicate S/M implementation",
-                    task.key
-                ));
+            if let Some(summary) = child_preclassification_rejection(&task.key, result) {
+                return Err(summary);
             }
             let mut prerequisite_keys = Vec::new();
             let mut source_dependency_ids = Vec::new();
@@ -18585,14 +18654,152 @@ mod tests {
                 duplicate_of: vec![],
             },
         ];
-        assert_eq!(planned_children(&proposal, &valid).unwrap().len(), 2);
-        let mut large = valid.clone();
-        large[1].size = "L".into();
-        assert!(planned_children(&proposal, &large).is_err());
+        let children = planned_children(&proposal, &valid).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].local_key, "a");
+        assert_eq!(children[1].prerequisite_keys, ["a"]);
+
+        let mut not_ready = valid.clone();
+        not_ready[0].ready = false;
+        not_ready[0].not_ready_reason = Some("missing acceptance criteria".into());
+        assert_eq!(
+            planned_children(&proposal, &not_ready).unwrap_err(),
+            "child a rejected by preclassification: ready=false (not_ready_reason: missing acceptance criteria)"
+        );
+
+        for size in ["L", "XL"] {
+            let mut large = valid.clone();
+            large[1].size = size.into();
+            assert_eq!(
+                planned_children(&proposal, &large).unwrap_err(),
+                format!("child b rejected by preclassification: size={size}")
+            );
+        }
+
         let mut duplicate = valid.clone();
-        duplicate[0].duplicate_of = vec![99];
-        assert!(planned_children(&proposal, &duplicate).is_err());
-        assert!(planned_children(&proposal, &valid[..1]).is_err());
+        duplicate[0].duplicate_of = vec![99, 101];
+        assert_eq!(
+            planned_children(&proposal, &duplicate).unwrap_err(),
+            "child a rejected by preclassification: duplicate_of=[99, 101]"
+        );
+
+        let mut combined = valid.clone();
+        combined[0].ready = false;
+        combined[0].not_ready_reason = Some("product decision required".into());
+        combined[0].size = "XL".into();
+        combined[0].duplicate_of = vec![301, 302];
+        assert_eq!(
+            planned_children(&proposal, &combined).unwrap_err(),
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]"
+        );
+
+        assert_eq!(
+            planned_children(&proposal, &valid[..1]).unwrap_err(),
+            "missing classification for b"
+        );
+    }
+
+    #[test]
+    fn proposal_preclassification_rejection_rendering_stays_within_attempt_bounds() {
+        let proposal = vec![planner::ProposedTask {
+            key: "bounded-child".into(),
+            title: "bounded child".into(),
+            observable_outcome: "bounded evidence persists".into(),
+            acceptance_criteria: vec!["bounded".into()],
+            source_constraints: vec!["atomic".into()],
+            verification_expectations: vec!["test".into()],
+            prerequisites: vec![],
+        }];
+        let classifications = vec![quorum_core::classify::TaskClassification {
+            task_id: -1,
+            cx_est: 5,
+            size: "XL".into(),
+            ready: false,
+            not_ready_reason: Some("é".repeat(4_096)),
+            duplicate_of: (1..=1_000).collect(),
+        }];
+
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+        assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+        assert!(summary.contains("ready=false (not_ready_reason: é"));
+        assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
+        assert!(summary.ends_with("...]"), "{summary}");
+    }
+
+    #[test]
+    fn proposal_preclassification_persists_exact_readiness_rejection_and_reason_code() {
+        let proposal = vec![planner::ProposedTask {
+            key: "readiness".into(),
+            title: "readiness".into(),
+            observable_outcome: "readiness is observable".into(),
+            acceptance_criteria: vec!["readiness".into()],
+            source_constraints: vec!["atomic".into()],
+            verification_expectations: vec!["test".into()],
+            prerequisites: vec![],
+        }];
+        let classifications = vec![quorum_core::classify::TaskClassification {
+            task_id: -1,
+            cx_est: 2,
+            size: "S".into(),
+            ready: false,
+            not_ready_reason: Some("owner must select the storage format".into()),
+            duplicate_of: vec![],
+        }];
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("rejection.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "source",
+            Some("source outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "child-preclassification",
+            &summary,
+            3,
+        )
+        .unwrap();
+
+        let persisted: (String, String) = conn
+            .query_row(
+                "SELECT reason_code,summary FROM decomposition_attempts WHERE graph_id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "child-preclassification".into(),
+                "child readiness rejected by preclassification: ready=false (not_ready_reason: owner must select the storage format)".into(),
+            )
+        );
     }
 
     #[test]
