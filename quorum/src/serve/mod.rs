@@ -4647,58 +4647,79 @@ async fn handle_pre_review_checks_failure(
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
-                let prompt = reviewer::build_rework_prompt(
-                    &workers[worker_index].agent_name,
+                if !install_live_worker_remediation_lease(
+                    config,
+                    workers[worker_index].agent_name.clone(),
                     task_id,
                     pr,
                     &feedback,
-                    workers[worker_index].cost_usd,
-                    config.limits.max_task_cost_usd,
-                );
-                if let Err(error) =
-                    feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                )
+                .await
                 {
-                    log(&format!(
-                        "pre-review CI rework feed failed for task #{task_id}: {error}; \
-                         preserving durable remediation intent"
-                    ));
                     let worker = workers.remove(worker_index);
-                    let p = config.db_path.clone();
-                    let agent = worker.agent_name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut conn) = quorum_core::db::open(&p) {
-                            let _ = tasks::release_remediation_lease(
-                                &mut conn,
-                                &agent,
-                                task_id,
-                                now_unix(),
-                            );
-                        }
-                    })
-                    .await
-                    .ok();
-                    cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                    cleanup_slot(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        worker,
+                        None,
+                        "remediation_lease_unavailable",
+                    )
+                    .await;
                 } else {
-                    let worker = &mut workers[worker_index];
-                    worker.draining = true;
-                    worker.pr = None;
-                    worker.rework_count += 1;
-                    worker.turn_started_at = std::time::Instant::now();
-                    if let Some(ref mut session_log) = worker.session_log {
-                        session_log.log_rework(worker.rework_count);
+                    let prompt = reviewer::build_rework_prompt(
+                        &workers[worker_index].agent_name,
+                        task_id,
+                        pr,
+                        &feedback,
+                        workers[worker_index].cost_usd,
+                        config.limits.max_task_cost_usd,
+                    );
+                    if let Err(error) =
+                        feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                    {
+                        log(&format!(
+                            "pre-review CI rework feed failed for task #{task_id}: {error}; \
+                         preserving durable remediation intent"
+                        ));
+                        let worker = workers.remove(worker_index);
+                        let p = config.db_path.clone();
+                        let agent = worker.agent_name.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                let _ = tasks::release_remediation_lease(
+                                    &mut conn,
+                                    &agent,
+                                    task_id,
+                                    now_unix(),
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                        cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                    } else {
+                        let worker = &mut workers[worker_index];
+                        worker.draining = true;
+                        worker.pr = None;
+                        worker.rework_count += 1;
+                        worker.turn_started_at = std::time::Instant::now();
+                        if let Some(ref mut session_log) = worker.session_log {
+                            session_log.log_rework(worker.rework_count);
+                        }
+                        let p = config.db_path.clone();
+                        let entry = slot_journal_entry(worker, "worker", "working");
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            journal::upsert(&mut conn, &entry)
+                        })
+                        .await
+                        .ok();
+                        log(&format!(
+                            "worker {} rework #{} (pre-review CI failure)",
+                            worker.agent_name, worker.rework_count
+                        ));
                     }
-                    let p = config.db_path.clone();
-                    let entry = slot_journal_entry(worker, "worker", "working");
-                    tokio::task::spawn_blocking(move || -> Result<()> {
-                        let mut conn = quorum_core::db::open(&p)?;
-                        journal::upsert(&mut conn, &entry)
-                    })
-                    .await
-                    .ok();
-                    log(&format!(
-                        "worker {} rework #{} (pre-review CI failure)",
-                        worker.agent_name, worker.rework_count
-                    ));
                 }
             } else {
                 log(&format!(
@@ -14604,6 +14625,90 @@ mod tests {
             .unwrap()
             .is_some(),
             "the live worker must reacquire the released remediation lease"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
+            .unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let claim: (String, i64) = conn
+            .query_row(
+                "SELECT holder, active FROM claims
+                 WHERE target=?1 ORDER BY id DESC LIMIT 1",
+                [format!("task#{task_id}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, ("live-worker".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn live_worker_pre_review_ci_rework_claim_survives_reaper_past_provisioning_grace() {
+        // Failed pre-review CI moves an awaiting-review worker directly to
+        // rework and releases its original lease. The immediate rework feed
+        // must replace that lease before its turn can outlive the grace window.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-worker-pre-review-ci-rework.db");
+        let now = now_unix();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "live pre-review CI rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "live-worker", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("live worker must claim the task");
+            tasks::apply_event(
+                &mut conn,
+                "live-worker",
+                task_id,
+                &Event::SignaledDone { pr: "553".into() },
+                now + 1,
+            )
+            .unwrap();
+            let transition = tasks::apply_checks_failed_with_remediation(
+                &mut conn,
+                task_id,
+                553,
+                "0123456789abcdef0123456789abcdef01234567",
+                &["test".into()],
+                "fix the failed pre-review CI check",
+                now + 2,
+            )
+            .unwrap();
+            assert_eq!(transition.task.status, "rework");
+            task_id
+        };
+
+        assert!(
+            claim_remediation_for_worker(
+                db_path.clone(),
+                "live-worker".into(),
+                task_id,
+                "fix the failed pre-review CI check".into(),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "the live pre-review CI worker must reacquire the released remediation lease"
         );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
