@@ -165,6 +165,55 @@ PATH="$BIN:$PATH" git push -q origin \
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
 [ "$REMOTE_SHA" = "$CONTINUATION_HEAD_SHA" ]
 
+# The daemon supports repositories configured with a non-main base. Seed an
+# existing PR head on develop, advance that base with two inherited sessions,
+# and prove the daemon-supplied base identity reaches the real hook.
+git switch -q --detach origin/develop
+git switch -qc daemon/develop-pr-source-t8
+printf 'develop PR\n' > develop-remediation
+git add develop-remediation
+git commit -qm 'develop PR head' \
+  -m 'Co-Authored-By: Develop-Worker <develop-worker@example.invalid>'
+DEVELOP_PR_HEAD=$(git rev-parse HEAD)
+git --git-dir="$REMOTE" fetch -q "$REPO" \
+  "$DEVELOP_PR_HEAD:refs/heads/daemon/develop-continuation-t8"
+
+git switch -q develop
+printf 'develop base A\n' > develop-inherited-a
+git add develop-inherited-a
+git commit -qm 'advance develop from session A' \
+  -m 'Co-Authored-By: Develop-Base-A <develop-base-a@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin develop
+printf 'develop base B\n' > develop-inherited-b
+git add develop-inherited-b
+git commit -qm 'advance develop from session B' \
+  -m 'Co-Authored-By: Develop-Base-B <develop-base-b@example.invalid>'
+PATH="$BIN:$PATH" git push -q origin develop
+
+git switch -q --detach "$DEVELOP_PR_HEAD"
+git switch -qc daemon/develop-continuation-worker-t9
+git merge -q --no-ff origin/develop -m 'merge configured develop base'
+printf 'develop continuation worker\n' >> develop-remediation
+git commit -qam 'finish develop continuation' \
+  -m 'Co-Authored-By: Develop-Continue <develop-continue@example.invalid>'
+DEVELOP_CONTINUATION_SHA=$(git rev-parse HEAD)
+if PATH="$BIN:$PATH" git push -q origin \
+  "$DEVELOP_CONTINUATION_SHA:refs/heads/daemon/develop-continuation-t8" \
+  >"$TMP/develop-default-base.out" 2>&1; then
+  echo 'expected main-default continuation attribution to reject develop history' >&2
+  exit 1
+fi
+grep -q 'sessions in branch-owned commits' "$TMP/develop-default-base.out"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
+  refs/heads/daemon/develop-continuation-t8)
+[ "$REMOTE_SHA" = "$DEVELOP_PR_HEAD" ]
+
+QUORUM_CONTINUATION_BASE_BRANCH=develop PATH="$BIN:$PATH" git push -q origin \
+  "$DEVELOP_CONTINUATION_SHA:refs/heads/daemon/develop-continuation-t8"
+REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse \
+  refs/heads/daemon/develop-continuation-t8)
+[ "$REMOTE_SHA" = "$DEVELOP_CONTINUATION_SHA" ]
+
 # Continuations only exempt already-published history. Multiple new worker
 # sessions after the authoritative remote tip remain genuine stacking.
 git switch -q --detach "$CONTINUATION_HEAD_SHA"

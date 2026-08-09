@@ -888,6 +888,7 @@ impl WorktreeManager {
         remote_branch: &str,
         expected_remote_sha: &str,
         source_sha: &str,
+        base_branch: &str,
     ) -> Result<String, String> {
         let _guard = self.lock.lock().await;
         let remote_ref = format!("refs/heads/{remote_branch}");
@@ -941,7 +942,8 @@ impl WorktreeManager {
 
         let refspec = format!("{source_sha}:{remote_ref}");
         let lease = format!("--force-with-lease={remote_ref}:{expected_remote_sha}");
-        let push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        let mut push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
+        push.env("QUORUM_CONTINUATION_BASE_BRANCH", base_branch);
         let pushed = run_git(push, self.fetch_timeout, "git push PR head").await?;
         if !pushed.status.success() {
             let mut refresh = self.git_cmd(worktree_dir);
@@ -2394,12 +2396,18 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn continuation_clean_base_merge_publishes_fast_forward_through_real_hook() {
+    async fn continuation_clean_non_main_base_publishes_fast_forward_through_real_hook() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, bare) = init_repo_with_bare_remote(tmp.path());
         add_continuation_fixture_files(&repo);
         let pr_head = "fix/clean-continuation";
 
+        assert!(git_output(&repo, &["checkout", "-b", "develop"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
         assert!(git_output(&repo, &["checkout", "-b", pr_head])
             .status
             .success());
@@ -2413,7 +2421,7 @@ mod tests {
             .success());
         let remote_pr_head = git_rev_parse(&repo, "HEAD");
 
-        assert!(git_output(&repo, &["checkout", "main"]).status.success());
+        assert!(git_output(&repo, &["checkout", "develop"]).status.success());
         std::fs::write(repo.join("base-only-a.txt"), "advanced base A\n").unwrap();
         assert!(git_output(&repo, &["add", "base-only-a.txt"])
             .status
@@ -2446,7 +2454,7 @@ mod tests {
         )
         .status
         .success());
-        assert!(git_output(&repo, &["push", "origin", "main"])
+        assert!(git_output(&repo, &["push", "origin", "develop"])
             .status
             .success());
         let base_head = git_rev_parse(&repo, "HEAD");
@@ -2460,7 +2468,7 @@ mod tests {
             .await
             .expect("verify exact PR head before integration");
         assert_eq!(
-            mgr.integrate_continuation_base(&worktree, "main")
+            mgr.integrate_continuation_base(&worktree, "develop")
                 .await
                 .expect("clean base integration"),
             ContinuationBaseMerge::Clean
@@ -2498,9 +2506,15 @@ mod tests {
         mgr.disable_push(&worktree)
             .await
             .expect("worker push lockout");
-        mgr.push_to_pr_head(&worktree, pr_head, &remote_pr_head, &integrated_head)
-            .await
-            .expect("daemon publication must pass the real ff-only pre-push hook");
+        mgr.push_to_pr_head(
+            &worktree,
+            pr_head,
+            &remote_pr_head,
+            &integrated_head,
+            "develop",
+        )
+        .await
+        .expect("daemon publication must pass the real ff-only pre-push hook");
         assert_eq!(git_rev_parse(&bare, pr_head), integrated_head);
     }
 
@@ -2617,7 +2631,7 @@ mod tests {
         mgr.disable_push(&worktree)
             .await
             .expect("worker push lockout");
-        mgr.push_to_pr_head(&worktree, pr_head, &remote_pr_head, &resolved_head)
+        mgr.push_to_pr_head(&worktree, pr_head, &remote_pr_head, &resolved_head, "main")
             .await
             .expect("resolved conflict must publish without parking");
         assert_eq!(git_rev_parse(&bare, pr_head), resolved_head);
@@ -2695,7 +2709,13 @@ mod tests {
         let source_sha = git_rev_parse(&wt_path, "HEAD");
 
         let result = mgr
-            .push_to_pr_head(&wt_path, pr_head, "not-the-authoritative-sha", &source_sha)
+            .push_to_pr_head(
+                &wt_path,
+                pr_head,
+                "not-the-authoritative-sha",
+                &source_sha,
+                "main",
+            )
             .await;
         assert!(
             result.is_err(),
@@ -2736,7 +2756,7 @@ mod tests {
         let mutable_head = git_rev_parse(&wt_path, "HEAD");
         assert_ne!(intent_sha, mutable_head);
 
-        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha)
+        mgr.push_to_pr_head(&wt_path, pr_head, &remote_tip, &intent_sha, "main")
             .await
             .expect("exact durable source must publish");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
@@ -2801,7 +2821,7 @@ mod tests {
         let replacement_head = git_rev_parse(&retry_wt, "HEAD");
         assert_ne!(replacement_head, intent_sha);
 
-        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha)
+        mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha, "main")
             .await
             .expect("task retry must replay the durable intent source");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
@@ -2949,7 +2969,7 @@ mod tests {
             WorktreeManager::with_config(shim, Duration::from_secs(10), Duration::from_secs(10));
         let source_sha = git_rev_parse(&wt_path, "HEAD");
         let result = mgr
-            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha)
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &source_sha, "main")
             .await;
         assert!(result.is_err(), "racing writer must defeat the lease");
         assert_eq!(
@@ -3093,7 +3113,7 @@ mod tests {
         );
 
         let pushed = mgr
-            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip)
+            .push_to_pr_head(&wt_path, pr_head, &remote_tip, &new_tip, "main")
             .await
             .expect("daemon push must succeed");
         assert_eq!(pushed, new_tip);

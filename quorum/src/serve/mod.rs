@@ -1287,6 +1287,7 @@ async fn publish_worker_completion(
                 &target.head_ref,
                 expected_remote_sha,
                 &intent.local_sha,
+                &config.base_branch,
             )
             .await?;
         intent.stage = "verified".into();

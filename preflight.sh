@@ -22,6 +22,8 @@ set -u
 QUICK=0
 CONTINUATION_FROM=
 CONTINUATION_SET=0
+CONTINUATION_BASE=
+CONTINUATION_BASE_SET=0
 PROPOSED_SHA=
 PROPOSED_SET=0
 HOOK_FORMAT_ONLY=0
@@ -33,6 +35,12 @@ for arg in "$@"; do
         || { printf 'preflight.sh: duplicate --continuation-from\n' >&2; exit 2; }
       CONTINUATION_FROM=${arg#*=}
       CONTINUATION_SET=1
+      ;;
+    --continuation-base=*)
+      [ "$CONTINUATION_BASE_SET" -eq 0 ] \
+        || { printf 'preflight.sh: duplicate --continuation-base\n' >&2; exit 2; }
+      CONTINUATION_BASE=${arg#*=}
+      CONTINUATION_BASE_SET=1
       ;;
     --proposed-sha=*)
       [ "$PROPOSED_SET" -eq 0 ] \
@@ -50,11 +58,16 @@ if [ "$CONTINUATION_SET" -eq 1 ] && [ -z "$CONTINUATION_FROM" ]; then
   printf 'preflight.sh: --continuation-from requires a commit\n' >&2
   exit 2
 fi
+if [ "$CONTINUATION_BASE_SET" -eq 1 ] && [ -z "$CONTINUATION_BASE" ]; then
+  printf 'preflight.sh: --continuation-base requires a commit\n' >&2
+  exit 2
+fi
 if [ "$PROPOSED_SET" -eq 1 ] && [ -z "$PROPOSED_SHA" ]; then
   printf 'preflight.sh: --proposed-sha requires a commit\n' >&2
   exit 2
 fi
-if { [ "$CONTINUATION_SET" -eq 1 ] || [ "$PROPOSED_SET" -eq 1 ] \
+if { [ "$CONTINUATION_SET" -eq 1 ] || [ "$CONTINUATION_BASE_SET" -eq 1 ] \
+  || [ "$PROPOSED_SET" -eq 1 ] \
   || [ "$HOOK_FORMAT_ONLY" -eq 1 ]; } && [ "$QUICK" -ne 1 ]; then
   printf 'preflight.sh: hook-only options require --quick\n' >&2
   exit 2
@@ -63,8 +76,17 @@ if [ "$CONTINUATION_SET" -eq 1 ] && [ "$PROPOSED_SET" -ne 1 ]; then
   printf 'preflight.sh: --continuation-from requires --proposed-sha\n' >&2
   exit 2
 fi
+if [ "$CONTINUATION_SET" -eq 1 ] && [ "$CONTINUATION_BASE_SET" -ne 1 ]; then
+  printf 'preflight.sh: --continuation-from requires --continuation-base\n' >&2
+  exit 2
+fi
+if [ "$CONTINUATION_BASE_SET" -eq 1 ] && [ "$CONTINUATION_SET" -ne 1 ]; then
+  printf 'preflight.sh: --continuation-base requires --continuation-from\n' >&2
+  exit 2
+fi
 if [ "$HOOK_FORMAT_ONLY" -eq 1 ] \
-  && { [ "$CONTINUATION_SET" -eq 1 ] || [ "$PROPOSED_SET" -eq 1 ]; }; then
+  && { [ "$CONTINUATION_SET" -eq 1 ] || [ "$CONTINUATION_BASE_SET" -eq 1 ] \
+    || [ "$PROPOSED_SET" -eq 1 ]; }; then
   printf 'preflight.sh: --hook-format-only conflicts with publication options\n' >&2
   exit 2
 fi
@@ -114,13 +136,16 @@ else
       || fail "continuation base is not a local commit"
     git merge-base --is-ancestor "$CONTINUATION_FROM" "$TIP" \
       || fail "continuation base is not an ancestor of proposed SHA"
+    git cat-file -e "$CONTINUATION_BASE^{commit}" 2>/dev/null \
+      || fail "configured continuation base is not a local commit"
     # A continuation may merge the freshly fetched base to preserve the
     # published PR head as an ancestor. Commits already reachable from the
     # base are inherited integration input, not work authored by this worker.
     # Exclude both histories while retaining the merge and worker commits.
-    BASE_REF="$CONTINUATION_FROM + origin/main"
-    OWN_COMMITS=$(git rev-list "$TIP" --not "$CONTINUATION_FROM" origin/main)
-    printf 'continuation-owned commits excluding published head and origin/main:\n'
+    BASE_REF="$CONTINUATION_FROM + $CONTINUATION_BASE"
+    OWN_COMMITS=$(git rev-list "$TIP" --not "$CONTINUATION_FROM" "$CONTINUATION_BASE")
+    printf 'continuation-owned commits excluding published head and %s:\n' \
+      "$CONTINUATION_BASE"
     if [ -n "$OWN_COMMITS" ]; then
       git show -s --oneline $OWN_COMMITS
     fi
