@@ -14645,9 +14645,9 @@ mod tests {
 
     #[tokio::test]
     async fn live_worker_pre_review_ci_rework_claim_survives_reaper_past_provisioning_grace() {
-        // Failed pre-review CI moves an awaiting-review worker directly to
-        // rework and releases its original lease. The immediate rework feed
-        // must replace that lease before its turn can outlive the grace window.
+        // Drive the real pre-review CI failure handler. Failed CI moves an
+        // awaiting-review worker directly to rework and releases its original
+        // lease; the handler must replace it before feeding the worker.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("live-worker-pre-review-ci-rework.db");
         let now = now_unix();
@@ -14684,32 +14684,33 @@ mod tests {
                 now + 1,
             )
             .unwrap();
-            let transition = tasks::apply_checks_failed_with_remediation(
-                &mut conn,
-                task_id,
-                553,
-                "0123456789abcdef0123456789abcdef01234567",
-                &["test".into()],
-                "fix the failed pre-review CI check",
-                now + 2,
-            )
-            .unwrap();
-            assert_eq!(transition.task.status, "rework");
             task_id
         };
 
-        assert!(
-            claim_remediation_for_worker(
-                db_path.clone(),
-                "live-worker".into(),
-                task_id,
-                "fix the failed pre-review CI check".into(),
-            )
-            .await
-            .unwrap()
-            .is_some(),
-            "the live pre-review CI worker must reacquire the released remediation lease"
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut name_pool = Pool::new_generated();
+        let wt_mgr = WorktreeManager::new();
+        let mut workers =
+            vec![make_live_pre_review_ci_slot(task_id, dir.path().to_path_buf()).await];
+        let mut roster = LifetimeRoster::new();
+        handle_pre_review_checks_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut roster,
+            task_id,
+            553,
+            "0123456789abcdef0123456789abcdef01234567",
+            &["test".into()],
+        )
+        .await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "the live worker must remain after a successful feed"
         );
+        assert!(workers[0].draining, "the rework turn must be fed");
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
@@ -14725,6 +14726,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(claim, ("live-worker".into(), 1));
+
+        let worker = workers.remove(0);
+        worker.proc.kill_and_reap().await;
     }
 
     #[test]
@@ -15312,6 +15316,110 @@ mod tests {
             reviewed_head_sha: None,
             continuation_id: None,
             pending_prompt: "test prompt".into(),
+            pending_turn_kind: "initial".into(),
+        }
+    }
+
+    fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        let profile = crate::serve_config::ModelProfile {
+            runner: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
+        ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            repo_dir: repo_dir.clone(),
+            worktree_base: repo_dir,
+            names_file: None,
+            agent_bin: None,
+            merge_executor: Arc::new(merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            codex_sandbox: "danger-full-access".into(),
+        }
+    }
+
+    async fn make_live_pre_review_ci_slot(task_id: i64, worktree_path: PathBuf) -> SlotState {
+        use tokio::io::BufReader;
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let now = std::time::Instant::now();
+        SlotState {
+            agent_name: "live-worker".into(),
+            proc: runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                BufReader::new(stdout),
+            )),
+            task_id,
+            session_id: agent::new_session_id(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+            worktree_path,
+            branch: "test-branch".into(),
+            remote_branch: "test-branch".into(),
+            draining: false,
+            pr: Some(553),
+            rework_count: 0,
+            cost_tokens: 0,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: None,
+            cap_run_id: None,
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "initial".into(),
             pending_turn_kind: "initial".into(),
         }
     }
