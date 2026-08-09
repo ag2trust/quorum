@@ -568,8 +568,13 @@ only through an explicit outside request)
 - **Existing-PR implementation entry:** `task-create --continue-pr N` creates an `open`
   implementation intent and atomically rejects an already-owned PR. Before provisioning,
   the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal
-  ownership, and persists its exact head branch and SHA. The worker starts from that commit,
-  and later publication targets only that branch under the recorded SHA lease. Ownership ambiguity, closure,
+  ownership, and persists its exact head branch and SHA. The daemon checks out and verifies
+  that exact commit, then merges the freshly fetched configured base into the continuation
+  branch before worker launch. Git completes a clean integration (creating a merge commit when
+  histories diverge); a conflicting merge remains in progress for the worker to resolve and
+  commit. This preserves the recorded PR head as an ancestor so later publication is
+  fast-forward-only. Publication targets only that branch under the recorded SHA lease.
+  Ownership ambiguity, closure,
   branch replacement, or SHA movement fails closed; Quorum neither rebases onto the new
   head nor silently falls back to fresh implementation or a new PR. Existing same-task
   rework continues through the established PR association and does not create a new entry.

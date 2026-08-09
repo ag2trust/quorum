@@ -64,7 +64,7 @@ fn prepare_reviewer_authority(
     )
 }
 use tokio::io::{AsyncRead, AsyncReadExt};
-use worktree::WorktreeManager;
+use worktree::{ContinuationBaseMerge, WorktreeManager};
 
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
@@ -1533,6 +1533,43 @@ fn validate_continue_pr_target(
         ));
     }
     Ok(())
+}
+
+fn continuation_worker_context(
+    target: &PrTarget,
+    base_branch: &str,
+    base_merge: ContinuationBaseMerge,
+) -> String {
+    let merge_state = match base_merge {
+        ContinuationBaseMerge::Clean => format!(
+            "The daemon already ran `git merge --no-edit origin/{base_branch}` in this worktree and the merge completed cleanly."
+        ),
+        ContinuationBaseMerge::Conflicted => format!(
+            "The daemon already started `git merge --no-edit origin/{base_branch}` in this worktree, and it is still in progress because of conflicts. Resolve every conflict, stage the resolutions, and commit the merge before doing the remaining task work. Do not abort the prepared merge."
+        ),
+    };
+    format!(
+        "\n\nCONTINUATION SOURCE — ANCESTRY MUST BE PRESERVED: Continue existing PR #{} from its verified remote head {} on branch '{}'. {merge_state} Any further base integration must merge origin/{base_branch} into this branch. Never rebase, squash-rebuild, reset away, or otherwise rewrite the lineage of the published branch. The verified remote head must remain an ancestor of your final commit. Commit changes in this worktree; the daemon alone publishes back to that PR.\n",
+        target.pr, target.head_sha, target.head_ref
+    )
+}
+
+async fn prepare_continue_pr_worktree(
+    wt_mgr: &WorktreeManager,
+    repo_dir: &Path,
+    local_branch: &str,
+    worktree: &Path,
+    target: &PrTarget,
+    base_branch: &str,
+) -> std::result::Result<(PathBuf, ContinuationBaseMerge), String> {
+    let path = wt_mgr
+        .fetch_and_provision(repo_dir, local_branch, worktree, &target.head_ref)
+        .await?;
+    wt_mgr.verify_head_sha(&path, &target.head_sha).await?;
+    let base_merge = wt_mgr
+        .integrate_continuation_base(&path, base_branch)
+        .await?;
+    Ok((path, base_merge))
 }
 
 async fn resolve_and_persist_continue_pr_target(
@@ -11985,9 +12022,19 @@ async fn spawn_worker(
     }
 
     let provision_result = if let Some(target) = &continue_target {
-        wt_mgr
-            .fetch_and_provision(worker_repo_dir, &branch, &wt_path, &target.head_ref)
-            .await
+        prepare_continue_pr_worktree(
+            wt_mgr,
+            worker_repo_dir,
+            &branch,
+            &wt_path,
+            target,
+            &config.base_branch,
+        )
+        .await
+        .map(|(path, base_merge)| {
+            let context = continuation_worker_context(target, &config.base_branch, base_merge);
+            (path, Some(context))
+        })
     } else {
         wt_mgr
             .provision(
@@ -11997,17 +12044,12 @@ async fn spawn_worker(
                 &format!("origin/{}", config.base_branch),
             )
             .await
+            .map(|path| (path, None))
     };
-    let provision_result = match (provision_result, continue_target.as_ref()) {
-        (Ok(path), Some(target)) => wt_mgr
-            .verify_head_sha(&wt_path, &target.head_sha)
-            .await
-            .map(|_| path),
-        (result, _) => result,
-    };
-    match provision_result {
-        Ok(_) => {
+    let continuation_context = match provision_result {
+        Ok((_, context)) => {
             log(&format!("worktree provisioned at {}", wt_path.display()));
+            context
         }
         Err(e) => {
             log(&format!("worktree provision failed: {e}"));
@@ -12034,7 +12076,7 @@ async fn spawn_worker(
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             return Ok(false);
         }
-    }
+    };
 
     // Managed workers commit only. Keep ordinary push commands from escaping
     // the daemon-owned publish boundary while preserving their read/fetch use.
@@ -12170,11 +12212,8 @@ async fn spawn_worker(
         },
         |retry| retry.prompt.clone(),
     );
-    if let Some(target) = &continue_target {
-        prompt_text.push_str(&format!(
-            "\n\nCONTINUATION SOURCE: Continue existing PR #{} from its verified head {} on branch '{}'. Commit changes in this worktree; the daemon alone publishes back to that PR.\n",
-            target.pr, target.head_sha, target.head_ref
-        ));
+    if let Some(context) = &continuation_context {
+        prompt_text.push_str(context);
     }
 
     let resolved_kind = resolve_worker_provider(&resolved_model)?;
@@ -16263,6 +16302,28 @@ mod tests {
         assert!(validate_continue_pr_target(&target, 19, "main")
             .unwrap_err()
             .contains("identity changed"));
+    }
+
+    #[test]
+    fn continuation_worker_context_requires_merge_lineage_and_conflict_resolution() {
+        let target = PrTarget {
+            pr: 535,
+            head_ref: "daemon/facet-349z-t336".into(),
+            head_sha: "0eb645bb".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        let clean = continuation_worker_context(&target, "main", ContinuationBaseMerge::Clean);
+        assert!(clean.contains("git merge --no-edit origin/main"));
+        assert!(clean.contains("Never rebase, squash-rebuild"));
+        assert!(clean.contains("must remain an ancestor"));
+
+        let conflicted =
+            continuation_worker_context(&target, "main", ContinuationBaseMerge::Conflicted);
+        assert!(conflicted.contains("still in progress because of conflicts"));
+        assert!(conflicted.contains("commit the merge before"));
+        assert!(conflicted.contains("Do not abort the prepared merge"));
     }
 
     #[test]
