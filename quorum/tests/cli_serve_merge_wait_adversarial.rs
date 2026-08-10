@@ -253,7 +253,7 @@ fi
     where
         F: FnMut() -> bool,
     {
-        common::wait_until(
+        common::wait_for_daemon_state(
             &mut self.child,
             &self.rx,
             &mut self.lines,

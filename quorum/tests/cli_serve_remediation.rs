@@ -241,6 +241,10 @@ fi
         false
     }
 
+    fn drain_pending_lines(&mut self) {
+        common::drain_pending_lines(&self.rx, &mut self.lines);
+    }
+
     fn wait_for_count(&mut self, needle: &str, count: usize, timeout_secs: u64) -> bool {
         common::wait_for_count(
             &mut self.child,
@@ -256,7 +260,7 @@ fi
     where
         F: FnMut() -> bool,
     {
-        common::wait_until(
+        common::wait_for_daemon_state(
             &mut self.child,
             &self.rx,
             &mut self.lines,
