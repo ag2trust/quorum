@@ -2376,7 +2376,7 @@ mod tests {
 
     #[test]
     fn every_durable_task_ref_column_has_a_lookup_index() {
-        // Task #395 remediation: schema 47 adds a lookup index for every
+        // Task #395 remediation: schema 48 adds a lookup index for every
         // durable REFERENCES tasks(id) column so sweep_on_write's
         // `NOT EXISTS (SELECT 1 FROM x WHERE x.col=t.id)` guard is served by
         // an index rather than a scan of retained provenance. The guard runs

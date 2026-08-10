@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 47). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 48). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS cursors (
     PRIMARY KEY (agent_id, topic)
 );
 
--- v47: rotating cursors for bounded opportunistic sweep. Sweep-on-write
+-- v48: rotating cursors for bounded opportunistic sweep. Sweep-on-write
 -- examines at most SWEEP_LIMIT aged done tasks per mutation and advances the
 -- cursor, so ever-growing durable-reference-pinned provenance never inflates
 -- per-mutation work even though every guard predicate is indexed. When the
@@ -233,7 +233,7 @@ CREATE TABLE IF NOT EXISTS decomposition_cleanup (
     updated_at     INTEGER NOT NULL,
     PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
 );
--- v47: bound sweep's durable-reference guard by task_id lookup. The composite
+-- v48: bound sweep's durable-reference guard by task_id lookup. The composite
 -- PK's leading column is graph_id, so `WHERE task_id=?` falls back to a full
 -- scan of retained cleanup provenance. This lookup index keeps
 -- sweep_on_write's REFERENCES tasks(id) probe O(log n).
@@ -600,7 +600,7 @@ CREATE TABLE IF NOT EXISTS review_followup_batches (
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL
 );
--- v47: index each REFERENCES tasks(id) column so sweep's durable-reference
+-- v48: index each REFERENCES tasks(id) column so sweep's durable-reference
 -- guard is bounded by index probe rather than a scan of every retained batch.
 CREATE INDEX IF NOT EXISTS review_followup_batches_task
     ON review_followup_batches(task_id);
@@ -643,7 +643,7 @@ CREATE TABLE IF NOT EXISTS review_followup_artifacts (
         END
     )
 );
--- v47: partial indexes (the CHECK above guarantees at most one of the two
+-- v48: partial indexes (the CHECK above guarantees at most one of the two
 -- columns is non-NULL per row) so sweep's durable-reference guard is bounded
 -- by index probe over just the disposition='linked'/'created' subset.
 CREATE INDEX IF NOT EXISTS review_followup_artifacts_linked_task
@@ -678,7 +678,7 @@ CREATE TABLE IF NOT EXISTS review_followup_assessments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_followup_assessment
     ON review_followup_assessments(target) WHERE active = 1;
--- v47: index REFERENCES tasks(id) so sweep's durable-reference guard is
+-- v48: index REFERENCES tasks(id) so sweep's durable-reference guard is
 -- bounded by index probe rather than a scan of every retained assessment.
 CREATE INDEX IF NOT EXISTS review_followup_assessments_source_task
     ON review_followup_assessments(source_task_id);
