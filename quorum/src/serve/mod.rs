@@ -1731,14 +1731,29 @@ fn require_reviewer_provider(
 /// may intentionally use the other provider, in which case it must use that
 /// provider's default executable rather than receiving incompatible flags.
 fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&str> {
-    let runner_kind = match config.model_profiles.values().next()?.runner.as_str() {
-        "claude" => crate::serve_config::RunnerKind::Claude,
-        "codex" => crate::serve_config::RunnerKind::Codex,
-        _ => return None,
-    };
-    agent_bin_for_runner(true, runner_kind, config.agent_bin.as_deref(), kind)
+    let configured_kinds = config
+        .model_profiles
+        .values()
+        .map(|profile| match profile.runner.as_str() {
+            "claude" => Some(runner::AgentKind::Claude),
+            "codex" => Some(runner::AgentKind::Codex),
+            "grok" => Some(runner::AgentKind::Grok),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (configured_kind, remainder) = configured_kinds.split_first()?;
+    if remainder
+        .iter()
+        .any(|candidate| candidate != configured_kind)
+    {
+        return None;
+    }
+    (kind == *configured_kind)
+        .then_some(config.agent_bin.as_deref())
+        .flatten()
 }
 
+#[cfg(test)]
 fn agent_bin_for_runner(
     provider_explicit: bool,
     runner_kind: crate::serve_config::RunnerKind,
@@ -18412,6 +18427,25 @@ mod tests {
             agent_bin_for_kind(&config, runner::AgentKind::Claude),
             Some("/opt/claude"),
             "the configured provider retains its explicit executable"
+        );
+
+        config.model_profiles.insert(
+            "codex".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+            },
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Codex),
+            None,
+            "mixed runners must never infer an override from the first profile"
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Claude),
+            None,
+            "an invalid mixed-provider override must not reach either provider"
         );
     }
 
