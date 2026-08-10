@@ -3,10 +3,13 @@
 //! The helper is an entry point in this integration-test executable, not a
 //! Cargo binary or production CLI command, so it cannot become public surface.
 
-use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::io::Read;
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const TTL: i64 = 300;
+const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
 #[test]
 fn retry_claim_subprocess() {
@@ -96,28 +99,27 @@ fn n_process_provider_rework_claim_has_exactly_one_winner(rounds: usize, racers:
         let agents: Vec<String> = (0..racers)
             .map(|index| format!("retry-{round}-{index}"))
             .collect();
-        let children: Vec<_> = agents
-            .iter()
-            .map(|agent| {
-                Command::new(&test_exe)
-                    .args(["--exact", "retry_claim_subprocess", "--nocapture"])
-                    .env("QUORUM_TEST_RETRY_DB", &db_path)
-                    .env("QUORUM_TEST_RETRY_TASK", task_id.to_string())
-                    .env("QUORUM_TEST_RETRY_AGENT", agent)
-                    .env("QUORUM_TEST_RETRY_GATE", &gate_path)
-                    .env("QUORUM_TEST_RETRY_NOW", now.to_string())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
+        let mut children = Vec::with_capacity(agents.len());
+        for agent in &agents {
+            let child = Command::new(&test_exe)
+                .args(["--exact", "retry_claim_subprocess", "--nocapture"])
+                .env("QUORUM_TEST_RETRY_DB", &db_path)
+                .env("QUORUM_TEST_RETRY_TASK", task_id.to_string())
+                .env("QUORUM_TEST_RETRY_AGENT", agent)
+                .env("QUORUM_TEST_RETRY_GATE", &gate_path)
+                .env("QUORUM_TEST_RETRY_NOW", now.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            children.push(RunningChild::new(child));
+        }
         std::fs::write(&gate_path, b"go").unwrap();
 
         let outcomes: Vec<_> = agents
             .iter()
             .zip(children)
-            .map(|(agent, child)| (agent, child.wait_with_output().unwrap()))
+            .map(|(agent, child)| (agent, child.wait(CHILD_TIMEOUT)))
             .collect();
         let winners: Vec<_> = outcomes
             .iter()
@@ -173,6 +175,93 @@ fn n_process_provider_rework_claim_has_exactly_one_winner(rounds: usize, racers:
             .unwrap();
         assert_eq!(errors, 0, "round {round}: normal losers logged errors");
     }
+}
+
+struct RunningChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl RunningChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn wait(mut self, timeout: Duration) -> Output {
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.reaped = true;
+                    break status;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    self.kill_and_reap();
+                    panic!("provider retry helper exceeded {timeout:?}");
+                }
+                Err(error) => {
+                    self.kill_and_reap();
+                    panic!("wait for provider retry helper: {error}");
+                }
+            }
+        };
+        Output {
+            status,
+            stdout: read_bounded(
+                self.child
+                    .stdout
+                    .take()
+                    .expect("helper stdout must be piped"),
+                "stdout",
+            ),
+            stderr: read_bounded(
+                self.child
+                    .stderr
+                    .take()
+                    .expect("helper stderr must be piped"),
+                "stderr",
+            ),
+        }
+    }
+
+    fn kill_and_reap(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+        self.reaped = true;
+    }
+}
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if self.child.try_wait().ok().flatten().is_none() {
+            self.child.kill().ok();
+        }
+        self.child.wait().ok();
+        self.reaped = true;
+    }
+}
+
+fn read_bounded(mut reader: impl Read, stream: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_CAPTURE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|error| panic!("read provider retry helper {stream}: {error}"));
+    assert!(
+        bytes.len() <= MAX_CAPTURE_BYTES,
+        "provider retry helper {stream} exceeds {MAX_CAPTURE_BYTES} bytes"
+    );
+    bytes
 }
 
 #[test]
