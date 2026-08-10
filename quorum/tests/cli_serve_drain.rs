@@ -43,6 +43,21 @@ fn init_git_repo(dir: &std::path::Path) {
         .args(["-C", &d, "commit", "--allow-empty", "-m", "init"])
         .status()
         .unwrap();
+    // Align the fixture's initial origin/main with the executable under test.
+    // The daemon now compares origin directly to its embedded build SHA rather
+    // than taking a startup baseline, so a fresh fixture must represent a
+    // current build before a test advances it.
+    let source_repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("quorum crate has repository parent");
+    Command::new("git")
+        .args(["-C", &d, "fetch", &source_repo.to_string_lossy(), "HEAD"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &d, "reset", "--hard", "FETCH_HEAD"])
+        .status()
+        .unwrap();
     Command::new("git")
         .args(["-C", &d, "remote", "add", "origin", &*d])
         .status()
@@ -528,6 +543,93 @@ fn other_repo_merge_does_not_drain() {
     handle.stop();
 }
 
+/// Trigger B treats an origin matching the running build as current.
+#[test]
+fn build_sha_matching_origin_does_not_drain() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--self-update-drain"],
+    );
+
+    assert!(
+        handle.wait_for("decision=Current", 15),
+        "did not observe current build-staleness decision: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "current build SHA must not stop the daemon: {:?}",
+        handle.lines
+    );
+    assert!(
+        !handle.lines.iter().any(|line| line.contains("DRAIN:")),
+        "current build SHA must not start a drain: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
+/// A failed staleness check is explicitly non-fatal so offline supervisors do
+/// not enter a restart loop.
+#[test]
+fn unreachable_origin_logs_warning_and_daemon_keeps_running() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let d = repo_dir.path().to_string_lossy().to_string();
+    Command::new("git")
+        .args(["-C", &d, "remote", "set-url", "origin", "/does/not/exist"])
+        .status()
+        .unwrap();
+    let names_file = write_names_file(home.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &["--self-update-drain"],
+    );
+
+    assert!(
+        handle.wait_for("WARN: self-update-drain build staleness check failed", 15),
+        "did not observe staleness warning: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.child.try_wait().unwrap().is_none(),
+        "unreachable origin must not stop the daemon: {:?}",
+        handle.lines
+    );
+    handle.stop();
+}
+
 /// Drain timeout force-kills remaining agents and still exits 75.
 /// Uses Trigger B (sha change) to start drain while agent is mid-turn.
 #[test]
@@ -619,6 +721,14 @@ fn drain_timeout_force_kills_and_exits_75() {
         Some(75),
         "expected exit 75, got {:?}. Lines: {:?}",
         status.code(),
+        handle.lines
+    );
+    assert!(
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains("decision=Behind")),
+        "advanced origin/main did not record a behind decision: {:?}",
         handle.lines
     );
 
