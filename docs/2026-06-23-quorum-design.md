@@ -1773,9 +1773,10 @@ serializes decomposition per repository: it stops new managed delivery, lets act
 finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
 regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
 worker. Every `continue_pr` task dispatches directly because only the source task carries authority
-to publish to the bound PR. A non-continuation XL task with `cx_est` 1–3 violates the classification
-rubric and is parked with an explicit reclassify-or-rescope reason. Review-only L/XL work is parked
-for external splitting.
+to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
+any classified size because it has no implementation work to decompose. A non-continuation XL task
+with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
+reclassify-or-rescope reason.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
 read-only repository view and bounded source
@@ -1906,10 +1907,11 @@ labels are ignored.
   dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
   `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
   as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
-  decomposition route, regardless of classified size. The daemon also atomically parks an
-  unready classification and review-only L/XL work. Parking writes the standard refs, note, and
-  event with no claim, run, or error row; an explicit retry requests reclassification of
-  remaining work and a newly dispatchable result restores the saved lifecycle status.
+  decomposition route, regardless of classified size. A review-only task likewise always takes
+  the direct reviewer route at any classified size. The daemon atomically parks an unready
+  classification. Parking writes the standard refs, note, and event with no claim, run, or error
+  row; an explicit retry requests reclassification of remaining work and a newly dispatchable
+  result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`

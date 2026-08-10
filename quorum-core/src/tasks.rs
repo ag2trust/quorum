@@ -737,7 +737,7 @@ pub fn claim(
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
         SELECT 1 FROM task_decompositions WHERE freeze_active=1
     )";
-    const DIRECT_DISPATCH_CLAUSE: &str = "(continue_pr IS NOT NULL OR (
+    const DIRECT_DISPATCH_CLAUSE: &str = "(review_only=1 OR continue_pr IS NOT NULL OR (
         (json_extract(refs, '$.cx_size') IN ('S','M') OR (
             json_extract(refs, '$.cx_size')='L'
             AND json_extract(refs, '$.cx_est') <= 3
@@ -791,6 +791,7 @@ pub fn claim(
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
+                       AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
                        AND {DIRECT_DISPATCH_CLAUSE}
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
@@ -815,6 +816,7 @@ pub fn claim(
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
+                   AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
                    AND {DIRECT_DISPATCH_CLAUSE}
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
@@ -916,7 +918,8 @@ pub fn claim_provider_retry_rework(
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
-               AND (continue_pr IS NOT NULL OR (
+               AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
+               AND (review_only=1 OR continue_pr IS NOT NULL OR (
                    (json_extract(refs, '$.cx_size') IN ('S','M') OR (
                        json_extract(refs, '$.cx_size')='L'
                        AND json_extract(refs, '$.cx_est') <= 3
@@ -1039,7 +1042,7 @@ pub fn claim_remediation_rework_with_feedback(
                  OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L','XL')
                  OR json_type(refs, '$.cx_ready') IS NOT 'true'
                  OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
-                 OR NOT (continue_pr IS NOT NULL OR (
+                 OR NOT (review_only=1 OR continue_pr IS NOT NULL OR (
                      (json_extract(refs, '$.cx_size') IN ('S','M') OR (
                          json_extract(refs, '$.cx_size')='L'
                          AND json_extract(refs, '$.cx_est') <= 3
@@ -1134,7 +1137,9 @@ pub fn reserve_reviewer_provision(
                AND json_valid(t.refs)
                AND json_type(t.refs,'$.cx_est')='integer'
                AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
-               AND (t.continue_pr IS NOT NULL OR (
+               AND json_type(t.refs,'$.cx_size')='text'
+               AND json_extract(t.refs,'$.cx_size') IN ('S','M','L','XL')
+               AND (t.review_only=1 OR t.continue_pr IS NOT NULL OR (
                    (json_extract(t.refs,'$.cx_size') IN ('S','M') OR (
                        json_extract(t.refs,'$.cx_size')='L'
                        AND json_extract(t.refs,'$.cx_est') <= 3
@@ -1142,7 +1147,8 @@ pub fn reserve_reviewer_provision(
                    AND NOT (json_extract(t.refs,'$.cx_est')=5
                             AND json_extract(t.refs,'$.cx_size')='L')
                ))
-               AND json_extract(t.refs,'$.cx_ready')=1
+               AND json_type(t.refs,'$.cx_ready')='true'
+               AND json_type(t.refs,'$.cx_not_ready_reason')='null'
                AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
          )",
@@ -2774,7 +2780,11 @@ pub fn classification_is_complete(refs: &Option<String>) -> bool {
 
 /// Classification policy is intentionally separate from model routing: difficult
 /// focused work may run, while unready or compound work is parked.
-pub fn classification_is_dispatchable(refs: &Option<String>, continue_pr: Option<i64>) -> bool {
+pub fn classification_is_dispatchable(
+    refs: &Option<String>,
+    review_only: bool,
+    continue_pr: Option<i64>,
+) -> bool {
     if !classification_is_complete(refs) {
         return false;
     }
@@ -2793,7 +2803,10 @@ pub fn classification_is_dispatchable(refs: &Option<String>, continue_pr: Option
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
     ready
         && (1..=5).contains(&cx)
-        && (continue_pr.is_some() || matches!(size, "S" | "M") || (size == "L" && cx <= 3))
+        && (review_only
+            || continue_pr.is_some()
+            || matches!(size, "S" | "M")
+            || (size == "L" && cx <= 3))
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -2953,9 +2966,9 @@ pub(crate) fn park_complexity_five_tx(
 }
 
 /// Reconcile non-admissible classifications written by an older daemon or
-/// changed while this daemon was stopped. Admission-ready L/XL implementation
-/// tasks with decomposition-range estimates are intentionally left open;
-/// review-only large work and low-complexity non-continuation XL work are held.
+/// changed while this daemon was stopped. Admission-ready review-only tasks and
+/// L/XL implementation tasks with decomposition-range estimates are
+/// intentionally left runnable; low-complexity non-continuation XL work is held.
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
@@ -2964,7 +2977,6 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
                AND (json_extract(refs, '$.cx_ready')!=1
-                    OR (review_only=1 AND json_extract(refs, '$.cx_size') IN ('L','XL'))
                     OR (review_only=0 AND continue_pr IS NULL
                         AND json_extract(refs, '$.cx_size')='XL'
                         AND json_extract(refs, '$.cx_est') <= 3))
@@ -6002,7 +6014,7 @@ mod tests {
 
         let moderate_refs = get(&conn, moderate_l).unwrap().unwrap().refs;
         assert!(classification_is_complete(&moderate_refs));
-        assert!(classification_is_dispatchable(&moderate_refs, None));
+        assert!(classification_is_dispatchable(&moderate_refs, false, None));
         assert!(claim(&mut conn, "moderate", Some(moderate_l), &[], TTL, 3)
             .unwrap()
             .is_some());
@@ -6033,7 +6045,11 @@ mod tests {
             )
             .unwrap();
             let task = get(&conn, id).unwrap().unwrap();
-            assert!(classification_is_dispatchable(&task.refs, task.continue_pr));
+            assert!(classification_is_dispatchable(
+                &task.refs,
+                task.review_only,
+                task.continue_pr
+            ));
             assert!(claim(
                 &mut conn,
                 &format!("continue-{size}"),
@@ -9434,12 +9450,264 @@ mod tests {
     }
 
     #[test]
-    fn legacy_category_five_is_unclaimable_then_reconciled_once() {
+    fn ready_large_review_only_gets_atomic_review_and_remediation_authority() {
+        let (_d, mut c) = open_tmp();
+        for (index, (size, cx_est)) in [("L", 5), ("XL", 2)].into_iter().enumerate() {
+            let offset = index as i64 * 10;
+            let id = create(
+                &mut c,
+                "owner",
+                &format!("review {size}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(500 + index as i64),
+                1000 + index as i64,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET refs=json_object(
+                    'pr', ?2, 'cx_est', ?4, 'cx_size', ?3, 'cx_ready', json('true'),
+                    'cx_not_ready_reason', json('null'), 'cx_by', 'test:v2'
+                 ) WHERE id=?1",
+                params![id, 500 + index as i64, size, cx_est],
+            )
+            .unwrap();
+            let task = get(&c, id).unwrap().unwrap();
+            assert!(task.review_only);
+            assert_eq!(task.status, "in-review");
+            assert!(classification_is_dispatchable(
+                &task.refs,
+                task.review_only,
+                task.continue_pr
+            ));
+
+            let token = format!("review-{size}");
+            assert!(reserve_reviewer_provision(&mut c, id, &token, "r1", 1100 + offset,).unwrap());
+            assert!(
+                !reserve_reviewer_provision(
+                    &mut c,
+                    id,
+                    &format!("loser-{size}"),
+                    "r1",
+                    1101 + offset,
+                )
+                .unwrap(),
+                "the reviewer reservation remains single-holder for size {size}"
+            );
+
+            let reviewer = format!("reviewer-{size}");
+            let attached = claim(&mut c, &reviewer, Some(id), &[], TTL, 1102 + offset)
+                .unwrap()
+                .expect("large review-only task must accept reviewer attachment");
+            assert_eq!(attached.reviewer.as_deref(), Some(reviewer.as_str()));
+            assert!(release_reviewer_provision(&mut c, id, &token).unwrap());
+
+            let rework =
+                apply_event(&mut c, &reviewer, id, &Event::VerdictChanges, 1103 + offset).unwrap();
+            assert_eq!(rework.task.status, "rework");
+            let remediation = format!("remediation-{size}");
+            let claimed = claim_remediation_rework(&mut c, &remediation, id, TTL, 1104 + offset)
+                .unwrap()
+                .expect("large review-only rework must accept remediation authority");
+            assert_eq!(claimed.assignee.as_deref(), Some(remediation.as_str()));
+            assert!(has_live_lease(&c, id, 1104 + offset));
+        }
+
+        assert_eq!(park_classified_complexity_five(&mut c, 2000).unwrap(), 0);
+        let parked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE status='failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, 0);
+    }
+
+    #[test]
+    fn ready_large_review_only_provider_retry_rework_gets_atomic_authority() {
+        let (_d, mut c) = open_tmp();
+        for (index, (size, cx_est)) in [("L", 5), ("XL", 2)].into_iter().enumerate() {
+            let id = create(
+                &mut c,
+                "owner",
+                &format!("provider retry {size}"),
+                None,
+                0,
+                None,
+                Some(&format!(
+                    r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null}}"#
+                )),
+                None,
+                Some(700 + index as i64),
+                1200 + index as i64,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET status='rework',
+                     refs=json_set(refs,'$.runner_retry',
+                         json_object('requested',json('true')))
+                 WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+
+            let agent = format!("provider-retry-{size}");
+            let claimed = claim_provider_retry_rework(&mut c, &agent, id, TTL, 1300 + index as i64)
+                .unwrap()
+                .expect("large review-only provider retry must acquire worker authority");
+            assert_eq!(claimed.assignee.as_deref(), Some(agent.as_str()));
+            assert!(has_live_lease(&c, id, 1300 + index as i64));
+        }
+    }
+
+    #[test]
+    fn review_only_atomic_authority_still_requires_complete_ready_classification_and_no_freeze() {
+        let (_d, mut c) = open_tmp();
+        let incomplete = create(
+            &mut c,
+            "owner",
+            "incomplete review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(600),
+            1000,
+        )
+        .unwrap();
+        let unready = create(
+            &mut c,
+            "owner",
+            "unready review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(601),
+            1001,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET refs=json_object(
+                'pr',600,'cx_est',4,'cx_size','XL','cx_ready',json('true'))
+             WHERE id=?1",
+            [incomplete],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET refs=json_object(
+                'pr',601,'cx_est',4,'cx_size','XL','cx_ready',json('false'),
+                'cx_not_ready_reason','scope is incomplete')
+             WHERE id=?1",
+            [unready],
+        )
+        .unwrap();
+
+        for (id, label) in [(incomplete, "incomplete"), (unready, "unready")] {
+            assert!(!reserve_reviewer_provision(&mut c, id, label, "r1", 1010).unwrap());
+            assert!(claim(&mut c, label, Some(id), &[], TTL, 1011)
+                .unwrap()
+                .is_none());
+            c.execute(
+                "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+            assert!(claim_remediation_rework(&mut c, label, id, TTL, 1012)
+                .unwrap()
+                .is_none());
+        }
+
+        let source = create(
+            &mut c,
+            "owner",
+            "planning source",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1020,
+        )
+        .unwrap();
+        let frozen_review = create(
+            &mut c,
+            "owner",
+            "ready review under freeze",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"pr":602,"cx_est":5,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null}"#,
+            ),
+            None,
+            Some(602),
+            1021,
+        )
+        .unwrap();
+        crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 1022,
+            },
+        )
+        .unwrap()
+        .expect("planning source must acquire the freeze");
+
+        assert!(!reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
+        assert!(
+            claim(&mut c, "frozen", Some(frozen_review), &[], TTL, 1024,)
+                .unwrap()
+                .is_none()
+        );
+        c.execute(
+            "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
+            [frozen_review],
+        )
+        .unwrap();
+        assert!(
+            claim_remediation_rework(&mut c, "frozen", frozen_review, TTL, 1025)
+                .unwrap()
+                .is_none()
+        );
+
+        let reservations: i64 = c
+            .query_row(
+                "SELECT count(*) FROM reviewer_provision_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claims: i64 = c
+            .query_row("SELECT count(*) FROM claims WHERE active=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(reservations, 0);
+        assert_eq!(claims, 0);
+    }
+
+    #[test]
+    fn legacy_low_complexity_xl_is_unclaimable_then_reconciled_once() {
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
             "boss",
-            "legacy category five",
+            "legacy low complexity XL",
             None,
             0,
             None,
@@ -9450,7 +9718,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
+            "UPDATE tasks SET refs=json_object('cx_est', 2, 'cx_size','XL','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
             params![id],
         )
         .unwrap();
@@ -9464,7 +9732,7 @@ mod tests {
         let task = get(&c, id).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(task.status, "failed");
-        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_est"], 2);
         assert_eq!(refs["cx_by"], "legacy:v1");
         assert_eq!(refs["daemon_parked"], true);
         let events: i64 = c
@@ -9478,14 +9746,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_category_five_reconciliation_progresses_in_bounded_batches() {
+    fn legacy_low_complexity_xl_reconciliation_progresses_in_bounded_batches() {
         let (_d, mut c) = open_tmp();
         let total = SWEEP_LIMIT + 1;
         for seq in 0..total {
             let id = create(
                 &mut c,
                 "boss",
-                &format!("legacy category five {seq}"),
+                &format!("legacy low complexity XL {seq}"),
                 None,
                 0,
                 None,
@@ -9497,7 +9765,7 @@ mod tests {
             .unwrap();
             c.execute(
                 "UPDATE tasks
-                 SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
+                 SET refs=json_object('cx_est', 2, 'cx_size','XL','cx_ready',true,'cx_by', 'legacy:v1')
                  WHERE id=?1",
                 params![id],
             )
@@ -9524,7 +9792,7 @@ mod tests {
                 "SELECT count(*) FROM tasks
                  WHERE status='failed'
                    AND json_extract(refs, '$.daemon_parked')=1
-                   AND json_extract(refs, '$.cx_est')=5",
+                   AND json_extract(refs, '$.cx_est')=2",
                 [],
                 |row| row.get(0),
             )

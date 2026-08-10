@@ -5589,8 +5589,11 @@ async fn reconcile_remediation_retries(
             Ok(tasks::list_dependency_ready_rework(&conn)?
                 .into_iter()
                 .filter(|task| {
-                    tasks::classification_is_dispatchable(&task.refs, task.continue_pr)
-                        && remediation_retry_feedback(task.refs.as_deref()).is_some()
+                    tasks::classification_is_dispatchable(
+                        &task.refs,
+                        task.review_only,
+                        task.continue_pr,
+                    ) && remediation_retry_feedback(task.refs.as_deref()).is_some()
                 })
                 .collect())
         })
@@ -10426,7 +10429,8 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
-                    if !tasks::classification_is_dispatchable(task_refs, *continue_pr) {
+                    if !tasks::classification_is_dispatchable(task_refs, *review_only, *continue_pr)
+                    {
                         log(&format!(
                             "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
                         ));
@@ -12601,7 +12605,7 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if !tasks::classification_is_dispatchable(&t.refs, t.continue_pr) {
+            if !tasks::classification_is_dispatchable(&t.refs, t.review_only, t.continue_pr) {
                 return false;
             }
             if t.review_only {
