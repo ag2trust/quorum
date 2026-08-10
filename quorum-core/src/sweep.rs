@@ -312,22 +312,28 @@ fn task_ref_guard_predicates() -> String {
     guards
 }
 
+/// Primary-key page used to drive opportunistic task reclamation. Keep age,
+/// status, and reference predicates out of this query: adding them can make
+/// SQLite choose a secondary index and sort every qualifying historical row
+/// before applying `LIMIT`, which defeats the writer-lock bound.
+const RECLAIMABLE_TASK_WINDOW_SQL: &str =
+    "SELECT id FROM tasks WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
+
 /// Opportunistic per-mutation sweep: reclaim at most `limit` aged done tasks
 /// whose operational children are drained and whose durable references are
 /// gone.
 ///
-/// The candidate window is bounded by [`SWEEP_LIMIT`] *before* the guard
-/// predicates apply, using `sweep_cursors('reclaimable_tasks')` as a rotating
-/// starting point (`id > cursor`). Ever-growing durable-reference-pinned
-/// provenance can therefore never inflate per-mutation examination work — a
-/// pinned task consumes one slot in a single sweep window, then the cursor
-/// advances past it. When the cursor reaches the tail, the next call resets
-/// it to 0 so unreferenced tasks at any id eventually reclaim (no starvation
-/// even if pinned tasks dominate).
+/// The raw task-ID window is bounded by [`SWEEP_LIMIT`] *before* age, status,
+/// or guard predicates apply. `sweep_cursors('reclaimable_tasks')` supplies a
+/// rotating primary-key starting point (`id > cursor`), and the exact query is
+/// pinned by a query-plan regression below. Ever-growing retained history can
+/// therefore never inflate per-mutation candidate discovery: each task ID
+/// consumes one slot in one window, then the cursor advances past it. A short
+/// tail window resets the cursor to 0 immediately so tasks that become eligible
+/// after an earlier pass are revisited without starvation.
 ///
-/// Task #395 acceptance boundary: this keeps the guarded probe served by six
-/// indexed lookups per candidate and caps total per-mutation work at
-/// `SWEEP_LIMIT * 6 * O(log n)`, independent of retained history size.
+/// Task #395 acceptance boundary: candidate discovery is one bounded primary-
+/// key range page, and at most `SWEEP_LIMIT` task IDs reach the fixed guard set.
 fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     let cursor: i64 = conn
         .query_row(
@@ -338,23 +344,19 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
         .optional()?
         .unwrap_or(0);
 
-    let horizon = now - DONE_TASK_TTL_SECS;
     let candidates: Vec<i64> = conn
-        .prepare(
-            "SELECT id FROM tasks
-             WHERE status='done' AND updated_at < ?1 AND id > ?2
-             ORDER BY id ASC LIMIT ?3",
-        )?
-        .query_map(params![horizon, cursor, limit as i64], |r| r.get(0))?
+        .prepare(RECLAIMABLE_TASK_WINDOW_SQL)?
+        .query_map(params![cursor, limit as i64], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // Advance the cursor to the highest examined id, or wrap to 0 when the
-    // scan runs off the tail so the next sweep restarts from the beginning.
+    // Advance after a full window. A short window proves this primary-key page
+    // reached the current tail, so wrap immediately and revisit the beginning
+    // on the next write. This remains fair even while new tasks are appended.
     // A no-op sweep (no candidates and cursor already 0) leaves the cursor
     // alone so a fresh DB does not accumulate a sweep_cursors row before it
     // has anything to reclaim.
     let new_cursor: Option<i64> = if let Some(&max) = candidates.last() {
-        Some(max)
+        Some(if candidates.len() < limit { 0 } else { max })
     } else if cursor > 0 {
         Some(0)
     } else {
@@ -372,16 +374,22 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
         return Ok(());
     }
 
-    // Apply guards to the bounded candidate set. Per-row NOT EXISTS is served
-    // by the durable-reference indexes materialized in schema.sql, so the
-    // guarded DELETE is O(k * 6 * log n) with k ≤ SWEEP_LIMIT.
+    // Apply eligibility and guards only to the bounded raw-ID window. Per-row
+    // durable NOT EXISTS probes are served by the indexes materialized in
+    // schema.sql; no age/status predicate participates in candidate discovery.
     let guards = task_ref_guard_predicates();
     let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!("DELETE FROM tasks WHERE id IN ({placeholders}){guards}");
-    let bound: Vec<&dyn rusqlite::ToSql> = candidates
+    let sql = format!(
+        "DELETE FROM tasks
+         WHERE id IN ({placeholders})
+           AND status='done' AND updated_at < ?{guards}"
+    );
+    let horizon = now - DONE_TASK_TTL_SECS;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = candidates
         .iter()
         .map(|v| v as &dyn rusqlite::ToSql)
         .collect();
+    bound.push(&horizon);
     conn.execute(&sql, bound.as_slice())?;
     Ok(())
 }
@@ -2215,15 +2223,40 @@ mod tests {
     }
 
     #[test]
+    fn sweep_candidate_discovery_uses_primary_key_page_without_history_sort() {
+        // Task #395 remediation, blocker #3: filtering age/status in the
+        // cursor query made SQLite choose tasks_reviewing_newest and sort the
+        // full qualifying history before LIMIT. Pin the exact production
+        // query to a rowid range seek with no temporary ordering structure.
+        let (_d, c) = open_tmp_fk();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECLAIMABLE_TASK_WINDOW_SQL}"))
+            .unwrap()
+            .query_map(params![0, SWEEP_LIMIT as i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("INTEGER PRIMARY KEY") && detail.contains("rowid>?")
+            }),
+            "candidate discovery must seek the tasks primary key above the rotating cursor: \
+             {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "candidate discovery must not enumerate and sort retained task history: {plan:?}"
+        );
+    }
+
+    #[test]
     fn sweep_on_write_examines_at_most_sweep_limit_candidates_per_call() {
-        // Task #395 remediation, blocker #2: even with the durable-ref
-        // indexes, the old shape applied LIMIT *after* the guard predicates,
-        // so every write's write transaction still probed each retained
-        // pinned aged task. Assert per-call candidate examination is bounded
-        // by SWEEP_LIMIT via the rotating cursor: create 3*SWEEP_LIMIT pinned
-        // aged done tasks, run one sweep, and confirm the cursor advanced by
-        // exactly SWEEP_LIMIT ids (proving the LIMIT applied *before* the
-        // guards ran).
+        // Task #395 remediation: every write must expose at most SWEEP_LIMIT
+        // raw IDs to eligibility and reference guards. Create 3*SWEEP_LIMIT
+        // pinned aged done tasks, run one sweep, and confirm the cursor moves
+        // across exactly one primary-key window.
         let (_d, mut c) = open_tmp_fk();
         let n = SWEEP_LIMIT * 3;
         let mut ids = Vec::with_capacity(n);
@@ -2232,6 +2265,13 @@ mod tests {
             insert_decomposition(&c, id);
             ids.push(id);
         }
+        // tasks::create runs opportunistic sweep itself; isolate the one call
+        // under test from cursor movement incurred while building the fixture.
+        c.execute(
+            "DELETE FROM sweep_cursors WHERE name='reclaimable_tasks'",
+            [],
+        )
+        .unwrap();
         let first = *ids.first().unwrap();
         let expected_cursor = first + SWEEP_LIMIT as i64 - 1;
 
@@ -2246,9 +2286,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             cursor, expected_cursor,
-            "cursor must advance by exactly SWEEP_LIMIT ids so per-mutation \
-             examination is bounded; retained pinned provenance cannot \
-             inflate write-lock time. cursor={cursor}, expected={expected_cursor}"
+            "cursor must advance by exactly one SWEEP_LIMIT-sized raw-ID window; \
+             retained pinned provenance cannot inflate write-lock time. \
+             cursor={cursor}, expected={expected_cursor}"
         );
         let survivors: i64 = c
             .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))

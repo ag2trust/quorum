@@ -37,12 +37,11 @@ CREATE TABLE IF NOT EXISTS cursors (
     PRIMARY KEY (agent_id, topic)
 );
 
--- v48: rotating cursors for bounded opportunistic sweep. Sweep-on-write
--- examines at most SWEEP_LIMIT aged done tasks per mutation and advances the
--- cursor, so ever-growing durable-reference-pinned provenance never inflates
--- per-mutation work even though every guard predicate is indexed. When the
--- cursor reaches the tail, the next sweep resets it to 0 so unreferenced
--- tasks at any id eventually reclaim. Sweep-all does not consult the cursor.
+-- v48: rotating cursors for bounded opportunistic sweep. Sweep-on-write pages
+-- over at most SWEEP_LIMIT raw task IDs before applying age/status/reference
+-- predicates, so retained history never inflates per-mutation candidate work.
+-- A short tail page resets the cursor to 0 so newly eligible lower task IDs are
+-- revisited fairly. Sweep-all does not consult the cursor.
 CREATE TABLE IF NOT EXISTS sweep_cursors (
     name  TEXT PRIMARY KEY,
     value INTEGER NOT NULL
