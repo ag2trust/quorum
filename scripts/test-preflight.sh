@@ -17,6 +17,9 @@ mkdir -p "$BIN"
 cat >"$BIN/cargo" <<'EOF'
 #!/bin/sh
 [ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || exit 1
+if [ -n "${PREFLIGHT_CARGO_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$PREFLIGHT_CARGO_LOG"
+fi
 exit 0
 EOF
 chmod +x "$BIN/cargo"
@@ -160,6 +163,14 @@ printf 'continuation worker\n' >> remediation
 git commit -qam 'finish ancestry-preserving continuation' \
   -m 'Co-Authored-By: Continue-Worker <continue-worker@example.invalid>'
 CONTINUATION_HEAD_SHA=$(git rev-parse HEAD)
+git fetch -q origin \
+  refs/heads/daemon/continuation-t3:refs/remotes/origin/daemon/continuation-t3
+git branch --set-upstream-to=origin/daemon/continuation-t3
+PATH="$BIN:$PATH" ./preflight.sh >"$TMP/full-merge-continuation.out"
+grep -q 'configured-upstream continuation-owned commits' \
+  "$TMP/full-merge-continuation.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' \
+  "$TMP/full-merge-continuation.out"
 PATH="$BIN:$PATH" git push -q origin \
   "$CONTINUATION_HEAD_SHA:refs/heads/daemon/continuation-t3"
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
@@ -225,6 +236,14 @@ printf 'continue B\n' >> remediation
 git commit -qam 'stacked continuation session' \
   -m 'Co-Authored-By: Continue-B <continue-b@example.invalid>'
 STACKED_CONTINUATION_SHA=$(git rev-parse HEAD)
+git branch --set-upstream-to=origin/daemon/continuation-t3
+if PATH="$BIN:$PATH" ./preflight.sh \
+  >"$TMP/full-stacked-continuation.out" 2>&1; then
+  echo 'expected full gate to reject an upstream-tracking branch without a new base merge' >&2
+  exit 1
+fi
+grep -q 'sessions in branch-owned commits' \
+  "$TMP/full-stacked-continuation.out"
 if PATH="$BIN:$PATH" git push -q origin \
   "$STACKED_CONTINUATION_SHA:refs/heads/daemon/continuation-t3" \
   >"$TMP/stacked-continuation.out" 2>&1; then
@@ -373,5 +392,27 @@ if PATH="$BIN:$PATH" ./preflight.sh \
   exit 1
 fi
 grep -q 'require --quick' "$TMP/full-continuation.out"
+
+# The full author gate must launch Cargo with this exact argument surface.
+# In particular, the explicit quorum-core/test-support feature builds the
+# private real-process helper used by the canaries; fake-agent tests cannot
+# catch a Cargo feature or helper-launch failure before their protocol starts.
+# Compare the complete ordered invocation log, rather than independently
+# finding flags, so additions, removals, and ordering drift all fail.
+cat >"$TMP/full-cargo.expected" <<'EOF'
+fmt --all -- --check
+clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings
+test --workspace --all-features --features quorum-core/test-support
+EOF
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/full.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/full.out"
+
+# CI must preserve the same explicit feature at the test boundary. Its test
+# command is what builds the real helper binary in a clean installed toolchain.
+grep -Fqx \
+  '      - run: cargo test --workspace --all-features --features quorum-core/test-support' \
+  "$ROOT/.github/workflows/ci.yml"
 
 echo 'test-preflight: PASS'

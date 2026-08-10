@@ -132,7 +132,14 @@ Contributor and agent instructions live in [`AGENTS.md`](AGENTS.md). The design 
 before submitting any change:
 
 ```sh
-./preflight.sh
+rtk proxy ./preflight.sh
+```
+
+The required suite includes one real-process SQLite smoke race per contention
+path. To run the full repeated contention depth on demand, use:
+
+```sh
+scripts/stress-process-canaries.sh
 ```
 
 ## License

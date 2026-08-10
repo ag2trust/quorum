@@ -96,7 +96,7 @@ primary = 100
 # self_update_drain = false
 # drain_timeout_secs = 900
 # self_repo = \"owner/name\"
-# sha_poll_interval_secs = 60
+# sha_poll_interval_secs = 600
 
 ## Diagnostics
 # log_dir = \"/path/to/logs\"
@@ -1223,7 +1223,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let r_drain_timeout = resolve_val(drain_timeout_secs, file_cfg.drain_timeout_secs, 900);
             let r_self_repo = resolve_opt_str(self_repo.as_deref(), file_cfg.self_repo.as_deref());
             let r_sha_poll =
-                resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 60);
+                resolve_val(sha_poll_interval_secs, file_cfg.sha_poll_interval_secs, 600);
+            if r_sha_poll.value == 0 {
+                return Err(QuorumError::Usage(
+                    "sha_poll_interval_secs must be greater than zero".into(),
+                ));
+            }
             let r_base_branch = resolve_str(
                 base_branch.as_deref(),
                 file_cfg.base_branch.as_deref(),
@@ -1250,6 +1255,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
             })?;
+            serve_config::validate_agent_bin_for_profiles(
+                r_agent_bin.value.as_deref(),
+                &model_profiles,
+            )?;
             let routing = file_cfg
                 .routing
                 .clone()

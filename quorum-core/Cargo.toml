@@ -4,9 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# Enables the exhaustive contract tests for the private real-process helper.
-# The helper itself is also built for the default decomposition process canaries
-# and is not a quorum CLI.
+# Builds the private real-process canary helper and its tests. This is
+# intentionally absent from the default feature set and is not a quorum CLI.
 test-support = []
 
 [dependencies]
@@ -22,6 +21,7 @@ tempfile = "3"
 [[bin]]
 name = "quorum-core-test-helper"
 path = "test-support/main.rs"
+required-features = ["test-support"]
 test = false
 bench = false
 doc = false
@@ -34,8 +34,13 @@ required-features = ["test-support"]
 [[test]]
 name = "decomposition_process"
 path = "tests/decomposition_process.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "assessment_process"
+path = "tests/assessment_process.rs"
+required-features = ["test-support"]
 
 [[test]]
 name = "test_helper_races"
 path = "tests/test_helper_races.rs"
-required-features = ["test-support"]

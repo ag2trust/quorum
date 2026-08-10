@@ -21,27 +21,33 @@ pub const EXIT_INTERNAL: i32 = 3;
 pub enum Operation {
     AllocateRole,
     ClaimTask,
+    ClaimProviderRetryRework,
     CancelSourceGraph,
     ApplyGraphEvent,
     ClaimCleanup,
+    MaterializeAssessment,
 }
 
 impl Operation {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::AllocateRole,
         Self::ClaimTask,
+        Self::ClaimProviderRetryRework,
         Self::CancelSourceGraph,
         Self::ApplyGraphEvent,
         Self::ClaimCleanup,
+        Self::MaterializeAssessment,
     ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AllocateRole => "allocate-role",
             Self::ClaimTask => "claim-task",
+            Self::ClaimProviderRetryRework => "claim-provider-retry-rework",
             Self::CancelSourceGraph => "cancel-source-graph",
             Self::ApplyGraphEvent => "apply-graph-event",
             Self::ClaimCleanup => "claim-cleanup",
+            Self::MaterializeAssessment => "materialize-assessment",
         }
     }
 }
@@ -91,6 +97,17 @@ pub struct ClaimTaskInput {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ClaimProviderRetryReworkInput {
+    pub db_path: PathBuf,
+    pub task_id: i64,
+    pub agent: String,
+    pub ttl: i64,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelSourceGraphInput {
     pub db_path: PathBuf,
     pub caller: String,
@@ -122,6 +139,18 @@ pub struct ApplyGraphEventInput {
 #[serde(deny_unknown_fields)]
 pub struct ClaimCleanupInput {
     pub db_path: PathBuf,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializeAssessmentInput {
+    pub db_path: PathBuf,
+    pub scope_kind: String,
+    pub scope_id: i64,
+    pub source_task_id: i64,
+    pub artifact_ids: Vec<i64>,
     pub now: i64,
     pub barrier: Barrier,
 }

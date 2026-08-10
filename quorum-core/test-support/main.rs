@@ -2,8 +2,9 @@ mod protocol;
 
 use protocol::{
     AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
-    MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    ClaimProviderRetryReworkInput, ClaimTaskInput, GraphEvent, MaterializeAssessmentInput,
+    Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS,
+    MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -67,9 +68,11 @@ fn run() -> Result<i32, HelperError> {
     let result = match operation {
         Operation::AllocateRole => allocate_role(parse(&input)?)?,
         Operation::ClaimTask => claim_task(parse(&input)?)?,
+        Operation::ClaimProviderRetryRework => claim_provider_retry_rework(parse(&input)?)?,
         Operation::CancelSourceGraph => cancel_source_graph(parse(&input)?)?,
         Operation::ApplyGraphEvent => apply_graph_event(parse(&input)?)?,
         Operation::ClaimCleanup => claim_cleanup(parse(&input)?)?,
+        Operation::MaterializeAssessment => materialize_assessment(parse(&input)?)?,
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -214,6 +217,29 @@ fn claim_task(input: ClaimTaskInput) -> Result<OperationResult, HelperError> {
     Ok(OperationResult::race(json!({"won": won}), won))
 }
 
+fn claim_provider_retry_rework(
+    input: ClaimProviderRetryReworkInput,
+) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    validate_positive("task id", input.task_id)?;
+    validate_text("agent", &input.agent)?;
+    validate_positive("ttl", input.ttl)?;
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let won = quorum_core::tasks::claim_provider_retry_rework(
+        &mut conn,
+        &input.agent,
+        input.task_id,
+        input.ttl,
+        input.now,
+    )?
+    .is_some();
+    Ok(OperationResult::race(
+        json!({"ok": won, "agent": input.agent}),
+        won,
+    ))
+}
+
 fn cancel_source_graph(input: CancelSourceGraphInput) -> Result<OperationResult, HelperError> {
     validate_path("database", &input.db_path)?;
     validate_positive("source task id", input.source_task_id)?;
@@ -276,6 +302,34 @@ fn claim_cleanup(input: ClaimCleanupInput) -> Result<OperationResult, HelperErro
             "artifact_kind": work.key.artifact_kind,
             "artifact_ref": work.key.artifact_ref,
             "attempt": work.attempt,
+        })),
+        None => OperationResult::race(json!({"won": false}), false),
+    })
+}
+
+fn materialize_assessment(
+    input: MaterializeAssessmentInput,
+) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    wait_at_barrier(&input.barrier)?;
+    let scope_kind =
+        quorum_core::review_followup_assessments::FollowupScopeKind::from_str(&input.scope_kind)?;
+    let value = quorum_core::review_followup_assessments::NewReviewFollowupAssessment::new(
+        scope_kind,
+        input.scope_id,
+        input.source_task_id,
+        input.artifact_ids,
+        input.now,
+    )?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(QuorumError::from)?;
+    let assessment =
+        quorum_core::review_followup_assessments::materialize_assessment(&mut conn, &value)?;
+    Ok(match assessment {
+        Some(assessment) => OperationResult::positive(json!({
+            "won": true,
+            "assessment_id": assessment.id(),
         })),
         None => OperationResult::race(json!({"won": false}), false),
     })

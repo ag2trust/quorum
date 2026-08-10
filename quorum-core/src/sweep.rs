@@ -126,18 +126,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                 params![target],
             )?;
             crate::events::emit(conn, "task_parked", &target, &park_reason, now)?;
-            // Failures are loud: alert the owner like Effect::NotifyOwner does.
-            conn.execute(
-                "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
-                 VALUES (?1, 'daemon', ?2, 'alert', ?3, ?4, ?5, 'owner')",
-                params![
-                    now,
-                    crate::feed::DEFAULT_TOPIC,
-                    format!("task #{id}: {park_reason}; parked — resume with `quorum task-retry`"),
-                    format!("task:{id}"),
-                    now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
-                ],
-            )?;
+            crate::tasks::alert_owner_of_park(conn, *id, &park_reason, now)?;
             continue;
         }
         // Only implementation tasks reach here: review_only tasks are never
@@ -291,6 +280,19 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
 /// dep is terminal (done/failed/cancelled) but at least one is failed or cancelled. They stay
 /// excluded from provisioning until an explicit retry, without losing their dependency context.
 pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
+    // sweep_on_write and sweep_all already call us inside their write
+    // transaction. Direct callers must make the terminal task update, note,
+    // event, and owner alert equally indivisible.
+    if conn.is_autocommit() {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let count = cascade_dead_deps_in_tx(&tx, now, limit)?;
+        tx.commit()?;
+        return Ok(count);
+    }
+    cascade_dead_deps_in_tx(conn, now, limit)
+}
+
+fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
     let doomed: Vec<(i64, i64, String)> = {
         let mut stmt = conn.prepare(
             "SELECT t.id, je.value AS dep_id, t.status
@@ -355,6 +357,7 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
             params![task_id, now, format!("parked: {reason}")],
         )?;
         crate::events::emit(conn, "task_parked", &target, &reason, now)?;
+        crate::tasks::alert_owner_of_park(conn, *task_id, &reason, now)?;
         count += 1;
     }
     Ok(count)
@@ -872,6 +875,133 @@ mod tests {
         assert!(
             evs.iter().any(|e| e.kind == "task_parked"),
             "task_parked event must be emitted"
+        );
+        let alert: (String, String, String, String, i64, String) = c
+            .query_row(
+                "SELECT author, kind, body, refs, expires_at, recipient
+                 FROM messages WHERE refs=?1",
+                params![format!("task:{child}")],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("dependency park must alert the owner");
+        assert_eq!(alert.0, "daemon");
+        assert_eq!(alert.1, "alert");
+        assert!(alert
+            .2
+            .contains(&format!("dependency #{dep} is terminal-not-done")));
+        assert!(alert.2.contains("quorum task-retry"));
+        assert_eq!(alert.3, format!("task:{child}"));
+        assert_eq!(
+            alert.4,
+            300 + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+            "park alert uses the default message TTL"
+        );
+        assert_eq!(alert.5, "owner");
+    }
+
+    #[test]
+    fn cascade_park_rolls_back_when_owner_alert_fails() {
+        let (_d, mut c) = open_tmp();
+        let dep = crate::tasks::create(&mut c, "boss", "dep", None, 0, None, None, None, None, 100)
+            .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', updated_at=200 WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        c.execute_batch(
+            "CREATE TRIGGER fail_owner_alert
+             BEFORE INSERT ON messages
+             WHEN NEW.kind='alert' AND NEW.recipient='owner'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected owner alert failure');
+             END;",
+        )
+        .unwrap();
+        let target = format!("task#{child}");
+        let notes_before: i64 = c
+            .query_row(
+                "SELECT count(*) FROM task_notes WHERE task_id=?1",
+                params![child],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events_before: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE subject=?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let messages_before: i64 = c
+            .query_row(
+                "SELECT count(*) FROM messages WHERE refs=?1",
+                params![format!("task:{child}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let error = cascade_dead_deps(&c, 300, 100).unwrap_err();
+        assert!(error.to_string().contains("injected owner alert failure"));
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open",
+            "the task update rolls back with the alert"
+        );
+        let notes_after: i64 = c
+            .query_row(
+                "SELECT count(*) FROM task_notes WHERE task_id=?1",
+                params![child],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let events_after: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE subject=?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let messages_after: i64 = c
+            .query_row(
+                "SELECT count(*) FROM messages WHERE refs=?1",
+                params![format!("task:{child}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            notes_after, notes_before,
+            "task note must roll back with the park"
+        );
+        assert_eq!(
+            events_after, events_before,
+            "event must roll back with the park"
+        );
+        assert_eq!(
+            messages_after, messages_before,
+            "alert must not be inserted when the park rolls back"
         );
     }
 

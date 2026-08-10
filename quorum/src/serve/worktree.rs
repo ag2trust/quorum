@@ -37,6 +37,18 @@ struct GitPipeOutput {
     exceeded_limit: bool,
 }
 
+/// Render captured git stderr only when it is safe to carry into a durable
+/// diagnostic. Git output is untrusted process output: replacement-decoding
+/// malformed bytes would make an operator believe the captured text was exact,
+/// and SQLite text must never receive an embedded NUL.
+fn git_stderr(stderr: &[u8]) -> String {
+    match std::str::from_utf8(stderr) {
+        Ok(value) if !value.contains('\0') => value.trim().to_string(),
+        Ok(_) => "git stderr rejected: contains embedded NUL".into(),
+        Err(_) => "git stderr rejected: invalid UTF-8".into(),
+    }
+}
+
 async fn drain_git_pipe<R>(
     mut pipe: R,
     limit: usize,
@@ -538,7 +550,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add (reuse branch) failed: {}",
-                    String::from_utf8_lossy(&add.stderr)
+                    git_stderr(&add.stderr)
                 ));
             }
         } else {
@@ -549,7 +561,7 @@ impl WorktreeManager {
             if !add.status.success() {
                 return Err(format!(
                     "git worktree add failed: {}",
-                    String::from_utf8_lossy(&add.stderr)
+                    git_stderr(&add.stderr)
                 ));
             }
         }
@@ -573,7 +585,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {remote_branch} failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
+                git_stderr(&fetch.stderr)
             ));
         }
 
@@ -603,7 +615,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
+                git_stderr(&add.stderr)
             ));
         }
 
@@ -630,7 +642,7 @@ impl WorktreeManager {
         if !fetched.status.success() {
             return Err(format!(
                 "git fetch origin {remote_ref} failed: {}",
-                String::from_utf8_lossy(&fetched.stderr)
+                git_stderr(&fetched.stderr)
             ));
         }
 
@@ -668,7 +680,7 @@ impl WorktreeManager {
         } else {
             Err(format!(
                 "git merge {base_ref} failed without leaving a resolvable merge: {}",
-                String::from_utf8_lossy(&merged.stderr)
+                git_stderr(&merged.stderr)
             ))
         }
     }
@@ -692,7 +704,7 @@ impl WorktreeManager {
         if !fetch.status.success() {
             return Err(format!(
                 "git fetch origin {refspec} failed: {}",
-                String::from_utf8_lossy(&fetch.stderr)
+                git_stderr(&fetch.stderr)
             ));
         }
 
@@ -720,7 +732,7 @@ impl WorktreeManager {
         if !add.status.success() {
             return Err(format!(
                 "git worktree add failed: {}",
-                String::from_utf8_lossy(&add.stderr)
+                git_stderr(&add.stderr)
             ));
         }
 
@@ -736,7 +748,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git config {} failed: {}",
                 args.join(" "),
-                String::from_utf8_lossy(&out.stderr)
+                git_stderr(&out.stderr)
             ));
         }
         Ok(())
@@ -776,7 +788,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --get core.worktree failed: {}",
-                    String::from_utf8_lossy(&worktree.stderr)
+                    git_stderr(&worktree.stderr)
                 ));
             }
         }
@@ -805,7 +817,7 @@ impl WorktreeManager {
             _ => {
                 return Err(format!(
                     "git config --bool --get core.bare failed: {}",
-                    String::from_utf8_lossy(&bare.stderr)
+                    git_stderr(&bare.stderr)
                 ));
             }
         }
@@ -849,7 +861,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                String::from_utf8_lossy(&out.stderr)
+                git_stderr(&out.stderr)
             ));
         }
         let actual = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -869,7 +881,7 @@ impl WorktreeManager {
             return Err(format!(
                 "git rev-parse HEAD failed in {}: {}",
                 worktree_dir.display(),
-                String::from_utf8_lossy(&out.stderr)
+                git_stderr(&out.stderr)
             ));
         }
         let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -2285,6 +2297,19 @@ mod tests {
         mgr.remove(repo_dir.path(), &wt_path).await.ok();
     }
 
+    #[test]
+    fn captured_git_stderr_rejects_invalid_utf8_and_nul() {
+        assert_eq!(
+            git_stderr(b"fatal: cannot lock ref\0detail"),
+            "git stderr rejected: contains embedded NUL"
+        );
+        assert_eq!(
+            git_stderr(&[b'f', b'a', 0x80]),
+            "git stderr rejected: invalid UTF-8"
+        );
+        assert_eq!(git_stderr(b" fatal: missing ref\n"), "fatal: missing ref");
+    }
+
     /// Repo with a real bare `origin` remote and `main` pushed. Returns
     /// (repo dir, bare remote dir) inside `base`.
     fn init_repo_with_bare_remote(base: &Path) -> (PathBuf, PathBuf) {
@@ -2782,12 +2807,12 @@ mod tests {
         assert_ne!(git_rev_parse(&bare, pr_head), mutable_head);
     }
 
-    /// Regression for PR #483 remediation review: a publication failure may
-    /// remove the source worktree/branch before an operator retries the parked
-    /// task. The retry can use a different run-local remediation branch, but
-    /// it must still publish intent A rather than its replacement HEAD B.
+    /// A crash-window replay with no accepted replacement delivery must keep
+    /// publishing the exact pinned intent even if another worktree HEAD moves.
+    /// The serve layer explicitly supersedes this pin only when a parked
+    /// rework retry completes a new delivery round.
     #[tokio::test]
-    async fn publication_pin_replays_exact_source_after_branch_cleanup_and_retry() {
+    async fn publication_pin_replays_exact_source_after_branch_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, bare) = init_repo_with_bare_remote(tmp.path());
         let pr_head = "fix/publication-retry";
@@ -2837,14 +2862,14 @@ mod tests {
         )
         .status
         .success());
-        let replacement_head = git_rev_parse(&retry_wt, "HEAD");
-        assert_ne!(replacement_head, intent_sha);
+        let unrelated_head = git_rev_parse(&retry_wt, "HEAD");
+        assert_ne!(unrelated_head, intent_sha);
 
         mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha, "main")
             .await
-            .expect("task retry must replay the durable intent source");
+            .expect("crash replay must retain the durable intent source");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
-        assert_ne!(git_rev_parse(&bare, pr_head), replacement_head);
+        assert_ne!(git_rev_parse(&bare, pr_head), unrelated_head);
 
         mgr.retire_publication_source(&repo, 263, &intent_sha)
             .await

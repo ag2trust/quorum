@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 43). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 47). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -88,7 +88,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     edit_count   INTEGER NOT NULL DEFAULT 0,
     -- v35: authoritative existing-PR implementation intent. Unlike refs.pr, this field is
     -- creator-selected only through --continue-pr and controls daemon provisioning.
-    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0)
+    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0),
+    -- v47: daemon-owned terminal provenance. NULL deliberately preserves legacy/unknown
+    -- completions without guessing whether a retained refs.pr actually merged.
+    completion_provenance TEXT
+        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual'))
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two
@@ -616,6 +620,78 @@ CREATE TABLE IF NOT EXISTS review_followup_artifacts (
         END
     )
 );
+
+-- v44: dormant follow-up assessment storage. The aggregate is unique by
+-- semantic scope; `active` is an explicit per-target authority sentinel. No
+-- daemon or planner path consumes these rows until the final activation task.
+CREATE TABLE IF NOT EXISTS review_followup_assessments (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    target                TEXT NOT NULL,
+    scope_kind            TEXT NOT NULL CHECK(scope_kind IN ('task', 'graph')),
+    scope_id              INTEGER NOT NULL CHECK(scope_id > 0),
+    source_task_id        INTEGER NOT NULL REFERENCES tasks(id),
+    state                 TEXT NOT NULL CHECK(state IN (
+                              'pending', 'planning', 'provider-backoff', 'held', 'completed')),
+    active                INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    membership_sealed     INTEGER NOT NULL DEFAULT 1 CHECK(membership_sealed IN (0, 1)),
+    proposal_attempts     INTEGER NOT NULL DEFAULT 0 CHECK(proposal_attempts BETWEEN 0 AND 3),
+    provider_failures     INTEGER NOT NULL DEFAULT 0 CHECK(provider_failures BETWEEN 0 AND 3),
+    planner_provider      TEXT,
+    planner_model         TEXT,
+    planner_assignment_id INTEGER REFERENCES role_assignments(id),
+    base_sha              TEXT,
+    hold_code             TEXT,
+    hold_summary          TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE(scope_kind, scope_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_followup_assessment
+    ON review_followup_assessments(target) WHERE active = 1;
+
+-- Membership is immutable once materialized. Fresh aggregate rows are sealed
+-- by default; the core materializer explicitly opens and irreversibly seals
+-- membership inside its BEGIN IMMEDIATE transaction. The artifact-level UNIQUE
+-- is separate from the composite primary key so one artifact cannot
+-- participate in two different assessments.
+CREATE TABLE IF NOT EXISTS review_followup_assessment_artifacts (
+    assessment_id INTEGER NOT NULL REFERENCES review_followup_assessments(id),
+    artifact_id   INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),
+    PRIMARY KEY (assessment_id, artifact_id)
+);
+
+-- v45: memberships are append-once at the storage boundary. These triggers
+-- also retrofit immutability onto v44 databases without recreating the table.
+CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_update
+BEFORE UPDATE ON review_followup_assessment_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment membership is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_delete
+BEFORE DELETE ON review_followup_assessment_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment membership is immutable');
+END;
+
+-- v44 tables had non-negative counter checks but no upper storage check.
+-- Guard both insert and update so migrated and fresh databases share the
+-- three-attempt bound even for writes outside the core API.
+CREATE TRIGGER IF NOT EXISTS review_followup_assessment_counter_insert_bound
+BEFORE INSERT ON review_followup_assessments
+WHEN NEW.proposal_attempts NOT BETWEEN 0 AND 3
+  OR NEW.provider_failures NOT BETWEEN 0 AND 3
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment counter exceeds bound');
+END;
+
+CREATE TRIGGER IF NOT EXISTS review_followup_assessment_counter_update_bound
+BEFORE UPDATE OF proposal_attempts, provider_failures ON review_followup_assessments
+WHEN NEW.proposal_attempts NOT BETWEEN 0 AND 3
+  OR NEW.provider_failures NOT BETWEEN 0 AND 3
+BEGIN
+    SELECT RAISE(ABORT, 'follow-up assessment counter exceeds bound');
+END;
 
 -- v24 (#127): durable post-merge collector retry queue. Each row is a pending
 -- collector invocation — the daemon enqueues one at MergeSucceeded and drains
