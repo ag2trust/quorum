@@ -40,12 +40,14 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 4
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Explicitly enables the non-product real-process contention helpers.
-      - run: cargo test --workspace --all-features
+      # Keeps the real-process helper canaries in the standard threaded suite.
+      - run: cargo test --workspace --all-features --features quorum-core/test-support
 
   shell-tests:
     name: shell-tests
