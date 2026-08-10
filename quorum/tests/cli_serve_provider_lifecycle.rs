@@ -61,6 +61,47 @@ fn routing_config(provider: &str, model: &str) -> String {
     )
 }
 
+/// Route future worker allocations to Claude while retaining the original
+/// Codex profile. An in-flight Codex worker may continue; a new worker would
+/// use the current Claude pool.
+fn rerouted_worker_config() -> String {
+    "[model_profiles.codex]\n\
+     runner = \"codex\"\n\
+     model = \"gpt-5.6-terra\"\n\
+     effort = \"high\"\n\
+     [model_profiles.claude]\n\
+     runner = \"claude\"\n\
+     model = \"claude-opus-4-6\"\n\
+     effort = \"high\"\n\
+     [routing.classifier]\n\
+     codex = 100\n\
+     [routing.planner]\n\
+     claude = 100\n\
+     [routing.collector]\n\
+     codex = 100\n\
+     [routing.worker.1]\n\
+     claude = 100\n\
+     [routing.worker.2]\n\
+     claude = 100\n\
+     [routing.worker.3]\n\
+     claude = 100\n\
+     [routing.worker.4]\n\
+     claude = 100\n\
+     [routing.worker.5]\n\
+     claude = 100\n\
+     [routing.reviewer.1]\n\
+     codex = 100\n\
+     [routing.reviewer.2]\n\
+     codex = 100\n\
+     [routing.reviewer.3]\n\
+     codex = 100\n\
+     [routing.reviewer.4]\n\
+     codex = 100\n\
+     [routing.reviewer.5]\n\
+     codex = 100\n"
+        .into()
+}
+
 fn write_dual_protocol_runner(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("dual-runner.sh");
     std::fs::write(
@@ -1303,10 +1344,8 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
     let reviewer = case.handle.agent_after("spawning reviewer ");
     case.handle.wait_for(&format!("reviewer {reviewer} result"));
 
-    // This restart removes the original Codex profile entirely and routes all
-    // new worker responsibilities to Claude. The Codex model remains a
-    // supported provider, so spawn_remediation_worker must honor the durable
-    // allocation instead of treating current profile removal as a park cause.
+    // This restart changes all new worker allocations to Claude, while
+    // retaining the original Codex profile for the in-flight continuation.
     case.handle.stop_mut();
     assert!(Command::new("git")
         .args([
@@ -1319,7 +1358,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
         .status()
         .unwrap()
         .success());
-    case.restart_after_stop("claude", "claude-opus-4-6", None);
+    case.restart_after_stop("claude", "claude-opus-4-6", Some(&rerouted_worker_config()));
     case.handle.wait_for(&format!(
         "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
     ));
@@ -1384,7 +1423,7 @@ fn changed_worker_routing_remediation_resumes_original_worker_layout() {
 }
 
 #[test]
-fn unsupported_original_worker_model_parks_remediation_and_releases_lease() {
+fn removed_original_worker_profile_parks_remediation_and_releases_lease() {
     let mut case = Case::start("codex", "gpt-5.6-terra", None);
     case.handle.wait_for("spawning agent ");
     let original_worker = case.handle.agent_after("spawning agent ");
@@ -1396,17 +1435,9 @@ fn unsupported_original_worker_model_parks_remediation_and_releases_lease() {
     let reviewer = case.handle.agent_after("spawning reviewer ");
     case.handle.wait_for(&format!("reviewer {reviewer} result"));
 
-    // Corrupt the persisted original layout to an unsupported model. This is
-    // distinct from removing its current routing profile: only an unusable
-    // historical provider/model may park the remediation attempt.
-    {
-        let conn = case.db();
-        conn.execute(
-            "UPDATE agent_runs SET model='not-a-managed-model' WHERE task_id=1 AND agent_name=?1",
-            [&original_worker],
-        )
-        .unwrap();
-    }
+    // Remove the historical Codex profile after its first worker run. A
+    // continuation must fail closed rather than using a catalog-default or
+    // replacement Claude route.
     case.handle.stop_mut();
     assert!(Command::new("git")
         .args([
@@ -1419,7 +1450,7 @@ fn unsupported_original_worker_model_parks_remediation_and_releases_lease() {
         .status()
         .unwrap()
         .success());
-    case.restart_after_stop("codex", "gpt-5.6-terra", None);
+    case.restart_after_stop("claude", "claude-opus-4-6", None);
     case.handle.wait_for(&format!(
         "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
     ));
@@ -1448,8 +1479,9 @@ fn unsupported_original_worker_model_parks_remediation_and_releases_lease() {
         .as_str()
         .expect("explicit remediation provider park reason");
     assert!(
-        reason.contains("remediation provider recovery failed") && reason.contains("unknown model"),
-        "the unsupported original provider/model must park with an actionable reason: {reason}"
+        reason.contains("remediation provider recovery failed")
+            && reason.contains("no longer configured"),
+        "the removed original provider/model must park with an actionable reason: {reason}"
     );
     assert!(
         !reason.contains("historical worker run does not match durable routing assignment"),
@@ -1470,7 +1502,7 @@ fn unsupported_original_worker_model_parks_remediation_and_releases_lease() {
         .unwrap()
         .expect("original worker snapshot remains durable");
     assert_eq!(first_worker.agent, original_worker);
-    assert_eq!(first_worker.model, "not-a-managed-model");
+    assert_eq!(first_worker.model, "gpt-5.6-terra");
     assert_eq!(first_worker.provider.as_deref(), Some("codex"));
     drop(conn);
     case.handle.stop();

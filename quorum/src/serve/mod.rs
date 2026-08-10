@@ -1684,11 +1684,6 @@ fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind
     Ok(kind)
 }
 
-fn explicitly_configured_provider(config: &ServeConfig) -> Option<runner::AgentKind> {
-    let _ = config;
-    None
-}
-
 fn require_configured_provider(
     config: &ServeConfig,
     model: &str,
@@ -1701,7 +1696,22 @@ fn require_configured_provider(
             "{context} persisted provider '{actual}' does not match model '{model}' resolved as '{resolved}'"
         )));
     }
-    require_provider_match(explicitly_configured_provider(config), actual, context)
+    let profile = config
+        .model_profiles
+        .values()
+        .find(|profile| profile.model == model)
+        .ok_or_else(|| {
+            QuorumError::Io(format!(
+                "{context} original provider/model '{actual}/{model}' is no longer configured"
+            ))
+        })?;
+    if profile.runner != actual.to_string() {
+        return Err(QuorumError::Io(format!(
+            "{context} configured provider '{}' does not match persisted provider '{actual}' for model '{model}'",
+            profile.runner
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1772,6 +1782,7 @@ fn configured_reviewer_selection<'a>(
     (provider_explicit || review_model_explicit).then_some((review_model, review_effort))
 }
 
+#[cfg(test)]
 fn require_provider_match(
     expected: Option<runner::AgentKind>,
     actual: runner::AgentKind,
@@ -14390,7 +14401,7 @@ async fn spawn_remediation_worker(
             mode: runner::LaunchMode::Normal,
             continuation_id: launch_continuation_id,
         },
-        &runner_adapter_config(config, config.agent_bin.as_deref()),
+        &runner_adapter_config(config, agent_bin_for_kind(config, remediation_kind)),
     )
     .await;
 
@@ -18348,9 +18359,10 @@ mod tests {
     }
 
     #[test]
-    fn original_remediation_profile_removal_keeps_supported_provider_recoverable() {
+    fn original_remediation_provider_model_must_remain_configured() {
         let dir = tempfile::tempdir().unwrap();
-        let config = pre_review_ci_test_config(dir.path().join("q.db"), dir.path().join("repo"));
+        let mut config =
+            pre_review_ci_test_config(dir.path().join("q.db"), dir.path().join("repo"));
 
         require_configured_provider(
             &config,
@@ -18360,13 +18372,17 @@ mod tests {
         )
         .unwrap();
 
-        require_configured_provider(
+        let error = require_configured_provider(
             &config,
             "gpt-5.6-terra",
             runner::AgentKind::Codex,
             "original remediation worker",
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no longer configured"),
+            "profile removal must fail closed with an actionable cause: {error}"
+        );
 
         let error = require_configured_provider(
             &config,
@@ -18384,6 +18400,18 @@ mod tests {
                 .to_string()
                 .contains("historical worker run does not match durable routing assignment"),
             "the retired routing-equality failure must not mask the operator action"
+        );
+
+        config.agent_bin = Some("/opt/claude".into());
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Codex),
+            None,
+            "recovered Codex remediation must not receive the replacement Claude executable"
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Claude),
+            Some("/opt/claude"),
+            "the configured provider retains its explicit executable"
         );
     }
 
