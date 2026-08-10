@@ -1459,6 +1459,7 @@ pub fn adopt_recovery_delivery(
     let changed = tx.execute(
         "UPDATE tasks
          SET status='done',assignee=NULL,updated_at=?2,
+             completion_provenance=?6,
              refs=json_set(
                  json_remove(refs,
                      '$.daemon_parked',
@@ -1478,7 +1479,8 @@ pub fn adopt_recovery_delivery(
             now,
             recovery_task_id,
             pr_number,
-            merged_head_sha
+            merged_head_sha,
+            crate::tasks::COMPLETION_PROVENANCE_MERGED
         ],
     )?;
     if changed != 1 {
@@ -1883,11 +1885,20 @@ mod tests {
                 .unwrap();
             let original = ids[3];
             let siblings = ids[..3].to_vec();
-            conn.execute(
-                "UPDATE tasks SET status='done' WHERE id IN (?1,?2,?3)",
-                params![siblings[0], siblings[1], siblings[2]],
-            )
-            .unwrap();
+            for (ordinal, sibling) in siblings.iter().enumerate() {
+                conn.execute(
+                    "UPDATE tasks
+                     SET status='done',refs=json_object('pr',?2),
+                         completion_provenance=?3
+                     WHERE id=?1",
+                    params![
+                        sibling,
+                        RECOVERY_PR - 3 + ordinal as i64,
+                        crate::tasks::COMPLETION_PROVENANCE_MERGED
+                    ],
+                )
+                .unwrap();
+            }
             conn.execute(
                 "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
                 params![
@@ -3544,16 +3555,20 @@ mod tests {
                 fixture.original,
             ],
         );
-        let original_refs: String = fixture
+        let (original_refs, original_provenance): (String, Option<String>) = fixture
             .conn
             .query_row(
-                "SELECT refs FROM tasks WHERE id=?1",
+                "SELECT refs,completion_provenance FROM tasks WHERE id=?1",
                 [fixture.original],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         let original_refs: serde_json::Value = serde_json::from_str(&original_refs).unwrap();
         assert_eq!(original_refs["pr"], RECOVERY_PR);
+        assert_eq!(
+            original_provenance.as_deref(),
+            Some(crate::tasks::COMPLETION_PROVENANCE_MERGED)
+        );
         assert_eq!(
             original_refs["recovery_delivery"],
             serde_json::json!({
@@ -3599,6 +3614,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, (1, 1));
+        assert_eq!(
+            crate::review_followup_graph_eligibility::classify_graph_assessment(
+                &fixture.conn,
+                fixture.graph,
+                "followups-v1",
+            )
+            .unwrap(),
+            crate::review_followup_graph_eligibility::GraphAssessmentEligibility::WaitingInterpretation
+        );
     }
 
     #[test]

@@ -12,9 +12,10 @@ fn seed(path: &Path) {
     let conn = quorum_core::db::open(path).unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
     conn.execute_batch(
-        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs)
-         VALUES (1,'source','done','owner',1,1,'{\"pr\":100}'),
-                (2,'other','done','owner',1,1,'{\"pr\":200}');
+        "INSERT INTO tasks(
+             id,title,status,created_by,created_at,updated_at,refs,completion_provenance)
+         VALUES (1,'source','done','owner',1,1,'{\"pr\":100}','merged'),
+                (2,'other','done','owner',1,1,'{\"pr\":200}','merged');
          INSERT INTO review_followup_batches(
              pr_number,task_id,source_task_id,collector_version,
              artifact_count,state,created_at,updated_at)

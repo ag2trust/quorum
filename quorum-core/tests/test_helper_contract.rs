@@ -37,8 +37,13 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
                  '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);",
     )
     .unwrap();
-    conn.execute("UPDATE tasks SET refs='{\"pr\":100}' WHERE id=2", [])
-        .unwrap();
+    conn.execute(
+        "UPDATE tasks
+         SET refs='{\"pr\":100}',completion_provenance='merged'
+         WHERE id=2",
+        [],
+    )
+    .unwrap();
     (dir, path)
 }
 
