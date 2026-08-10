@@ -6,8 +6,6 @@ use support::protocol::{
     Barrier, MaterializeAssessmentInput, Operation, EXIT_NEGATIVE, EXIT_SUCCESS,
 };
 
-const ROUNDS: usize = 8;
-const RACERS: usize = 4;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn seed(path: &Path) {
@@ -60,14 +58,13 @@ fn release_when_ready(ready_paths: &[PathBuf], go_path: &Path) {
     std::fs::write(go_path, b"go").unwrap();
 }
 
-#[test]
-fn repeated_process_race_materializes_exactly_one_assessment_and_membership() {
-    for round in 0..ROUNDS {
+fn process_race_materializes_exactly_one_assessment_and_membership(rounds: usize, racers: usize) {
+    for round in 0..rounds {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join(format!("assessment-{round}.db"));
         seed(&db_path);
         let go_path = dir.path().join("go");
-        let ready_paths = (0..RACERS)
+        let ready_paths = (0..racers)
             .map(|index| dir.path().join(format!("ready-{index}")))
             .collect::<Vec<_>>();
         let helpers = ready_paths
@@ -113,7 +110,7 @@ fn repeated_process_race_materializes_exactly_one_assessment_and_membership() {
                 .filter(|output| output.status.code() == Some(EXIT_NEGATIVE)
                     && output.json()["won"] == false)
                 .count(),
-            RACERS - 1,
+            racers - 1,
             "round {round}: {outputs:?}"
         );
 
@@ -158,4 +155,15 @@ fn repeated_process_race_materializes_exactly_one_assessment_and_membership() {
             "round {round}"
         );
     }
+}
+
+#[test]
+fn real_process_assessment_smoke_materializes_exactly_one_membership() {
+    process_race_materializes_exactly_one_assessment_and_membership(1, 2);
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_assessment_process_race() {
+    process_race_materializes_exactly_one_assessment_and_membership(8, 4);
 }

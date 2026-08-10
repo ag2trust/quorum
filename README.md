@@ -135,6 +135,13 @@ before submitting any change:
 rtk proxy ./preflight.sh
 ```
 
+The required suite includes one real-process SQLite smoke race per contention
+path. To run the full repeated contention depth on demand, use:
+
+```sh
+scripts/stress-process-canaries.sh
+```
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
