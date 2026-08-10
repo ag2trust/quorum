@@ -1639,18 +1639,26 @@ the new daemon branch under a zero/nonexistent lease, creates the PR, and verifi
 binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
 verified` stages are durable task metadata. Startup recovery reuses an identical remote
 branch and a single existing PR, then folds the exact mailbox row only after verification.
-The publisher takes the intent's immutable source SHA and uses that object in the refspec;
-a later mutable worktree `HEAD` cannot change what is published. Before persisting the
-intent, the daemon pins that SHA under a task-scoped local Git ref, so parking may safely
-remove a failed run's worktree and run-local branch; `task-retry` and remediation retries
-still replay the exact source even when their replacement worktree starts at another
-`HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
-transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
-later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
-guard. Startup and bounded periodic reconciliation walk minimal task-id/SHA projections
-in fixed cursor batches, restore missing or mismatched intent pins, and exact-SHA-delete
-no-intent or terminal-task pins without scanning the full task history or Git ref
-namespace in one pass. A retry from `pr_created` repeats the same authoritative
+For an ordinary crash replay, the publisher takes the intent's immutable source SHA and
+uses that object in the refspec; a later mutable worktree `HEAD` cannot change what is
+published. Before persisting the intent, the daemon pins that SHA under a task-scoped
+local Git ref, so parking may safely remove the failed run's worktree and run-local branch.
+An explicit retry of a parked rework publication is a new delivery round, not an ordinary
+crash replay. Its spawn accepts only the recorded remote baseline or a live head already
+equal to the exact pinned source (the post-push verification-failure state); every third
+SHA parks. In the already-published case, one SQLite transaction advances both the
+persisted PR target and the publication intent's expected remote SHA to that exact source
+before provisioning. The replacement worktree starts from the accepted live head and
+integrates the current base. On completion, the daemon pins the replacement `HEAD` before
+overwriting the intent's source, preserving the advanced PR/head authority; a crash before
+intent persistence can only leave a harmless newer pin that reconciliation restores to
+the still-durable source. Successful worker lifecycle transitions retire the intent in the
+same SQLite transaction, including the late-mailbox fold, and the reachability pin is
+removed afterward with an exact-SHA guard. Startup and bounded periodic reconciliation
+walk minimal task-id/SHA projections in fixed cursor batches, restore missing or
+mismatched intent pins, and exact-SHA-delete no-intent or terminal-task pins without
+scanning the full task history or Git ref namespace in one pass. A retry from `pr_created`
+repeats the same authoritative
 branch/SHA/base validation before any push. Initial PR reconciliation
 also requires the PR base to equal the configured base branch. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish

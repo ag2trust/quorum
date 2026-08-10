@@ -2807,12 +2807,12 @@ mod tests {
         assert_ne!(git_rev_parse(&bare, pr_head), mutable_head);
     }
 
-    /// Regression for PR #483 remediation review: a publication failure may
-    /// remove the source worktree/branch before an operator retries the parked
-    /// task. The retry can use a different run-local remediation branch, but
-    /// it must still publish intent A rather than its replacement HEAD B.
+    /// A crash-window replay with no accepted replacement delivery must keep
+    /// publishing the exact pinned intent even if another worktree HEAD moves.
+    /// The serve layer explicitly supersedes this pin only when a parked
+    /// rework retry completes a new delivery round.
     #[tokio::test]
-    async fn publication_pin_replays_exact_source_after_branch_cleanup_and_retry() {
+    async fn publication_pin_replays_exact_source_after_branch_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, bare) = init_repo_with_bare_remote(tmp.path());
         let pr_head = "fix/publication-retry";
@@ -2862,14 +2862,14 @@ mod tests {
         )
         .status
         .success());
-        let replacement_head = git_rev_parse(&retry_wt, "HEAD");
-        assert_ne!(replacement_head, intent_sha);
+        let unrelated_head = git_rev_parse(&retry_wt, "HEAD");
+        assert_ne!(unrelated_head, intent_sha);
 
         mgr.push_to_pr_head(&retry_wt, pr_head, &remote_tip, &intent_sha, "main")
             .await
-            .expect("task retry must replay the durable intent source");
+            .expect("crash replay must retain the durable intent source");
         assert_eq!(git_rev_parse(&bare, pr_head), intent_sha);
-        assert_ne!(git_rev_parse(&bare, pr_head), replacement_head);
+        assert_ne!(git_rev_parse(&bare, pr_head), unrelated_head);
 
         mgr.retire_publication_source(&repo, 263, &intent_sha)
             .await
