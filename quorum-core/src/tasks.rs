@@ -737,7 +737,7 @@ pub fn claim(
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
         SELECT 1 FROM task_decompositions WHERE freeze_active=1
     )";
-    const DIRECT_DISPATCH_CLAUSE: &str = "(continue_pr IS NOT NULL OR (
+    const DIRECT_DISPATCH_CLAUSE: &str = "(review_only=1 OR continue_pr IS NOT NULL OR (
         (json_extract(refs, '$.cx_size') IN ('S','M') OR (
             json_extract(refs, '$.cx_size')='L'
             AND json_extract(refs, '$.cx_est') <= 3
@@ -791,6 +791,7 @@ pub fn claim(
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
+                       AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
                        AND {DIRECT_DISPATCH_CLAUSE}
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
@@ -815,6 +816,7 @@ pub fn claim(
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
+                   AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
                    AND {DIRECT_DISPATCH_CLAUSE}
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
@@ -916,7 +918,8 @@ pub fn claim_provider_retry_rework(
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
-               AND (continue_pr IS NOT NULL OR (
+               AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
+               AND (review_only=1 OR continue_pr IS NOT NULL OR (
                    (json_extract(refs, '$.cx_size') IN ('S','M') OR (
                        json_extract(refs, '$.cx_size')='L'
                        AND json_extract(refs, '$.cx_est') <= 3
@@ -1039,7 +1042,7 @@ pub fn claim_remediation_rework_with_feedback(
                  OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L','XL')
                  OR json_type(refs, '$.cx_ready') IS NOT 'true'
                  OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
-                 OR NOT (continue_pr IS NOT NULL OR (
+                 OR NOT (review_only=1 OR continue_pr IS NOT NULL OR (
                      (json_extract(refs, '$.cx_size') IN ('S','M') OR (
                          json_extract(refs, '$.cx_size')='L'
                          AND json_extract(refs, '$.cx_est') <= 3
@@ -1134,7 +1137,9 @@ pub fn reserve_reviewer_provision(
                AND json_valid(t.refs)
                AND json_type(t.refs,'$.cx_est')='integer'
                AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
-               AND (t.continue_pr IS NOT NULL OR (
+               AND json_type(t.refs,'$.cx_size')='text'
+               AND json_extract(t.refs,'$.cx_size') IN ('S','M','L','XL')
+               AND (t.review_only=1 OR t.continue_pr IS NOT NULL OR (
                    (json_extract(t.refs,'$.cx_size') IN ('S','M') OR (
                        json_extract(t.refs,'$.cx_size')='L'
                        AND json_extract(t.refs,'$.cx_est') <= 3
@@ -1142,7 +1147,8 @@ pub fn reserve_reviewer_provision(
                    AND NOT (json_extract(t.refs,'$.cx_est')=5
                             AND json_extract(t.refs,'$.cx_size')='L')
                ))
-               AND json_extract(t.refs,'$.cx_ready')=1
+               AND json_type(t.refs,'$.cx_ready')='true'
+               AND json_type(t.refs,'$.cx_not_ready_reason')='null'
                AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
          )",
@@ -9444,9 +9450,10 @@ mod tests {
     }
 
     #[test]
-    fn review_only_large_classification_is_direct_and_never_reconciled_to_parked() {
+    fn ready_large_review_only_gets_atomic_review_and_remediation_authority() {
         let (_d, mut c) = open_tmp();
         for (index, (size, cx_est)) in [("L", 5), ("XL", 2)].into_iter().enumerate() {
+            let offset = index as i64 * 10;
             let id = create(
                 &mut c,
                 "owner",
@@ -9477,6 +9484,37 @@ mod tests {
                 task.review_only,
                 task.continue_pr
             ));
+
+            let token = format!("review-{size}");
+            assert!(reserve_reviewer_provision(&mut c, id, &token, "r1", 1100 + offset,).unwrap());
+            assert!(
+                !reserve_reviewer_provision(
+                    &mut c,
+                    id,
+                    &format!("loser-{size}"),
+                    "r1",
+                    1101 + offset,
+                )
+                .unwrap(),
+                "the reviewer reservation remains single-holder for size {size}"
+            );
+
+            let reviewer = format!("reviewer-{size}");
+            let attached = claim(&mut c, &reviewer, Some(id), &[], TTL, 1102 + offset)
+                .unwrap()
+                .expect("large review-only task must accept reviewer attachment");
+            assert_eq!(attached.reviewer.as_deref(), Some(reviewer.as_str()));
+            assert!(release_reviewer_provision(&mut c, id, &token).unwrap());
+
+            let rework =
+                apply_event(&mut c, &reviewer, id, &Event::VerdictChanges, 1103 + offset).unwrap();
+            assert_eq!(rework.task.status, "rework");
+            let remediation = format!("remediation-{size}");
+            let claimed = claim_remediation_rework(&mut c, &remediation, id, TTL, 1104 + offset)
+                .unwrap()
+                .expect("large review-only rework must accept remediation authority");
+            assert_eq!(claimed.assignee.as_deref(), Some(remediation.as_str()));
+            assert!(has_live_lease(&c, id, 1104 + offset));
         }
 
         assert_eq!(park_classified_complexity_five(&mut c, 2000).unwrap(), 0);
@@ -9488,6 +9526,179 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parked, 0);
+    }
+
+    #[test]
+    fn ready_large_review_only_provider_retry_rework_gets_atomic_authority() {
+        let (_d, mut c) = open_tmp();
+        for (index, (size, cx_est)) in [("L", 5), ("XL", 2)].into_iter().enumerate() {
+            let id = create(
+                &mut c,
+                "owner",
+                &format!("provider retry {size}"),
+                None,
+                0,
+                None,
+                Some(&format!(
+                    r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null}}"#
+                )),
+                None,
+                Some(700 + index as i64),
+                1200 + index as i64,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET status='rework',
+                     refs=json_set(refs,'$.runner_retry',
+                         json_object('requested',json('true')))
+                 WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+
+            let agent = format!("provider-retry-{size}");
+            let claimed = claim_provider_retry_rework(&mut c, &agent, id, TTL, 1300 + index as i64)
+                .unwrap()
+                .expect("large review-only provider retry must acquire worker authority");
+            assert_eq!(claimed.assignee.as_deref(), Some(agent.as_str()));
+            assert!(has_live_lease(&c, id, 1300 + index as i64));
+        }
+    }
+
+    #[test]
+    fn review_only_atomic_authority_still_requires_complete_ready_classification_and_no_freeze() {
+        let (_d, mut c) = open_tmp();
+        let incomplete = create(
+            &mut c,
+            "owner",
+            "incomplete review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(600),
+            1000,
+        )
+        .unwrap();
+        let unready = create(
+            &mut c,
+            "owner",
+            "unready review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(601),
+            1001,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET refs=json_object(
+                'pr',600,'cx_est',4,'cx_size','XL','cx_ready',json('true'))
+             WHERE id=?1",
+            [incomplete],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET refs=json_object(
+                'pr',601,'cx_est',4,'cx_size','XL','cx_ready',json('false'),
+                'cx_not_ready_reason','scope is incomplete')
+             WHERE id=?1",
+            [unready],
+        )
+        .unwrap();
+
+        for (id, label) in [(incomplete, "incomplete"), (unready, "unready")] {
+            assert!(!reserve_reviewer_provision(&mut c, id, label, "r1", 1010).unwrap());
+            assert!(claim(&mut c, label, Some(id), &[], TTL, 1011)
+                .unwrap()
+                .is_none());
+            c.execute(
+                "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+            assert!(claim_remediation_rework(&mut c, label, id, TTL, 1012)
+                .unwrap()
+                .is_none());
+        }
+
+        let source = create(
+            &mut c,
+            "owner",
+            "planning source",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1020,
+        )
+        .unwrap();
+        let frozen_review = create(
+            &mut c,
+            "owner",
+            "ready review under freeze",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"pr":602,"cx_est":5,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null}"#,
+            ),
+            None,
+            Some(602),
+            1021,
+        )
+        .unwrap();
+        crate::decomposition::begin_planning(
+            &mut c,
+            &crate::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 1022,
+            },
+        )
+        .unwrap()
+        .expect("planning source must acquire the freeze");
+
+        assert!(!reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
+        assert!(
+            claim(&mut c, "frozen", Some(frozen_review), &[], TTL, 1024,)
+                .unwrap()
+                .is_none()
+        );
+        c.execute(
+            "UPDATE tasks SET status='rework',assignee=NULL WHERE id=?1",
+            [frozen_review],
+        )
+        .unwrap();
+        assert!(
+            claim_remediation_rework(&mut c, "frozen", frozen_review, TTL, 1025)
+                .unwrap()
+                .is_none()
+        );
+
+        let reservations: i64 = c
+            .query_row(
+                "SELECT count(*) FROM reviewer_provision_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claims: i64 = c
+            .query_row("SELECT count(*) FROM claims WHERE active=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(reservations, 0);
+        assert_eq!(claims, 0);
     }
 
     #[test]
