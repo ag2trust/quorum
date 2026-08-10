@@ -61,6 +61,59 @@ fn routing_config(provider: &str, model: &str) -> String {
     )
 }
 
+/// Keep the original Codex profile configured while moving only future worker
+/// responsibilities to the Claude profile. This lets remediation coverage
+/// distinguish a changed current routing pool from an unavailable historical
+/// worker layout.
+fn dual_worker_routing_config(worker_profile: &str) -> String {
+    assert!(matches!(worker_profile, "primary" | "rerouted"));
+    format!(
+        r#"[model_profiles.primary]
+runner = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+[model_profiles.rerouted]
+runner = "claude"
+model = "claude-opus-4-6"
+effort = "medium"
+[model_profiles.reviewer]
+runner = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+[model_profiles.planner]
+runner = "claude"
+model = "claude-opus-4-8"
+effort = "high"
+[routing.classifier]
+primary = 100
+[routing.planner]
+planner = 100
+[routing.collector]
+primary = 100
+[routing.worker.1]
+{worker_profile} = 100
+[routing.worker.2]
+{worker_profile} = 100
+[routing.worker.3]
+{worker_profile} = 100
+[routing.worker.4]
+{worker_profile} = 100
+[routing.worker.5]
+{worker_profile} = 100
+[routing.reviewer.1]
+reviewer = 100
+[routing.reviewer.2]
+reviewer = 100
+[routing.reviewer.3]
+reviewer = 100
+[routing.reviewer.4]
+reviewer = 100
+[routing.reviewer.5]
+reviewer = 100
+"#
+    )
+}
+
 fn write_dual_protocol_runner(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("dual-runner.sh");
     std::fs::write(
@@ -1285,6 +1338,180 @@ fn changes_reuses_codex_thread_then_runs_fresh_reviews_and_merges() {
         2,
         "changes must require a fresh R1"
     );
+    drop(conn);
+    case.handle.stop();
+}
+
+#[test]
+fn changed_worker_routing_remediation_resumes_original_worker_layout() {
+    let initial_routing = dual_worker_routing_config("primary");
+    let changed_routing = dual_worker_routing_config("rerouted");
+    let mut case =
+        Case::start_with_role_config("codex", "gpt-5.6-terra", None, Some(&initial_routing));
+    case.handle.wait_for("spawning agent ");
+    let original_worker = case.handle.agent_after("spawning agent ");
+    case.handle
+        .wait_for(&format!("worker {original_worker} result"));
+    let original_thread = format!("thread-{original_worker}");
+    case.done(&original_worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // Changing only the worker routing pool affects future allocations. The
+    // persisted original Codex profile remains configured so the live rework
+    // must enter spawn_remediation_worker and resume it instead of selecting
+    // the now-routed Claude profile.
+    case.handle.stop_mut();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.restart_after_stop("codex", "gpt-5.6-terra", Some(&changed_routing));
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "resume the original allocation",
+        ],
+    );
+
+    case.handle.wait_for("spawning remediation worker ");
+    let remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {remediation} result"));
+
+    let log = std::fs::read_to_string(&case.runner_log).unwrap();
+    let resume =
+        format!("{remediation}|exec resume {original_thread} --json --model gpt-5.6-terra ");
+    assert!(
+        log.lines().any(|line| line.starts_with(&resume)),
+        "changed worker routing must not reselect the remediation model: {log}"
+    );
+    assert!(
+        !log.lines().any(|line| line.starts_with(&format!(
+            "{remediation}|exec resume {original_thread} --json --model claude-opus-4-6 "
+        ))),
+        "remediation must never switch to the current Claude worker route: {log}"
+    );
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    let first_worker = quorum_core::agent_runs::first_worker(&conn, 1)
+        .unwrap()
+        .expect("initial worker snapshot");
+    assert_eq!(first_worker.agent, original_worker);
+    assert_eq!(first_worker.model, "gpt-5.6-terra");
+    assert_eq!(first_worker.effort, "high");
+    assert_eq!(first_worker.provider.as_deref(), Some("codex"));
+    drop(conn);
+
+    case.done(&remediation, &["--pr", "1"]);
+    case.handle.wait_for("lifecycle: task #1 -> in-review");
+    case.handle.stop();
+}
+
+#[test]
+fn removed_original_worker_provider_parks_remediation_and_releases_lease() {
+    let mut case = Case::start("codex", "gpt-5.6-terra", None);
+    case.handle.wait_for("spawning agent ");
+    let original_worker = case.handle.agent_after("spawning agent ");
+    case.handle
+        .wait_for(&format!("worker {original_worker} result"));
+    case.done(&original_worker, &["--pr", "1"]);
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+
+    // Restart with no Codex profile at all. The original worker snapshot is
+    // immutable, so remediation must park loudly rather than reroute it to
+    // this current Claude-only worker pool.
+    case.handle.stop_mut();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "branch",
+            "-f",
+            "daemon/agent0-t1",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    case.restart_after_stop("claude", "claude-opus-4-6", None);
+    case.handle.wait_for(&format!(
+        "recovering R1 reviewer {reviewer} with persisted provider codex model gpt-5.6-terra"
+    ));
+    case.handle.wait_for(&format!("reviewer {reviewer} result"));
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "do not reroute this worker",
+        ],
+    );
+    case.handle.wait_for("PARKED: task #1");
+    case.wait_for_completed_tick();
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    let reason = refs["daemon_parked_reason"]
+        .as_str()
+        .expect("explicit remediation provider park reason");
+    assert!(
+        reason.contains("remediation provider recovery failed")
+            && reason.contains("no longer configured"),
+        "the unavailable original provider must park with an actionable reason: {reason}"
+    );
+    assert!(
+        !reason.contains("historical worker run does not match durable routing assignment"),
+        "the retired current-routing equality error must not mask the park cause: {reason}"
+    );
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target='task:1' AND active=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        active_claims, 0,
+        "the failed remediation lease must be released"
+    );
+    let first_worker = quorum_core::agent_runs::first_worker(&conn, 1)
+        .unwrap()
+        .expect("original worker snapshot remains durable");
+    assert_eq!(first_worker.agent, original_worker);
+    assert_eq!(first_worker.model, "gpt-5.6-terra");
+    assert_eq!(first_worker.provider.as_deref(), Some("codex"));
     drop(conn);
     case.handle.stop();
 }
