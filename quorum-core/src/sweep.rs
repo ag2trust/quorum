@@ -6,7 +6,7 @@
 //! explicit sweep (`quorum sweep`) plus a WAL checkpoint.
 
 use crate::error::Result;
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
@@ -286,32 +286,120 @@ const OPERATIONAL_TASK_REF_TABLES: &[&str] = &[
     "pr_targets",
 ];
 
-fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    // Two guard families:
-    //   • operational — bounded child cleanup drains these each sweep, so the parent waits
-    //     until the fanout is fully swept rather than letting one write delete unbounded rows.
-    //   • durable — decomposition and review-follow-up provenance is intentionally retained;
-    //     these tables enforce FKs on tasks(id), so deleting a still-referenced task raises
-    //     `FOREIGN KEY constraint failed` and turns every subsequent mutation on the DB into
-    //     an exit-3 failure (schema-46 regression, see task #395).
+/// Build the operational + durable guard predicates that keep sweep from
+/// deleting a task while any child row still references it. Guards reference
+/// `tasks.id` so the caller composes them into a `DELETE FROM tasks` shape.
+///
+/// The two families are:
+///   • operational — bounded child cleanup drains these each sweep, so the parent waits
+///     until the fanout is fully swept rather than letting one write delete unbounded rows.
+///   • durable — decomposition and review-follow-up provenance is intentionally retained;
+///     these tables enforce FKs on tasks(id), so deleting a still-referenced task raises
+///     `FOREIGN KEY constraint failed` and turns every subsequent mutation on the DB into
+///     an exit-3 failure (schema-46 regression, see task #395).
+fn task_ref_guard_predicates() -> String {
     let mut guards = String::new();
     for table in OPERATIONAL_TASK_REF_TABLES {
         guards.push_str(&format!(
-            "\n            AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.task_id=t.id)"
+            " AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.task_id=tasks.id)"
         ));
     }
     for (table, column) in DURABLE_TASK_REF_TABLES {
         guards.push_str(&format!(
-            "\n            AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.{column}=t.id)"
+            " AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.{column}=tasks.id)"
         ));
     }
-    let sql = format!(
-        "DELETE FROM tasks WHERE rowid IN \
-         (SELECT t.rowid FROM tasks t
-          WHERE t.status='done' AND t.updated_at < ?1{guards}
-          LIMIT ?2)"
-    );
-    conn.execute(&sql, params![now - DONE_TASK_TTL_SECS, limit as i64])?;
+    guards
+}
+
+/// Opportunistic per-mutation sweep: reclaim at most `limit` aged done tasks
+/// whose operational children are drained and whose durable references are
+/// gone.
+///
+/// The candidate window is bounded by [`SWEEP_LIMIT`] *before* the guard
+/// predicates apply, using `sweep_cursors('reclaimable_tasks')` as a rotating
+/// starting point (`id > cursor`). Ever-growing durable-reference-pinned
+/// provenance can therefore never inflate per-mutation examination work — a
+/// pinned task consumes one slot in a single sweep window, then the cursor
+/// advances past it. When the cursor reaches the tail, the next call resets
+/// it to 0 so unreferenced tasks at any id eventually reclaim (no starvation
+/// even if pinned tasks dominate).
+///
+/// Task #395 acceptance boundary: this keeps the guarded probe served by six
+/// indexed lookups per candidate and caps total per-mutation work at
+/// `SWEEP_LIMIT * 6 * O(log n)`, independent of retained history size.
+fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    let cursor: i64 = conn
+        .query_row(
+            "SELECT value FROM sweep_cursors WHERE name='reclaimable_tasks'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    let horizon = now - DONE_TASK_TTL_SECS;
+    let candidates: Vec<i64> = conn
+        .prepare(
+            "SELECT id FROM tasks
+             WHERE status='done' AND updated_at < ?1 AND id > ?2
+             ORDER BY id ASC LIMIT ?3",
+        )?
+        .query_map(params![horizon, cursor, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Advance the cursor to the highest examined id, or wrap to 0 when the
+    // scan runs off the tail so the next sweep restarts from the beginning.
+    // A no-op sweep (no candidates and cursor already 0) leaves the cursor
+    // alone so a fresh DB does not accumulate a sweep_cursors row before it
+    // has anything to reclaim.
+    let new_cursor: Option<i64> = if let Some(&max) = candidates.last() {
+        Some(max)
+    } else if cursor > 0 {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(v) = new_cursor {
+        conn.execute(
+            "INSERT INTO sweep_cursors(name, value) VALUES ('reclaimable_tasks', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            [v],
+        )?;
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // Apply guards to the bounded candidate set. Per-row NOT EXISTS is served
+    // by the durable-reference indexes materialized in schema.sql, so the
+    // guarded DELETE is O(k * 6 * log n) with k ≤ SWEEP_LIMIT.
+    let guards = task_ref_guard_predicates();
+    let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM tasks WHERE id IN ({placeholders}){guards}");
+    let bound: Vec<&dyn rusqlite::ToSql> = candidates
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+    conn.execute(&sql, bound.as_slice())?;
+    Ok(())
+}
+
+/// Explicit unbounded reclamation used by `quorum sweep`. No candidate cap,
+/// no cursor — every aged done task whose guards pass is deleted in one
+/// statement. Guard probes stay indexed; SQLite's LIMIT-free DELETE avoids
+/// the SQLITE_MAX_VARIABLE_NUMBER cap that a materialized `IN (...)` would
+/// hit at scale. Resets the opportunistic cursor so subsequent sweep-on-write
+/// mutations restart from the beginning after a full explicit sweep.
+fn delete_reclaimable_tasks_unbounded(conn: &Connection, now: i64) -> Result<()> {
+    let guards = task_ref_guard_predicates();
+    let sql = format!("DELETE FROM tasks WHERE status='done' AND updated_at < ?1{guards}");
+    conn.execute(&sql, params![now - DONE_TASK_TTL_SECS])?;
+    conn.execute(
+        "DELETE FROM sweep_cursors WHERE name='reclaimable_tasks'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -458,7 +546,7 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     let unbounded = i64::MAX as usize;
     delete_reclaimable_task_rows_bounded(&tx, now, unbounded)?;
     delete_orphaned_task_rows_bounded(&tx, unbounded)?;
-    delete_reclaimable_tasks_bounded(&tx, now, unbounded)?;
+    delete_reclaimable_tasks_unbounded(&tx, now)?;
     tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
@@ -2124,6 +2212,166 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 0, "unreferenced aged done task must reclaim");
+    }
+
+    #[test]
+    fn sweep_on_write_examines_at_most_sweep_limit_candidates_per_call() {
+        // Task #395 remediation, blocker #2: even with the durable-ref
+        // indexes, the old shape applied LIMIT *after* the guard predicates,
+        // so every write's write transaction still probed each retained
+        // pinned aged task. Assert per-call candidate examination is bounded
+        // by SWEEP_LIMIT via the rotating cursor: create 3*SWEEP_LIMIT pinned
+        // aged done tasks, run one sweep, and confirm the cursor advanced by
+        // exactly SWEEP_LIMIT ids (proving the LIMIT applied *before* the
+        // guards ran).
+        let (_d, mut c) = open_tmp_fk();
+        let n = SWEEP_LIMIT * 3;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = aged_done_task(&mut c, &format!("pinned {i}"));
+            insert_decomposition(&c, id);
+            ids.push(id);
+        }
+        let first = *ids.first().unwrap();
+        let expected_cursor = first + SWEEP_LIMIT as i64 - 1;
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+
+        let cursor: i64 = c
+            .query_row(
+                "SELECT value FROM sweep_cursors WHERE name='reclaimable_tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor, expected_cursor,
+            "cursor must advance by exactly SWEEP_LIMIT ids so per-mutation \
+             examination is bounded; retained pinned provenance cannot \
+             inflate write-lock time. cursor={cursor}, expected={expected_cursor}"
+        );
+        let survivors: i64 = c
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            survivors, n as i64,
+            "every pinned task must survive — no FK violation, no unintended reclamation"
+        );
+    }
+
+    #[test]
+    fn sweep_on_write_eventually_reclaims_unreferenced_task_behind_pinned_wall() {
+        // Boundedness must not cause starvation. Plant SWEEP_LIMIT+5 pinned
+        // aged done tasks at the front (low ids) and one unreferenced aged
+        // done task at the tail. The unreferenced task never reclaims in the
+        // first sweep (cursor examines only pinned rows), but after the
+        // cursor advances past the pinned block and eventually wraps, the
+        // sweep reaches and deletes the unreferenced tail task.
+        let (_d, mut c) = open_tmp_fk();
+        let pinned_count = SWEEP_LIMIT + 5;
+        for i in 0..pinned_count {
+            let id = aged_done_task(&mut c, &format!("pinned {i}"));
+            insert_decomposition(&c, id);
+        }
+        let tail = aged_done_task(&mut c, "tail unreferenced");
+
+        // Drive sweeps until the tail is reclaimed. Cap the loop at a
+        // generous multiple of the pinned block so a real starvation bug
+        // still fails loudly rather than hanging the test.
+        let mut sweeps = 0;
+        let cap = pinned_count * 3;
+        loop {
+            sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+            sweeps += 1;
+            let alive: i64 = c
+                .query_row("SELECT count(*) FROM tasks WHERE id=?1", [tail], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if alive == 0 {
+                break;
+            }
+            assert!(
+                sweeps < cap,
+                "unreferenced tail task starved behind pinned wall — the \
+                 rotating cursor must eventually visit every id even while \
+                 SWEEP_LIMIT bounds per-call work"
+            );
+        }
+        let pinned_survivors: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE status='done'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            pinned_survivors, pinned_count as i64,
+            "every pinned task must still survive the loop"
+        );
+    }
+
+    #[test]
+    fn sweep_all_ignores_cursor_and_reclaims_everything_in_one_call() {
+        // Explicit sweep_all is documented as unbounded. Even if the
+        // opportunistic cursor was left partway through the aged done range
+        // by an earlier sweep_on_write, one sweep_all must reclaim every
+        // unreferenced aged done task (guards still retain pinned ones) and
+        // clear the cursor so subsequent opportunistic sweeps restart clean.
+        let (_d, mut c) = open_tmp_fk();
+        let unref_low = aged_done_task(&mut c, "unref low");
+        let pinned_mid = aged_done_task(&mut c, "pinned mid");
+        insert_decomposition(&c, pinned_mid);
+        let unref_high = aged_done_task(&mut c, "unref high");
+        // Pre-set the cursor past unref_low so a naive cursor-honoring
+        // sweep_all would skip it.
+        c.execute(
+            "INSERT INTO sweep_cursors(name, value)
+             VALUES ('reclaimable_tasks', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            [pinned_mid],
+        )
+        .unwrap();
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        let low: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [unref_low], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let high: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id=?1",
+                [unref_high],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let pinned: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id=?1",
+                [pinned_mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            low, 0,
+            "sweep_all must reclaim unreferenced task before cursor"
+        );
+        assert_eq!(
+            high, 0,
+            "sweep_all must reclaim unreferenced task after cursor"
+        );
+        assert_eq!(pinned, 1, "pinned task must still be retained");
+        let cursor_rows: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sweep_cursors WHERE name='reclaimable_tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_rows, 0,
+            "sweep_all must clear the opportunistic cursor after a full pass"
+        );
     }
 
     #[test]
