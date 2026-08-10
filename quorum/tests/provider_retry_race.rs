@@ -6,8 +6,6 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const RACERS: usize = 12;
-const ROUNDS: usize = 3;
 const TTL: i64 = 300;
 
 #[test]
@@ -52,11 +50,10 @@ fn retry_claim_subprocess() {
     }
 }
 
-#[test]
-fn n_process_provider_rework_claim_exactly_one_winner() {
+fn n_process_provider_rework_claim_has_exactly_one_winner(rounds: usize, racers: usize) {
     let test_exe = std::env::current_exe().unwrap();
 
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("quorum.db");
         let gate_path = dir.path().join("start");
@@ -96,7 +93,7 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
         .unwrap();
         drop(conn);
 
-        let agents: Vec<String> = (0..RACERS)
+        let agents: Vec<String> = (0..racers)
             .map(|index| format!("retry-{round}-{index}"))
             .collect();
         let children: Vec<_> = agents
@@ -176,6 +173,17 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
             .unwrap();
         assert_eq!(errors, 0, "round {round}: normal losers logged errors");
     }
+}
+
+#[test]
+fn real_process_provider_rework_claim_smoke_has_exactly_one_winner() {
+    n_process_provider_rework_claim_has_exactly_one_winner(1, 2);
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_provider_rework_claim_race() {
+    n_process_provider_rework_claim_has_exactly_one_winner(3, 12);
 }
 
 fn render_outcomes(outcomes: &[(&String, std::process::Output)]) -> String {
