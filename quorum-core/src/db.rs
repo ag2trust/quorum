@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 46;
+pub const SCHEMA_VERSION: i64 = 47;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -694,6 +694,40 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         }
         // Guarded core write APIs remain dormant until later daemon activation
         // work.
+
+        // v47 bounds sweep's REFERENCES tasks(id) guards (task #395). Schema 46
+        // left six durable FK columns unindexed; sweep_on_write runs inside
+        // every mutation's write transaction and would otherwise scan each
+        // retained provenance table once per candidate task. SCHEMA_SQL
+        // (which runs at the top of migrate) declares the six indexes so a
+        // fresh DB gets them, but the v39 block below drops+recreates
+        // `decomposition_cleanup` via a rename that also drops its indexes;
+        // recreate every durable-ref index here so both fresh and upgraded
+        // databases end up with the same shape. `CREATE INDEX IF NOT EXISTS`
+        // is idempotent so re-running the migration (crash between blocks) is
+        // safe. Bumping SCHEMA_VERSION to 47 is load-bearing: the
+        // `current == SCHEMA_VERSION` early-return above short-circuits
+        // SCHEMA_SQL, so a live DB stopped at user_version=46 would otherwise
+        // never see the new indexes and the durable-reference guard would
+        // remain a full scan.
+        if current < 47 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS decomposition_cleanup_task
+                     ON decomposition_cleanup(task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_batches_task
+                     ON review_followup_batches(task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_batches_source_task
+                     ON review_followup_batches(source_task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_artifacts_linked_task
+                     ON review_followup_artifacts(linked_task_id)
+                     WHERE linked_task_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS review_followup_artifacts_created_task
+                     ON review_followup_artifacts(created_task_id)
+                     WHERE created_task_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS review_followup_assessments_source_task
+                     ON review_followup_assessments(source_task_id);",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };

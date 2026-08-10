@@ -2127,6 +2127,89 @@ mod tests {
     }
 
     #[test]
+    fn every_durable_task_ref_column_has_a_lookup_index() {
+        // Task #395 remediation: schema 47 adds a lookup index for every
+        // durable REFERENCES tasks(id) column so sweep_on_write's
+        // `NOT EXISTS (SELECT 1 FROM x WHERE x.col=t.id)` guard is served by
+        // an index rather than a scan of retained provenance. The guard runs
+        // inside every mutation's write transaction and the outer LIMIT lets
+        // it examine SWEEP_LIMIT candidate tasks, so an unindexed column
+        // would give SWEEP_LIMIT × |retained| work per write.
+        //
+        // Assert the mechanism directly (via sqlite_master / index_info)
+        // rather than through EXPLAIN QUERY PLAN — the planner falls back to
+        // a full covering-PK scan on an empty table regardless of which
+        // secondary indexes exist, so a plan-based check would silently pass
+        // an unindexed column here.
+        let (_d, c) = open_tmp_fk();
+        for (table, column) in DURABLE_TASK_REF_TABLES {
+            // `INTEGER PRIMARY KEY` is an alias for rowid, which is inherently
+            // O(log n) for `WHERE column=?` even though PRAGMA index_list
+            // reports no explicit secondary index. Skip those columns —
+            // they're already index-bounded by SQLite's rowid.
+            let is_rowid_alias: bool = c
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| {
+                    // (cid, name, type, notnull, dflt_value, pk)
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .into_iter()
+                .any(|(name, ty, pk)| name == *column && pk == 1 && ty.to_uppercase() == "INTEGER");
+            if is_rowid_alias {
+                continue;
+            }
+            let indexes: Vec<String> = c
+                .prepare(&format!("PRAGMA index_list({table})"))
+                .unwrap()
+                // (seq, name, unique, origin, partial)
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let mut served_by: Option<String> = None;
+            for index_name in &indexes {
+                let mut stmt = c
+                    .prepare(&format!("PRAGMA index_info({index_name})"))
+                    .unwrap();
+                let leading: Option<String> = stmt
+                    .query_map([], |row| {
+                        // (seqno, cid, name)
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .find(|(seqno, _)| *seqno == 0)
+                    .map(|(_, name)| name);
+                if leading.as_deref() == Some(column) {
+                    served_by = Some(index_name.clone());
+                    break;
+                }
+            }
+            assert!(
+                served_by.is_some(),
+                "{table}.{column} has no index whose leading column is \
+                 {column} — sweep_on_write's durable-reference guard would \
+                 fall back to a full scan of {table} inside every mutation's \
+                 write transaction. Add a `CREATE INDEX` on ({column}) to \
+                 schema.sql (partial `WHERE {column} IS NOT NULL` is fine \
+                 for nullable columns) and, if this is a new durable FK, \
+                 bump SCHEMA_VERSION so existing databases materialize it. \
+                 Existing indexes on {table}: {indexes:?}"
+            );
+        }
+    }
+
+    #[test]
     fn durable_task_ref_inventory_covers_every_fk_on_tasks() {
         // Mechanism-level assertion: enumerate every FK in the live schema
         // that points at tasks(id) and require it to appear in
