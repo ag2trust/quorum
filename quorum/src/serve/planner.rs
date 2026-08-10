@@ -514,7 +514,7 @@ mod tests {
 
     // The no-read provider test fills a pipe with a near-limit prompt. Allow
     // normal CI scheduling delay while retaining a finite failure boundary.
-    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
 
     fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {

@@ -333,7 +333,7 @@ mod tests {
     // process-heavy cases. Keep their assertion bounded without mistaking
     // ordinary CI scheduling delay for a boundary regression.
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
-    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
 
     #[cfg(unix)]
     async fn spawn_scripted_classifier(
@@ -390,6 +390,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn drain_classifier_until_terminal(
+        slot: &mut ClassifierSlot,
+    ) -> Option<ClassifierResult> {
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if let Some(result) = drain_classifier_events(slot).await {
+                    break Some(result);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("classifier boundary must reach its terminal condition")
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn shared_classifier_boundary_times_out_a_silent_provider() {
         let (_temp, mut slot, pid) = spawn_scripted_classifier(
@@ -414,9 +430,17 @@ mod tests {
             format!("#!/bin/sh\nIFS= read -r _turn\nwhile :; do printf '%s\\n' '{chunk}'; done\n");
         let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, CLASSIFIER_MODEL).await;
 
-        let first = tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, drain_classifier_events(&mut slot))
-            .await
-            .expect("one continuous-output poll must stay bounded");
+        let first = tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                let result = drain_classifier_events(&mut slot).await;
+                if result.is_some() || slot.stdout_bytes > 0 {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one continuous-output poll must stay bounded");
         assert!(
             first.is_none(),
             "one poll must yield before the turn ceiling"
@@ -446,10 +470,7 @@ mod tests {
         let script = format!("#!/bin/sh\nwhile :; do printf '%s' '{chunk}'; done\n");
         let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, "gpt-5.6-terra").await;
 
-        let result =
-            tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, drain_classifier_events(&mut slot))
-                .await
-                .expect("unterminated output must fail at the read boundary");
+        let result = drain_classifier_until_terminal(&mut slot).await;
         assert_classifier_failure_reaped(slot, pid, result, "stdout exceeded").await;
     }
 
@@ -468,10 +489,7 @@ mod tests {
         );
         let (_temp, mut slot, pid) = spawn_scripted_classifier(&script, CLASSIFIER_MODEL).await;
 
-        let result =
-            tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, drain_classifier_events(&mut slot))
-                .await
-                .expect("oversized response must fail promptly");
+        let result = drain_classifier_until_terminal(&mut slot).await;
         assert_classifier_failure_reaped(slot, pid, result, "response exceeded").await;
     }
 

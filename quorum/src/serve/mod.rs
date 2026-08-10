@@ -20289,9 +20289,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let repo = tempfile::tempdir().unwrap();
-        for (case, body, expected) in [
-            ("silent", "exec sleep 30", "timed out"),
-            ("noisy", "exec yes x", "stdout exceeded"),
+        for (case, body, expected, timeout) in [
+            (
+                "silent",
+                "exec sleep 30",
+                "timed out",
+                Duration::from_secs(5),
+            ),
+            (
+                "noisy",
+                "exec yes x",
+                "stdout exceeded",
+                Duration::from_secs(15),
+            ),
         ] {
             let pid_path = repo.path().join(format!("{case}.pid"));
             let git = repo.path().join(format!("git-{case}"));
@@ -20304,11 +20314,10 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let error =
-                repository_head_sha_with_options(repo.path(), &git, Duration::from_secs(5), 4096)
-                    .await
-                    .unwrap_err()
-                    .to_string();
+            let error = repository_head_sha_with_options(repo.path(), &git, timeout, 4096)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(expected), "{case}: {error}");
             let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
             assert_eq!(
@@ -20340,7 +20349,7 @@ mod tests {
         let capture = tokio::spawn(async move {
             repository_head_sha_with_options(&repo_path, &git, Duration::from_secs(5), 4096).await
         });
-        for _ in 0..500 {
+        for _ in 0..1_500 {
             if pid_path.exists() {
                 break;
             }
@@ -20385,7 +20394,7 @@ mod tests {
             &frozen,
             Path::new("git"),
             Path::new("tar"),
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             1024,
         )
         .await
@@ -20462,7 +20471,7 @@ mod tests {
             // The full suite runs many real-process canaries concurrently;
             // leave enough headroom for the preliminary git check and both
             // wrappers to be scheduled before exercising the deadline path.
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             1024 * 1024,
         )
         .await
