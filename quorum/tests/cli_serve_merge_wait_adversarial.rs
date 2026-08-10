@@ -1375,7 +1375,11 @@ fn merge_conflict_absent_worker_spawns_remediation() {
     );
     assert!(
         prompts.contains("has conflicts with main")
-            && prompts.contains("Rebase on main, resolve conflicts"),
+            && prompts.contains("Preserve the published PR head")
+            && prompts.contains("merge main into the PR branch")
+            && prompts.contains("Never rebase")
+            && prompts.contains("The daemon already ran `git merge --ff --no-edit origin/main`")
+            && prompts.contains("must remain an ancestor"),
         "remediation turn must include conflict instructions: {prompts}"
     );
 

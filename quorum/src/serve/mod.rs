@@ -5136,7 +5136,7 @@ async fn handle_pre_review_checks_failure(
     let names = failing_checks.join(", ");
     let feedback = format!(
         "CI checks failed before review for PR #{pr}: {names}\n\n\
-         Fix the failing checks, push the same PR branch, and submit it again."
+         Fix the failing checks, commit, and submit the existing PR again without pushing."
     );
     log(&format!(
         "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) — entering rework without spawning a reviewer"
@@ -7080,8 +7080,8 @@ async fn tick(
                                     let rework_msg = format!(
                                         "PR #{pr_num} has conflicts with {} \
                                      (a sibling PR likely merged first).\n\n\
-                                     Rebase on {}, resolve conflicts, \
-                                     and push again.",
+                                     Preserve the published PR head, merge {} into the PR branch, \
+                                     resolve conflicts, commit, and submit without pushing. Never rebase.",
                                         config.base_branch, config.base_branch
                                     );
                                     if let Some(wi) =
@@ -7381,7 +7381,7 @@ async fn tick(
                                 Some(ref tr) if tr.task.status == "rework" => {
                                     let rework_msg = format!(
                                         "CI checks failed for PR #{pr_num}: {names}\n\n\
-                                         Fix the failing checks and push again.",
+                                         Fix the failing checks, commit, and submit again without pushing.",
                                     );
                                     // Reviewer stays alive (sticky-agent).
                                     if let Some(wi) =
@@ -7608,8 +7608,8 @@ async fn tick(
                                         let rework_msg = format!(
                                             "PR #{pr_num} has conflicts with {} \
                                              (detected after checks timeout).\n\n\
-                                             Rebase on {}, resolve conflicts, \
-                                             and push again.",
+                                             Preserve the published PR head, merge {} into the PR branch, \
+                                             resolve conflicts, commit, and submit without pushing. Never rebase.",
                                             config.base_branch, config.base_branch
                                         );
                                         if let Some(wi) = workers
@@ -7971,8 +7971,8 @@ async fn tick(
                                     let rework_msg = format!(
                                         "PR #{pr_num} has conflicts with {} \
                                          (detected at merge time).\n\n\
-                                         Rebase on {}, resolve conflicts, \
-                                         and push again.",
+                                         Preserve the published PR head, merge {} into the PR branch, \
+                                         resolve conflicts, commit, and submit without pushing. Never rebase.",
                                         config.base_branch, config.base_branch
                                     );
                                     if let Some(wi) =
@@ -8374,8 +8374,8 @@ async fn tick(
                                         Some(ref tr) if tr.task.status == "rework" => {
                                             let rework_msg = format!(
                                                 "Merge of PR #{pr_num} failed: {}\n\n\
-                                             Rebase on {}, resolve any conflicts, \
-                                             and push again.",
+                                             Preserve the published PR head, merge {} into the PR branch, \
+                                             resolve conflicts, commit, and submit without pushing. Never rebase.",
                                                 merge_result.message, config.base_branch
                                             );
                                             // Reviewer stays alive (sticky-agent).
@@ -14347,84 +14347,70 @@ async fn spawn_remediation_worker(
         .join(format!("{}-t{}", agent_name, task_id));
 
     let task_repo_dir = &config.repo_dir;
-    let (provision_result, sha_to_verify) = if let Some(ref target) = pr_target {
-        let result = if target.is_fork {
-            // A fork head ref names a branch in the FORK, not in origin, and
-            // the daemon holds no fork credentials — there is nowhere for the
-            // agent to push. Configuring an origin upstream would aim a bare
-            // `git push` at a same-named origin branch (`main`, for a typical
-            // fork PR). Fail closed and let the provision-strike path park.
-            Err(format!(
+    let provision_result: std::result::Result<Option<ContinuationBaseMerge>, String> = async {
+        if let Some(ref target) = pr_target {
+            if target.is_fork {
+                // A fork head ref names a branch in the FORK, not in origin, and
+                // the daemon holds no fork credentials — there is nowhere for the
+                // agent to push. Configuring an origin upstream would aim a bare
+                // `git push` at a same-named origin branch (`main`, for a typical
+                // fork PR). Fail closed and let the provision-strike path park.
+                Err(format!(
                 "fork PR: no pushable remote for head '{}' — remediation cannot push to the fork",
                 target.head_ref
             ))
+            } else {
+                wt_mgr
+                    .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
+                    .await?;
+                wt_mgr.verify_head_sha(&wt_path, &target.head_sha).await?;
+                let base_merge = wt_mgr
+                    .integrate_continuation_base(&wt_path, &config.base_branch)
+                    .await?;
+                wt_mgr.disable_push(&wt_path).await.map_err(|error| {
+                    format!("remediation push lockout failed for PR #{pr}: {error}")
+                })?;
+                Ok(Some(base_merge))
+            }
         } else {
             wt_mgr
-                .fetch_and_provision(task_repo_dir, &branch, &wt_path, &target.head_ref)
-                .await
-        };
-        (result, Some(target.head_sha.as_str()))
-    } else {
-        let result = wt_mgr
-            .fetch_and_provision(task_repo_dir, &branch, &wt_path, &remote_branch)
-            .await;
-        (result, None)
-    };
-    let provision_failure = match provision_result {
-        Ok(_) => {
-            if let Some(expected_sha) = sha_to_verify {
-                if let Err(error) = wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
-                    Some(format!(
-                        "structural head-SHA mismatch for remediation PR #{pr}: {error}"
-                    ))
-                } else {
-                    match wt_mgr.disable_push(&wt_path).await {
-                        Ok(()) => None,
-                        Err(error) => Some(format!(
-                            "remediation push lockout failed for PR #{pr}: {error}"
-                        )),
-                    }
-                }
-            } else {
-                match wt_mgr.disable_push(&wt_path).await {
-                    Ok(()) => None,
-                    Err(error) => Some(format!(
-                        "remediation push lockout failed for PR #{pr}: {error}"
-                    )),
-                }
-            }
+                .fetch_and_provision(task_repo_dir, &branch, &wt_path, &remote_branch)
+                .await?;
+            wt_mgr.disable_push(&wt_path).await.map_err(|error| {
+                format!("remediation push lockout failed for PR #{pr}: {error}")
+            })?;
+            Ok(None)
         }
+    }
+    .await;
+    let remediation_base_merge = match provision_result {
+        Ok(base_merge) => base_merge,
         Err(error) => {
             log(&format!(
                 "remediation: worktree provision failed for PR #{pr}: {error}"
             ));
-            Some(format!(
-                "remediation worktree provisioning failed for PR #{pr}: {error}"
-            ))
+            let cause = format!("remediation worktree provisioning failed for PR #{pr}: {error}");
+            log(&format!(
+                "remediation: worktree provision failed for PR #{pr} — giving up"
+            ));
+            wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(task_repo_dir, &branch).await;
+            {
+                let p = db_path.clone();
+                let name = agent_name.clone();
+                let tid = task_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut conn = quorum_core::db::open(&p)?;
+                    tasks::release_remediation_lease(&mut conn, &name, tid, now_unix())
+                })
+                .await;
+            }
+            name_pool.release(&agent_name);
+            return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: classified_provisioning_cause(&cause),
+            });
         }
     };
-    if let Some(cause) = provision_failure {
-        log(&format!(
-            "remediation: worktree provision failed for PR #{pr} — giving up"
-        ));
-        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-        wt_mgr.delete_branch(task_repo_dir, &branch).await;
-        // Release the lease installed by claim_remediation_rework.
-        {
-            let p = db_path.clone();
-            let name = agent_name.clone();
-            let tid = task_id;
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut conn = quorum_core::db::open(&p)?;
-                tasks::release_remediation_lease(&mut conn, &name, tid, now_unix())
-            })
-            .await;
-        }
-        name_pool.release(&agent_name);
-        return Ok(RemediationSpawnOutcome::ProvisionFailed {
-            cause: classified_provisioning_cause(&cause),
-        });
-    }
 
     // Inspection surfaces report the PR branch this run continues, not the
     // daemon's local checkout name.
@@ -14483,12 +14469,20 @@ async fn spawn_remediation_worker(
         .await;
     }
 
+    let continuation_context =
+        pr_target
+            .as_ref()
+            .zip(remediation_base_merge)
+            .map(|(target, base_merge)| {
+                continuation_worker_context(target, &config.base_branch, base_merge)
+            });
     let prompt = reviewer::build_remediation_turn(
         &agent_name,
         task_id,
         pr,
         feedback,
         &task_body,
+        continuation_context.as_deref(),
         config.limits.max_task_cost_usd,
     );
 
