@@ -512,6 +512,11 @@ fn parsed_poll(text: &str) -> PlannerPoll {
 mod tests {
     use super::*;
 
+    // The no-read provider test fills a pipe with a near-limit prompt. Allow
+    // normal CI scheduling delay while retaining a finite failure boundary.
+    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(5);
+    const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
+
     fn task(key: &str, prerequisites: &[&str]) -> serde_json::Value {
         serde_json::json!({
             "key": key,
@@ -634,7 +639,7 @@ mod tests {
             &prompt,
             false,
             runner.to_str(),
-            Duration::from_secs(2),
+            TEST_STDIN_FEED_TIMEOUT,
         )
         .await
         {
@@ -676,7 +681,7 @@ mod tests {
         .await
         .unwrap();
         let pid = slot.pid().unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        let outcome = tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
             loop {
                 if let Some(outcome) = poll_planner(&mut slot).await {
                     break outcome;
