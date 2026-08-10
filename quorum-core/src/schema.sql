@@ -88,7 +88,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     edit_count   INTEGER NOT NULL DEFAULT 0,
     -- v35: authoritative existing-PR implementation intent. Unlike refs.pr, this field is
     -- creator-selected only through --continue-pr and controls daemon provisioning.
-    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0)
+    continue_pr INTEGER CHECK (continue_pr IS NULL OR continue_pr > 0),
+    -- v47: daemon-owned terminal provenance. NULL deliberately preserves legacy/unknown
+    -- completions without guessing whether a retained refs.pr actually merged.
+    completion_provenance TEXT
+        CHECK (completion_provenance IS NULL OR completion_provenance IN ('merged','manual'))
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two

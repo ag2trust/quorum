@@ -49,6 +49,8 @@ pub const CI_REMEDIATION_HEAD_SHA_REF: &str = "ci_remediation_head_sha";
 pub const CI_REMEDIATION_FEEDBACK_REF: &str = "ci_remediation_feedback";
 pub const CI_REMEDIATION_CHECKS_REF: &str = "ci_remediation_checks";
 pub const CI_REMEDIATION_ATTEMPTS_REF: &str = "ci_remediation_attempts";
+pub const COMPLETION_PROVENANCE_MERGED: &str = "merged";
+pub const COMPLETION_PROVENANCE_MANUAL: &str = "manual";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiRemediationIntent {
@@ -1940,9 +1942,16 @@ where
         refs = clear_runner_retry_refs(refs.as_deref())?;
     }
 
+    // Only daemon-observed merge events can establish merged completion
+    // provenance through the lifecycle path. Other transitions preserve the
+    // existing value; historical NULL remains unknown rather than inferred.
+    let completion_provenance = matches!(event, Event::MergeSucceeded | Event::PrFoundMerged)
+        .then_some(COMPLETION_PROVENANCE_MERGED);
+
     tx.execute(
         "UPDATE tasks SET status=?1, assignee=?2, author=?3, reviewer=?4, \
-         rework_round=?5, refs=?6, updated_at=?7, recovery_attempts=?9 WHERE id=?8",
+         rework_round=?5, refs=?6, updated_at=?7, recovery_attempts=?9, \
+         completion_provenance=COALESCE(?10,completion_provenance) WHERE id=?8",
         params![
             new_status_str,
             assignee,
@@ -1953,6 +1962,7 @@ where
             now,
             id,
             recovery_attempts,
+            completion_provenance,
         ],
     )?;
 
@@ -3394,9 +3404,10 @@ pub fn retry_provider_blocked(
 pub fn close_after_merge(conn: &mut Connection, id: i64, note: &str, now: i64) -> Result<bool> {
     let tx = begin_immediate(conn)?;
     let n = tx.execute(
-        "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
+        "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2,
+                          completion_provenance=?3
          WHERE id=?1 AND status NOT IN ('done', 'failed', 'cancelled')",
-        params![id, now],
+        params![id, now, COMPLETION_PROVENANCE_MERGED],
     )?;
     if n == 0 {
         tx.commit()?;
@@ -3461,9 +3472,10 @@ pub fn close_manual(
         ));
     }
     let n = tx.execute(
-        "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2
+        "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2,
+                          completion_provenance=?3
          WHERE id=?1 AND status NOT IN ('done', 'cancelled')",
-        params![id, now],
+        params![id, now, COMPLETION_PROVENANCE_MANUAL],
     )?;
     if n == 0 {
         tx.commit()?;

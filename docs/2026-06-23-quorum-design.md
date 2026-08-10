@@ -207,7 +207,8 @@ INTEGER NOT NULL DEFAULT 0 · `labels` TEXT (json) · `assignee` TEXT · `create
 NULL · `created_at` · `updated_at` · `refs` TEXT (json) · `author` TEXT · `reviewer` TEXT ·
 `rework_round` INTEGER NOT NULL DEFAULT 0 · `review_only` INTEGER NOT NULL DEFAULT 0 ·
 `continue_pr` INTEGER NULL (authoritative existing-PR implementation entry; never inferred
-from `refs.pr`) ·
+from `refs.pr`) · `completion_provenance` TEXT NULL (`merged`/`manual`; NULL is
+legacy or unknown and is never inferred from status or `refs.pr`) ·
 `depends_on` TEXT (json array of task IDs).
 
 ### `errors` — observable *abnormal* failures
@@ -315,7 +316,8 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   managed lifecycle has no other route to `done` and its dependents stay parked until it
   gets there (`compute_ready` counts only `done`). Closing a generated child performs final
   graph/source reconciliation in the same transaction. Reason REQUIRED. Sets `done` but
-  emits `task_closed_manual` event
+  records `completion_provenance=manual` without removing `refs.pr`, and emits
+  `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum submit` (`quorum done` is a deprecated alias).
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
@@ -1237,7 +1239,11 @@ Planning Agent and daemon-owned materialization described in
   only the daemon may apply a complete validated Follow-up Assessment.
 
 **Follow-up assessment:** ordinary merged tasks become eligible after successful
-interpretation. Generated-child artifacts wait and are assessed together only
+interpretation. Eligibility requires daemon-owned `completion_provenance=merged`; a
+manual close or legacy/unknown NULL provenance remains ineligible even when `done` retains
+`refs.pr`. `MergeSucceeded`, externally observed `PrFoundMerged`, and authoritative
+merge-recovery closure are the only merged-provenance writers; migration performs no
+speculative backfill. Generated-child artifacts wait and are assessed together only
 after the Task Graph completes, or after cancellation preserves a merged subset,
 and every merged PR in the batch has successful interpretation. A fresh bounded
 Planning Agent turn receives durable Planning Lineage, all active tasks, bounded

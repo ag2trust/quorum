@@ -112,6 +112,32 @@ if [ "$PROPOSED_SET" -eq 1 ]; then
     || fail "proposed SHA is not a local commit"
   TIP=$PROPOSED_SHA
 fi
+# A full author gate has no pre-push tuple, but a daemon-prepared PR
+# continuation still has authoritative local evidence: its configured remote
+# upstream is the published PR head. Recognize that history only when the
+# upstream is on TIP's first-parent chain and a later first-parent merge
+# contains the freshly fetched origin/main. This keeps an ordinary branch that
+# merely tracks another feature branch on the strict origin/main..TIP path.
+CONFIGURED_CONTINUATION_FROM=
+if [ "$QUICK" -eq 0 ] && [ "$PROPOSED_SET" -eq 0 ]; then
+  CONFIGURED_UPSTREAM_REF=$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null)
+  case "$CONFIGURED_UPSTREAM_REF" in
+    refs/remotes/origin/main|refs/remotes/origin/develop|'') ;;
+    refs/remotes/origin/*)
+      CONFIGURED_UPSTREAM_SHA=$(git rev-parse --verify "$CONFIGURED_UPSTREAM_REF^{commit}" 2>/dev/null)
+      if [ -n "$CONFIGURED_UPSTREAM_SHA" ] \
+        && git rev-list --first-parent "$TIP" | grep -Fqx "$CONFIGURED_UPSTREAM_SHA"; then
+        for MERGE_SHA in $(git rev-list --first-parent --merges \
+          "$CONFIGURED_UPSTREAM_SHA..$TIP"); do
+          if git merge-base --is-ancestor origin/main "$MERGE_SHA"; then
+            CONFIGURED_CONTINUATION_FROM=$CONFIGURED_UPSTREAM_SHA
+            break
+          fi
+        done
+      fi
+      ;;
+  esac
+fi
 # Detect an intentional develop -> main integration from immutable ancestry, not
 # from a branch-name convention. Daemon-owned branches are always named
 # `daemon/<agent>-t<task>` and therefore cannot preserve a caller's
@@ -146,6 +172,14 @@ else
     OWN_COMMITS=$(git rev-list "$TIP" --not "$CONTINUATION_FROM" "$CONTINUATION_BASE")
     printf 'continuation-owned commits excluding published head and %s:\n' \
       "$CONTINUATION_BASE"
+    if [ -n "$OWN_COMMITS" ]; then
+      git show -s --oneline $OWN_COMMITS
+    fi
+  elif [ -n "$CONFIGURED_CONTINUATION_FROM" ]; then
+    BASE_REF="$CONFIGURED_UPSTREAM_REF + origin/main"
+    OWN_COMMITS=$(git rev-list "$TIP" --not \
+      "$CONFIGURED_CONTINUATION_FROM" origin/main)
+    printf 'configured-upstream continuation-owned commits excluding published head and origin/main:\n'
     if [ -n "$OWN_COMMITS" ]; then
       git show -s --oneline $OWN_COMMITS
     fi
