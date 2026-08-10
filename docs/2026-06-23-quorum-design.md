@@ -300,8 +300,10 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
 - `quorum task-create ... --continue-pr <N>` → implementation task (status: `open`,
   `continue_pr=N`) rooted at the exact head of an open same-repository PR. It follows the
-  normal worker/review/rework/merge lifecycle and publishes back to that PR under lease.
-  `--continue-pr` and `--review-pr` are mutually exclusive.
+  normal worker/review/rework/merge lifecycle, dispatches directly regardless of classified
+  size, and publishes back to that PR under lease. It is never a decomposition source because
+  generated children cannot inherit the continuation publication authority. `--continue-pr`
+  and `--review-pr` are mutually exclusive.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
@@ -1639,18 +1641,26 @@ the new daemon branch under a zero/nonexistent lease, creates the PR, and verifi
 binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
 verified` stages are durable task metadata. Startup recovery reuses an identical remote
 branch and a single existing PR, then folds the exact mailbox row only after verification.
-The publisher takes the intent's immutable source SHA and uses that object in the refspec;
-a later mutable worktree `HEAD` cannot change what is published. Before persisting the
-intent, the daemon pins that SHA under a task-scoped local Git ref, so parking may safely
-remove a failed run's worktree and run-local branch; `task-retry` and remediation retries
-still replay the exact source even when their replacement worktree starts at another
-`HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
-transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
-later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
-guard. Startup and bounded periodic reconciliation walk minimal task-id/SHA projections
-in fixed cursor batches, restore missing or mismatched intent pins, and exact-SHA-delete
-no-intent or terminal-task pins without scanning the full task history or Git ref
-namespace in one pass. A retry from `pr_created` repeats the same authoritative
+For an ordinary crash replay, the publisher takes the intent's immutable source SHA and
+uses that object in the refspec; a later mutable worktree `HEAD` cannot change what is
+published. Before persisting the intent, the daemon pins that SHA under a task-scoped
+local Git ref, so parking may safely remove the failed run's worktree and run-local branch.
+An explicit retry of a parked rework publication is a new delivery round, not an ordinary
+crash replay. Its spawn accepts only the recorded remote baseline or a live head already
+equal to the exact pinned source (the post-push verification-failure state); every third
+SHA parks. In the already-published case, one SQLite transaction advances both the
+persisted PR target and the publication intent's expected remote SHA to that exact source
+before provisioning. The replacement worktree starts from the accepted live head and
+integrates the current base. On completion, the daemon pins the replacement `HEAD` before
+overwriting the intent's source, preserving the advanced PR/head authority; a crash before
+intent persistence can only leave a harmless newer pin that reconciliation restores to
+the still-durable source. Successful worker lifecycle transitions retire the intent in the
+same SQLite transaction, including the late-mailbox fold, and the reachability pin is
+removed afterward with an exact-SHA guard. Startup and bounded periodic reconciliation
+walk minimal task-id/SHA projections in fixed cursor batches, restore missing or
+mismatched intent pins, and exact-SHA-delete no-intent or terminal-task pins without
+scanning the full task history or Git ref namespace in one pass. A retry from `pr_created`
+repeats the same authoritative
 branch/SHA/base validation before any push. Initial PR reconciliation
 also requires the PR base to equal the configured base branch. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish
@@ -1751,11 +1761,15 @@ filename. Runner-specific process options remain scoped under `[claude]` or `[co
 
 ### Bounded task decomposition
 
-An admission-ready implementation task classified size L or XL does not dispatch directly.
-After its dependencies are done, the daemon serializes decomposition per repository: it stops
-new managed delivery, lets active delivery finish, and plans against the resulting frozen base.
-S/M implementation tasks dispatch normally regardless of complexity. Review-only L/XL work is
-parked for external splitting.
+A non-continuation, admission-ready implementation task is a decomposition source only when its
+classified size is L or XL and `cx_est` is 4 or 5. After its dependencies are done, the daemon
+serializes decomposition per repository: it stops new managed delivery, lets active delivery
+finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
+regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
+worker. Every `continue_pr` task dispatches directly because only the source task carries authority
+to publish to the bound PR. A non-continuation XL task with `cx_est` 1–3 violates the classification
+rubric and is parked with an explicit reclassify-or-rescope reason. Review-only L/XL work is parked
+for external splitting.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
 read-only repository view and bounded source
@@ -1882,11 +1896,14 @@ labels are ignored.
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to
   reject the task.
-- The daemon atomically parks a classification when it is not ready, size is `XL`, or it is
-  complexity 5 with size `L`. Complexity-5 `S` and `M` tasks remain dispatchable. Parking
-  writes the standard refs, note, and event with no claim, run, or error row; an explicit
-  retry requests reclassification of remaining work and a newly dispatchable result restores
-  the saved lifecycle status.
+- Direct dispatch and decomposition partition admission-ready implementation work. S/M tasks
+  dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
+  `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
+  as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
+  decomposition route, regardless of classified size. The daemon also atomically parks an
+  unready classification and review-only L/XL work. Parking writes the standard refs, note, and
+  event with no claim, run, or error row; an explicit retry requests reclassification of
+  remaining work and a newly dispatchable result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`

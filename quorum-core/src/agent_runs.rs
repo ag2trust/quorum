@@ -236,32 +236,44 @@ pub fn insert_r2_with_assignment(
     Ok(conn.last_insert_rowid())
 }
 
+/// Return the immutable execution layout used by the first worker agent_run
+/// for a task, if any. Remediation resumes this snapshot rather than routing a
+/// new worker profile under the daemon's current policy.
+pub fn first_worker(conn: &Connection, task_id: i64) -> Result<Option<AgentRun>> {
+    conn.query_row(
+        "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id, spawned_at, ended_at, end_reason
+         FROM agent_runs
+         WHERE task_id = ?1 AND role = 'worker'
+         ORDER BY spawned_at ASC LIMIT 1",
+        params![task_id],
+        |r| {
+            Ok(AgentRun {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                role: r.get(2)?,
+                sub_role: r.get(3)?,
+                model: r.get(4)?,
+                effort: r.get(5)?,
+                provider: r.get(6)?,
+                role_assignment_id: r.get(7)?,
+                spawned_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                end_reason: r.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 /// Return the model used by the first worker agent_run for a task, if any.
 pub fn worker_model(conn: &Connection, task_id: i64) -> Result<Option<String>> {
-    let model = conn
-        .query_row(
-            "SELECT model FROM agent_runs \
-             WHERE task_id = ?1 AND role = 'worker' \
-             ORDER BY spawned_at ASC LIMIT 1",
-            params![task_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(model)
+    Ok(first_worker(conn, task_id)?.map(|run| run.model))
 }
 
 /// Return the provider used by the first worker agent_run for a task, if any.
 pub fn worker_provider(conn: &Connection, task_id: i64) -> Result<Option<String>> {
-    let provider = conn
-        .query_row(
-            "SELECT provider FROM agent_runs \
-             WHERE task_id = ?1 AND role = 'worker' \
-             ORDER BY spawned_at ASC LIMIT 1",
-            params![task_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(provider)
+    Ok(first_worker(conn, task_id)?.and_then(|run| run.provider))
 }
 
 /// Latest interrupted reviewer run for a role, if any.
@@ -650,6 +662,17 @@ mod tests {
         assert_eq!(
             worker_model(&c, 1).unwrap().as_deref(),
             Some("claude-opus-4-6")
+        );
+        let snapshot = first_worker(&c, 1).unwrap().unwrap();
+        assert_eq!(
+            (
+                snapshot.agent.as_str(),
+                snapshot.model.as_str(),
+                snapshot.effort.as_str(),
+                snapshot.provider.as_deref(),
+            ),
+            ("Alice", "claude-opus-4-6", "high", Some("claude")),
+            "remediation must recover the complete first-worker layout"
         );
     }
 

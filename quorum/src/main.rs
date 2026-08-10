@@ -1250,6 +1250,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
             })?;
+            serve_config::validate_agent_bin_for_profiles(
+                r_agent_bin.value.as_deref(),
+                &model_profiles,
+            )?;
             let routing = file_cfg
                 .routing
                 .clone()

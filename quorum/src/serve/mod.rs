@@ -73,6 +73,9 @@ const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
+/// One error row is enough for an operator to diagnose a failed provision;
+/// keep it safely below every downstream status/rendering limit.
+const MAX_PROVISIONING_CAUSE_BYTES: usize = 2048;
 
 #[derive(Debug, Clone)]
 enum ReviewRole {
@@ -234,6 +237,7 @@ struct PoisonTracker {
 
 enum PreReviewChecksState {
     Waiting(tokio::task::JoinHandle<merge::ChecksOutcome>),
+    Retry,
     Ready,
 }
 
@@ -241,6 +245,8 @@ struct PreReviewChecksEntry {
     pr: i64,
     head_sha: String,
     state: PreReviewChecksState,
+    consecutive_timeouts: u8,
+    timeout_alerted: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -249,6 +255,8 @@ enum PreReviewChecksGate {
     Ready,
     Failed { failing_checks: Vec<String> },
 }
+
+const PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER: u8 = 3;
 
 impl PoisonTracker {
     fn new() -> Self {
@@ -942,7 +950,7 @@ async fn create_initial_pr(
         .ok_or_else(|| "gh pr create succeeded but did not return a pull-request URL".to_string())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PublicationIntent {
     branch: String,
     local_sha: String,
@@ -975,27 +983,83 @@ async fn persist_publication_intent(
     .map_err(|e| format!("publication intent persistence failed: {e}"))
 }
 
-async fn load_publication_intent(
+async fn load_publication_state(
     db_path: &Path,
     task_id: i64,
-) -> std::result::Result<Option<PublicationIntent>, String> {
+) -> std::result::Result<(Option<PublicationIntent>, bool), String> {
     let p = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<Option<PublicationIntent>> {
+    let refs = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let conn = quorum_core::db::open(&p)?;
         let Some(task) = tasks::get(&conn, task_id)? else {
             return Ok(None);
         };
-        Ok(publication_intent_from_refs(task.refs.as_deref()))
+        Ok(task.refs)
     })
     .await
     .map_err(|e| format!("publication intent read join failure: {e}"))?
-    .map_err(|e| format!("publication intent read failed: {e}"))
+    .map_err(|e| format!("publication intent read failed: {e}"))?;
+    let intent = publication_intent_from_refs(refs.as_deref());
+    let supersede_source = parked_rework_publication_intent(refs.as_deref())?.is_some();
+    Ok((intent, supersede_source))
 }
 
 fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent> {
     refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
         .and_then(|refs| refs.get("daemon_publication").cloned())
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+/// Recover the immutable existing-PR authority left by a parked rework
+/// publication failure. A rework retry without a publication intent keeps its
+/// historical generic-worker behavior; once the intent exists, every field
+/// needed to select one exact PR head is mandatory and conflicts fail closed.
+fn parked_rework_publication_intent(
+    refs: Option<&str>,
+) -> std::result::Result<Option<PublicationIntent>, String> {
+    if !daemon_rework_retry_requested(refs) {
+        return Ok(None);
+    }
+    let refs = refs
+        .ok_or_else(|| "parked rework retry has no refs".to_string())
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .map_err(|error| format!("parked rework retry refs are invalid JSON: {error}"))
+        })?;
+    let Some(publication) = refs.get("daemon_publication").cloned() else {
+        return Ok(None);
+    };
+    let intent: PublicationIntent = serde_json::from_value(publication)
+        .map_err(|error| format!("recorded daemon publication is incomplete: {error}"))?;
+    let pr = intent
+        .pr
+        .filter(|pr| *pr > 0)
+        .ok_or_else(|| "recorded daemon publication has no valid PR identity".to_string())?;
+    let recorded_pr = refs
+        .get("pr")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|recorded| *recorded > 0)
+        .ok_or_else(|| "parked rework retry has no valid task PR identity".to_string())?;
+    if recorded_pr != pr {
+        return Err(format!(
+            "recorded daemon publication PR #{pr} conflicts with task PR #{recorded_pr}"
+        ));
+    }
+    if intent.branch.trim().is_empty() {
+        return Err("recorded daemon publication has no head branch".into());
+    }
+    if intent.local_sha.trim().is_empty() {
+        return Err("recorded daemon publication has no source SHA".into());
+    }
+    if intent
+        .expected_remote_sha
+        .as_deref()
+        .is_none_or(|sha| sha.trim().is_empty())
+    {
+        return Err(format!(
+            "recorded daemon publication for PR #{pr} has no expected remote SHA"
+        ));
+    }
+    Ok(Some(intent))
 }
 
 async fn reconcile_publication_source_refs(
@@ -1187,7 +1251,7 @@ async fn publish_worker_completion(
     branch: &str,
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
-    let prior = load_publication_intent(&config.db_path, task_id).await?;
+    let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
     if let Some(prior) = &prior {
         if prior.branch != branch {
             return Err(format!(
@@ -1199,9 +1263,13 @@ async fn publish_worker_completion(
             return Err("durable publication PR conflicts with current task PR".into());
         }
     }
-    let local_sha = match &prior {
-        Some(intent) => intent.local_sha.clone(),
-        None => wt_mgr.head_sha(worktree).await?,
+    let local_sha = match (&prior, supersede_source) {
+        // A parked-rework retry is a new, explicitly requested delivery round.
+        // Its worktree was provisioned from the recorded PR lease, so its
+        // completed HEAD supersedes the failed pre-park source. Ordinary
+        // publication crash recovery still replays the exact durable source.
+        (_, true) | (None, false) => wt_mgr.head_sha(worktree).await?,
+        (Some(intent), false) => intent.local_sha.clone(),
     };
     // Pin before persisting a new intent. A crash between these operations can
     // leave only a harmless local ref; the unsafe inverse would persist an
@@ -1264,6 +1332,10 @@ async fn publish_worker_completion(
         stage: "intent".into(),
         expected_remote_sha: expected_remote_sha.clone(),
     });
+    if supersede_source {
+        intent.local_sha = local_sha.clone();
+        intent.stage = "intent".into();
+    }
     intent.pr = known_pr;
     intent.expected_remote_sha = expected_remote_sha;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
@@ -1606,6 +1678,136 @@ async fn resolve_and_persist_continue_pr_target(
     Ok(target)
 }
 
+async fn resolve_and_persist_parked_rework_target(
+    config: &ServeConfig,
+    task_id: i64,
+    intent: &PublicationIntent,
+) -> std::result::Result<PrTarget, String> {
+    let pr = intent
+        .pr
+        .ok_or_else(|| "recorded daemon publication has no PR identity".to_string())?;
+    intent.expected_remote_sha.as_deref().ok_or_else(|| {
+        format!("recorded daemon publication for PR #{pr} has no expected remote SHA")
+    })?;
+
+    // Resolve GitHub completely before opening the short persistence
+    // transaction. The recorded lease is authoritative: a live target may
+    // confirm it, never replace it.
+    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+    validate_continue_pr_target(&target, pr, &config.base_branch)?;
+    existing_pr_lease_baseline(intent, &target, &config.base_branch)?;
+
+    let db_path = config.db_path.clone();
+    let persisted = target.clone();
+    let persisted_intent = intent.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_parked_rework_baseline(&mut conn, task_id, &persisted_intent, &persisted)
+    })
+    .await
+    .map_err(|error| format!("parked rework target persistence join failure: {error}"))?
+    .map_err(|error| format!("parked rework target persistence failed: {error}"))?;
+    Ok(target)
+}
+
+/// Persist one exact parked-rework continuation target. The recorded remote
+/// baseline remains immutable unless the live head is the intent's exact
+/// source, which is the distinguished post-push recovery state. In that case
+/// the old publication handoff has already landed, so rotate both durable
+/// baselines atomically before a replacement delivery is allowed to start.
+fn persist_parked_rework_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    intent: &PublicationIntent,
+    target: &PrTarget,
+) -> Result<()> {
+    let expected_sha = intent.expected_remote_sha.as_deref().ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "recorded daemon publication for PR #{} has no expected remote SHA",
+            target.pr
+        ))
+    })?;
+    let source_already_published = target.head_sha == intent.local_sha;
+    if target.head_sha != expected_sha && !source_already_published {
+        return Err(QuorumError::Usage(format!(
+            "parked rework PR #{} moved outside its publication lease",
+            target.pr
+        )));
+    }
+
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    if let Some(owner) = tasks::active_pr_owner_in(&tx, target.pr, Some(task_id))? {
+        return Err(QuorumError::Usage(format!(
+            "continue PR #{} is already owned by active task #{owner}",
+            target.pr
+        )));
+    }
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    let current_intent = parked_rework_publication_intent(task.refs.as_deref())
+        .map_err(QuorumError::Usage)?
+        .ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "task #{task_id} no longer carries a parked rework publication"
+            ))
+        })?;
+    if current_intent != *intent {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} parked rework publication changed before baseline persistence"
+        )));
+    }
+
+    if let Some(existing) = pr_targets::get(&tx, task_id, target.pr)? {
+        let allowed_existing_sha = existing.head_sha == target.head_sha
+            || (source_already_published && existing.head_sha == expected_sha);
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || !allowed_existing_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "continue PR #{} moved after its durable baseline (expected {} at {}, got {} at {})",
+                target.pr,
+                existing.head_ref,
+                existing.head_sha,
+                target.head_ref,
+                target.head_sha
+            )));
+        }
+        if existing.head_sha != target.head_sha {
+            tx.execute(
+                "UPDATE pr_targets
+                 SET head_sha=?1, resolved_at=?2
+                 WHERE task_id=?3 AND pr_number=?4",
+                (target.head_sha.as_str(), now_unix(), task_id, target.pr),
+            )?;
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO pr_targets
+               (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                task_id,
+                target.pr,
+                target.head_ref.as_str(),
+                target.head_sha.as_str(),
+                target.is_fork as i64,
+                now_unix(),
+            ),
+        )?;
+    }
+
+    if source_already_published && expected_sha != intent.local_sha {
+        let mut advanced = intent.clone();
+        advanced.expected_remote_sha = Some(intent.local_sha.clone());
+        let json = serde_json::to_string(&advanced)
+            .map_err(|error| QuorumError::Io(format!("publication intent JSON: {error}")))?;
+        tasks::set_publication_intent(&tx, task_id, &json, now_unix())?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn persist_continue_pr_baseline(
     conn: &mut quorum_core::Connection,
     task_id: i64,
@@ -1676,17 +1878,34 @@ fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind
     Ok(kind)
 }
 
-fn explicitly_configured_provider(config: &ServeConfig) -> Option<runner::AgentKind> {
-    let _ = config;
-    None
-}
-
 fn require_configured_provider(
     config: &ServeConfig,
+    model: &str,
     actual: runner::AgentKind,
     context: &str,
 ) -> Result<()> {
-    require_provider_match(explicitly_configured_provider(config), actual, context)
+    let resolved = resolve_managed_provider(model, context)?;
+    if resolved != actual {
+        return Err(QuorumError::Io(format!(
+            "{context} persisted provider '{actual}' does not match model '{model}' resolved as '{resolved}'"
+        )));
+    }
+    let profile = config
+        .model_profiles
+        .values()
+        .find(|profile| profile.model == model)
+        .ok_or_else(|| {
+            QuorumError::Io(format!(
+                "{context} original provider/model '{actual}/{model}' is no longer configured"
+            ))
+        })?;
+    if profile.runner != actual.to_string() {
+        return Err(QuorumError::Io(format!(
+            "{context} configured provider '{}' does not match persisted provider '{actual}' for model '{model}'",
+            profile.runner
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1706,14 +1925,29 @@ fn require_reviewer_provider(
 /// may intentionally use the other provider, in which case it must use that
 /// provider's default executable rather than receiving incompatible flags.
 fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&str> {
-    let runner_kind = match config.model_profiles.values().next()?.runner.as_str() {
-        "claude" => crate::serve_config::RunnerKind::Claude,
-        "codex" => crate::serve_config::RunnerKind::Codex,
-        _ => return None,
-    };
-    agent_bin_for_runner(true, runner_kind, config.agent_bin.as_deref(), kind)
+    let configured_kinds = config
+        .model_profiles
+        .values()
+        .map(|profile| match profile.runner.as_str() {
+            "claude" => Some(runner::AgentKind::Claude),
+            "codex" => Some(runner::AgentKind::Codex),
+            "grok" => Some(runner::AgentKind::Grok),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (configured_kind, remainder) = configured_kinds.split_first()?;
+    if remainder
+        .iter()
+        .any(|candidate| candidate != configured_kind)
+    {
+        return None;
+    }
+    (kind == *configured_kind)
+        .then_some(config.agent_bin.as_deref())
+        .flatten()
 }
 
+#[cfg(test)]
 fn agent_bin_for_runner(
     provider_explicit: bool,
     runner_kind: crate::serve_config::RunnerKind,
@@ -1757,6 +1991,7 @@ fn configured_reviewer_selection<'a>(
     (provider_explicit || review_model_explicit).then_some((review_model, review_effort))
 }
 
+#[cfg(test)]
 fn require_provider_match(
     expected: Option<runner::AgentKind>,
     actual: runner::AgentKind,
@@ -1772,15 +2007,11 @@ fn require_provider_match(
     Ok(())
 }
 
-#[cfg(test)]
-fn resolve_remediation_provider(
+fn resolve_original_remediation_provider(
     recorded_provider: Option<&str>,
-    recorded_model: Option<String>,
-    config_model: &str,
-    _config_runner: crate::serve_config::RunnerKind,
-) -> Result<(String, runner::AgentKind)> {
-    let model = recorded_model.unwrap_or_else(|| config_model.to_string());
-    let model_kind = resolve_managed_provider(&model, "remediation")?;
+    model: &str,
+) -> Result<runner::AgentKind> {
+    let model_kind = resolve_managed_provider(model, "remediation")?;
     let kind = match recorded_provider {
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
@@ -1789,13 +2020,88 @@ fn resolve_remediation_provider(
                 "unknown persisted provider '{provider}' for model '{model}'"
             )));
         }
-        None => model_kind,
+        None => {
+            return Err(QuorumError::Io(format!(
+                "original worker run has no persisted provider for model '{model}'"
+            )));
+        }
     };
     if kind != model_kind {
         return Err(QuorumError::Io(format!(
             "persisted provider '{kind}' does not match model '{model}' resolved as '{model_kind}'"
         )));
     }
+    Ok(kind)
+}
+
+/// Recover the complete immutable worker layout for an in-flight task. This
+/// deliberately has no routing-policy input: routing changes only apply when
+/// a task has never allocated a worker. If the original run carries canonical
+/// routing evidence, preserve that exact assignment for the resumed run too.
+#[derive(Debug, Clone)]
+struct OriginalRemediationLayout {
+    model: String,
+    effort: String,
+    kind: runner::AgentKind,
+    assignment: Option<quorum_core::role_assignments::RoleAssignment>,
+}
+
+fn recover_original_remediation_layout(
+    conn: &rusqlite::Connection,
+    task_id: i64,
+    worker: quorum_core::agent_runs::AgentRun,
+) -> Result<OriginalRemediationLayout> {
+    let kind = resolve_original_remediation_provider(worker.provider.as_deref(), &worker.model)?;
+    match worker.role_assignment_id {
+        None => Ok(OriginalRemediationLayout {
+            model: worker.model,
+            effort: worker.effort,
+            kind,
+            assignment: None,
+        }),
+        Some(assignment_id) => {
+            let assignment = quorum_core::role_assignments::get(conn, assignment_id)?.ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "original worker run {} references missing durable routing assignment {assignment_id}",
+                    worker.id
+                ))
+            })?;
+            if assignment.id != assignment_id
+                || assignment.task_id != Some(task_id)
+                || assignment.role != "worker"
+                || assignment.provider != kind.to_string()
+                || assignment.runner != kind.to_string()
+                || assignment.model != worker.model
+                || assignment.effort != worker.effort
+            {
+                return Err(QuorumError::Io(format!(
+                    "original worker run {} does not match durable routing assignment {assignment_id}",
+                    worker.id
+                )));
+            }
+            Ok(OriginalRemediationLayout {
+                model: worker.model,
+                effort: worker.effort,
+                kind,
+                assignment: Some(assignment),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+fn resolve_remediation_provider(
+    recorded_provider: Option<&str>,
+    recorded_model: Option<String>,
+    config_model: &str,
+    _config_runner: crate::serve_config::RunnerKind,
+) -> Result<(String, runner::AgentKind)> {
+    let model = recorded_model.unwrap_or_else(|| config_model.to_string());
+    let kind = if recorded_provider.is_some() {
+        resolve_original_remediation_provider(recorded_provider, &model)?
+    } else {
+        resolve_managed_provider(&model, "remediation")?
+    };
     Ok((model, kind))
 }
 
@@ -3133,6 +3439,8 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
                               OR repository_graph.active=1)
            AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
            AND json_extract(t.refs,'$.cx_size') IN ('L','XL')
+           AND json_extract(t.refs,'$.cx_est') IN (4,5)
+           AND t.continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
            AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
            AND (t.depends_on IS NULL OR NOT EXISTS (
@@ -3515,7 +3823,7 @@ async fn record_decomposition_attempt(
 ) -> Result<()> {
     let path = config.db_path.clone();
     let code = code.to_string();
-    let summary = truncate_utf8_bytes(summary, 2048).to_string();
+    let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
         quorum_core::decomposition::record_attempt(
@@ -3638,6 +3946,161 @@ fn truncate_utf8_bytes(value: &str, limit: usize) -> &str {
     &value[..end]
 }
 
+const DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES: usize = 2048;
+const MAX_PLANNED_CHILD_KEY_BYTES: usize = 64;
+const CHILD_REJECTION_REASON_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES / 2;
+const CHILD_REJECTION_PREFIX_MAX_BYTES: usize =
+    "child ".len() + MAX_PLANNED_CHILD_KEY_BYTES + " rejected by preclassification: ".len();
+const CHILD_REJECTION_READY_WRAPPER_BYTES: usize =
+    "ready=false (not_ready_reason: ".len() + ")".len();
+const CHILD_REJECTION_SIZE_MAX_BYTES: usize = "size=".len() + "XL".len();
+const CHILD_REJECTION_DUPLICATE_LABEL_BYTES: usize = "duplicate_of=".len();
+const CHILD_REJECTION_SEPARATORS_MAX_BYTES: usize = 2 * "; ".len();
+// Keep the complete combined rejection within the planner retry-feedback
+// consumer's bound. Reserve fixed space for every dimension, then divide the
+// variable space between the readiness reason and duplicate task IDs.
+const CHILD_REJECTION_DUPLICATES_MAX_BYTES: usize = planner::MAX_REJECTION_SUMMARY_BYTES
+    - CHILD_REJECTION_PREFIX_MAX_BYTES
+    - CHILD_REJECTION_READY_WRAPPER_BYTES
+    - CHILD_REJECTION_REASON_MAX_BYTES
+    - CHILD_REJECTION_SIZE_MAX_BYTES
+    - CHILD_REJECTION_DUPLICATE_LABEL_BYTES
+    - CHILD_REJECTION_SEPARATORS_MAX_BYTES;
+
+fn bounded_with_ellipsis(value: &str, limit: usize) -> String {
+    const ELLIPSIS: &str = "…";
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let prefix = truncate_utf8_bytes(value, limit.saturating_sub(ELLIPSIS.len()));
+    format!("{prefix}{ELLIPSIS}")
+}
+
+/// Produce text that is safe to retain in task state and the errors table.
+/// Git stderr reaches this boundary only after `worktree::git_stderr` rejects
+/// malformed UTF-8 and NUL bytes. Keep this defensive check for other
+/// provisioning errors, which may originate outside that subprocess boundary.
+fn bounded_provisioning_cause(cause: &str) -> String {
+    if cause.contains('\0') {
+        return "provisioning cause rejected: contains embedded NUL".into();
+    }
+    let cause = cause.trim();
+    if cause.is_empty() {
+        return "provisioning failed without a diagnostic".into();
+    }
+    bounded_with_ellipsis(cause, MAX_PROVISIONING_CAUSE_BYTES)
+}
+
+/// Add a cheap operational classification without attempting to turn every
+/// git diagnostic into a policy decision. The raw named cause remains intact;
+/// this prefix merely makes retry-versus-repair visible in `status`.
+fn classified_provisioning_cause(cause: &str) -> String {
+    let cause = bounded_provisioning_cause(cause);
+    if cause.starts_with("structural:") || cause.starts_with("transient:") {
+        return cause;
+    }
+    let lower = cause.to_ascii_lowercase();
+    let class = if lower.contains("branch collision")
+        || lower.contains("head-sha mismatch")
+        || lower.contains("couldn't find remote ref")
+        || lower.contains("not our ref")
+        || lower.contains("no such ref")
+        || lower.contains("no pushable remote")
+    {
+        "structural"
+    } else if lower.contains(".lock")
+        || lower.contains(" lock")
+        || lower.contains("git fetch")
+        || lower.contains("timed out")
+        || lower.contains("network")
+        || lower.contains("connection")
+    {
+        "transient"
+    } else {
+        "unknown"
+    };
+    bounded_provisioning_cause(&format!("{class}: {cause}"))
+}
+
+/// Append the concrete provision failure independently of the lifecycle
+/// transition. This is deliberately a short local write after all git I/O;
+/// failure to write telemetry must not alter the existing park/release flow.
+async fn persist_provisioning_failure(db_path: &Path, task_id: i64, detail: &str) {
+    let path = db_path.to_path_buf();
+    let detail = classified_provisioning_cause(detail);
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = quorum_core::db::open(&path) {
+            quorum_core::errlog::log_error(
+                &conn,
+                now_unix(),
+                "provisioning",
+                &format!("task #{task_id}: {detail}"),
+            );
+        }
+    })
+    .await;
+}
+
+fn bounded_duplicate_ids(ids: &[i64], limit: usize) -> String {
+    let mut rendered = String::from("[");
+    for (index, id) in ids.iter().enumerate() {
+        let separator = if index == 0 { "" } else { ", " };
+        let item = format!("{separator}{id}");
+        let more_follow = index + 1 < ids.len();
+        let reserved_suffix = if more_follow {
+            if index == 0 {
+                "...]"
+            } else {
+                ", ...]"
+            }
+        } else {
+            "]"
+        };
+        if rendered.len() + item.len() + reserved_suffix.len() > limit {
+            rendered.push_str(if index == 0 { "...]" } else { ", ...]" });
+            return rendered;
+        }
+        rendered.push_str(&item);
+    }
+    rendered.push(']');
+    rendered
+}
+
+fn child_preclassification_rejection(
+    task_key: &str,
+    result: &quorum_core::classify::TaskClassification,
+) -> Option<String> {
+    let mut failed_dimensions = Vec::new();
+    if !result.ready {
+        let reason = bounded_with_ellipsis(
+            result
+                .not_ready_reason
+                .as_deref()
+                .unwrap_or("missing not_ready_reason"),
+            CHILD_REJECTION_REASON_MAX_BYTES,
+        );
+        failed_dimensions.push(format!("ready=false (not_ready_reason: {reason})"));
+    }
+    if !matches!(result.size.as_str(), "S" | "M") {
+        failed_dimensions.push(format!("size={}", result.size));
+    }
+    if !result.duplicate_of.is_empty() {
+        failed_dimensions.push(format!(
+            "duplicate_of={}",
+            bounded_duplicate_ids(&result.duplicate_of, CHILD_REJECTION_DUPLICATES_MAX_BYTES)
+        ));
+    }
+    if failed_dimensions.is_empty() {
+        return None;
+    }
+    let summary = format!(
+        "child {task_key} rejected by preclassification: {}",
+        failed_dimensions.join("; ")
+    );
+    debug_assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+    Some(summary)
+}
+
 async fn reset_decomposition_to_planning(
     config: &ServeConfig,
     graph_id: i64,
@@ -3704,14 +4167,8 @@ fn planned_children(
             let result = by_id
                 .get(&id)
                 .ok_or_else(|| format!("missing classification for {}", task.key))?;
-            if !result.ready
-                || !matches!(result.size.as_str(), "S" | "M")
-                || !result.duplicate_of.is_empty()
-            {
-                return Err(format!(
-                    "child {} is not an admission-ready nonduplicate S/M implementation",
-                    task.key
-                ));
+            if let Some(summary) = child_preclassification_rejection(&task.key, result) {
+                return Err(summary);
             }
             let mut prerequisite_keys = Vec::new();
             let mut source_dependency_ids = Vec::new();
@@ -4404,6 +4861,18 @@ async fn poll_pre_review_checks(
                 return Ok(PreReviewChecksGate::Waiting);
             }
             PreReviewChecksState::Waiting(_) => {}
+            PreReviewChecksState::Retry => {
+                let repo = config.repo_dir.clone();
+                let executor = Arc::clone(&config.merge_executor);
+                let timeout = config.merge_checks_timeout_secs;
+                let poll = config.merge_checks_poll_secs;
+                let handle = tokio::task::spawn_blocking(move || {
+                    executor.wait_for_checks(pr, &repo, timeout, poll)
+                });
+                waits.get_mut(&task_id).expect("retry entry present").state =
+                    PreReviewChecksState::Waiting(handle);
+                return Ok(PreReviewChecksGate::Waiting);
+            }
         }
     } else {
         let repo = config.repo_dir.clone();
@@ -4418,6 +4887,8 @@ async fn poll_pre_review_checks(
                 pr,
                 head_sha: head_sha.to_string(),
                 state: PreReviewChecksState::Waiting(handle),
+                consecutive_timeouts: 0,
+                timeout_alerted: false,
             },
         );
         log(&format!(
@@ -4429,12 +4900,39 @@ async fn poll_pre_review_checks(
     let Some(entry) = waits.remove(&task_id) else {
         return Ok(PreReviewChecksGate::Waiting);
     };
-    let PreReviewChecksState::Waiting(handle) = entry.state else {
+    let PreReviewChecksEntry {
+        pr: entry_pr,
+        head_sha: entry_head_sha,
+        state,
+        mut consecutive_timeouts,
+        mut timeout_alerted,
+    } = entry;
+    let PreReviewChecksState::Waiting(handle) = state else {
         return Ok(PreReviewChecksGate::Ready);
     };
     let checks = handle
         .await
         .map_err(|error| QuorumError::Io(format!("pre-review checks join: {error}")))?;
+
+    let timed_out = matches!(&checks, merge::ChecksOutcome::TimedOut);
+    if timed_out {
+        consecutive_timeouts = consecutive_timeouts.saturating_add(1);
+        if consecutive_timeouts >= PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER && !timeout_alerted {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let pending_checks =
+                tokio::task::spawn_blocking(move || executor.pending_check_names(pr, &repo))
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("pre-review pending checks join: {error}"))
+                    })?;
+            notify_pre_review_checks_timeout(config, task_id, pr, head_sha, &pending_checks)
+                .await?;
+            timeout_alerted = true;
+        }
+    } else {
+        consecutive_timeouts = 0;
+    }
 
     let gate = match checks {
         merge::ChecksOutcome::Ready if config.required_jobs.is_empty() => {
@@ -4485,16 +4983,68 @@ async fn poll_pre_review_checks(
         waits.insert(
             task_id,
             PreReviewChecksEntry {
-                pr,
-                head_sha: head_sha.to_string(),
+                pr: entry_pr,
+                head_sha: entry_head_sha,
                 state: PreReviewChecksState::Ready,
+                consecutive_timeouts,
+                timeout_alerted,
             },
         );
         log(&format!(
             "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — checks ready"
         ));
+    } else if gate == PreReviewChecksGate::Waiting {
+        waits.insert(
+            task_id,
+            PreReviewChecksEntry {
+                pr: entry_pr,
+                head_sha: entry_head_sha,
+                state: PreReviewChecksState::Retry,
+                consecutive_timeouts,
+                timeout_alerted,
+            },
+        );
     }
     Ok(gate)
+}
+
+async fn notify_pre_review_checks_timeout(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    pending_checks: &[String],
+) -> Result<()> {
+    let db_path = config.db_path.clone();
+    let head_sha = head_sha.to_string();
+    let checks = if pending_checks.is_empty() {
+        "unavailable".to_string()
+    } else {
+        pending_checks.join(", ")
+    };
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let now = now_unix();
+        let body = format!(
+            "task #{task_id} PR #{pr} head {head_sha}: pre-review CI timed out {} consecutive times; pending checks: {checks}",
+            PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER
+        );
+        let refs = format!("task:{task_id},pr:{pr},head:{head_sha}");
+        quorum_core::feed::post(
+            &mut conn,
+            "daemon",
+            "alert",
+            None,
+            &body,
+            Some(&refs),
+            Some("owner"),
+            quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
+            now,
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review timeout alert join: {error}")))?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4563,58 +5113,79 @@ async fn handle_pre_review_checks_failure(
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
-                let prompt = reviewer::build_rework_prompt(
-                    &workers[worker_index].agent_name,
+                if !install_live_worker_remediation_lease(
+                    config,
+                    workers[worker_index].agent_name.clone(),
                     task_id,
                     pr,
                     &feedback,
-                    workers[worker_index].cost_usd,
-                    config.limits.max_task_cost_usd,
-                );
-                if let Err(error) =
-                    feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                )
+                .await
                 {
-                    log(&format!(
-                        "pre-review CI rework feed failed for task #{task_id}: {error}; \
-                         preserving durable remediation intent"
-                    ));
                     let worker = workers.remove(worker_index);
-                    let p = config.db_path.clone();
-                    let agent = worker.agent_name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut conn) = quorum_core::db::open(&p) {
-                            let _ = tasks::release_remediation_lease(
-                                &mut conn,
-                                &agent,
-                                task_id,
-                                now_unix(),
-                            );
-                        }
-                    })
-                    .await
-                    .ok();
-                    cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                    cleanup_slot(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        worker,
+                        None,
+                        "remediation_lease_unavailable",
+                    )
+                    .await;
                 } else {
-                    let worker = &mut workers[worker_index];
-                    worker.draining = true;
-                    worker.pr = None;
-                    worker.rework_count += 1;
-                    worker.turn_started_at = std::time::Instant::now();
-                    if let Some(ref mut session_log) = worker.session_log {
-                        session_log.log_rework(worker.rework_count);
+                    let prompt = reviewer::build_rework_prompt(
+                        &workers[worker_index].agent_name,
+                        task_id,
+                        pr,
+                        &feedback,
+                        workers[worker_index].cost_usd,
+                        config.limits.max_task_cost_usd,
+                    );
+                    if let Err(error) =
+                        feed_worker_turn(&mut workers[worker_index], &prompt, config).await
+                    {
+                        log(&format!(
+                            "pre-review CI rework feed failed for task #{task_id}: {error}; \
+                         preserving durable remediation intent"
+                        ));
+                        let worker = workers.remove(worker_index);
+                        let p = config.db_path.clone();
+                        let agent = worker.agent_name.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(mut conn) = quorum_core::db::open(&p) {
+                                let _ = tasks::release_remediation_lease(
+                                    &mut conn,
+                                    &agent,
+                                    task_id,
+                                    now_unix(),
+                                );
+                            }
+                        })
+                        .await
+                        .ok();
+                        cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+                    } else {
+                        let worker = &mut workers[worker_index];
+                        worker.draining = true;
+                        worker.pr = None;
+                        worker.rework_count += 1;
+                        worker.turn_started_at = std::time::Instant::now();
+                        if let Some(ref mut session_log) = worker.session_log {
+                            session_log.log_rework(worker.rework_count);
+                        }
+                        let p = config.db_path.clone();
+                        let entry = slot_journal_entry(worker, "worker", "working");
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            journal::upsert(&mut conn, &entry)
+                        })
+                        .await
+                        .ok();
+                        log(&format!(
+                            "worker {} rework #{} (pre-review CI failure)",
+                            worker.agent_name, worker.rework_count
+                        ));
                     }
-                    let p = config.db_path.clone();
-                    let entry = slot_journal_entry(worker, "worker", "working");
-                    tokio::task::spawn_blocking(move || -> Result<()> {
-                        let mut conn = quorum_core::db::open(&p)?;
-                        journal::upsert(&mut conn, &entry)
-                    })
-                    .await
-                    .ok();
-                    log(&format!(
-                        "worker {} rework #{} (pre-review CI failure)",
-                        worker.agent_name, worker.rework_count
-                    ));
                 }
             } else {
                 log(&format!(
@@ -4837,7 +5408,7 @@ async fn reconcile_ci_remediations(
             intent.pr,
             &intent.head_sha[..12.min(intent.head_sha.len())]
         ));
-        match spawn_remediation_worker(
+        let cause = match spawn_remediation_worker(
             config,
             wt_mgr,
             name_pool,
@@ -4850,8 +5421,17 @@ async fn reconcile_ci_remediations(
         .await?
         {
             RemediationSpawnOutcome::Spawned | RemediationSpawnOutcome::ClaimLost => continue,
-            RemediationSpawnOutcome::ProvisionFailed => {}
-        }
+            RemediationSpawnOutcome::ProvisionFailed { cause } => cause,
+        };
+        persist_provisioning_failure(
+            &config.db_path,
+            task_id,
+            &format!(
+                "CI remediation provisioning failed for PR #{}: {cause}",
+                intent.pr
+            ),
+        )
+        .await;
 
         let p = config.db_path.clone();
         let attempts = tokio::task::spawn_blocking(move || -> Result<Option<i64>> {
@@ -4872,7 +5452,7 @@ async fn reconcile_ci_remediations(
             ));
             if attempts >= MAX_CI_REMEDIATION_PROVISION_STRIKES {
                 let reason = format!(
-                    "CI remediation provisioning exhausted for PR #{} head {} after {attempts} attempts",
+                    "CI remediation provisioning exhausted for PR #{} head {} after {attempts} attempts: {cause}",
                     intent.pr,
                     &intent.head_sha[..12.min(intent.head_sha.len())]
                 );
@@ -4932,10 +5512,10 @@ async fn reconcile_remediation_retries(
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
             let conn = quorum_core::db::open(&p)?;
-            Ok(tasks::list(&conn, Some("rework"), None, None)?
+            Ok(tasks::list_dependency_ready_rework(&conn)?
                 .into_iter()
                 .filter(|task| {
-                    tasks::classification_is_dispatchable(&task.refs)
+                    tasks::classification_is_dispatchable(&task.refs, task.continue_pr)
                         && remediation_retry_feedback(task.refs.as_deref()).is_some()
                 })
                 .collect())
@@ -4972,7 +5552,7 @@ async fn reconcile_remediation_retries(
             "durable remediation retry: provisioning task #{} on PR #{pr}",
             task.id
         ));
-        if spawn_remediation_worker(
+        let spawn_outcome = spawn_remediation_worker(
             config,
             wt_mgr,
             name_pool,
@@ -4982,10 +5562,9 @@ async fn reconcile_remediation_retries(
             pr,
             &feedback,
         )
-        .await?
-            == RemediationSpawnOutcome::ProvisionFailed
-        {
-            park_remediation_provision_failure(config, task.id, pr, &feedback).await;
+        .await?;
+        if let Some(cause) = spawn_outcome.provision_failure_cause() {
+            park_remediation_provision_failure(config, task.id, pr, &feedback, cause).await;
         }
     }
     Ok(())
@@ -6435,64 +7014,88 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_prompt = reviewer::build_rework_prompt(
-                                            &workers[wi].agent_name,
-                                            workers[wi].task_id,
+                                        if !install_live_worker_remediation_lease(
+                                            config,
+                                            workers[wi].agent_name.clone(),
+                                            reviewer_task_id,
                                             pr_num,
                                             &rework_msg,
-                                            workers[wi].cost_usd,
-                                            config.limits.max_task_cost_usd,
-                                        );
-                                        if let Err(e) = feed_worker_turn(
-                                            &mut workers[wi],
-                                            &rework_prompt,
-                                            config,
                                         )
                                         .await
                                         {
-                                            log(&format!(
-                                                "conflict rework feed failed: {e} — cleaning up"
-                                            ));
                                             let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
                                             cleanup_slot(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "agent_failed",
+                                                "remediation_lease_unavailable",
                                             )
                                             .await;
                                         } else {
-                                            let w = &mut workers[wi];
-                                            w.draining = true;
-                                            w.pr = None;
-                                            w.rework_count += 1;
-                                            w.turn_started_at = std::time::Instant::now();
-                                            if let Some(ref mut sl) = w.session_log {
-                                                sl.log_rework(w.rework_count);
-                                            }
-                                            let p = db_path.clone();
-                                            let entry = slot_journal_entry(w, "worker", "working");
-                                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                                let mut conn = quorum_core::db::open(&p)?;
-                                                journal::upsert(&mut conn, &entry)
-                                            })
+                                            let rework_prompt = reviewer::build_rework_prompt(
+                                                &workers[wi].agent_name,
+                                                workers[wi].task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                                workers[wi].cost_usd,
+                                                config.limits.max_task_cost_usd,
+                                            );
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
                                             .await
-                                            .ok();
-                                            log(&format!(
-                                                "worker {} rework #{} (pre-merge conflict)",
-                                                w.agent_name, w.rework_count
+                                            {
+                                                log(&format!(
+                                                "conflict rework feed failed: {e} — cleaning up"
                                             ));
+                                                let w = workers.remove(wi);
+                                                fire_event(
+                                                    &db_path,
+                                                    &w.agent_name,
+                                                    w.task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: format!("rework feed failed: {e}"),
+                                                    },
+                                                )
+                                                .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                w.draining = true;
+                                                w.pr = None;
+                                                w.rework_count += 1;
+                                                w.turn_started_at = std::time::Instant::now();
+                                                if let Some(ref mut sl) = w.session_log {
+                                                    sl.log_rework(w.rework_count);
+                                                }
+                                                let p = db_path.clone();
+                                                let entry =
+                                                    slot_journal_entry(w, "worker", "working");
+                                                tokio::task::spawn_blocking(
+                                                    move || -> Result<()> {
+                                                        let mut conn = quorum_core::db::open(&p)?;
+                                                        journal::upsert(&mut conn, &entry)
+                                                    },
+                                                )
+                                                .await
+                                                .ok();
+                                                log(&format!(
+                                                    "worker {} rework #{} (pre-merge conflict)",
+                                                    w.agent_name, w.rework_count
+                                                ));
+                                            }
                                         }
                                     } else {
                                         // #175: no live worker — spawn remediation
@@ -6512,13 +7115,14 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await?;
-                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            if let Some(cause) = spawn_ok.provision_failure_cause()
                                             {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
+                                                    cause,
                                                 )
                                                 .await;
                                             }
@@ -6710,64 +7314,88 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_prompt = reviewer::build_rework_prompt(
-                                            &workers[wi].agent_name,
-                                            workers[wi].task_id,
+                                        if !install_live_worker_remediation_lease(
+                                            config,
+                                            workers[wi].agent_name.clone(),
+                                            reviewer_task_id,
                                             pr_num,
                                             &rework_msg,
-                                            workers[wi].cost_usd,
-                                            config.limits.max_task_cost_usd,
-                                        );
-                                        if let Err(e) = feed_worker_turn(
-                                            &mut workers[wi],
-                                            &rework_prompt,
-                                            config,
                                         )
                                         .await
                                         {
-                                            log(&format!(
-                                                "checks-failure rework feed failed: {e} — cleaning up"
-                                            ));
                                             let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
                                             cleanup_slot(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "agent_failed",
+                                                "remediation_lease_unavailable",
                                             )
                                             .await;
                                         } else {
-                                            let w = &mut workers[wi];
-                                            w.draining = true;
-                                            w.pr = None;
-                                            w.rework_count += 1;
-                                            w.turn_started_at = std::time::Instant::now();
-                                            if let Some(ref mut sl) = w.session_log {
-                                                sl.log_rework(w.rework_count);
-                                            }
-                                            let p = db_path.clone();
-                                            let entry = slot_journal_entry(w, "worker", "working");
-                                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                                let mut conn = quorum_core::db::open(&p)?;
-                                                journal::upsert(&mut conn, &entry)
-                                            })
+                                            let rework_prompt = reviewer::build_rework_prompt(
+                                                &workers[wi].agent_name,
+                                                workers[wi].task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                                workers[wi].cost_usd,
+                                                config.limits.max_task_cost_usd,
+                                            );
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
                                             .await
-                                            .ok();
-                                            log(&format!(
-                                                "worker {} rework #{} (checks failure)",
-                                                w.agent_name, w.rework_count
+                                            {
+                                                log(&format!(
+                                                "checks-failure rework feed failed: {e} — cleaning up"
                                             ));
+                                                let w = workers.remove(wi);
+                                                fire_event(
+                                                    &db_path,
+                                                    &w.agent_name,
+                                                    w.task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: format!("rework feed failed: {e}"),
+                                                    },
+                                                )
+                                                .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                w.draining = true;
+                                                w.pr = None;
+                                                w.rework_count += 1;
+                                                w.turn_started_at = std::time::Instant::now();
+                                                if let Some(ref mut sl) = w.session_log {
+                                                    sl.log_rework(w.rework_count);
+                                                }
+                                                let p = db_path.clone();
+                                                let entry =
+                                                    slot_journal_entry(w, "worker", "working");
+                                                tokio::task::spawn_blocking(
+                                                    move || -> Result<()> {
+                                                        let mut conn = quorum_core::db::open(&p)?;
+                                                        journal::upsert(&mut conn, &entry)
+                                                    },
+                                                )
+                                                .await
+                                                .ok();
+                                                log(&format!(
+                                                    "worker {} rework #{} (checks failure)",
+                                                    w.agent_name, w.rework_count
+                                                ));
+                                            }
                                         }
                                     } else {
                                         // #175: no live worker — spawn remediation
@@ -6787,13 +7415,14 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await?;
-                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            if let Some(cause) = spawn_ok.provision_failure_cause()
                                             {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
+                                                    cause,
                                                 )
                                                 .await;
                                             }
@@ -6914,69 +7543,93 @@ async fn tick(
                                             .iter()
                                             .position(|w| w.task_id == reviewer_task_id)
                                         {
-                                            let rework_prompt = reviewer::build_rework_prompt(
-                                                &workers[wi].agent_name,
-                                                workers[wi].task_id,
+                                            if !install_live_worker_remediation_lease(
+                                                config,
+                                                workers[wi].agent_name.clone(),
+                                                reviewer_task_id,
                                                 pr_num,
                                                 &rework_msg,
-                                                workers[wi].cost_usd,
-                                                config.limits.max_task_cost_usd,
-                                            );
-                                            if let Err(e) = feed_worker_turn(
-                                                &mut workers[wi],
-                                                &rework_prompt,
-                                                config,
                                             )
                                             .await
                                             {
-                                                log(&format!(
-                                                    "timeout-conflict rework feed failed: \
-                                                     {e} — cleaning up"
-                                                ));
                                                 let w = workers.remove(wi);
-                                                fire_event(
-                                                    &db_path,
-                                                    &w.agent_name,
-                                                    w.task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: format!("rework feed failed: {e}"),
-                                                    },
-                                                )
-                                                .await;
                                                 cleanup_slot(
                                                     config,
                                                     wt_mgr,
                                                     name_pool,
                                                     w,
                                                     None,
-                                                    "agent_failed",
+                                                    "remediation_lease_unavailable",
                                                 )
                                                 .await;
                                             } else {
-                                                let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
+                                                let rework_prompt = reviewer::build_rework_prompt(
+                                                    &workers[wi].agent_name,
+                                                    workers[wi].task_id,
+                                                    pr_num,
+                                                    &rework_msg,
+                                                    workers[wi].cost_usd,
+                                                    config.limits.max_task_cost_usd,
+                                                );
+                                                if let Err(e) = feed_worker_turn(
+                                                    &mut workers[wi],
+                                                    &rework_prompt,
+                                                    config,
                                                 )
                                                 .await
-                                                .ok();
-                                                log(&format!(
-                                                    "worker {} rework #{} \
+                                                {
+                                                    log(&format!(
+                                                        "timeout-conflict rework feed failed: \
+                                                     {e} — cleaning up"
+                                                    ));
+                                                    let w = workers.remove(wi);
+                                                    fire_event(
+                                                        &db_path,
+                                                        &w.agent_name,
+                                                        w.task_id,
+                                                        &Event::AgentFailed {
+                                                            reason: format!(
+                                                                "rework feed failed: {e}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    cleanup_slot(
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        w,
+                                                        None,
+                                                        "agent_failed",
+                                                    )
+                                                    .await;
+                                                } else {
+                                                    let w = &mut workers[wi];
+                                                    w.draining = true;
+                                                    w.pr = None;
+                                                    w.rework_count += 1;
+                                                    w.turn_started_at = std::time::Instant::now();
+                                                    if let Some(ref mut sl) = w.session_log {
+                                                        sl.log_rework(w.rework_count);
+                                                    }
+                                                    let p = db_path.clone();
+                                                    let entry =
+                                                        slot_journal_entry(w, "worker", "working");
+                                                    tokio::task::spawn_blocking(
+                                                        move || -> Result<()> {
+                                                            let mut conn =
+                                                                quorum_core::db::open(&p)?;
+                                                            journal::upsert(&mut conn, &entry)
+                                                        },
+                                                    )
+                                                    .await
+                                                    .ok();
+                                                    log(&format!(
+                                                        "worker {} rework #{} \
                                                      (timeout + conflict)",
-                                                    w.agent_name, w.rework_count
-                                                ));
+                                                        w.agent_name, w.rework_count
+                                                    ));
+                                                }
                                             }
                                         } else {
                                             // #175: no live worker — spawn remediation
@@ -6996,14 +7649,15 @@ async fn tick(
                                                     &rework_msg,
                                                 )
                                                 .await?;
-                                                if spawn_ok
-                                                    == RemediationSpawnOutcome::ProvisionFailed
+                                                if let Some(cause) =
+                                                    spawn_ok.provision_failure_cause()
                                                 {
                                                     park_remediation_provision_failure(
                                                         config,
                                                         reviewer_task_id,
                                                         pr_num,
                                                         &rework_msg,
+                                                        cause,
                                                     )
                                                     .await;
                                                 }
@@ -7251,66 +7905,90 @@ async fn tick(
                                     if let Some(wi) =
                                         workers.iter().position(|w| w.task_id == reviewer_task_id)
                                     {
-                                        let rework_prompt = reviewer::build_rework_prompt(
-                                            &workers[wi].agent_name,
-                                            workers[wi].task_id,
+                                        if !install_live_worker_remediation_lease(
+                                            config,
+                                            workers[wi].agent_name.clone(),
+                                            reviewer_task_id,
                                             pr_num,
                                             &rework_msg,
-                                            workers[wi].cost_usd,
-                                            config.limits.max_task_cost_usd,
-                                        );
-                                        if let Err(e) = feed_worker_turn(
-                                            &mut workers[wi],
-                                            &rework_prompt,
-                                            config,
                                         )
                                         .await
                                         {
-                                            log(&format!(
-                                                "pre-merge conflict rework feed failed: \
-                                                 {e} — cleaning up"
-                                            ));
                                             let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
                                             cleanup_slot(
                                                 config,
                                                 wt_mgr,
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "agent_failed",
+                                                "remediation_lease_unavailable",
                                             )
                                             .await;
                                         } else {
-                                            let w = &mut workers[wi];
-                                            w.draining = true;
-                                            w.pr = None;
-                                            w.rework_count += 1;
-                                            w.turn_started_at = std::time::Instant::now();
-                                            if let Some(ref mut sl) = w.session_log {
-                                                sl.log_rework(w.rework_count);
-                                            }
-                                            let p = db_path.clone();
-                                            let entry = slot_journal_entry(w, "worker", "working");
-                                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                                let mut conn = quorum_core::db::open(&p)?;
-                                                journal::upsert(&mut conn, &entry)
-                                            })
+                                            let rework_prompt = reviewer::build_rework_prompt(
+                                                &workers[wi].agent_name,
+                                                workers[wi].task_id,
+                                                pr_num,
+                                                &rework_msg,
+                                                workers[wi].cost_usd,
+                                                config.limits.max_task_cost_usd,
+                                            );
+                                            if let Err(e) = feed_worker_turn(
+                                                &mut workers[wi],
+                                                &rework_prompt,
+                                                config,
+                                            )
                                             .await
-                                            .ok();
-                                            log(&format!(
-                                                "worker {} rework #{} \
+                                            {
+                                                log(&format!(
+                                                    "pre-merge conflict rework feed failed: \
+                                                 {e} — cleaning up"
+                                                ));
+                                                let w = workers.remove(wi);
+                                                fire_event(
+                                                    &db_path,
+                                                    &w.agent_name,
+                                                    w.task_id,
+                                                    &Event::AgentFailed {
+                                                        reason: format!("rework feed failed: {e}"),
+                                                    },
+                                                )
+                                                .await;
+                                                cleanup_slot(
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    w,
+                                                    None,
+                                                    "agent_failed",
+                                                )
+                                                .await;
+                                            } else {
+                                                let w = &mut workers[wi];
+                                                w.draining = true;
+                                                w.pr = None;
+                                                w.rework_count += 1;
+                                                w.turn_started_at = std::time::Instant::now();
+                                                if let Some(ref mut sl) = w.session_log {
+                                                    sl.log_rework(w.rework_count);
+                                                }
+                                                let p = db_path.clone();
+                                                let entry =
+                                                    slot_journal_entry(w, "worker", "working");
+                                                tokio::task::spawn_blocking(
+                                                    move || -> Result<()> {
+                                                        let mut conn = quorum_core::db::open(&p)?;
+                                                        journal::upsert(&mut conn, &entry)
+                                                    },
+                                                )
+                                                .await
+                                                .ok();
+                                                log(&format!(
+                                                    "worker {} rework #{} \
                                                  (pre-merge conflict recheck)",
-                                                w.agent_name, w.rework_count
-                                            ));
+                                                    w.agent_name, w.rework_count
+                                                ));
+                                            }
                                         }
                                     } else {
                                         // #175: no live worker — spawn remediation
@@ -7330,13 +8008,14 @@ async fn tick(
                                                 &rework_msg,
                                             )
                                             .await?;
-                                            if spawn_ok == RemediationSpawnOutcome::ProvisionFailed
+                                            if let Some(cause) = spawn_ok.provision_failure_cause()
                                             {
                                                 park_remediation_provision_failure(
                                                     config,
                                                     reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
+                                                    cause,
                                                 )
                                                 .await;
                                             }
@@ -7631,70 +8310,94 @@ async fn tick(
                                                 .iter()
                                                 .position(|w| w.task_id == reviewer_task_id)
                                             {
-                                                let rework_prompt = reviewer::build_rework_prompt(
-                                                    &workers[wi].agent_name,
-                                                    workers[wi].task_id,
+                                                if !install_live_worker_remediation_lease(
+                                                    config,
+                                                    workers[wi].agent_name.clone(),
+                                                    reviewer_task_id,
                                                     pr_num,
                                                     &rework_msg,
-                                                    workers[wi].cost_usd,
-                                                    config.limits.max_task_cost_usd,
-                                                );
-                                                if let Err(e) = feed_worker_turn(
-                                                    &mut workers[wi],
-                                                    &rework_prompt,
-                                                    config,
                                                 )
                                                 .await
                                                 {
-                                                    log(&format!(
-                                                    "merge-failure rework feed failed: {e} — cleaning up"
-                                                ));
                                                     let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
-                                                    )
-                                                    .await;
                                                     cleanup_slot(
                                                         config,
                                                         wt_mgr,
                                                         name_pool,
                                                         w,
                                                         None,
-                                                        "agent_failed",
+                                                        "remediation_lease_unavailable",
                                                     )
                                                     .await;
                                                 } else {
-                                                    let w = &mut workers[wi];
-                                                    w.draining = true;
-                                                    w.pr = None;
-                                                    w.rework_count += 1;
-                                                    w.turn_started_at = std::time::Instant::now();
-                                                    if let Some(ref mut sl) = w.session_log {
-                                                        sl.log_rework(w.rework_count);
-                                                    }
-                                                    let p = db_path.clone();
-                                                    let entry =
-                                                        slot_journal_entry(w, "worker", "working");
-                                                    tokio::task::spawn_blocking(
-                                                        move || -> Result<()> {
-                                                            let mut conn =
-                                                                quorum_core::db::open(&p)?;
-                                                            journal::upsert(&mut conn, &entry)
-                                                        },
+                                                    let rework_prompt =
+                                                        reviewer::build_rework_prompt(
+                                                            &workers[wi].agent_name,
+                                                            workers[wi].task_id,
+                                                            pr_num,
+                                                            &rework_msg,
+                                                            workers[wi].cost_usd,
+                                                            config.limits.max_task_cost_usd,
+                                                        );
+                                                    if let Err(e) = feed_worker_turn(
+                                                        &mut workers[wi],
+                                                        &rework_prompt,
+                                                        config,
                                                     )
                                                     .await
-                                                    .ok();
-                                                    log(&format!(
-                                                        "worker {} rework #{} (merge failure)",
-                                                        w.agent_name, w.rework_count
-                                                    ));
+                                                    {
+                                                        log(&format!(
+                                                    "merge-failure rework feed failed: {e} — cleaning up"
+                                                ));
+                                                        let w = workers.remove(wi);
+                                                        fire_event(
+                                                            &db_path,
+                                                            &w.agent_name,
+                                                            w.task_id,
+                                                            &Event::AgentFailed {
+                                                                reason: format!(
+                                                                    "rework feed failed: {e}"
+                                                                ),
+                                                            },
+                                                        )
+                                                        .await;
+                                                        cleanup_slot(
+                                                            config,
+                                                            wt_mgr,
+                                                            name_pool,
+                                                            w,
+                                                            None,
+                                                            "agent_failed",
+                                                        )
+                                                        .await;
+                                                    } else {
+                                                        let w = &mut workers[wi];
+                                                        w.draining = true;
+                                                        w.pr = None;
+                                                        w.rework_count += 1;
+                                                        w.turn_started_at =
+                                                            std::time::Instant::now();
+                                                        if let Some(ref mut sl) = w.session_log {
+                                                            sl.log_rework(w.rework_count);
+                                                        }
+                                                        let p = db_path.clone();
+                                                        let entry = slot_journal_entry(
+                                                            w, "worker", "working",
+                                                        );
+                                                        tokio::task::spawn_blocking(
+                                                            move || -> Result<()> {
+                                                                let mut conn =
+                                                                    quorum_core::db::open(&p)?;
+                                                                journal::upsert(&mut conn, &entry)
+                                                            },
+                                                        )
+                                                        .await
+                                                        .ok();
+                                                        log(&format!(
+                                                            "worker {} rework #{} (merge failure)",
+                                                            w.agent_name, w.rework_count
+                                                        ));
+                                                    }
                                                 }
                                             } else {
                                                 // #175: no live worker — spawn remediation
@@ -7714,14 +8417,15 @@ async fn tick(
                                                         &rework_msg,
                                                     )
                                                     .await?;
-                                                    if spawn_ok
-                                                        == RemediationSpawnOutcome::ProvisionFailed
+                                                    if let Some(cause) =
+                                                        spawn_ok.provision_failure_cause()
                                                     {
                                                         park_remediation_provision_failure(
                                                             config,
                                                             reviewer_task_id,
                                                             pr_num,
                                                             &rework_msg,
+                                                            cause,
                                                         )
                                                         .await;
                                                     }
@@ -7900,58 +8604,80 @@ async fn tick(
                                     ));
                                     0
                                 });
-                                let rework_prompt = reviewer::build_rework_prompt(
-                                    &workers[wi].agent_name,
-                                    workers[wi].task_id,
+                                if !install_live_worker_remediation_lease(
+                                    config,
+                                    workers[wi].agent_name.clone(),
+                                    reviewer_task_id,
                                     rework_pr,
                                     feedback,
-                                    workers[wi].cost_usd,
-                                    config.limits.max_task_cost_usd,
-                                );
-                                if let Err(e) =
-                                    feed_worker_turn(&mut workers[wi], &rework_prompt, config).await
+                                )
+                                .await
                                 {
-                                    log(&format!("rework feed_turn failed: {e} — cleaning up"));
                                     let w = workers.remove(wi);
-                                    fire_event(
-                                        &db_path,
-                                        &w.agent_name,
-                                        w.task_id,
-                                        &Event::AgentFailed {
-                                            reason: format!("rework feed failed: {e}"),
-                                        },
-                                    )
-                                    .await;
                                     cleanup_slot(
                                         config,
                                         wt_mgr,
                                         name_pool,
                                         w,
                                         None,
-                                        "agent_failed",
+                                        "remediation_lease_unavailable",
                                     )
                                     .await;
                                 } else {
-                                    let w = &mut workers[wi];
-                                    w.draining = true;
-                                    w.pr = None;
-                                    w.rework_count += 1;
-                                    w.turn_started_at = std::time::Instant::now();
-                                    if let Some(ref mut sl) = w.session_log {
-                                        sl.log_rework(w.rework_count);
+                                    let rework_prompt = reviewer::build_rework_prompt(
+                                        &workers[wi].agent_name,
+                                        workers[wi].task_id,
+                                        rework_pr,
+                                        feedback,
+                                        workers[wi].cost_usd,
+                                        config.limits.max_task_cost_usd,
+                                    );
+                                    if let Err(e) =
+                                        feed_worker_turn(&mut workers[wi], &rework_prompt, config)
+                                            .await
+                                    {
+                                        log(&format!("rework feed_turn failed: {e} — cleaning up"));
+                                        let w = workers.remove(wi);
+                                        fire_event(
+                                            &db_path,
+                                            &w.agent_name,
+                                            w.task_id,
+                                            &Event::AgentFailed {
+                                                reason: format!("rework feed failed: {e}"),
+                                            },
+                                        )
+                                        .await;
+                                        cleanup_slot(
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            w,
+                                            None,
+                                            "agent_failed",
+                                        )
+                                        .await;
+                                    } else {
+                                        let w = &mut workers[wi];
+                                        w.draining = true;
+                                        w.pr = None;
+                                        w.rework_count += 1;
+                                        w.turn_started_at = std::time::Instant::now();
+                                        if let Some(ref mut sl) = w.session_log {
+                                            sl.log_rework(w.rework_count);
+                                        }
+                                        let p = db_path.clone();
+                                        let entry = slot_journal_entry(w, "worker", "working");
+                                        tokio::task::spawn_blocking(move || -> Result<()> {
+                                            let mut conn = quorum_core::db::open(&p)?;
+                                            journal::upsert(&mut conn, &entry)
+                                        })
+                                        .await
+                                        .ok();
+                                        log(&format!(
+                                            "worker {} rework #{} started",
+                                            w.agent_name, w.rework_count
+                                        ));
                                     }
-                                    let p = db_path.clone();
-                                    let entry = slot_journal_entry(w, "worker", "working");
-                                    tokio::task::spawn_blocking(move || -> Result<()> {
-                                        let mut conn = quorum_core::db::open(&p)?;
-                                        journal::upsert(&mut conn, &entry)
-                                    })
-                                    .await
-                                    .ok();
-                                    log(&format!(
-                                        "worker {} rework #{} started",
-                                        w.agent_name, w.rework_count
-                                    ));
                                 }
                             } else {
                                 // #159: no live worker — spawn a remediation
@@ -7974,12 +8700,13 @@ async fn tick(
                                         feedback,
                                     )
                                     .await?;
-                                    if spawn_ok == RemediationSpawnOutcome::ProvisionFailed {
+                                    if let Some(cause) = spawn_ok.provision_failure_cause() {
                                         park_remediation_provision_failure(
                                             config,
                                             reviewer_task_id,
                                             rework_pr,
                                             feedback,
+                                            cause,
                                         )
                                         .await;
                                     }
@@ -9415,12 +10142,13 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        // (task_id, pr, author, review_only, body, reviewer, refs)
+        // (task_id, pr, author, review_only, continue_pr, body, reviewer, refs)
         type OrphanRow = (
             i64,
             i64,
             String,
             bool,
+            Option<i64>,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -9434,7 +10162,16 @@ async fn tick(
                 for t in ir_tasks {
                     if let Some(pr) = tasks::extract_pr_number(&t.refs) {
                         let author = t.author.unwrap_or_default();
-                        result.push((t.id, pr, author, t.review_only, t.body, t.reviewer, t.refs));
+                        result.push((
+                            t.id,
+                            pr,
+                            author,
+                            t.review_only,
+                            t.continue_pr,
+                            t.body,
+                            t.reviewer,
+                            t.refs,
+                        ));
                     }
                 }
                 Ok(result)
@@ -9443,7 +10180,9 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
+        for (task_id, pr, author, review_only, continue_pr, body, reviewer, task_refs) in
+            &orphan_in_review
+        {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -9614,7 +10353,7 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
-                    if !tasks::classification_is_dispatchable(task_refs) {
+                    if !tasks::classification_is_dispatchable(task_refs, *continue_pr) {
                         log(&format!(
                             "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
                         ));
@@ -11789,7 +12528,7 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if !tasks::classification_is_dispatchable(&t.refs) {
+            if !tasks::classification_is_dispatchable(&t.refs, t.continue_pr) {
                 return false;
             }
             if t.review_only {
@@ -11912,20 +12651,56 @@ async fn spawn_worker(
     let worker_repo_dir = &config.repo_dir;
 
     // A continuation assignment is bound to the live PR target resolved after
-    // the atomic claim. It must never inherit a stale refs.pr value or fall
-    // through to base-derived provisioning.
-    let continue_target = if let Some(pr) = task.continue_pr {
+    // the atomic claim. Explicit --continue-pr remains authoritative. A
+    // parked-rework retry may recover the same authority only from a complete
+    // daemon publication lease; it must never adopt a mutable refs.pr value or
+    // fall through to base-derived provisioning once that lease exists.
+    let (continue_target, parked_rework_continuation) = if let Some(pr) = task.continue_pr {
         match resolve_and_persist_continue_pr_target(config, task.id, pr).await {
-            Ok(target) => Some(target),
+            Ok(target) => (Some(target), false),
             Err(error) => {
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
                 park_task(&db_path, task.id, &reason, "open").await;
                 name_pool.release(&agent_name);
                 return Ok(false);
             }
         }
     } else {
-        None
+        let recorded = match parked_rework_publication_intent(task.refs.as_deref()) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let reason = format!("parked rework publication provisioning rejected: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(&db_path, task.id, &reason, "rework").await;
+                name_pool.release(&agent_name);
+                return Ok(false);
+            }
+        };
+        match recorded {
+            Some(intent) => {
+                let pr = intent.pr.expect("validated parked publication PR");
+                match resolve_and_persist_parked_rework_target(config, task.id, &intent).await {
+                    Ok(target) => (Some(target), true),
+                    Err(error) => {
+                        let reason = format!(
+                            "parked rework publication for PR #{pr} provisioning rejected: {error}"
+                        );
+                        persist_provisioning_failure(&db_path, task.id, &reason).await;
+                        park_task(&db_path, task.id, &reason, "rework").await;
+                        name_pool.release(&agent_name);
+                        return Ok(false);
+                    }
+                }
+            }
+            None => (None, false),
+        }
+    };
+    let continuation_pr = continue_target.as_ref().map(|target| target.pr);
+    let continuation_rework_count = if parked_rework_continuation {
+        i32::try_from(task.rework_round.max(1)).unwrap_or(i32::MAX)
+    } else {
+        0
     };
 
     // Branch keyed to task + original author, not current assignee — a rework
@@ -11979,13 +12754,9 @@ async fn spawn_worker(
         let resolved_provenance = match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
             Ok(sha) => sha,
             Err(error) => {
-                park_task(
-                    &db_path,
-                    task.id,
-                    &format!("branch provenance resolution failed: {error}"),
-                    "open",
-                )
-                .await;
+                let reason = format!("branch provenance resolution failed: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(&db_path, task.id, &reason, "open").await;
                 name_pool.release(&agent_name);
                 return Ok(false);
             }
@@ -12066,12 +12837,21 @@ async fn spawn_worker(
         }
         Err(e) => {
             log(&format!("worktree provision failed: {e}"));
-            if task.continue_pr.is_some() {
+            let cause = classified_provisioning_cause(&format!(
+                "initial worker worktree provisioning failed: {e}"
+            ));
+            persist_provisioning_failure(&db_path, task.id, &cause).await;
+            if let Some(pr) = continuation_pr {
+                let resume_status = if parked_rework_continuation {
+                    "rework"
+                } else {
+                    "open"
+                };
                 park_task(
                     &db_path,
                     task.id,
-                    &format!("continue PR worktree provisioning failed: {e}"),
-                    "open",
+                    &format!("initial worker provisioning failed for continue PR #{pr}: {cause}"),
+                    resume_status,
                 )
                 .await;
                 name_pool.release(&agent_name);
@@ -12081,7 +12861,7 @@ async fn spawn_worker(
             }
             let strikes = poison_tracker.record_strike(task.id);
             if strikes >= MAX_POISON_STRIKES {
-                poison_task(&db_path, &agent_name, task.id, strikes).await;
+                poison_task(&db_path, &agent_name, task.id, strikes, Some(&cause)).await;
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
@@ -12095,9 +12875,12 @@ async fn spawn_worker(
     // the daemon-owned publish boundary while preserving their read/fetch use.
     if let Err(e) = wt_mgr.disable_push(&wt_path).await {
         log(&format!("worker push lockout failed: {e}"));
+        let cause =
+            classified_provisioning_cause(&format!("initial worker push lockout failed: {e}"));
+        persist_provisioning_failure(&db_path, task.id, &cause).await;
         let strikes = poison_tracker.record_strike(task.id);
         if strikes >= MAX_POISON_STRIKES {
-            poison_task(&db_path, &agent_name, task.id, strikes).await;
+            poison_task(&db_path, &agent_name, task.id, strikes, Some(&cause)).await;
         } else {
             release_task(&db_path, &agent_name, task.id).await;
         }
@@ -12137,8 +12920,8 @@ async fn spawn_worker(
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
         pid: None,
-        pr: task.continue_pr,
-        rework_count: 0,
+        pr: continuation_pr,
+        rework_count: continuation_rework_count,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -12255,7 +13038,7 @@ async fn spawn_worker(
             .ok();
         } else {
             // Initial open task: poison — this won't resolve on retry.
-            poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES).await;
+            poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES, None).await;
         }
         name_pool.release(&agent_name);
         wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
@@ -12305,8 +13088,8 @@ async fn spawn_worker(
                         .as_ref()
                         .map(|l| l.dir().to_string_lossy().into()),
                     pid: spawn_pid,
-                    pr: task.continue_pr,
-                    rework_count: 0,
+                    pr: continuation_pr,
+                    rework_count: continuation_rework_count,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -12361,7 +13144,7 @@ async fn spawn_worker(
                 remote_branch: remote_branch.clone(),
                 branch,
                 draining: true,
-                pr: task.continue_pr,
+                pr: continuation_pr,
                 rework_count: retry_slot_rework_count(
                     task.rework_round,
                     retry_turn.as_ref(),
@@ -12395,7 +13178,7 @@ async fn spawn_worker(
             log(&format!("agent spawn failed: {e}"));
             let strikes = poison_tracker.record_strike(task.id);
             if strikes >= MAX_POISON_STRIKES {
-                poison_task(&db_path, &agent_name, task.id, strikes).await;
+                poison_task(&db_path, &agent_name, task.id, strikes, None).await;
             } else {
                 release_task(&db_path, &agent_name, task.id).await;
             }
@@ -12430,8 +13213,18 @@ async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
     .ok();
 }
 
-async fn poison_task(db_path: &std::path::Path, agent: &str, task_id: i64, strikes: u32) {
-    let reason = format!("worker {agent} died {strikes} time(s) without producing output");
+async fn poison_task(
+    db_path: &std::path::Path,
+    agent: &str,
+    task_id: i64,
+    strikes: u32,
+    provision_cause: Option<&str>,
+) {
+    let mut reason = format!("worker {agent} died {strikes} time(s) without producing output");
+    if let Some(cause) = provision_cause {
+        reason.push_str(": ");
+        reason.push_str(&classified_provisioning_cause(cause));
+    }
     park_task(db_path, task_id, &reason, "open").await;
 }
 
@@ -12800,20 +13593,19 @@ async fn park_remediation_provision_failure(
     task_id: i64,
     pr: i64,
     feedback: &str,
+    cause: &str,
 ) {
     // `task-retry` restores a parked rework task without the original reviewer
     // process or mailbox row. Preserve the accepted blocking feedback so the
     // replacement remediation turn remains tied to the unresolved finding.
     persist_remediation_feedback(&config.db_path, task_id, feedback).await;
-    let reason = format!("remediation worker provisioning failed for PR #{pr}");
+    let reason = format!(
+        "remediation provisioning failed for PR #{pr}: {}",
+        classified_provisioning_cause(cause)
+    );
+    persist_provisioning_failure(&config.db_path, task_id, &reason).await;
     if park_task(&config.db_path, task_id, &reason, "rework").await {
-        notify_provision_failure(
-            &config.db_path,
-            task_id,
-            "remediation worker provisioning failed",
-            &format!("#{pr}"),
-        )
-        .await;
+        notify_provision_failure(&config.db_path, task_id, &reason, &format!("#{pr}")).await;
     }
 }
 
@@ -13144,18 +13936,30 @@ static R2_META: std::sync::LazyLock<std::sync::Mutex<HashMap<String, R2Meta>>> =
 
 // ── Remediation worker (#159) ────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RemediationSpawnOutcome {
     Spawned,
     /// The authoritative guarded DB claim lost because the task was no longer
     /// eligible.  This is a clean race outcome: callers must not park, notify,
     /// or charge a provisioning strike.
     ClaimLost,
-    /// Eligibility was claimed, but external worker provisioning failed.
-    ProvisionFailed,
+    /// Eligibility was claimed, but external worker provisioning failed. The
+    /// bounded cause must be preserved by callers that park the task.
+    ProvisionFailed {
+        cause: String,
+    },
 }
 
-async fn claim_remediation_for_spawn(
+impl RemediationSpawnOutcome {
+    fn provision_failure_cause(&self) -> Option<&str> {
+        match self {
+            Self::ProvisionFailed { cause } => Some(cause),
+            Self::Spawned | Self::ClaimLost => None,
+        }
+    }
+}
+
+async fn claim_remediation_for_worker(
     db_path: PathBuf,
     agent: String,
     task_id: i64,
@@ -13178,6 +13982,43 @@ async fn claim_remediation_for_spawn(
             "remediation claim join for task #{task_id}: {error}"
         ))
     })?
+}
+
+/// Install a fresh remediation lease for a still-live worker before feeding it
+/// a rework turn. `VerdictChanges` and `MergeConflict` release the prior lease
+/// as part of their lifecycle transition, so renewal cannot protect this gap.
+///
+/// A lost guarded claim is a clean race: the worker is not fed. An abnormal
+/// claim failure parks and notifies through the same path as failed remediation
+/// provisioning, rather than running an unleased turn.
+async fn install_live_worker_remediation_lease(
+    config: &ServeConfig,
+    agent: String,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+) -> bool {
+    match claim_remediation_for_worker(config.db_path.clone(), agent, task_id, feedback.to_string())
+        .await
+    {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            log(&format!(
+                "live remediation: claim lost for task #{task_id} — task no longer eligible"
+            ));
+            false
+        }
+        Err(error) => {
+            log(&format!(
+                "live remediation: lease install failed for task #{task_id}: {error} — parking task"
+            ));
+            let cause = classified_provisioning_cause(&format!(
+                "remediation lease installation failed: {error}"
+            ));
+            park_remediation_provision_failure(config, task_id, pr, feedback, &cause).await;
+            false
+        }
+    }
 }
 
 async fn retain_blocked_remediation_retry_for_spawn(
@@ -13260,7 +14101,7 @@ async fn spawn_remediation_worker(
     // sweep. Without this, an intervening sweep_on_write sees a rework task
     // with no active claim and reaps it to open (#199).
     {
-        match claim_remediation_for_spawn(
+        match claim_remediation_for_worker(
             db_path.clone(),
             agent_name.clone(),
             task_id,
@@ -13387,7 +14228,9 @@ async fn spawn_remediation_worker(
             })
             .await;
             name_pool.release(&agent_name);
-            return Ok(RemediationSpawnOutcome::ProvisionFailed);
+            return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: "structural: remediation PR target is unavailable and no safe fallback branch exists".into(),
+            });
         }
         fb
     } else {
@@ -13454,33 +14297,40 @@ async fn spawn_remediation_worker(
             .await;
         (result, None)
     };
-    let provision_ok = match provision_result {
+    let provision_failure = match provision_result {
         Ok(_) => {
-            let head_ok = match sha_to_verify {
-                Some(expected_sha) => wt_mgr.verify_head_sha(&wt_path, expected_sha).await.is_ok(),
-                None => true,
-            };
-            // Workers commit only. The daemon owns the later explicit push to
-            // the PR head and verifies it before advancing lifecycle.
-            head_ok
-                && match wt_mgr.disable_push(&wt_path).await {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log(&format!(
-                            "remediation: push lockout failed for PR #{pr}: {e}"
-                        ));
-                        false
+            if let Some(expected_sha) = sha_to_verify {
+                if let Err(error) = wt_mgr.verify_head_sha(&wt_path, expected_sha).await {
+                    Some(format!(
+                        "structural head-SHA mismatch for remediation PR #{pr}: {error}"
+                    ))
+                } else {
+                    match wt_mgr.disable_push(&wt_path).await {
+                        Ok(()) => None,
+                        Err(error) => Some(format!(
+                            "remediation push lockout failed for PR #{pr}: {error}"
+                        )),
                     }
                 }
+            } else {
+                match wt_mgr.disable_push(&wt_path).await {
+                    Ok(()) => None,
+                    Err(error) => Some(format!(
+                        "remediation push lockout failed for PR #{pr}: {error}"
+                    )),
+                }
+            }
         }
-        Err(e) => {
+        Err(error) => {
             log(&format!(
-                "remediation: worktree provision failed for PR #{pr}: {e}"
+                "remediation: worktree provision failed for PR #{pr}: {error}"
             ));
-            false
+            Some(format!(
+                "remediation worktree provisioning failed for PR #{pr}: {error}"
+            ))
         }
     };
-    if !provision_ok {
+    if let Some(cause) = provision_failure {
         log(&format!(
             "remediation: worktree provision failed for PR #{pr} — giving up"
         ));
@@ -13498,7 +14348,9 @@ async fn spawn_remediation_worker(
             .await;
         }
         name_pool.release(&agent_name);
-        return Ok(RemediationSpawnOutcome::ProvisionFailed);
+        return Ok(RemediationSpawnOutcome::ProvisionFailed {
+            cause: classified_provisioning_cause(&cause),
+        });
     }
 
     // Inspection surfaces report the PR branch this run continues, not the
@@ -13573,7 +14425,10 @@ async fn spawn_remediation_worker(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
 
-    let (remediation_complexity, remediation_revision) = {
+    // An implementation task must resume the immutable profile from its first
+    // worker run. Only workerless review-only remediation has no allocation to
+    // recover, so it receives a fresh assignment from the current pool.
+    let (remediation_complexity, remediation_revision, original_worker) = {
         let conn = quorum_core::db::open(db_path)?;
         let task = tasks::get(&conn, task_id)?
             .ok_or_else(|| QuorumError::Io(format!("remediation task #{task_id} disappeared")))?;
@@ -13582,74 +14437,99 @@ async fn spawn_remediation_worker(
                 "task #{task_id} cannot dispatch remediation without classifier-owned complexity"
             ))
         })?;
-        (complexity, task.revision)
+        (
+            complexity,
+            task.revision,
+            quorum_core::agent_runs::first_worker(&conn, task_id)?,
+        )
     };
-    let remediation_assignment = assign_role(
-        config,
-        quorum_core::role_assignments::AssignmentRequest {
-            responsibility_key: worker_responsibility_key(task_id, remediation_revision),
-            task_id: Some(task_id),
-            pr_number: None,
-            role: "worker".into(),
-            review_stage: None,
-            complexity: Some(remediation_complexity.to_string()),
-        },
-        Some(remediation_complexity),
-    )?;
-
-    // Recover the original assignment snapshot. Historical run rows are checked
-    // as evidence, but current configuration never reselects remediation.
-    let (remediation_model, remediation_effort, remediation_kind, has_original_worker) = {
-        let p = db_path.clone();
-        let tid = task_id;
-        let assigned_model = remediation_assignment.model.clone();
-        let assigned_effort = remediation_assignment.effort.clone();
-        let assigned_provider = remediation_assignment.provider.clone();
-        let resolved = tokio::task::spawn_blocking(move || -> Result<_> {
-            let conn = quorum_core::db::open(&p)?;
-            let provider = quorum_core::agent_runs::worker_provider(&conn, tid)?;
-            let model = quorum_core::agent_runs::worker_model(&conn, tid)?;
-            let worker_runs = quorum_core::agent_runs::runs_for_task(&conn, tid)?;
-            let has_original_worker = worker_runs.iter().any(|run| run.role == "worker");
-            if model
-                .as_deref()
-                .is_some_and(|model| model != assigned_model)
-                || provider
-                    .as_deref()
-                    .is_some_and(|provider| provider != assigned_provider)
-            {
-                return Err(QuorumError::Io(
-                    "historical worker run does not match durable routing assignment".into(),
-                ));
-            }
-            let kind = resolve_provider(&assigned_model)?;
-            Ok((assigned_model, assigned_effort, kind, has_original_worker))
+    let fresh_assignment = original_worker
+        .is_none()
+        .then(|| {
+            assign_role(
+                config,
+                quorum_core::role_assignments::AssignmentRequest {
+                    responsibility_key: worker_responsibility_key(task_id, remediation_revision),
+                    task_id: Some(task_id),
+                    pr_number: None,
+                    role: "worker".into(),
+                    review_stage: None,
+                    complexity: Some(remediation_complexity.to_string()),
+                },
+                Some(remediation_complexity),
+            )
         })
-        .await;
+        .transpose()?;
+
+    let (
+        remediation_model,
+        remediation_effort,
+        remediation_kind,
+        has_original_worker,
+        worker_assignment,
+    ) = {
+        let resolved = match original_worker {
+            Some(worker) => {
+                let conn = quorum_core::db::open(db_path)?;
+                recover_original_remediation_layout(&conn, task_id, worker).map(|layout| {
+                    (
+                        layout.model,
+                        layout.effort,
+                        layout.kind,
+                        true,
+                        layout.assignment,
+                    )
+                })
+            }
+            None => {
+                let assignment =
+                    fresh_assignment.expect("workerless remediation has a fresh assignment");
+                let kind = resolve_managed_provider(&assignment.model, "remediation");
+                kind.map(|kind| {
+                    (
+                        assignment.model.clone(),
+                        assignment.effort.clone(),
+                        kind,
+                        false,
+                        Some(assignment),
+                    )
+                })
+            }
+        };
         match resolved {
-            Ok(Ok(resolved)) => {
-                if let Err(error) =
-                    require_configured_provider(config, resolved.2, "remediation worker")
-                {
-                    log(&format!(
-                        "remediation: provider recovery failed for task #{task_id}: {error}"
-                    ));
-                    let p = db_path.clone();
-                    let name = agent_name.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let mut conn = quorum_core::db::open(&p)?;
-                        tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
-                    })
-                    .await;
-                    cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                    name_pool.release(&agent_name);
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return Ok(RemediationSpawnOutcome::ProvisionFailed);
+            Ok(resolved) => {
+                if resolved.3 {
+                    if let Err(error) = require_configured_provider(
+                        config,
+                        &resolved.0,
+                        resolved.2,
+                        "original remediation worker",
+                    ) {
+                        log(&format!(
+                            "remediation: provider recovery failed for task #{task_id}: {error}"
+                        ));
+                        let p = db_path.clone();
+                        let name = agent_name.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+                        })
+                        .await;
+                        cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id)
+                            .await;
+                        name_pool.release(&agent_name);
+                        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                        wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                            cause: classified_provisioning_cause(&format!(
+                                "remediation provider recovery failed: {error}"
+                            )),
+                        });
+                    }
                 }
                 resolved
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 log(&format!(
                     "remediation: provider recovery failed for task #{task_id}: {error}"
                 ));
@@ -13664,24 +14544,11 @@ async fn spawn_remediation_worker(
                 name_pool.release(&agent_name);
                 wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
                 wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return Ok(RemediationSpawnOutcome::ProvisionFailed);
-            }
-            Err(error) => {
-                log(&format!(
-                    "remediation: provider recovery join failed for task #{task_id}: {error}"
-                ));
-                let p = db_path.clone();
-                let name = agent_name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
-                })
-                .await;
-                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return Ok(RemediationSpawnOutcome::ProvisionFailed);
+                return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                    cause: classified_provisioning_cause(&format!(
+                        "remediation provider recovery failed: {error}"
+                    )),
+                });
             }
         }
     };
@@ -13727,7 +14594,9 @@ async fn spawn_remediation_worker(
         name_pool.release(&agent_name);
         wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
         wt_mgr.delete_branch(task_repo_dir, &branch).await;
-        return Ok(RemediationSpawnOutcome::ProvisionFailed);
+        return Ok(RemediationSpawnOutcome::ProvisionFailed {
+            cause: "remediation provider policy rejected launch: Codex cannot report USD cost while max_*_cost_usd is configured".into(),
+        });
     }
 
     // Turn-oriented rework resumes the exact provider-tagged continuation.
@@ -13775,7 +14644,11 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            return Ok(RemediationSpawnOutcome::ProvisionFailed);
+            return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: classified_provisioning_cause(&format!(
+                    "remediation continuation recovery failed: {error}"
+                )),
+            });
         }
     };
 
@@ -13791,7 +14664,7 @@ async fn spawn_remediation_worker(
             mode: runner::LaunchMode::Normal,
             continuation_id: launch_continuation_id,
         },
-        &runner_adapter_config(config, config.agent_bin.as_deref()),
+        &runner_adapter_config(config, agent_bin_for_kind(config, remediation_kind)),
     )
     .await;
 
@@ -13805,22 +14678,32 @@ async fn spawn_remediation_worker(
                 let e = remediation_effort.clone();
                 let prov = remediation_provider_str;
                 let tid = task_id;
-                let assignment_id = remediation_assignment.id;
-                let responsibility_key = worker_responsibility_key(task_id, remediation_revision);
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_worker_with_assignment(
-                        &conn,
-                        tid,
-                        &name,
-                        &responsibility_key,
-                        &m,
-                        &e,
-                        &prov,
-                        &prov,
-                        Some(assignment_id),
-                        now_unix(),
-                    )
+                    match worker_assignment {
+                        Some(assignment) => quorum_core::agent_runs::insert_worker_with_assignment(
+                            &conn,
+                            tid,
+                            &name,
+                            &assignment.responsibility_key,
+                            &m,
+                            &e,
+                            &prov,
+                            &prov,
+                            Some(assignment.id),
+                            now_unix(),
+                        ),
+                        None => quorum_core::agent_runs::insert(
+                            &conn,
+                            tid,
+                            &name,
+                            "worker",
+                            &m,
+                            &e,
+                            &prov,
+                            now_unix(),
+                        ),
+                    }
                 })
                 .await
                 .ok()
@@ -13883,7 +14766,11 @@ async fn spawn_remediation_worker(
             name_pool.release(&agent_name);
             wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
             wt_mgr.delete_branch(task_repo_dir, &branch).await;
-            Ok(RemediationSpawnOutcome::ProvisionFailed)
+            Ok(RemediationSpawnOutcome::ProvisionFailed {
+                cause: classified_provisioning_cause(&format!(
+                    "remediation worker process launch failed: {e}"
+                )),
+            })
         }
     }
 }
@@ -13893,6 +14780,166 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct TimedOutPreReviewChecks;
+
+    impl merge::MergeExecutor for TimedOutPreReviewChecks {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            merge::ChecksOutcome::TimedOut
+        }
+
+        fn pending_check_names(&self, _pr: i64, _repo_dir: &Path) -> Vec<String> {
+            vec!["shell-tests".to_string()]
+        }
+    }
+
+    fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        let profile = crate::serve_config::ModelProfile {
+            runner: "codex".into(),
+            model: "test".into(),
+            effort: "medium".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
+        ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            worktree_base: repo_dir.clone(),
+            repo_dir,
+            names_file: None,
+            agent_bin: None,
+            merge_executor: Arc::new(TimedOutPreReviewChecks),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            codex_sandbox: "danger-full-access".into(),
+        }
+    }
+
+    async fn complete_pre_review_timeout_cycle(
+        config: &ServeConfig,
+        waits: &mut HashMap<i64, PreReviewChecksEntry>,
+        task_id: i64,
+        pr: i64,
+        head_sha: &str,
+    ) {
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert_eq!(
+                    poll_pre_review_checks(config, waits, task_id, pr, head_sha)
+                        .await
+                        .unwrap(),
+                    PreReviewChecksGate::Waiting
+                );
+                if matches!(
+                    waits.get(&task_id).map(|entry| &entry.state),
+                    Some(PreReviewChecksState::Retry)
+                ) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            completed.is_ok(),
+            "pre-review timeout cycle did not complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_review_check_timeouts_alert_once_and_reset_for_a_new_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        let mut waits = HashMap::new();
+
+        for _ in 0..2 {
+            complete_pre_review_timeout_cycle(&config, &mut waits, 377, 549, "head-a").await;
+        }
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alerts, 0, "the threshold must not alert early");
+        drop(conn);
+
+        for _ in 0..PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER {
+            complete_pre_review_timeout_cycle(&config, &mut waits, 377, 549, "head-b").await;
+        }
+        for _ in 0..2 {
+            complete_pre_review_timeout_cycle(&config, &mut waits, 377, 549, "head-b").await;
+        }
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (count, body): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(body), '') FROM messages \
+                 WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "one alert per task and head");
+        assert!(body.contains("task #377"));
+        assert!(body.contains("PR #549"));
+        assert!(body.contains("head-b"));
+        assert!(body.contains("shell-tests"));
+        assert!(matches!(
+            waits.get(&377).map(|entry| &entry.state),
+            Some(PreReviewChecksState::Retry)
+        ));
+    }
 
     fn graph_blocker_fixture(
         cap_role: &str,
@@ -14263,13 +15310,191 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let error = claim_remediation_for_spawn(db_path, "worker".into(), 1, "feedback".into())
+        let error = claim_remediation_for_worker(db_path, "worker".into(), 1, "feedback".into())
             .await
             .expect_err("abnormal database failure must propagate");
         assert!(
             matches!(error, QuorumError::SchemaTooNew { .. }),
             "database failure was collapsed into a claim loss: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn live_worker_rework_claim_survives_reaper_past_provisioning_grace() {
+        // A sticky worker survives review, so VerdictChanges releases its old
+        // lease and this path must install a replacement before refeeding it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-worker-rework.db");
+        let now = now_unix();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "live rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "live-worker", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("live worker must claim the task");
+            tasks::apply_event(
+                &mut conn,
+                "live-worker",
+                task_id,
+                &Event::SignaledDone { pr: "551".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "reviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "reviewer",
+                task_id,
+                &Event::VerdictChanges,
+                now + 3,
+            )
+            .unwrap();
+            task_id
+        };
+
+        assert!(
+            claim_remediation_for_worker(
+                db_path.clone(),
+                "live-worker".into(),
+                task_id,
+                "fix the blocking finding".into(),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "the live worker must reacquire the released remediation lease"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
+            .unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let claim: (String, i64) = conn
+            .query_row(
+                "SELECT holder, active FROM claims
+                 WHERE target=?1 ORDER BY id DESC LIMIT 1",
+                [format!("task#{task_id}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, ("live-worker".into(), 1));
+    }
+
+    #[tokio::test]
+    async fn live_worker_pre_review_ci_rework_claim_survives_reaper_past_provisioning_grace() {
+        // Drive the real pre-review CI failure handler. Failed CI moves an
+        // awaiting-review worker directly to rework and releases its original
+        // lease; the handler must replace it before feeding the worker.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live-worker-pre-review-ci-rework.db");
+        let now = now_unix();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "live pre-review CI rework",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "live-worker", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .expect("live worker must claim the task");
+            tasks::apply_event(
+                &mut conn,
+                "live-worker",
+                task_id,
+                &Event::SignaledDone { pr: "553".into() },
+                now + 1,
+            )
+            .unwrap();
+            task_id
+        };
+
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut name_pool = Pool::new_generated();
+        let wt_mgr = WorktreeManager::new();
+        let mut workers =
+            vec![make_live_pre_review_ci_slot(task_id, dir.path().to_path_buf()).await];
+        let mut roster = LifetimeRoster::new();
+        handle_pre_review_checks_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut roster,
+            task_id,
+            553,
+            "0123456789abcdef0123456789abcdef01234567",
+            &["test".into()],
+        )
+        .await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "the live worker must remain after a successful feed"
+        );
+        assert!(workers[0].draining, "the rework turn must be fed");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
+            .unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let claim: (String, i64) = conn
+            .query_row(
+                "SELECT holder, active FROM claims
+                 WHERE target=?1 ORDER BY id DESC LIMIT 1",
+                [format!("task#{task_id}")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, ("live-worker".into(), 1));
+
+        let worker = workers.remove(0);
+        worker.proc.kill_and_reap().await;
     }
 
     #[test]
@@ -14857,6 +16082,110 @@ mod tests {
             reviewed_head_sha: None,
             continuation_id: None,
             pending_prompt: "test prompt".into(),
+            pending_turn_kind: "initial".into(),
+        }
+    }
+
+    fn pre_review_ci_test_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
+        let profile = crate::serve_config::ModelProfile {
+            runner: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
+        ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            repo_dir: repo_dir.clone(),
+            worktree_base: repo_dir,
+            names_file: None,
+            agent_bin: None,
+            merge_executor: Arc::new(merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            bare_agent: true,
+            limits: CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            exit_when_gone: None,
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: false,
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            codex_sandbox: "danger-full-access".into(),
+        }
+    }
+
+    async fn make_live_pre_review_ci_slot(task_id: i64, worktree_path: PathBuf) -> SlotState {
+        use tokio::io::BufReader;
+
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "read _"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let now = std::time::Instant::now();
+        SlotState {
+            agent_name: "live-worker".into(),
+            proc: runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                BufReader::new(stdout),
+            )),
+            task_id,
+            session_id: agent::new_session_id(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+            worktree_path,
+            branch: "test-branch".into(),
+            remote_branch: "test-branch".into(),
+            draining: false,
+            pr: Some(553),
+            rework_count: 0,
+            cost_tokens: 0,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            last_error_text: None,
+            agent_run_id: None,
+            cap_run_id: None,
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "initial".into(),
             pending_turn_kind: "initial".into(),
         }
     }
@@ -16740,6 +18069,58 @@ mod tests {
     }
 
     #[test]
+    fn parked_rework_publication_requires_one_complete_matching_pr_lease() {
+        let valid = serde_json::json!({
+            "daemon_rework_retry_requested": true,
+            "pr": 551,
+            "daemon_publication": {
+                "branch": "daemon/alloy-t365",
+                "local_sha": "source-a",
+                "pr": 551,
+                "stage": "intent",
+                "expected_remote_sha": "head-a"
+            }
+        });
+        let recovered = parked_rework_publication_intent(Some(&valid.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.pr, Some(551));
+        assert_eq!(recovered.expected_remote_sha.as_deref(), Some("head-a"));
+
+        let mut malformed = valid.clone();
+        malformed["daemon_publication"]["expected_remote_sha"] = serde_json::Value::Null;
+        assert!(
+            parked_rework_publication_intent(Some(&malformed.to_string()))
+                .unwrap_err()
+                .contains("no expected remote SHA")
+        );
+        malformed = valid.clone();
+        malformed["pr"] = serde_json::json!(552);
+        assert!(
+            parked_rework_publication_intent(Some(&malformed.to_string()))
+                .unwrap_err()
+                .contains("conflicts with task PR")
+        );
+    }
+
+    #[test]
+    fn ordinary_and_publication_free_retries_do_not_select_a_continuation() {
+        let ordinary = r#"{"pr":551,"daemon_publication":{"pr":551}}"#;
+        assert!(parked_rework_publication_intent(Some(ordinary))
+            .unwrap()
+            .is_none());
+        let publication_free_retry = r#"{
+            "daemon_rework_retry_requested":true,
+            "pr":551
+        }"#;
+        assert!(
+            parked_rework_publication_intent(Some(publication_free_retry))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn published_lifecycle_atomically_retires_intent_before_restart() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("published-transition.db");
@@ -17293,6 +18674,82 @@ mod tests {
     }
 
     #[test]
+    fn original_remediation_provider_model_must_remain_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config =
+            pre_review_ci_test_config(dir.path().join("q.db"), dir.path().join("repo"));
+
+        require_configured_provider(
+            &config,
+            "claude-sonnet-5",
+            runner::AgentKind::Claude,
+            "original remediation worker",
+        )
+        .unwrap();
+
+        let error = require_configured_provider(
+            &config,
+            "gpt-5.6-terra",
+            runner::AgentKind::Codex,
+            "original remediation worker",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no longer configured"),
+            "profile removal must fail closed with an actionable cause: {error}"
+        );
+
+        let error = require_configured_provider(
+            &config,
+            "not-a-managed-model",
+            runner::AgentKind::Codex,
+            "original remediation worker",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown model"),
+            "unsupported historical profiles must park with an explicit cause: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("historical worker run does not match durable routing assignment"),
+            "the retired routing-equality failure must not mask the operator action"
+        );
+
+        config.agent_bin = Some("/opt/claude".into());
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Codex),
+            None,
+            "recovered Codex remediation must not receive the replacement Claude executable"
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Claude),
+            Some("/opt/claude"),
+            "the configured provider retains its explicit executable"
+        );
+
+        config.model_profiles.insert(
+            "codex".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+            },
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Codex),
+            None,
+            "mixed runners must never infer an override from the first profile"
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::Claude),
+            None,
+            "an invalid mixed-provider override must not reach either provider"
+        );
+    }
+
+    #[test]
     fn strict_provider_mode_rejects_cross_provider_task_tiers() {
         let claude = resolve_provider(&tier_to_model_id("opus-46").unwrap()).unwrap();
         let codex = resolve_provider(&tier_to_model_id("terra").unwrap()).unwrap();
@@ -17379,6 +18836,15 @@ mod tests {
 
         // A daemon restart closes and reopens the sole source of truth.
         let conn = quorum_core::db::open(&db_path).unwrap();
+        let original_layout = quorum_core::agent_runs::first_worker(&conn, task_id)
+            .unwrap()
+            .unwrap();
+        let snapshot =
+            recover_original_remediation_layout(&conn, task_id, original_layout).unwrap();
+        assert_eq!(snapshot.model, "o3");
+        assert_eq!(snapshot.effort, "high");
+        assert_eq!(snapshot.kind, runner::AgentKind::Codex);
+        assert!(snapshot.assignment.is_none());
         let recorded_provider = quorum_core::agent_runs::worker_provider(&conn, task_id).unwrap();
         let recorded_model = quorum_core::agent_runs::worker_model(&conn, task_id).unwrap();
         let (model, kind) = resolve_remediation_provider(
@@ -18422,24 +19888,110 @@ mod tests {
     }
 
     #[test]
-    fn planning_candidate_is_ready_large_implementation_priority_ordered() {
+    fn planning_candidate_requires_complex_large_non_continuation() {
         let dir = tempfile::tempdir().unwrap();
         let conn = quorum_core::db::open(&dir.path().join("candidate.db")).unwrap();
         conn.execute_batch(
             "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
-             VALUES ('small','open',100,'owner',1,1,
-               '{\"cx_est\":2,\"cx_size\":\"S\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             VALUES ('moderate-large','open',100,'owner',1,1,
+               '{\"cx_est\":3,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only,continue_pr)
+             VALUES ('continued-large','open',90,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0,529);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('large-low','open',5,'owner',1,1,
                '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('large-high','open',9,'owner',1,1,
-               '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('review-large','open',99,'owner',1,1,
                '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1);"
         ).unwrap();
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((4, 1)));
+        conn.execute("UPDATE tasks SET status='done' WHERE id=4", [])
+            .unwrap();
         assert_eq!(planning_candidate(&conn).unwrap(), Some((3, 1)));
+        conn.execute("UPDATE tasks SET status='done' WHERE id=3", [])
+            .unwrap();
+        assert_eq!(planning_candidate(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn continuation_incident_shape_plans_plain_large_and_claims_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("incident.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only,continue_pr)
+             VALUES ('continue PR 529','open',100,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0,529);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('plain complex large','open',1,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);"
+        )
+        .unwrap();
+
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+        let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 2)
+            .unwrap()
+            .expect("continuation must dispatch directly");
+        assert_eq!(claimed.continue_pr, Some(529));
+    }
+
+    #[test]
+    fn planning_and_claim_partition_classified_shapes() {
+        for size in ["S", "M", "L", "XL"] {
+            for cx_est in 1..=5 {
+                for continue_pr in [None, Some(500)] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut conn = quorum_core::db::open(&dir.path().join("partition.db")).unwrap();
+                    conn.execute(
+                        "INSERT INTO tasks(
+                            title,status,priority,created_by,created_at,updated_at,refs,
+                            review_only,continue_pr
+                         ) VALUES (
+                            'shape','open',1,'owner',1,1,
+                            json_object(
+                                'cx_est',?1,'cx_size',?2,'cx_ready',json('true'),
+                                'cx_not_ready_reason',json('null')
+                            ),0,?3
+                         )",
+                        rusqlite::params![cx_est, size, continue_pr],
+                    )
+                    .unwrap();
+                    tasks::park_classified_complexity_five(&mut conn, 2).unwrap();
+
+                    let planned = planning_candidate(&conn).unwrap().is_some();
+                    let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 3)
+                        .unwrap()
+                        .is_some();
+                    let direct = continue_pr.is_some()
+                        || matches!(size, "S" | "M")
+                        || (size == "L" && cx_est <= 3);
+                    let decomposition =
+                        continue_pr.is_none() && matches!(size, "L" | "XL") && cx_est >= 4;
+                    let parked = continue_pr.is_none() && size == "XL" && cx_est <= 3;
+                    let shape = format!("size={size} cx_est={cx_est} continue={continue_pr:?}");
+
+                    assert_eq!(claimed, direct, "claim route mismatch for {shape}");
+                    assert_eq!(planned, decomposition, "planner route mismatch for {shape}");
+                    assert!(!(planned && claimed), "double route for {shape}");
+                    assert!(planned || claimed || parked, "starved shape: {shape}");
+
+                    if parked {
+                        let task = tasks::get(&conn, 1).unwrap().unwrap();
+                        assert_eq!(task.status, "failed", "XL mismatch not parked: {shape}");
+                        let refs: serde_json::Value =
+                            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+                        assert_eq!(
+                            refs[tasks::PARKED_REASON_REF],
+                            tasks::LOW_COMPLEXITY_XL_PARK_REASON,
+                            "wrong XL park reason for {shape}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -18585,14 +20137,167 @@ mod tests {
                 duplicate_of: vec![],
             },
         ];
-        assert_eq!(planned_children(&proposal, &valid).unwrap().len(), 2);
-        let mut large = valid.clone();
-        large[1].size = "L".into();
-        assert!(planned_children(&proposal, &large).is_err());
+        let children = planned_children(&proposal, &valid).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].local_key, "a");
+        assert_eq!(children[1].prerequisite_keys, ["a"]);
+
+        let mut not_ready = valid.clone();
+        not_ready[0].ready = false;
+        not_ready[0].not_ready_reason = Some("missing acceptance criteria".into());
+        assert_eq!(
+            planned_children(&proposal, &not_ready).unwrap_err(),
+            "child a rejected by preclassification: ready=false (not_ready_reason: missing acceptance criteria)"
+        );
+
+        for size in ["L", "XL"] {
+            let mut large = valid.clone();
+            large[1].size = size.into();
+            assert_eq!(
+                planned_children(&proposal, &large).unwrap_err(),
+                format!("child b rejected by preclassification: size={size}")
+            );
+        }
+
         let mut duplicate = valid.clone();
-        duplicate[0].duplicate_of = vec![99];
-        assert!(planned_children(&proposal, &duplicate).is_err());
-        assert!(planned_children(&proposal, &valid[..1]).is_err());
+        duplicate[0].duplicate_of = vec![99, 101];
+        assert_eq!(
+            planned_children(&proposal, &duplicate).unwrap_err(),
+            "child a rejected by preclassification: duplicate_of=[99, 101]"
+        );
+
+        let mut combined = valid.clone();
+        combined[0].ready = false;
+        combined[0].not_ready_reason = Some("product decision required".into());
+        combined[0].size = "XL".into();
+        combined[0].duplicate_of = vec![301, 302];
+        assert_eq!(
+            planned_children(&proposal, &combined).unwrap_err(),
+            "child a rejected by preclassification: ready=false (not_ready_reason: product decision required); size=XL; duplicate_of=[301, 302]"
+        );
+
+        assert_eq!(
+            planned_children(&proposal, &valid[..1]).unwrap_err(),
+            "missing classification for b"
+        );
+    }
+
+    #[test]
+    fn proposal_preclassification_rejection_rendering_survives_planner_retry_bounds() {
+        let proposal = vec![planner::ProposedTask {
+            key: "bounded-child".into(),
+            title: "bounded child".into(),
+            observable_outcome: "bounded evidence persists".into(),
+            acceptance_criteria: vec!["bounded".into()],
+            source_constraints: vec!["atomic".into()],
+            verification_expectations: vec!["test".into()],
+            prerequisites: vec![],
+        }];
+        let classifications = vec![quorum_core::classify::TaskClassification {
+            task_id: -1,
+            cx_est: 5,
+            size: "XL".into(),
+            ready: false,
+            not_ready_reason: Some("é".repeat(4_096)),
+            duplicate_of: (1..=1_000).collect(),
+        }];
+
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+        assert!(summary.len() <= DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES);
+        assert!(summary.len() <= planner::MAX_REJECTION_SUMMARY_BYTES);
+        assert!(std::str::from_utf8(summary.as_bytes()).is_ok());
+        assert!(summary.contains("ready=false (not_ready_reason: é"));
+        assert!(summary.contains("…); size=XL; duplicate_of=[1, 2"));
+        assert!(summary.ends_with("...]"), "{summary}");
+
+        let source = planner::PlanningSource {
+            task_id: 301,
+            revision: 1,
+            title: "source",
+            body: None,
+            dependencies: &[],
+        };
+        let retry_json = serde_json::to_string(&vec![summary.clone()]).unwrap();
+        let prompt = planner::build_prompt(&source, std::slice::from_ref(&summary));
+        assert!(
+            prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")),
+            "planner retry feedback altered the bounded rejection summary: {prompt}"
+        );
+    }
+
+    #[test]
+    fn proposal_preclassification_persists_exact_readiness_rejection_and_reason_code() {
+        let proposal = vec![planner::ProposedTask {
+            key: "readiness".into(),
+            title: "readiness".into(),
+            observable_outcome: "readiness is observable".into(),
+            acceptance_criteria: vec!["readiness".into()],
+            source_constraints: vec!["atomic".into()],
+            verification_expectations: vec!["test".into()],
+            prerequisites: vec![],
+        }];
+        let classifications = vec![quorum_core::classify::TaskClassification {
+            task_id: -1,
+            cx_est: 2,
+            size: "S".into(),
+            ready: false,
+            not_ready_reason: Some("owner must select the storage format".into()),
+            duplicate_of: vec![],
+        }];
+        let summary = planned_children(&proposal, &classifications).unwrap_err();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("rejection.db")).unwrap();
+        let source = tasks::create(
+            &mut conn,
+            "owner",
+            "source",
+            Some("source outcome"),
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let graph = quorum_core::decomposition::begin_planning(
+            &mut conn,
+            &quorum_core::decomposition::BeginPlanning {
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "claude",
+                model: "opus",
+                frozen_base_sha: "abc",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::decomposition::record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "child-preclassification",
+            &summary,
+            3,
+        )
+        .unwrap();
+
+        let persisted: (String, String) = conn
+            .query_row(
+                "SELECT reason_code,summary FROM decomposition_attempts WHERE graph_id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "child-preclassification".into(),
+                "child readiness rejected by preclassification: ready=false (not_ready_reason: owner must select the storage format)".into(),
+            )
+        );
     }
 
     #[test]
@@ -19089,9 +20794,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let repo = tempfile::tempdir().unwrap();
-        for (case, body, expected) in [
-            ("silent", "exec sleep 30", "timed out"),
-            ("noisy", "exec yes x", "stdout exceeded"),
+        for (case, body, expected, timeout) in [
+            (
+                "silent",
+                "exec sleep 30",
+                "timed out",
+                Duration::from_secs(5),
+            ),
+            (
+                "noisy",
+                "exec yes x",
+                "stdout exceeded",
+                Duration::from_secs(15),
+            ),
         ] {
             let pid_path = repo.path().join(format!("{case}.pid"));
             let git = repo.path().join(format!("git-{case}"));
@@ -19104,11 +20819,10 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let error =
-                repository_head_sha_with_options(repo.path(), &git, Duration::from_secs(5), 4096)
-                    .await
-                    .unwrap_err()
-                    .to_string();
+            let error = repository_head_sha_with_options(repo.path(), &git, timeout, 4096)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains(expected), "{case}: {error}");
             let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
             assert_eq!(
@@ -19140,7 +20854,7 @@ mod tests {
         let capture = tokio::spawn(async move {
             repository_head_sha_with_options(&repo_path, &git, Duration::from_secs(5), 4096).await
         });
-        for _ in 0..500 {
+        for _ in 0..1_500 {
             if pid_path.exists() {
                 break;
             }
@@ -19185,7 +20899,7 @@ mod tests {
             &frozen,
             Path::new("git"),
             Path::new("tar"),
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             1024,
         )
         .await
@@ -19262,7 +20976,7 @@ mod tests {
             // The full suite runs many real-process canaries concurrently;
             // leave enough headroom for the preliminary git check and both
             // wrappers to be scheduled before exercising the deadline path.
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             1024 * 1024,
         )
         .await
@@ -19319,5 +21033,139 @@ mod tests {
             worker_responsibility_key(42, 7),
             worker_responsibility_key(42, 8)
         );
+    }
+
+    #[test]
+    fn provisioning_causes_are_bounded_safe_and_operationally_classified() {
+        assert!(classified_provisioning_cause(
+            "git fetch origin deleted-head failed: fatal: couldn't find remote ref deleted-head"
+        )
+        .starts_with("structural:"));
+        assert!(classified_provisioning_cause(
+            "git worktree add failed: fatal: Unable to create '.git/index.lock': File exists"
+        )
+        .starts_with("transient:"));
+        assert!(classified_provisioning_cause(
+            "structural head-SHA mismatch for remediation PR #37: expected abc, got def"
+        )
+        .starts_with("structural:"));
+        let rejected = classified_provisioning_cause("git stderr\0must not persist");
+        assert!(!rejected.contains('\0'));
+        assert!(rejected.contains("rejected"));
+        let long = classified_provisioning_cause(&"x".repeat(MAX_PROVISIONING_CAUSE_BYTES + 1));
+        assert!(long.len() <= MAX_PROVISIONING_CAUSE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn initial_provision_failure_parks_with_cause_and_surfaces_in_status_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("initial-provision.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "initial provision diagnostic",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+        let cause = classified_provisioning_cause(
+            "git fetch origin deleted-head failed: fatal: couldn't find remote ref deleted-head",
+        );
+        persist_provisioning_failure(
+            &db_path,
+            task_id,
+            &format!("initial worker worktree provisioning failed: {cause}"),
+        )
+        .await;
+        poison_task(
+            &db_path,
+            "Initial",
+            task_id,
+            MAX_POISON_STRIKES,
+            Some(&cause),
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT json_extract(refs, '$.daemon_parked_reason') FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(reason.contains("structural:"), "{reason}");
+        assert!(reason.contains("couldn't find remote ref"), "{reason}");
+        let stats = quorum_core::stats::stats(&conn, now_unix(), 60).unwrap();
+        assert!(stats.last_errors.iter().any(|error| {
+            error.source == "provisioning"
+                && error
+                    .detail
+                    .contains("initial worker worktree provisioning failed")
+                && error.detail.contains("couldn't find remote ref")
+        }));
+    }
+
+    #[tokio::test]
+    async fn remediation_provision_failure_parks_with_transient_cause_and_error_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("remediation-provision.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "remediation provision diagnostic",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='rework' WHERE id=?1", [task_id])
+                .unwrap();
+            task_id
+        };
+        let config = pre_review_checks_config(db_path.clone(), dir.path().join("repo"));
+        park_remediation_provision_failure(
+            &config,
+            task_id,
+            37,
+            "fix the blocker",
+            "git worktree add failed: fatal: Unable to create '.git/index.lock': File exists",
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let reason: String = conn
+            .query_row(
+                "SELECT json_extract(refs, '$.daemon_parked_reason') FROM tasks WHERE id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            reason.contains("remediation provisioning failed for PR #37"),
+            "{reason}"
+        );
+        assert!(reason.contains("transient:"), "{reason}");
+        assert!(reason.contains("index.lock"), "{reason}");
+        let stats = quorum_core::stats::stats(&conn, now_unix(), 60).unwrap();
+        assert!(stats.last_errors.iter().any(|error| {
+            error.source == "provisioning"
+                && error.detail.contains("PR #37")
+                && error.detail.contains("index.lock")
+        }));
     }
 }

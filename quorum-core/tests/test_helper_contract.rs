@@ -4,8 +4,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use support::protocol::{
     AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimTaskInput, GraphEvent, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
-    MAX_INPUT_BYTES,
+    ClaimProviderRetryReworkInput, ClaimTaskInput, GraphEvent, MaterializeAssessmentInput,
+    Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -15,10 +15,30 @@ fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
     conn.execute(
         "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
          VALUES (1,'allocation target','open','owner',1,1),
+                (2,'assessment source','done','owner',1,1),
                 (999,'event target','merging','owner',1,1)",
         [],
     )
     .unwrap();
+    conn.execute_batch(
+        "INSERT INTO review_followup_batches(
+             pr_number,task_id,source_task_id,collector_version,
+             artifact_count,state,created_at,updated_at)
+         VALUES (100,2,2,'followups-v1',1,'collected',1,1);
+         INSERT INTO review_collection_runs(
+             pr_number,task_id,status,error,collector_model,collector_version,
+             findings_count,followup_count,attempted_at,completed_at)
+         VALUES (100,2,'success',NULL,'collector','followups-v1',0,1,1,1);
+         INSERT INTO review_followup_artifacts(
+             id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+             non_blocking_reason,affected_behavior,desired_outcome,
+             verification_expectations,evidence_ids,created_at,updated_at)
+         VALUES (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                 '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1);",
+    )
+    .unwrap();
+    conn.execute("UPDATE tasks SET refs='{\"pr\":100}' WHERE id=2", [])
+        .unwrap();
     (dir, path)
 }
 
@@ -65,6 +85,21 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
         ),
         (
             support::run(
+                Operation::ClaimProviderRetryRework,
+                &ClaimProviderRetryReworkInput {
+                    db_path: db_path.clone(),
+                    task_id: 999,
+                    agent: "worker".into(),
+                    ttl: 60,
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "provider-retry"),
+                },
+            )
+            .unwrap(),
+            EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
                 Operation::CancelSourceGraph,
                 &CancelSourceGraphInput {
                     db_path: db_path.clone(),
@@ -96,13 +131,29 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
             support::run(
                 Operation::ClaimCleanup,
                 &ClaimCleanupInput {
-                    db_path,
+                    db_path: db_path.clone(),
                     now: 10,
                     barrier: open_barrier(dir.path(), "cleanup"),
                 },
             )
             .unwrap(),
             EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::MaterializeAssessment,
+                &MaterializeAssessmentInput {
+                    db_path,
+                    scope_kind: "task".into(),
+                    scope_id: 2,
+                    source_task_id: 2,
+                    artifact_ids: vec![11],
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "assessment"),
+                },
+            )
+            .unwrap(),
+            EXIT_SUCCESS,
         ),
     ];
 
