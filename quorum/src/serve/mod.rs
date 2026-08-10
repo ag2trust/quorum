@@ -3080,8 +3080,9 @@ fn retry_slot_rework_count(
 ///
 /// A tagged build looks like `v0.3.3-399-g17c95190`; an untagged build can be
 /// just the abbreviated SHA. A dirty build still identifies the commit before
-/// its `-dirty` suffix.
-fn running_build_sha(version: &str) -> Option<String> {
+/// its `-dirty` suffix. Exact-tag builds use the separately embedded SHA,
+/// because `git describe` then contains only the tag name.
+fn running_build_sha(version: &str, embedded_sha: &str) -> Option<String> {
     let describe = version.strip_suffix("-dirty").unwrap_or(version);
     let candidate = describe
         .rsplit_once("-g")
@@ -3091,6 +3092,12 @@ fn running_build_sha(version: &str) -> Option<String> {
         && candidate.len() <= 64
         && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()))
     .then(|| candidate.to_string())
+    .or_else(|| {
+        (embedded_sha.len() >= 7
+            && embedded_sha.len() <= 64
+            && embedded_sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| embedded_sha.to_string())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5986,7 +5993,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             match tokio::task::spawn_blocking(move || poll_origin_base_sha(&repo_dir, &base_branch))
                 .await
             {
-                Ok(Ok(remote_sha)) => match running_build_sha(crate::cli::short_version()) {
+                Ok(Ok(remote_sha)) => match running_build_sha(
+                    crate::cli::short_version(),
+                    crate::cli::build_sha_short(),
+                ) {
                     Some(build_sha) => {
                         let decision = build_staleness_decision(&build_sha, &remote_sha);
                         log(&format!(
@@ -16858,19 +16868,27 @@ mod tests {
     #[test]
     fn running_build_sha_extracts_describe_commit() {
         assert_eq!(
-            running_build_sha("v0.3.3-399-g17c95190"),
+            running_build_sha("v0.3.3-399-g17c95190", "irrelevant"),
             Some("17c95190".to_string())
         );
         assert_eq!(
-            running_build_sha("v0.3.3-399-g17c95190-dirty"),
+            running_build_sha("v0.3.3-399-g17c95190-dirty", "irrelevant"),
             Some("17c95190".to_string())
         );
     }
 
     #[test]
     fn running_build_sha_rejects_non_commit_version() {
-        assert_eq!(running_build_sha("unknown"), None);
-        assert_eq!(running_build_sha("v0.3.3"), None);
+        assert_eq!(running_build_sha("unknown", "also-unknown"), None);
+        assert_eq!(running_build_sha("v0.3.3", "also-unknown"), None);
+    }
+
+    #[test]
+    fn running_build_sha_uses_embedded_sha_for_exact_tag() {
+        assert_eq!(
+            running_build_sha("v0.3.3", "17c95190"),
+            Some("17c95190".to_string())
+        );
     }
 
     #[test]

@@ -17,6 +17,13 @@ pub fn short_version() -> &'static str {
     env!("QUORUM_GIT_DESCRIBE")
 }
 
+/// Commit SHA embedded independently of the human-readable version string.
+/// `git describe` is just a tag for an exact-tag release, so it cannot be the
+/// sole source of the running build's identity.
+pub fn build_sha_short() -> &'static str {
+    env!("QUORUM_GIT_SHA_SHORT")
+}
+
 #[derive(Parser)]
 #[command(
     name = "quorum",
