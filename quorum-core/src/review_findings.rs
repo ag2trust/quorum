@@ -49,7 +49,7 @@ pub struct ReviewFinding {
     pub text: String,
     #[serde(default = "default_source")]
     pub source_endpoint: String,
-    /// v24: 'addressed' | 'unaddressed' | 'partial' | 'unclear'.
+    /// v24: 'addressed' | 'unaddressed' | 'partial' | 'unclear' | 'withdrawn'.
     /// A blocking finding that merged as `unaddressed` is a review-quality
     /// signal; the collector must never mutate the merge outcome regardless.
     #[serde(default)]
@@ -447,7 +447,9 @@ Fields per finding:
      author replies "fixed in <sha>", or the reviewer confirms it resolved),
    - `"unaddressed"` if it merged without a fix and the author did not push back,
    - `"partial"` if some parts were fixed and others were left,
-   - `"unclear"` if the record does not let you tell.
+   - `"unclear"` if the record does not let you tell,
+   - `"withdrawn"` if the reviewer independently retracted the finding without
+     accepting author pushback.
 9. `evidence` — array of `{{"kind":"review"|"review_comment"|"issue_comment","id":<int>}}`
    objects. Include at least one; use the GitHub numeric `id` field from the raw
    comment/review JSON above. Threaded replies count as separate evidence rows.
@@ -965,6 +967,7 @@ mod tests {
         assert!(prompt.contains("deadbeef"));
         assert!(prompt.contains("Alpha"));
         assert!(prompt.contains("addressed_status"));
+        assert!(prompt.contains("withdrawn"));
         assert!(prompt.contains("evidence"));
         assert!(prompt.contains("followup_artifacts"));
         assert!(prompt.contains("technical_impact"));

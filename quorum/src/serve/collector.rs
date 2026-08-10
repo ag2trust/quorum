@@ -213,7 +213,7 @@ fn validate_finding(
     }
     if !matches!(
         finding.addressed_status.as_str(),
-        "addressed" | "unaddressed" | "partial" | "unclear"
+        "addressed" | "unaddressed" | "partial" | "unclear" | "withdrawn"
     ) {
         return Err(QuorumError::Usage(format!(
             "invalid collector finding addressed status: {}",
@@ -263,7 +263,8 @@ fn validate_artifact_source(artifact: &RawFollowupArtifact, findings: &[RawFindi
         ));
     }
     if suggestion_sources.iter().any(|finding| {
-        finding.addressed_status == "addressed" || finding.pushback_accepted == Some(true)
+        matches!(finding.addressed_status.as_str(), "addressed" | "withdrawn")
+            || finding.pushback_accepted == Some(true)
     }) {
         return Err(QuorumError::Usage(
             "follow-up artifact source was fixed, withdrawn, or accepted as invalid".into(),
@@ -307,7 +308,30 @@ fn is_vague_improvement(value: &str) -> bool {
         .filter(|word| !word.is_empty())
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>();
-    words.is_empty()
+
+    // A concrete concern names a failure, and a concrete outcome names an
+    // observable state. Very short labels and generic improvement directives
+    // do neither, even when they contain a domain-quality noun not anticipated
+    // by a denylist (for example, "Improve queue reliability").
+    let starts_with_generic_directive = words.first().is_some_and(|word| {
+        matches!(
+            word.as_str(),
+            "better"
+                | "cleanup"
+                | "enhance"
+                | "enhancement"
+                | "fix"
+                | "improve"
+                | "improved"
+                | "improves"
+                | "improving"
+                | "make"
+                | "optimize"
+                | "strengthen"
+        )
+    });
+    words.len() < 3
+        || starts_with_generic_directive
         || words.iter().all(|word| {
             matches!(
                 word.as_str(),
@@ -318,6 +342,9 @@ fn is_vague_improvement(value: &str) -> bool {
                     | "clean"
                     | "cleanup"
                     | "code"
+                    | "consistency"
+                    | "correctness"
+                    | "could"
                     | "do"
                     | "enhance"
                     | "enhancement"
@@ -330,10 +357,26 @@ fn is_vague_improvement(value: &str) -> bool {
                     | "issue"
                     | "it"
                     | "make"
+                    | "maintainability"
+                    | "maintainable"
                     | "more"
+                    | "optimize"
+                    | "performance"
+                    | "performant"
                     | "please"
                     | "quality"
+                    | "reliability"
+                    | "reliable"
+                    | "resilience"
+                    | "resilient"
+                    | "robust"
+                    | "robustness"
+                    | "safer"
+                    | "safety"
+                    | "secure"
+                    | "security"
                     | "something"
+                    | "strengthen"
                     | "that"
                     | "the"
                     | "thing"
@@ -341,6 +384,7 @@ fn is_vague_improvement(value: &str) -> bool {
                     | "this"
                     | "to"
                     | "up"
+                    | "usability"
                     | "work"
             )
         })
@@ -1553,7 +1597,11 @@ mod tests {
         let mut artifacts = (0..MAX_FOLLOWUP_ARTIFACTS)
             .map(|_| artifact(1))
             .collect::<Vec<_>>();
-        artifacts[0]["concern"] = serde_json::Value::String("x".repeat(MAX_FOLLOWUP_TEXT_BYTES));
+        let concern_prefix = "Concurrent shutdown loses operations ";
+        artifacts[0]["concern"] = serde_json::Value::String(format!(
+            "{concern_prefix}{}",
+            "x".repeat(MAX_FOLLOWUP_TEXT_BYTES - concern_prefix.len())
+        ));
         for candidate in &mut artifacts {
             candidate["verification_expectations"] = serde_json::json!([
                 "expectation one",
@@ -1641,30 +1689,71 @@ mod tests {
         fixed["addressed_status"] = serde_json::json!("addressed");
         assert!(parse_fixture(&response(vec![fixed], vec![artifact(10)]), &inputs).is_err());
 
-        // Accepted pushback is the normalized final-review representation for
-        // a withdrawn concern or one the reviewer accepted as invalid.
-        let mut withdrawn_or_invalid = finding("suggestion", 10);
-        withdrawn_or_invalid["author_pushback"] = serde_json::json!(true);
-        withdrawn_or_invalid["pushback_accepted"] = serde_json::json!(true);
+        // A reviewer can independently retract a suggestion without any
+        // author pushback. That final state must be representable and rejected.
+        let mut withdrawn = finding("suggestion", 10);
+        withdrawn["addressed_status"] = serde_json::json!("withdrawn");
+        assert!(parse_fixture(&response(vec![withdrawn], vec![artifact(10)]), &inputs).is_err());
+
+        let mut accepted_as_invalid = finding("suggestion", 10);
+        accepted_as_invalid["author_pushback"] = serde_json::json!(true);
+        accepted_as_invalid["pushback_accepted"] = serde_json::json!(true);
         assert!(parse_fixture(
-            &response(vec![withdrawn_or_invalid], vec![artifact(10)]),
+            &response(vec![accepted_as_invalid], vec![artifact(10)]),
             &inputs,
         )
         .is_err());
     }
 
     #[test]
+    fn collector_protocol_preserves_withdrawn_finding_without_artifact() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut withdrawn = finding("suggestion", 10);
+        withdrawn["addressed_status"] = serde_json::json!("withdrawn");
+
+        let parsed = parse_fixture(&response(vec![withdrawn], vec![]), &inputs).unwrap();
+        assert_eq!(
+            parsed.findings[0].addressed_status.as_deref(),
+            Some("withdrawn")
+        );
+        assert!(parsed.followup_artifacts.is_empty());
+    }
+
+    #[test]
     fn collector_protocol_rejects_vague_concern_or_desired_outcome() {
         let inputs = parser_inputs(&[10], &[]);
         for field in ["concern", "desired_outcome"] {
-            let mut candidate = artifact(10);
-            candidate[field] = serde_json::json!("Make code better");
-            assert!(parse_fixture(
-                &response(vec![finding("suggestion", 10)], vec![candidate]),
-                &inputs,
-            )
-            .is_err());
+            for vague_text in [
+                "Make code better",
+                "Improve reliability",
+                "Better reliability.",
+                "Improve queue reliability",
+            ] {
+                let mut candidate = artifact(10);
+                candidate[field] = serde_json::json!(vague_text);
+                assert!(
+                    parse_fixture(
+                        &response(vec![finding("suggestion", 10)], vec![candidate]),
+                        &inputs,
+                    )
+                    .is_err(),
+                    "{field} accepted vague text: {vague_text}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn collector_protocol_accepts_concise_concrete_concern_and_outcome() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut candidate = artifact(10);
+        candidate["concern"] = serde_json::json!("Concurrent shutdown loses operations");
+        candidate["desired_outcome"] = serde_json::json!("Retries preserve pending operations");
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![candidate]),
+            &inputs,
+        )
+        .is_ok());
     }
 
     #[test]
