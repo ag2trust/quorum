@@ -185,6 +185,7 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
                            WHERE state IN ('active','blocked') OR active=1))",
@@ -214,7 +215,8 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
         "UPDATE tasks SET status='planning', updated_at=?3
-         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL",
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL",
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -249,6 +251,7 @@ pub fn begin_routed_planning(
     let eligible: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
                            WHERE state IN ('active','blocked') OR active=1))",
@@ -273,7 +276,8 @@ pub fn begin_routed_planning(
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
         "UPDATE tasks SET status='planning',updated_at=?3
-         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL",
+         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
+           AND review_only=0 AND continue_pr IS NULL",
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -1724,6 +1728,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (assignment.id, "codex".into(), "sol".into()));
+    }
+
+    #[test]
+    fn planning_authority_rejects_review_only_and_continuation_sources() {
+        for (review_only, continue_pr) in [(1, None), (0, Some(529))] {
+            for routed in [false, true] {
+                let (_dir, mut conn) = file_setup();
+                conn.execute(
+                    "UPDATE tasks SET review_only=?1,continue_pr=?2 WHERE id=1",
+                    params![review_only, continue_pr],
+                )
+                .unwrap();
+
+                let graph = if routed {
+                    let request = planner_request();
+                    let pool = planner_pool();
+                    begin_routed_planning(
+                        &mut conn,
+                        &BeginRoutedPlanning {
+                            source_task_id: 1,
+                            expected_revision: 1,
+                            assignment: &request,
+                            pool: &pool,
+                            seed: 7,
+                            now: 2,
+                        },
+                    )
+                    .unwrap()
+                    .map(|(graph, _)| graph)
+                } else {
+                    begin_planning(
+                        &mut conn,
+                        &BeginPlanning {
+                            source_task_id: 1,
+                            expected_revision: 1,
+                            provider: "codex",
+                            model: "sol",
+                            frozen_base_sha: "abc",
+                            now: 2,
+                        },
+                    )
+                    .unwrap()
+                };
+
+                assert_eq!(graph, None);
+                let state: (String, i64, i64) = conn
+                    .query_row(
+                        "SELECT status,
+                                (SELECT count(*) FROM task_decompositions),
+                                (SELECT count(*) FROM role_assignments)
+                         FROM tasks WHERE id=1",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+                assert_eq!(state, ("open".into(), 0, 0));
+            }
+        }
     }
 
     #[test]

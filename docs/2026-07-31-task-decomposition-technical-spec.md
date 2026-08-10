@@ -201,7 +201,10 @@ The migration is additive and forward-only under the normal `BEGIN IMMEDIATE` mi
 
 The daemon selects planning candidates by priority, then task ID. A candidate must be an open,
 unclaimed, admission-ready L/XL implementation task whose dependencies are done. It must not be
-review-only or generated work. S/M work follows normal dispatch regardless of complexity.
+review-only or generated work. Review-only work always routes directly to reviewer provisioning
+at any classified size; S/M implementation work follows normal dispatch regardless of complexity.
+The atomic planning transaction rechecks `review_only=0` and `continue_pr IS NULL`, so neither
+PR-bound entry shape can become a decomposition source even if a stale caller selects it.
 
 Starting a cycle atomically moves the source to `planning`, records `freeze-requested`, and sets
 `freeze_active=1`. Every worker, reviewer, remediation, and merge-start authority check must

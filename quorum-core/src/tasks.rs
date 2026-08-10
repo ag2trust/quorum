@@ -2774,7 +2774,11 @@ pub fn classification_is_complete(refs: &Option<String>) -> bool {
 
 /// Classification policy is intentionally separate from model routing: difficult
 /// focused work may run, while unready or compound work is parked.
-pub fn classification_is_dispatchable(refs: &Option<String>, continue_pr: Option<i64>) -> bool {
+pub fn classification_is_dispatchable(
+    refs: &Option<String>,
+    review_only: bool,
+    continue_pr: Option<i64>,
+) -> bool {
     if !classification_is_complete(refs) {
         return false;
     }
@@ -2793,7 +2797,10 @@ pub fn classification_is_dispatchable(refs: &Option<String>, continue_pr: Option
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
     ready
         && (1..=5).contains(&cx)
-        && (continue_pr.is_some() || matches!(size, "S" | "M") || (size == "L" && cx <= 3))
+        && (review_only
+            || continue_pr.is_some()
+            || matches!(size, "S" | "M")
+            || (size == "L" && cx <= 3))
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -2953,9 +2960,9 @@ pub(crate) fn park_complexity_five_tx(
 }
 
 /// Reconcile non-admissible classifications written by an older daemon or
-/// changed while this daemon was stopped. Admission-ready L/XL implementation
-/// tasks with decomposition-range estimates are intentionally left open;
-/// review-only large work and low-complexity non-continuation XL work are held.
+/// changed while this daemon was stopped. Admission-ready review-only tasks and
+/// L/XL implementation tasks with decomposition-range estimates are
+/// intentionally left runnable; low-complexity non-continuation XL work is held.
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
@@ -2964,7 +2971,6 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
                AND (json_extract(refs, '$.cx_ready')!=1
-                    OR (review_only=1 AND json_extract(refs, '$.cx_size') IN ('L','XL'))
                     OR (review_only=0 AND continue_pr IS NULL
                         AND json_extract(refs, '$.cx_size')='XL'
                         AND json_extract(refs, '$.cx_est') <= 3))
@@ -6002,7 +6008,7 @@ mod tests {
 
         let moderate_refs = get(&conn, moderate_l).unwrap().unwrap().refs;
         assert!(classification_is_complete(&moderate_refs));
-        assert!(classification_is_dispatchable(&moderate_refs, None));
+        assert!(classification_is_dispatchable(&moderate_refs, false, None));
         assert!(claim(&mut conn, "moderate", Some(moderate_l), &[], TTL, 3)
             .unwrap()
             .is_some());
@@ -6033,7 +6039,11 @@ mod tests {
             )
             .unwrap();
             let task = get(&conn, id).unwrap().unwrap();
-            assert!(classification_is_dispatchable(&task.refs, task.continue_pr));
+            assert!(classification_is_dispatchable(
+                &task.refs,
+                task.review_only,
+                task.continue_pr
+            ));
             assert!(claim(
                 &mut conn,
                 &format!("continue-{size}"),
@@ -9434,12 +9444,59 @@ mod tests {
     }
 
     #[test]
-    fn legacy_category_five_is_unclaimable_then_reconciled_once() {
+    fn review_only_large_classification_is_direct_and_never_reconciled_to_parked() {
+        let (_d, mut c) = open_tmp();
+        for (index, (size, cx_est)) in [("L", 5), ("XL", 2)].into_iter().enumerate() {
+            let id = create(
+                &mut c,
+                "owner",
+                &format!("review {size}"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(500 + index as i64),
+                1000 + index as i64,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET refs=json_object(
+                    'pr', ?2, 'cx_est', ?4, 'cx_size', ?3, 'cx_ready', json('true'),
+                    'cx_not_ready_reason', json('null'), 'cx_by', 'test:v2'
+                 ) WHERE id=?1",
+                params![id, 500 + index as i64, size, cx_est],
+            )
+            .unwrap();
+            let task = get(&c, id).unwrap().unwrap();
+            assert!(task.review_only);
+            assert_eq!(task.status, "in-review");
+            assert!(classification_is_dispatchable(
+                &task.refs,
+                task.review_only,
+                task.continue_pr
+            ));
+        }
+
+        assert_eq!(park_classified_complexity_five(&mut c, 2000).unwrap(), 0);
+        let parked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE status='failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, 0);
+    }
+
+    #[test]
+    fn legacy_low_complexity_xl_is_unclaimable_then_reconciled_once() {
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
             "boss",
-            "legacy category five",
+            "legacy low complexity XL",
             None,
             0,
             None,
@@ -9450,7 +9507,7 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
+            "UPDATE tasks SET refs=json_object('cx_est', 2, 'cx_size','XL','cx_ready',true,'cx_by', 'legacy:v1') WHERE id=?1",
             params![id],
         )
         .unwrap();
@@ -9464,7 +9521,7 @@ mod tests {
         let task = get(&c, id).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(task.status, "failed");
-        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_est"], 2);
         assert_eq!(refs["cx_by"], "legacy:v1");
         assert_eq!(refs["daemon_parked"], true);
         let events: i64 = c
@@ -9478,14 +9535,14 @@ mod tests {
     }
 
     #[test]
-    fn legacy_category_five_reconciliation_progresses_in_bounded_batches() {
+    fn legacy_low_complexity_xl_reconciliation_progresses_in_bounded_batches() {
         let (_d, mut c) = open_tmp();
         let total = SWEEP_LIMIT + 1;
         for seq in 0..total {
             let id = create(
                 &mut c,
                 "boss",
-                &format!("legacy category five {seq}"),
+                &format!("legacy low complexity XL {seq}"),
                 None,
                 0,
                 None,
@@ -9497,7 +9554,7 @@ mod tests {
             .unwrap();
             c.execute(
                 "UPDATE tasks
-                 SET review_only=1, refs=json_object('cx_est', 5, 'cx_size','L','cx_ready',true,'cx_by', 'legacy:v1')
+                 SET refs=json_object('cx_est', 2, 'cx_size','XL','cx_ready',true,'cx_by', 'legacy:v1')
                  WHERE id=?1",
                 params![id],
             )
@@ -9524,7 +9581,7 @@ mod tests {
                 "SELECT count(*) FROM tasks
                  WHERE status='failed'
                    AND json_extract(refs, '$.daemon_parked')=1
-                   AND json_extract(refs, '$.cx_est')=5",
+                   AND json_extract(refs, '$.cx_est')=2",
                 [],
                 |row| row.get(0),
             )
