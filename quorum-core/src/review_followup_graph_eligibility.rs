@@ -102,7 +102,8 @@ pub fn classify_graph_assessment(
              WHERE graph.id=?1
          ), accepted_members AS (
              SELECT member.graph_id,member.task_id,child.status,
-                    CASE WHEN json_valid(child.refs) THEN
+                    CASE WHEN child.completion_provenance='merged'
+                                   AND json_valid(child.refs) THEN
                       CASE WHEN json_type(child.refs,'$.pr')='integer'
                               AND json_extract(child.refs,'$.pr')>0
                            THEN json_extract(child.refs,'$.pr') END
@@ -341,9 +342,16 @@ mod tests {
             let refs = child.pr_number.map(|pr| format!(r#"{{"pr":{pr}}}"#));
             connection
                 .execute(
-                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
-                     VALUES (?1,?2,'owner',1,1,?3)",
-                    params![format!("child {ordinal}"), child.status, refs],
+                    "INSERT INTO tasks(
+                         title,status,created_by,created_at,updated_at,refs,
+                         completion_provenance)
+                     VALUES (?1,?2,'owner',1,1,?3,?4)",
+                    params![
+                        format!("child {ordinal}"),
+                        child.status,
+                        refs,
+                        (child.status == "done").then_some("merged")
+                    ],
                 )
                 .unwrap();
             let child_id = connection.last_insert_rowid();
@@ -534,6 +542,54 @@ mod tests {
             classify_graph_assessment(&connection, graph_id, CURRENT_VERSION).unwrap(),
             GraphAssessmentEligibility::Ineligible
         );
+    }
+
+    #[test]
+    fn done_child_with_manual_or_unknown_provenance_is_not_a_merged_child() {
+        for provenance in [Some("manual"), None] {
+            let (_dir, mut connection) = database();
+            let specs = [
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(117),
+                },
+                ChildSpec {
+                    status: "done",
+                    pr_number: Some(118),
+                },
+            ];
+            let (graph_id, source_id, child_ids) = graph(&connection, "completed", &specs);
+            connection
+                .execute(
+                    "UPDATE tasks SET completion_provenance=?2 WHERE id=?1",
+                    params![child_ids[0], provenance],
+                )
+                .unwrap();
+            interpreted(
+                &mut connection,
+                graph_id,
+                source_id,
+                child_ids[0],
+                117,
+                1,
+                CURRENT_VERSION,
+            );
+            interpreted(
+                &mut connection,
+                graph_id,
+                source_id,
+                child_ids[1],
+                118,
+                1,
+                CURRENT_VERSION,
+            );
+
+            assert_eq!(
+                classify_graph_assessment(&connection, graph_id, CURRENT_VERSION).unwrap(),
+                GraphAssessmentEligibility::Ineligible,
+                "done child with {provenance:?} provenance must fail closed"
+            );
+        }
     }
 
     #[test]

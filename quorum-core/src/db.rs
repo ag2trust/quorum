@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 46;
+pub const SCHEMA_VERSION: i64 = 47;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -690,6 +690,17 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                  BEGIN
                      SELECT RAISE(ABORT, 'follow-up assessment membership seal is irreversible');
                  END;",
+            )?;
+        }
+        // v47 records daemon-owned terminal provenance without reinterpreting
+        // history. Existing done rows remain NULL: refs.pr alone cannot prove
+        // whether task-close represented a merge, an external fix, or obsolescence.
+        if current < 47 && !column_exists(conn, "tasks", "completion_provenance")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN completion_provenance TEXT
+                 CHECK(completion_provenance IS NULL
+                       OR completion_provenance IN ('merged','manual'))",
+                [],
             )?;
         }
         // Guarded core write APIs remain dormant until later daemon activation
@@ -1395,6 +1406,75 @@ mod tests {
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn populated_v46_migration_adds_closed_completion_provenance_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v46-completion-provenance.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(
+                     id,title,status,created_by,created_at,updated_at,refs,
+                     completion_provenance)
+                 VALUES
+                     (71,'legacy done with PR','done','owner',1,1,'{\"pr\":701}','merged'),
+                     (72,'legacy open','open','owner',1,1,NULL,NULL);
+                 ALTER TABLE tasks DROP COLUMN completion_provenance;
+                 PRAGMA user_version=46;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert!(column_exists(&conn, "tasks", "completion_provenance").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT completion_provenance FROM tasks WHERE id=71",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+            None,
+            "migration must not infer merge provenance from legacy done + refs.pr"
+        );
+        conn.execute(
+            "UPDATE tasks SET completion_provenance='merged' WHERE id=71",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET completion_provenance='manual' WHERE id=72",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE tasks SET completion_provenance='unknown' WHERE id=72",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT json_array(
+                         (SELECT completion_provenance FROM tasks WHERE id=71),
+                         (SELECT completion_provenance FROM tasks WHERE id=72))",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            r#"["merged","manual"]"#
         );
     }
 
