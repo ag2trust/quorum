@@ -3439,6 +3439,8 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
                               OR repository_graph.active=1)
            AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
            AND json_extract(t.refs,'$.cx_size') IN ('L','XL')
+           AND json_extract(t.refs,'$.cx_est') IN (4,5)
+           AND t.continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
            AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
            AND (t.depends_on IS NULL OR NOT EXISTS (
@@ -5513,7 +5515,7 @@ async fn reconcile_remediation_retries(
             Ok(tasks::list_dependency_ready_rework(&conn)?
                 .into_iter()
                 .filter(|task| {
-                    tasks::classification_is_dispatchable(&task.refs)
+                    tasks::classification_is_dispatchable(&task.refs, task.continue_pr)
                         && remediation_retry_feedback(task.refs.as_deref()).is_some()
                 })
                 .collect())
@@ -10140,12 +10142,13 @@ async fn tick(
         // After a stateless recovery (or if a worker exited without being
         // tracked), in-review tasks with a PR but no live worker or reviewer
         // need a reviewer provisioned from the DB state alone.
-        // (task_id, pr, author, review_only, body, reviewer, refs)
+        // (task_id, pr, author, review_only, continue_pr, body, reviewer, refs)
         type OrphanRow = (
             i64,
             i64,
             String,
             bool,
+            Option<i64>,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -10159,7 +10162,16 @@ async fn tick(
                 for t in ir_tasks {
                     if let Some(pr) = tasks::extract_pr_number(&t.refs) {
                         let author = t.author.unwrap_or_default();
-                        result.push((t.id, pr, author, t.review_only, t.body, t.reviewer, t.refs));
+                        result.push((
+                            t.id,
+                            pr,
+                            author,
+                            t.review_only,
+                            t.continue_pr,
+                            t.body,
+                            t.reviewer,
+                            t.refs,
+                        ));
                     }
                 }
                 Ok(result)
@@ -10168,7 +10180,9 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
-        for (task_id, pr, author, review_only, body, reviewer, task_refs) in &orphan_in_review {
+        for (task_id, pr, author, review_only, continue_pr, body, reviewer, task_refs) in
+            &orphan_in_review
+        {
             let has_worker = workers.iter().any(|w| w.task_id == *task_id);
             let has_reviewer = reviewers.iter().any(|r| r.task_id == *task_id);
             if has_worker || has_reviewer {
@@ -10339,7 +10353,7 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
-                    if !tasks::classification_is_dispatchable(task_refs) {
+                    if !tasks::classification_is_dispatchable(task_refs, *continue_pr) {
                         log(&format!(
                             "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
                         ));
@@ -12514,7 +12528,7 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if !tasks::classification_is_dispatchable(&t.refs) {
+            if !tasks::classification_is_dispatchable(&t.refs, t.continue_pr) {
                 return false;
             }
             if t.review_only {
@@ -19874,24 +19888,110 @@ mod tests {
     }
 
     #[test]
-    fn planning_candidate_is_ready_large_implementation_priority_ordered() {
+    fn planning_candidate_requires_complex_large_non_continuation() {
         let dir = tempfile::tempdir().unwrap();
         let conn = quorum_core::db::open(&dir.path().join("candidate.db")).unwrap();
         conn.execute_batch(
             "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
-             VALUES ('small','open',100,'owner',1,1,
-               '{\"cx_est\":2,\"cx_size\":\"S\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             VALUES ('moderate-large','open',100,'owner',1,1,
+               '{\"cx_est\":3,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only,continue_pr)
+             VALUES ('continued-large','open',90,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0,529);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('large-low','open',5,'owner',1,1,
                '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('large-high','open',9,'owner',1,1,
-               '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
              INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
              VALUES ('review-large','open',99,'owner',1,1,
                '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1);"
         ).unwrap();
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((4, 1)));
+        conn.execute("UPDATE tasks SET status='done' WHERE id=4", [])
+            .unwrap();
         assert_eq!(planning_candidate(&conn).unwrap(), Some((3, 1)));
+        conn.execute("UPDATE tasks SET status='done' WHERE id=3", [])
+            .unwrap();
+        assert_eq!(planning_candidate(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn continuation_incident_shape_plans_plain_large_and_claims_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("incident.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only,continue_pr)
+             VALUES ('continue PR 529','open',100,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0,529);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('plain complex large','open',1,'owner',1,1,
+               '{\"cx_est\":4,\"cx_size\":\"L\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);"
+        )
+        .unwrap();
+
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+        let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 2)
+            .unwrap()
+            .expect("continuation must dispatch directly");
+        assert_eq!(claimed.continue_pr, Some(529));
+    }
+
+    #[test]
+    fn planning_and_claim_partition_classified_shapes() {
+        for size in ["S", "M", "L", "XL"] {
+            for cx_est in 1..=5 {
+                for continue_pr in [None, Some(500)] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut conn = quorum_core::db::open(&dir.path().join("partition.db")).unwrap();
+                    conn.execute(
+                        "INSERT INTO tasks(
+                            title,status,priority,created_by,created_at,updated_at,refs,
+                            review_only,continue_pr
+                         ) VALUES (
+                            'shape','open',1,'owner',1,1,
+                            json_object(
+                                'cx_est',?1,'cx_size',?2,'cx_ready',json('true'),
+                                'cx_not_ready_reason',json('null')
+                            ),0,?3
+                         )",
+                        rusqlite::params![cx_est, size, continue_pr],
+                    )
+                    .unwrap();
+                    tasks::park_classified_complexity_five(&mut conn, 2).unwrap();
+
+                    let planned = planning_candidate(&conn).unwrap().is_some();
+                    let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 3)
+                        .unwrap()
+                        .is_some();
+                    let direct = continue_pr.is_some()
+                        || matches!(size, "S" | "M")
+                        || (size == "L" && cx_est <= 3);
+                    let decomposition =
+                        continue_pr.is_none() && matches!(size, "L" | "XL") && cx_est >= 4;
+                    let parked = continue_pr.is_none() && size == "XL" && cx_est <= 3;
+                    let shape = format!("size={size} cx_est={cx_est} continue={continue_pr:?}");
+
+                    assert_eq!(claimed, direct, "claim route mismatch for {shape}");
+                    assert_eq!(planned, decomposition, "planner route mismatch for {shape}");
+                    assert!(!(planned && claimed), "double route for {shape}");
+                    assert!(planned || claimed || parked, "starved shape: {shape}");
+
+                    if parked {
+                        let task = tasks::get(&conn, 1).unwrap().unwrap();
+                        assert_eq!(task.status, "failed", "XL mismatch not parked: {shape}");
+                        let refs: serde_json::Value =
+                            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+                        assert_eq!(
+                            refs[tasks::PARKED_REASON_REF],
+                            tasks::LOW_COMPLEXITY_XL_PARK_REASON,
+                            "wrong XL park reason for {shape}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

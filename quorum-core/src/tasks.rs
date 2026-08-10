@@ -735,6 +735,14 @@ pub fn claim(
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
         SELECT 1 FROM task_decompositions WHERE freeze_active=1
     )";
+    const DIRECT_DISPATCH_CLAUSE: &str = "(continue_pr IS NOT NULL OR (
+        (json_extract(refs, '$.cx_size') IN ('S','M') OR (
+            json_extract(refs, '$.cx_size')='L'
+            AND json_extract(refs, '$.cx_est') <= 3
+        ))
+        AND NOT (json_extract(refs, '$.cx_est')=5
+                 AND json_extract(refs, '$.cx_size')='L')
+    ))";
     // Generated implementation work has additional graph authority. Keep this
     // predicate in the same BEGIN IMMEDIATE transaction as the task update so
     // sibling claims, failures, and graph blockers cannot race provisioning.
@@ -781,10 +789,9 @@ pub fn claim(
                        AND json_type(refs, '$.cx_est')='integer'
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
-                       AND json_extract(refs, '$.cx_size') IN ('S','M')
+                       AND {DIRECT_DISPATCH_CLAUSE}
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
-                       AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                        AND {CONTINUE_PR_UNOWNED_CLAUSE}
                        AND (
                          (status='open' AND {DEP_READY_CLAUSE}
@@ -806,10 +813,9 @@ pub fn claim(
                    AND json_type(refs, '$.cx_est')='integer'
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
-                   AND json_extract(refs, '$.cx_size') IN ('S','M')
+                   AND {DIRECT_DISPATCH_CLAUSE}
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
-                   AND NOT (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L')
                    AND {CONTINUE_PR_UNOWNED_CLAUSE}
                    AND (
                     (status='open' AND {DEP_READY_CLAUSE}
@@ -908,11 +914,16 @@ pub fn claim_provider_retry_rework(
                json_type(refs, '$.cx_est')='integer'
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
-               AND json_extract(refs, '$.cx_size') IN ('S','M')
+               AND (continue_pr IS NOT NULL OR (
+                   (json_extract(refs, '$.cx_size') IN ('S','M') OR (
+                       json_extract(refs, '$.cx_size')='L'
+                       AND json_extract(refs, '$.cx_est') <= 3
+                   ))
+                   AND NOT (json_extract(refs, '$.cx_est')=5
+                            AND json_extract(refs, '$.cx_size')='L')
+               ))
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
-               AND NOT (json_extract(refs, '$.cx_est')=5
-                        AND json_extract(refs, '$.cx_size')='L')
                AND (
                    CASE WHEN json_type(refs, '$.runner_retry') IS NOT NULL
                        THEN COALESCE(json_type(refs, '$.runner_retry.requested')='true', 0)
@@ -1023,10 +1034,17 @@ pub fn claim_remediation_rework_with_feedback(
                  OR json_type(refs, '$.cx_est') IS NOT 'integer'
                  OR COALESCE(json_extract(refs, '$.cx_est'), 0) NOT BETWEEN 1 AND 5
                  OR json_type(refs, '$.cx_size') IS NOT 'text'
-                 OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L')
+                 OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L','XL')
                  OR json_type(refs, '$.cx_ready') IS NOT 'true'
                  OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
-                 OR (json_extract(refs, '$.cx_est')=5 AND json_extract(refs, '$.cx_size')='L'))
+                 OR NOT (continue_pr IS NOT NULL OR (
+                     (json_extract(refs, '$.cx_size') IN ('S','M') OR (
+                         json_extract(refs, '$.cx_size')='L'
+                         AND json_extract(refs, '$.cx_est') <= 3
+                     ))
+                     AND NOT (json_extract(refs, '$.cx_est')=5
+                              AND json_extract(refs, '$.cx_size')='L')
+                 )))
          )",
         params![id],
         |row| row.get(0),
@@ -1114,7 +1132,14 @@ pub fn reserve_reviewer_provision(
                AND json_valid(t.refs)
                AND json_type(t.refs,'$.cx_est')='integer'
                AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
-               AND json_extract(t.refs,'$.cx_size') IN ('S','M')
+               AND (t.continue_pr IS NOT NULL OR (
+                   (json_extract(t.refs,'$.cx_size') IN ('S','M') OR (
+                       json_extract(t.refs,'$.cx_size')='L'
+                       AND json_extract(t.refs,'$.cx_est') <= 3
+                   ))
+                   AND NOT (json_extract(t.refs,'$.cx_est')=5
+                            AND json_extract(t.refs,'$.cx_size')='L')
+               ))
                AND json_extract(t.refs,'$.cx_ready')=1
                AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
@@ -2705,6 +2730,8 @@ fn set_classifier_policy_parked_refs(
 
 pub const COMPLEXITY_FIVE_PARK_REASON: &str =
     "complexity 5 exceeds automatic dispatch policy; split or rescope into a new task";
+pub const LOW_COMPLEXITY_XL_PARK_REASON: &str =
+    "size XL requires complexity 4 or 5 for decomposition; reclassify or rescope the task";
 
 /// A complete v2 classification has the exact persisted types and
 /// readiness/reason relationship required by dispatch policy.
@@ -2737,7 +2764,7 @@ pub fn classification_is_complete(refs: &Option<String>) -> bool {
 
 /// Classification policy is intentionally separate from model routing: difficult
 /// focused work may run, while unready or compound work is parked.
-pub fn classification_is_dispatchable(refs: &Option<String>) -> bool {
+pub fn classification_is_dispatchable(refs: &Option<String>, continue_pr: Option<i64>) -> bool {
     if !classification_is_complete(refs) {
         return false;
     }
@@ -2754,7 +2781,9 @@ pub fn classification_is_dispatchable(refs: &Option<String>) -> bool {
         return false;
     };
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
-    ready && (1..=5).contains(&cx) && matches!(size, "S" | "M")
+    ready
+        && (1..=5).contains(&cx)
+        && (continue_pr.is_some() || matches!(size, "S" | "M") || (size == "L" && cx <= 3))
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -2773,11 +2802,21 @@ pub(crate) fn park_classified_task_tx(
     let effective_reason = if reason == "classification outside automatic dispatch policy" {
         refs.as_deref()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-            .filter(|v| v.get("cx_ready").and_then(|b| b.as_bool()) == Some(false))
             .and_then(|v| {
-                v.get("cx_not_ready_reason")
-                    .and_then(|s| s.as_str())
-                    .map(|s| format!("task is not ready: {s}"))
+                if v.get("cx_ready").and_then(|b| b.as_bool()) == Some(false) {
+                    return v
+                        .get("cx_not_ready_reason")
+                        .and_then(|s| s.as_str())
+                        .map(|s| format!("task is not ready: {s}"));
+                }
+                if v.get("cx_size").and_then(|s| s.as_str()) == Some("XL")
+                    && v.get("cx_est")
+                        .and_then(|cx| cx.as_i64())
+                        .is_some_and(|cx| cx <= 3)
+                {
+                    return Some(LOW_COMPLEXITY_XL_PARK_REASON.to_string());
+                }
+                None
             })
             .unwrap_or_else(|| reason.to_string())
     } else {
@@ -2905,8 +2944,8 @@ pub(crate) fn park_complexity_five_tx(
 
 /// Reconcile non-admissible classifications written by an older daemon or
 /// changed while this daemon was stopped. Admission-ready L/XL implementation
-/// tasks are intentionally left open for decomposition; review-only large work
-/// is held for an external split.
+/// tasks with decomposition-range estimates are intentionally left open;
+/// review-only large work and low-complexity non-continuation XL work are held.
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
@@ -2915,7 +2954,10 @@ pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Resul
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
                AND (json_extract(refs, '$.cx_ready')!=1
-                    OR (review_only=1 AND json_extract(refs, '$.cx_size') IN ('L','XL')))
+                    OR (review_only=1 AND json_extract(refs, '$.cx_size') IN ('L','XL'))
+                    OR (review_only=0 AND continue_pr IS NULL
+                        AND json_extract(refs, '$.cx_size')='XL'
+                        AND json_extract(refs, '$.cx_est') <= 3))
              ORDER BY id
              LIMIT ?1",
         )?;
@@ -5917,50 +5959,80 @@ mod tests {
     }
 
     #[test]
-    fn large_tasks_are_planning_only_and_cannot_be_claimed() {
+    fn direct_claim_routes_moderate_l_and_all_continuation_sizes() {
         let (_d, mut conn) = open_tmp();
-        let large = create(
+        let moderate_l = create(
             &mut conn,
             "owner",
-            "large",
+            "moderate large",
             None,
             100,
             None,
-            Some(r#"{"cx_est":4,"cx_size":"L"}"#),
+            Some(r#"{"cx_est":3,"cx_size":"L"}"#),
             None,
             None,
             1,
         )
         .unwrap();
-        let small = create(
+        let complex_l = create(
             &mut conn,
             "owner",
-            "small",
+            "complex large",
             None,
             1,
             None,
-            Some(r#"{"cx_est":2,"cx_size":"S"}"#),
+            Some(r#"{"cx_est":4,"cx_size":"L"}"#),
             None,
             None,
             2,
         )
         .unwrap();
 
-        let large_refs = get(&conn, large).unwrap().unwrap().refs;
-        assert!(classification_is_complete(&large_refs));
-        assert!(!classification_is_dispatchable(&large_refs));
-        assert!(claim(&mut conn, "explicit", Some(large), &[], TTL, 3)
+        let moderate_refs = get(&conn, moderate_l).unwrap().unwrap().refs;
+        assert!(classification_is_complete(&moderate_refs));
+        assert!(classification_is_dispatchable(&moderate_refs, None));
+        assert!(claim(&mut conn, "moderate", Some(moderate_l), &[], TTL, 3)
+            .unwrap()
+            .is_some());
+        assert!(claim(&mut conn, "complex", Some(complex_l), &[], TTL, 4)
             .unwrap()
             .is_none());
 
-        let claimed = claim(&mut conn, "next", None, &[], TTL, 4)
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.id, small);
-        let untouched = get(&conn, large).unwrap().unwrap();
+        let untouched = get(&conn, complex_l).unwrap().unwrap();
         assert_eq!(untouched.status, "open");
         assert_eq!(untouched.assignee, None);
-        assert!(!has_live_lease(&conn, large, 4));
+        assert!(!has_live_lease(&conn, complex_l, 4));
+
+        for (index, size) in ["S", "M", "L", "XL"].into_iter().enumerate() {
+            let id = create_with_continue_pr(
+                &mut conn,
+                "owner",
+                &format!("continue {size}"),
+                None,
+                1,
+                None,
+                Some(&format!(
+                    r#"{{"cx_est":5,"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null}}"#
+                )),
+                None,
+                None,
+                Some(100 + index as i64),
+                10 + index as i64,
+            )
+            .unwrap();
+            let task = get(&conn, id).unwrap().unwrap();
+            assert!(classification_is_dispatchable(&task.refs, task.continue_pr));
+            assert!(claim(
+                &mut conn,
+                &format!("continue-{size}"),
+                Some(id),
+                &[],
+                TTL,
+                20 + index as i64,
+            )
+            .unwrap()
+            .is_some());
+        }
     }
 
     #[test]

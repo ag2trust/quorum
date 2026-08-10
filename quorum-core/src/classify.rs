@@ -403,12 +403,12 @@ pub fn store_classifications_for_inputs(
                     params![result.task_id, now, note],
                 )?;
             }
-            let review_only: bool = tx.query_row(
-                "SELECT review_only FROM tasks WHERE id=?1",
+            let (review_only, continue_pr): (bool, Option<i64>) = tx.query_row(
+                "SELECT review_only, continue_pr FROM tasks WHERE id=?1",
                 params![result.task_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            if let Some(reason) = parking_reason(&sanitized, review_only) {
+            if let Some(reason) = parking_reason(&sanitized, review_only, continue_pr.is_some()) {
                 crate::tasks::park_classified_task_tx(&tx, result.task_id, reason, now)?;
             } else {
                 crate::tasks::restore_classified_task_tx(&tx, result.task_id, now)?;
@@ -489,7 +489,11 @@ pub fn validate_batch(
     Ok(())
 }
 
-fn parking_reason(result: &TaskClassification, review_only: bool) -> Option<&str> {
+fn parking_reason(
+    result: &TaskClassification,
+    review_only: bool,
+    continue_pr: bool,
+) -> Option<&str> {
     if !result.ready {
         return result.not_ready_reason.as_deref();
     }
@@ -502,6 +506,9 @@ fn parking_reason(result: &TaskClassification, review_only: bool) -> Option<&str
         return Some(
             "review-only size L cannot be decomposed automatically; split or rescope externally",
         );
+    }
+    if !continue_pr && result.size == "XL" && result.cx_est <= 3 {
+        return Some(crate::tasks::LOW_COMPLEXITY_XL_PARK_REASON);
     }
     None
 }
@@ -1730,7 +1737,7 @@ mod tests {
         assert_eq!(unclassified_tasks(&conn).unwrap()[0].id, task_id);
         assert_eq!(tasks_missing_cx_all(&conn).unwrap()[0].id, task_id);
         let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
-        assert!(!crate::tasks::classification_is_dispatchable(&refs));
+        assert!(!crate::tasks::classification_is_dispatchable(&refs, None));
     }
 
     #[test]
@@ -1844,12 +1851,13 @@ mod redesigned_tests {
 
     #[test]
     fn policy_allows_focused_complexity_five() {
-        assert!(parking_reason(&result(5, "S", true, None), false).is_none());
-        assert!(parking_reason(&result(5, "M", true, None), false).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), false).is_none());
-        assert!(parking_reason(&result(2, "XL", true, None), false).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), true).is_some());
-        assert!(parking_reason(&result(2, "XL", true, None), true).is_some());
+        assert!(parking_reason(&result(5, "S", true, None), false, false).is_none());
+        assert!(parking_reason(&result(5, "M", true, None), false, false).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), false, false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), false, false).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), false, true).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), true, false).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), true, false).is_some());
     }
 
     #[test]
