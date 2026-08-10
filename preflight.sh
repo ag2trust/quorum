@@ -10,8 +10,8 @@
 # Gates (in order, fail-fast):
 #   1. branch base   — HEAD is branched from origin/main, not another feature branch
 #   2. cargo fmt     — --all -- --check
-#   3. cargo clippy  — --all-targets -- -D warnings
-#   4. cargo test    — full suite incl. the claim-race canary
+#   3. cargo clippy  — all targets and explicit test-support targets
+#   4. cargo test    — full suite incl. real-process contention canaries
 #
 # Usage:
 #   ./preflight.sh          # all four gates
@@ -196,12 +196,12 @@ if [ "$QUICK" -eq 1 ]; then
 fi
 
 # --- Gate 3: cargo clippy -----------------------------------------------------
-printf '=== preflight 3/4: cargo clippy --all-targets -- -D warnings ===\n'
-cargo clippy --all-targets -- -D warnings || fail "cargo clippy"
+printf '=== preflight 3/4: cargo clippy --all-targets --all-features -- -D warnings ===\n'
+cargo clippy --all-targets --all-features -- -D warnings || fail "cargo clippy"
 printf 'clippy OK\n'
 
 # --- Gate 4: cargo test -------------------------------------------------------
-printf '=== preflight 4/4: cargo test ===\n'
-cargo test || fail "cargo test"
+printf '=== preflight 4/4: cargo test --workspace --all-features ===\n'
+cargo test --workspace --all-features || fail "cargo test"
 
 printf '\nPREFLIGHT: PASS (all 4 gates green)\n'
