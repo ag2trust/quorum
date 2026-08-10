@@ -300,8 +300,10 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
 - `quorum task-create ... --continue-pr <N>` → implementation task (status: `open`,
   `continue_pr=N`) rooted at the exact head of an open same-repository PR. It follows the
-  normal worker/review/rework/merge lifecycle and publishes back to that PR under lease.
-  `--continue-pr` and `--review-pr` are mutually exclusive.
+  normal worker/review/rework/merge lifecycle, dispatches directly regardless of classified
+  size, and publishes back to that PR under lease. It is never a decomposition source because
+  generated children cannot inherit the continuation publication authority. `--continue-pr`
+  and `--review-pr` are mutually exclusive.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
@@ -1759,11 +1761,15 @@ filename. Runner-specific process options remain scoped under `[claude]` or `[co
 
 ### Bounded task decomposition
 
-An admission-ready implementation task classified size L or XL does not dispatch directly.
-After its dependencies are done, the daemon serializes decomposition per repository: it stops
-new managed delivery, lets active delivery finish, and plans against the resulting frozen base.
-S/M implementation tasks dispatch normally regardless of complexity. Review-only L/XL work is
-parked for external splitting.
+A non-continuation, admission-ready implementation task is a decomposition source only when its
+classified size is L or XL and `cx_est` is 4 or 5. After its dependencies are done, the daemon
+serializes decomposition per repository: it stops new managed delivery, lets active delivery
+finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
+regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
+worker. Every `continue_pr` task dispatches directly because only the source task carries authority
+to publish to the bound PR. A non-continuation XL task with `cx_est` 1–3 violates the classification
+rubric and is parked with an explicit reclassify-or-rescope reason. Review-only L/XL work is parked
+for external splitting.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
 read-only repository view and bounded source
@@ -1890,11 +1896,14 @@ labels are ignored.
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to
   reject the task.
-- The daemon atomically parks a classification when it is not ready, size is `XL`, or it is
-  complexity 5 with size `L`. Complexity-5 `S` and `M` tasks remain dispatchable. Parking
-  writes the standard refs, note, and event with no claim, run, or error row; an explicit
-  retry requests reclassification of remaining work and a newly dispatchable result restores
-  the saved lifecycle status.
+- Direct dispatch and decomposition partition admission-ready implementation work. S/M tasks
+  dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
+  `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
+  as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
+  decomposition route, regardless of classified size. The daemon also atomically parks an
+  unready classification and review-only L/XL work. Parking writes the standard refs, note, and
+  event with no claim, run, or error row; an explicit retry requests reclassification of
+  remaining work and a newly dispatchable result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
