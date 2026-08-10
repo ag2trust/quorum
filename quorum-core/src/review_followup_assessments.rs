@@ -565,6 +565,7 @@ fn eligible_artifact_ids(
                   AND b.source_task_id=t.id
                  JOIN review_collection_runs r ON r.pr_number=b.pr_number
                  WHERE t.id=?1 AND t.id=?2 AND t.status='done'
+                   AND t.completion_provenance='merged'
                    AND json_valid(t.refs)
                    AND json_extract(t.refs,'$.pr') IS NOT NULL
                    AND CAST(json_extract(t.refs,'$.pr') AS TEXT)=CAST(b.pr_number AS TEXT)
@@ -602,7 +603,9 @@ fn eligible_artifact_ids(
                          FROM graph g
                          JOIN task_graph_members m ON m.graph_id=g.id
                          JOIN tasks t ON t.id=m.task_id
-                         WHERE t.status='done' AND json_valid(t.refs)
+                         WHERE t.status='done'
+                           AND t.completion_provenance='merged'
+                           AND json_valid(t.refs)
                            AND json_extract(t.refs,'$.pr') IS NOT NULL
                      ),
                      eligible_batches AS (
@@ -633,10 +636,13 @@ fn eligible_artifact_ids(
                             JOIN task_graph_members m ON m.graph_id=g.id
                             JOIN tasks t ON t.id=m.task_id
                             WHERE (g.state='completed' AND (
-                                      t.status!='done' OR NOT json_valid(t.refs)
+                                      t.status!='done'
+                                      OR t.completion_provenance IS NOT 'merged'
+                                      OR NOT json_valid(t.refs)
                                       OR json_extract(t.refs,'$.pr') IS NULL))
                                OR (g.state='cancelled' AND t.status='done' AND (
-                                      NOT json_valid(t.refs)
+                                      t.completion_provenance IS NOT 'merged'
+                                      OR NOT json_valid(t.refs)
                                       OR json_extract(t.refs,'$.pr') IS NULL))
                         )
                         AND NOT EXISTS (
@@ -1027,10 +1033,10 @@ mod tests {
                  (3,'graph source','done','owner',1,1),
                  (4,'graph child one','done','owner',1,1),
                  (5,'graph child two','done','owner',1,1);
-             UPDATE tasks SET refs='{\"pr\":100}' WHERE id=1;
-             UPDATE tasks SET refs='{\"pr\":200}' WHERE id=2;
-             UPDATE tasks SET refs='{\"pr\":300}' WHERE id=4;
-             UPDATE tasks SET refs='{\"pr\":301}' WHERE id=5;
+             UPDATE tasks SET refs='{\"pr\":100}',completion_provenance='merged' WHERE id=1;
+             UPDATE tasks SET refs='{\"pr\":200}',completion_provenance='merged' WHERE id=2;
+             UPDATE tasks SET refs='{\"pr\":300}',completion_provenance='merged' WHERE id=4;
+             UPDATE tasks SET refs='{\"pr\":301}',completion_provenance='merged' WHERE id=5;
              INSERT INTO task_decompositions(
                  id,source_task_id,state,active,freeze_active,planned_source_revision,
                  created_at,updated_at)
@@ -1351,6 +1357,25 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_scope_rejects_manual_and_unknown_completion_without_writes() {
+        for provenance in [Some(crate::tasks::COMPLETION_PROVENANCE_MANUAL), None] {
+            let (_dir, mut conn) = database();
+            conn.execute(
+                "UPDATE tasks SET completion_provenance=?2 WHERE id=?1",
+                params![1, provenance],
+            )
+            .unwrap();
+
+            let input = new_assessment(FollowupScopeKind::Task, 1, 1, vec![11, 12]);
+            assert!(
+                materialize_assessment(&mut conn, &input).unwrap().is_none(),
+                "provenance {provenance:?} must not authorize ordinary assessment"
+            );
+            assert_eq!(counts(&conn), (0, 0, 0));
+        }
+    }
+
+    #[test]
     fn graph_scope_rechecks_union_lineage_completeness_and_stale_eligibility() {
         let (_dir, mut conn) = database();
         let partial = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![31]);
@@ -1372,6 +1397,37 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(counts(&conn), (0, 0, 0));
+    }
+
+    #[test]
+    fn graph_scope_rejects_manual_and_unknown_child_completion_without_writes() {
+        for provenance in [Some(crate::tasks::COMPLETION_PROVENANCE_MANUAL), None] {
+            let (_dir, mut conn) = database();
+            conn.execute(
+                "UPDATE tasks SET completion_provenance=?2 WHERE id=?1",
+                params![4, provenance],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM review_followup_artifacts WHERE pr_number=300",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM review_followup_batches WHERE pr_number=300",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM review_collection_runs WHERE pr_number=300", [])
+                .unwrap();
+
+            let input = new_assessment(FollowupScopeKind::Graph, 9, 3, vec![32]);
+            assert!(
+                materialize_assessment(&mut conn, &input).unwrap().is_none(),
+                "provenance {provenance:?} must not authorize graph assessment"
+            );
+            assert_eq!(counts(&conn), (0, 0, 0));
+        }
     }
 
     #[test]
