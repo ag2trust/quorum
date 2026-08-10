@@ -44,4 +44,3 @@ required-features = ["test-support"]
 [[test]]
 name = "test_helper_races"
 path = "tests/test_helper_races.rs"
-required-features = ["test-support"]

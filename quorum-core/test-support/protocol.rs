@@ -21,6 +21,7 @@ pub const EXIT_INTERNAL: i32 = 3;
 pub enum Operation {
     AllocateRole,
     ClaimTask,
+    ClaimProviderRetryRework,
     CancelSourceGraph,
     ApplyGraphEvent,
     ClaimCleanup,
@@ -28,9 +29,10 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::AllocateRole,
         Self::ClaimTask,
+        Self::ClaimProviderRetryRework,
         Self::CancelSourceGraph,
         Self::ApplyGraphEvent,
         Self::ClaimCleanup,
@@ -41,6 +43,7 @@ impl Operation {
         match self {
             Self::AllocateRole => "allocate-role",
             Self::ClaimTask => "claim-task",
+            Self::ClaimProviderRetryRework => "claim-provider-retry-rework",
             Self::CancelSourceGraph => "cancel-source-graph",
             Self::ApplyGraphEvent => "apply-graph-event",
             Self::ClaimCleanup => "claim-cleanup",
@@ -89,6 +92,17 @@ pub struct ClaimTaskInput {
     pub db_path: PathBuf,
     pub task_id: i64,
     pub agent: String,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimProviderRetryReworkInput {
+    pub db_path: PathBuf,
+    pub task_id: i64,
+    pub agent: String,
+    pub ttl: i64,
+    pub now: i64,
     pub barrier: Barrier,
 }
 
