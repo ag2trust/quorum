@@ -163,6 +163,14 @@ printf 'continuation worker\n' >> remediation
 git commit -qam 'finish ancestry-preserving continuation' \
   -m 'Co-Authored-By: Continue-Worker <continue-worker@example.invalid>'
 CONTINUATION_HEAD_SHA=$(git rev-parse HEAD)
+git fetch -q origin \
+  refs/heads/daemon/continuation-t3:refs/remotes/origin/daemon/continuation-t3
+git branch --set-upstream-to=origin/daemon/continuation-t3
+PATH="$BIN:$PATH" ./preflight.sh >"$TMP/full-merge-continuation.out"
+grep -q 'configured-upstream continuation-owned commits' \
+  "$TMP/full-merge-continuation.out"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' \
+  "$TMP/full-merge-continuation.out"
 PATH="$BIN:$PATH" git push -q origin \
   "$CONTINUATION_HEAD_SHA:refs/heads/daemon/continuation-t3"
 REMOTE_SHA=$(git --git-dir="$REMOTE" rev-parse refs/heads/daemon/continuation-t3)
@@ -228,6 +236,14 @@ printf 'continue B\n' >> remediation
 git commit -qam 'stacked continuation session' \
   -m 'Co-Authored-By: Continue-B <continue-b@example.invalid>'
 STACKED_CONTINUATION_SHA=$(git rev-parse HEAD)
+git branch --set-upstream-to=origin/daemon/continuation-t3
+if PATH="$BIN:$PATH" ./preflight.sh \
+  >"$TMP/full-stacked-continuation.out" 2>&1; then
+  echo 'expected full gate to reject an upstream-tracking branch without a new base merge' >&2
+  exit 1
+fi
+grep -q 'sessions in branch-owned commits' \
+  "$TMP/full-stacked-continuation.out"
 if PATH="$BIN:$PATH" git push -q origin \
   "$STACKED_CONTINUATION_SHA:refs/heads/daemon/continuation-t3" \
   >"$TMP/stacked-continuation.out" 2>&1; then

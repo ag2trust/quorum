@@ -38,18 +38,14 @@ fn count(conn: &rusqlite::Connection, table: &str) -> i64 {
     .unwrap()
 }
 
-#[test]
-fn repeated_real_process_allocations_are_atomic() {
-    const ROUNDS: usize = 3;
-    const RACERS: usize = 8;
-
+fn real_process_allocations_are_atomic(rounds: usize, racers: usize) {
     for same_responsibility in [true, false] {
-        for round in 0..ROUNDS {
+        for round in 0..rounds {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("quorum.db");
             quorum_core::db::open(&db_path).unwrap();
             let go_path = dir.path().join("go");
-            let ready_paths = (0..RACERS)
+            let ready_paths = (0..racers)
                 .map(|index| dir.path().join(format!("ready-{index}")))
                 .collect::<Vec<_>>();
             let helpers = ready_paths
@@ -93,7 +89,7 @@ fn repeated_real_process_allocations_are_atomic() {
             let expected = if same_responsibility {
                 1
             } else {
-                RACERS as i64
+                racers as i64
             };
             assert_eq!(
                 count(&conn, "role_assignments"),
@@ -111,6 +107,11 @@ fn repeated_real_process_allocations_are_atomic() {
             assert_eq!(count(&conn, "errors"), 0);
         }
     }
+}
+
+#[test]
+fn real_process_allocation_smoke_is_atomic() {
+    real_process_allocations_are_atomic(1, 2);
 }
 
 fn seed_cleanup(conn: &rusqlite::Connection) {
@@ -142,9 +143,8 @@ fn seed_cleanup(conn: &rusqlite::Connection) {
     .unwrap();
 }
 
-#[test]
-fn concurrent_processes_have_exactly_one_cleanup_claim_winner() {
-    for iteration in 0..8 {
+fn real_process_cleanup_claim_has_exactly_one_winner(iterations: usize) {
+    for iteration in 0..iterations {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join(format!("quorum-{iteration}.db"));
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -211,12 +211,14 @@ fn concurrent_processes_have_exactly_one_cleanup_claim_winner() {
 }
 
 #[test]
-fn n_process_provider_rework_claim_exactly_one_winner() {
-    const RACERS: usize = 12;
-    const ROUNDS: usize = 3;
+fn real_process_cleanup_claim_smoke_has_exactly_one_winner() {
+    real_process_cleanup_claim_has_exactly_one_winner(1);
+}
+
+fn provider_rework_claim_has_exactly_one_winner(rounds: usize, racers: usize) {
     const TTL: i64 = 300;
 
-    for round in 0..ROUNDS {
+    for round in 0..rounds {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("quorum.db");
         let now = 10_000 + round as i64;
@@ -256,10 +258,10 @@ fn n_process_provider_rework_claim_exactly_one_winner() {
         drop(conn);
 
         let go_path = dir.path().join("go");
-        let agents: Vec<String> = (0..RACERS)
+        let agents: Vec<String> = (0..racers)
             .map(|index| format!("retry-{round}-{index}"))
             .collect();
-        let ready_paths = (0..RACERS)
+        let ready_paths = (0..racers)
             .map(|index| dir.path().join(format!("ready-{index}")))
             .collect::<Vec<_>>();
         let helpers = agents
@@ -356,4 +358,22 @@ fn render_provider_retry_outcomes(outcomes: &[(&String, support::HelperOutput)])
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_real_process_helper_races() {
+    real_process_allocations_are_atomic(3, 8);
+    real_process_cleanup_claim_has_exactly_one_winner(8);
+}
+
+#[test]
+fn real_process_provider_rework_claim_smoke_has_exactly_one_winner() {
+    provider_rework_claim_has_exactly_one_winner(1, 2);
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_provider_rework_claim_race() {
+    provider_rework_claim_has_exactly_one_winner(3, 12);
 }
