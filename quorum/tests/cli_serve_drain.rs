@@ -51,7 +51,14 @@ fn init_git_repo(dir: &std::path::Path) {
         .parent()
         .expect("quorum crate has repository parent");
     Command::new("git")
-        .args(["-C", &d, "fetch", &source_repo.to_string_lossy(), "HEAD"])
+        .args([
+            "-C",
+            &d,
+            "fetch",
+            "--update-shallow",
+            &source_repo.to_string_lossy(),
+            "HEAD",
+        ])
         .status()
         .unwrap();
     Command::new("git")
