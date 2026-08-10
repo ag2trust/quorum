@@ -456,27 +456,30 @@ Fields per finding:
    comment/review JSON above. Threaded replies count as separate evidence rows.
 
 Also emit a `followup_artifacts` entry for each concrete, evidence-backed
-non-blocking concern that remains valid after merge. Every artifact must share
-at least one evidence row with a `suggestion` finding above. Do not emit an
-artifact for a finding that was fixed, withdrawn, or accepted as invalid.
+non-blocking concern that remains valid after merge. Every artifact must name
+exactly one source finding by its zero-based index in the `findings` array. That
+source must be a `suggestion`, must share at least one evidence row with the
+artifact, and must not be fixed, withdrawn, or accepted as invalid.
 
 Fields per follow-up artifact:
 
-1. `technical_impact` — `"critical" | "major" | "minor" | "nit"`.
-2. `scope_relationship` — `"pre_existing" | "out_of_scope" |
+1. `source_finding_index` — zero-based array index of the exact source finding.
+2. `technical_impact` — `"critical" | "major" | "minor" | "nit"`.
+3. `scope_relationship` — `"pre_existing" | "out_of_scope" |
    "threat_model_expansion" | "defense_in_depth" | "future_requirement" |
    "design_debt"`.
-3. `concern` — a closed object with both:
+4. `concern` — a closed object with both:
    - `failure_mode` — the concrete failure (concise text such as "Requests deadlock" is valid),
    - `trigger_or_assumption` — when or under which assumption the failure occurs.
-4. `non_blocking_reason` — why the merged PR did not need to resolve it.
-5. `affected_behavior` — the affected product behavior.
-6. `desired_outcome` — a closed object with both:
+5. `non_blocking_reason` — why the merged PR did not need to resolve it.
+6. `affected_behavior` — the affected product behavior.
+7. `desired_outcome` — a closed object with both:
    - `observable_behavior` — the behavior that can be observed (concise text such as
      "Requests complete" is valid),
    - `observation_condition` — when the behavior must be observed.
-7. `verification_expectations` — one through eight concrete checks.
-8. `evidence` — one or more unique GitHub evidence rows, all present above.
+8. `verification_expectations` — one through eight concrete checks.
+9. `evidence` — one or more unique GitHub evidence rows, all present above and
+   sharing at least one row with the selected source finding.
 
 ## Output
 
@@ -488,7 +491,7 @@ Respond with ONLY a JSON object:
    "addressed_status":"addressed",
    "evidence":[{{"kind":"review_comment","id":12345}}]}}
 ],"followup_artifacts":[
-  {{"technical_impact":"major","scope_relationship":"out_of_scope",
+  {{"source_finding_index":0,"technical_impact":"major","scope_relationship":"out_of_scope",
    "concern":{{"failure_mode":"Requests deadlock",
               "trigger_or_assumption":"Concurrent shutdown overlaps request handling"}},
    "non_blocking_reason":"Why the merged PR did not need to resolve it",
@@ -978,6 +981,7 @@ mod tests {
         assert!(prompt.contains("withdrawn"));
         assert!(prompt.contains("evidence"));
         assert!(prompt.contains("followup_artifacts"));
+        assert!(prompt.contains("source_finding_index"));
         assert!(prompt.contains("technical_impact"));
         assert!(prompt.contains("scope_relationship"));
         assert!(prompt.contains("failure_mode"));

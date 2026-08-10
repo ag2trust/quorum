@@ -124,6 +124,7 @@ becomes:
   ],
   "followup_artifacts": [
     {
+      "source_finding_index": 0,
       "technical_impact": "major",
       "scope_relationship": "threat_model_expansion",
       "concern": {
@@ -155,13 +156,16 @@ Collector validation requires:
 - evidence IDs present in the deterministic fetched input;
 - streaming evidence-ID extraction without a full JSON DOM, with at most 4 MiB of aggregate
   evidence JSON inspected and at most 20,480 fetched records indexed for validation;
-- a `suggestion`/non-blocking source finding for every artifact, established by shared evidence;
-- no artifact whose final record says it was fixed, withdrawn, or accepted as invalid; and
+- a response-local zero-based source finding index for every artifact, selecting exactly one
+  `suggestion`/non-blocking finding and sharing at least one evidence row with that finding;
+- no artifact whose selected source finding says it was fixed, withdrawn, or accepted as invalid;
 - no vague improvement artifact lacking both a concrete concern and desired outcome.
 
-The collector canonicalizes the two required concern components and the two required desired-
-outcome components into the durable `concern` and `desired_outcome` strings. Unstructured prose,
-including generic reliability directives, is not a valid protocol value.
+The source finding index exists only in the bounded collector response and is validated before
+durable artifact construction. It does not turn replaceable `review_findings` row IDs into
+lifecycle authority. The collector canonicalizes the two required concern components and the two
+required desired-outcome components into the durable `concern` and `desired_outcome` strings.
+Unstructured prose, including generic reliability directives, is not a valid protocol value.
 
 Malformed JSON, unknown fields, invalid evidence, or invalid artifact semantics fails the complete
 interpretation. A failed run preserves the last successful findings and artifacts verbatim.

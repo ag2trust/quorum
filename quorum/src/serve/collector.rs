@@ -40,7 +40,7 @@ use tokio::time::timeout;
 /// Version stamp on every finding / run row this collector generation writes.
 /// Bump when the prompt/schema meaningfully changes so future readers can filter
 /// analytics by generation.
-pub const COLLECTOR_VERSION: &str = "v2";
+pub const COLLECTOR_VERSION: &str = "v3";
 
 /// Hard wall-clock cap on the classifier turn. Post-merge, so failing here
 /// leaves the merged task alone — the observable surface is `review_collection_runs`.
@@ -100,6 +100,7 @@ struct RawEvidenceId {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFollowupArtifact {
+    source_finding_index: usize,
     technical_impact: TechnicalImpact,
     scope_relationship: ScopeRelationship,
     concern: RawConcreteConcern,
@@ -274,35 +275,37 @@ fn validate_finding(
 }
 
 fn validate_artifact_source(artifact: &RawFollowupArtifact, findings: &[RawFinding]) -> Result<()> {
+    let source = findings.get(artifact.source_finding_index).ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "follow-up artifact source finding index {} is out of bounds",
+            artifact.source_finding_index
+        ))
+    })?;
+    if source.kind != "suggestion" {
+        return Err(QuorumError::Usage(
+            "follow-up artifact source finding is not a suggestion".into(),
+        ));
+    }
+    if matches!(source.addressed_status.as_str(), "addressed" | "withdrawn")
+        || source.pushback_accepted == Some(true)
+    {
+        return Err(QuorumError::Usage(
+            "follow-up artifact source was fixed, withdrawn, or accepted as invalid".into(),
+        ));
+    }
+
     let artifact_evidence = artifact
         .evidence
         .iter()
         .map(|evidence| (evidence.kind, evidence.id))
         .collect::<HashSet<_>>();
-    let sources = findings
+    if !source
+        .evidence
         .iter()
-        .filter(|finding| {
-            finding
-                .evidence
-                .iter()
-                .any(|evidence| artifact_evidence.contains(&(evidence.kind, evidence.id)))
-        })
-        .collect::<Vec<_>>();
-    let suggestion_sources = sources
-        .into_iter()
-        .filter(|finding| finding.kind == "suggestion")
-        .collect::<Vec<_>>();
-    if suggestion_sources.is_empty() {
+        .any(|evidence| artifact_evidence.contains(&(evidence.kind, evidence.id)))
+    {
         return Err(QuorumError::Usage(
-            "follow-up artifact has no shared suggestion evidence".into(),
-        ));
-    }
-    if suggestion_sources.iter().any(|finding| {
-        matches!(finding.addressed_status.as_str(), "addressed" | "withdrawn")
-            || finding.pushback_accepted == Some(true)
-    }) {
-        return Err(QuorumError::Usage(
-            "follow-up artifact source was fixed, withdrawn, or accepted as invalid".into(),
+            "follow-up artifact does not share evidence with its source finding".into(),
         ));
     }
     Ok(())
@@ -1523,6 +1526,7 @@ mod tests {
 
     fn artifact(id: i64) -> serde_json::Value {
         serde_json::json!({
+            "source_finding_index": 0,
             "technical_impact": "major",
             "scope_relationship": "out_of_scope",
             "concern": {
@@ -1854,6 +1858,76 @@ mod tests {
         assert!(parse_fixture(
             &response(vec![finding("blocking", 10)], vec![artifact(10)]),
             &parser_inputs(&[10], &[]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_disambiguates_mixed_validity_findings_with_shared_evidence() {
+        let inputs = parser_inputs(&[10], &[]);
+        let mut invalid = finding("suggestion", 10);
+        invalid["addressed_status"] = serde_json::json!("addressed");
+        let valid = finding("suggestion", 10);
+
+        let mut valid_artifact = artifact(10);
+        valid_artifact["source_finding_index"] = serde_json::json!(1);
+        assert!(parse_fixture(
+            &response(vec![invalid.clone(), valid.clone()], vec![valid_artifact]),
+            &inputs,
+        )
+        .is_ok());
+
+        let invalid_artifact = artifact(10);
+        assert!(parse_fixture(
+            &response(vec![invalid, valid], vec![invalid_artifact]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_rejects_invalid_source_finding_references() {
+        let inputs = parser_inputs(&[10], &[]);
+        for invalid_index in [
+            serde_json::json!(-1),
+            serde_json::json!(1),
+            serde_json::json!("0"),
+        ] {
+            let mut candidate = artifact(10);
+            candidate["source_finding_index"] = invalid_index;
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &inputs,
+            )
+            .is_err());
+        }
+
+        let mut missing = artifact(10);
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("source_finding_index");
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![missing]),
+            &inputs,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collector_protocol_requires_evidence_shared_with_selected_source() {
+        let inputs = parser_inputs(&[10, 11], &[]);
+        let evidence_match = finding("suggestion", 10);
+        let selected_without_match = finding("suggestion", 11);
+        let mut candidate = artifact(10);
+        candidate["source_finding_index"] = serde_json::json!(1);
+
+        assert!(parse_fixture(
+            &response(
+                vec![evidence_match, selected_without_match],
+                vec![candidate]
+            ),
+            &inputs,
         )
         .is_err());
     }
