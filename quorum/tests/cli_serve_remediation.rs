@@ -139,7 +139,7 @@ elif [ "$cmd" = "pr view" ]; then
   if [ -z "$sha" ]; then
     sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -1369,8 +1369,21 @@ fn pending_dependency_preserves_owner_requested_remediation_retry() {
         )],
     );
     assert!(
-        handle.wait_for("remediation: claim lost for task", 15),
-        "dependency-gated retry did not reach the remediation claim: {:?}",
+        handle.wait_for("serving (cap=1)", 15),
+        "daemon did not start: {:?}",
+        handle.lines
+    );
+    // The dedicated retry reconciler must leave the retained retry untouched
+    // while its dependency is unresolved. In particular, it must not spend a
+    // remediation provisioning round-trip only to lose the claim.
+    std::thread::sleep(Duration::from_secs(2));
+    handle.drain_pending_lines();
+    assert!(
+        !handle.lines.iter().any(|line| {
+            line.contains("durable remediation retry: provisioning task")
+                || line.contains("remediation: claim lost for task")
+        }),
+        "dependency-gated retry must not provision or attempt a claim: {:?}",
         handle.lines
     );
 

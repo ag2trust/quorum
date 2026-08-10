@@ -156,5 +156,10 @@ git cat-file -e "$REMOTE_SHA_1^{commit}" 2>/dev/null \
 git merge-base --is-ancestor "$REMOTE_SHA_1" "$LOCAL_SHA_1" \
   || fail "remote branch update is stale or non-fast-forward"
 
+CONTINUATION_BASE_BRANCH=${QUORUM_CONTINUATION_BASE_BRANCH:-main}
+git check-ref-format "refs/heads/$CONTINUATION_BASE_BRANCH" >/dev/null 2>&1 \
+  || fail "configured continuation base branch is malformed"
+CONTINUATION_BASE_REF="refs/remotes/origin/$CONTINUATION_BASE_BRANCH"
 exec ./preflight.sh --quick --proposed-sha="$LOCAL_SHA_1" \
-  --continuation-from="$REMOTE_SHA_1"
+  --continuation-from="$REMOTE_SHA_1" \
+  --continuation-base="$CONTINUATION_BASE_REF"

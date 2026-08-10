@@ -4,7 +4,7 @@
 //! is unit-tested, but never integration-tested through the CLI stdin path. These tests pipe
 //! bad bytes via `--body-stdin` to `post`, `task-create`, and `task-update`, asserting exit 2.
 
-mod common;
+use crate::common;
 
 use assert_cmd::Command;
 

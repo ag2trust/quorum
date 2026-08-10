@@ -226,6 +226,7 @@ CREATE TABLE review_followup_assessments (
   source_task_id        INTEGER NOT NULL REFERENCES tasks(id),
   state                 TEXT NOT NULL,
   active                INTEGER NOT NULL DEFAULT 0,
+  membership_sealed     INTEGER NOT NULL DEFAULT 1,
   proposal_attempts     INTEGER NOT NULL DEFAULT 0,
   provider_failures     INTEGER NOT NULL DEFAULT 0,
   planner_provider      TEXT,
@@ -244,9 +245,11 @@ CREATE UNIQUE INDEX one_active_followup_assessment
 
 `scope_kind` is `task` or `graph`; `scope_id` is the ordinary task ID or graph ID. `target` is
 `followup:task:<id>` or `followup:graph:<id>`. States are `pending`, `planning`,
-`provider-backoff`, `held`, and `completed`. The partial unique index provides atomic per-target
-planning authority. Planning claims and final application use `BEGIN IMMEDIATE` and guarded
-`UPDATE ... RETURNING`; lost races are clean negatives.
+`provider-backoff`, `held`, and `completed`. `membership_sealed` is opened only by the core
+materializer and irreversibly sealed before its transaction commits; all other inserts default to
+sealed. The partial unique index provides atomic per-target planning authority. Planning claims and
+final application use `BEGIN IMMEDIATE` and guarded `UPDATE ... RETURNING`; lost races are clean
+negatives.
 
 ### `review_followup_assessment_artifacts`
 
@@ -258,8 +261,10 @@ CREATE TABLE review_followup_assessment_artifacts (
 );
 ```
 
-Membership is materialized before the provider call and never changes. The unique artifact ID
-prevents one artifact from entering two assessments without semantic fingerprinting.
+Membership is materialized before the provider call and never changes. A storage trigger permits
+membership inserts only while the parent assessment is unsealed, and another trigger prevents a
+sealed assessment from reopening. The unique artifact ID prevents one artifact from entering two
+assessments without semantic fingerprinting.
 
 All migrations are additive, forward-only, idempotent under the normal migration write lock, and
 preserve `rusqlite` bundled behavior.

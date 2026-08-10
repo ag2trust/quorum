@@ -3,7 +3,41 @@
 use std::path::Path;
 use std::process::Child;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub enum WaitState<T> {
+    Ready(T),
+    Pending(String),
+}
+
+/// Poll an observable test state until it is ready or fail with the last value seen.
+///
+/// Integration tests use this for SQLite and process state, where no notification
+/// primitive crosses the daemon boundary. Keeping the deadline here makes every
+/// wait bounded and gives timeouts a useful missing-state diagnostic.
+pub fn wait_until<T>(
+    description: &str,
+    timeout: Duration,
+    mut observe: impl FnMut() -> WaitState<T>,
+) -> T {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let last_observation = match observe() {
+            WaitState::Ready(value) => return value,
+            WaitState::Pending(observation) => observation,
+        };
+
+        let now = Instant::now();
+        if now >= deadline {
+            panic!(
+                "timed out after {timeout:?} waiting for {description}; \\
+                 last observation: {last_observation}"
+            );
+        }
+        std::thread::park_timeout((deadline - now).min(Duration::from_millis(25)));
+    }
+}
 
 pub fn record_process_state(child: &mut Child, lines: &mut Vec<String>, context: &str) {
     let state = match child.try_wait() {
@@ -53,7 +87,7 @@ pub fn wait_for_count(
     }
 }
 
-pub fn wait_until<F>(
+pub fn wait_for_daemon_state<F>(
     child: &mut Child,
     rx: &mpsc::Receiver<String>,
     lines: &mut Vec<String>,

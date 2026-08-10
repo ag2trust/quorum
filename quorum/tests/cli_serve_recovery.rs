@@ -122,7 +122,7 @@ elif [ "$cmd" = "pr view" ]; then
     branch="daemon/agent0-t$pr"
   fi
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -209,6 +209,42 @@ fi
     fn drain_pending_lines(&mut self) {
         while let Ok(line) = self.rx.try_recv() {
             self.lines.push(line);
+        }
+    }
+
+    /// Wait until the daemon has completed at least one full scheduling tick.
+    ///
+    /// Phase 2 consumes each mailbox marker. Inserting the second marker only
+    /// after the first is consumed makes its observation prove that the prior
+    /// tick reached the later recovery and provisioning phases.
+    fn wait_for_completed_tick(&mut self, home: &std::path::Path) {
+        let db_path = home.join("repos/test__repo/quorum.db");
+        for marker in ["RecoveryTick0", "RecoveryTick1"] {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            quorum_core::mailbox::append(
+                &mut conn,
+                &quorum_core::mailbox::MailboxRow {
+                    agent: marker.into(),
+                    kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                    task_id: None,
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: Some("readiness barrier".into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            drop(conn);
+            assert!(
+                self.wait_for(
+                    &format!("consuming unmatched task_update from {marker}"),
+                    15,
+                ),
+                "daemon did not consume readiness marker {marker}. Lines: {:?}",
+                self.lines
+            );
         }
     }
 
@@ -431,8 +467,7 @@ fn restart_resumes_awaiting_review_at_review_stage_no_re_execution() {
         "reviewer not provisioned for in-review task after restart. Lines: {:?}",
         handle2.lines
     );
-
-    std::thread::sleep(Duration::from_millis(500));
+    handle2.wait_for_completed_tick(home.path());
     handle2.drain_pending_lines();
 
     // ── Invariant: NO fresh worker spawn for task #1 after restart. ──
@@ -748,9 +783,7 @@ fn exit75_in_review_recovered_without_worker_respawn() {
         "recovery did not complete. Lines: {:?}",
         handle.lines
     );
-
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    handle.wait_for_completed_tick(home.path());
 
     // Task stays in-review.
     let conn = quorum_core::db::open(&db_path).unwrap();
@@ -837,6 +870,68 @@ impl TestEnv {
         )
     }
 
+    fn seed_merged_continuation_graph(&self) {
+        let conn = quorum_core::db::open(&self.db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs,depends_on)
+             VALUES
+               (299,'graph source','decomposed','owner',1,1,'{}',NULL),
+               (300,'released dependent','open','owner',1,1,
+                '{\"cx_est\":2,\"cx_size\":\"S\",\"cx_ready\":true,\"cx_not_ready_reason\":null,\"cx_by\":\"test:v2\"}',
+                '[299]'),
+               (304,'sibling one','done','owner',1,1,'{}',NULL),
+               (305,'sibling two','done','owner',1,1,'{}',NULL),
+               (306,'sibling three','done','owner',1,1,'{}',NULL),
+               (307,'failed child','failed','owner',1,1,
+                '{\"pr\":526,\"daemon_parked\":true,\"daemon_parked_reason\":\"publication failed\",\"daemon_resume_status\":\"rework\",\"daemon_publication\":{\"pr\":526}}',NULL);
+
+             INSERT INTO task_decompositions(
+                 id,source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (4,299,'active',1,0,1,1,1,1,1);
+             INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (4,304,'one',1,1),(4,305,'two',1,1),
+                    (4,306,'three',1,1),(4,307,'failed',1,1);
+             INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+             VALUES (307,526,'daemon/original','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0,8);",
+        )
+        .unwrap();
+    }
+
+    fn seed_merged_continuation_delivery(&self) {
+        let conn = quorum_core::db::open(&self.db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs,continue_pr)
+             VALUES (320,'merged continuation','done','owner',9,40,
+                     '{\"pr\":526,\"source_task\":307}',526);
+             INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+             VALUES (320,526,'daemon/original','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',0,25);
+
+             INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                 profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES
+               (700,'worker:task:320:revision:1',320,NULL,'worker',NULL,'M',
+                'worker','codex','codex','sol','high','worker','test',9),
+               (701,'reviewer:task:320:r1',320,526,'reviewer','r1','M',
+                'reviewer','codex','codex','sol','high','reviewer','test',21);
+             INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,spawned_at,ended_at,end_reason,
+                 sub_role,provider,review_cap_run_id,review_pr,review_head_sha,role_assignment_id)
+             VALUES
+               (320,'worker','worker','sol','high',10,20,'completed',NULL,'codex',NULL,NULL,NULL,700),
+               (320,'reviewer','reviewer','sol','high',21,40,'verdict:approved',NULL,'codex',
+                'review-cap',526,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',701);
+             INSERT INTO r2_sampling_decisions(pr_number,head_sha,task_id,required,created_at)
+             VALUES (526,'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',320,0,29);
+             INSERT INTO events(ts,kind,subject,body,expires_at)
+             VALUES (15,'task_in_review','task#320','by worker',4000000000),
+                    (30,'task_merging','task#320','by reviewer',4000000000),
+                    (40,'task_done','task#320','by system',4000000000);",
+        )
+        .unwrap();
+    }
+
     fn seed_claimed_task(&self, title: &str, agent: &str) -> i64 {
         let mut conn = quorum_core::db::open(&self.db_path).unwrap();
         let now = quorum_core::clock::now();
@@ -872,6 +967,47 @@ impl TestEnv {
         let entries = quorum_core::journal::list_in_flight(&conn).unwrap();
         entries.iter().any(|e| e.agent == agent)
     }
+}
+
+#[test]
+fn merged_continuation_is_reconciled_by_production_startup_callsite() {
+    let env = TestEnv::new();
+    env.seed_merged_continuation_graph();
+    env.seed_merged_continuation_delivery();
+
+    let mut handle = env.start_serve();
+    assert!(
+        handle.wait_for("merged-continuation startup reconciliation adopted", 15),
+        "production startup callsite did not reconcile incident. Lines: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task_status(307), "done");
+    assert_eq!(env.task_status(299), "done");
+    handle.sigkill();
+}
+
+#[test]
+fn merged_continuation_created_after_startup_is_reconciled_by_production_tick_callsite() {
+    let env = TestEnv::new();
+    env.seed_merged_continuation_graph();
+
+    let mut handle = env.start_serve();
+    assert!(
+        handle.wait_for("recovery: complete", 15),
+        "daemon did not finish startup without a recovery delivery. Lines: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task_status(307), "failed");
+
+    env.seed_merged_continuation_delivery();
+    assert!(
+        handle.wait_for("merged-continuation tick reconciliation adopted", 15),
+        "production tick callsite did not reconcile later delivery. Lines: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task_status(307), "done");
+    assert_eq!(env.task_status(299), "done");
+    handle.sigkill();
 }
 
 fn make_journal_entry(
@@ -1090,17 +1226,20 @@ fn recovery_stale_mailbox_drained_on_respawn() {
 
     let mut handle = env.start_serve();
 
-    // Recovery resets task to open, then Phase 6 spawns Agent0. The tick loop
-    // consumes stale mailbox rows (either via F9 drain or message processing).
+    // Recovery resets task to open. With no live Agent0 slot yet, Phase 4c
+    // consumes both stale messages before Phase 6 logs the replacement spawn.
+    for _ in 0..2 {
+        assert!(
+            handle.wait_for("consuming message from Agent0 with no to_agent", 15),
+            "stale mailbox row was not consumed. Lines: {:?}",
+            handle.lines
+        );
+    }
     assert!(
         handle.wait_for("spawning agent Agent0", 15),
         "Phase 6 did not re-spawn Agent0. Lines: {:?}",
         handle.lines
     );
-
-    // Give the spawn + mailbox processing a moment to settle.
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
 
     // Verify the stale mailbox rows are consumed (no unconsumed rows remain).
     {

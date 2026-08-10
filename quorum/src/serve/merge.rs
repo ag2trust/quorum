@@ -130,6 +130,13 @@ pub trait MergeExecutor: Send + Sync {
         ChecksOutcome::Ready
     }
 
+    /// Names of checks that are still pending, used only to make a prolonged
+    /// pre-review CI wait actionable for the owner. Implementations may return
+    /// an empty list when the provider cannot determine them.
+    fn pending_check_names(&self, _pr: i64, _repo_dir: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Pre-merge mergeability check. Returns `Conflicting` if the PR has
     /// conflicts with the base branch, allowing the daemon to skip the
     /// approve+checks cycle and go straight to a rework round.
@@ -194,6 +201,13 @@ enum SingleCheckStatus {
     Pending,
 }
 
+/// A missing or JSON-null conclusion is normalized to the empty conclusion
+/// used by the check parser. Only an explicitly completed check with no
+/// conclusion fails closed; all other empty-conclusion checks are pending.
+fn is_pending_check(status: &str, conclusion: &str) -> bool {
+    conclusion.is_empty() && status != "COMPLETED"
+}
+
 /// Returns `(mergeStateStatus, checks)` where `checks` is:
 /// - `Some(vec![...])` when `statusCheckRollup` is a valid JSON array (possibly empty),
 /// - `None` when the field is missing, not an array, or JSON is malformed.
@@ -225,13 +239,15 @@ fn parse_checks_json(json_str: &str) -> (Option<String>, Option<Vec<(String, Sin
                         .unwrap_or("");
                     let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
-                    let check_status = if status != "COMPLETED" {
-                        SingleCheckStatus::Pending
-                    } else {
-                        match conclusion {
-                            "SUCCESS" | "NEUTRAL" | "SKIPPED" => SingleCheckStatus::Passed,
-                            _ => SingleCheckStatus::Failed,
-                        }
+                    // GitHub only supplies a conclusion for a terminal check-run, but its
+                    // status field can lag behind. Treat a non-empty conclusion as
+                    // authoritative so a phantom IN_PROGRESS/SUCCESS run cannot hold a
+                    // gate open forever. An empty conclusion remains pending unless the
+                    // status is explicitly completed, in which case it is fail-closed.
+                    let check_status = match conclusion {
+                        "SUCCESS" | "NEUTRAL" | "SKIPPED" => SingleCheckStatus::Passed,
+                        _ if is_pending_check(status, conclusion) => SingleCheckStatus::Pending,
+                        _ => SingleCheckStatus::Failed,
                     };
 
                     (name, check_status)
@@ -240,6 +256,34 @@ fn parse_checks_json(json_str: &str) -> (Option<String>, Option<Vec<(String, Sin
         });
 
     (merge_state, checks)
+}
+
+fn pending_check_names_from_json(json_str: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    let Some(checks) = value
+        .get("statusCheckRollup")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+    checks
+        .iter()
+        .filter(|check| {
+            let conclusion = check
+                .get("conclusion")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let status = check
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            is_pending_check(status, conclusion)
+        })
+        .filter_map(|check| check.get("name").and_then(|value| value.as_str()))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn checks_query_from_parsed(
@@ -687,6 +731,19 @@ impl MergeExecutor for GhMergeExecutor {
             }
             std::thread::sleep(Duration::from_secs(poll_interval_secs));
         }
+    }
+
+    fn pending_check_names(&self, pr: i64, repo_dir: &Path) -> Vec<String> {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr_str, "--json", "statusCheckRollup"],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(output) if output.status.success() => output,
+            _ => return Vec::new(),
+        };
+        pending_check_names_from_json(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> MergeabilityState {
@@ -1267,6 +1324,48 @@ mod tests {
         assert_eq!(state.as_deref(), Some("CLEAN"));
         let result = checks_query_from_parsed(&state, &checks);
         assert_eq!(result, ChecksQueryResult::AllPassed);
+    }
+
+    #[test]
+    fn parse_checks_conclusion_is_terminal_even_when_status_lags() {
+        let json = r#"{
+            "mergeStateStatus": "BLOCKED",
+            "statusCheckRollup": [
+                {"name": "passed", "status": "IN_PROGRESS", "conclusion": "SUCCESS"},
+                {"name": "failed", "status": "IN_PROGRESS", "conclusion": "FAILURE"},
+                {"name": "pending", "status": "IN_PROGRESS", "conclusion": ""}
+            ]
+        }"#;
+        let (_, checks) = parse_checks_json(json);
+        assert_eq!(
+            checks,
+            Some(vec![
+                ("passed".to_string(), SingleCheckStatus::Passed),
+                ("failed".to_string(), SingleCheckStatus::Failed),
+                ("pending".to_string(), SingleCheckStatus::Pending),
+            ])
+        );
+    }
+
+    #[test]
+    fn pending_check_names_normalizes_null_and_missing_conclusions() {
+        let json = r#"{
+            "statusCheckRollup": [
+                {"name": "null-conclusion", "status": "IN_PROGRESS", "conclusion": null},
+                {"name": "missing-conclusion", "status": "QUEUED"},
+                {"name": "empty-conclusion", "status": "IN_PROGRESS", "conclusion": ""},
+                {"name": "completed-empty", "status": "COMPLETED", "conclusion": null},
+                {"name": "terminal", "status": "IN_PROGRESS", "conclusion": "SUCCESS"}
+            ]
+        }"#;
+        assert_eq!(
+            pending_check_names_from_json(json),
+            vec![
+                "null-conclusion".to_string(),
+                "missing-conclusion".to_string(),
+                "empty-conclusion".to_string(),
+            ]
+        );
     }
 
     #[test]

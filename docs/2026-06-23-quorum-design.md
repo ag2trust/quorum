@@ -568,9 +568,19 @@ only through an explicit outside request)
 - **Existing-PR implementation entry:** `task-create --continue-pr N` creates an `open`
   implementation intent and atomically rejects an already-owned PR. Before provisioning,
   the daemon resolves an open, same-repository, non-fork PR, rechecks exclusive nonterminal
-  ownership, and persists its exact head branch and SHA. The worker starts from that commit,
-  and later publication targets only that branch under the recorded SHA lease. Ownership ambiguity, closure,
-  branch replacement, or SHA movement fails closed; Quorum neither rebases onto the new
+  ownership, and persists its exact head branch and SHA. The daemon checks out and verifies
+  that exact commit, then merges the freshly fetched configured base into the continuation
+  branch before worker launch. The daemon explicitly overrides `merge.ff=only` for this operation;
+  Git completes a clean integration (creating a merge commit when histories diverge), while a
+  conflicting merge remains in progress for the worker to resolve and commit. This preserves the
+  recorded PR head as an ancestor so later publication is
+  fast-forward-only. The daemon supplies the configured base identity at the push boundary, and
+  the publication gate attributes sessions only to commits reachable from the proposed tip but
+  from neither the recorded PR head nor that freshly fetched base; inherited base commits do not
+  become worker-owned. Before publication, the daemon revalidates the live PR as open and still
+  targeting the configured base, then targets only its recorded branch under the recorded SHA
+  lease. Ownership ambiguity, closure, base retargeting, branch replacement, or SHA movement fails
+  closed; Quorum neither rebases onto the new
   head nor silently falls back to fresh implementation or a new PR. Existing same-task
   rework continues through the established PR association and does not create a new entry.
 - **Entry authority:** task creators select exactly one of fresh implementation (neither
@@ -1629,18 +1639,26 @@ the new daemon branch under a zero/nonexistent lease, creates the PR, and verifi
 binds that exact branch/SHA. Publication intent and the `intent → pushed → pr_created →
 verified` stages are durable task metadata. Startup recovery reuses an identical remote
 branch and a single existing PR, then folds the exact mailbox row only after verification.
-The publisher takes the intent's immutable source SHA and uses that object in the refspec;
-a later mutable worktree `HEAD` cannot change what is published. Before persisting the
-intent, the daemon pins that SHA under a task-scoped local Git ref, so parking may safely
-remove a failed run's worktree and run-local branch; `task-retry` and remediation retries
-still replay the exact source even when their replacement worktree starts at another
-`HEAD`. Successful worker lifecycle transitions retire the intent in the same SQLite
-transaction, including the late-mailbox fold, so a restart cannot carry SHA A into a
-later SHA B rework round; the reachability pin is removed afterward with an exact-SHA
-guard. Startup and bounded periodic reconciliation walk minimal task-id/SHA projections
-in fixed cursor batches, restore missing or mismatched intent pins, and exact-SHA-delete
-no-intent or terminal-task pins without scanning the full task history or Git ref
-namespace in one pass. A retry from `pr_created` repeats the same authoritative
+For an ordinary crash replay, the publisher takes the intent's immutable source SHA and
+uses that object in the refspec; a later mutable worktree `HEAD` cannot change what is
+published. Before persisting the intent, the daemon pins that SHA under a task-scoped
+local Git ref, so parking may safely remove the failed run's worktree and run-local branch.
+An explicit retry of a parked rework publication is a new delivery round, not an ordinary
+crash replay. Its spawn accepts only the recorded remote baseline or a live head already
+equal to the exact pinned source (the post-push verification-failure state); every third
+SHA parks. In the already-published case, one SQLite transaction advances both the
+persisted PR target and the publication intent's expected remote SHA to that exact source
+before provisioning. The replacement worktree starts from the accepted live head and
+integrates the current base. On completion, the daemon pins the replacement `HEAD` before
+overwriting the intent's source, preserving the advanced PR/head authority; a crash before
+intent persistence can only leave a harmless newer pin that reconciliation restores to
+the still-durable source. Successful worker lifecycle transitions retire the intent in the
+same SQLite transaction, including the late-mailbox fold, and the reachability pin is
+removed afterward with an exact-SHA guard. Startup and bounded periodic reconciliation
+walk minimal task-id/SHA projections in fixed cursor batches, restore missing or
+mismatched intent pins, and exact-SHA-delete no-intent or terminal-task pins without
+scanning the full task history or Git ref namespace in one pass. A retry from `pr_created`
+repeats the same authoritative
 branch/SHA/base validation before any push. Initial PR reconciliation
 also requires the PR base to equal the configured base branch. Rejected or ambiguous
 publication parks the task; persisted PR target data is never authority for a publish
@@ -1799,6 +1817,35 @@ affected child and blocks the graph without consuming ordinary rework. The sourc
 decomposed and the blocked graph remains active until source cancellation; recovery requires a
 replacement source, not automatic replanning after delivery has begun.
 
+A separate, explicit incident-recovery primitive may adopt the exact merged delivery of a done
+managed continuation task for the final failed member of an otherwise complete active graph.
+This is not graph-blocker recovery: blocked graphs still require cancellation and replacement.
+The immediate transaction requires the same repository and PR, creator-selected `continue_pr`,
+explicit `source_task` provenance, live daemon publication and merge events (`expires_at > now`),
+immutable managed-review authority, and one consistent PR target/approved head SHA. It changes
+only the failed child, records recovery provenance while preserving the PR, then invokes ordinary
+final-child completion. Missing or expired evidence, replay, and losing concurrent callers are
+clean no-ops with no events; the winner emits bounded completion events once. After graph
+consistency reconciliation and before generic stateless lifecycle recovery or provisioning, the
+daemon automatically discovers eligible deliveries at startup and on ordinary ticks. Discovery
+consumes at most eight physical rows from the durable lifecycle-event sequence in ascending `seq` order,
+then resolves explicit `source_task`, graph membership, PR targets, and live publication/merge
+evidence using short reads only. It never scans terminal-task history or performs network I/O.
+A dedicated monotonic cursor is acknowledged only after every guarded adoption call and durable
+retry-marker write in the page. If the short read observes an unfinished sibling and the core
+remains a clean negative, the daemon records one idempotent, TTL-bounded marker for the exact
+child/recovery pair. A later sibling `task_done` event drains live markers oldest-first through a
+second monotonic cursor, with at most eight candidate applications per pass. If the marker batch
+fills that capacity, the sibling trigger remains unacknowledged while the pending cursor advances,
+so later pairs receive a bounded subsequent pass. Partial graphs consume the current sibling
+trigger without advancing pending markers and wait for the next sibling completion. Every settled
+page advances, so a stalled graph cannot starve later deliveries. A crash before application or
+after the core, marker, or pending-cursor commit replays safely. Startup discovery failure is
+logged and fail-open; tick failure
+uses the ordinary tick error policy without advancing the cursor. The guarded transaction remains
+the sole adoption authority. The complete predicate is specified in the decomposition technical
+specification.
+
 The final child merge marks the source and graph done in the same transaction that marks that
 child done. Source dependents remain blocked until then. Cancelling a source atomically makes the
 graph non-runnable, cancels unfinished children, revokes authority, and records idempotent cleanup
@@ -1817,12 +1864,17 @@ pending classification/planning and restarts admission; stale/replayed edits do 
 fourth accepted edit is rejected. Materialized source/child scope and graph dependencies cannot be
 edited. Daemon-owned lifecycle evidence remains writable.
 
-Decomposition reconciliation runs before ordinary recovery and provisioning. A durable freeze
+Decomposition reconciliation runs before merged-continuation adoption, ordinary recovery, and
+provisioning. A durable freeze
 resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
 nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
-path, while any delivery evidence requires cancellation and replacement. Read-only status exposes
-bounded membership, edges, progress, attempts, provenance, and blockers. The complete storage,
-protocol, and recovery contract is in `docs/2026-07-31-task-decomposition-technical-spec.md`.
+path, while any delivery evidence requires cancellation and replacement except for the
+evidence-complete exact-continuation case above. Its automatic daemon discovery is a bounded
+reconciliation action on a consistent active graph; the core transaction remains fail-closed and
+does not broaden graph-blocker recovery. Read-only status exposes bounded membership, edges,
+progress, attempts, provenance, and blockers. The complete storage, protocol, and recovery
+contract is in
+`docs/2026-07-31-task-decomposition-technical-spec.md`.
 
 **Classifier-owned per-run model selection.** Task creators describe the outcome,
 constraints, and verification but have no routing authority. `task-create` rejects every

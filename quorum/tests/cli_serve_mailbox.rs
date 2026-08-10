@@ -12,6 +12,8 @@
 //! 6. Rework feed failure tears down the broken worker and releases the task
 //!    back to open — F8.
 
+mod common;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -19,6 +21,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
+
+use common::{wait_until, WaitState};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -124,7 +128,7 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main"}\n' "$branch" "$sha"
+  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -217,6 +221,25 @@ fi
         None
     }
 
+    fn suspend(&mut self) {
+        let pid = self.child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGSTOP) },
+            0,
+            "failed to suspend daemon process {pid}"
+        );
+        wait_for_process_suspended(pid);
+    }
+
+    fn resume(&mut self) {
+        let pid = self.child.id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, libc::SIGCONT) },
+            0,
+            "failed to resume daemon process {pid}"
+        );
+    }
+
     fn stop(mut self) {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
@@ -287,6 +310,21 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
     );
 }
 
+fn append_phase4c_barrier(conn: &mut rusqlite::Connection, target: &str) {
+    let row = quorum_core::mailbox::MailboxRow {
+        agent: "ReworkPhaseBarrier".to_string(),
+        kind: quorum_core::mailbox::MailboxKind::Message,
+        task_id: None,
+        pr: None,
+        verdict: None,
+        feedback: None,
+        note: None,
+        to_agent: Some(target.to_string()),
+        payload: Some("phase barrier".to_string()),
+    };
+    quorum_core::mailbox::append(conn, &row).unwrap();
+}
+
 /// Insert a raw mailbox row directly via the quorum DB (bypasses CLI).
 fn insert_mailbox_row(home: &std::path::Path, agent: &str, kind: &str) {
     let db_path = home.join("repos/test__repo/quorum.db");
@@ -308,6 +346,158 @@ fn count_unconsumed(home: &std::path::Path, agent: &str) -> usize {
         |r| r.get::<_, usize>(0),
     )
     .unwrap()
+}
+
+fn wait_for_unconsumed_count(home: &std::path::Path, agent: &str, expected: usize) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("{expected} unconsumed mailbox row(s) for {agent}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db_path) {
+            Ok(conn) => {
+                let actual = conn.query_row(
+                    "SELECT COUNT(*) FROM mailbox WHERE agent=?1 AND consumed_at IS NULL",
+                    [agent],
+                    |row| row.get::<_, usize>(0),
+                );
+                match actual {
+                    Ok(actual) if actual == expected => WaitState::Ready(()),
+                    Ok(actual) => WaitState::Pending(format!(
+                        "agent {agent} still had {actual} unconsumed mailbox row(s)"
+                    )),
+                    Err(error) => WaitState::Pending(format!(
+                        "could not query {}: {error}",
+                        db_path.display()
+                    )),
+                }
+            }
+            Err(error) => {
+                WaitState::Pending(format!("could not open {}: {error}", db_path.display()))
+            }
+        },
+    );
+}
+
+fn managed_pid(home: &std::path::Path, role: &str) -> i32 {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    conn.query_row(
+        "SELECT pid FROM journal WHERE role=?1 AND pid IS NOT NULL",
+        [role],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn wait_for_process_terminated(pid: i32) {
+    wait_until(
+        &format!("managed process {pid} to terminate"),
+        Duration::from_secs(15),
+        || {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output();
+            match output {
+                Ok(output) if !output.status.success() || output.stdout.is_empty() => {
+                    WaitState::Ready(())
+                }
+                Ok(output) => {
+                    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if state.starts_with('Z') {
+                        WaitState::Ready(())
+                    } else {
+                        WaitState::Pending(format!("process {pid} state was {state:?}"))
+                    }
+                }
+                Err(error) => {
+                    WaitState::Pending(format!("could not inspect process {pid} state: {error}"))
+                }
+            }
+        },
+    );
+}
+
+fn wait_for_process_suspended(pid: i32) {
+    wait_until(
+        &format!("daemon process {pid} to suspend"),
+        Duration::from_secs(15),
+        || {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output();
+            match output {
+                Ok(output) if !output.status.success() || output.stdout.is_empty() => {
+                    WaitState::Pending(format!("daemon process {pid} was absent"))
+                }
+                Ok(output) => {
+                    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if state.starts_with('T') {
+                        WaitState::Ready(())
+                    } else {
+                        WaitState::Pending(format!("daemon process {pid} state was {state:?}"))
+                    }
+                }
+                Err(error) => WaitState::Pending(format!(
+                    "could not inspect daemon process {pid} state: {error}"
+                )),
+            }
+        },
+    );
+}
+
+fn wait_for_task_status(home: &std::path::Path, task_id: i64, expected: &str) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("task #{task_id} status {expected:?}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db_path) {
+            Ok(conn) => {
+                let status = conn
+                    .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .ok();
+                if status.as_deref() == Some(expected) {
+                    WaitState::Ready(())
+                } else {
+                    WaitState::Pending(format!("task #{task_id} status was {status:?}"))
+                }
+            }
+            Err(error) => {
+                WaitState::Pending(format!("could not open {}: {error}", db_path.display()))
+            }
+        },
+    );
+}
+
+fn wait_for_journal_absent(home: &std::path::Path, agent: &str) {
+    let db_path = home.join("repos/test__repo/quorum.db");
+    wait_until(
+        &format!("journal teardown for agent {agent}"),
+        Duration::from_secs(15),
+        || match quorum_core::db::open(&db_path) {
+            Ok(conn) => {
+                let count = conn.query_row(
+                    "SELECT COUNT(*) FROM journal WHERE agent=?1",
+                    [agent],
+                    |row| row.get::<_, i64>(0),
+                );
+                match count {
+                    Ok(0) => WaitState::Ready(()),
+                    Ok(count) => {
+                        WaitState::Pending(format!("journal still has {count} row(s) for {agent}"))
+                    }
+                    Err(error) => WaitState::Pending(format!(
+                        "could not query {}: {error}",
+                        db_path.display()
+                    )),
+                }
+            }
+            Err(error) => {
+                WaitState::Pending(format!("could not open {}: {error}", db_path.display()))
+            }
+        },
+    );
 }
 
 // ── Unmatched Done row is consumed (#130) ────────────────────────────
@@ -345,7 +535,7 @@ fn unmatched_done_row_consumed_as_passive_phantom() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "GhostAgent", 0);
 
     handle.stop();
 
@@ -394,7 +584,7 @@ fn unmatched_done_row_does_not_drive_lifecycle() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "GhostAgent", 0);
     handle.stop();
 
     // Row consumed as phantom.
@@ -549,7 +739,8 @@ fn non_roster_done_rows_consumed_as_phantoms() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "Aardvark0", 0);
+    wait_for_unconsumed_count(home.path(), "Beluga0", 0);
     handle.stop();
 
     assert_eq!(
@@ -597,8 +788,7 @@ fn non_done_mailbox_rows_dont_block_daemon() {
         handle.lines
     );
 
-    // Wait 2 ticks for the daemon to finish processing the two mailbox rows.
-    std::thread::sleep(Duration::from_secs(1));
+    wait_for_unconsumed_count(home.path(), "SomeAgent", 0);
 
     handle.stop();
 
@@ -750,24 +940,43 @@ fn rework_feed_failure_releases_task() {
         handle.lines
     );
 
-    // Kill ALL fake-agent processes so the worker's stdin pipe breaks.
-    // This also kills the reviewer, so Phase 4b fires AgentFailed on both.
-    let pgrep_out = Command::new("pgrep")
-        .args(["-f", "fake-agent.*--session-id"])
-        .output();
-    if let Ok(out) = pgrep_out {
-        let pids = String::from_utf8_lossy(&out.stdout);
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
-    }
+    // A message to an absent agent is handled in Phase 4c, after Phase 4b.
+    // Its log precedes the marker-consumption write, so first observe the log,
+    // then serialize behind that write before suspending the daemon.
+    let phase_barrier_target = "MissingReworkPhaseBarrier";
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let mut barrier_conn = quorum_core::db::open(&db_path).unwrap();
+    append_phase4c_barrier(&mut barrier_conn, phase_barrier_target);
+    assert!(
+        handle.wait_for(
+            &format!("consuming message to {phase_barrier_target} (no active worker)"),
+            15,
+        ),
+        "daemon did not reach the post-death-scan barrier. Lines: {:?}",
+        handle.lines
+    );
 
-    // Give the worker a moment to actually die.
-    std::thread::sleep(Duration::from_secs(1));
+    // BEGIN IMMEDIATE cannot succeed until marker consumption commits. Once it
+    // does, no daemon thread owns a write transaction, and the barrier prevents
+    // any later writer from starting before SIGSTOP becomes observable.
+    let db_write_barrier =
+        quorum_core::db::begin_immediate(&mut barrier_conn).unwrap_or_else(|error| {
+            panic!(
+                "could not acquire post-consumption SQLite writer barrier before daemon \
+                 suspension: {error}"
+            )
+        });
+    handle.suspend();
+    db_write_barrier.commit().unwrap_or_else(|error| {
+        panic!("could not release Phase 4c SQLite writer barrier: {error}")
+    });
+    drop(barrier_conn);
+
+    // The paused daemon retains this worker slot while the process dies and
+    // the reviewer verdict is atomically appended to the mailbox.
+    let worker_pid = managed_pid(home.path(), "worker");
+    assert_eq!(unsafe { libc::kill(worker_pid, libc::SIGKILL) }, 0);
+    wait_for_process_terminated(worker_pid);
 
     // Reviewer signals "changes" verdict — daemon will try to feed rework
     // to the (now dead) worker, which should fail.
@@ -784,28 +993,29 @@ fn rework_feed_failure_releases_task() {
             "Fix the tests",
         ],
     );
+    handle.resume();
 
-    // The daemon should detect the feed failure and tear down the worker.
-    // Either: "rework feed_turn failed" + "tearing down broken worker"
-    // or: the death detection in Phase 4b catches it first and logs
-    // "died mid-task".
-    let saw_feed_failure = handle.wait_for("tearing down", 15);
-    let saw_death = handle.lines.iter().any(|l| {
-        l.contains("tearing down broken worker")
-            || l.contains("died mid-task")
-            || l.contains("tearing down worker")
-    });
+    // The specific failure proves the changes verdict reached the dead
+    // worker's rework-feed path, rather than a Phase 4b teardown winning first.
     assert!(
-        saw_feed_failure || saw_death,
-        "daemon did not handle dead worker. Lines: {:?}",
+        handle.wait_for("rework feed_turn failed", 15),
+        "daemon did not exercise the failed rework-feed path. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for(&format!("tearing down worker {worker_name}"), 15),
+        "dead worker teardown not seen after rework-feed failure. Lines: {:?}",
         handle.lines
     );
 
+    // VerdictChanges moves the task to rework, then AgentFailed from the
+    // failed feed releases it to open. Journal absence proves cleanup finished.
+    wait_for_task_status(home.path(), 1, "open");
+    wait_for_journal_absent(home.path(), &worker_name);
+
     handle.stop();
 
-    // With lifecycle, AgentFailed from in-review stays in-review (the code
-    // was pushed, task just needs a new reviewer). The pgrep kills both
-    // agents, so the task lands in in-review — not open.
+    // The failed rework delivery releases the task for a replacement worker.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -814,11 +1024,10 @@ fn rework_feed_failure_releases_task() {
         .unwrap();
     assert!(get_out.status.success());
     let stdout = String::from_utf8_lossy(&get_out.stdout);
-    assert!(
-        stdout.contains("\"status\":\"in-review\"")
-            || stdout.contains("\"status\": \"in-review\"")
-            || stdout.contains("\"status\":\"open\"")
-            || stdout.contains("\"status\": \"open\""),
-        "task was not in a recoverable state after rework feed failure: {stdout}"
+    let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        task["status"].as_str(),
+        Some("open"),
+        "task was not released after rework feed failure: {stdout}"
     );
 }

@@ -1327,6 +1327,178 @@ pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<
     Ok(true)
 }
 
+/// Adopt the exact managed delivery of a continuation task for one failed
+/// generated child.
+///
+/// This is intentionally an evidence-heavy, incident-recovery primitive.  It
+/// does not infer relationships from titles, notes, labels, or a shared PR
+/// alone.  The original graph membership, explicit source-task provenance,
+/// daemon publication handoff, managed review, merge transition, and exact PR
+/// head all have to agree inside one `BEGIN IMMEDIATE` transaction.  A stale,
+/// incomplete, or replayed request is a clean negative.
+pub fn adopt_recovery_delivery(
+    conn: &mut Connection,
+    original_child_id: i64,
+    recovery_task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let delivery: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT recovery_target.pr_number,recovery_target.head_sha
+             FROM task_graph_members member
+             JOIN task_decompositions graph ON graph.id=member.graph_id
+             JOIN tasks source ON source.id=graph.source_task_id
+             JOIN tasks original ON original.id=member.task_id
+             JOIN tasks recovery ON recovery.id=?2
+             JOIN pr_targets original_target ON original_target.task_id=original.id
+             JOIN pr_targets recovery_target ON recovery_target.task_id=recovery.id
+             JOIN r2_sampling_decisions sampling
+               ON sampling.pr_number=recovery_target.pr_number
+              AND sampling.head_sha=recovery_target.head_sha
+              AND sampling.task_id=recovery.id
+             WHERE original.id=?1 AND original.id!=recovery.id
+               AND original.status='failed'
+               AND member.active=1 AND member.plan_revision=graph.accepted_plan_revision
+               AND graph.state='active' AND graph.active=1
+               AND source.status='decomposed'
+               AND NOT EXISTS (
+                    SELECT 1 FROM task_graph_members sibling
+                    JOIN tasks sibling_task ON sibling_task.id=sibling.task_id
+                    WHERE sibling.graph_id=graph.id AND sibling.active=1
+                      AND sibling.task_id!=original.id
+                      AND sibling_task.status!='done'
+               )
+               AND json_valid(original.refs)
+               AND json_type(original.refs,'$.pr')='integer'
+               AND json_extract(original.refs,'$.pr')=original_target.pr_number
+               AND original_target.pr_number=recovery_target.pr_number
+               AND original_target.head_ref!=''
+               AND length(original_target.head_sha) IN (40,64)
+               AND original_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND recovery.status='done' AND recovery.review_only=0
+               AND recovery.continue_pr=recovery_target.pr_number
+               AND json_valid(recovery.refs)
+               AND json_type(recovery.refs,'$.pr')='integer'
+               AND json_extract(recovery.refs,'$.pr')=recovery_target.pr_number
+               AND json_type(recovery.refs,'$.source_task')='integer'
+               AND json_extract(recovery.refs,'$.source_task')=original.id
+               AND json_type(recovery.refs,'$.daemon_publication') IS NULL
+               AND (
+                    (json_type(original.refs,'$.repo') IS NULL
+                     AND json_type(recovery.refs,'$.repo') IS NULL)
+                    OR
+                    (json_type(original.refs,'$.repo')='text'
+                     AND json_type(recovery.refs,'$.repo')='text'
+                     AND json_extract(original.refs,'$.repo')=
+                         json_extract(recovery.refs,'$.repo'))
+               )
+               AND recovery_target.head_ref!=''
+               AND length(recovery_target.head_sha) IN (40,64)
+               AND recovery_target.head_sha NOT GLOB '*[^0-9A-Fa-f]*'
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs worker
+                    JOIN role_assignments assignment
+                      ON assignment.id=worker.role_assignment_id
+                    JOIN events published
+                      ON published.subject='task#' || recovery.id
+                     AND published.kind='task_in_review'
+                     AND published.expires_at>?3
+                     AND published.body='by ' || worker.agent_name
+                     AND published.ts BETWEEN worker.spawned_at AND worker.ended_at
+                    WHERE worker.task_id=recovery.id AND worker.role='worker'
+                      AND worker.sub_role IS NULL AND worker.ended_at IS NOT NULL
+                      AND worker.end_reason='completed'
+                      AND assignment.task_id=recovery.id
+                      AND assignment.role='worker'
+                      AND assignment.pr_number IS NULL
+                      AND EXISTS (
+                           SELECT 1 FROM events merging
+                           WHERE merging.subject=published.subject
+                             AND merging.kind='task_merging'
+                             AND merging.expires_at>?3
+                             AND merging.seq>published.seq
+                      )
+               )
+               AND EXISTS (
+                    SELECT 1 FROM agent_runs reviewer
+                    JOIN role_assignments assignment
+                      ON assignment.id=reviewer.role_assignment_id
+                    WHERE reviewer.task_id=recovery.id AND reviewer.role='reviewer'
+                      AND reviewer.ended_at IS NOT NULL
+                      AND reviewer.end_reason='verdict:approved'
+                      AND reviewer.review_pr=recovery_target.pr_number
+                      AND reviewer.review_head_sha=recovery_target.head_sha
+                      AND assignment.task_id=recovery.id
+                      AND assignment.pr_number=recovery_target.pr_number
+                      AND assignment.role='reviewer'
+                      AND ((sampling.required=0 AND reviewer.sub_role IS NULL
+                            AND assignment.review_stage='r1')
+                           OR (sampling.required=1 AND reviewer.sub_role='r2'
+                            AND assignment.review_stage='r2'))
+               )
+               AND EXISTS (
+                    SELECT 1 FROM events merging
+                    JOIN events done ON done.subject=merging.subject
+                                    AND done.kind='task_done'
+                                    AND done.expires_at>?3
+                                    AND done.seq>merging.seq
+                    WHERE merging.subject='task#' || recovery.id
+                      AND merging.kind='task_merging'
+                      AND merging.expires_at>?3
+               )",
+            params![original_child_id, recovery_task_id, now],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((pr_number, merged_head_sha)) = delivery else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    };
+
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET status='done',assignee=NULL,updated_at=?2,
+             refs=json_set(
+                 json_remove(refs,
+                     '$.daemon_parked',
+                     '$.daemon_parked_reason',
+                     '$.daemon_resume_status',
+                     '$.daemon_publication'),
+                 '$.recovery_delivery',
+                 json_object(
+                     'source_task',?1,
+                     'recovery_task',?3,
+                     'pr',?4,
+                     'merged_head_sha',?5,
+                     'adopted_at',?2))
+         WHERE id=?1 AND status='failed'",
+        params![
+            original_child_id,
+            now,
+            recovery_task_id,
+            pr_number,
+            merged_head_sha
+        ],
+    )?;
+    if changed != 1 {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    }
+    crate::events::emit(
+        &tx,
+        "task_done",
+        &format!("task#{original_child_id}"),
+        &format!(
+            "adopted recovery task #{recovery_task_id} for PR #{pr_number} at {merged_head_sha}"
+        ),
+        now,
+    )?;
+    complete_graph_if_final_child(&tx, original_child_id, now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(true)
+}
+
 /// Fold graph completion into the transaction that marks a generated child
 /// done. This is deliberately transaction-scoped for the final-child race.
 pub(crate) fn complete_graph_if_final_child(
@@ -1676,6 +1848,190 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap()
+    }
+
+    const RECOVERY_PR: i64 = 526;
+    const ORIGINAL_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    struct RecoveryFixture {
+        _dir: tempfile::TempDir,
+        db_path: std::path::PathBuf,
+        conn: Connection,
+        graph: i64,
+        original: i64,
+        recovery: i64,
+        dependent: i64,
+        siblings: Vec<i64>,
+    }
+
+    type RecoveryEvidenceMutation = Box<dyn FnOnce(&mut RecoveryFixture)>;
+
+    impl RecoveryFixture {
+        fn new() -> Self {
+            let (dir, mut conn) = file_setup();
+            let db_path = dir.path().join("decomposition.db");
+            let graph = begin(&mut conn);
+            let children = [
+                child("one", &[]),
+                child("two", &[]),
+                child("three", &[]),
+                child("failed", &[]),
+            ];
+            let ids = materialize_graph(&mut conn, graph, 1, &children, 4)
+                .unwrap()
+                .unwrap();
+            let original = ids[3];
+            let siblings = ids[..3].to_vec();
+            conn.execute(
+                "UPDATE tasks SET status='done' WHERE id IN (?1,?2,?3)",
+                params![siblings[0], siblings[1], siblings[2]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',refs=?2 WHERE id=?1",
+                params![
+                    original,
+                    serde_json::json!({
+                        "daemon_parked": true,
+                        "daemon_parked_reason": "publication failed",
+                        "daemon_publication": {
+                            "branch": "daemon/original",
+                            "local_sha": ORIGINAL_HEAD,
+                            "pr": RECOVERY_PR,
+                            "stage": "intent"
+                        },
+                        "daemon_resume_status": "rework",
+                        "pr": RECOVERY_PR
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,8)",
+                params![original, RECOVERY_PR, ORIGINAL_HEAD],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO tasks(title,status,labels,created_by,created_at,updated_at,refs,
+                     review_only,continue_pr)
+                 VALUES ('exact continuation','done','[\"type:recovery\"]','owner',9,40,?1,0,?2)",
+                params![
+                    serde_json::json!({
+                        "pr": RECOVERY_PR,
+                        "source_task": original
+                    })
+                    .to_string(),
+                    RECOVERY_PR
+                ],
+            )
+            .unwrap();
+            let recovery = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,25)",
+                params![recovery, RECOVERY_PR, RECOVERY_HEAD],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                     profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,NULL,'worker',NULL,'M','worker','codex','codex','sol','high',
+                         'worker','test',9)",
+                params![format!("worker:task:{recovery}:revision:1"), recovery],
+            )
+            .unwrap();
+            let worker_assignment = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                     role_assignment_id,spawned_at,ended_at,end_reason)
+                 VALUES (?1,'worker','worker','sol','high','codex',?2,10,20,'completed')",
+                params![recovery, worker_assignment],
+            )
+            .unwrap();
+            crate::events::emit(
+                &conn,
+                "task_in_review",
+                &format!("task#{recovery}"),
+                "by worker",
+                15,
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO role_assignments(
+                     responsibility_key,task_id,pr_number,role,review_stage,complexity,
+                     profile_id,provider,runner,model,effort,pool_key,policy_generation,created_at)
+                 VALUES (?1,?2,?3,'reviewer','r1','M','reviewer','codex','codex','sol','high',
+                         'reviewer','test',21)",
+                params![
+                    format!("reviewer:task:{recovery}:r1"),
+                    recovery,
+                    RECOVERY_PR
+                ],
+            )
+            .unwrap();
+            let reviewer_assignment = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,
+                     role_assignment_id,spawned_at,ended_at,end_reason,review_cap_run_id,
+                     review_pr,review_head_sha)
+                 VALUES (?1,'reviewer','reviewer','sol','high','codex',?2,21,40,
+                         'verdict:approved','review-cap',?3,?4)",
+                params![recovery, reviewer_assignment, RECOVERY_PR, RECOVERY_HEAD],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO r2_sampling_decisions(pr_number,head_sha,task_id,required,created_at)
+                 VALUES (?1,?2,?3,0,29)",
+                params![RECOVERY_PR, RECOVERY_HEAD, recovery],
+            )
+            .unwrap();
+            crate::events::emit(
+                &conn,
+                "task_merging",
+                &format!("task#{recovery}"),
+                "by reviewer",
+                30,
+            )
+            .unwrap();
+            crate::events::emit(
+                &conn,
+                "task_done",
+                &format!("task#{recovery}"),
+                "by system",
+                40,
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs,depends_on)
+                 VALUES ('dependent','open','owner',41,41,'{}','[1]')",
+                [],
+            )
+            .unwrap();
+            let dependent = conn.last_insert_rowid();
+
+            Self {
+                _dir: dir,
+                db_path,
+                conn,
+                graph,
+                original,
+                recovery,
+                dependent,
+                siblings,
+            }
+        }
+
+        fn adoption(&mut self) -> bool {
+            adopt_recovery_delivery(&mut self.conn, self.original, self.recovery, 50).unwrap()
+        }
     }
 
     #[test]
@@ -3164,6 +3520,380 @@ mod tests {
         assert_eq!(completed, ("completed".into(), 0, "done".into()));
     }
 
+    #[test]
+    fn exact_continuation_adoption_completes_incident_graph_and_releases_dependent() {
+        let mut fixture = RecoveryFixture::new();
+        let recovery_before: (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT status,refs FROM tasks WHERE id=?1",
+                [fixture.recovery],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert!(fixture.adoption());
+        assert_graph_completed(
+            &fixture.conn,
+            fixture.graph,
+            1,
+            &[
+                fixture.siblings[0],
+                fixture.siblings[1],
+                fixture.siblings[2],
+                fixture.original,
+            ],
+        );
+        let original_refs: String = fixture
+            .conn
+            .query_row(
+                "SELECT refs FROM tasks WHERE id=?1",
+                [fixture.original],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_refs: serde_json::Value = serde_json::from_str(&original_refs).unwrap();
+        assert_eq!(original_refs["pr"], RECOVERY_PR);
+        assert_eq!(
+            original_refs["recovery_delivery"],
+            serde_json::json!({
+                "source_task": fixture.original,
+                "recovery_task": fixture.recovery,
+                "pr": RECOVERY_PR,
+                "merged_head_sha": RECOVERY_HEAD,
+                "adopted_at": 50
+            })
+        );
+        for key in [
+            "daemon_parked",
+            "daemon_parked_reason",
+            "daemon_resume_status",
+            "daemon_publication",
+        ] {
+            assert!(original_refs.get(key).is_none(), "stale {key} survived");
+        }
+        let recovery_after: (String, String) = fixture
+            .conn
+            .query_row(
+                "SELECT status,refs FROM tasks WHERE id=?1",
+                [fixture.recovery],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery_before, recovery_after);
+        assert!(
+            crate::tasks::get(&fixture.conn, fixture.dependent)
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+        let events: (i64, i64) = fixture
+            .conn
+            .query_row(
+                "SELECT
+                   count(*) FILTER (WHERE kind='task_done' AND subject=?1),
+                   count(*) FILTER (WHERE kind='task_graph_completed' AND subject='task#1')
+                 FROM events",
+                [format!("task#{}", fixture.original)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(events, (1, 1));
+    }
+
+    #[test]
+    fn continuation_adoption_rejects_inconsistent_or_incomplete_evidence_without_mutation() {
+        let cases: Vec<(&str, RecoveryEvidenceMutation)> = vec![
+            (
+                "wrong PR",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET continue_pr=?2 WHERE id=?1",
+                            params![fixture.recovery, RECOVERY_PR + 1],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong repository",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','owner/repo') WHERE id=?1",
+                            [fixture.original],
+                        )
+                        .unwrap();
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.repo','other/repo') WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "wrong source provenance",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET refs=json_set(refs,'$.source_task',999) WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "inconsistent authoritative SHA",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET review_head_sha=?2
+                             WHERE task_id=?1 AND role='reviewer'",
+                            params![fixture.recovery, "cccccccccccccccccccccccccccccccccccccccc"],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unpublished recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "DELETE FROM events WHERE subject=?1 AND kind='task_in_review'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unmerged recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "DELETE FROM events WHERE subject=?1 AND kind='task_merging'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "publication event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_in_review'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "merging event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_merging'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "done event expired at the exact adoption boundary",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE events SET expires_at=50
+                             WHERE subject=?1 AND kind='task_done'",
+                            [format!("task#{}", fixture.recovery)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "unreviewed recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE agent_runs SET end_reason='completed'
+                             WHERE task_id=?1 AND role='reviewer'",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "failed recovery",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='failed' WHERE id=?1",
+                            [fixture.recovery],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "partial graph",
+                Box::new(|fixture| {
+                    fixture
+                        .conn
+                        .execute(
+                            "UPDATE tasks SET status='open' WHERE id=?1",
+                            [fixture.siblings[0]],
+                        )
+                        .unwrap();
+                }),
+            ),
+        ];
+
+        for (name, mutate) in cases {
+            let mut fixture = RecoveryFixture::new();
+            mutate(&mut fixture);
+            assert!(!fixture.adoption(), "{name} unexpectedly adopted");
+            let state: (String, String, String) = fixture
+                .conn
+                .query_row(
+                    "SELECT child.status,graph.state,source.status
+                     FROM tasks child
+                     JOIN task_graph_members member ON member.task_id=child.id
+                     JOIN task_decompositions graph ON graph.id=member.graph_id
+                     JOIN tasks source ON source.id=graph.source_task_id
+                     WHERE child.id=?1",
+                    [fixture.original],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                state,
+                ("failed".into(), "active".into(), "decomposed".into()),
+                "{name} mutated lifecycle state"
+            );
+            let emitted: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM events
+                     WHERE kind='task_done' AND subject=?1",
+                    [format!("task#{}", fixture.original)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(emitted, 0, "{name} emitted an adoption event");
+        }
+    }
+
+    #[test]
+    fn continuation_adoption_rejects_nonmember_and_replay() {
+        let mut fixture = RecoveryFixture::new();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs)
+                 VALUES ('not a member','failed','owner',1,1,?1)",
+                [serde_json::json!({"pr": RECOVERY_PR}).to_string()],
+            )
+            .unwrap();
+        let nonmember = fixture.conn.last_insert_rowid();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
+                 VALUES (?1,?2,'daemon/original',?3,0,1)",
+                params![nonmember, RECOVERY_PR, ORIGINAL_HEAD],
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET refs=json_set(refs,'$.source_task',?2) WHERE id=?1",
+                params![fixture.recovery, nonmember],
+            )
+            .unwrap();
+        assert!(
+            !adopt_recovery_delivery(&mut fixture.conn, nonmember, fixture.recovery, 49).unwrap()
+        );
+        fixture
+            .conn
+            .execute(
+                "UPDATE tasks SET refs=json_set(refs,'$.source_task',?2) WHERE id=?1",
+                params![fixture.recovery, fixture.original],
+            )
+            .unwrap();
+        assert!(fixture.adoption());
+        assert!(!adopt_recovery_delivery(
+            &mut fixture.conn,
+            fixture.original,
+            fixture.recovery,
+            51
+        )
+        .unwrap());
+        let count: i64 = fixture
+            .conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_done' AND subject=?1",
+                [format!("task#{}", fixture.original)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn concurrent_exact_continuation_adopters_have_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let fixture = RecoveryFixture::new();
+            let barrier = Arc::new(Barrier::new(3));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let path = fixture.db_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let original = fixture.original;
+                let recovery = fixture.recovery;
+                handles.push(std::thread::spawn(move || {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    adopt_recovery_delivery(&mut conn, original, recovery, 50).unwrap()
+                }));
+            }
+            barrier.wait();
+            let outcomes: Vec<bool> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            assert_eq!(
+                outcomes.iter().filter(|outcome| **outcome).count(),
+                1,
+                "round {round}: {outcomes:?}"
+            );
+            let count: i64 = fixture
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_done' AND subject=?1",
+                    [format!("task#{}", fixture.original)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "round {round}");
+        }
+    }
+
     fn assert_graph_completed(conn: &Connection, graph: i64, source: i64, children: &[i64]) {
         let graph_state: (String, i64) = conn
             .query_row(
@@ -3382,530 +4112,5 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(winners, 2, "round {round}");
         }
-    }
-
-    /// Internal subprocess entrypoint for the process-level graph claim canary.
-    /// It is reachable only by re-executing this test binary with the private
-    /// environment tuple; no user-facing claim command is introduced.
-    #[test]
-    fn process_child_claim_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_CLAIM_DB") else {
-            return;
-        };
-        let task_id: i64 = std::env::var("QUORUM_TEST_GRAPH_CLAIM_TASK")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let agent = std::env::var("QUORUM_TEST_GRAPH_CLAIM_AGENT").unwrap();
-        let ready_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_READY").unwrap();
-        let go_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_GO").unwrap();
-        let result_path = std::env::var("QUORUM_TEST_GRAPH_CLAIM_RESULT").unwrap();
-        std::fs::write(&ready_path, b"ready").unwrap();
-        // This helper runs beside many real-process canaries in the full
-        // workspace suite. Preserve a bounded wait without assuming every
-        // child is scheduled within five seconds.
-        for _ in 0..3_000 {
-            if std::fs::read(&go_path).is_ok() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                let won = crate::tasks::claim(&mut conn, &agent, Some(task_id), &[], 60, 10)
-                    .unwrap()
-                    .is_some();
-                std::fs::write(&result_path, if won { b"1" } else { b"0" }).unwrap();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for process claim barrier");
-    }
-
-    /// Internal subprocess entrypoint paired with `process_child_claim_helper`
-    /// to race source cancellation against generated execution authority.
-    #[test]
-    fn process_source_cancel_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_CANCEL_DB") else {
-            return;
-        };
-        let ready_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_READY").unwrap();
-        let go_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_GO").unwrap();
-        let result_path = std::env::var("QUORUM_TEST_GRAPH_CANCEL_RESULT").ok();
-        std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..3_000 {
-            if std::fs::read(&go_path).is_ok() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                let outcome = cancel_source_graph(&mut conn, "owner", 1, Some(1), 11).unwrap();
-                if let Some(result_path) = result_path {
-                    std::fs::write(
-                        result_path,
-                        match outcome {
-                            SourceCancellation::Cancelled => b"won".as_slice(),
-                            SourceCancellation::Rejected => b"lost".as_slice(),
-                            SourceCancellation::NotGraphSource => b"not-graph".as_slice(),
-                        },
-                    )
-                    .unwrap();
-                } else {
-                    assert_eq!(outcome, SourceCancellation::Cancelled);
-                }
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for process cancellation barrier");
-    }
-
-    #[test]
-    fn process_graph_lifecycle_event_helper() {
-        let Ok(db_path) = std::env::var("QUORUM_TEST_GRAPH_EVENT_DB") else {
-            return;
-        };
-        let task_id: i64 = std::env::var("QUORUM_TEST_GRAPH_EVENT_TASK")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let event = std::env::var("QUORUM_TEST_GRAPH_EVENT_KIND").unwrap();
-        let ready_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_READY").unwrap();
-        let go_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_GO").unwrap();
-        let result_path = std::env::var("QUORUM_TEST_GRAPH_EVENT_RESULT").unwrap();
-        std::fs::write(&ready_path, b"ready").unwrap();
-        for _ in 0..3_000 {
-            if std::fs::read(&go_path).is_ok() {
-                let mut conn = crate::db::open(std::path::Path::new(&db_path)).unwrap();
-                let outcome = match event.as_str() {
-                    "submit" => (
-                        "worker",
-                        crate::lifecycle::Event::SignaledDone { pr: "42".into() },
-                    ),
-                    "review" => ("reviewer", crate::lifecycle::Event::VerdictApprove),
-                    "merge" => {
-                        let won = crate::tasks::apply_event(
-                            &mut conn,
-                            "system",
-                            task_id,
-                            &crate::lifecycle::Event::MergeSucceeded,
-                            10,
-                        )
-                        .is_ok();
-                        std::fs::write(
-                            result_path,
-                            if won {
-                                b"won".as_slice()
-                            } else {
-                                b"lost".as_slice()
-                            },
-                        )
-                        .unwrap();
-                        return;
-                    }
-                    _ => panic!("unknown graph event helper kind"),
-                };
-                let won = crate::tasks::apply_event(&mut conn, outcome.0, task_id, &outcome.1, 10)
-                    .is_ok();
-                std::fs::write(
-                    result_path,
-                    if won {
-                        b"won".as_slice()
-                    } else {
-                        b"lost".as_slice()
-                    },
-                )
-                .unwrap();
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("timed out waiting for process lifecycle event barrier");
-    }
-
-    fn race_cancel_with_event(
-        db_path: &std::path::Path,
-        task_id: i64,
-        event_kind: &str,
-        dir: &std::path::Path,
-    ) -> (String, String) {
-        use std::process::Command;
-        let go_path = dir.join("event-go");
-        let event_ready = dir.join("event-ready");
-        let event_result = dir.join("event-result");
-        let cancel_ready = dir.join("cancel-ready");
-        let cancel_result = dir.join("cancel-result");
-        let test_binary = std::env::current_exe().unwrap();
-        let mut event = Command::new(&test_binary)
-            .arg("--exact")
-            .arg("decomposition::tests::process_graph_lifecycle_event_helper")
-            .env("QUORUM_TEST_GRAPH_EVENT_DB", db_path)
-            .env("QUORUM_TEST_GRAPH_EVENT_TASK", task_id.to_string())
-            .env("QUORUM_TEST_GRAPH_EVENT_KIND", event_kind)
-            .env("QUORUM_TEST_GRAPH_EVENT_READY", &event_ready)
-            .env("QUORUM_TEST_GRAPH_EVENT_GO", &go_path)
-            .env("QUORUM_TEST_GRAPH_EVENT_RESULT", &event_result)
-            .spawn()
-            .unwrap();
-        let mut cancel = Command::new(&test_binary)
-            .arg("--exact")
-            .arg("decomposition::tests::process_source_cancel_helper")
-            .env("QUORUM_TEST_GRAPH_CANCEL_DB", db_path)
-            .env("QUORUM_TEST_GRAPH_CANCEL_READY", &cancel_ready)
-            .env("QUORUM_TEST_GRAPH_CANCEL_GO", &go_path)
-            .env("QUORUM_TEST_GRAPH_CANCEL_RESULT", &cancel_result)
-            .spawn()
-            .unwrap();
-        for _ in 0..500 {
-            if event_ready.exists() && cancel_ready.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(event_ready.exists() && cancel_ready.exists());
-        std::fs::write(&go_path, b"go").unwrap();
-        assert!(event.wait().unwrap().success());
-        assert!(cancel.wait().unwrap().success());
-        (
-            std::fs::read_to_string(event_result).unwrap(),
-            std::fs::read_to_string(cancel_result).unwrap(),
-        )
-    }
-
-    #[test]
-    fn real_process_cancel_racing_child_claim_leaves_no_authority() {
-        use std::process::Command;
-
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            drop(conn);
-
-            let go_path = dir.path().join("go");
-            let claim_ready = dir.path().join("claim-ready");
-            let claim_result = dir.path().join("claim-result");
-            let cancel_ready = dir.path().join("cancel-ready");
-            let test_binary = std::env::current_exe().unwrap();
-            let mut claim = Command::new(&test_binary)
-                .arg("--exact")
-                .arg("decomposition::tests::process_child_claim_helper")
-                .env("QUORUM_TEST_GRAPH_CLAIM_DB", &db_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_TASK", ids[0].to_string())
-                .env("QUORUM_TEST_GRAPH_CLAIM_AGENT", "process-worker")
-                .env("QUORUM_TEST_GRAPH_CLAIM_READY", &claim_ready)
-                .env("QUORUM_TEST_GRAPH_CLAIM_GO", &go_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_RESULT", &claim_result)
-                .spawn()
-                .unwrap();
-            let mut cancel = Command::new(&test_binary)
-                .arg("--exact")
-                .arg("decomposition::tests::process_source_cancel_helper")
-                .env("QUORUM_TEST_GRAPH_CANCEL_DB", &db_path)
-                .env("QUORUM_TEST_GRAPH_CANCEL_READY", &cancel_ready)
-                .env("QUORUM_TEST_GRAPH_CANCEL_GO", &go_path)
-                .spawn()
-                .unwrap();
-            for _ in 0..500 {
-                if claim_ready.exists() && cancel_ready.exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert!(claim_ready.exists() && cancel_ready.exists());
-            std::fs::write(&go_path, b"go").unwrap();
-            assert!(
-                claim.wait().unwrap().success(),
-                "claim iteration {iteration}"
-            );
-            assert!(
-                cancel.wait().unwrap().success(),
-                "cancel iteration {iteration}"
-            );
-
-            let conn = crate::db::open(&db_path).unwrap();
-            let authority: (i64, i64, i64) = conn
-                .query_row(
-                    "SELECT
-                       (SELECT count(*) FROM claims WHERE active=1),
-                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
-                          AND task_id IN (SELECT task_id FROM task_graph_members WHERE graph_id=?1)),
-                       (SELECT active FROM task_decompositions WHERE id=?1)",
-                    [graph],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .unwrap();
-            assert_eq!(authority, (0, 0, 0), "iteration {iteration}");
-        }
-    }
-
-    #[test]
-    fn real_process_cancel_racing_submit_revokes_winner_and_stale_submit_is_inert() {
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            conn.execute(
-                "UPDATE tasks SET status='working',assignee='worker' WHERE id=?1",
-                [ids[0]],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO claims(target,holder,ts,expires_at,active)
-                 VALUES (?1,'worker',4,100,1)",
-                [format!("task#{}", ids[0])],
-            )
-            .unwrap();
-            crate::capabilities::issue(&mut conn, "worker-run", ids[0], "worker", "worker", 4)
-                .unwrap();
-            drop(conn);
-
-            let (submit, cancel) = race_cancel_with_event(&db_path, ids[0], "submit", dir.path());
-            assert!(
-                matches!(submit.as_str(), "won" | "lost") && cancel == "won",
-                "iteration {iteration}: submit={submit}, cancel={cancel}"
-            );
-            let mut conn = crate::db::open(&db_path).unwrap();
-            let state: (String, String, i64, i64) = conn
-                .query_row(
-                    "SELECT d.state,t.status,
-                       (SELECT count(*) FROM claims WHERE active=1),
-                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
-                          AND task_id=?2)
-                     FROM task_decompositions d JOIN tasks t ON t.id=?2 WHERE d.id=?1",
-                    params![graph, ids[0]],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
-            assert_eq!(state, ("cancelled".into(), "cancelled".into(), 0, 0));
-            let events_before: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert!(crate::tasks::apply_event(
-                &mut conn,
-                "worker",
-                ids[0],
-                &crate::lifecycle::Event::SignaledDone { pr: "42".into() },
-                12,
-            )
-            .is_err());
-            let events_after: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(events_before, events_after);
-        }
-    }
-
-    #[test]
-    fn real_process_cancel_racing_review_revokes_authority_and_stale_review_is_inert() {
-        for iteration in 0..8 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            conn.execute(
-                "UPDATE tasks SET status='in-review',reviewer='reviewer' WHERE id=?1",
-                [ids[0]],
-            )
-            .unwrap();
-            crate::capabilities::issue(&mut conn, "review-run", ids[0], "reviewer", "reviewer", 4)
-                .unwrap();
-            drop(conn);
-
-            let (review, cancel) = race_cancel_with_event(&db_path, ids[0], "review", dir.path());
-            assert!(
-                matches!(review.as_str(), "won" | "lost") && cancel == "won",
-                "iteration {iteration}: review={review}, cancel={cancel}"
-            );
-            let mut conn = crate::db::open(&db_path).unwrap();
-            let authority: (String, i64) = conn
-                .query_row(
-                    "SELECT t.status,
-                       (SELECT count(*) FROM run_capabilities WHERE revoked_at IS NULL
-                          AND task_id=?1)
-                     FROM tasks t WHERE t.id=?1",
-                    [ids[0]],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(authority, ("cancelled".into(), 0));
-            let events_before: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert!(crate::tasks::apply_event(
-                &mut conn,
-                "reviewer",
-                ids[0],
-                &crate::lifecycle::Event::VerdictApprove,
-                12,
-            )
-            .is_err());
-            let events_after: i64 = conn
-                .query_row("SELECT count(*) FROM events", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(events_before, events_after);
-        }
-    }
-
-    #[test]
-    fn real_process_cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes() {
-        for iteration in 0..16 {
-            let dir = tempfile::tempdir().unwrap();
-            let db_path = dir.path().join("quorum.db");
-            let mut conn = crate::db::open(&db_path).unwrap();
-            conn.execute(
-                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-                 VALUES ('large','open','owner',1,1)",
-                [],
-            )
-            .unwrap();
-            let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
-            conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
-                .unwrap();
-            conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
-                .unwrap();
-            drop(conn);
-
-            let (merge, cancel) = race_cancel_with_event(&db_path, ids[1], "merge", dir.path());
-            assert_ne!(merge, cancel, "iteration {iteration}");
-            let conn = crate::db::open(&db_path).unwrap();
-            let state: (String, String, String, String) = conn
-                .query_row(
-                    "SELECT d.state,source.status,first.status,last.status
-                     FROM task_decompositions d
-                     JOIN tasks source ON source.id=d.source_task_id
-                     JOIN tasks first ON first.id=?2 JOIN tasks last ON last.id=?3
-                     WHERE d.id=?1",
-                    params![graph, ids[0], ids[1]],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
-            if merge == "won" {
-                assert_eq!(cancel, "lost");
-                assert_eq!(
-                    state,
-                    (
-                        "completed".into(),
-                        "done".into(),
-                        "done".into(),
-                        "done".into()
-                    )
-                );
-                let cleanup: i64 = conn
-                    .query_row("SELECT count(*) FROM decomposition_cleanup", [], |row| {
-                        row.get(0)
-                    })
-                    .unwrap();
-                assert_eq!(cleanup, 0);
-            } else {
-                assert_eq!(cancel, "won");
-                assert_eq!(
-                    state,
-                    (
-                        "cancelled".into(),
-                        "cancelled".into(),
-                        "done".into(),
-                        "cancelled".into()
-                    )
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn real_process_child_claims_never_exceed_two() {
-        use std::process::Command;
-
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("quorum.db");
-        let mut conn = crate::db::open(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
-             VALUES ('large','open','owner',1,1)",
-            [],
-        )
-        .unwrap();
-        let graph = begin(&mut conn);
-        let ids = materialize_graph(
-            &mut conn,
-            graph,
-            1,
-            &[child("a", &[]), child("b", &[]), child("c", &[])],
-            4,
-        )
-        .unwrap()
-        .unwrap();
-        drop(conn);
-
-        let go_path = dir.path().join("go");
-        let test_binary = std::env::current_exe().unwrap();
-        let mut children = Vec::new();
-        let mut ready_paths = Vec::new();
-        let mut result_paths = Vec::new();
-        for (index, task_id) in ids.into_iter().enumerate() {
-            let ready_path = dir.path().join(format!("ready-{index}"));
-            let result_path = dir.path().join(format!("result-{index}"));
-            let child = Command::new(&test_binary)
-                .arg("--exact")
-                .arg("decomposition::tests::process_child_claim_helper")
-                .arg("--nocapture")
-                .env("QUORUM_TEST_GRAPH_CLAIM_DB", &db_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_TASK", task_id.to_string())
-                .env("QUORUM_TEST_GRAPH_CLAIM_AGENT", format!("process-{index}"))
-                .env("QUORUM_TEST_GRAPH_CLAIM_READY", &ready_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_GO", &go_path)
-                .env("QUORUM_TEST_GRAPH_CLAIM_RESULT", &result_path)
-                .spawn()
-                .unwrap();
-            children.push(child);
-            ready_paths.push(ready_path);
-            result_paths.push(result_path);
-        }
-        for _ in 0..500 {
-            if ready_paths.iter().all(|path| path.exists()) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(ready_paths.iter().all(|path| path.exists()));
-        std::fs::write(&go_path, b"go").unwrap();
-        for mut child in children {
-            assert!(child.wait().unwrap().success());
-        }
-        let winners = result_paths
-            .iter()
-            .map(|path| std::fs::read_to_string(path).unwrap())
-            .filter(|result| result == "1")
-            .count();
-        assert_eq!(winners, 2);
     }
 }

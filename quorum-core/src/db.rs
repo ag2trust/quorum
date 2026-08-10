@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 43;
+pub const SCHEMA_VERSION: i64 = 46;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -31,6 +31,13 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 pub fn apply_pragmas(conn: &Connection) -> Result<()> {
     // busy_timeout MUST be first so every subsequent lock acquisition honors it.
     conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    apply_persistent_pragmas(conn)
+}
+
+/// Apply the PRAGMAs that follow `busy_timeout`. Kept separate so open can
+/// perform its read-only schema compatibility check before the persistent WAL
+/// switch without moving that check ahead of the mandatory timeout.
+fn apply_persistent_pragmas(conn: &Connection) -> Result<()> {
     set_journal_wal(conn)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
@@ -100,11 +107,14 @@ pub struct MigrateResult {
     pub schema_version: i64,
 }
 
-/// Open the store at `path`, applying PRAGMAs and running migrations. The returned
-/// connection is ready for use.
+/// Open the store at `path`, refusing an unsupported newer schema before applying
+/// any persistent PRAGMA, then applying PRAGMAs and running migrations. The
+/// returned connection is ready for use.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    ensure_schema_supported(&conn)?;
+    apply_persistent_pragmas(&conn)?;
     migrate(&conn)?;
     Ok(conn)
 }
@@ -112,9 +122,27 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Like [`open`], but also returns the migration outcome so callers can report what changed.
 pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_TIMEOUT_MS)?;
+    ensure_schema_supported(&conn)?;
+    apply_persistent_pragmas(&conn)?;
     let info = migrate(&conn)?;
     Ok((conn, info))
+}
+
+/// Read the on-disk version and reject unsupported schemas without changing
+/// connection or database state. This must run before
+/// [`apply_persistent_pragmas`]: switching `journal_mode` to WAL is persistent
+/// and would otherwise mutate a newer database that this binary has no
+/// authority to open.
+fn ensure_schema_supported(conn: &Connection) -> Result<i64> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(QuorumError::SchemaTooNew {
+            db: current,
+            bin: SCHEMA_VERSION,
+        });
+    }
+    Ok(current)
 }
 
 /// Bring the on-disk schema up to [`SCHEMA_VERSION`].
@@ -122,13 +150,7 @@ pub fn open_init(path: &Path) -> Result<(Connection, MigrateResult)> {
 /// Forward-only and idempotent. Runs under `BEGIN IMMEDIATE` so concurrent first-runs are
 /// safe. Refuses (fails loud) if the DB was written by a newer binary.
 pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
-    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if current > SCHEMA_VERSION {
-        return Err(QuorumError::SchemaTooNew {
-            db: current,
-            bin: SCHEMA_VERSION,
-        });
-    }
+    let current = ensure_schema_supported(conn)?;
     if current == SCHEMA_VERSION {
         return Ok(MigrateResult {
             migrated_from: current,
@@ -635,6 +657,43 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
                 [],
             )?;
         }
+        // v44 adds dormant follow-up assessment aggregates and artifact
+        // membership via SCHEMA_SQL. v45 adds counter-bound and membership-
+        // immutability triggers, also via SCHEMA_SQL. v46 adds a durable,
+        // irreversible membership seal. Existing assessments are sealed by
+        // default; only the atomic materializer explicitly creates an open row.
+        if current < 46 && !column_exists(conn, "review_followup_assessments", "membership_sealed")?
+        {
+            conn.execute(
+                "ALTER TABLE review_followup_assessments
+                 ADD COLUMN membership_sealed INTEGER NOT NULL DEFAULT 1
+                 CHECK(membership_sealed IN (0,1))",
+                [],
+            )?;
+        }
+        if current < 46 {
+            conn.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS review_followup_membership_insert_unsealed
+                 BEFORE INSERT ON review_followup_assessment_artifacts
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM review_followup_assessments
+                     WHERE id=NEW.assessment_id AND membership_sealed=0
+                       AND state='pending' AND active=0
+                 )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'follow-up assessment membership is sealed');
+                 END;
+
+                 CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_unseal
+                 BEFORE UPDATE OF membership_sealed ON review_followup_assessments
+                 WHEN OLD.membership_sealed=1 AND NEW.membership_sealed!=1
+                 BEGIN
+                     SELECT RAISE(ABORT, 'follow-up assessment membership seal is irreversible');
+                 END;",
+            )?;
+        }
+        // Guarded core write APIs remain dormant until later daemon activation
+        // work.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1062,6 +1121,280 @@ mod tests {
                 )
                 .unwrap(),
             (1, 0)
+        );
+    }
+
+    #[test]
+    fn populated_v43_migration_adds_assessment_tables_and_enforces_all_authority() {
+        fn unique_indexes(conn: &Connection, table: &str) -> Vec<(String, bool, Vec<String>)> {
+            let mut stmt = conn
+                .prepare("SELECT name,partial FROM pragma_index_list(?1) WHERE \"unique\"=1")
+                .unwrap();
+            let indexes = stmt
+                .query_map([table], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            indexes
+                .into_iter()
+                .map(|(name, partial)| {
+                    let columns = conn
+                        .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                        .unwrap()
+                        .query_map([&name], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap();
+                    (name, partial, columns)
+                })
+                .collect()
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v43-assessments.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at) VALUES
+                     (1,'source one','done','owner',1,1),
+                     (2,'source two','done','owner',1,1);
+                 INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (100,1,1,'followups-v1',2,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                     id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES
+                     (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+                     (12,100,1,'minor','design_debt','two','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);
+                 DROP TABLE review_followup_assessment_artifacts;
+                 DROP TABLE review_followup_assessments;
+                 PRAGMA user_version=43;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        for table in [
+            "review_followup_assessments",
+            "review_followup_assessment_artifacts",
+        ] {
+            assert!(conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+
+        let assessment_indexes = unique_indexes(&conn, "review_followup_assessments");
+        assert!(assessment_indexes
+            .iter()
+            .any(|(_, partial, columns)| !partial && columns == &["scope_kind", "scope_id"]));
+        assert!(assessment_indexes.iter().any(|(name, partial, columns)| {
+            name == "one_active_followup_assessment" && *partial && columns == &["target"]
+        }));
+        let membership_indexes = unique_indexes(&conn, "review_followup_assessment_artifacts");
+        assert!(membership_indexes
+            .iter()
+            .any(|(_, _, columns)| columns == &["artifact_id"]));
+
+        let insert_assessment = |id: i64,
+                                 target: &str,
+                                 scope_kind: &str,
+                                 scope_id: i64,
+                                 source_task_id: i64,
+                                 active: i64| {
+            conn.execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     membership_sealed,created_at,updated_at)
+                 VALUES (?1,?2,?3,?4,?5,'pending',?6,0,1,1)",
+                rusqlite::params![id, target, scope_kind, scope_id, source_task_id, active],
+            )
+        };
+        insert_assessment(21, "shared-authority", "task", 1, 1, 0).unwrap();
+        assert!(insert_assessment(22, "another-target", "task", 1, 1, 0).is_err());
+        insert_assessment(22, "shared-authority", "graph", 10, 1, 1).unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET active=1 WHERE id=21",
+                [],
+            )
+            .is_err());
+        insert_assessment(23, "followup:task:2", "task", 2, 2, 0).unwrap();
+        assert!(insert_assessment(24, "invalid-scope", "repo", 3, 1, 0).is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     created_at,updated_at)
+                 VALUES (24,'invalid-state','graph',11,1,'retrying',0,1,1)",
+                [],
+            )
+            .is_err());
+
+        conn.execute(
+            "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+             VALUES (21,11)",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (23,11)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+             VALUES (23,12)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE review_followup_assessments SET membership_sealed=1
+             WHERE id IN (21,23)",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=21",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn populated_v44_migration_seals_existing_membership_and_bounds_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v44-assessment-guards.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER review_followup_membership_no_update;
+                 DROP TRIGGER review_followup_membership_no_delete;
+                 DROP TRIGGER review_followup_assessment_counter_insert_bound;
+                 DROP TRIGGER review_followup_assessment_counter_update_bound;
+                 DROP TRIGGER review_followup_membership_insert_unsealed;
+                 DROP TRIGGER review_followup_membership_no_unseal;
+                 ALTER TABLE review_followup_assessments DROP COLUMN membership_sealed;
+                 INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'source','done','owner',1,1),
+                        (2,'other','done','owner',1,1);
+                 INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,
+                     artifact_count,state,created_at,updated_at)
+                 VALUES (100,1,1,'followups-v1',1,'collected',1,1),
+                        (200,2,2,'followups-v1',1,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                     id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES
+                     (11,100,0,'major','out_of_scope','one','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1),
+                     (12,200,0,'minor','design_debt','two','reason','behavior','outcome',
+                      '[\"verify\"]','[{\"kind\":\"review\",\"id\":2}]',1,1);
+                 INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     proposal_attempts,provider_failures,created_at,updated_at)
+                 VALUES (21,'followup:task:1','task',1,1,'pending',0,2,1,2,2);
+                 INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (21,11);
+                 PRAGMA user_version=44;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state,membership_sealed,proposal_attempts,provider_failures,
+                        (SELECT artifact_id FROM review_followup_assessment_artifacts
+                         WHERE assessment_id=21)
+                 FROM review_followup_assessments WHERE id=21",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                )),
+            )
+            .unwrap(),
+            ("pending".into(), 1, 2, 1, 11)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='trigger' AND name IN (
+                     'review_followup_membership_no_update',
+                     'review_followup_membership_no_delete',
+                     'review_followup_assessment_counter_insert_bound',
+                     'review_followup_assessment_counter_update_bound',
+                     'review_followup_membership_insert_unsealed',
+                     'review_followup_membership_no_unseal')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            6
+        );
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessment_artifacts
+                 SET artifact_id=12 WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM review_followup_assessment_artifacts WHERE assessment_id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (21,12)",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET membership_sealed=0 WHERE id=21",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE review_followup_assessments SET proposal_attempts=4 WHERE id=21",
+                [],
+            )
+            .is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
         );
     }
 
@@ -1877,16 +2210,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("q.db");
         {
-            let c = open(&p).unwrap();
-            c.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
-                .unwrap();
+            let c = Connection::open(&p).unwrap();
+            c.execute_batch(&format!(
+                "CREATE TABLE newer_marker(value TEXT NOT NULL);
+                 INSERT INTO newer_marker(value) VALUES ('untouched');
+                 PRAGMA user_version={};",
+                SCHEMA_VERSION + 1
+            ))
+            .unwrap();
+            assert_eq!(
+                c.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "delete"
+            );
         }
+        let bytes_before = std::fs::read(&p).unwrap();
         match open(&p) {
             Err(QuorumError::SchemaTooNew { db, bin }) => {
                 assert_eq!(db, SCHEMA_VERSION + 1);
                 assert_eq!(bin, SCHEMA_VERSION);
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            bytes_before,
+            "newer-schema refusal must not modify the database file"
+        );
+        let c = Connection::open(&p).unwrap();
+        assert_eq!(
+            c.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete",
+            "newer-schema refusal must not persistently switch journal mode"
+        );
+        assert_eq!(
+            c.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION + 1
+        );
+        assert_eq!(
+            c.query_row("SELECT value FROM newer_marker", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "untouched"
+        );
+        for table in [
+            "review_followup_assessments",
+            "review_followup_assessment_artifacts",
+        ] {
+            assert!(!c
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
         }
     }
 
