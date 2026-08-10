@@ -7,8 +7,13 @@
 //! When the reviewer approves and merge handling encounters a failure, the
 //! daemon must spawn a remediation worker instead of firing AgentFailed.
 
+mod common;
+
 use std::env;
+use std::ffi::CString;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
@@ -123,7 +128,7 @@ elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   if [ -n "${QUORUM_TEST_GH_BLOCK_DIR:-}" ]; then
     : > "$QUORUM_TEST_GH_BLOCK_DIR/started"
-    while [ ! -f "$QUORUM_TEST_GH_BLOCK_DIR/release" ]; do sleep 0.02; done
+    IFS= read -r _ < "$QUORUM_TEST_GH_BLOCK_DIR/release"
   fi
   if [ -f "$QUORUM_TEST_GH_STATE/$pr" ]; then
     branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
@@ -222,17 +227,55 @@ fi
                         return true;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => return false,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return false,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.record_process_state("output wait timed out");
+                    return false;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.record_process_state("stderr disconnected");
+                    return false;
+                }
             }
         }
+        self.record_process_state("output wait deadline elapsed");
         false
     }
 
     fn drain_pending_lines(&mut self) {
-        while let Ok(line) = self.rx.try_recv() {
-            self.lines.push(line);
-        }
+        common::drain_pending_lines(&self.rx, &mut self.lines);
+    }
+
+    fn wait_for_count(&mut self, needle: &str, count: usize, timeout_secs: u64) -> bool {
+        common::wait_for_count(
+            &mut self.child,
+            &self.rx,
+            &mut self.lines,
+            needle,
+            count,
+            timeout_secs,
+        )
+    }
+
+    fn wait_until<F>(&mut self, description: &str, timeout_secs: u64, ready: F)
+    where
+        F: FnMut() -> bool,
+    {
+        common::wait_for_daemon_state(
+            &mut self.child,
+            &self.rx,
+            &mut self.lines,
+            description,
+            timeout_secs,
+            ready,
+        );
+    }
+
+    fn terminate_and_drain(&mut self) {
+        common::terminate_and_drain(&mut self.child, &self.rx, &mut self.lines);
+    }
+
+    fn record_process_state(&mut self, context: &str) {
+        common::record_process_state(&mut self.child, &mut self.lines, context);
     }
 
     fn extract_agent_name(&self, prefix: &str) -> Option<String> {
@@ -530,6 +573,35 @@ fn failed_checks_absent_worker_spawns_remediation() {
         "remediation worker was not spawned. Lines: {:?}",
         handle.lines
     );
+    assert!(
+        handle.wait_for("spawned for task", 20),
+        "remediation worker never finished provisioning. Lines: {:?}",
+        handle.lines
+    );
+    let remediation_agent = handle
+        .extract_agent_name("spawning remediation worker ")
+        .expect("remediation agent name after completed provisioning");
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    handle.wait_until("durable remediation journal and run", 15, || {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        let journal_ready = quorum_core::journal::list_in_flight(&conn)
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.agent == remediation_agent
+                    && entry.role == "worker"
+                    && entry.task_id == Some(task_id)
+                    && entry.phase == "working"
+            });
+        let run_ready = quorum_core::agent_runs::runs_for_task(&conn, task_id)
+            .unwrap()
+            .iter()
+            .any(|run| {
+                run.agent == remediation_agent && run.role == "worker" && run.ended_at.is_none()
+            });
+        task.status == "rework" && journal_ready && run_ready
+    });
 
     // Verify the old AgentFailed("no worker for rework") path did NOT fire.
     // The new path logs "spawning remediation worker" — that's correct, not an error.
@@ -543,8 +615,7 @@ fn failed_checks_absent_worker_spawns_remediation() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    handle.terminate_and_drain();
 
     // Negative: no duplicate PR created (remediation works on existing PR).
     let new_pr_lines = handle
@@ -557,8 +628,6 @@ fn failed_checks_absent_worker_spawns_remediation() {
         "remediation should NOT create a new PR. Lines: {:?}",
         handle.lines
     );
-
-    handle.sigkill();
 }
 
 /// Regression (2026-07-29): a PR head branch checked out in an unrelated
@@ -1512,6 +1581,21 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
     let gh_block = tempfile::tempdir().unwrap();
+    let release_fifo = gh_block.path().join("release");
+    let release_fifo_c = CString::new(release_fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        unsafe { libc::mkfifo(release_fifo_c.as_ptr(), 0o600) },
+        0,
+        "create gh release FIFO: {}",
+        std::io::Error::last_os_error()
+    );
+    // Retain both ends before the daemon starts so releasing cannot block on
+    // opening a writer if the bounded gh child exits after publishing started.
+    let mut release_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&release_fifo)
+        .expect("open retained gh release FIFO handle");
     init_git_repo(repo_dir.path());
     let names_file = write_names_file(home.path());
 
@@ -1569,15 +1653,9 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
     );
 
     let lookup_started = gh_block.path().join("started");
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while !lookup_started.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        lookup_started.exists(),
-        "remediation PR lookup did not start: {:?}",
-        handle.lines
-    );
+    handle.wait_until("remediation PR lookup to start", 15, || {
+        lookup_started.exists()
+    });
 
     let claimed_agent: String = {
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -1617,14 +1695,13 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
         String::from_utf8_lossy(&cancelled.stderr)
     );
 
-    std::fs::write(gh_block.path().join("release"), "release").unwrap();
+    release_handle.write_all(b"release\n").unwrap();
     assert!(
         handle.wait_for("claim lost after PR lookup", 15),
         "post-lookup claim loss was not observed: {:?}",
         handle.lines
     );
-    std::thread::sleep(Duration::from_millis(750));
-    handle.drain_pending_lines();
+    handle.terminate_and_drain();
 
     assert!(
         handle
@@ -1769,7 +1846,6 @@ fn cancellation_after_remediation_claim_prevents_provisioning() {
         !claimed_agent.is_empty(),
         "the committed remediation holder must be observable"
     );
-    handle.sigkill();
 }
 
 /// A fork PR head names a branch in the fork, not in origin, and the daemon
@@ -1826,8 +1902,7 @@ fn fork_pr_remediation_parks_without_configuring_origin_upstream() {
         "refused fork remediation did not park. Lines: {:?}",
         handle.lines
     );
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    handle.terminate_and_drain();
 
     let db_path = home
         .path()
@@ -1868,8 +1943,6 @@ fn fork_pr_remediation_parks_without_configuring_origin_upstream() {
         0,
         "fork remediation must not leave a worktree behind"
     );
-
-    handle.sigkill();
 }
 
 #[test]
@@ -1911,7 +1984,7 @@ fn repeated_ci_remediation_provision_failure_parks_without_open_fallback() {
         "exhausted CI remediation did not park loudly: {:?}",
         handle.lines
     );
-    std::thread::sleep(Duration::from_millis(500));
+    handle.terminate_and_drain();
     assert!(
         !handle
             .lines
@@ -1935,7 +2008,6 @@ fn repeated_ci_remediation_provision_failure_parks_without_open_fallback() {
     assert_eq!(intent.pr, pr);
     assert_eq!(intent.head_sha, staged_head);
     assert_eq!(intent.attempts, 3);
-    handle.sigkill();
 }
 
 /// #175: Remediation worker submits → same PR returns to review.
@@ -2212,9 +2284,13 @@ fn pending_checks_no_remediation() {
         "checks timeout not detected. Lines: {:?}",
         handle.lines
     );
+    assert!(
+        handle.wait_for_count("merge wait:", 2, 15),
+        "second pending-CI merge-wait tick not observed. Lines: {:?}",
+        handle.lines
+    );
 
-    std::thread::sleep(Duration::from_millis(500));
-    handle.drain_pending_lines();
+    handle.terminate_and_drain();
 
     // No remediation worker should be spawned for timeout.
     let remediation_spawned = handle
@@ -2226,8 +2302,6 @@ fn pending_checks_no_remediation() {
         "remediation worker should NOT be spawned for timed-out CI. Lines: {:?}",
         handle.lines
     );
-
-    handle.sigkill();
 }
 
 /// #175: rework cap bounds replacement attempts. After cap exhaustion,
@@ -2312,8 +2386,7 @@ fn rework_cap_bounds_remediation_attempts() {
         handle.lines
     );
 
-    std::thread::sleep(Duration::from_millis(1500));
-    handle.drain_pending_lines();
+    handle.terminate_and_drain();
 
     let remediation_spawned = handle
         .lines
@@ -2338,8 +2411,6 @@ fn rework_cap_bounds_remediation_attempts() {
         "task should be failed after rework cap exhaustion, got: {}",
         task.status
     );
-
-    handle.sigkill();
 }
 
 /// #270: a production-shaped terminal retry marker set is cleanup-only. It
@@ -2457,12 +2528,11 @@ fn terminal_parked_retry_markers_reconcile_once_without_provisioning() {
         first.lines
     );
     assert!(
-        first.wait_for("reconciled stale terminal remediation retry markers", 15),
+        first.wait_for_count("reconciled stale terminal remediation retry markers", 3, 15,),
         "{:?}",
         first.lines
     );
-    std::thread::sleep(Duration::from_millis(1500));
-    first.drain_pending_lines();
+    first.terminate_and_drain();
     assert_eq!(
         first
             .lines
@@ -2486,16 +2556,53 @@ fn terminal_parked_retry_markers_reconcile_once_without_provisioning() {
             first.lines
         );
     }
-    drop(first);
-
     let mut restarted = run_daemon();
     assert!(
         restarted.wait_for("recovery: complete", 15),
         "{:?}",
         restarted.lines
     );
-    std::thread::sleep(Duration::from_millis(1500));
-    restarted.drain_pending_lines();
+    // Task updates are consumed in Phase 2. Once this row is consumed, SIGINT
+    // can only be acted on between ticks, after Phase 5c has run.
+    let tick_witness = {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        quorum_core::mailbox::append(
+            &mut conn,
+            &quorum_core::mailbox::MailboxRow {
+                agent: "restart-tick-witness".into(),
+                kind: quorum_core::mailbox::MailboxKind::TaskUpdate,
+                task_id: None,
+                pr: None,
+                verdict: None,
+                feedback: None,
+                note: Some("prove restarted tick reached Phase 2".into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap()
+    };
+    restarted.wait_until("restarted tick to consume its mailbox witness", 15, || {
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.query_row(
+            "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+            [tick_witness],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        unsafe { libc::kill(restarted.child.id() as libc::pid_t, libc::SIGINT) },
+        0,
+        "signal daemon after witnessed tick: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(
+        restarted.wait_for("shutting down (signal, no in-flight agents)", 15),
+        "restart did not finish its witnessed tick before graceful shutdown: {:?}",
+        restarted.lines
+    );
+    restarted.terminate_and_drain();
     assert!(
         restarted
             .lines
@@ -2504,8 +2611,6 @@ fn terminal_parked_retry_markers_reconcile_once_without_provisioning() {
         "restart must be inert: {:?}",
         restarted.lines
     );
-    drop(restarted);
-
     let conn = quorum_core::db::open(&db_path).unwrap();
     let messages: i64 = conn
         .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
