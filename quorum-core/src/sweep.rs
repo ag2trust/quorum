@@ -6,7 +6,7 @@
 //! explicit sweep (`quorum sweep`) plus a WAL checkpoint.
 
 use crate::error::Result;
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 /// Done tasks are reclaimed this long after entering `done`. Default; Phase 6 config overrides.
 pub const DONE_TASK_TTL_SECS: i64 = 7 * 24 * 3600;
@@ -254,24 +254,159 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
     Ok(())
 }
 
+/// Durable schema tables whose `REFERENCES tasks(id)` columns pin the task row.
+/// Sweep must retain the task while any of these still reference it — deleting
+/// the provenance to make GC succeed would silently discard decomposition and
+/// review-follow-up history. Add here whenever a new durable FK to tasks(id) is
+/// introduced; the FK inventory test below fails when a new one is missed.
+const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
+    ("task_decompositions", "source_task_id"),
+    ("task_graph_members", "task_id"),
+    ("decomposition_cleanup", "task_id"),
+    ("reviewer_provision_reservations", "task_id"),
+    ("review_followup_batches", "task_id"),
+    ("review_followup_batches", "source_task_id"),
+    ("review_followup_artifacts", "linked_task_id"),
+    ("review_followup_artifacts", "created_task_id"),
+    ("review_followup_assessments", "source_task_id"),
+];
+
+/// Operational task-owned tables whose rows are reclaimed alongside the parent
+/// task. The parent delete waits until each of these is empty for the task, so
+/// bounded child sweeps drive the reclamation instead of one giant cascade.
+const OPERATIONAL_TASK_REF_TABLES: &[&str] = &[
+    "agent_runs",
+    "task_branches",
+    "task_notes",
+    "task_messages",
+    "mailbox",
+    "journal",
+    "approvals",
+    "reviewer_provision_attempts",
+    "pr_targets",
+];
+
+/// Build the operational + durable guard predicates that keep sweep from
+/// deleting a task while any child row still references it. Guards reference
+/// `tasks.id` so the caller composes them into a `DELETE FROM tasks` shape.
+///
+/// The two families are:
+///   • operational — bounded child cleanup drains these each sweep, so the parent waits
+///     until the fanout is fully swept rather than letting one write delete unbounded rows.
+///   • durable — decomposition and review-follow-up provenance is intentionally retained;
+///     these tables enforce FKs on tasks(id), so deleting a still-referenced task raises
+///     `FOREIGN KEY constraint failed` and turns every subsequent mutation on the DB into
+///     an exit-3 failure (schema-46 regression, see task #395).
+fn task_ref_guard_predicates() -> String {
+    let mut guards = String::new();
+    for table in OPERATIONAL_TASK_REF_TABLES {
+        guards.push_str(&format!(
+            " AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.task_id=tasks.id)"
+        ));
+    }
+    for (table, column) in DURABLE_TASK_REF_TABLES {
+        guards.push_str(&format!(
+            " AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.{column}=tasks.id)"
+        ));
+    }
+    guards
+}
+
+/// Primary-key page used to drive opportunistic task reclamation. Keep age,
+/// status, and reference predicates out of this query: adding them can make
+/// SQLite choose a secondary index and sort every qualifying historical row
+/// before applying `LIMIT`, which defeats the writer-lock bound.
+const RECLAIMABLE_TASK_WINDOW_SQL: &str =
+    "SELECT id FROM tasks WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
+
+/// Opportunistic per-mutation sweep: reclaim at most `limit` aged done tasks
+/// whose operational children are drained and whose durable references are
+/// gone.
+///
+/// The raw task-ID window is bounded by [`SWEEP_LIMIT`] *before* age, status,
+/// or guard predicates apply. `sweep_cursors('reclaimable_tasks')` supplies a
+/// rotating primary-key starting point (`id > cursor`), and the exact query is
+/// pinned by a query-plan regression below. Ever-growing retained history can
+/// therefore never inflate per-mutation candidate discovery: each task ID
+/// consumes one slot in one window, then the cursor advances past it. A short
+/// tail window resets the cursor to 0 immediately so tasks that become eligible
+/// after an earlier pass are revisited without starvation.
+///
+/// Task #395 acceptance boundary: candidate discovery is one bounded primary-
+/// key range page, and at most `SWEEP_LIMIT` task IDs reach the fixed guard set.
 fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    // Do not remove a parent until bounded child cleanup has caught up. This makes a large task
-    // take several opportunistic sweeps rather than letting one write delete an unbounded fanout.
+    let cursor: i64 = conn
+        .query_row(
+            "SELECT value FROM sweep_cursors WHERE name='reclaimable_tasks'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    let candidates: Vec<i64> = conn
+        .prepare(RECLAIMABLE_TASK_WINDOW_SQL)?
+        .query_map(params![cursor, limit as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Advance after a full window. A short window proves this primary-key page
+    // reached the current tail, so wrap immediately and revisit the beginning
+    // on the next write. This remains fair even while new tasks are appended.
+    // A no-op sweep (no candidates and cursor already 0) leaves the cursor
+    // alone so a fresh DB does not accumulate a sweep_cursors row before it
+    // has anything to reclaim.
+    let new_cursor: Option<i64> = if let Some(&max) = candidates.last() {
+        Some(if candidates.len() < limit { 0 } else { max })
+    } else if cursor > 0 {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(v) = new_cursor {
+        conn.execute(
+            "INSERT INTO sweep_cursors(name, value) VALUES ('reclaimable_tasks', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            [v],
+        )?;
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // Apply eligibility and guards only to the bounded raw-ID window. Per-row
+    // durable NOT EXISTS probes are served by the indexes materialized in
+    // schema.sql; no age/status predicate participates in candidate discovery.
+    let guards = task_ref_guard_predicates();
+    let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "DELETE FROM tasks
+         WHERE id IN ({placeholders})
+           AND status='done' AND updated_at < ?{guards}"
+    );
+    let horizon = now - DONE_TASK_TTL_SECS;
+    let mut bound: Vec<&dyn rusqlite::ToSql> = candidates
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
+    bound.push(&horizon);
+    conn.execute(&sql, bound.as_slice())?;
+    Ok(())
+}
+
+/// Explicit unbounded reclamation used by `quorum sweep`. No candidate cap,
+/// no cursor — every aged done task whose guards pass is deleted in one
+/// statement. Guard probes stay indexed; SQLite's LIMIT-free DELETE avoids
+/// the SQLITE_MAX_VARIABLE_NUMBER cap that a materialized `IN (...)` would
+/// hit at scale. Resets the opportunistic cursor so subsequent sweep-on-write
+/// mutations restart from the beginning after a full explicit sweep.
+fn delete_reclaimable_tasks_unbounded(conn: &Connection, now: i64) -> Result<()> {
+    let guards = task_ref_guard_predicates();
+    let sql = format!("DELETE FROM tasks WHERE status='done' AND updated_at < ?1{guards}");
+    conn.execute(&sql, params![now - DONE_TASK_TTL_SECS])?;
     conn.execute(
-        "DELETE FROM tasks WHERE rowid IN \
-         (SELECT t.rowid FROM tasks t
-          WHERE t.status='done' AND t.updated_at < ?1
-            AND NOT EXISTS (SELECT 1 FROM agent_runs x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM task_branches x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM task_notes x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM task_messages x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM mailbox x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM journal x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM approvals x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_attempts x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM pr_targets x WHERE x.task_id=t.id)
-          LIMIT ?2)",
-        params![now - DONE_TASK_TTL_SECS, limit as i64],
+        "DELETE FROM sweep_cursors WHERE name='reclaimable_tasks'",
+        [],
     )?;
     Ok(())
 }
@@ -419,7 +554,7 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     let unbounded = i64::MAX as usize;
     delete_reclaimable_task_rows_bounded(&tx, now, unbounded)?;
     delete_orphaned_task_rows_bounded(&tx, unbounded)?;
-    delete_reclaimable_tasks_bounded(&tx, now, unbounded)?;
+    delete_reclaimable_tasks_unbounded(&tx, now)?;
     tx.commit()?;
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     Ok(())
@@ -1759,6 +1894,661 @@ mod tests {
         assert_eq!(
             t.status, "open",
             "working task must not get provisioning grace"
+        );
+    }
+
+    // ── Durable FK protection (task #395) ──────────────────────────────
+    //
+    // Schema 46 adds real REFERENCES tasks(id) columns on the decomposition
+    // and review-follow-up tables. If sweep deletes an aged done task while
+    // one of those rows still references it, FK enforcement raises
+    // `FOREIGN KEY constraint failed`; the sweep runs inside every mutation's
+    // transaction, so a single referenced-but-aged done task turns every
+    // subsequent write on the DB into an exit-3 failure until the task's
+    // updated_at is nudged past the retention horizon.
+
+    fn open_tmp_fk() -> (tempfile::TempDir, Connection) {
+        let (dir, c) = open_tmp();
+        c.pragma_update(None, "foreign_keys", true).unwrap();
+        (dir, c)
+    }
+
+    fn aged_done_task(c: &mut Connection, title: &str) -> i64 {
+        // Age the task past the done-task retention horizon so sweep considers
+        // it reclaimable. Uses `updated_at=0` and now = DONE_TASK_TTL_SECS+1
+        // (the pattern from `reclaimable_task`).
+        let id =
+            crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, 1).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=0 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn insert_decomposition(c: &Connection, source_task_id: i64) {
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id, state, planned_source_revision, created_at, updated_at)
+             VALUES (?1, 'completed', 1, 1, 1)",
+            [source_task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_graph_member(c: &Connection, source_task_id: i64, member_task_id: i64) {
+        insert_decomposition(c, source_task_id);
+        let graph_id: i64 = c
+            .query_row(
+                "SELECT id FROM task_decompositions WHERE source_task_id=?1",
+                [source_task_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id, task_id, local_key, plan_revision, active)
+             VALUES (?1, ?2, 'k', 1, 0)",
+            [graph_id, member_task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_followup_batch(c: &Connection, pr: i64, task_id: i64, source_task_id: i64) {
+        c.execute(
+            "INSERT INTO review_followup_batches(
+                 pr_number, task_id, source_task_id, collector_version,
+                 artifact_count, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'v1', 0, 'collected', 1, 1)",
+            [pr, task_id, source_task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_followup_artifact_with_link(
+        c: &Connection,
+        pr: i64,
+        ordinal: i64,
+        column: &str,
+        linked_task_id: i64,
+    ) {
+        assert!(
+            column == "linked_task_id" || column == "created_task_id",
+            "unknown artifact link column: {column}"
+        );
+        let disposition = if column == "linked_task_id" {
+            "linked"
+        } else {
+            "created"
+        };
+        let sql = format!(
+            "INSERT INTO review_followup_artifacts(
+                 pr_number, ordinal, technical_impact, scope_relationship,
+                 concern, non_blocking_reason, affected_behavior,
+                 desired_outcome, verification_expectations, evidence_ids,
+                 disposition, {column}, created_at, updated_at)
+             VALUES (?1, ?2, 'minor', 'defense_in_depth',
+                 'c', 'nbr', 'ab', 'do', 've', '[]',
+                 '{disposition}', ?3, 1, 1)"
+        );
+        c.execute(&sql, [pr, ordinal, linked_task_id]).unwrap();
+    }
+
+    fn assert_task_survives(c: &Connection, id: i64, guard: &str) {
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "task #{id} must survive sweep while {guard} references it"
+        );
+    }
+
+    #[test]
+    fn sweep_on_write_retains_task_referenced_by_task_decomposition() {
+        let (_d, mut c) = open_tmp_fk();
+        let source = aged_done_task(&mut c, "aged source");
+        insert_decomposition(&c, source);
+
+        // Without the durable-ref guard the sweep raises FOREIGN KEY constraint
+        // failed inside sweep_on_write, poisoning every future mutation.
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+        assert_task_survives(&c, source, "task_decompositions.source_task_id");
+
+        // The recovered DB accepts a subsequent task creation.
+        let follow_up = crate::tasks::create(
+            &mut c,
+            "boss",
+            "follow up",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            DONE_TASK_TTL_SECS + 2,
+        )
+        .unwrap();
+        assert!(follow_up > 0);
+    }
+
+    #[test]
+    fn sweep_all_retains_task_referenced_by_task_decomposition() {
+        let (_d, mut c) = open_tmp_fk();
+        let source = aged_done_task(&mut c, "aged source");
+        insert_decomposition(&c, source);
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+        assert_task_survives(&c, source, "task_decompositions.source_task_id");
+    }
+
+    #[test]
+    fn sweep_retains_every_durable_task_reference() {
+        // Table-driven mechanism check: for every durable REFERENCES tasks(id)
+        // relationship, plant a fresh aged done task, insert the referencing
+        // row, sweep, and prove the task survives. When a new durable FK is
+        // added the inventory test below fails until this list grows with it.
+        struct Case {
+            label: &'static str,
+            plant: fn(&Connection, i64),
+        }
+        fn decomp(c: &Connection, t: i64) {
+            insert_decomposition(c, t);
+        }
+        fn graph_member(c: &Connection, t: i64) {
+            let source_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('graph src','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_graph_member(c, source_id, t);
+        }
+        fn cleanup(c: &Connection, t: i64) {
+            let source_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('cleanup src','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_decomposition(c, source_id);
+            let graph_id: i64 = c
+                .query_row(
+                    "SELECT id FROM task_decompositions WHERE source_task_id=?1",
+                    [source_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            c.execute(
+                "INSERT INTO decomposition_cleanup(
+                     graph_id, task_id, artifact_kind, artifact_ref, updated_at)
+                 VALUES (?1, ?2, 'branch', 'ref', 1)",
+                [graph_id, t],
+            )
+            .unwrap();
+        }
+        fn reservation(c: &Connection, t: i64) {
+            c.execute(
+                "INSERT INTO reviewer_provision_reservations(task_id, token, role, created_at)
+                 VALUES (?1, 'tok', 'r1', 1)",
+                [t],
+            )
+            .unwrap();
+        }
+        fn batch_task(c: &Connection, t: i64) {
+            let source_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('batch src','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1001, t, source_id);
+        }
+        fn batch_source(c: &Connection, t: i64) {
+            let task_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('batch owner','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1002, task_id, t);
+        }
+        fn artifact_linked(c: &Connection, t: i64) {
+            let owner: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('art owner','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1003, owner, owner);
+            insert_followup_artifact_with_link(c, 1003, 1, "linked_task_id", t);
+        }
+        fn artifact_created(c: &Connection, t: i64) {
+            let owner: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('art owner','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1004, owner, owner);
+            insert_followup_artifact_with_link(c, 1004, 1, "created_task_id", t);
+        }
+        fn assessment(c: &Connection, t: i64) {
+            c.execute(
+                "INSERT INTO review_followup_assessments(
+                     target, scope_kind, scope_id, source_task_id, state,
+                     created_at, updated_at)
+                 VALUES ('t', 'task', 1, ?1, 'pending', 1, 1)",
+                [t],
+            )
+            .unwrap();
+        }
+        let cases = [
+            Case {
+                label: "task_decompositions.source_task_id",
+                plant: decomp,
+            },
+            Case {
+                label: "task_graph_members.task_id",
+                plant: graph_member,
+            },
+            Case {
+                label: "decomposition_cleanup.task_id",
+                plant: cleanup,
+            },
+            Case {
+                label: "reviewer_provision_reservations.task_id",
+                plant: reservation,
+            },
+            Case {
+                label: "review_followup_batches.task_id",
+                plant: batch_task,
+            },
+            Case {
+                label: "review_followup_batches.source_task_id",
+                plant: batch_source,
+            },
+            Case {
+                label: "review_followup_artifacts.linked_task_id",
+                plant: artifact_linked,
+            },
+            Case {
+                label: "review_followup_artifacts.created_task_id",
+                plant: artifact_created,
+            },
+            Case {
+                label: "review_followup_assessments.source_task_id",
+                plant: assessment,
+            },
+        ];
+        for case in &cases {
+            let (_d, mut c) = open_tmp_fk();
+            let task = aged_done_task(&mut c, case.label);
+            (case.plant)(&c, task);
+
+            sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+            assert_task_survives(&c, task, case.label);
+            sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+            assert_task_survives(&c, task, case.label);
+        }
+    }
+
+    #[test]
+    fn unreferenced_aged_done_task_is_still_reclaimed() {
+        // The durable-ref guard must not turn every aged done task into a
+        // permanent row: an unreferenced one still reclaims under FK
+        // enforcement.
+        let (_d, mut c) = open_tmp_fk();
+        let orphan = aged_done_task(&mut c, "orphan");
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [orphan], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "unreferenced aged done task must reclaim");
+    }
+
+    #[test]
+    fn sweep_candidate_discovery_uses_primary_key_page_without_history_sort() {
+        // Task #395 remediation, blocker #3: filtering age/status in the
+        // cursor query made SQLite choose tasks_reviewing_newest and sort the
+        // full qualifying history before LIMIT. Pin the exact production
+        // query to a rowid range seek with no temporary ordering structure.
+        let (_d, c) = open_tmp_fk();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECLAIMABLE_TASK_WINDOW_SQL}"))
+            .unwrap()
+            .query_map(params![0, SWEEP_LIMIT as i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("INTEGER PRIMARY KEY") && detail.contains("rowid>?")
+            }),
+            "candidate discovery must seek the tasks primary key above the rotating cursor: \
+             {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "candidate discovery must not enumerate and sort retained task history: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_on_write_examines_at_most_sweep_limit_candidates_per_call() {
+        // Task #395 remediation: every write must expose at most SWEEP_LIMIT
+        // raw IDs to eligibility and reference guards. Create 3*SWEEP_LIMIT
+        // pinned aged done tasks, run one sweep, and confirm the cursor moves
+        // across exactly one primary-key window.
+        let (_d, mut c) = open_tmp_fk();
+        let n = SWEEP_LIMIT * 3;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = aged_done_task(&mut c, &format!("pinned {i}"));
+            insert_decomposition(&c, id);
+            ids.push(id);
+        }
+        // tasks::create runs opportunistic sweep itself; isolate the one call
+        // under test from cursor movement incurred while building the fixture.
+        c.execute(
+            "DELETE FROM sweep_cursors WHERE name='reclaimable_tasks'",
+            [],
+        )
+        .unwrap();
+        let first = *ids.first().unwrap();
+        let expected_cursor = first + SWEEP_LIMIT as i64 - 1;
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+
+        let cursor: i64 = c
+            .query_row(
+                "SELECT value FROM sweep_cursors WHERE name='reclaimable_tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor, expected_cursor,
+            "cursor must advance by exactly one SWEEP_LIMIT-sized raw-ID window; \
+             retained pinned provenance cannot inflate write-lock time. \
+             cursor={cursor}, expected={expected_cursor}"
+        );
+        let survivors: i64 = c
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            survivors, n as i64,
+            "every pinned task must survive — no FK violation, no unintended reclamation"
+        );
+    }
+
+    #[test]
+    fn sweep_on_write_eventually_reclaims_unreferenced_task_behind_pinned_wall() {
+        // Boundedness must not cause starvation. Plant SWEEP_LIMIT+5 pinned
+        // aged done tasks at the front (low ids) and one unreferenced aged
+        // done task at the tail. The unreferenced task never reclaims in the
+        // first sweep (cursor examines only pinned rows), but after the
+        // cursor advances past the pinned block and eventually wraps, the
+        // sweep reaches and deletes the unreferenced tail task.
+        let (_d, mut c) = open_tmp_fk();
+        let pinned_count = SWEEP_LIMIT + 5;
+        for i in 0..pinned_count {
+            let id = aged_done_task(&mut c, &format!("pinned {i}"));
+            insert_decomposition(&c, id);
+        }
+        let tail = aged_done_task(&mut c, "tail unreferenced");
+
+        // Drive sweeps until the tail is reclaimed. Cap the loop at a
+        // generous multiple of the pinned block so a real starvation bug
+        // still fails loudly rather than hanging the test.
+        let mut sweeps = 0;
+        let cap = pinned_count * 3;
+        loop {
+            sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+            sweeps += 1;
+            let alive: i64 = c
+                .query_row("SELECT count(*) FROM tasks WHERE id=?1", [tail], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if alive == 0 {
+                break;
+            }
+            assert!(
+                sweeps < cap,
+                "unreferenced tail task starved behind pinned wall — the \
+                 rotating cursor must eventually visit every id even while \
+                 SWEEP_LIMIT bounds per-call work"
+            );
+        }
+        let pinned_survivors: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE status='done'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            pinned_survivors, pinned_count as i64,
+            "every pinned task must still survive the loop"
+        );
+    }
+
+    #[test]
+    fn sweep_all_ignores_cursor_and_reclaims_everything_in_one_call() {
+        // Explicit sweep_all is documented as unbounded. Even if the
+        // opportunistic cursor was left partway through the aged done range
+        // by an earlier sweep_on_write, one sweep_all must reclaim every
+        // unreferenced aged done task (guards still retain pinned ones) and
+        // clear the cursor so subsequent opportunistic sweeps restart clean.
+        let (_d, mut c) = open_tmp_fk();
+        let unref_low = aged_done_task(&mut c, "unref low");
+        let pinned_mid = aged_done_task(&mut c, "pinned mid");
+        insert_decomposition(&c, pinned_mid);
+        let unref_high = aged_done_task(&mut c, "unref high");
+        // Pre-set the cursor past unref_low so a naive cursor-honoring
+        // sweep_all would skip it.
+        c.execute(
+            "INSERT INTO sweep_cursors(name, value)
+             VALUES ('reclaimable_tasks', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            [pinned_mid],
+        )
+        .unwrap();
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        let low: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [unref_low], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let high: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id=?1",
+                [unref_high],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let pinned: i64 = c
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id=?1",
+                [pinned_mid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            low, 0,
+            "sweep_all must reclaim unreferenced task before cursor"
+        );
+        assert_eq!(
+            high, 0,
+            "sweep_all must reclaim unreferenced task after cursor"
+        );
+        assert_eq!(pinned, 1, "pinned task must still be retained");
+        let cursor_rows: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sweep_cursors WHERE name='reclaimable_tasks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_rows, 0,
+            "sweep_all must clear the opportunistic cursor after a full pass"
+        );
+    }
+
+    #[test]
+    fn every_durable_task_ref_column_has_a_lookup_index() {
+        // Task #395 remediation: schema 48 adds a lookup index for every
+        // durable REFERENCES tasks(id) column so sweep_on_write's
+        // `NOT EXISTS (SELECT 1 FROM x WHERE x.col=t.id)` guard is served by
+        // an index rather than a scan of retained provenance. The guard runs
+        // inside every mutation's write transaction and the outer LIMIT lets
+        // it examine SWEEP_LIMIT candidate tasks, so an unindexed column
+        // would give SWEEP_LIMIT × |retained| work per write.
+        //
+        // Assert the mechanism directly (via sqlite_master / index_info)
+        // rather than through EXPLAIN QUERY PLAN — the planner falls back to
+        // a full covering-PK scan on an empty table regardless of which
+        // secondary indexes exist, so a plan-based check would silently pass
+        // an unindexed column here.
+        let (_d, c) = open_tmp_fk();
+        for (table, column) in DURABLE_TASK_REF_TABLES {
+            // `INTEGER PRIMARY KEY` is an alias for rowid, which is inherently
+            // O(log n) for `WHERE column=?` even though PRAGMA index_list
+            // reports no explicit secondary index. Skip those columns —
+            // they're already index-bounded by SQLite's rowid.
+            let is_rowid_alias: bool = c
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| {
+                    // (cid, name, type, notnull, dflt_value, pk)
+                    Ok((
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .into_iter()
+                .any(|(name, ty, pk)| name == *column && pk == 1 && ty.to_uppercase() == "INTEGER");
+            if is_rowid_alias {
+                continue;
+            }
+            let indexes: Vec<String> = c
+                .prepare(&format!("PRAGMA index_list({table})"))
+                .unwrap()
+                // (seq, name, unique, origin, partial)
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let mut served_by: Option<String> = None;
+            for index_name in &indexes {
+                let mut stmt = c
+                    .prepare(&format!("PRAGMA index_info({index_name})"))
+                    .unwrap();
+                let leading: Option<String> = stmt
+                    .query_map([], |row| {
+                        // (seqno, cid, name)
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .find(|(seqno, _)| *seqno == 0)
+                    .map(|(_, name)| name);
+                if leading.as_deref() == Some(column) {
+                    served_by = Some(index_name.clone());
+                    break;
+                }
+            }
+            assert!(
+                served_by.is_some(),
+                "{table}.{column} has no index whose leading column is \
+                 {column} — sweep_on_write's durable-reference guard would \
+                 fall back to a full scan of {table} inside every mutation's \
+                 write transaction. Add a `CREATE INDEX` on ({column}) to \
+                 schema.sql (partial `WHERE {column} IS NOT NULL` is fine \
+                 for nullable columns) and, if this is a new durable FK, \
+                 bump SCHEMA_VERSION so existing databases materialize it. \
+                 Existing indexes on {table}: {indexes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_task_ref_inventory_covers_every_fk_on_tasks() {
+        // Mechanism-level assertion: enumerate every FK in the live schema
+        // that points at tasks(id) and require it to appear in
+        // DURABLE_TASK_REF_TABLES. A new REFERENCES tasks(id) added without
+        // updating the sweep guard fails here, preventing schema drift from
+        // reintroducing the sweep-on-write foreign-key regression.
+        let (_d, c) = open_tmp_fk();
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut discovered: Vec<(String, String)> = Vec::new();
+        for table in &tables {
+            let mut stmt = c
+                .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                .unwrap();
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| {
+                    // (id, seq, table, from, to, on_update, on_delete, match)
+                    let referenced_table: String = r.get(2)?;
+                    let from_column: String = r.get(3)?;
+                    Ok((referenced_table, from_column))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for (ref_table, from_column) in rows {
+                if ref_table == "tasks" {
+                    discovered.push((table.clone(), from_column));
+                }
+            }
+        }
+        discovered.sort();
+        let mut expected: Vec<(String, String)> = DURABLE_TASK_REF_TABLES
+            .iter()
+            .map(|(t, c)| ((*t).to_string(), (*c).to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            discovered, expected,
+            "REFERENCES tasks(id) inventory drifted — update \
+             DURABLE_TASK_REF_TABLES (and the sweep guard covers it \
+             automatically) or, if the new FK's rows are safe to delete \
+             with the task, extend OPERATIONAL_TASK_REF_TABLES + the \
+             per-table bounded delete instead"
         );
     }
 
