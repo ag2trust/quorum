@@ -254,25 +254,64 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
     Ok(())
 }
 
+/// Durable schema tables whose `REFERENCES tasks(id)` columns pin the task row.
+/// Sweep must retain the task while any of these still reference it — deleting
+/// the provenance to make GC succeed would silently discard decomposition and
+/// review-follow-up history. Add here whenever a new durable FK to tasks(id) is
+/// introduced; the FK inventory test below fails when a new one is missed.
+const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
+    ("task_decompositions", "source_task_id"),
+    ("task_graph_members", "task_id"),
+    ("decomposition_cleanup", "task_id"),
+    ("reviewer_provision_reservations", "task_id"),
+    ("review_followup_batches", "task_id"),
+    ("review_followup_batches", "source_task_id"),
+    ("review_followup_artifacts", "linked_task_id"),
+    ("review_followup_artifacts", "created_task_id"),
+    ("review_followup_assessments", "source_task_id"),
+];
+
+/// Operational task-owned tables whose rows are reclaimed alongside the parent
+/// task. The parent delete waits until each of these is empty for the task, so
+/// bounded child sweeps drive the reclamation instead of one giant cascade.
+const OPERATIONAL_TASK_REF_TABLES: &[&str] = &[
+    "agent_runs",
+    "task_branches",
+    "task_notes",
+    "task_messages",
+    "mailbox",
+    "journal",
+    "approvals",
+    "reviewer_provision_attempts",
+    "pr_targets",
+];
+
 fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    // Do not remove a parent until bounded child cleanup has caught up. This makes a large task
-    // take several opportunistic sweeps rather than letting one write delete an unbounded fanout.
-    conn.execute(
+    // Two guard families:
+    //   • operational — bounded child cleanup drains these each sweep, so the parent waits
+    //     until the fanout is fully swept rather than letting one write delete unbounded rows.
+    //   • durable — decomposition and review-follow-up provenance is intentionally retained;
+    //     these tables enforce FKs on tasks(id), so deleting a still-referenced task raises
+    //     `FOREIGN KEY constraint failed` and turns every subsequent mutation on the DB into
+    //     an exit-3 failure (schema-46 regression, see task #395).
+    let mut guards = String::new();
+    for table in OPERATIONAL_TASK_REF_TABLES {
+        guards.push_str(&format!(
+            "\n            AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.task_id=t.id)"
+        ));
+    }
+    for (table, column) in DURABLE_TASK_REF_TABLES {
+        guards.push_str(&format!(
+            "\n            AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.{column}=t.id)"
+        ));
+    }
+    let sql = format!(
         "DELETE FROM tasks WHERE rowid IN \
          (SELECT t.rowid FROM tasks t
-          WHERE t.status='done' AND t.updated_at < ?1
-            AND NOT EXISTS (SELECT 1 FROM agent_runs x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM task_branches x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM task_notes x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM task_messages x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM mailbox x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM journal x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM approvals x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_attempts x WHERE x.task_id=t.id)
-            AND NOT EXISTS (SELECT 1 FROM pr_targets x WHERE x.task_id=t.id)
-          LIMIT ?2)",
-        params![now - DONE_TASK_TTL_SECS, limit as i64],
-    )?;
+          WHERE t.status='done' AND t.updated_at < ?1{guards}
+          LIMIT ?2)"
+    );
+    conn.execute(&sql, params![now - DONE_TASK_TTL_SECS, limit as i64])?;
     Ok(())
 }
 
@@ -1759,6 +1798,386 @@ mod tests {
         assert_eq!(
             t.status, "open",
             "working task must not get provisioning grace"
+        );
+    }
+
+    // ── Durable FK protection (task #395) ──────────────────────────────
+    //
+    // Schema 46 adds real REFERENCES tasks(id) columns on the decomposition
+    // and review-follow-up tables. If sweep deletes an aged done task while
+    // one of those rows still references it, FK enforcement raises
+    // `FOREIGN KEY constraint failed`; the sweep runs inside every mutation's
+    // transaction, so a single referenced-but-aged done task turns every
+    // subsequent write on the DB into an exit-3 failure until the task's
+    // updated_at is nudged past the retention horizon.
+
+    fn open_tmp_fk() -> (tempfile::TempDir, Connection) {
+        let (dir, c) = open_tmp();
+        c.pragma_update(None, "foreign_keys", true).unwrap();
+        (dir, c)
+    }
+
+    fn aged_done_task(c: &mut Connection, title: &str) -> i64 {
+        // Age the task past the done-task retention horizon so sweep considers
+        // it reclaimable. Uses `updated_at=0` and now = DONE_TASK_TTL_SECS+1
+        // (the pattern from `reclaimable_task`).
+        let id =
+            crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, 1).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=0 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn insert_decomposition(c: &Connection, source_task_id: i64) {
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id, state, planned_source_revision, created_at, updated_at)
+             VALUES (?1, 'completed', 1, 1, 1)",
+            [source_task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_graph_member(c: &Connection, source_task_id: i64, member_task_id: i64) {
+        insert_decomposition(c, source_task_id);
+        let graph_id: i64 = c
+            .query_row(
+                "SELECT id FROM task_decompositions WHERE source_task_id=?1",
+                [source_task_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id, task_id, local_key, plan_revision, active)
+             VALUES (?1, ?2, 'k', 1, 0)",
+            [graph_id, member_task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_followup_batch(c: &Connection, pr: i64, task_id: i64, source_task_id: i64) {
+        c.execute(
+            "INSERT INTO review_followup_batches(
+                 pr_number, task_id, source_task_id, collector_version,
+                 artifact_count, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'v1', 0, 'collected', 1, 1)",
+            [pr, task_id, source_task_id],
+        )
+        .unwrap();
+    }
+
+    fn insert_followup_artifact_with_link(
+        c: &Connection,
+        pr: i64,
+        ordinal: i64,
+        column: &str,
+        linked_task_id: i64,
+    ) {
+        assert!(
+            column == "linked_task_id" || column == "created_task_id",
+            "unknown artifact link column: {column}"
+        );
+        let disposition = if column == "linked_task_id" {
+            "linked"
+        } else {
+            "created"
+        };
+        let sql = format!(
+            "INSERT INTO review_followup_artifacts(
+                 pr_number, ordinal, technical_impact, scope_relationship,
+                 concern, non_blocking_reason, affected_behavior,
+                 desired_outcome, verification_expectations, evidence_ids,
+                 disposition, {column}, created_at, updated_at)
+             VALUES (?1, ?2, 'minor', 'defense_in_depth',
+                 'c', 'nbr', 'ab', 'do', 've', '[]',
+                 '{disposition}', ?3, 1, 1)"
+        );
+        c.execute(&sql, [pr, ordinal, linked_task_id]).unwrap();
+    }
+
+    fn assert_task_survives(c: &Connection, id: i64, guard: &str) {
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "task #{id} must survive sweep while {guard} references it"
+        );
+    }
+
+    #[test]
+    fn sweep_on_write_retains_task_referenced_by_task_decomposition() {
+        let (_d, mut c) = open_tmp_fk();
+        let source = aged_done_task(&mut c, "aged source");
+        insert_decomposition(&c, source);
+
+        // Without the durable-ref guard the sweep raises FOREIGN KEY constraint
+        // failed inside sweep_on_write, poisoning every future mutation.
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+        assert_task_survives(&c, source, "task_decompositions.source_task_id");
+
+        // The recovered DB accepts a subsequent task creation.
+        let follow_up = crate::tasks::create(
+            &mut c,
+            "boss",
+            "follow up",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            DONE_TASK_TTL_SECS + 2,
+        )
+        .unwrap();
+        assert!(follow_up > 0);
+    }
+
+    #[test]
+    fn sweep_all_retains_task_referenced_by_task_decomposition() {
+        let (_d, mut c) = open_tmp_fk();
+        let source = aged_done_task(&mut c, "aged source");
+        insert_decomposition(&c, source);
+
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+        assert_task_survives(&c, source, "task_decompositions.source_task_id");
+    }
+
+    #[test]
+    fn sweep_retains_every_durable_task_reference() {
+        // Table-driven mechanism check: for every durable REFERENCES tasks(id)
+        // relationship, plant a fresh aged done task, insert the referencing
+        // row, sweep, and prove the task survives. When a new durable FK is
+        // added the inventory test below fails until this list grows with it.
+        struct Case {
+            label: &'static str,
+            plant: fn(&Connection, i64),
+        }
+        fn decomp(c: &Connection, t: i64) {
+            insert_decomposition(c, t);
+        }
+        fn graph_member(c: &Connection, t: i64) {
+            let source_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('graph src','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_graph_member(c, source_id, t);
+        }
+        fn cleanup(c: &Connection, t: i64) {
+            let source_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('cleanup src','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_decomposition(c, source_id);
+            let graph_id: i64 = c
+                .query_row(
+                    "SELECT id FROM task_decompositions WHERE source_task_id=?1",
+                    [source_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            c.execute(
+                "INSERT INTO decomposition_cleanup(
+                     graph_id, task_id, artifact_kind, artifact_ref, updated_at)
+                 VALUES (?1, ?2, 'branch', 'ref', 1)",
+                [graph_id, t],
+            )
+            .unwrap();
+        }
+        fn reservation(c: &Connection, t: i64) {
+            c.execute(
+                "INSERT INTO reviewer_provision_reservations(task_id, token, role, created_at)
+                 VALUES (?1, 'tok', 'r1', 1)",
+                [t],
+            )
+            .unwrap();
+        }
+        fn batch_task(c: &Connection, t: i64) {
+            let source_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('batch src','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1001, t, source_id);
+        }
+        fn batch_source(c: &Connection, t: i64) {
+            let task_id: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('batch owner','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1002, task_id, t);
+        }
+        fn artifact_linked(c: &Connection, t: i64) {
+            let owner: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('art owner','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1003, owner, owner);
+            insert_followup_artifact_with_link(c, 1003, 1, "linked_task_id", t);
+        }
+        fn artifact_created(c: &Connection, t: i64) {
+            let owner: i64 = c
+                .query_row(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('art owner','done','owner',1,1) RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            insert_followup_batch(c, 1004, owner, owner);
+            insert_followup_artifact_with_link(c, 1004, 1, "created_task_id", t);
+        }
+        fn assessment(c: &Connection, t: i64) {
+            c.execute(
+                "INSERT INTO review_followup_assessments(
+                     target, scope_kind, scope_id, source_task_id, state,
+                     created_at, updated_at)
+                 VALUES ('t', 'task', 1, ?1, 'pending', 1, 1)",
+                [t],
+            )
+            .unwrap();
+        }
+        let cases = [
+            Case {
+                label: "task_decompositions.source_task_id",
+                plant: decomp,
+            },
+            Case {
+                label: "task_graph_members.task_id",
+                plant: graph_member,
+            },
+            Case {
+                label: "decomposition_cleanup.task_id",
+                plant: cleanup,
+            },
+            Case {
+                label: "reviewer_provision_reservations.task_id",
+                plant: reservation,
+            },
+            Case {
+                label: "review_followup_batches.task_id",
+                plant: batch_task,
+            },
+            Case {
+                label: "review_followup_batches.source_task_id",
+                plant: batch_source,
+            },
+            Case {
+                label: "review_followup_artifacts.linked_task_id",
+                plant: artifact_linked,
+            },
+            Case {
+                label: "review_followup_artifacts.created_task_id",
+                plant: artifact_created,
+            },
+            Case {
+                label: "review_followup_assessments.source_task_id",
+                plant: assessment,
+            },
+        ];
+        for case in &cases {
+            let (_d, mut c) = open_tmp_fk();
+            let task = aged_done_task(&mut c, case.label);
+            (case.plant)(&c, task);
+
+            sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+            assert_task_survives(&c, task, case.label);
+            sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+            assert_task_survives(&c, task, case.label);
+        }
+    }
+
+    #[test]
+    fn unreferenced_aged_done_task_is_still_reclaimed() {
+        // The durable-ref guard must not turn every aged done task into a
+        // permanent row: an unreferenced one still reclaims under FK
+        // enforcement.
+        let (_d, mut c) = open_tmp_fk();
+        let orphan = aged_done_task(&mut c, "orphan");
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [orphan], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "unreferenced aged done task must reclaim");
+    }
+
+    #[test]
+    fn durable_task_ref_inventory_covers_every_fk_on_tasks() {
+        // Mechanism-level assertion: enumerate every FK in the live schema
+        // that points at tasks(id) and require it to appear in
+        // DURABLE_TASK_REF_TABLES. A new REFERENCES tasks(id) added without
+        // updating the sweep guard fails here, preventing schema drift from
+        // reintroducing the sweep-on-write foreign-key regression.
+        let (_d, c) = open_tmp_fk();
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut discovered: Vec<(String, String)> = Vec::new();
+        for table in &tables {
+            let mut stmt = c
+                .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                .unwrap();
+            let rows: Vec<(String, String)> = stmt
+                .query_map([], |r| {
+                    // (id, seq, table, from, to, on_update, on_delete, match)
+                    let referenced_table: String = r.get(2)?;
+                    let from_column: String = r.get(3)?;
+                    Ok((referenced_table, from_column))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for (ref_table, from_column) in rows {
+                if ref_table == "tasks" {
+                    discovered.push((table.clone(), from_column));
+                }
+            }
+        }
+        discovered.sort();
+        let mut expected: Vec<(String, String)> = DURABLE_TASK_REF_TABLES
+            .iter()
+            .map(|(t, c)| ((*t).to_string(), (*c).to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            discovered, expected,
+            "REFERENCES tasks(id) inventory drifted — update \
+             DURABLE_TASK_REF_TABLES (and the sweep guard covers it \
+             automatically) or, if the new FK's rows are safe to delete \
+             with the task, extend OPERATIONAL_TASK_REF_TABLES + the \
+             per-table bounded delete instead"
         );
     }
 
