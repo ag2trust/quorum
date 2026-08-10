@@ -4,8 +4,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use support::protocol::{
     AllocateRoleInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimCleanupInput,
-    ClaimTaskInput, GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL,
-    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
+    ClaimProviderRetryReworkInput, ClaimTaskInput, GraphEvent, MaterializeAssessmentInput,
+    Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -78,6 +78,21 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
                     task_id: 999,
                     agent: "worker".into(),
                     barrier: open_barrier(dir.path(), "claim"),
+                },
+            )
+            .unwrap(),
+            EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::ClaimProviderRetryRework,
+                &ClaimProviderRetryReworkInput {
+                    db_path: db_path.clone(),
+                    task_id: 999,
+                    agent: "worker".into(),
+                    ttl: 60,
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "provider-retry"),
                 },
             )
             .unwrap(),
