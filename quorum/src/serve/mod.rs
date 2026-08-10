@@ -950,7 +950,7 @@ async fn create_initial_pr(
         .ok_or_else(|| "gh pr create succeeded but did not return a pull-request URL".to_string())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PublicationIntent {
     branch: String,
     local_sha: String,
@@ -1686,7 +1686,7 @@ async fn resolve_and_persist_parked_rework_target(
     let pr = intent
         .pr
         .ok_or_else(|| "recorded daemon publication has no PR identity".to_string())?;
-    let expected_sha = intent.expected_remote_sha.as_deref().ok_or_else(|| {
+    intent.expected_remote_sha.as_deref().ok_or_else(|| {
         format!("recorded daemon publication for PR #{pr} has no expected remote SHA")
     })?;
 
@@ -1695,29 +1695,117 @@ async fn resolve_and_persist_parked_rework_target(
     // confirm it, never replace it.
     let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
     validate_continue_pr_target(&target, pr, &config.base_branch)?;
-    if target.head_ref != intent.branch {
-        return Err(format!(
-            "recorded daemon publication head branch changed for PR #{pr}: expected {}, got {}",
-            intent.branch, target.head_ref
-        ));
-    }
-    if target.head_sha != expected_sha {
-        return Err(format!(
-            "recorded daemon publication head moved for PR #{pr}: expected {expected_sha}, got {}",
-            target.head_sha
-        ));
-    }
+    existing_pr_lease_baseline(intent, &target, &config.base_branch)?;
 
     let db_path = config.db_path.clone();
     let persisted = target.clone();
+    let persisted_intent = intent.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
-        persist_continue_pr_baseline(&mut conn, task_id, &persisted)
+        persist_parked_rework_baseline(&mut conn, task_id, &persisted_intent, &persisted)
     })
     .await
     .map_err(|error| format!("parked rework target persistence join failure: {error}"))?
     .map_err(|error| format!("parked rework target persistence failed: {error}"))?;
     Ok(target)
+}
+
+/// Persist one exact parked-rework continuation target. The recorded remote
+/// baseline remains immutable unless the live head is the intent's exact
+/// source, which is the distinguished post-push recovery state. In that case
+/// the old publication handoff has already landed, so rotate both durable
+/// baselines atomically before a replacement delivery is allowed to start.
+fn persist_parked_rework_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    intent: &PublicationIntent,
+    target: &PrTarget,
+) -> Result<()> {
+    let expected_sha = intent.expected_remote_sha.as_deref().ok_or_else(|| {
+        QuorumError::Usage(format!(
+            "recorded daemon publication for PR #{} has no expected remote SHA",
+            target.pr
+        ))
+    })?;
+    let source_already_published = target.head_sha == intent.local_sha;
+    if target.head_sha != expected_sha && !source_already_published {
+        return Err(QuorumError::Usage(format!(
+            "parked rework PR #{} moved outside its publication lease",
+            target.pr
+        )));
+    }
+
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    if let Some(owner) = tasks::active_pr_owner_in(&tx, target.pr, Some(task_id))? {
+        return Err(QuorumError::Usage(format!(
+            "continue PR #{} is already owned by active task #{owner}",
+            target.pr
+        )));
+    }
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    let current_intent = parked_rework_publication_intent(task.refs.as_deref())
+        .map_err(QuorumError::Usage)?
+        .ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "task #{task_id} no longer carries a parked rework publication"
+            ))
+        })?;
+    if current_intent != *intent {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} parked rework publication changed before baseline persistence"
+        )));
+    }
+
+    if let Some(existing) = pr_targets::get(&tx, task_id, target.pr)? {
+        let allowed_existing_sha = existing.head_sha == target.head_sha
+            || (source_already_published && existing.head_sha == expected_sha);
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || !allowed_existing_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "continue PR #{} moved after its durable baseline (expected {} at {}, got {} at {})",
+                target.pr,
+                existing.head_ref,
+                existing.head_sha,
+                target.head_ref,
+                target.head_sha
+            )));
+        }
+        if existing.head_sha != target.head_sha {
+            tx.execute(
+                "UPDATE pr_targets
+                 SET head_sha=?1, resolved_at=?2
+                 WHERE task_id=?3 AND pr_number=?4",
+                (target.head_sha.as_str(), now_unix(), task_id, target.pr),
+            )?;
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO pr_targets
+               (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                task_id,
+                target.pr,
+                target.head_ref.as_str(),
+                target.head_sha.as_str(),
+                target.is_fork as i64,
+                now_unix(),
+            ),
+        )?;
+    }
+
+    if source_already_published && expected_sha != intent.local_sha {
+        let mut advanced = intent.clone();
+        advanced.expected_remote_sha = Some(intent.local_sha.clone());
+        let json = serde_json::to_string(&advanced)
+            .map_err(|error| QuorumError::Io(format!("publication intent JSON: {error}")))?;
+        tasks::set_publication_intent(&tx, task_id, &json, now_unix())?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn persist_continue_pr_baseline(

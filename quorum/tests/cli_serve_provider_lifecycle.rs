@@ -222,10 +222,17 @@ struct Case {
     handle: ServeHandle,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParkedRemoteState {
+    ExpectedHead,
+    PublishedSource,
+    UnrelatedHead,
+}
+
 #[derive(Clone, Copy)]
 struct ParkedPublicationFixture {
     pr: i64,
-    move_remote_head: bool,
+    remote_state: ParkedRemoteState,
 }
 
 impl Case {
@@ -258,7 +265,7 @@ impl Case {
         Self::start_with_pr_assignment(default_provider, model, None, None, None, Some(pr), None)
     }
 
-    fn start_parked_publication(move_remote_head: bool) -> Self {
+    fn start_parked_publication(remote_state: ParkedRemoteState) -> Self {
         Self::start_with_pr_assignment(
             "codex",
             "gpt-5.6-terra",
@@ -268,7 +275,7 @@ impl Case {
             None,
             Some(ParkedPublicationFixture {
                 pr: 10,
-                move_remote_head,
+                remote_state,
             }),
         )
     }
@@ -430,42 +437,51 @@ impl Case {
             .unwrap()
             .trim()
             .to_string();
-            let remote_sha = if fixture.move_remote_head {
-                assert!(Command::new("git")
-                    .args(["-C", &repo_path, "checkout", &head_ref])
-                    .status()
-                    .unwrap()
-                    .success());
-                assert!(Command::new("git")
-                    .args([
-                        "-C",
-                        &repo_path,
-                        "commit",
-                        "--allow-empty",
-                        "-m",
-                        "move remote PR head",
-                    ])
-                    .status()
-                    .unwrap()
-                    .success());
-                let moved = String::from_utf8(
-                    Command::new("git")
-                        .args(["-C", &repo_path, "rev-parse", "HEAD"])
-                        .output()
+            let remote_sha = match fixture.remote_state {
+                ParkedRemoteState::ExpectedHead => expected_sha.clone(),
+                ParkedRemoteState::PublishedSource => {
+                    assert!(Command::new("git")
+                        .args(["-C", &repo_path, "branch", "-f", &head_ref, &stale_delivery])
+                        .status()
                         .unwrap()
-                        .stdout,
-                )
-                .unwrap()
-                .trim()
-                .to_string();
-                assert!(Command::new("git")
-                    .args(["-C", &repo_path, "checkout", "main"])
-                    .status()
+                        .success());
+                    stale_delivery.clone()
+                }
+                ParkedRemoteState::UnrelatedHead => {
+                    assert!(Command::new("git")
+                        .args(["-C", &repo_path, "checkout", &head_ref])
+                        .status()
+                        .unwrap()
+                        .success());
+                    assert!(Command::new("git")
+                        .args([
+                            "-C",
+                            &repo_path,
+                            "commit",
+                            "--allow-empty",
+                            "-m",
+                            "move remote PR head",
+                        ])
+                        .status()
+                        .unwrap()
+                        .success());
+                    let moved = String::from_utf8(
+                        Command::new("git")
+                            .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                            .output()
+                            .unwrap()
+                            .stdout,
+                    )
                     .unwrap()
-                    .success());
-                moved
-            } else {
-                expected_sha.clone()
+                    .trim()
+                    .to_string();
+                    assert!(Command::new("git")
+                        .args(["-C", &repo_path, "checkout", "main"])
+                        .status()
+                        .unwrap()
+                        .success());
+                    moved
+                }
             };
             assert!(Command::new("git")
                 .args(["-C", &repo_path, "fetch", "origin"])
@@ -980,15 +996,22 @@ fn run_routes_with_effort(
 const CHATGPT_ONLY_ROLE_CONFIG: &str = "chatgpt-only-routing";
 
 #[cfg(unix)]
-#[test]
-fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() {
-    let mut case = Case::start_parked_publication(false);
+fn assert_parked_rework_retry_publishes_from(remote_state: ParkedRemoteState) {
+    let mut case = Case::start_parked_publication(remote_state);
     case.handle.wait_for("worktree provisioned");
     let worker = case.handle.agent_after("spawning agent ");
     case.handle.wait_for("turn");
 
-    let expected_sha = case.parked_expected_sha.as_deref().unwrap();
-    let (worktree, remote_branch, rework_count, stale_source_sha, retry_requested) = {
+    let provision_base_sha = case.parked_remote_sha.as_deref().unwrap();
+    let (
+        worktree,
+        remote_branch,
+        rework_count,
+        stale_source_sha,
+        retry_requested,
+        persisted_baseline_sha,
+        publication_baseline_sha,
+    ) = {
         let conn = case.db();
         let journal = conn
             .query_row(
@@ -1006,6 +1029,7 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
             .unwrap();
         let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let target = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
         (
             journal.0,
             journal.1,
@@ -1017,6 +1041,11 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
             refs["daemon_rework_retry_requested"]
                 .as_bool()
                 .unwrap_or(false),
+            target.head_sha,
+            refs["daemon_publication"]["expected_remote_sha"]
+                .as_str()
+                .unwrap()
+                .to_string(),
         )
     };
     assert!(
@@ -1029,7 +1058,9 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
         case.handle.lines
     );
     assert_eq!(rework_count, 1);
-    for ancestor in [expected_sha, "origin/main"] {
+    assert_eq!(persisted_baseline_sha, provision_base_sha);
+    assert_eq!(publication_baseline_sha, provision_base_sha);
+    for ancestor in [provision_base_sha, "origin/main"] {
         assert!(
             Command::new("git")
                 .args([
@@ -1108,11 +1139,23 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
     case.handle.stop_mut();
 }
 
+#[cfg(unix)]
+#[test]
+fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() {
+    assert_parked_rework_retry_publishes_from(ParkedRemoteState::ExpectedHead);
+}
+
+#[cfg(unix)]
+#[test]
+fn parked_rework_publication_retry_recovers_already_published_source() {
+    assert_parked_rework_retry_publishes_from(ParkedRemoteState::PublishedSource);
+}
+
 #[test]
 fn parked_rework_publication_retry_parks_when_remote_head_moved() {
-    let mut case = Case::start_parked_publication(true);
+    let mut case = Case::start_parked_publication(ParkedRemoteState::UnrelatedHead);
     case.handle
-        .wait_for("recorded daemon publication head moved for PR #10");
+        .wait_for("PR #10 head moved outside publication lease");
     case.wait_for_completed_tick();
 
     let conn = case.db();
@@ -1138,6 +1181,17 @@ fn parked_rework_publication_retry_parks_when_remote_head_moved() {
         })
         .unwrap();
     assert_eq!(journal_rows, 0);
+    let persisted = quorum_core::pr_targets::get(&conn, 1, 10).unwrap().unwrap();
+    assert_eq!(
+        persisted.head_sha,
+        case.parked_expected_sha.as_deref().unwrap(),
+        "an unrelated live head must not rotate the durable baseline"
+    );
+    assert_eq!(
+        refs["daemon_publication"]["expected_remote_sha"],
+        case.parked_expected_sha.as_deref().unwrap(),
+        "an unrelated live head must not rewrite publication authority"
+    );
     drop(conn);
 
     let remote_sha = String::from_utf8(
