@@ -572,13 +572,11 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             "model_profiles must contain at least one profile".into(),
         ));
     }
-    let mut configured_runners = std::collections::BTreeSet::new();
     for (name, profile) in profiles {
         validate_durable_routing_text("model profile name", name)?;
         validate_durable_routing_text("model", &profile.model)?;
         validate_durable_routing_text("effort", &profile.effort)?;
         let expected = RunnerKind::from_str_opt(Some(&profile.runner))?;
-        configured_runners.insert(expected);
         let actual = crate::serve::runner::AgentKind::for_model(&profile.model)
             .map_err(|error| QuorumError::Usage(format!("model profile \"{name}\": {error}")))?;
         let expected = match expected {
@@ -612,11 +610,7 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             )));
         }
     }
-    if config.agent_bin.is_some() && configured_runners.len() > 1 {
-        return Err(QuorumError::Usage(
-            "agent_bin cannot be used when model_profiles span multiple runners".into(),
-        ));
-    }
+    validate_agent_bin_for_profiles(config.agent_bin.as_deref(), profiles)?;
 
     let routing = config
         .routing
@@ -635,6 +629,28 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
     validate_complexity_pools("worker", &routing.worker, profiles)?;
     validate_complexity_pools("reviewer", &routing.reviewer, profiles)?;
     validate_routed_cost_limits(config, config.max_turn_cost_usd, config.max_task_cost_usd)?;
+    Ok(())
+}
+
+/// A custom executable belongs to one provider CLI. Validate it after every
+/// config source has been resolved, because `--agent-bin` is merged after the
+/// TOML file itself has been validated.
+pub fn validate_agent_bin_for_profiles(
+    agent_bin: Option<&str>,
+    profiles: &BTreeMap<String, ModelProfile>,
+) -> Result<()> {
+    if agent_bin.is_none() {
+        return Ok(());
+    }
+    let configured_runners: std::collections::BTreeSet<&str> = profiles
+        .values()
+        .map(|profile| profile.runner.as_str())
+        .collect();
+    if configured_runners.len() > 1 {
+        return Err(QuorumError::Usage(
+            "agent_bin cannot be used when model_profiles span multiple runners".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1710,6 +1726,13 @@ worktree_base = "/tmp/wt"
 
         cfg.agent_bin = None;
         validate_model_routing(&cfg).unwrap();
+
+        let err = validate_agent_bin_for_profiles(
+            Some("/custom/provider-cli"),
+            cfg.model_profiles.as_ref().unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("span multiple runners"), "{err}");
     }
 
     #[test]
