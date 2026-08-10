@@ -17,6 +17,13 @@ pub fn short_version() -> &'static str {
     env!("QUORUM_GIT_DESCRIBE")
 }
 
+/// Commit SHA embedded independently of the human-readable version string.
+/// `git describe` is just a tag for an exact-tag release, so it cannot be the
+/// sole source of the running build's identity.
+pub fn build_sha_short() -> &'static str {
+    env!("QUORUM_GIT_SHA_SHORT")
+}
+
 #[derive(Parser)]
 #[command(
     name = "quorum",
@@ -469,7 +476,7 @@ pub enum Command {
         /// Default: derived from --repo-dir's origin remote via `gh repo view`.
         #[arg(long)]
         self_repo: Option<String>,
-        /// Interval between git ls-remote sha polls in seconds (default: 60).
+        /// Interval between git ls-remote build-staleness checks in seconds (default: 600).
         #[arg(long, hide = true)]
         sha_poll_interval_secs: Option<u64>,
         /// Repo this daemon manages (e.g. "ag2trust/quorum"). Required

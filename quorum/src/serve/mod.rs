@@ -73,6 +73,7 @@ const MAX_ERROR_RETRIES: u32 = 3;
 const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
 const PUBLICATION_GH_TIMEOUT: Duration = Duration::from_secs(30);
 const PUBLICATION_GH_PIPE_LIMIT: usize = 1024 * 1024;
+const SELF_UPDATE_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 /// One error row is enough for an operator to diagnose a failed provision;
 /// keep it safely below every downstream status/rendering limit.
 const MAX_PROVISIONING_CAUSE_BYTES: usize = 2048;
@@ -2461,7 +2462,7 @@ pub struct ServeConfig {
     pub drain_timeout_secs: u64,
     /// Owner/name of the daemon's own repo (e.g. "ag2trust/quorum").
     pub self_repo: Option<String>,
-    /// Interval between git ls-remote polls for Trigger B (seconds). Default: 60.
+    /// Interval between git ls-remote build-staleness checks (seconds). Default: 600.
     pub sha_poll_interval_secs: u64,
     /// Seconds to wait for required status checks before merging. Default: 900.
     pub merge_checks_timeout_secs: u64,
@@ -3075,19 +3076,94 @@ fn retry_slot_rework_count(
     }
 }
 
-/// Snapshot the sha of origin's base branch via `git ls-remote`. Returns None on any failure.
-fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Option<String> {
+/// Extract the commit portion from the build's `git describe` version string.
+///
+/// A tagged build looks like `v0.3.3-399-g17c95190`; an untagged build can be
+/// just the abbreviated SHA. A dirty build still identifies the commit before
+/// its `-dirty` suffix. Exact-tag builds use the separately embedded SHA,
+/// because `git describe` then contains only the tag name.
+fn running_build_sha(version: &str, embedded_sha: &str) -> Option<String> {
+    let describe = version.strip_suffix("-dirty").unwrap_or(version);
+    let candidate = describe
+        .rsplit_once("-g")
+        .map(|(_, sha)| sha)
+        .unwrap_or(describe);
+    (candidate.len() >= 7
+        && candidate.len() <= 64
+        && candidate.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then(|| candidate.to_string())
+    .or_else(|| {
+        (embedded_sha.len() >= 7
+            && embedded_sha.len() <= 64
+            && embedded_sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| embedded_sha.to_string())
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildStalenessDecision {
+    Current,
+    Behind,
+}
+
+/// A describe SHA is normally abbreviated, while ls-remote returns a full SHA.
+fn build_staleness_decision(build_sha: &str, remote_sha: &str) -> BuildStalenessDecision {
+    if remote_sha == build_sha || remote_sha.starts_with(build_sha) {
+        BuildStalenessDecision::Current
+    } else {
+        BuildStalenessDecision::Behind
+    }
+}
+
+/// Snapshot the sha of origin's base branch via a bounded `git ls-remote`.
+/// This runs outside DB work; inability to reach origin is an operational
+/// warning, not a daemon failure.
+fn poll_origin_base_sha(repo_dir: &std::path::Path, base_branch: &str) -> Result<String> {
     let refspec = format!("refs/heads/{}", base_branch);
-    let output = std::process::Command::new("git")
+    let mut child = std::process::Command::new("git")
         .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
-        .output()
-        .ok()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| QuorumError::Io(format!("git ls-remote spawn: {error}")))?;
+    let deadline = std::time::Instant::now() + SELF_UPDATE_REMOTE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(QuorumError::Io(format!(
+                    "git ls-remote timed out after {}s",
+                    SELF_UPDATE_REMOTE_TIMEOUT.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => return Err(QuorumError::Io(format!("git ls-remote wait: {error}"))),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| QuorumError::Io(format!("git ls-remote output: {error}")))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(QuorumError::Io(format!(
+            "git ls-remote failed: {}",
+            stderr.trim()
+        )));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.split_whitespace().next().map(|s| s.to_string())
+    let sha = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| QuorumError::Io("git ls-remote returned no SHA".into()))?;
+    if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(QuorumError::Io(
+            "git ls-remote returned an invalid commit SHA".into(),
+        ));
+    }
+    Ok(sha.to_string())
 }
 
 /// Run unbacked/twin PR drift detection. Shells out to `gh pr list`,
@@ -3164,7 +3240,6 @@ struct DrainState {
     drain_started_at: Option<std::time::Instant>,
     drain_sha: Option<String>,
     last_sha_poll: Option<std::time::Instant>,
-    known_base_sha: Option<String>,
 }
 
 #[derive(Default)]
@@ -3775,7 +3850,6 @@ impl DrainState {
             drain_started_at: None,
             drain_sha: None,
             last_sha_poll: None,
-            known_base_sha: None,
         }
     }
 
@@ -5678,18 +5752,6 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
     let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    // Snapshot initial main sha for Trigger B baseline
-    if config.self_update_drain {
-        drain_state.known_base_sha = poll_origin_base_sha(&config.repo_dir, &config.base_branch);
-        if let Some(ref sha) = drain_state.known_base_sha {
-            log(&format!(
-                "self-update-drain: baseline {} sha={}",
-                config.base_branch,
-                &sha[..12.min(sha.len())]
-            ));
-        }
-    }
-
     // Decomposition authority is always reconstructed before any recovery
     // pass that can complete, merge, reset, or provision task lifecycle.
     let startup_decomposition =
@@ -5919,7 +5981,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             }
         }
 
-        // Trigger B: throttled git ls-remote poll for main sha changes
+        // Trigger B: periodically compare the executable's build SHA to origin.
+        // The network operation is deliberately outside all database transactions.
         if config.self_update_drain
             && !drain_state.draining
             && drain_state.should_poll_sha(config.sha_poll_interval_secs)
@@ -5927,27 +5990,37 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             drain_state.last_sha_poll = Some(std::time::Instant::now());
             let repo_dir = config.repo_dir.clone();
             let base_branch = config.base_branch.clone();
-            if let Some(new_sha) =
-                tokio::task::spawn_blocking(move || poll_origin_base_sha(&repo_dir, &base_branch))
-                    .await
-                    .ok()
-                    .flatten()
+            match tokio::task::spawn_blocking(move || poll_origin_base_sha(&repo_dir, &base_branch))
+                .await
             {
-                match &drain_state.known_base_sha {
-                    Some(old) if *old != new_sha => {
+                Ok(Ok(remote_sha)) => match running_build_sha(
+                    crate::cli::short_version(),
+                    crate::cli::build_sha_short(),
+                ) {
+                    Some(build_sha) => {
+                        let decision = build_staleness_decision(&build_sha, &remote_sha);
                         log(&format!(
-                            "DRAIN: origin/{} advanced ({} -> {})",
-                            config.base_branch,
-                            &old[..12.min(old.len())],
-                            &new_sha[..12.min(new_sha.len())]
+                            "self-update-drain: build staleness running_sha={build_sha} remote_sha={remote_sha} decision={decision:?}"
                         ));
-                        drain_state.start_drain(&new_sha);
+                        if decision == BuildStalenessDecision::Behind {
+                            log(&format!(
+                                "DRAIN: origin/{} is ahead of running build ({} -> {})",
+                                config.base_branch, build_sha, remote_sha
+                            ));
+                            drain_state.start_drain(&remote_sha);
+                        }
                     }
-                    None => {
-                        drain_state.known_base_sha = Some(new_sha);
-                    }
-                    _ => {}
+                    None => log(&format!(
+                        "WARN: self-update-drain build staleness check failed: cannot extract running SHA from version {}",
+                        crate::cli::short_version()
+                    )),
                 }
+                Ok(Err(error)) => log(&format!(
+                    "WARN: self-update-drain build staleness check failed: {error}"
+                )),
+                Err(error) => log(&format!(
+                    "WARN: self-update-drain build staleness check join failed: {error}"
+                )),
             }
         }
 
@@ -16790,6 +16863,54 @@ mod tests {
         let mut ds = DrainState::new();
         ds.last_sha_poll = Some(std::time::Instant::now());
         assert!(!ds.should_poll_sha(60));
+    }
+
+    #[test]
+    fn running_build_sha_extracts_describe_commit() {
+        assert_eq!(
+            running_build_sha("v0.3.3-399-g17c95190", "irrelevant"),
+            Some("17c95190".to_string())
+        );
+        assert_eq!(
+            running_build_sha("v0.3.3-399-g17c95190-dirty", "irrelevant"),
+            Some("17c95190".to_string())
+        );
+    }
+
+    #[test]
+    fn running_build_sha_rejects_non_commit_version() {
+        assert_eq!(running_build_sha("unknown", "also-unknown"), None);
+        assert_eq!(running_build_sha("v0.3.3", "also-unknown"), None);
+    }
+
+    #[test]
+    fn running_build_sha_uses_embedded_sha_for_exact_tag() {
+        assert_eq!(
+            running_build_sha("v0.3.3", "17c95190"),
+            Some("17c95190".to_string())
+        );
+    }
+
+    #[test]
+    fn build_staleness_current_when_remote_matches_abbreviated_build_sha() {
+        assert_eq!(
+            build_staleness_decision("17c95190", "17c95190aabbccddeeff00112233445566778899"),
+            BuildStalenessDecision::Current
+        );
+    }
+
+    #[test]
+    fn build_staleness_behind_when_remote_main_advanced() {
+        assert_eq!(
+            build_staleness_decision("17c95190", "00c171e0df4396cf945a8dcd0f4e446550b00081"),
+            BuildStalenessDecision::Behind
+        );
+    }
+
+    #[test]
+    fn origin_poll_failure_is_nonfatal_result() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(poll_origin_base_sha(repo.path(), "main").is_err());
     }
 
     #[test]
