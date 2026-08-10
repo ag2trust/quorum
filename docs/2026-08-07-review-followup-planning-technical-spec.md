@@ -126,10 +126,16 @@ becomes:
     {
       "technical_impact": "major",
       "scope_relationship": "threat_model_expansion",
-      "concern": "Concrete failure under the stated assumptions",
+      "concern": {
+        "failure_mode": "Requests deadlock",
+        "trigger_or_assumption": "Concurrent shutdown overlaps request handling"
+      },
       "non_blocking_reason": "Why the merged PR did not need to resolve it",
       "affected_behavior": "Product behavior affected by the concern",
-      "desired_outcome": "Observable future outcome",
+      "desired_outcome": {
+        "observable_behavior": "Requests complete",
+        "observation_condition": "The retry resumes after shutdown"
+      },
       "verification_expectations": ["Evidence that would prove the outcome"],
       "evidence": [{"kind":"review_comment","id":123}]
     }
@@ -141,13 +147,21 @@ Collector validation requires:
 
 - at most 128 findings and 32 follow-up artifacts per PR;
 - closed enum values and no unknown response fields;
+- closed concern and desired-outcome objects with no unknown fields, separately required
+  failure/assumption and observable/condition text, and an 8 KiB bound on each canonical value;
 - non-empty bounded text fields (8 KiB each, 64 KiB total artifact JSON);
 - one through eight bounded verification expectations per artifact;
 - at least one concrete GitHub evidence row per finding and artifact;
 - evidence IDs present in the deterministic fetched input;
+- streaming evidence-ID extraction without a full JSON DOM, with at most 4 MiB of aggregate
+  evidence JSON inspected and at most 20,480 fetched records indexed for validation;
 - a `suggestion`/non-blocking source finding for every artifact, established by shared evidence;
 - no artifact whose final record says it was fixed, withdrawn, or accepted as invalid; and
 - no vague improvement artifact lacking both a concrete concern and desired outcome.
+
+The collector canonicalizes the two required concern components and the two required desired-
+outcome components into the durable `concern` and `desired_outcome` strings. Unstructured prose,
+including generic reliability directives, is not a valid protocol value.
 
 Malformed JSON, unknown fields, invalid evidence, or invalid artifact semantics fails the complete
 interpretation. A failed run preserves the last successful findings and artifacts verbatim.

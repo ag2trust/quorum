@@ -27,10 +27,12 @@ use quorum_core::review_findings::{
 use quorum_core::review_followups::{
     EvidenceKind, FollowupEvidenceIds, ReviewFollowupArtifact, ReviewFollowupEvidenceId,
     ScopeRelationship, TechnicalImpact, VerificationExpectations, MAX_FOLLOWUP_ARTIFACTS,
-    MAX_FOLLOWUP_TEXT_BYTES,
+    MAX_FOLLOWUP_EVIDENCE_IDS, MAX_FOLLOWUP_TEXT_BYTES,
 };
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -38,7 +40,7 @@ use tokio::time::timeout;
 /// Version stamp on every finding / run row this collector generation writes.
 /// Bump when the prompt/schema meaningfully changes so future readers can filter
 /// analytics by generation.
-pub const COLLECTOR_VERSION: &str = "v1";
+pub const COLLECTOR_VERSION: &str = "v2";
 
 /// Hard wall-clock cap on the classifier turn. Post-merge, so failing here
 /// leaves the merged task alone — the observable surface is `review_collection_runs`.
@@ -53,6 +55,19 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const GH_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 const MAX_REVIEW_FINDINGS: usize = 128;
+
+/// The largest distinct evidence universe a maximum-size response can cite:
+/// every finding and every artifact may use its complete bounded evidence list.
+/// Production extraction stops at this record count while streaming the raw
+/// paginated JSON, before retaining another entry or allocating a full DOM.
+const MAX_FETCHED_EVIDENCE_RECORDS: usize =
+    (MAX_REVIEW_FINDINGS + MAX_FOLLOWUP_ARTIFACTS) * MAX_FOLLOWUP_EVIDENCE_IDS;
+
+/// Bound the raw evidence material this PR's added parser will inspect. The
+/// underlying `gh` capture is older transport debt, but payloads above this
+/// aggregate limit fail before Serde performs any additional parsing work.
+const MAX_FETCHED_EVIDENCE_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FETCHED_EVIDENCE_ARRAY_DEPTH: usize = 2;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,12 +102,32 @@ struct RawEvidenceId {
 struct RawFollowupArtifact {
     technical_impact: TechnicalImpact,
     scope_relationship: ScopeRelationship,
-    concern: String,
+    concern: RawConcreteConcern,
     non_blocking_reason: String,
     affected_behavior: String,
-    desired_outcome: String,
+    desired_outcome: RawObservableOutcome,
     verification_expectations: Vec<String>,
     evidence: Vec<RawEvidenceId>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConcreteConcern {
+    failure_mode: String,
+    trigger_or_assumption: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawObservableOutcome {
+    observable_behavior: String,
+    observation_condition: String,
+}
+
+#[derive(Debug)]
+struct ValidatedArtifactText {
+    concern: String,
+    desired_outcome: String,
 }
 
 #[derive(Debug)]
@@ -144,7 +179,7 @@ fn parse_and_validate_response(
     let mut followup_artifacts = Vec::with_capacity(raw.followup_artifacts.len());
     for (ordinal, artifact) in raw.followup_artifacts.into_iter().enumerate() {
         validate_artifact_source(&artifact, &raw.findings)?;
-        validate_artifact_text(&artifact)?;
+        let artifact_text = validate_artifact_text(&artifact)?;
         let verification_expectations =
             VerificationExpectations::new(artifact.verification_expectations)?;
         let evidence_ids = validated_evidence(artifact.evidence, &available_evidence)?;
@@ -154,10 +189,10 @@ fn parse_and_validate_response(
             ordinal as i64,
             artifact.technical_impact,
             artifact.scope_relationship,
-            artifact.concern,
+            artifact_text.concern,
             artifact.non_blocking_reason,
             artifact.affected_behavior,
-            artifact.desired_outcome,
+            artifact_text.desired_outcome,
             verification_expectations,
             evidence_ids,
             None,
@@ -273,24 +308,34 @@ fn validate_artifact_source(artifact: &RawFollowupArtifact, findings: &[RawFindi
     Ok(())
 }
 
-fn validate_artifact_text(artifact: &RawFollowupArtifact) -> Result<()> {
+fn validate_artifact_text(artifact: &RawFollowupArtifact) -> Result<ValidatedArtifactText> {
     for (field, value) in [
-        ("concern", artifact.concern.as_str()),
         ("non-blocking reason", artifact.non_blocking_reason.as_str()),
         ("affected behavior", artifact.affected_behavior.as_str()),
-        ("desired outcome", artifact.desired_outcome.as_str()),
     ] {
         validate_bounded_text(field, value)?;
     }
     for expectation in &artifact.verification_expectations {
         validate_bounded_text("verification expectation", expectation)?;
     }
-    if is_vague_improvement(&artifact.concern) || is_vague_improvement(&artifact.desired_outcome) {
-        return Err(QuorumError::Usage(
-            "follow-up artifact must state a concrete concern and desired outcome".into(),
-        ));
-    }
-    Ok(())
+    let concern = join_structured_text(
+        "concern",
+        "failure mode",
+        &artifact.concern.failure_mode,
+        "trigger or assumption",
+        &artifact.concern.trigger_or_assumption,
+    )?;
+    let desired_outcome = join_structured_text(
+        "desired outcome",
+        "observable behavior",
+        &artifact.desired_outcome.observable_behavior,
+        "observation condition",
+        &artifact.desired_outcome.observation_condition,
+    )?;
+    Ok(ValidatedArtifactText {
+        concern,
+        desired_outcome,
+    })
 }
 
 fn validate_bounded_text(field: &str, value: &str) -> Result<()> {
@@ -302,92 +347,18 @@ fn validate_bounded_text(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_vague_improvement(value: &str) -> bool {
-    let words = value
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-
-    // A concrete concern names a failure, and a concrete outcome names an
-    // observable state. Very short labels and generic improvement directives
-    // do neither, even when they contain a domain-quality noun not anticipated
-    // by a denylist (for example, "Improve queue reliability").
-    let starts_with_generic_directive = words.first().is_some_and(|word| {
-        matches!(
-            word.as_str(),
-            "better"
-                | "cleanup"
-                | "enhance"
-                | "enhancement"
-                | "fix"
-                | "improve"
-                | "improved"
-                | "improves"
-                | "improving"
-                | "make"
-                | "optimize"
-                | "strengthen"
-        )
-    });
-    words.len() < 3
-        || starts_with_generic_directive
-        || words.iter().all(|word| {
-            matches!(
-                word.as_str(),
-                "a" | "an"
-                    | "and"
-                    | "be"
-                    | "better"
-                    | "clean"
-                    | "cleanup"
-                    | "code"
-                    | "consistency"
-                    | "correctness"
-                    | "could"
-                    | "do"
-                    | "enhance"
-                    | "enhancement"
-                    | "fix"
-                    | "future"
-                    | "general"
-                    | "generally"
-                    | "improve"
-                    | "improvement"
-                    | "issue"
-                    | "it"
-                    | "make"
-                    | "maintainability"
-                    | "maintainable"
-                    | "more"
-                    | "optimize"
-                    | "performance"
-                    | "performant"
-                    | "please"
-                    | "quality"
-                    | "reliability"
-                    | "reliable"
-                    | "resilience"
-                    | "resilient"
-                    | "robust"
-                    | "robustness"
-                    | "safer"
-                    | "safety"
-                    | "secure"
-                    | "security"
-                    | "something"
-                    | "strengthen"
-                    | "that"
-                    | "the"
-                    | "thing"
-                    | "things"
-                    | "this"
-                    | "to"
-                    | "up"
-                    | "usability"
-                    | "work"
-            )
-        })
+fn join_structured_text(
+    field: &str,
+    first_label: &str,
+    first: &str,
+    second_label: &str,
+    second: &str,
+) -> Result<String> {
+    validate_bounded_text(first_label, first)?;
+    validate_bounded_text(second_label, second)?;
+    let combined = format!("{} when {}", first.trim(), second.trim());
+    validate_bounded_text(field, &combined)?;
+    Ok(combined)
 }
 
 fn validated_evidence(
@@ -411,6 +382,11 @@ fn validated_evidence(
 
 fn fetched_evidence(inputs: &CollectorInputs) -> Result<HashSet<(EvidenceKind, i64)>> {
     if let Some(index) = &inputs.fetched_evidence {
+        if index.len() > MAX_FETCHED_EVIDENCE_RECORDS {
+            return Err(QuorumError::Usage(
+                "fetched evidence index exceeds bounded record count".into(),
+            ));
+        }
         return index
             .iter()
             .map(|evidence| {
@@ -432,54 +408,188 @@ fn fetched_evidence_from_json(
     review_comments_json: &str,
     issue_comments_json: &str,
 ) -> Result<HashSet<(EvidenceKind, i64)>> {
-    let mut evidence = HashSet::new();
-    add_fetched_ids(&mut evidence, EvidenceKind::Review, reviews_json)?;
+    let input_bytes = reviews_json
+        .len()
+        .checked_add(review_comments_json.len())
+        .and_then(|bytes| bytes.checked_add(issue_comments_json.len()))
+        .ok_or_else(|| QuorumError::Usage("fetched evidence byte count overflow".into()))?;
+    if input_bytes > MAX_FETCHED_EVIDENCE_JSON_BYTES {
+        return Err(QuorumError::Usage(
+            "fetched evidence JSON exceeds bounded input size".into(),
+        ));
+    }
+    let mut index = FetchedEvidenceIndex::default();
+    add_fetched_ids(&mut index, EvidenceKind::Review, reviews_json)?;
     add_fetched_ids(
-        &mut evidence,
+        &mut index,
         EvidenceKind::ReviewComment,
         review_comments_json,
     )?;
-    add_fetched_ids(
-        &mut evidence,
-        EvidenceKind::IssueComment,
-        issue_comments_json,
-    )?;
-    Ok(evidence)
+    add_fetched_ids(&mut index, EvidenceKind::IssueComment, issue_comments_json)?;
+    Ok(index.evidence)
 }
 
-fn add_fetched_ids(
-    evidence: &mut HashSet<(EvidenceKind, i64)>,
-    kind: EvidenceKind,
-    json: &str,
-) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_str(json).map_err(|error| {
-        QuorumError::Usage(format!("malformed fetched {kind} evidence JSON: {error}"))
-    })?;
-    add_json_record_ids(evidence, kind, &value);
-    Ok(())
+#[derive(Default)]
+struct FetchedEvidenceIndex {
+    evidence: HashSet<(EvidenceKind, i64)>,
+    records: usize,
 }
 
-fn add_json_record_ids(
-    evidence: &mut HashSet<(EvidenceKind, i64)>,
+fn add_fetched_ids(index: &mut FetchedEvidenceIndex, kind: EvidenceKind, json: &str) -> Result<()> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    FetchedEvidenceSeed {
+        index,
+        kind,
+        array_depth: 0,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end())
+    .map_err(|error| QuorumError::Usage(format!("malformed fetched {kind} evidence JSON: {error}")))
+}
+
+struct FetchedEvidenceSeed<'a> {
+    index: &'a mut FetchedEvidenceIndex,
     kind: EvidenceKind,
-    value: &serde_json::Value,
-) {
-    match value {
-        // `gh api --paginate --slurp` returns an outer page array. Recursing
-        // through arrays accepts that shape and the single-page fixture shape.
-        serde_json::Value::Array(values) => {
-            for value in values {
-                add_json_record_ids(evidence, kind, value);
-            }
+    array_depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for FetchedEvidenceSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<(), D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(FetchedEvidenceVisitor {
+            index: self.index,
+            kind: self.kind,
+            array_depth: self.array_depth,
+        })
+    }
+}
+
+struct FetchedEvidenceVisitor<'a> {
+    index: &'a mut FetchedEvidenceIndex,
+    kind: EvidenceKind,
+    array_depth: usize,
+}
+
+impl<'de> Visitor<'de> for FetchedEvidenceVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a GitHub evidence record or paginated array")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        if self.array_depth >= MAX_FETCHED_EVIDENCE_ARRAY_DEPTH {
+            return Err(de::Error::custom(
+                "fetched evidence exceeds bounded array depth",
+            ));
         }
-        serde_json::Value::Object(record) => {
-            if let Some(id) = record.get("id").and_then(serde_json::Value::as_i64) {
-                if id > 0 {
-                    evidence.insert((kind, id));
+        let index = self.index;
+        while sequence
+            .next_element_seed(FetchedEvidenceSeed {
+                index: &mut *index,
+                kind: self.kind,
+                array_depth: self.array_depth + 1,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        self.index.records = self
+            .index
+            .records
+            .checked_add(1)
+            .ok_or_else(|| de::Error::custom("fetched evidence record count overflow"))?;
+        if self.index.records > MAX_FETCHED_EVIDENCE_RECORDS {
+            return Err(de::Error::custom(
+                "fetched evidence exceeds bounded record count",
+            ));
+        }
+
+        let mut id = None;
+        while let Some(field) = map.next_key::<FetchedEvidenceField>()? {
+            match field {
+                FetchedEvidenceField::Id => id = map.next_value::<Option<i64>>()?,
+                FetchedEvidenceField::Other => {
+                    map.next_value::<IgnoredAny>()?;
                 }
             }
         }
-        _ => {}
+        if let Some(id) = id.filter(|id| *id > 0) {
+            self.index.evidence.insert((self.kind, id));
+        }
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<(), E> {
+        Ok(())
+    }
+}
+
+enum FetchedEvidenceField {
+    Id,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for FetchedEvidenceField {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_identifier(FetchedEvidenceFieldVisitor)
+    }
+}
+
+struct FetchedEvidenceFieldVisitor;
+
+impl Visitor<'_> for FetchedEvidenceFieldVisitor {
+    type Value = FetchedEvidenceField;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a GitHub evidence record field")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(if value == "id" {
+            FetchedEvidenceField::Id
+        } else {
+            FetchedEvidenceField::Other
+        })
     }
 }
 
@@ -1415,10 +1525,16 @@ mod tests {
         serde_json::json!({
             "technical_impact": "major",
             "scope_relationship": "out_of_scope",
-            "concern": "A timed-out worker can lose the pending operation",
+            "concern": {
+                "failure_mode": "The worker loses the pending operation",
+                "trigger_or_assumption": "A provider request times out during shutdown"
+            },
             "non_blocking_reason": "The merged change does not alter timeout handling",
             "affected_behavior": "Worker shutdown after a provider timeout",
-            "desired_outcome": "Timed-out workers preserve the pending operation for retry",
+            "desired_outcome": {
+                "observable_behavior": "The worker preserves the pending operation for retry",
+                "observation_condition": "A provider request times out during shutdown"
+            },
             "verification_expectations": ["A timeout recovery test preserves the operation"],
             "evidence": [{"kind": "review_comment", "id": id}]
         })
@@ -1578,6 +1694,22 @@ mod tests {
         )
         .is_err());
 
+        let mut unknown_concern = artifact(10);
+        unknown_concern["concern"]["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![unknown_concern]),
+            &inputs,
+        )
+        .is_err());
+
+        let mut unknown_outcome = artifact(10);
+        unknown_outcome["desired_outcome"]["extra"] = serde_json::json!(true);
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![unknown_outcome]),
+            &inputs,
+        )
+        .is_err());
+
         let mut unknown_evidence = artifact(10);
         unknown_evidence["evidence"][0]["extra"] = serde_json::json!(true);
         assert!(parse_fixture(
@@ -1597,11 +1729,12 @@ mod tests {
         let mut artifacts = (0..MAX_FOLLOWUP_ARTIFACTS)
             .map(|_| artifact(1))
             .collect::<Vec<_>>();
-        let concern_prefix = "Concurrent shutdown loses operations ";
-        artifacts[0]["concern"] = serde_json::Value::String(format!(
-            "{concern_prefix}{}",
-            "x".repeat(MAX_FOLLOWUP_TEXT_BYTES - concern_prefix.len())
-        ));
+        let trigger = "concurrent shutdown overlaps request handling";
+        artifacts[0]["concern"]["failure_mode"] = serde_json::Value::String(
+            "x".repeat(MAX_FOLLOWUP_TEXT_BYTES - " when ".len() - trigger.len()),
+        );
+        artifacts[0]["concern"]["trigger_or_assumption"] =
+            serde_json::Value::String(trigger.into());
         for candidate in &mut artifacts {
             candidate["verification_expectations"] = serde_json::json!([
                 "expectation one",
@@ -1674,6 +1807,49 @@ mod tests {
     }
 
     #[test]
+    fn fetched_evidence_streams_paginated_records_without_nested_payload_ids() {
+        let large_body = "x".repeat(MAX_PAYLOAD_BYTES * 2);
+        let reviews = format!(
+            r#"[[{{"id":10,"body":{},"nested":{{"id":999}}}}],[{{"id":11}}]]"#,
+            serde_json::to_string(&large_body).unwrap()
+        );
+        let evidence = fetched_evidence_from_json(&reviews, "[]", "[]").unwrap();
+        assert_eq!(evidence.len(), 2);
+        assert!(evidence.contains(&(EvidenceKind::Review, 10)));
+        assert!(evidence.contains(&(EvidenceKind::Review, 11)));
+        assert!(!evidence.contains(&(EvidenceKind::Review, 999)));
+    }
+
+    #[test]
+    fn fetched_evidence_rejects_record_overrun_at_streaming_boundary() {
+        let records = std::iter::repeat_n(r#"{"id":1}"#, MAX_FETCHED_EVIDENCE_RECORDS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let reviews = format!("[{records}]");
+        let error = fetched_evidence_from_json(&reviews, "[]", "[]").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fetched evidence exceeds bounded record count"));
+    }
+
+    #[test]
+    fn fetched_evidence_rejects_oversized_input_before_json_parsing() {
+        let oversized_malformed = "[".repeat(MAX_FETCHED_EVIDENCE_JSON_BYTES + 1);
+        let error = fetched_evidence_from_json(&oversized_malformed, "[]", "[]").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fetched evidence JSON exceeds bounded input size"));
+    }
+
+    #[test]
+    fn fetched_evidence_rejects_unexpected_array_nesting() {
+        let error = fetched_evidence_from_json("[[[{\"id\":1}]]]", "[]", "[]").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fetched evidence exceeds bounded array depth"));
+    }
+
+    #[test]
     fn collector_protocol_rejects_artifact_without_suggestion_source() {
         assert!(parse_fixture(
             &response(vec![finding("blocking", 10)], vec![artifact(10)]),
@@ -1720,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn collector_protocol_rejects_vague_concern_or_desired_outcome() {
+    fn collector_protocol_rejects_unstructured_vague_concern_or_desired_outcome() {
         let inputs = parser_inputs(&[10], &[]);
         for field in ["concern", "desired_outcome"] {
             for vague_text in [
@@ -1728,6 +1904,8 @@ mod tests {
                 "Improve reliability",
                 "Better reliability.",
                 "Improve queue reliability",
+                "Queue reliability should improve",
+                "The queue should be more reliable",
             ] {
                 let mut candidate = artifact(10);
                 candidate[field] = serde_json::json!(vague_text);
@@ -1741,19 +1919,50 @@ mod tests {
                 );
             }
         }
+
+        let mut incomplete_concern = artifact(10);
+        incomplete_concern["concern"] =
+            serde_json::json!({"failure_mode": "Queue reliability should improve"});
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![incomplete_concern]),
+            &inputs,
+        )
+        .is_err());
+
+        let mut incomplete_outcome = artifact(10);
+        incomplete_outcome["desired_outcome"] =
+            serde_json::json!({"observable_behavior": "The queue should be more reliable"});
+        assert!(parse_fixture(
+            &response(vec![finding("suggestion", 10)], vec![incomplete_outcome]),
+            &inputs,
+        )
+        .is_err());
     }
 
     #[test]
     fn collector_protocol_accepts_concise_concrete_concern_and_outcome() {
         let inputs = parser_inputs(&[10], &[]);
         let mut candidate = artifact(10);
-        candidate["concern"] = serde_json::json!("Concurrent shutdown loses operations");
-        candidate["desired_outcome"] = serde_json::json!("Retries preserve pending operations");
-        assert!(parse_fixture(
+        candidate["concern"]["failure_mode"] = serde_json::json!("Requests deadlock");
+        candidate["concern"]["trigger_or_assumption"] =
+            serde_json::json!("Concurrent shutdown overlaps request handling");
+        candidate["desired_outcome"]["observable_behavior"] =
+            serde_json::json!("Requests complete");
+        candidate["desired_outcome"]["observation_condition"] =
+            serde_json::json!("The retry resumes after shutdown");
+        let parsed = parse_fixture(
             &response(vec![finding("suggestion", 10)], vec![candidate]),
             &inputs,
         )
-        .is_ok());
+        .unwrap();
+        assert_eq!(
+            parsed.followup_artifacts[0].concern(),
+            "Requests deadlock when Concurrent shutdown overlaps request handling"
+        );
+        assert_eq!(
+            parsed.followup_artifacts[0].desired_outcome(),
+            "Requests complete when The retry resumes after shutdown"
+        );
     }
 
     #[test]
@@ -1817,14 +2026,24 @@ mod tests {
     #[test]
     fn collector_protocol_rejects_each_overlong_artifact_string() {
         let inputs = parser_inputs(&[10], &[]);
-        for field in [
-            "concern",
-            "non_blocking_reason",
-            "affected_behavior",
-            "desired_outcome",
-        ] {
+        for field in ["non_blocking_reason", "affected_behavior"] {
             let mut candidate = artifact(10);
             candidate[field] = serde_json::Value::String("x".repeat(MAX_FOLLOWUP_TEXT_BYTES + 1));
+            assert!(parse_fixture(
+                &response(vec![finding("suggestion", 10)], vec![candidate]),
+                &inputs,
+            )
+            .is_err());
+        }
+        for (field, component) in [
+            ("concern", "failure_mode"),
+            ("concern", "trigger_or_assumption"),
+            ("desired_outcome", "observable_behavior"),
+            ("desired_outcome", "observation_condition"),
+        ] {
+            let mut candidate = artifact(10);
+            candidate[field][component] =
+                serde_json::Value::String("x".repeat(MAX_FOLLOWUP_TEXT_BYTES + 1));
             assert!(parse_fixture(
                 &response(vec![finding("suggestion", 10)], vec![candidate]),
                 &inputs,
@@ -1836,13 +2055,16 @@ mod tests {
     #[test]
     fn collector_protocol_rejects_aggregate_artifact_overrun() {
         let mut candidate = artifact(10);
-        for field in [
-            "concern",
-            "non_blocking_reason",
-            "affected_behavior",
-            "desired_outcome",
-        ] {
+        for field in ["non_blocking_reason", "affected_behavior"] {
             candidate[field] = serde_json::Value::String("x".repeat(8_000));
+        }
+        for (field, component) in [
+            ("concern", "failure_mode"),
+            ("concern", "trigger_or_assumption"),
+            ("desired_outcome", "observable_behavior"),
+            ("desired_outcome", "observation_condition"),
+        ] {
+            candidate[field][component] = serde_json::Value::String("x".repeat(3_900));
         }
         candidate["verification_expectations"] = serde_json::Value::Array(
             (0..8)

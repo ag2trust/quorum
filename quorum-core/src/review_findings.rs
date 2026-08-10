@@ -342,7 +342,8 @@ pub struct CollectorInputs {
     pub reviews_json: String,
     pub review_comments_json: String,
     pub issue_comments_json: String,
-    /// Deterministic evidence index captured before bounded prompt truncation.
+    /// Deterministic, record-count-bounded evidence index captured by streaming
+    /// the raw payloads before bounded prompt truncation.
     /// `None` keeps hand-built/legacy inputs compatible with validation that
     /// derives IDs directly from their JSON payloads.
     #[serde(skip)]
@@ -465,10 +466,15 @@ Fields per follow-up artifact:
 2. `scope_relationship` — `"pre_existing" | "out_of_scope" |
    "threat_model_expansion" | "defense_in_depth" | "future_requirement" |
    "design_debt"`.
-3. `concern` — the concrete failure under stated assumptions.
+3. `concern` — a closed object with both:
+   - `failure_mode` — the concrete failure (concise text such as "Requests deadlock" is valid),
+   - `trigger_or_assumption` — when or under which assumption the failure occurs.
 4. `non_blocking_reason` — why the merged PR did not need to resolve it.
 5. `affected_behavior` — the affected product behavior.
-6. `desired_outcome` — an observable future outcome, not a vague improvement.
+6. `desired_outcome` — a closed object with both:
+   - `observable_behavior` — the behavior that can be observed (concise text such as
+     "Requests complete" is valid),
+   - `observation_condition` — when the behavior must be observed.
 7. `verification_expectations` — one through eight concrete checks.
 8. `evidence` — one or more unique GitHub evidence rows, all present above.
 
@@ -483,10 +489,12 @@ Respond with ONLY a JSON object:
    "evidence":[{{"kind":"review_comment","id":12345}}]}}
 ],"followup_artifacts":[
   {{"technical_impact":"major","scope_relationship":"out_of_scope",
-   "concern":"Concrete failure under the stated assumptions",
+   "concern":{{"failure_mode":"Requests deadlock",
+              "trigger_or_assumption":"Concurrent shutdown overlaps request handling"}},
    "non_blocking_reason":"Why the merged PR did not need to resolve it",
    "affected_behavior":"Product behavior affected by the concern",
-   "desired_outcome":"Observable future outcome",
+   "desired_outcome":{{"observable_behavior":"Requests complete",
+                       "observation_condition":"The retry resumes after shutdown"}},
    "verification_expectations":["Evidence that proves the outcome"],
    "evidence":[{{"kind":"review_comment","id":12345}}]}}
 ]}}
@@ -972,5 +980,9 @@ mod tests {
         assert!(prompt.contains("followup_artifacts"));
         assert!(prompt.contains("technical_impact"));
         assert!(prompt.contains("scope_relationship"));
+        assert!(prompt.contains("failure_mode"));
+        assert!(prompt.contains("trigger_or_assumption"));
+        assert!(prompt.contains("observable_behavior"));
+        assert!(prompt.contains("observation_condition"));
     }
 }
