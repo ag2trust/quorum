@@ -49,6 +49,17 @@ fn install_real_pre_push_hook(repo: &std::path::Path, hook_dir: &std::path::Path
         .success());
 }
 
+fn test_command_path(shim_dir: &std::path::Path) -> String {
+    let cargo_dir = std::path::Path::new(env!("CARGO"))
+        .parent()
+        .expect("cargo executable must have a parent directory");
+    format!(
+        "{}:{}:/usr/bin:/bin:/usr/sbin:/sbin",
+        shim_dir.display(),
+        cargo_dir.display()
+    )
+}
+
 fn write_names(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut file = std::fs::File::create(&path).unwrap();
@@ -509,6 +520,17 @@ impl Case {
                 "task-retry failed: {}",
                 String::from_utf8_lossy(&retry.stderr)
             );
+            let retried = quorum_core::tasks::get(
+                &quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap(),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let retried_refs: serde_json::Value =
+                serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(retried.status, "rework");
+            assert_eq!(retried_refs["daemon_rework_retry_requested"], true);
+            assert_eq!(retried_refs["daemon_publication"]["pr"], fixture.pr);
             parked_expected_sha = Some(expected_sha);
             parked_remote_sha = Some(remote_sha);
         }
@@ -628,7 +650,7 @@ fi
         {
             std::fs::copy(&runner, &codex_path).unwrap();
         }
-        let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", gh_shim.path().display());
+        let path = test_command_path(gh_shim.path());
         let sentinel = tempfile::tempdir().unwrap();
         let (runner_hold_reader, runner_hold_writer) = runner_hold_pipe();
         let mut serve = Command::new(cargo_bin("quorum"));
@@ -774,13 +796,7 @@ fi
             .env("QUORUM_REPO", "test/repo")
             .env("RUNNER_LOG", &self.runner_log)
             .env("RUNNER_HOLD_FD", runner_hold_reader.as_raw_fd().to_string())
-            .env(
-                "PATH",
-                format!(
-                    "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-                    self.gh_shim.path().display()
-                ),
-            )
+            .env("PATH", test_command_path(self.gh_shim.path()))
             .env("QUORUM_TEST_GH_STATE", self.gh_shim.path().join("state"))
             .env("QUORUM_TEST_REPO", self._repo.path())
             .args([
@@ -968,28 +984,50 @@ const CHATGPT_ONLY_ROLE_CONFIG: &str = "chatgpt-only-routing";
 fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() {
     let mut case = Case::start_parked_publication(false);
     case.handle.wait_for("worktree provisioned");
+    let worker = case.handle.agent_after("spawning agent ");
     case.handle.wait_for("turn");
 
     let expected_sha = case.parked_expected_sha.as_deref().unwrap();
-    let (worktree, journal_pr, remote_branch, rework_count) = {
+    let (worktree, remote_branch, rework_count, stale_source_sha, retry_requested) = {
         let conn = case.db();
-        conn.query_row(
-            "SELECT worktree,pr,branch,rework_count
+        let journal = conn
+            .query_row(
+                "SELECT worktree,branch,rework_count
              FROM journal WHERE task_id=1 AND role='worker'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        (
+            journal.0,
+            journal.1,
+            journal.2,
+            refs["daemon_publication"]["local_sha"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            refs["daemon_rework_retry_requested"]
+                .as_bool()
+                .unwrap_or(false),
         )
-        .unwrap()
     };
-    assert_eq!(journal_pr, Some(10));
-    assert_eq!(remote_branch, "parked-pr-10");
+    assert!(
+        retry_requested,
+        "retry marker disappeared before worker spawn"
+    );
+    assert_eq!(
+        remote_branch, "parked-pr-10",
+        "parked retry did not select recorded PR target: {:?}",
+        case.handle.lines
+    );
     assert_eq!(rework_count, 1);
     for ancestor in [expected_sha, "origin/main"] {
         assert!(
@@ -1033,25 +1071,13 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
     .unwrap()
     .trim()
     .to_string();
+    assert_ne!(delivery_sha, stale_source_sha);
 
     let hooks = tempfile::tempdir().unwrap();
     install_real_pre_push_hook(case._repo.path(), hooks.path());
-    let pushed = Command::new("git")
-        .env("QUORUM_CONTINUATION_BASE_BRANCH", "main")
-        .args([
-            "-C",
-            &worktree,
-            "push",
-            &case._repo.path().to_string_lossy(),
-            "HEAD:refs/heads/parked-pr-10",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        pushed.status.success(),
-        "real pre-push hook rejected retry delivery: {}",
-        String::from_utf8_lossy(&pushed.stderr)
-    );
+    case.done(&worker, &[]);
+    case.handle.wait_for("PR #10 ready for review");
+
     let remote_sha = String::from_utf8(
         Command::new("git")
             .args([
@@ -1068,6 +1094,17 @@ fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() 
     .trim()
     .to_string();
     assert_eq!(remote_sha, delivery_sha);
+    assert_ne!(remote_sha, stale_source_sha);
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "in-review");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert!(
+        refs.get("daemon_publication").is_none(),
+        "daemon publisher must retire the superseded delivery intent"
+    );
+    drop(conn);
     case.handle.stop_mut();
 }
 

@@ -983,21 +983,24 @@ async fn persist_publication_intent(
     .map_err(|e| format!("publication intent persistence failed: {e}"))
 }
 
-async fn load_publication_intent(
+async fn load_publication_state(
     db_path: &Path,
     task_id: i64,
-) -> std::result::Result<Option<PublicationIntent>, String> {
+) -> std::result::Result<(Option<PublicationIntent>, bool), String> {
     let p = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<Option<PublicationIntent>> {
+    let refs = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
         let conn = quorum_core::db::open(&p)?;
         let Some(task) = tasks::get(&conn, task_id)? else {
             return Ok(None);
         };
-        Ok(publication_intent_from_refs(task.refs.as_deref()))
+        Ok(task.refs)
     })
     .await
     .map_err(|e| format!("publication intent read join failure: {e}"))?
-    .map_err(|e| format!("publication intent read failed: {e}"))
+    .map_err(|e| format!("publication intent read failed: {e}"))?;
+    let intent = publication_intent_from_refs(refs.as_deref());
+    let supersede_source = parked_rework_publication_intent(refs.as_deref())?.is_some();
+    Ok((intent, supersede_source))
 }
 
 fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent> {
@@ -1248,7 +1251,7 @@ async fn publish_worker_completion(
     branch: &str,
     known_pr: Option<i64>,
 ) -> std::result::Result<PublishedCompletion, String> {
-    let prior = load_publication_intent(&config.db_path, task_id).await?;
+    let (prior, supersede_source) = load_publication_state(&config.db_path, task_id).await?;
     if let Some(prior) = &prior {
         if prior.branch != branch {
             return Err(format!(
@@ -1260,9 +1263,13 @@ async fn publish_worker_completion(
             return Err("durable publication PR conflicts with current task PR".into());
         }
     }
-    let local_sha = match &prior {
-        Some(intent) => intent.local_sha.clone(),
-        None => wt_mgr.head_sha(worktree).await?,
+    let local_sha = match (&prior, supersede_source) {
+        // A parked-rework retry is a new, explicitly requested delivery round.
+        // Its worktree was provisioned from the recorded PR lease, so its
+        // completed HEAD supersedes the failed pre-park source. Ordinary
+        // publication crash recovery still replays the exact durable source.
+        (_, true) | (None, false) => wt_mgr.head_sha(worktree).await?,
+        (Some(intent), false) => intent.local_sha.clone(),
     };
     // Pin before persisting a new intent. A crash between these operations can
     // leave only a harmless local ref; the unsafe inverse would persist an
@@ -1325,6 +1332,10 @@ async fn publish_worker_completion(
         stage: "intent".into(),
         expected_remote_sha: expected_remote_sha.clone(),
     });
+    if supersede_source {
+        intent.local_sha = local_sha.clone();
+        intent.stage = "intent".into();
+    }
     intent.pr = known_pr;
     intent.expected_remote_sha = expected_remote_sha;
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
