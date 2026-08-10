@@ -10,15 +10,17 @@ use rusqlite::Connection;
 /// delivery.
 ///
 /// An ordinary task is neither a decomposition source nor a generated graph
-/// member. Its `done` status must retain the positive PR association written
-/// before the merge transition. The single bounded query uses primary/unique
-/// indexes and opens no transaction.
+/// member. Its `done` status must retain both the positive PR association and
+/// the daemon-owned merged provenance written by an authoritative completion
+/// path. The single bounded query uses primary/unique indexes and opens no
+/// transaction.
 pub fn ordinary_task_done_through_merge(conn: &Connection, task_id: i64) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM tasks task
              WHERE task.id=?1
                AND task.status='done'
+               AND task.completion_provenance='merged'
                AND json_valid(task.refs)
                AND json_type(task.refs,'$.pr')='integer'
                AND json_extract(task.refs,'$.pr')>0
@@ -63,6 +65,15 @@ mod tests {
         crate::tasks::apply_event(conn, "daemon", task_id, &Event::MergeSucceeded, 101).unwrap();
     }
 
+    fn completion_provenance(conn: &Connection, task_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT completion_provenance FROM tasks WHERE id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn ordinary_done_through_merge_is_positive_without_side_effects() {
         let (_dir, mut conn) = database();
@@ -96,6 +107,88 @@ mod tests {
     }
 
     #[test]
+    fn every_authoritative_merge_completion_path_is_eligible() {
+        let (_dir, mut conn) = database();
+
+        let daemon_confirmed = create_task(&mut conn, "daemon-confirmed merge");
+        complete_merge(&mut conn, daemon_confirmed, 41);
+
+        let externally_observed = create_task(&mut conn, "externally observed merge");
+        conn.execute(
+            "UPDATE tasks SET status='in-review',refs=json_object('pr',42) WHERE id=?1",
+            [externally_observed],
+        )
+        .unwrap();
+        crate::tasks::apply_event(
+            &mut conn,
+            "daemon",
+            externally_observed,
+            &Event::PrFoundMerged,
+            102,
+        )
+        .unwrap();
+
+        let merge_recovery = create_task(&mut conn, "merge recovery");
+        conn.execute(
+            "UPDATE tasks SET refs=json_object('pr',43) WHERE id=?1",
+            [merge_recovery],
+        )
+        .unwrap();
+        assert!(crate::tasks::close_after_merge(
+            &mut conn,
+            merge_recovery,
+            "daemon recovered authoritative merge",
+            103,
+        )
+        .unwrap());
+
+        for task_id in [daemon_confirmed, externally_observed, merge_recovery] {
+            assert_eq!(
+                completion_provenance(&conn, task_id).as_deref(),
+                Some(crate::tasks::COMPLETION_PROVENANCE_MERGED)
+            );
+            assert!(ordinary_task_done_through_merge(&conn, task_id).unwrap());
+        }
+    }
+
+    #[test]
+    fn manual_close_retains_pr_but_is_ineligible() {
+        let (_dir, mut conn) = database();
+        let task_id = create_task(&mut conn, "manual close with retained PR");
+        conn.execute(
+            "UPDATE tasks SET refs=json_object('pr',51) WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+
+        crate::tasks::close_manual(
+            &mut conn,
+            "owner",
+            task_id,
+            "resolved outside the managed merge lifecycle",
+            102,
+        )
+        .unwrap()
+        .unwrap();
+
+        let (status, pr, provenance): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT status,json_extract(refs,'$.pr'),completion_provenance
+                 FROM tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(pr, 51, "task-close must retain the existing PR reference");
+        assert_eq!(
+            provenance.as_deref(),
+            Some(crate::tasks::COMPLETION_PROVENANCE_MANUAL)
+        );
+        assert!(!ordinary_task_done_through_merge(&conn, task_id).unwrap());
+    }
+
+    #[test]
     fn non_merged_and_non_ordinary_tasks_are_negative() {
         let (_dir, mut conn) = database();
 
@@ -106,10 +199,10 @@ mod tests {
         )
         .unwrap();
 
-        let done_without_pr = create_task(&mut conn, "manual completion");
+        let legacy_done_with_pr = create_task(&mut conn, "legacy unknown completion");
         conn.execute(
-            "UPDATE tasks SET status='done' WHERE id=?1",
-            [done_without_pr],
+            "UPDATE tasks SET status='done',refs=json_object('pr',50) WHERE id=?1",
+            [legacy_done_with_pr],
         )
         .unwrap();
 
@@ -143,7 +236,8 @@ mod tests {
         )
         .unwrap();
 
-        for task_id in [open_with_pr, done_without_pr, source, child, i64::MAX] {
+        assert_eq!(completion_provenance(&conn, legacy_done_with_pr), None);
+        for task_id in [open_with_pr, legacy_done_with_pr, source, child, i64::MAX] {
             assert!(
                 !ordinary_task_done_through_merge(&conn, task_id).unwrap(),
                 "task #{task_id} must not satisfy ordinary merged eligibility"

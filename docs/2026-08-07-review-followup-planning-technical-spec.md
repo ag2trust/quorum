@@ -299,7 +299,8 @@ assessment and membership rows in one `BEGIN IMMEDIATE` transaction.
 
 An ordinary task is eligible when:
 
-- its task is `done` through merged delivery;
+- its task is `done` with daemon-owned `completion_provenance=merged` and a positive PR
+  association; manual and legacy/unknown completion provenance fail closed;
 - its current-generation collection run succeeded;
 - its immutable batch exists; and
 - `artifact_count > 0`.
@@ -312,7 +313,7 @@ Generated-child merges collect artifacts but never create child assessment jobs.
 eligible when:
 
 - the graph is `completed`, or it is `cancelled` with at least one merged child;
-- every merged generated child has a PR association;
+- every merged generated child has `completion_provenance=merged` and a PR association;
 - every such PR has a successful current-generation collection run and immutable batch; and
 - the union contains at least one unresolved artifact.
 
