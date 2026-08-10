@@ -1691,9 +1691,19 @@ fn explicitly_configured_provider(config: &ServeConfig) -> Option<runner::AgentK
 
 fn require_configured_provider(
     config: &ServeConfig,
+    model: &str,
     actual: runner::AgentKind,
     context: &str,
 ) -> Result<()> {
+    let configured = config.model_profiles.values().any(|profile| {
+        profile.model == model
+            && resolve_provider(&profile.model).is_ok_and(|configured| configured == actual)
+    });
+    if !configured {
+        return Err(QuorumError::Io(format!(
+            "{context} provider/model '{actual}/{model}' is no longer configured"
+        )));
+    }
     require_provider_match(explicitly_configured_provider(config), actual, context)
 }
 
@@ -1780,15 +1790,11 @@ fn require_provider_match(
     Ok(())
 }
 
-#[cfg(test)]
-fn resolve_remediation_provider(
+fn resolve_original_remediation_provider(
     recorded_provider: Option<&str>,
-    recorded_model: Option<String>,
-    config_model: &str,
-    _config_runner: crate::serve_config::RunnerKind,
-) -> Result<(String, runner::AgentKind)> {
-    let model = recorded_model.unwrap_or_else(|| config_model.to_string());
-    let model_kind = resolve_managed_provider(&model, "remediation")?;
+    model: &str,
+) -> Result<runner::AgentKind> {
+    let model_kind = resolve_managed_provider(model, "remediation")?;
     let kind = match recorded_provider {
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
@@ -1797,13 +1803,43 @@ fn resolve_remediation_provider(
                 "unknown persisted provider '{provider}' for model '{model}'"
             )));
         }
-        None => model_kind,
+        None => {
+            return Err(QuorumError::Io(format!(
+                "original worker run has no persisted provider for model '{model}'"
+            )));
+        }
     };
     if kind != model_kind {
         return Err(QuorumError::Io(format!(
             "persisted provider '{kind}' does not match model '{model}' resolved as '{model_kind}'"
         )));
     }
+    Ok(kind)
+}
+
+/// Recover the complete immutable worker layout for an in-flight task. This
+/// deliberately has no routing-policy input: routing changes only apply when
+/// a task has never allocated a worker.
+fn recover_original_remediation_layout(
+    worker: quorum_core::agent_runs::AgentRun,
+) -> Result<(String, String, runner::AgentKind)> {
+    let kind = resolve_original_remediation_provider(worker.provider.as_deref(), &worker.model)?;
+    Ok((worker.model, worker.effort, kind))
+}
+
+#[cfg(test)]
+fn resolve_remediation_provider(
+    recorded_provider: Option<&str>,
+    recorded_model: Option<String>,
+    config_model: &str,
+    _config_runner: crate::serve_config::RunnerKind,
+) -> Result<(String, runner::AgentKind)> {
+    let model = recorded_model.unwrap_or_else(|| config_model.to_string());
+    let kind = if recorded_provider.is_some() {
+        resolve_original_remediation_provider(recorded_provider, &model)?
+    } else {
+        resolve_managed_provider(&model, "remediation")?
+    };
     Ok((model, kind))
 }
 
@@ -14073,7 +14109,10 @@ async fn spawn_remediation_worker(
         ("QUORUM_RUN_ID".into(), cap_run_id.clone()),
     ];
 
-    let (remediation_complexity, remediation_revision) = {
+    // An implementation task must resume the immutable profile from its first
+    // worker run. Only workerless review-only remediation has no allocation to
+    // recover, so it receives a fresh assignment from the current pool.
+    let (remediation_complexity, remediation_revision, original_worker) = {
         let conn = quorum_core::db::open(db_path)?;
         let task = tasks::get(&conn, task_id)?
             .ok_or_else(|| QuorumError::Io(format!("remediation task #{task_id} disappeared")))?;
@@ -14082,78 +14121,89 @@ async fn spawn_remediation_worker(
                 "task #{task_id} cannot dispatch remediation without classifier-owned complexity"
             ))
         })?;
-        (complexity, task.revision)
+        (
+            complexity,
+            task.revision,
+            quorum_core::agent_runs::first_worker(&conn, task_id)?,
+        )
     };
-    let remediation_assignment = assign_role(
-        config,
-        quorum_core::role_assignments::AssignmentRequest {
-            responsibility_key: worker_responsibility_key(task_id, remediation_revision),
-            task_id: Some(task_id),
-            pr_number: None,
-            role: "worker".into(),
-            review_stage: None,
-            complexity: Some(remediation_complexity.to_string()),
-        },
-        Some(remediation_complexity),
-    )?;
-
-    // Recover the original assignment snapshot. Historical run rows are checked
-    // as evidence, but current configuration never reselects remediation.
-    let (remediation_model, remediation_effort, remediation_kind, has_original_worker) = {
-        let p = db_path.clone();
-        let tid = task_id;
-        let assigned_model = remediation_assignment.model.clone();
-        let assigned_effort = remediation_assignment.effort.clone();
-        let assigned_provider = remediation_assignment.provider.clone();
-        let resolved = tokio::task::spawn_blocking(move || -> Result<_> {
-            let conn = quorum_core::db::open(&p)?;
-            let provider = quorum_core::agent_runs::worker_provider(&conn, tid)?;
-            let model = quorum_core::agent_runs::worker_model(&conn, tid)?;
-            let worker_runs = quorum_core::agent_runs::runs_for_task(&conn, tid)?;
-            let has_original_worker = worker_runs.iter().any(|run| run.role == "worker");
-            if model
-                .as_deref()
-                .is_some_and(|model| model != assigned_model)
-                || provider
-                    .as_deref()
-                    .is_some_and(|provider| provider != assigned_provider)
-            {
-                return Err(QuorumError::Io(
-                    "historical worker run does not match durable routing assignment".into(),
-                ));
-            }
-            let kind = resolve_provider(&assigned_model)?;
-            Ok((assigned_model, assigned_effort, kind, has_original_worker))
+    let fresh_assignment = original_worker
+        .is_none()
+        .then(|| {
+            assign_role(
+                config,
+                quorum_core::role_assignments::AssignmentRequest {
+                    responsibility_key: worker_responsibility_key(task_id, remediation_revision),
+                    task_id: Some(task_id),
+                    pr_number: None,
+                    role: "worker".into(),
+                    review_stage: None,
+                    complexity: Some(remediation_complexity.to_string()),
+                },
+                Some(remediation_complexity),
+            )
         })
-        .await;
+        .transpose()?;
+
+    let (
+        remediation_model,
+        remediation_effort,
+        remediation_kind,
+        has_original_worker,
+        fresh_assignment,
+    ) = {
+        let resolved = match original_worker {
+            Some(worker) => recover_original_remediation_layout(worker)
+                .map(|(model, effort, kind)| (model, effort, kind, true, None)),
+            None => {
+                let assignment =
+                    fresh_assignment.expect("workerless remediation has a fresh assignment");
+                let kind = resolve_managed_provider(&assignment.model, "remediation");
+                kind.map(|kind| {
+                    (
+                        assignment.model.clone(),
+                        assignment.effort.clone(),
+                        kind,
+                        false,
+                        Some(assignment),
+                    )
+                })
+            }
+        };
         match resolved {
-            Ok(Ok(resolved)) => {
-                if let Err(error) =
-                    require_configured_provider(config, resolved.2, "remediation worker")
-                {
-                    log(&format!(
-                        "remediation: provider recovery failed for task #{task_id}: {error}"
-                    ));
-                    let p = db_path.clone();
-                    let name = agent_name.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let mut conn = quorum_core::db::open(&p)?;
-                        tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
-                    })
-                    .await;
-                    cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                    name_pool.release(&agent_name);
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                    return Ok(RemediationSpawnOutcome::ProvisionFailed {
-                        cause: classified_provisioning_cause(&format!(
-                            "remediation provider recovery failed: {error}"
-                        )),
-                    });
+            Ok(resolved) => {
+                if resolved.3 {
+                    if let Err(error) = require_configured_provider(
+                        config,
+                        &resolved.0,
+                        resolved.2,
+                        "original remediation worker",
+                    ) {
+                        log(&format!(
+                            "remediation: provider recovery failed for task #{task_id}: {error}"
+                        ));
+                        let p = db_path.clone();
+                        let name = agent_name.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut conn = quorum_core::db::open(&p)?;
+                            tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
+                        })
+                        .await;
+                        cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id)
+                            .await;
+                        name_pool.release(&agent_name);
+                        wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
+                        wt_mgr.delete_branch(task_repo_dir, &branch).await;
+                        return Ok(RemediationSpawnOutcome::ProvisionFailed {
+                            cause: classified_provisioning_cause(&format!(
+                                "remediation provider recovery failed: {error}"
+                            )),
+                        });
+                    }
                 }
                 resolved
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 log(&format!(
                     "remediation: provider recovery failed for task #{task_id}: {error}"
                 ));
@@ -14171,27 +14221,6 @@ async fn spawn_remediation_worker(
                 return Ok(RemediationSpawnOutcome::ProvisionFailed {
                     cause: classified_provisioning_cause(&format!(
                         "remediation provider recovery failed: {error}"
-                    )),
-                });
-            }
-            Err(error) => {
-                log(&format!(
-                    "remediation: provider recovery join failed for task #{task_id}: {error}"
-                ));
-                let p = db_path.clone();
-                let name = agent_name.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut conn = quorum_core::db::open(&p)?;
-                    tasks::release_remediation_lease(&mut conn, &name, task_id, now_unix())
-                })
-                .await;
-                cleanup_failed_remediation_identity(db_path, &agent_name, &cap_run_id).await;
-                name_pool.release(&agent_name);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                return Ok(RemediationSpawnOutcome::ProvisionFailed {
-                    cause: classified_provisioning_cause(&format!(
-                        "remediation provider recovery join failed: {error}"
                     )),
                 });
             }
@@ -14323,22 +14352,36 @@ async fn spawn_remediation_worker(
                 let e = remediation_effort.clone();
                 let prov = remediation_provider_str;
                 let tid = task_id;
-                let assignment_id = remediation_assignment.id;
+                let fresh_assignment = fresh_assignment.map(|assignment| assignment.id);
                 let responsibility_key = worker_responsibility_key(task_id, remediation_revision);
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let conn = quorum_core::db::open(&p)?;
-                    quorum_core::agent_runs::insert_worker_with_assignment(
-                        &conn,
-                        tid,
-                        &name,
-                        &responsibility_key,
-                        &m,
-                        &e,
-                        &prov,
-                        &prov,
-                        Some(assignment_id),
-                        now_unix(),
-                    )
+                    match fresh_assignment {
+                        Some(assignment_id) => {
+                            quorum_core::agent_runs::insert_worker_with_assignment(
+                                &conn,
+                                tid,
+                                &name,
+                                &responsibility_key,
+                                &m,
+                                &e,
+                                &prov,
+                                &prov,
+                                Some(assignment_id),
+                                now_unix(),
+                            )
+                        }
+                        None => quorum_core::agent_runs::insert(
+                            &conn,
+                            tid,
+                            &name,
+                            "worker",
+                            &m,
+                            &e,
+                            &prov,
+                            now_unix(),
+                        ),
+                    }
                 })
                 .await
                 .ok()
@@ -18257,6 +18300,38 @@ mod tests {
     }
 
     #[test]
+    fn original_remediation_profile_must_remain_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = pre_review_ci_test_config(dir.path().join("q.db"), dir.path().join("repo"));
+
+        require_configured_provider(
+            &config,
+            "claude-sonnet-5",
+            runner::AgentKind::Claude,
+            "original remediation worker",
+        )
+        .unwrap();
+
+        let error = require_configured_provider(
+            &config,
+            "gpt-5.6-terra",
+            runner::AgentKind::Codex,
+            "original remediation worker",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no longer configured"),
+            "unconfigured historical profiles must park with an explicit cause: {error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("historical worker run does not match durable routing assignment"),
+            "the retired routing-equality failure must not mask the operator action"
+        );
+    }
+
+    #[test]
     fn strict_provider_mode_rejects_cross_provider_task_tiers() {
         let claude = resolve_provider(&tier_to_model_id("opus-46").unwrap()).unwrap();
         let codex = resolve_provider(&tier_to_model_id("terra").unwrap()).unwrap();
@@ -18343,6 +18418,14 @@ mod tests {
 
         // A daemon restart closes and reopens the sole source of truth.
         let conn = quorum_core::db::open(&db_path).unwrap();
+        let original_layout = quorum_core::agent_runs::first_worker(&conn, task_id)
+            .unwrap()
+            .unwrap();
+        let (snapshot_model, snapshot_effort, snapshot_kind) =
+            recover_original_remediation_layout(original_layout).unwrap();
+        assert_eq!(snapshot_model, "o3");
+        assert_eq!(snapshot_effort, "high");
+        assert_eq!(snapshot_kind, runner::AgentKind::Codex);
         let recorded_provider = quorum_core::agent_runs::worker_provider(&conn, task_id).unwrap();
         let recorded_model = quorum_core::agent_runs::worker_model(&conn, task_id).unwrap();
         let (model, kind) = resolve_remediation_provider(
