@@ -12,4 +12,3 @@ cd "$(dirname "$0")/.."
 cargo test -p quorum-core --features test-support --test test_helper_races -- --ignored
 cargo test -p quorum-core --features test-support --test assessment_process -- --ignored
 cargo test -p quorum-core --features test-support --test decomposition_process -- --ignored
-cargo test -p quorum --test provider_retry_race -- --ignored

@@ -17,6 +17,9 @@ mkdir -p "$BIN"
 cat >"$BIN/cargo" <<'EOF'
 #!/bin/sh
 [ "${PREFLIGHT_CARGO_FAIL:-0}" = 0 ] || exit 1
+if [ -n "${PREFLIGHT_CARGO_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$PREFLIGHT_CARGO_LOG"
+fi
 exit 0
 EOF
 chmod +x "$BIN/cargo"
@@ -373,5 +376,27 @@ if PATH="$BIN:$PATH" ./preflight.sh \
   exit 1
 fi
 grep -q 'require --quick' "$TMP/full-continuation.out"
+
+# The full author gate must launch Cargo with this exact argument surface.
+# In particular, the explicit quorum-core/test-support feature builds the
+# private real-process helper used by the canaries; fake-agent tests cannot
+# catch a Cargo feature or helper-launch failure before their protocol starts.
+# Compare the complete ordered invocation log, rather than independently
+# finding flags, so additions, removals, and ordering drift all fail.
+cat >"$TMP/full-cargo.expected" <<'EOF'
+fmt --all -- --check
+clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings
+test --workspace --all-features --features quorum-core/test-support
+EOF
+PREFLIGHT_CARGO_LOG="$TMP/full-cargo.log" PATH="$BIN:$PATH" \
+  ./preflight.sh >"$TMP/full.out"
+cmp "$TMP/full-cargo.expected" "$TMP/full-cargo.log"
+grep -q 'PREFLIGHT: PASS (all 4 gates green)' "$TMP/full.out"
+
+# CI must preserve the same explicit feature at the test boundary. Its test
+# command is what builds the real helper binary in a clean installed toolchain.
+grep -Fqx \
+  '      - run: cargo test --workspace --all-features --features quorum-core/test-support' \
+  "$ROOT/.github/workflows/ci.yml"
 
 echo 'test-preflight: PASS'

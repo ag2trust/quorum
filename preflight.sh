@@ -10,8 +10,8 @@
 # Gates (in order, fail-fast):
 #   1. branch base   — HEAD is branched from origin/main, not another feature branch
 #   2. cargo fmt     — --all -- --check
-#   3. cargo clippy  — all targets and explicit test-support targets
-#   4. cargo test    — required suite incl. real-process SQLite smoke canaries
+#   3. cargo clippy  — all targets and quorum-core/test-support
+#   4. cargo test    — full suite incl. real-process contention canaries (4 threads)
 #
 # Usage:
 #   ./preflight.sh          # all four gates
@@ -196,12 +196,13 @@ if [ "$QUICK" -eq 1 ]; then
 fi
 
 # --- Gate 3: cargo clippy -----------------------------------------------------
-printf '=== preflight 3/4: cargo clippy --all-targets --all-features -- -D warnings ===\n'
-cargo clippy --all-targets --all-features -- -D warnings || fail "cargo clippy"
+printf '=== preflight 3/4: cargo clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings ===\n'
+cargo clippy --all-targets --all-features --features quorum-core/test-support -- -D warnings || fail "cargo clippy"
 printf 'clippy OK\n'
 
 # --- Gate 4: cargo test -------------------------------------------------------
-printf '=== preflight 4/4: cargo test --workspace --all-features ===\n'
-cargo test --workspace --all-features || fail "cargo test"
+TEST_THREADS="${RUST_TEST_THREADS:-4}"
+printf '=== preflight 4/4: RUST_TEST_THREADS=%s cargo test --workspace --all-features --features quorum-core/test-support ===\n' "$TEST_THREADS"
+RUST_TEST_THREADS="$TEST_THREADS" cargo test --workspace --all-features --features quorum-core/test-support || fail "cargo test"
 
 printf '\nPREFLIGHT: PASS (all 4 gates green)\n'
