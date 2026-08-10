@@ -30,6 +30,25 @@ fn init_git_repo(dir: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
+fn install_real_pre_push_hook(repo: &std::path::Path, hook_dir: &std::path::Path) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.githooks/pre-push");
+    let installed = hook_dir.join("pre-push");
+    std::fs::copy(source, &installed).unwrap();
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo.to_string_lossy(),
+            "config",
+            "core.hooksPath",
+            &hook_dir.to_string_lossy(),
+        ])
+        .status()
+        .unwrap()
+        .success());
+}
+
 fn write_names(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("names.txt");
     let mut file = std::fs::File::create(&path).unwrap();
@@ -187,7 +206,15 @@ struct Case {
     _worktrees: tempfile::TempDir,
     gh_shim: tempfile::TempDir,
     runner_log: std::path::PathBuf,
+    parked_expected_sha: Option<String>,
+    parked_remote_sha: Option<String>,
     handle: ServeHandle,
+}
+
+#[derive(Clone, Copy)]
+struct ParkedPublicationFixture {
+    pr: i64,
+    move_remote_head: bool,
 }
 
 impl Case {
@@ -201,15 +228,38 @@ impl Case {
         labels: Option<&str>,
         role_config: Option<&str>,
     ) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, labels, role_config, None, None)
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            labels,
+            role_config,
+            None,
+            None,
+            None,
+        )
     }
 
     fn start_review_only(default_provider: &str, model: &str) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, None, None, Some(1), None)
+        Self::start_with_pr_assignment(default_provider, model, None, None, Some(1), None, None)
     }
 
     fn start_continue(default_provider: &str, model: &str, pr: i64) -> Self {
-        Self::start_with_pr_assignment(default_provider, model, None, None, None, Some(pr))
+        Self::start_with_pr_assignment(default_provider, model, None, None, None, Some(pr), None)
+    }
+
+    fn start_parked_publication(move_remote_head: bool) -> Self {
+        Self::start_with_pr_assignment(
+            "codex",
+            "gpt-5.6-terra",
+            None,
+            None,
+            None,
+            None,
+            Some(ParkedPublicationFixture {
+                pr: 10,
+                move_remote_head,
+            }),
+        )
     }
 
     fn start_with_pr_assignment(
@@ -219,6 +269,7 @@ impl Case {
         role_config: Option<&str>,
         review_pr: Option<i64>,
         continue_pr: Option<i64>,
+        parked_publication: Option<ParkedPublicationFixture>,
     ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -287,6 +338,181 @@ impl Case {
                 .unwrap();
         }
 
+        let mut parked_expected_sha = None;
+        let mut parked_remote_sha = None;
+        if let Some(fixture) = parked_publication {
+            let repo_path = repo.path().to_string_lossy();
+            std::fs::copy(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../preflight.sh"),
+                repo.path().join("preflight.sh"),
+            )
+            .unwrap();
+            std::fs::write(
+                repo.path().join("Cargo.toml"),
+                "[package]\nname = \"parked-retry-fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+            )
+            .unwrap();
+            std::fs::create_dir(repo.path().join("src")).unwrap();
+            std::fs::write(repo.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "add", "."])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "commit", "-m", "add hook fixture"])
+                .status()
+                .unwrap()
+                .success());
+            let head_ref = format!("parked-pr-{}", fixture.pr);
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "checkout", "-b", &head_ref])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args([
+                    "-C",
+                    &repo_path,
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "recorded PR head",
+                ])
+                .status()
+                .unwrap()
+                .success());
+            let expected_sha = String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "checkout", "main"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("git")
+                .args([
+                    "-C",
+                    &repo_path,
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "advance current base",
+                ])
+                .status()
+                .unwrap()
+                .success());
+            let stale_delivery = String::from_utf8(
+                Command::new("git")
+                    .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+            let remote_sha = if fixture.move_remote_head {
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "checkout", &head_ref])
+                    .status()
+                    .unwrap()
+                    .success());
+                assert!(Command::new("git")
+                    .args([
+                        "-C",
+                        &repo_path,
+                        "commit",
+                        "--allow-empty",
+                        "-m",
+                        "move remote PR head",
+                    ])
+                    .status()
+                    .unwrap()
+                    .success());
+                let moved = String::from_utf8(
+                    Command::new("git")
+                        .args(["-C", &repo_path, "rev-parse", "HEAD"])
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .unwrap()
+                .trim()
+                .to_string();
+                assert!(Command::new("git")
+                    .args(["-C", &repo_path, "checkout", "main"])
+                    .status()
+                    .unwrap()
+                    .success());
+                moved
+            } else {
+                expected_sha.clone()
+            };
+            assert!(Command::new("git")
+                .args(["-C", &repo_path, "fetch", "origin"])
+                .status()
+                .unwrap()
+                .success());
+
+            let refs = serde_json::json!({
+                "cx_est": 2,
+                "cx_size": "S",
+                "cx_ready": true,
+                "cx_not_ready_reason": null,
+                "cx_by": "test-classifier:v1",
+                "pr": fixture.pr,
+                "daemon_publication": {
+                    "branch": head_ref,
+                    "local_sha": stale_delivery,
+                    "pr": fixture.pr,
+                    "stage": "intent",
+                    "expected_remote_sha": expected_sha,
+                }
+            });
+            conn.execute(
+                "UPDATE tasks
+                 SET status='rework', author='Original', rework_round=1, refs=?1
+                 WHERE id=1",
+                [refs.to_string()],
+            )
+            .unwrap();
+            quorum_core::pr_targets::upsert(
+                &mut conn,
+                1,
+                fixture.pr,
+                &head_ref,
+                &expected_sha,
+                false,
+            )
+            .unwrap();
+            quorum_core::tasks::park(&mut conn, 1, "daemon-owned publication failed", "rework", 2)
+                .unwrap()
+                .unwrap();
+            drop(conn);
+
+            let retry = Command::new(cargo_bin("quorum"))
+                .env("QUORUM_HOME", home.path())
+                .env("QUORUM_REPO", "test/repo")
+                .args(["task-retry", "--task-id", "1", "--by", "operator"])
+                .output()
+                .unwrap();
+            assert!(
+                retry.status.success(),
+                "task-retry failed: {}",
+                String::from_utf8_lossy(&retry.stderr)
+            );
+            parked_expected_sha = Some(expected_sha);
+            parked_remote_sha = Some(remote_sha);
+        }
+
         // A review-only task has no managed branch or worker. Persist the
         // resolved PR identity before the daemon begins orphan review
         // provisioning so the test exercises the same verified-PR path as
@@ -335,6 +561,13 @@ impl Case {
                 format!("continue-pr-{pr}")
             };
             std::fs::write(gh_state.join(pr.to_string()), head_ref).unwrap();
+        }
+        if let Some(fixture) = parked_publication {
+            std::fs::write(
+                gh_state.join(fixture.pr.to_string()),
+                format!("parked-pr-{}", fixture.pr),
+            )
+            .unwrap();
         }
         let gh_path = gh_shim.path().join("gh");
         std::fs::write(
@@ -454,6 +687,8 @@ fi
             _worktrees: worktrees,
             gh_shim,
             runner_log,
+            parked_expected_sha,
+            parked_remote_sha,
             handle: ServeHandle {
                 child,
                 rx,
@@ -727,6 +962,176 @@ fn run_routes_with_effort(
 }
 
 const CHATGPT_ONLY_ROLE_CONFIG: &str = "chatgpt-only-routing";
+
+#[cfg(unix)]
+#[test]
+fn parked_rework_publication_retry_preserves_pr_ancestry_and_passes_real_hook() {
+    let mut case = Case::start_parked_publication(false);
+    case.handle.wait_for("worktree provisioned");
+    case.handle.wait_for("turn");
+
+    let expected_sha = case.parked_expected_sha.as_deref().unwrap();
+    let (worktree, journal_pr, remote_branch, rework_count) = {
+        let conn = case.db();
+        conn.query_row(
+            "SELECT worktree,pr,branch,rework_count
+             FROM journal WHERE task_id=1 AND role='worker'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(journal_pr, Some(10));
+    assert_eq!(remote_branch, "parked-pr-10");
+    assert_eq!(rework_count, 1);
+    for ancestor in [expected_sha, "origin/main"] {
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    &worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    ancestor,
+                    "HEAD",
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "provisioned retry HEAD must descend from {ancestor}"
+        );
+    }
+
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &worktree,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "parked retry delivery",
+            "-m",
+            "Co-Authored-By: Retry-Worker <retry@example.invalid>",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let delivery_sha = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &worktree, "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let hooks = tempfile::tempdir().unwrap();
+    install_real_pre_push_hook(case._repo.path(), hooks.path());
+    let pushed = Command::new("git")
+        .env("QUORUM_CONTINUATION_BASE_BRANCH", "main")
+        .args([
+            "-C",
+            &worktree,
+            "push",
+            &case._repo.path().to_string_lossy(),
+            "HEAD:refs/heads/parked-pr-10",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        pushed.status.success(),
+        "real pre-push hook rejected retry delivery: {}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/parked-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_sha, delivery_sha);
+    case.handle.stop_mut();
+}
+
+#[test]
+fn parked_rework_publication_retry_parks_when_remote_head_moved() {
+    let mut case = Case::start_parked_publication(true);
+    case.handle
+        .wait_for("recorded daemon publication head moved for PR #10");
+    case.wait_for_completed_tick();
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked"], true);
+    assert_eq!(refs["daemon_resume_status"], "rework");
+    assert!(refs["daemon_parked_reason"]
+        .as_str()
+        .unwrap()
+        .contains("provisioning rejected"));
+    assert_eq!(
+        quorum_core::agent_runs::runs_for_task(&conn, 1)
+            .unwrap()
+            .len(),
+        0,
+        "head drift must fail before a worker process receives authority"
+    );
+    let journal_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM journal WHERE task_id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(journal_rows, 0);
+    drop(conn);
+
+    let remote_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &case._repo.path().to_string_lossy(),
+                "rev-parse",
+                "refs/heads/parked-pr-10",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_sha, case.parked_remote_sha.as_deref().unwrap());
+    assert_ne!(remote_sha, case.parked_expected_sha.as_deref().unwrap());
+
+    let calls = std::fs::read_to_string(case.gh_shim.path().join("state/calls")).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pr view 10"))
+            .count(),
+        1
+    );
+    assert!(!calls.lines().any(|line| line.starts_with("pr create")));
+    case.handle.stop_mut();
+}
 
 #[test]
 fn continuation_worker_without_pr_recovers_pre_fix_intent_with_spawn_lease() {

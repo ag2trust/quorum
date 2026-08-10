@@ -1006,6 +1006,59 @@ fn publication_intent_from_refs(refs: Option<&str>) -> Option<PublicationIntent>
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+/// Recover the immutable existing-PR authority left by a parked rework
+/// publication failure. A rework retry without a publication intent keeps its
+/// historical generic-worker behavior; once the intent exists, every field
+/// needed to select one exact PR head is mandatory and conflicts fail closed.
+fn parked_rework_publication_intent(
+    refs: Option<&str>,
+) -> std::result::Result<Option<PublicationIntent>, String> {
+    if !daemon_rework_retry_requested(refs) {
+        return Ok(None);
+    }
+    let refs = refs
+        .ok_or_else(|| "parked rework retry has no refs".to_string())
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .map_err(|error| format!("parked rework retry refs are invalid JSON: {error}"))
+        })?;
+    let Some(publication) = refs.get("daemon_publication").cloned() else {
+        return Ok(None);
+    };
+    let intent: PublicationIntent = serde_json::from_value(publication)
+        .map_err(|error| format!("recorded daemon publication is incomplete: {error}"))?;
+    let pr = intent
+        .pr
+        .filter(|pr| *pr > 0)
+        .ok_or_else(|| "recorded daemon publication has no valid PR identity".to_string())?;
+    let recorded_pr = refs
+        .get("pr")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|recorded| *recorded > 0)
+        .ok_or_else(|| "parked rework retry has no valid task PR identity".to_string())?;
+    if recorded_pr != pr {
+        return Err(format!(
+            "recorded daemon publication PR #{pr} conflicts with task PR #{recorded_pr}"
+        ));
+    }
+    if intent.branch.trim().is_empty() {
+        return Err("recorded daemon publication has no head branch".into());
+    }
+    if intent.local_sha.trim().is_empty() {
+        return Err("recorded daemon publication has no source SHA".into());
+    }
+    if intent
+        .expected_remote_sha
+        .as_deref()
+        .is_none_or(|sha| sha.trim().is_empty())
+    {
+        return Err(format!(
+            "recorded daemon publication for PR #{pr} has no expected remote SHA"
+        ));
+    }
+    Ok(Some(intent))
+}
+
 async fn reconcile_publication_source_refs(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -1611,6 +1664,48 @@ async fn resolve_and_persist_continue_pr_target(
     .await
     .map_err(|error| format!("continue PR target persistence join failure: {error}"))?
     .map_err(|error| format!("continue PR target persistence failed: {error}"))?;
+    Ok(target)
+}
+
+async fn resolve_and_persist_parked_rework_target(
+    config: &ServeConfig,
+    task_id: i64,
+    intent: &PublicationIntent,
+) -> std::result::Result<PrTarget, String> {
+    let pr = intent
+        .pr
+        .ok_or_else(|| "recorded daemon publication has no PR identity".to_string())?;
+    let expected_sha = intent.expected_remote_sha.as_deref().ok_or_else(|| {
+        format!("recorded daemon publication for PR #{pr} has no expected remote SHA")
+    })?;
+
+    // Resolve GitHub completely before opening the short persistence
+    // transaction. The recorded lease is authoritative: a live target may
+    // confirm it, never replace it.
+    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+    validate_continue_pr_target(&target, pr, &config.base_branch)?;
+    if target.head_ref != intent.branch {
+        return Err(format!(
+            "recorded daemon publication head branch changed for PR #{pr}: expected {}, got {}",
+            intent.branch, target.head_ref
+        ));
+    }
+    if target.head_sha != expected_sha {
+        return Err(format!(
+            "recorded daemon publication head moved for PR #{pr}: expected {expected_sha}, got {}",
+            target.head_sha
+        ));
+    }
+
+    let db_path = config.db_path.clone();
+    let persisted = target.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_continue_pr_baseline(&mut conn, task_id, &persisted)
+    })
+    .await
+    .map_err(|error| format!("parked rework target persistence join failure: {error}"))?
+    .map_err(|error| format!("parked rework target persistence failed: {error}"))?;
     Ok(target)
 }
 
@@ -12339,11 +12434,13 @@ async fn spawn_worker(
     let worker_repo_dir = &config.repo_dir;
 
     // A continuation assignment is bound to the live PR target resolved after
-    // the atomic claim. It must never inherit a stale refs.pr value or fall
-    // through to base-derived provisioning.
-    let continue_target = if let Some(pr) = task.continue_pr {
+    // the atomic claim. Explicit --continue-pr remains authoritative. A
+    // parked-rework retry may recover the same authority only from a complete
+    // daemon publication lease; it must never adopt a mutable refs.pr value or
+    // fall through to base-derived provisioning once that lease exists.
+    let (continue_target, parked_rework_continuation) = if let Some(pr) = task.continue_pr {
         match resolve_and_persist_continue_pr_target(config, task.id, pr).await {
-            Ok(target) => Some(target),
+            Ok(target) => (Some(target), false),
             Err(error) => {
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
@@ -12353,7 +12450,40 @@ async fn spawn_worker(
             }
         }
     } else {
-        None
+        let recorded = match parked_rework_publication_intent(task.refs.as_deref()) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                let reason = format!("parked rework publication provisioning rejected: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(&db_path, task.id, &reason, "rework").await;
+                name_pool.release(&agent_name);
+                return Ok(false);
+            }
+        };
+        match recorded {
+            Some(intent) => {
+                let pr = intent.pr.expect("validated parked publication PR");
+                match resolve_and_persist_parked_rework_target(config, task.id, &intent).await {
+                    Ok(target) => (Some(target), true),
+                    Err(error) => {
+                        let reason = format!(
+                            "parked rework publication for PR #{pr} provisioning rejected: {error}"
+                        );
+                        persist_provisioning_failure(&db_path, task.id, &reason).await;
+                        park_task(&db_path, task.id, &reason, "rework").await;
+                        name_pool.release(&agent_name);
+                        return Ok(false);
+                    }
+                }
+            }
+            None => (None, false),
+        }
+    };
+    let continuation_pr = continue_target.as_ref().map(|target| target.pr);
+    let continuation_rework_count = if parked_rework_continuation {
+        i32::try_from(task.rework_round.max(1)).unwrap_or(i32::MAX)
+    } else {
+        0
     };
 
     // Branch keyed to task + original author, not current assignee — a rework
@@ -12494,12 +12624,17 @@ async fn spawn_worker(
                 "initial worker worktree provisioning failed: {e}"
             ));
             persist_provisioning_failure(&db_path, task.id, &cause).await;
-            if let Some(pr) = task.continue_pr {
+            if let Some(pr) = continuation_pr {
+                let resume_status = if parked_rework_continuation {
+                    "rework"
+                } else {
+                    "open"
+                };
                 park_task(
                     &db_path,
                     task.id,
                     &format!("initial worker provisioning failed for continue PR #{pr}: {cause}"),
-                    "open",
+                    resume_status,
                 )
                 .await;
                 name_pool.release(&agent_name);
@@ -12568,8 +12703,8 @@ async fn spawn_worker(
             .as_ref()
             .map(|l| l.dir().to_string_lossy().into()),
         pid: None,
-        pr: task.continue_pr,
-        rework_count: 0,
+        pr: continuation_pr,
+        rework_count: continuation_rework_count,
     };
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -12736,8 +12871,8 @@ async fn spawn_worker(
                         .as_ref()
                         .map(|l| l.dir().to_string_lossy().into()),
                     pid: spawn_pid,
-                    pr: task.continue_pr,
-                    rework_count: 0,
+                    pr: continuation_pr,
+                    rework_count: continuation_rework_count,
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&p)?;
@@ -12792,7 +12927,7 @@ async fn spawn_worker(
                 remote_branch: remote_branch.clone(),
                 branch,
                 draining: true,
-                pr: task.continue_pr,
+                pr: continuation_pr,
                 rework_count: retry_slot_rework_count(
                     task.rework_round,
                     retry_turn.as_ref(),
@@ -17700,6 +17835,58 @@ mod tests {
             recovered.expected_remote_sha.as_deref(),
             Some("spawn-x"),
             "retry must retain the original round's lease baseline"
+        );
+    }
+
+    #[test]
+    fn parked_rework_publication_requires_one_complete_matching_pr_lease() {
+        let valid = serde_json::json!({
+            "daemon_rework_retry_requested": true,
+            "pr": 551,
+            "daemon_publication": {
+                "branch": "daemon/alloy-t365",
+                "local_sha": "source-a",
+                "pr": 551,
+                "stage": "intent",
+                "expected_remote_sha": "head-a"
+            }
+        });
+        let recovered = parked_rework_publication_intent(Some(&valid.to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.pr, Some(551));
+        assert_eq!(recovered.expected_remote_sha.as_deref(), Some("head-a"));
+
+        let mut malformed = valid.clone();
+        malformed["daemon_publication"]["expected_remote_sha"] = serde_json::Value::Null;
+        assert!(
+            parked_rework_publication_intent(Some(&malformed.to_string()))
+                .unwrap_err()
+                .contains("no expected remote SHA")
+        );
+        malformed = valid.clone();
+        malformed["pr"] = serde_json::json!(552);
+        assert!(
+            parked_rework_publication_intent(Some(&malformed.to_string()))
+                .unwrap_err()
+                .contains("conflicts with task PR")
+        );
+    }
+
+    #[test]
+    fn ordinary_and_publication_free_retries_do_not_select_a_continuation() {
+        let ordinary = r#"{"pr":551,"daemon_publication":{"pr":551}}"#;
+        assert!(parked_rework_publication_intent(Some(ordinary))
+            .unwrap()
+            .is_none());
+        let publication_free_retry = r#"{
+            "daemon_rework_retry_requested":true,
+            "pr":551
+        }"#;
+        assert!(
+            parked_rework_publication_intent(Some(publication_free_retry))
+                .unwrap()
+                .is_none()
         );
     }
 
