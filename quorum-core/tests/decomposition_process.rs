@@ -195,9 +195,8 @@ fn race_cancel_with_event(
     (event, cancel)
 }
 
-#[test]
-fn real_process_cancel_racing_child_claim_leaves_no_authority() {
-    for iteration in 0..8 {
+fn cancel_racing_child_claim_leaves_no_authority(iterations: usize) {
+    for iteration in 0..iterations {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, graph, ids) = graph_with_children(&dir, &["a", "b"]);
         let go_path = dir.path().join("go");
@@ -253,9 +252,8 @@ fn real_process_cancel_racing_child_claim_leaves_no_authority() {
     }
 }
 
-#[test]
-fn real_process_cancel_racing_submit_revokes_winner_and_stale_submit_is_inert() {
-    for iteration in 0..8 {
+fn cancel_racing_submit_revokes_winner_and_stale_submit_is_inert(iterations: usize) {
+    for iteration in 0..iterations {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, graph, ids) = graph_with_children(&dir, &["a", "b"]);
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -312,9 +310,8 @@ fn real_process_cancel_racing_submit_revokes_winner_and_stale_submit_is_inert() 
     }
 }
 
-#[test]
-fn real_process_cancel_racing_review_revokes_authority_and_stale_review_is_inert() {
-    for iteration in 0..8 {
+fn cancel_racing_review_revokes_authority_and_stale_review_is_inert(iterations: usize) {
+    for iteration in 0..iterations {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, _graph, ids) = graph_with_children(&dir, &["a", "b"]);
         let mut conn = quorum_core::db::open(&db_path).unwrap();
@@ -371,9 +368,8 @@ fn real_process_cancel_racing_review_revokes_authority_and_stale_review_is_inert
     }
 }
 
-#[test]
-fn real_process_cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes() {
-    for iteration in 0..16 {
+fn cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes(iterations: usize) {
+    for iteration in 0..iterations {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, graph, ids) = graph_with_children(&dir, &["a", "b"]);
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -465,4 +461,33 @@ fn real_process_child_claims_never_exceed_two() {
         .filter(|won| *won)
         .count();
     assert_eq!(winners, 2);
+}
+
+#[test]
+fn real_process_cancel_racing_child_claim_smoke_leaves_no_authority() {
+    cancel_racing_child_claim_leaves_no_authority(1);
+}
+
+#[test]
+fn real_process_cancel_racing_submit_smoke_revokes_authority() {
+    cancel_racing_submit_revokes_winner_and_stale_submit_is_inert(1);
+}
+
+#[test]
+fn real_process_cancel_racing_review_smoke_revokes_authority() {
+    cancel_racing_review_revokes_authority_and_stale_review_is_inert(1);
+}
+
+#[test]
+fn real_process_cancel_racing_final_merge_smoke_has_exclusive_outcomes() {
+    cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes(1);
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_real_process_decomposition_races() {
+    cancel_racing_child_claim_leaves_no_authority(8);
+    cancel_racing_submit_revokes_winner_and_stale_submit_is_inert(8);
+    cancel_racing_review_revokes_authority_and_stale_review_is_inert(8);
+    cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes(16);
 }

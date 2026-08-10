@@ -11,7 +11,7 @@
 #   1. branch base   — HEAD is branched from origin/main, not another feature branch
 #   2. cargo fmt     — --all -- --check
 #   3. cargo clippy  — all targets and explicit test-support targets
-#   4. cargo test    — full suite incl. real-process contention canaries
+#   4. cargo test    — required suite incl. real-process SQLite smoke canaries
 #
 # Usage:
 #   ./preflight.sh          # all four gates
