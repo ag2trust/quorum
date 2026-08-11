@@ -2267,12 +2267,49 @@ signal and cheap-poll for resume. This model is removed:
   of the target agent process, slot release, and post-mortem ladder on any
   held task. Use for zombie workers, stuck processes, or emergency abort.
 - **Self-update drain remains separate.** The `--self-update-drain` mechanism
-  (signal-triggered drain, exit 75 for supervisor rebuild) is orthogonal to
-  agent stop/kill and is unchanged.
+  is orthogonal to agent stop/kill and is unchanged. See "Self-update (exit 75
+  contract)" below for the staleness trigger and exit path.
 
 Daemon scheduling pause/resume (pausing the daemon's spawn loop without
 stopping individual agents) is **out of scope for v2** — drain covers the
 "stop spawning new work" use case.
+
+### Self-update (exit 75 contract)
+
+`quorum serve` never patches itself in place. It exits with a reserved code,
+`EXIT_SELF_UPDATE = 75`, and `scripts/serve-supervisor.sh` (or an equivalent
+supervisor) treats that code as an upgrade signal: fetch `origin/<base>`,
+fast-forward merge, rebuild via `./dev-install.sh`, and relaunch. Any other
+exit code propagates and stops the supervisor loop — a crash is not an
+upgrade signal.
+
+Two independent triggers reach exit 75, with different urgency and shutdown
+behavior:
+
+1. **Build staleness (graceful drain-then-exit).** With `--self-update-drain`
+   set, the tick loop periodically (`sha_poll_interval_secs`, default 60s)
+   shells out to a bounded `git ls-remote origin <base_branch>` and compares
+   the result against the running binary's build SHA. A mismatch means
+   origin's base branch has advanced past this build. The daemon does not
+   exit immediately: it enters drain mode (blocks new claims/spawns, lets
+   in-flight workers and reviewers finish normally) and exits 75 only once
+   the roster is empty or `drain_timeout_secs` elapses, whichever comes
+   first — at timeout, remaining agents are force-killed rather than left to
+   block the upgrade indefinitely. This is the same drain state machine used
+   for signal-triggered shutdown (Ctrl-C), except the signal path exits 0
+   and this path exits 75.
+2. **Schema-too-new (immediate force-kill, no drain).** If a tick returns
+   `QuorumError::SchemaTooNew` — the on-disk DB was migrated by a newer
+   binary than the one running — retrying can never succeed, since this
+   binary cannot read the schema. There is no graceful path: teardown itself
+   writes to the DB, which would also fail. The daemon force-kills every
+   in-flight worker/reviewer/planner/classifier process immediately and
+   exits 75 without waiting. Tasks are re-adopted from the journal by the
+   relaunched daemon on restart.
+
+Both triggers share the exit code so the supervisor needs only one branch to
+handle either case; they differ only in whether existing agents get a chance
+to finish before the process exits.
 
 ### Run identity and capability enforcement
 
