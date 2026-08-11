@@ -613,6 +613,9 @@ pub fn build_rework_prompt(
          - The final PR history must let a later reader determine, for each finding, whether \
          it was fixed, accepted, overridden with evidence, or unaddressed. That trail lives \
          on the PR, not in this turn.\n\n\
+         Preserve the existing published PR lineage. If the base branch must be integrated, \
+         merge it into the PR branch. Never rebase, reset away, squash-rebuild, or otherwise \
+         replace the published PR head; it must remain an ancestor of your final commit.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          After fixing and committing (do not push):\n\
          1. Run the verification prescribed by the target repository's checked-in instructions \
@@ -655,6 +658,7 @@ pub fn build_remediation_turn(
     pr: i64,
     feedback: &str,
     task_body: &str,
+    continuation_context: Option<&str>,
     max_task_cost_usd: Option<f64>,
 ) -> String {
     format!(
@@ -662,6 +666,7 @@ pub fn build_remediation_turn(
          and no managed worker exists to address them.\n\n\
          ## Task context\n{body}\n\n\
          ## Blocking findings from the reviewer\n{feedback}\n\n\
+         {continuation_context}\
          ## Instructions\n\
          You are fixing an EXISTING PR — do NOT open a new one and do NOT run `gh pr create`.\n\n\
          ## Publishing your fix\n\
@@ -687,6 +692,7 @@ pub fn build_remediation_turn(
         local_branch = remediation_branch(agent_name, task_id),
         body = if task_body.is_empty() { "(no task body)" } else { task_body },
         feedback = feedback,
+        continuation_context = continuation_context.unwrap_or_default(),
         task_id = task_id,
         budget = budget_line(0.0, max_task_cost_usd),
     )
@@ -1145,7 +1151,7 @@ mod tests {
 
     #[test]
     fn remediation_turn_uses_repository_relative_verification() {
-        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None, None);
         assert!(
             turn.contains("verification prescribed by the target repository")
                 && turn.contains("checked-in instructions")
@@ -1166,7 +1172,7 @@ mod tests {
     /// so the remediation prompt must require commit-only delivery.
     #[test]
     fn remediation_turn_forbids_agent_push_on_namespaced_branch() {
-        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None);
+        let turn = build_remediation_turn("W-1", 42, 99, "fix it", "task context", None, None);
         assert!(
             turn.contains(&remediation_branch("W-1", 42)),
             "remediation turn must name the local branch it checked out: {turn}"
@@ -1183,6 +1189,30 @@ mod tests {
             turn.contains("gh pr create"),
             "remediation turn must forbid opening a new PR explicitly"
         );
+    }
+
+    #[test]
+    fn rework_turn_requires_published_ancestry_preservation() {
+        let turn = build_rework_prompt("W-1", 42, 99, "resolve conflicts", 0.0, None);
+        assert!(turn.contains("Preserve the existing published PR lineage"));
+        assert!(turn.contains("Never rebase"));
+        assert!(turn.contains("must remain an ancestor"));
+    }
+
+    #[test]
+    fn remediation_turn_includes_daemon_prepared_merge_context() {
+        let context = "CONTINUATION SOURCE — ANCESTRY MUST BE PRESERVED: The daemon already started a merge. Never rebase.\n\n";
+        let turn = build_remediation_turn(
+            "W-1",
+            42,
+            99,
+            "resolve conflicts",
+            "task context",
+            Some(context),
+            None,
+        );
+        assert!(turn.contains(context));
+        assert!(turn.contains("do NOT push"));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 47;
+pub const SCHEMA_VERSION: i64 = 48;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -695,7 +695,10 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         // v47 records daemon-owned terminal provenance without reinterpreting
         // history. Existing done rows remain NULL: refs.pr alone cannot prove
         // whether task-close represented a merge, an external fix, or obsolescence.
-        if current < 47 && !column_exists(conn, "tasks", "completion_provenance")? {
+        // The column check deliberately extends through v48: v47 was also used
+        // by PR #565 before main's completion-provenance migration landed, so
+        // either v47 shape must converge safely when the lineages merge.
+        if current < 48 && !column_exists(conn, "tasks", "completion_provenance")? {
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN completion_provenance TEXT
                  CHECK(completion_provenance IS NULL
@@ -705,6 +708,40 @@ pub fn migrate(conn: &Connection) -> Result<MigrateResult> {
         }
         // Guarded core write APIs remain dormant until later daemon activation
         // work.
+
+        // v48 bounds sweep's REFERENCES tasks(id) guards (task #395). Schema 46
+        // and main's independently shipped v47 left six durable FK columns
+        // unindexed; sweep_on_write runs inside every mutation's write
+        // transaction and would otherwise scan each retained provenance table
+        // once per candidate task. SCHEMA_SQL (which runs at the top of
+        // migrate) declares the six indexes and rotating sweep cursor so fresh
+        // DBs get them, but the v39 block below drops+recreates
+        // `decomposition_cleanup` via a rename that also drops its indexes;
+        // recreate every durable-ref index here so both fresh and upgraded
+        // databases end up with the same shape. `CREATE INDEX IF NOT EXISTS`
+        // is idempotent so re-running the migration (crash between blocks) is
+        // safe. Bumping SCHEMA_VERSION to 48 is load-bearing: the
+        // `current == SCHEMA_VERSION` early-return above short-circuits
+        // SCHEMA_SQL, so a live DB stopped at either v47 lineage would
+        // otherwise retain an incomplete schema.
+        if current < 48 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS decomposition_cleanup_task
+                     ON decomposition_cleanup(task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_batches_task
+                     ON review_followup_batches(task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_batches_source_task
+                     ON review_followup_batches(source_task_id);
+                 CREATE INDEX IF NOT EXISTS review_followup_artifacts_linked_task
+                     ON review_followup_artifacts(linked_task_id)
+                     WHERE linked_task_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS review_followup_artifacts_created_task
+                     ON review_followup_artifacts(created_task_id)
+                     WHERE created_task_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS review_followup_assessments_source_task
+                     ON review_followup_assessments(source_task_id);",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
     };
@@ -1476,6 +1513,88 @@ mod tests {
                 .unwrap(),
             r#"["merged","manual"]"#
         );
+    }
+
+    #[test]
+    fn v47_split_lineages_converge_on_complete_v48_schema() {
+        // Main and PR #565 independently used schema version 47: main added
+        // completion_provenance, while the PR added the durable-reference
+        // indexes later consumed by the rotating task-sweep cursor. Model
+        // both deployed shapes and prove either one upgrades to the complete
+        // merged schema instead of short-circuiting at the shared version.
+        let dir = tempfile::tempdir().unwrap();
+        let main_v47 = dir.path().join("main-v47.db");
+        {
+            let conn = open(&main_v47).unwrap();
+            conn.execute_batch(
+                "DROP TABLE sweep_cursors;
+                 DROP INDEX decomposition_cleanup_task;
+                 DROP INDEX review_followup_batches_task;
+                 DROP INDEX review_followup_batches_source_task;
+                 DROP INDEX review_followup_artifacts_linked_task;
+                 DROP INDEX review_followup_artifacts_created_task;
+                 DROP INDEX review_followup_assessments_source_task;
+                 PRAGMA user_version=47;",
+            )
+            .unwrap();
+            assert!(column_exists(&conn, "tasks", "completion_provenance").unwrap());
+        }
+
+        let pr_v47 = dir.path().join("pr-v47.db");
+        {
+            let conn = open(&pr_v47).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN completion_provenance;
+                 PRAGMA user_version=47;",
+            )
+            .unwrap();
+        }
+
+        for path in [&main_v47, &pr_v47] {
+            let conn = open(path).unwrap();
+            assert!(column_exists(&conn, "tasks", "completion_provenance").unwrap());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type='table' AND name='sweep_cursors'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type='index' AND name IN (
+                         'decomposition_cleanup_task',
+                         'review_followup_batches_task',
+                         'review_followup_batches_source_task',
+                         'review_followup_artifacts_linked_task',
+                         'review_followup_artifacts_created_task',
+                         'review_followup_assessments_source_task')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                6
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            drop(conn);
+
+            // The converged schema is stable on the normal equal-version path.
+            assert_eq!(
+                open(path)
+                    .unwrap()
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+        }
     }
 
     #[test]

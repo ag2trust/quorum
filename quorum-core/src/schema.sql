@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 47). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 48). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS cursors (
     topic       TEXT NOT NULL,
     last_seq    INTEGER NOT NULL,
     PRIMARY KEY (agent_id, topic)
+);
+
+-- v48: rotating cursors for bounded opportunistic sweep. Sweep-on-write pages
+-- over at most SWEEP_LIMIT raw task IDs before applying age/status/reference
+-- predicates, so retained history never inflates per-mutation candidate work.
+-- A short tail page resets the cursor to 0 so newly eligible lower task IDs are
+-- revisited fairly. Sweep-all does not consult the cursor.
+CREATE TABLE IF NOT EXISTS sweep_cursors (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS claims (
@@ -222,6 +232,12 @@ CREATE TABLE IF NOT EXISTS decomposition_cleanup (
     updated_at     INTEGER NOT NULL,
     PRIMARY KEY (graph_id, task_id, artifact_kind, artifact_ref)
 );
+-- v48: bound sweep's durable-reference guard by task_id lookup. The composite
+-- PK's leading column is graph_id, so `WHERE task_id=?` falls back to a full
+-- scan of retained cleanup provenance. This lookup index keeps
+-- sweep_on_write's REFERENCES tasks(id) probe O(log n).
+CREATE INDEX IF NOT EXISTS decomposition_cleanup_task
+    ON decomposition_cleanup(task_id);
 
 CREATE TABLE IF NOT EXISTS errors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -583,6 +599,12 @@ CREATE TABLE IF NOT EXISTS review_followup_batches (
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL
 );
+-- v48: index each REFERENCES tasks(id) column so sweep's durable-reference
+-- guard is bounded by index probe rather than a scan of every retained batch.
+CREATE INDEX IF NOT EXISTS review_followup_batches_task
+    ON review_followup_batches(task_id);
+CREATE INDEX IF NOT EXISTS review_followup_batches_source_task
+    ON review_followup_batches(source_task_id);
 
 CREATE TABLE IF NOT EXISTS review_followup_artifacts (
     id                         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -620,6 +642,13 @@ CREATE TABLE IF NOT EXISTS review_followup_artifacts (
         END
     )
 );
+-- v48: partial indexes (the CHECK above guarantees at most one of the two
+-- columns is non-NULL per row) so sweep's durable-reference guard is bounded
+-- by index probe over just the disposition='linked'/'created' subset.
+CREATE INDEX IF NOT EXISTS review_followup_artifacts_linked_task
+    ON review_followup_artifacts(linked_task_id) WHERE linked_task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS review_followup_artifacts_created_task
+    ON review_followup_artifacts(created_task_id) WHERE created_task_id IS NOT NULL;
 
 -- v44: dormant follow-up assessment storage. The aggregate is unique by
 -- semantic scope; `active` is an explicit per-target authority sentinel. No
@@ -648,6 +677,10 @@ CREATE TABLE IF NOT EXISTS review_followup_assessments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_followup_assessment
     ON review_followup_assessments(target) WHERE active = 1;
+-- v48: index REFERENCES tasks(id) so sweep's durable-reference guard is
+-- bounded by index probe rather than a scan of every retained assessment.
+CREATE INDEX IF NOT EXISTS review_followup_assessments_source_task
+    ON review_followup_assessments(source_task_id);
 
 -- Membership is immutable once materialized. Fresh aggregate rows are sealed
 -- by default; the core materializer explicitly opens and irreversibly seals

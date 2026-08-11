@@ -822,7 +822,9 @@ after reviewer provisioning.
 After VerdictApprove (InReview → Merging):
 1. Check stale SHA — if reviewer recorded a head SHA and it differs from current, fire
    MergeFailed → rework cycle (prevents stale approval from authorizing a changed diff).
-2. Check mergeability — if conflicting, MergeConflict → rework cycle (worker rebases).
+2. Check mergeability — if conflicting, MergeConflict → rework cycle. The daemon checks out
+   the exact published PR head and merges the current base before worker launch; a conflicting
+   merge remains in progress for the worker to resolve and commit. The worker never rebases.
 3. Wait for CI checks — outcome classified into Ready / Failed / TimedOut. See
    § Merge-wait vs. actionable-rework contract (#173) below for the full disposition.
 4. Persist approval record (instance-independent, survives restart).
@@ -863,7 +865,7 @@ retry autonomously.
 |---|---|---|---|
 | `Ready` | any | actionable (proceed) | Continue to step 4 (persist approval) and merge |
 | `Failed { checks }` | any | actionable (code broken) | `MergeFailed` → InReview, then `VerdictChanges` → Rework (rework cap applies). Worker gets failing check names. |
-| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Worker rebases. |
+| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Daemon prepares an ancestry-preserving base merge for the worker to resolve. |
 | `TimedOut` | `Mergeable` | **infrastructure-pending** | **Durable merge-wait** — no VerdictChanges, no AgentFailed, no rework budget consumed. See retry/backoff below. |
 | `TimedOut` | `AlreadyMerged` | resolved externally | `PrFoundMerged` → Done |
 | `TimedOut` | `Closed` | resolved externally | `PrFoundClosed` → Failed |
@@ -1126,7 +1128,8 @@ Each invariant below requires both a positive and a negative test. Tests marked
     `rework_round` incremented.
 
 11. `conflict_during_checks_triggers_rework` — checks return `TimedOut`, mergeability
-    is `Conflicting`. Assert: `MergeConflict` → Rework, worker rebases.
+    is `Conflicting`. Assert: `MergeConflict` → Rework, daemon-prepared base merge preserves
+    the published PR head, and the worker resolves it without rebasing.
 
 12. `retryable_merge_failure_triggers_rework` — merge attempt fails with
     `MergeFailureKind::Retryable`. Assert: `MergeFailed` + `VerdictChanges` → Rework.
@@ -1773,9 +1776,10 @@ serializes decomposition per repository: it stops new managed delivery, lets act
 finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
 regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
 worker. Every `continue_pr` task dispatches directly because only the source task carries authority
-to publish to the bound PR. A non-continuation XL task with `cx_est` 1–3 violates the classification
-rubric and is parked with an explicit reclassify-or-rescope reason. Review-only L/XL work is parked
-for external splitting.
+to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
+any classified size because it has no implementation work to decompose. A non-continuation XL task
+with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
+reclassify-or-rescope reason.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
 read-only repository view and bounded source
@@ -1906,10 +1910,11 @@ labels are ignored.
   dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
   `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
   as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
-  decomposition route, regardless of classified size. The daemon also atomically parks an
-  unready classification and review-only L/XL work. Parking writes the standard refs, note, and
-  event with no claim, run, or error row; an explicit retry requests reclassification of
-  remaining work and a newly dispatchable result restores the saved lifecycle status.
+  decomposition route, regardless of classified size. A review-only task likewise always takes
+  the direct reviewer route at any classified size. The daemon atomically parks an unready
+  classification. Parking writes the standard refs, note, and event with no claim, run, or error
+  row; an explicit retry requests reclassification of remaining work and a newly dispatchable
+  result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`

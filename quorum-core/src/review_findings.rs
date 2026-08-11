@@ -49,7 +49,7 @@ pub struct ReviewFinding {
     pub text: String,
     #[serde(default = "default_source")]
     pub source_endpoint: String,
-    /// v24: 'addressed' | 'unaddressed' | 'partial' | 'unclear'.
+    /// v24: 'addressed' | 'unaddressed' | 'partial' | 'unclear' | 'withdrawn'.
     /// A blocking finding that merged as `unaddressed` is a review-quality
     /// signal; the collector must never mutate the merge outcome regardless.
     #[serde(default)]
@@ -342,6 +342,12 @@ pub struct CollectorInputs {
     pub reviews_json: String,
     pub review_comments_json: String,
     pub issue_comments_json: String,
+    /// Deterministic, record-count-bounded evidence index captured by streaming
+    /// the raw payloads before bounded prompt truncation.
+    /// `None` keeps hand-built/legacy inputs compatible with validation that
+    /// derives IDs directly from their JSON payloads.
+    #[serde(skip)]
+    pub fetched_evidence: Option<Vec<EvidenceId>>,
     pub commits_json: String,
     pub checks_summary: String,
     pub diff_stat: String,
@@ -442,10 +448,38 @@ Fields per finding:
      author replies "fixed in <sha>", or the reviewer confirms it resolved),
    - `"unaddressed"` if it merged without a fix and the author did not push back,
    - `"partial"` if some parts were fixed and others were left,
-   - `"unclear"` if the record does not let you tell.
+   - `"unclear"` if the record does not let you tell,
+   - `"withdrawn"` if the reviewer independently retracted the finding without
+     accepting author pushback.
 9. `evidence` — array of `{{"kind":"review"|"review_comment"|"issue_comment","id":<int>}}`
    objects. Include at least one; use the GitHub numeric `id` field from the raw
    comment/review JSON above. Threaded replies count as separate evidence rows.
+
+Also emit a `followup_artifacts` entry for each concrete, evidence-backed
+non-blocking concern that remains valid after merge. Every artifact must name
+exactly one source finding by its zero-based index in the `findings` array. That
+source must be a `suggestion`, must share at least one evidence row with the
+artifact, and must not be fixed, withdrawn, or accepted as invalid.
+
+Fields per follow-up artifact:
+
+1. `source_finding_index` — zero-based array index of the exact source finding.
+2. `technical_impact` — `"critical" | "major" | "minor" | "nit"`.
+3. `scope_relationship` — `"pre_existing" | "out_of_scope" |
+   "threat_model_expansion" | "defense_in_depth" | "future_requirement" |
+   "design_debt"`.
+4. `concern` — a closed object with both:
+   - `failure_mode` — the concrete failure (concise text such as "Requests deadlock" is valid),
+   - `trigger_or_assumption` — when or under which assumption the failure occurs.
+5. `non_blocking_reason` — why the merged PR did not need to resolve it.
+6. `affected_behavior` — the affected product behavior.
+7. `desired_outcome` — a closed object with both:
+   - `observable_behavior` — the behavior that can be observed (concise text such as
+     "Requests complete" is valid),
+   - `observation_condition` — when the behavior must be observed.
+8. `verification_expectations` — one through eight concrete checks.
+9. `evidence` — one or more unique GitHub evidence rows, all present above and
+   sharing at least one row with the selected source finding.
 
 ## Output
 
@@ -456,12 +490,23 @@ Respond with ONLY a JSON object:
    "severity":"major","text":"...","source_endpoint":"pulls",
    "addressed_status":"addressed",
    "evidence":[{{"kind":"review_comment","id":12345}}]}}
+],"followup_artifacts":[
+  {{"source_finding_index":0,"technical_impact":"major","scope_relationship":"out_of_scope",
+   "concern":{{"failure_mode":"Requests deadlock",
+              "trigger_or_assumption":"Concurrent shutdown overlaps request handling"}},
+   "non_blocking_reason":"Why the merged PR did not need to resolve it",
+   "affected_behavior":"Product behavior affected by the concern",
+   "desired_outcome":{{"observable_behavior":"Requests complete",
+                       "observation_condition":"The retry resumes after shutdown"}},
+   "verification_expectations":["Evidence that proves the outcome"],
+   "evidence":[{{"kind":"review_comment","id":12345}}]}}
 ]}}
 ```
 
 If the PR has no substantive reviewer findings (only bot noise, "LGTM", or merge
-notifications), return `{{"findings":[]}}`. Do NOT invent findings. Do NOT wrap the
-JSON in prose."#,
+notifications), return `{{"findings":[],"followup_artifacts":[]}}`. A PR may have
+findings and still have zero valid artifacts. Do NOT invent findings or artifacts.
+Do NOT wrap the JSON in prose."#,
         pr = inputs.pr_number,
         meta = inputs.pr_metadata_json,
         diff = inputs.diff_stat,
@@ -488,6 +533,7 @@ pub fn build_prompt(
         reviews_json: "[]".into(),
         review_comments_json: pulls_comments_json.to_string(),
         issue_comments_json: issues_comments_json.to_string(),
+        fetched_evidence: None,
         commits_json: "[]".into(),
         checks_summary: "unknown".into(),
         diff_stat: "unknown".into(),
@@ -891,6 +937,7 @@ mod tests {
             reviews_json: r#"[{"id":1,"state":"APPROVED"}]"#.into(),
             review_comments_json: r#"[{"id":10,"in_reply_to_id":null}]"#.into(),
             issue_comments_json: r#"[{"id":20,"body":"nit"}]"#.into(),
+            fetched_evidence: None,
             commits_json: r#"[{"sha":"deadbeef"}]"#.into(),
             checks_summary: "all-passed".into(),
             diff_stat: "3 files, 20 additions".into(),
@@ -931,6 +978,15 @@ mod tests {
         assert!(prompt.contains("deadbeef"));
         assert!(prompt.contains("Alpha"));
         assert!(prompt.contains("addressed_status"));
+        assert!(prompt.contains("withdrawn"));
         assert!(prompt.contains("evidence"));
+        assert!(prompt.contains("followup_artifacts"));
+        assert!(prompt.contains("source_finding_index"));
+        assert!(prompt.contains("technical_impact"));
+        assert!(prompt.contains("scope_relationship"));
+        assert!(prompt.contains("failure_mode"));
+        assert!(prompt.contains("trigger_or_assumption"));
+        assert!(prompt.contains("observable_behavior"));
+        assert!(prompt.contains("observation_condition"));
     }
 }

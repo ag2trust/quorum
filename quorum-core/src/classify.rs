@@ -497,17 +497,7 @@ fn parking_reason(
     if !result.ready {
         return result.not_ready_reason.as_deref();
     }
-    if review_only && result.size == "XL" {
-        return Some(
-            "review-only size XL cannot be decomposed automatically; split or rescope externally",
-        );
-    }
-    if review_only && result.size == "L" {
-        return Some(
-            "review-only size L cannot be decomposed automatically; split or rescope externally",
-        );
-    }
-    if !continue_pr && result.size == "XL" && result.cx_est <= 3 {
+    if !review_only && !continue_pr && result.size == "XL" && result.cx_est <= 3 {
         return Some(crate::tasks::LOW_COMPLEXITY_XL_PARK_REASON);
     }
     None
@@ -1432,17 +1422,17 @@ mod tests {
     }
 
     #[test]
-    fn large_review_only_classification_atomically_parks_without_run_or_error() {
+    fn large_review_only_classification_remains_in_review_without_parking() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "Architectural task", 1);
         conn.execute(
-            "UPDATE tasks SET review_only=1 WHERE id=?1",
+            "UPDATE tasks SET review_only=1, status='in-review' WHERE id=?1",
             params![task_id],
         )
         .unwrap();
-        let mut parked = classified(task_id, 5);
-        parked.size = "L".into();
-        let results = vec![parked];
+        let mut classified_large = classified(task_id, 2);
+        classified_large.size = "XL".into();
+        let results = vec![classified_large];
 
         assert_eq!(
             store_classifications(&mut conn, &results, "gpt-5.6-luna:v2", 2_000_000).unwrap(),
@@ -1451,16 +1441,16 @@ mod tests {
 
         let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(task.status, "failed");
+        assert_eq!(task.status, "in-review");
         assert_eq!(task.assignee, None);
-        assert_eq!(refs["cx_est"], 5);
+        assert_eq!(refs["cx_est"], 2);
         assert_eq!(refs["cx_by"], "gpt-5.6-luna:v2");
-        assert_eq!(refs["daemon_parked"], true);
-        assert_eq!(refs["daemon_resume_status"], "open");
-        assert!(refs["daemon_parked_reason"]
-            .as_str()
-            .unwrap()
-            .contains("review-only size L"));
+        assert!(refs.get("daemon_parked").is_none());
+        assert!(crate::tasks::classification_is_dispatchable(
+            &task.refs,
+            task.review_only,
+            task.continue_pr
+        ));
         let active_claims: i64 = conn
             .query_row(
                 "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
@@ -1488,33 +1478,7 @@ mod tests {
         assert_eq!(active_claims, 0);
         assert_eq!(runs, 0);
         assert_eq!(errors, 0);
-        assert_eq!(parked_events, 1);
-        let retried = crate::tasks::retry_parked(&mut conn, task_id, "operator", true, 2_000_001)
-            .unwrap()
-            .expect("policy retry must be accepted for reclassification");
-        assert_eq!(retried.status, "failed");
-        assert!(
-            unclassified_tasks(&conn)
-                .unwrap()
-                .iter()
-                .any(|task| task.id == task_id),
-            "accepted retry must await a fresh classifier result"
-        );
-        assert!(
-            crate::tasks::claim(&mut conn, "worker", Some(task_id), &[], 60, 2_000_002)
-                .unwrap()
-                .is_none(),
-            "awaiting reclassification must not enter worker dispatch"
-        );
-        assert_eq!(
-            store_classifications(&mut conn, &results, "gpt-5.6-luna:v2", 2_000_003).unwrap(),
-            1
-        );
-        assert_eq!(
-            crate::tasks::get(&conn, task_id).unwrap().unwrap().status,
-            "failed",
-            "an unchanged category-5 result must remain policy-parked"
-        );
+        assert_eq!(parked_events, 0);
     }
 
     #[test]
@@ -1644,13 +1608,10 @@ mod tests {
     fn retry_requests_reclassification_and_dispatchable_result_restores_status() {
         let (_dir, mut conn) = open_tmp();
         let task_id = create_task(&mut conn, "rescope", 1);
-        conn.execute(
-            "UPDATE tasks SET review_only=1 WHERE id=?1",
-            params![task_id],
-        )
-        .unwrap();
         let mut parked = classified(task_id, 5);
         parked.size = "L".into();
+        parked.ready = false;
+        parked.not_ready_reason = Some("outcome needs clarification".into());
         parked.duplicate_of = vec![99];
         store_classifications(&mut conn, &[parked], "test:v2", 10).unwrap();
         let parked_task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
@@ -1737,7 +1698,9 @@ mod tests {
         assert_eq!(unclassified_tasks(&conn).unwrap()[0].id, task_id);
         assert_eq!(tasks_missing_cx_all(&conn).unwrap()[0].id, task_id);
         let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
-        assert!(!crate::tasks::classification_is_dispatchable(&refs, None));
+        assert!(!crate::tasks::classification_is_dispatchable(
+            &refs, false, None
+        ));
     }
 
     #[test]
@@ -1856,8 +1819,7 @@ mod redesigned_tests {
         assert!(parking_reason(&result(5, "L", true, None), false, false).is_none());
         assert!(parking_reason(&result(2, "XL", true, None), false, false).is_some());
         assert!(parking_reason(&result(2, "XL", true, None), false, true).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), true, false).is_some());
-        assert!(parking_reason(&result(2, "XL", true, None), true, false).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), true, false).is_none());
     }
 
     #[test]
