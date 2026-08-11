@@ -2502,6 +2502,10 @@ pub struct ServeConfig {
     pub codex_sandbox: String,
 }
 
+/// Supervisor handoff: a daemon which has drained for a self-update exits 75.
+///
+/// `scripts/serve-supervisor.sh` treats this as its only rebuild-and-relaunch
+/// signal. Every other daemon exit code is terminal to the supervisor.
 pub const EXIT_SELF_UPDATE: i32 = 75;
 
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
@@ -3233,6 +3237,22 @@ enum DrainSource {
     Signal,
 }
 
+impl DrainSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfUpdate => "self-update",
+            Self::Signal => "signal",
+        }
+    }
+
+    fn supervisor_action(self) -> &'static str {
+        match self {
+            Self::SelfUpdate => "rebuild-and-relaunch",
+            Self::Signal => "none",
+        }
+    }
+}
+
 /// A shutdown trigger requests a drain; the tick loop owns the transition and
 /// its bounded outcome. Keeping triggers as data prevents a new trigger from
 /// bypassing the signal drain discipline and continuing into task dispatch.
@@ -3889,7 +3909,10 @@ impl DrainState {
         self.drain_source = Some(source);
         self.drain_started_at = Some(std::time::Instant::now());
         self.drain_sha = Some(sha.to_string());
-        log(&format!("DRAIN: entering drain mode (sha={sha})"));
+        log(&format!(
+            "DRAIN: entering drain mode source={} sha={sha}",
+            source.as_str()
+        ));
     }
 
     fn exit_code(&self) -> i32 {
@@ -3897,6 +3920,11 @@ impl DrainState {
             Some(DrainSource::SelfUpdate) => EXIT_SELF_UPDATE,
             _ => 0,
         }
+    }
+
+    fn exit_log_fields(&self) -> (&'static str, &'static str) {
+        let source = self.drain_source.unwrap_or(DrainSource::Signal);
+        (source.as_str(), source.supervisor_action())
     }
 
     fn should_poll_sha(&self, interval_secs: u64) -> bool {
@@ -6069,8 +6097,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             if workers.is_empty() && reviewers.is_empty() {
                 let exit = drain_state.exit_code();
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
+                let (source, supervisor_action) = drain_state.exit_log_fields();
                 log(&format!(
-                    "DRAIN: all agents finished (sha={sha}), exiting {exit}"
+                    "DRAIN: all agents finished source={source} sha={sha}; \
+                     exit_code={exit} supervisor={supervisor_action}"
                 ));
                 if let Some(slot) = classifier_slot.take() {
                     let _terminal_output = slot.proc.kill_and_reap().await;
@@ -6086,6 +6116,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
 
             if drain_state.timed_out(config.drain_timeout_secs) {
                 let exit = drain_state.exit_code();
+                let (source, supervisor_action) = drain_state.exit_log_fields();
                 log(&format!(
                     "DRAIN: timeout ({}s) — force-killing {} worker(s), {} reviewer(s)",
                     config.drain_timeout_secs,
@@ -6108,7 +6139,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     teardown_worker(config, &wt_mgr, &mut name_pool, w, "open").await;
                 }
                 let sha = drain_state.drain_sha.as_deref().unwrap_or("unknown");
-                log(&format!("DRAIN: exiting {exit} (sha={sha})"));
+                log(&format!(
+                    "DRAIN: exiting {exit} source={source} sha={sha}; \
+                     exit_code={exit} supervisor={supervisor_action}"
+                ));
                 return Ok(exit);
             }
         }
@@ -16972,6 +17006,22 @@ mod tests {
     #[test]
     fn exit_self_update_is_75() {
         assert_eq!(EXIT_SELF_UPDATE, 75);
+    }
+
+    #[test]
+    fn drain_exit_decision_keeps_the_supervisor_handoff_explicit() {
+        let mut self_update = DrainState::new();
+        self_update.start_drain_with_source("next-sha", DrainSource::SelfUpdate);
+        assert_eq!(self_update.exit_code(), EXIT_SELF_UPDATE);
+        assert_eq!(
+            self_update.exit_log_fields(),
+            ("self-update", "rebuild-and-relaunch")
+        );
+
+        let mut signal = DrainState::new();
+        signal.start_drain_with_source("signal", DrainSource::Signal);
+        assert_eq!(signal.exit_code(), 0);
+        assert_eq!(signal.exit_log_fields(), ("signal", "none"));
     }
 
     // ── Tick error classification (schema-too-new self-update) ───────────
