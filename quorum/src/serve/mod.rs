@@ -5951,11 +5951,16 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         }
         let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
 
-        // A second signal always forces immediate teardown. The first signal
-        // becomes a drain request below, even for an empty roster, so signal
-        // and staleness share one bounded drain outcome path.
-        if sig >= 2 {
-            log("force shutdown (second signal)");
+        // A second signal always forces immediate teardown. With no managed
+        // workers or reviewers, the first signal retains the established
+        // immediate signal exit; only in-flight signals enter the bounded
+        // drain request path below.
+        if sig >= 2 || (sig >= 1 && workers.is_empty() && reviewers.is_empty()) {
+            if sig >= 2 {
+                log("force shutdown (second signal)");
+            } else {
+                log("shutting down (signal, no in-flight agents)");
+            }
             if let Some(slot) = classifier_slot.take() {
                 let _terminal_output = slot.proc.kill_and_reap().await;
             }
