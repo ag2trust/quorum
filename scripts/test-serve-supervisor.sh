@@ -90,8 +90,15 @@ DEVSTUB
 
 printf 'test-serve-supervisor: running tests\n\n'
 
+# --- Test 0: contract alignment — SELF_UPDATE_EXIT_CODE matches daemon constant ---
+printf 'test 0: contract alignment (SELF_UPDATE_EXIT_CODE = 75)\n'
+
+script_code=$(grep '^SELF_UPDATE_EXIT_CODE=' "$SUPERVISOR" | head -1 | cut -d= -f2)
+if [ "$script_code" = "75" ]; then pass "SELF_UPDATE_EXIT_CODE is 75"
+else fail "SELF_UPDATE_EXIT_CODE is 75 (got $script_code)"; fi
+
 # --- Test 1: non-75 exit propagates and stops ---
-printf 'test 1: non-75 exit propagates\n'
+printf '\ntest 1: non-75 exit propagates\n'
 
 capture_supervisor "0" "0"
 if [ "$CAPTURED_EXIT" -eq 0 ]; then pass "exit 0 propagated"
@@ -116,9 +123,9 @@ capture_supervisor "75 0" "0"
 if [ "$CAPTURED_EXIT" -eq 0 ]; then pass "relaunched after exit 75 and exited cleanly"
 else fail "relaunched after exit 75 (got exit $CAPTURED_EXIT)"; fi
 
-if printf '%s' "$CAPTURED_OUTPUT" | grep -q "self-update drain"; then
-  pass "logged self-update drain message"
-else fail "logged self-update drain message"; fi
+if printf '%s' "$CAPTURED_OUTPUT" | grep -q "self-update drain handoff"; then
+  pass "logged self-update drain handoff message"
+else fail "logged self-update drain handoff message"; fi
 
 if printf '%s' "$CAPTURED_OUTPUT" | grep -q "rebuild OK"; then
   pass "logged rebuild OK"
