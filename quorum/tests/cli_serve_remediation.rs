@@ -677,6 +677,55 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         "external worktree add failed: {}",
         String::from_utf8_lossy(&add.stderr)
     );
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &held.to_string_lossy(),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "published PR work",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let published_pr_head = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &held.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &repo_dir.path().to_string_lossy(),
+            "commit",
+            "--allow-empty",
+            "-m",
+            "advance main after PR publication",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    let base_head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "main",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
     let mut handle = ServeHandle::start(
         home.path(),
@@ -759,6 +808,23 @@ fn remediation_provisions_when_pr_branch_held_by_external_worktree() {
         "",
         "remediation workers must not receive agent-side push refspecs"
     );
+    for ancestor in [&published_pr_head, &base_head] {
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    &wt_path.to_string_lossy(),
+                    "merge-base",
+                    "--is-ancestor",
+                    ancestor,
+                    "HEAD",
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "remediation worktree must preserve published PR and current base ancestry: {ancestor}"
+        );
+    }
     // The external checkout is untouched.
     assert_eq!(
         String::from_utf8_lossy(

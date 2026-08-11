@@ -822,7 +822,9 @@ after reviewer provisioning.
 After VerdictApprove (InReview → Merging):
 1. Check stale SHA — if reviewer recorded a head SHA and it differs from current, fire
    MergeFailed → rework cycle (prevents stale approval from authorizing a changed diff).
-2. Check mergeability — if conflicting, MergeConflict → rework cycle (worker rebases).
+2. Check mergeability — if conflicting, MergeConflict → rework cycle. The daemon checks out
+   the exact published PR head and merges the current base before worker launch; a conflicting
+   merge remains in progress for the worker to resolve and commit. The worker never rebases.
 3. Wait for CI checks — outcome classified into Ready / Failed / TimedOut. See
    § Merge-wait vs. actionable-rework contract (#173) below for the full disposition.
 4. Persist approval record (instance-independent, survives restart).
@@ -863,7 +865,7 @@ retry autonomously.
 |---|---|---|---|
 | `Ready` | any | actionable (proceed) | Continue to step 4 (persist approval) and merge |
 | `Failed { checks }` | any | actionable (code broken) | `MergeFailed` → InReview, then `VerdictChanges` → Rework (rework cap applies). Worker gets failing check names. |
-| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Worker rebases. |
+| `TimedOut` | `Conflicting` | actionable (conflict) | `MergeConflict` → Rework directly (rework cap applies). Daemon prepares an ancestry-preserving base merge for the worker to resolve. |
 | `TimedOut` | `Mergeable` | **infrastructure-pending** | **Durable merge-wait** — no VerdictChanges, no AgentFailed, no rework budget consumed. See retry/backoff below. |
 | `TimedOut` | `AlreadyMerged` | resolved externally | `PrFoundMerged` → Done |
 | `TimedOut` | `Closed` | resolved externally | `PrFoundClosed` → Failed |
@@ -1126,7 +1128,8 @@ Each invariant below requires both a positive and a negative test. Tests marked
     `rework_round` incremented.
 
 11. `conflict_during_checks_triggers_rework` — checks return `TimedOut`, mergeability
-    is `Conflicting`. Assert: `MergeConflict` → Rework, worker rebases.
+    is `Conflicting`. Assert: `MergeConflict` → Rework, daemon-prepared base merge preserves
+    the published PR head, and the worker resolves it without rebasing.
 
 12. `retryable_merge_failure_triggers_rework` — merge attempt fails with
     `MergeFailureKind::Retryable`. Assert: `MergeFailed` + `VerdictChanges` → Rework.

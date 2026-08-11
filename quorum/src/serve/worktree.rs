@@ -956,6 +956,30 @@ impl WorktreeManager {
             ));
         }
 
+        // Existing PR publication is intentionally fast-forward-only.  The
+        // lease above protects against a concurrently moved remote, but it
+        // does not prove that a worker preserved the published lineage.  A
+        // rebase can leave the remote unchanged while replacing its tip with
+        // an unrelated commit, so reject that shape before invoking push.
+        let mut ancestry = self.git_cmd(worktree_dir);
+        ancestry.args([
+            "merge-base",
+            "--is-ancestor",
+            expected_remote_sha,
+            source_sha,
+        ]);
+        let ancestry = run_git(
+            ancestry,
+            self.local_timeout,
+            "git validate PR publication ancestry",
+        )
+        .await?;
+        if !ancestry.status.success() {
+            return Err(format!(
+                "publication source {source_sha} rewrites published PR head {expected_remote_sha}; preserve the PR head and merge the base branch instead of rebasing"
+            ));
+        }
+
         let refspec = format!("{source_sha}:{remote_ref}");
         let lease = format!("--force-with-lease={remote_ref}:{expected_remote_sha}");
         let mut push = self.daemon_push_cmd(worktree_dir, &refspec, &lease).await?;
@@ -2773,6 +2797,57 @@ mod tests {
 
         mgr.remove(&repo, &wt_path).await.ok();
         mgr.delete_branch(&repo, "remediation/Brass-t10").await;
+    }
+
+    #[tokio::test]
+    async fn daemon_push_to_pr_head_rejects_rewritten_published_lineage_before_push() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, bare) = init_repo_with_bare_remote(tmp.path());
+        let pr_head = "fix/rewritten-pr";
+        let published_tip = push_branch(&repo, pr_head);
+
+        assert!(git_output(&repo, &["checkout", "main"]).status.success());
+        assert!(git_output(
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "replacement based on newer main"
+            ]
+        )
+        .status
+        .success());
+        let rewritten_source = git_rev_parse(&repo, "HEAD");
+        assert!(
+            !git_output(
+                &repo,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &published_tip,
+                    &rewritten_source,
+                ]
+            )
+            .status
+            .success(),
+            "fixture must model a rebased/squash-rebuilt PR lineage"
+        );
+
+        let error = WorktreeManager::new()
+            .push_to_pr_head(&repo, pr_head, &published_tip, &rewritten_source, "main")
+            .await
+            .expect_err("rewritten published ancestry must fail before push");
+        assert!(error.contains("rewrites published PR head"), "{error}");
+        assert!(
+            error.contains("merge the base branch instead of rebasing"),
+            "{error}"
+        );
+        assert_eq!(
+            git_rev_parse(&bare, pr_head),
+            published_tip,
+            "ancestry rejection must leave the remote PR branch unchanged"
+        );
     }
 
     #[tokio::test]
