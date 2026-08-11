@@ -3233,6 +3233,30 @@ enum DrainSource {
     Signal,
 }
 
+/// A shutdown trigger requests a drain; the tick loop owns the transition and
+/// its bounded outcome. Keeping triggers as data prevents a new trigger from
+/// bypassing the signal drain discipline and continuing into task dispatch.
+struct DrainRequest {
+    sha: String,
+    source: DrainSource,
+}
+
+impl DrainRequest {
+    fn signal() -> Self {
+        Self {
+            sha: "signal".into(),
+            source: DrainSource::Signal,
+        }
+    }
+
+    fn self_update(sha: String) -> Self {
+        Self {
+            sha,
+            source: DrainSource::SelfUpdate,
+        }
+    }
+}
+
 /// Mutable drain state tracked across ticks.
 struct DrainState {
     draining: bool,
@@ -5927,7 +5951,10 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
         }
         let sig = signal_count.load(std::sync::atomic::Ordering::SeqCst);
 
-        // Second signal (or first signal with no in-flight agents): immediate teardown.
+        // A second signal always forces immediate teardown. With no managed
+        // workers or reviewers, the first signal retains the established
+        // immediate signal exit; only in-flight signals enter the bounded
+        // drain request path below.
         if sig >= 2 || (sig >= 1 && workers.is_empty() && reviewers.is_empty()) {
             if sig >= 2 {
                 log("force shutdown (second signal)");
@@ -5952,10 +5979,12 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
             return Ok(0);
         }
 
-        // First signal: enter drain mode (let in-flight agents finish).
-        if sig >= 1 && !drain_state.draining {
+        // Signals and build staleness only request a shutdown here. The common
+        // handoff below starts the drain before any tick work can claim or
+        // spawn another task.
+        let mut drain_request = (sig >= 1 && !drain_state.draining).then(DrainRequest::signal);
+        if drain_request.is_some() {
             log("SIGINT: draining \u{2014} in-flight agents will finish; Ctrl+C again to force immediate shutdown");
-            drain_state.start_drain_with_source("signal", DrainSource::Signal);
         }
 
         // #201: sentinel file disappeared — parent test process died.
@@ -5986,7 +6015,8 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
 
         // Trigger B: periodically compare the executable's build SHA to origin.
         // The network operation is deliberately outside all database transactions.
-        if config.self_update_drain
+        if drain_request.is_none()
+            && config.self_update_drain
             && !drain_state.draining
             && drain_state.should_poll_sha(config.sha_poll_interval_secs)
         {
@@ -6010,7 +6040,7 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                                 "DRAIN: origin/{} is ahead of running build ({} -> {})",
                                 config.base_branch, build_sha, remote_sha
                             ));
-                            drain_state.start_drain(&remote_sha);
+                            drain_request = Some(DrainRequest::self_update(remote_sha));
                         }
                     }
                     None => log(&format!(
@@ -6025,6 +6055,13 @@ async fn tick_loop(config: &ServeConfig, daemon_pid: i64) -> Result<i32> {
                     "WARN: self-update-drain build staleness check join failed: {error}"
                 )),
             }
+        }
+
+        // This is the sole entry into graceful drain mode. It deliberately
+        // precedes cleanup and tick dispatch, so a behind decision cannot
+        // claim or spawn new work before the bounded drain starts.
+        if let Some(request) = drain_request {
+            drain_state.start_drain_with_source(&request.sha, request.source);
         }
 
         // Drain: check timeout and roster empty

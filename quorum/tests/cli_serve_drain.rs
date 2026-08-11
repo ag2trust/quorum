@@ -287,6 +287,21 @@ fn seed_task_with_refs(home: &std::path::Path, title: &str, refs: &str) {
     );
 }
 
+fn task_json(home: &std::path::Path, task_id: i64) -> serde_json::Value {
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-get", "--task-id", &task_id.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "task-get #{task_id} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
 fn resolve_run_id(home: &std::path::Path, agent: &str, role: &str) -> String {
     let db = home.join("repos").join("test__repo").join("quorum.db");
     let mut conn = quorum_core::db::open(&db).unwrap();
@@ -739,19 +754,18 @@ fn drain_timeout_force_kills_and_exits_75() {
         handle.lines
     );
 
-    // Verify queued task (#2) is still open (claimable after restart)
-    let get_out = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .env("QUORUM_REPO", "test/repo")
-        .args(["task-get", "--task-id", "2"])
-        .output()
-        .unwrap();
-    assert!(get_out.status.success());
-    let stdout = String::from_utf8_lossy(&get_out.stdout);
-    assert!(
-        stdout.contains("\"status\":\"open\"") || stdout.contains("\"status\": \"open\""),
-        "queued task was not left open for next generation: {stdout}"
-    );
+    // State evidence: once the behind decision is made, task #2 was neither
+    // claimed nor spawned. It remains wholly available to the next daemon.
+    let queued = task_json(home.path(), 2);
+    assert_eq!(queued["status"], "open");
+    assert!(queued["assignee"].is_null());
+    assert_eq!(queued["agent_runs"].as_array().unwrap().len(), 0);
+
+    // The in-flight task remains durable and recoverable after the bounded
+    // drain; the daemon must not silently lose it while stopping.
+    let in_flight = task_json(home.path(), 1);
+    assert_eq!(in_flight["status"], "open");
+    assert!(!in_flight["agent_runs"].as_array().unwrap().is_empty());
 }
 
 /// T3 regression: drain timeout must be honored even when tick() is blocked
