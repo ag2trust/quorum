@@ -2300,8 +2300,9 @@ upgrade signal.
    the daemon serving.
 2. **Schema too new.** A tick reporting `QuorumError::SchemaTooNew` means the
    on-disk DB is newer than the binary can read. The daemon cannot safely
-   perform DB-backed cleanup, so it force-kills managed in-flight processes
-   and exits 75 for a rebuild and relaunch.
+   perform DB-backed cleanup, so it force-kills its in-flight
+   worker/reviewer/planner/classifier processes and exits 75 for a rebuild
+   and relaunch.
 3. **Normal-tick merge.** When both `self_update_drain` and `self_repo` are
    configured, a successful merge performed by the normal tick merge executor
    requests the same self-update drain immediately after `MergeSucceeded`.
@@ -2310,9 +2311,10 @@ A self-update drain is bounded and shallow: ordinary worker/reviewer
 provisioning respects the drain state, and the daemon drains its
 worker/reviewer roster without waiting for their tasks to finish. The daemon
 exits 75 when that roster becomes empty or `drain_timeout_secs` expires; at
-timeout it force-kills the remaining managed slots. Restart recovery then
-applies the normal durable lifecycle rules. This is deliberately not a
-guarantee that every task reaches a terminal state before handoff.
+timeout it force-kills the remaining worker/reviewer/planner/classifier slots.
+Restart recovery then applies the normal durable lifecycle rules. This is
+deliberately not a guarantee that every task reaches a terminal state before
+handoff.
 
 The supervisor handles exit 75 by fetching `origin/<base>`, fast-forwarding
 the checkout, running `./dev-install.sh` (with its bounded build timeout), and
