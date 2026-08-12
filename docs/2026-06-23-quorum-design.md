@@ -2308,9 +2308,13 @@ shutdown (Ctrl-C, `DrainSource::Signal`, exits 0) but tagged
    deletes their journal row immediately (`journal::delete`) — the journal is
    not what carries the task across the restart. What happens to the task
    depends on its status and whether it is `review_only`:
-   - A plain `working`/`rework` task bounces to `Open` (or stays `Rework` and
-     is left for a fresh reviewer/worker pass), a non-terminal status the
-     tick loop reclaims on its own on the next daemon.
+   - A plain (non-`review_only`) `working` or `rework` task's `AgentFailed`
+     always bounces it to `Open` (`quorum-core/src/lifecycle.rs:267-277` for
+     `working`, `:411-421` for `rework`), a non-terminal status the tick loop
+     reclaims on its own on the next daemon. (Staying in `Rework` is a
+     distinct, narrower exception inside crash-recovery's own retry-queued
+     check — `quorum/src/serve/recovery.rs:190-245` — not a possible outcome
+     of the `AgentFailed` event drain fires here.)
    - A `review_only` remediation task (this task's own kind) in `Rework`
      hitting `AgentFailed` is parked to the *terminal* `Failed` status
      instead — `quorum-core/src/lifecycle.rs:391-410` deliberately does not
