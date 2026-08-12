@@ -2274,12 +2274,53 @@ signal and cheap-poll for resume. This model is removed:
   of the target agent process, slot release, and post-mortem ladder on any
   held task. Use for zombie workers, stuck processes, or emergency abort.
 - **Self-update drain remains separate.** The `--self-update-drain` mechanism
-  (signal-triggered drain, exit 75 for supervisor rebuild) is orthogonal to
-  agent stop/kill and is unchanged.
+  is orthogonal to agent stop/kill and is unchanged. See "Self-update (exit 75
+  contract)" below for the staleness trigger and exit path.
 
 Daemon scheduling pause/resume (pausing the daemon's spawn loop without
 stopping individual agents) is **out of scope for v2** — drain covers the
 "stop spawning new work" use case.
+
+### Self-update (exit 75 contract)
+
+`quorum serve` never patches itself in place. It exits with a reserved code,
+`EXIT_SELF_UPDATE = 75`, and `scripts/serve-supervisor.sh` (or an equivalent
+supervisor) treats that code as an upgrade signal: fetch `origin/<base>`,
+fast-forward merge, rebuild via `./dev-install.sh`, and relaunch. Any other
+exit code propagates and stops the supervisor loop — a crash is not an
+upgrade signal.
+
+`EXIT_SELF_UPDATE` has three supported triggers:
+
+1. **Build staleness.** With `--self-update-drain`, the tick loop periodically
+   (`sha_poll_interval_secs`, default 600 seconds) runs bounded
+   `git ls-remote origin <base_branch>` outside DB work. When the remote base
+   SHA does not match the running build SHA, it requests a self-update drain.
+   An unavailable remote or an unidentifiable build SHA is logged and leaves
+   the daemon serving.
+2. **Schema too new.** A tick reporting `QuorumError::SchemaTooNew` means the
+   on-disk DB is newer than the binary can read. The daemon cannot safely
+   perform DB-backed cleanup, so it force-kills its in-flight
+   worker/reviewer/planner/classifier processes and exits 75 for a rebuild
+   and relaunch.
+3. **Normal-tick merge.** When both `self_update_drain` and `self_repo` are
+   configured, a successful merge performed by the normal tick merge executor
+   requests the same self-update drain immediately after `MergeSucceeded`.
+
+A self-update drain is bounded and shallow: ordinary worker/reviewer
+provisioning respects the drain state, and the daemon drains its
+worker/reviewer roster without waiting for their tasks to finish. The daemon
+exits 75 when that roster becomes empty or `drain_timeout_secs` expires; at
+timeout it force-kills the remaining worker/reviewer/planner/classifier slots.
+Restart recovery then applies the normal durable lifecycle rules. This is
+deliberately not a guarantee that every task reaches a terminal state before
+handoff.
+
+The supervisor handles exit 75 by fetching `origin/<base>`, fast-forwarding
+the checkout, running `./dev-install.sh` (with its bounded build timeout), and
+relaunching. A failed fast-forward or build alerts and relaunches the existing
+binary; its restart-thrash guard is bounded. Other daemon exit codes propagate
+and stop the supervisor, so a crash is never treated as an upgrade signal.
 
 ### Run identity and capability enforcement
 
