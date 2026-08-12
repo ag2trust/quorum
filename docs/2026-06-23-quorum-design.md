@@ -776,13 +776,14 @@ approval path merges; when it requires R2, the following dual-review flow applie
 No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
 
 **Severity and disposition contract** — both R1 and R2 prompts classify
-technical impact separately from merge disposition. Concrete resource
-exhaustion, unbounded growth, network calls in DB transactions, data loss,
-corruption, security-boundary failures, and stuck paths are presumptively major
-or critical impact. They are BLOCKING only when the demonstrated failure also
-belongs to the current task/repository contract and supported operating or threat
-model. Each blocker explains why this PR cannot merge; each follow-up explains
-why deferral is safe.
+technical impact separately from merge disposition using the reviewer
+classification contract above: a finding is BLOCKING only when merging the
+exact change would leave the assigned primary outcome false, violate an
+applicable repository invariant, or introduce/materially worsen supported
+behavior. Concrete resource exhaustion, unbounded growth, network calls in
+DB transactions, data loss, corruption, security-boundary failures, and
+stuck paths are presumptively major or critical impact, but their category
+alone never decides merge disposition.
 
 ### Daemon-owned pre-review CI gate
 
