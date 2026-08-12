@@ -1804,7 +1804,8 @@ literals it carries. Tasks follow independently deliverable code or ownership se
 behavior and regression-only expectations remain criteria or non-goals rather than synthetic
 implementation work. Before any task row is created, deterministic validation checks the closed
 shape, references, cycles, prohibited synthetic integration work, and byte-exact coverage of
-source-marked literals that fit the 8 KiB `preserved_literals` field (Markdown code plus quoted
+the lexicographically sorted, distinct prefix of source-marked literals that fits both the 8 KiB
+`preserved_literals` field and its 8 KiB aggregate budget (Markdown code plus quoted
 literal/label/tag/message values), then
 classifies the complete proposal as one batch. Every child must be
 admission-ready, nonduplicate, and size S or M under the same execution-size rubric given to the

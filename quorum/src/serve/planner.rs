@@ -19,6 +19,10 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 128 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
+// Keep all required literal payload within one text field's budget so a plan
+// carrying every required value still has ample space under the 64 KiB response
+// and durable-proposal limits for its mandatory task structure.
+const MAX_REQUIRED_LITERAL_BYTES: usize = MAX_TEXT_BYTES;
 const MAX_LIST_ITEMS: usize = 32;
 const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize = 1024;
@@ -97,9 +101,11 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          and 10 Read calls. Do not browse unrelated directories or read whole large files. \
          Preserve every source constraint. Copy exact required text, literals, commands, schemas, \
          labels, tags, messages, identifiers, and other verbatim source material byte-for-byte \
-         without normalization or paraphrase. Put every source-marked literal of at most 8 KiB in \
-         preserved_literals on at least one child; do not put a larger source value there because \
-         it exceeds the field limit. Every source requirement must be represented by a child delta, criterion, \
+         without normalization or paraphrase. Put each value in the required literal set in \
+         preserved_literals on at least one child. That set is the lexicographically sorted, \
+         distinct source-marked values of at most 8 KiB whose prefix fits an 8 KiB aggregate; \
+         do not put larger values or values beyond that set there because they exceed the bounded \
+         response and proposal capacity. Every source requirement must be represented by a child delta, criterion, \
          constraint, verification expectation, or non-goal. Do not create synthetic integration \
          work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
          must be real delivery prerequisites and may \
@@ -247,7 +253,18 @@ fn required_source_literals(source: &str) -> Vec<String> {
     }
     literals.sort();
     literals.dedup();
-    literals
+
+    let mut required = Vec::new();
+    let mut required_bytes: usize = 0;
+    for literal in literals {
+        let next = required_bytes.saturating_add(literal.len());
+        if next > MAX_REQUIRED_LITERAL_BYTES {
+            break;
+        }
+        required_bytes = next;
+        required.push(literal);
+    }
+    required
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1020,6 +1037,33 @@ mod tests {
             )
             .is_ok());
         }
+    }
+
+    #[test]
+    fn source_validation_bounds_required_literals_to_the_response_and_proposal_budget() {
+        let source = (0..8)
+            .map(|index| {
+                let mut literal = format!("{index:02}");
+                literal.push_str(&"x".repeat(MAX_TEXT_BYTES - literal.len()));
+                format!("literal \"{literal}\"")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let required = required_source_literals(&source);
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].len(), MAX_TEXT_BYTES);
+
+        let mut first = task("a", &[]);
+        first["preserved_literals"] = serde_json::json!([required[0]]);
+        let plan = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [first, task("b", &["a"])]
+        });
+        assert!(plan.to_string().len() <= MAX_RESPONSE_BYTES);
+        let PlannerResponse::Plan { tasks } = parse_response(&plan.to_string()).unwrap() else {
+            panic!("plan response expected");
+        };
+        assert!(validate_for_source(&tasks, &[], "source", Some(&source)).is_ok());
     }
 
     #[test]
