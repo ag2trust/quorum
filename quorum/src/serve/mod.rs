@@ -8818,9 +8818,6 @@ async fn tick(
                     )
                     .await;
                     teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:none").await;
-                    if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id) {
-                        workers[wi].pr = None;
-                    }
                 }
             }
 

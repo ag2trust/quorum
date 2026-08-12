@@ -379,6 +379,15 @@ fi
         None
     }
 
+    fn latest_agent_name(&self, prefix: &str) -> Option<String> {
+        for line in self.lines.iter().rev() {
+            if let Some(rest) = line.split(prefix).nth(1) {
+                return Some(rest.split_whitespace().next().unwrap_or("").to_string());
+            }
+        }
+        None
+    }
+
     fn stop(mut self) {
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
@@ -1129,7 +1138,7 @@ fn merge_failure_feeds_rework_to_worker() {
 }
 
 #[test]
-fn no_verdict_done_clears_pr_no_respawn_loop() {
+fn no_verdict_reviewer_replacement_preserves_pr_for_rework() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -1215,32 +1224,56 @@ fn no_verdict_done_clears_pr_no_respawn_loop() {
         handle.lines
     );
 
-    // Phase 1 already snapshotted the tick handling reviewer teardown, so a
-    // barrier appended now cannot be consumed until a later tick. Observing it
-    // proves the teardown tick completed Phase 5/5b; if w.pr was not cleared,
-    // that reconciliation pass would have spawned another reviewer.
-    let barrier = append_done_barrier(home.path(), "NoVerdictBarrier");
-    wait_for_mailbox_consumed(home.path(), barrier);
-    assert_eq!(
-        journal_role_count(home.path(), "reviewer"),
-        0,
-        "reviewer journal row reappeared after the no-verdict barrier"
+    // AgentFailed requests a replacement reviewer. The worker must retain its
+    // daemon-owned PR so a changes verdict from that replacement can start a
+    // valid sticky rework turn.
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "replacement reviewer was not spawned: {:?}",
+        handle.lines
+    );
+    let replacement = handle
+        .latest_agent_name("spawning reviewer ")
+        .expect("replacement reviewer name missing");
+    assert_ne!(replacement, reviewer_name);
+    assert!(
+        handle.wait_for("result", 15),
+        "replacement reviewer did not finish its turn: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &replacement,
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix the replacement review finding",
+        ],
+    );
+    assert!(
+        handle.wait_for("rework #1 started", 15),
+        "replacement changes verdict did not start rework: {:?}",
+        handle.lines
+    );
+    assert!(
+        wait_session_log(home.path(), "Fixing", 15),
+        "worker rework response not seen after replacement reviewer changes"
+    );
+    assert!(
+        handle.wait_for("result", 15),
+        "worker rework result not seen: {:?}",
+        handle.lines
     );
 
-    // Drain any remaining log lines
-    while let Ok(line) = handle.rx.try_recv() {
-        handle.lines.push(line);
-    }
-
-    // Count reviewer spawn messages — should be exactly 1
-    let spawn_count = handle
-        .lines
-        .iter()
-        .filter(|l| l.contains("spawning reviewer"))
-        .count();
-    assert_eq!(
-        spawn_count, 1,
-        "expected exactly 1 reviewer spawn (no respawn loop), got {spawn_count}. Lines: {:?}",
+    // The same existing PR is accepted after the failure-to-rework handoff.
+    quorum_submit_existing_worker_pr(home.path(), &worker_name, "1");
+    assert!(
+        handle.wait_for("fed re-review turn", 15),
+        "matching rework publication was not returned to review: {:?}",
         handle.lines
     );
 
