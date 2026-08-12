@@ -2297,33 +2297,58 @@ shutdown (Ctrl-C, `DrainSource::Signal`, exits 0) but tagged
    exit immediately: it enters drain mode, which blocks new claims/spawns
    and tears down each in-flight worker/reviewer as soon as its *current
    turn* completes — not once its task reaches a terminal state. Torn-down
-   workers are marked `AgentFailed` ("daemon draining"), and `cleanup_slot`
+   agents are marked `AgentFailed` ("daemon draining"), and `cleanup_slot`
    deletes their journal row immediately (`journal::delete`) — the journal is
-   not what carries them across the restart. Their task is left in its
-   non-terminal durable status; the *next* (relaunched) daemon's startup
-   crash recovery (`recovery::recover`) resets any non-terminal task for the
-   tick loop to reclaim. This is a shallow drain — the current turn is
-   completed, then the agent is torn down and its task recovered from durable
-   task/PR state, not "finish the task normally". The daemon exits 75 once
-   the roster is empty or `drain_timeout_secs` elapses, whichever comes
-   first — at timeout, any remaining agents are force-killed rather than
-   left to
-   block the upgrade indefinitely.
+   not what carries the task across the restart. What happens to the task
+   depends on its status and whether it is `review_only`:
+   - A plain `working`/`rework` task bounces to `Open` (or stays `Rework` and
+     is left for a fresh reviewer/worker pass), a non-terminal status the
+     tick loop reclaims on its own on the next daemon.
+   - A `review_only` remediation task (this task's own kind) in `Rework`
+     hitting `AgentFailed` is parked to the *terminal* `Failed` status
+     instead — `quorum-core/src/lifecycle.rs:391-410` deliberately does not
+     bounce a lost remediation worker back to review (that would burn a
+     rework round re-judging an unchanged PR head with no fix applied).
+     Recovering it requires an explicit `quorum task-retry`; the relaunched
+     daemon's crash recovery does not resurrect it on its own.
+   - An idle `in-review` task is left as-is (`quorum/src/serve/recovery.rs:11`,
+     `:175`) — never reset, but still non-terminal, so the relaunched
+     daemon's normal tick loop spawns a reviewer for it.
+   This is a shallow drain: the current turn completes, then the agent is
+   torn down and the task's fate is decided by the lifecycle rule for its
+   exact status, not by a uniform "finish the task normally" or "always
+   reclaimed" contract. The daemon exits 75 once the roster is empty or
+   `drain_timeout_secs` elapses, whichever comes first — at timeout, any
+   remaining agents are force-killed rather than left to block the upgrade
+   indefinitely.
 2. **Schema-too-new (immediate force-kill, no drain).** If a tick returns
    `QuorumError::SchemaTooNew` — the on-disk DB was migrated by a newer
    binary than the one running — retrying can never succeed, since this
    binary cannot read the schema. There is no graceful path: teardown itself
    writes to the DB, which would also fail. The daemon force-kills every
-   in-flight worker/reviewer/planner/classifier process immediately and
-   exits 75 without waiting. Tasks are re-adopted from the journal by the
-   relaunched daemon on restart.
-3. **Successful self-repo merge (bounded drain-then-exit).** When
-   `self_update_drain` and `self_repo` are both configured, a successful
-   merge of a PR against the daemon's own repo enters the same bounded drain
-   as trigger 1 (`DrainState::start_drain`, source `SelfUpdate`) immediately
-   after firing `MergeSucceeded` — the daemon's own source moved, so the
-   running binary is now stale by construction and does not wait for the
-   next SHA poll.
+   in-flight worker/reviewer/planner/classifier process immediately without
+   calling `cleanup_slot`, so their journal rows are left intact. Recovery
+   does not replay them, though: on the relaunched daemon's startup,
+   `recovery::recover` (`quorum/src/serve/recovery.rs`, module doc at `:1-13`)
+   uses the surviving journal only to find and kill each stale process's PID
+   (Phase 1, `:80-115`), then unconditionally deletes every journal row
+   (Phase 2, `:149-162`, `journal::delete_all`), then drives recovery purely
+   from durable task status (Phase 4, `:172-355`) — `working`/`rework` →
+   `AgentFailed` → `Open` (or terminal `Failed` for `review_only` rework, per
+   the same lifecycle rule as trigger 1), `merging` → `AgentFailed` →
+   `in-review` unless a durable full approval is already recorded, and
+   `in-review` left unchanged.
+3. **Successful merge while self-update-drain is configured (bounded
+   drain-then-exit).** When `self_update_drain` and `self_repo` are both
+   configured, *any* successful PR merge — not only one in the repo named by
+   `self_repo` — enters the same bounded drain as trigger 1
+   (`DrainState::start_drain`, source `SelfUpdate`) immediately after firing
+   `MergeSucceeded` (`quorum/src/serve/mod.rs:8265-8279`). The code does not
+   check the merged task's repo against `self_repo`; it treats `self_repo`
+   being configured at all as sufficient grounds to assume the daemon's own
+   source may have moved. A daemon configured with `self_repo` pointing at a
+   different repo than the one it primarily manages (`config.repo`) will
+   drain on merges in *either* repo, not just `self_repo`'s.
 
 All three triggers share the exit code so the supervisor needs only one
 branch to handle any of them; they differ in whether existing agents get a
