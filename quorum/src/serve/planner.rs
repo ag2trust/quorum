@@ -1012,7 +1012,13 @@ mod tests {
             format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
         ] {
             assert!(required_source_literals(&source).is_empty());
-            assert!(validate_for_source(&[proposed.clone()], &[], "source", Some(&source)).is_ok());
+            assert!(validate_for_source(
+                std::slice::from_ref(&proposed),
+                &[],
+                "source",
+                Some(&source)
+            )
+            .is_ok());
         }
     }
 
