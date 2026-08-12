@@ -2356,25 +2356,37 @@ shutdown (Ctrl-C, `DrainSource::Signal`, exits 0) but tagged
    the same lifecycle rule as trigger 1), `merging` → `AgentFailed` →
    `in-review` unless a durable full approval is already recorded, and
    `in-review` left unchanged.
-3. **Successful merge via the merge executor while self-update-drain is
-   configured (bounded drain-then-exit).** When `self_update_drain` and
-   `self_repo` are both configured, a PR merge *performed by this daemon's
-   own merge-executor call* enters the same bounded drain as trigger 1
-   (`DrainState::start_drain`, source `SelfUpdate`) immediately after firing
-   `MergeSucceeded` (`quorum/src/serve/mod.rs:8265-8279`). The code does not
-   check the merged task's repo against `self_repo`; it treats `self_repo`
-   being configured at all as sufficient grounds to assume the daemon's own
-   source may have moved. A daemon configured with `self_repo` pointing at a
-   different repo than the one it primarily manages (`config.repo`) will
-   drain on merges in *either* repo, not just `self_repo`'s. This trigger is
-   narrower than "any successful merge," though: the daemon's other
-   already-merged *detection* paths — a pre-merge mergeability check finding
-   the PR already merged externally (`:7069-7093`), the same detection for a
-   worker awaiting review (`:9988-9995`), and for an orphaned in-review task
-   (`:10252-10259`) — fire `MergeSucceeded` or `PrFoundMerged` and clean up
-   the slot, but none of them call `start_drain`. Only the merge-executor's
-   own successful-merge branch triggers this drain; a merge completed
-   outside this daemon's own attempt and merely observed here does not.
+3. **Successful merge via the *normal tick* merge executor while
+   self-update-drain is configured (bounded drain-then-exit).** When
+   `self_update_drain` and `self_repo` are both configured, a PR merge
+   *performed by the tick loop's own merge-executor call* enters the same
+   bounded drain as trigger 1 (`DrainState::start_drain`, source
+   `SelfUpdate`) immediately after firing `MergeSucceeded`
+   (`quorum/src/serve/mod.rs:8265-8279`). The code does not check the merged
+   task's repo against `self_repo`; it treats `self_repo` being configured
+   at all as sufficient grounds to assume the daemon's own source may have
+   moved. A daemon configured with `self_repo` pointing at a different repo
+   than the one it primarily manages (`config.repo`) will drain on merges in
+   *either* repo, not just `self_repo`'s.
+
+   This trigger is narrower than "any successful merge," though — two other
+   classes of supported merge-executor call do not start drain:
+   - **Already-merged detection.** A pre-merge mergeability check finding
+     the PR already merged externally (`:7069-7093`), the same detection for
+     a worker awaiting review (`:9988-9995`), and for an orphaned in-review
+     task (`:10252-10259`) fire `MergeSucceeded` or `PrFoundMerged` and clean
+     up the slot, but none of them call `start_drain` — they observe a merge
+     rather than perform one.
+   - **Startup approval recovery.** `run_serve` calls `approvals::recover`
+     during startup (`:5864-5871`), before the tick loop's `DrainState`
+     exists, to merge a PR whose durable approval survived a crash. That
+     path calls `exec.merge` directly and closes the task
+     (`quorum/src/serve/approvals.rs:348-396`) — a real merge-executor merge,
+     unlike the detection paths above — but has no `DrainState` to signal at
+     all. If this merge is in `self_repo`, the running binary is stale
+     immediately, yet the daemon keeps serving until the next
+     `sha_poll_interval_secs` tick notices origin has moved; it does not
+     drain right away the way trigger 3's normal-tick path does.
 
 All three triggers share the exit code so the supervisor needs only one
 branch to handle any of them; they differ in whether existing agents get a
