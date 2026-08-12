@@ -2683,6 +2683,30 @@ fn worker_done_event(rework_count: u32, pr: i64) -> Event {
     }
 }
 
+/// Start another turn on a live worker after the daemon has moved its task to
+/// rework.  The PR belongs to the daemon for the lifetime of this worker: a
+/// rework turn must retain it both in memory and in the crash-recovery journal.
+async fn begin_sticky_worker_rework(slot: &mut SlotState, db_path: &Path) {
+    debug_assert!(
+        slot.pr.is_some(),
+        "a sticky rework worker must retain its daemon-owned PR"
+    );
+    slot.draining = true;
+    slot.rework_count += 1;
+    slot.turn_started_at = std::time::Instant::now();
+    if let Some(ref mut session_log) = slot.session_log {
+        session_log.log_rework(slot.rework_count);
+    }
+    let p = db_path.to_path_buf();
+    let entry = slot_journal_entry(slot, "worker", "working");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::upsert(&mut conn, &entry)
+    })
+    .await
+    .ok();
+}
+
 /// Resolve a worker's publication target without granting the worker any PR
 /// selection authority. An omitted signal retains the daemon-owned identity
 /// captured in the live slot or durable journal; an explicit signal may only
@@ -5292,21 +5316,7 @@ async fn handle_pre_review_checks_failure(
                         cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
                     } else {
                         let worker = &mut workers[worker_index];
-                        worker.draining = true;
-                        worker.pr = None;
-                        worker.rework_count += 1;
-                        worker.turn_started_at = std::time::Instant::now();
-                        if let Some(ref mut session_log) = worker.session_log {
-                            session_log.log_rework(worker.rework_count);
-                        }
-                        let p = config.db_path.clone();
-                        let entry = slot_journal_entry(worker, "worker", "working");
-                        tokio::task::spawn_blocking(move || -> Result<()> {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            journal::upsert(&mut conn, &entry)
-                        })
-                        .await
-                        .ok();
+                        begin_sticky_worker_rework(worker, &config.db_path).await;
                         log(&format!(
                             "worker {} rework #{} (pre-review CI failure)",
                             worker.agent_name, worker.rework_count
@@ -7220,24 +7230,7 @@ async fn tick(
                                                 .await;
                                             } else {
                                                 let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
-                                                )
-                                                .await
-                                                .ok();
+                                                begin_sticky_worker_rework(w, &db_path).await;
                                                 log(&format!(
                                                     "worker {} rework #{} (pre-merge conflict)",
                                                     w.agent_name, w.rework_count
@@ -7520,24 +7513,7 @@ async fn tick(
                                                 .await;
                                             } else {
                                                 let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
-                                                )
-                                                .await
-                                                .ok();
+                                                begin_sticky_worker_rework(w, &db_path).await;
                                                 log(&format!(
                                                     "worker {} rework #{} (checks failure)",
                                                     w.agent_name, w.rework_count
@@ -7752,25 +7728,7 @@ async fn tick(
                                                     .await;
                                                 } else {
                                                     let w = &mut workers[wi];
-                                                    w.draining = true;
-                                                    w.pr = None;
-                                                    w.rework_count += 1;
-                                                    w.turn_started_at = std::time::Instant::now();
-                                                    if let Some(ref mut sl) = w.session_log {
-                                                        sl.log_rework(w.rework_count);
-                                                    }
-                                                    let p = db_path.clone();
-                                                    let entry =
-                                                        slot_journal_entry(w, "worker", "working");
-                                                    tokio::task::spawn_blocking(
-                                                        move || -> Result<()> {
-                                                            let mut conn =
-                                                                quorum_core::db::open(&p)?;
-                                                            journal::upsert(&mut conn, &entry)
-                                                        },
-                                                    )
-                                                    .await
-                                                    .ok();
+                                                    begin_sticky_worker_rework(w, &db_path).await;
                                                     log(&format!(
                                                         "worker {} rework #{} \
                                                      (timeout + conflict)",
@@ -8112,24 +8070,7 @@ async fn tick(
                                                 .await;
                                             } else {
                                                 let w = &mut workers[wi];
-                                                w.draining = true;
-                                                w.pr = None;
-                                                w.rework_count += 1;
-                                                w.turn_started_at = std::time::Instant::now();
-                                                if let Some(ref mut sl) = w.session_log {
-                                                    sl.log_rework(w.rework_count);
-                                                }
-                                                let p = db_path.clone();
-                                                let entry =
-                                                    slot_journal_entry(w, "worker", "working");
-                                                tokio::task::spawn_blocking(
-                                                    move || -> Result<()> {
-                                                        let mut conn = quorum_core::db::open(&p)?;
-                                                        journal::upsert(&mut conn, &entry)
-                                                    },
-                                                )
-                                                .await
-                                                .ok();
+                                                begin_sticky_worker_rework(w, &db_path).await;
                                                 log(&format!(
                                                     "worker {} rework #{} \
                                                  (pre-merge conflict recheck)",
@@ -8519,27 +8460,8 @@ async fn tick(
                                                         .await;
                                                     } else {
                                                         let w = &mut workers[wi];
-                                                        w.draining = true;
-                                                        w.pr = None;
-                                                        w.rework_count += 1;
-                                                        w.turn_started_at =
-                                                            std::time::Instant::now();
-                                                        if let Some(ref mut sl) = w.session_log {
-                                                            sl.log_rework(w.rework_count);
-                                                        }
-                                                        let p = db_path.clone();
-                                                        let entry = slot_journal_entry(
-                                                            w, "worker", "working",
-                                                        );
-                                                        tokio::task::spawn_blocking(
-                                                            move || -> Result<()> {
-                                                                let mut conn =
-                                                                    quorum_core::db::open(&p)?;
-                                                                journal::upsert(&mut conn, &entry)
-                                                            },
-                                                        )
-                                                        .await
-                                                        .ok();
+                                                        begin_sticky_worker_rework(w, &db_path)
+                                                            .await;
                                                         log(&format!(
                                                             "worker {} rework #{} (merge failure)",
                                                             w.agent_name, w.rework_count
@@ -8805,21 +8727,7 @@ async fn tick(
                                         .await;
                                     } else {
                                         let w = &mut workers[wi];
-                                        w.draining = true;
-                                        w.pr = None;
-                                        w.rework_count += 1;
-                                        w.turn_started_at = std::time::Instant::now();
-                                        if let Some(ref mut sl) = w.session_log {
-                                            sl.log_rework(w.rework_count);
-                                        }
-                                        let p = db_path.clone();
-                                        let entry = slot_journal_entry(w, "worker", "working");
-                                        tokio::task::spawn_blocking(move || -> Result<()> {
-                                            let mut conn = quorum_core::db::open(&p)?;
-                                            journal::upsert(&mut conn, &entry)
-                                        })
-                                        .await
-                                        .ok();
+                                        begin_sticky_worker_rework(w, &db_path).await;
                                         log(&format!(
                                             "worker {} rework #{} started",
                                             w.agent_name, w.rework_count
@@ -8910,9 +8818,6 @@ async fn tick(
                     )
                     .await;
                     teardown_reviewer(config, wt_mgr, name_pool, r, "verdict:none").await;
-                    if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id) {
-                        workers[wi].pr = None;
-                    }
                 }
             }
 
@@ -15619,8 +15524,21 @@ mod tests {
             "the live worker must remain after a successful feed"
         );
         assert!(workers[0].draining, "the rework turn must be fed");
+        assert_eq!(
+            workers[0].pr,
+            Some(553),
+            "the rework turn must retain the daemon-owned publication PR"
+        );
 
         let conn = quorum_core::db::open(&db_path).unwrap();
+        let journal_entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(journal_entries.len(), 1);
+        assert_eq!(
+            journal_entries[0].pr,
+            Some(553),
+            "restart recovery must retain the same daemon-owned PR"
+        );
+        assert_eq!(journal_entries[0].rework_count, 1);
         quorum_core::sweep::reap_lapsed_tasks(&conn, now + 64, quorum_core::sweep::SWEEP_LIMIT)
             .unwrap();
         let task = tasks::get(&conn, task_id).unwrap().unwrap();
@@ -15636,6 +15554,28 @@ mod tests {
         assert_eq!(claim, ("live-worker".into(), 1));
 
         let worker = workers.remove(0);
+        worker.proc.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn sticky_rework_helper_preserves_publication_identity_in_slot_and_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sticky-rework.db");
+        let mut worker = make_live_pre_review_ci_slot(414, dir.path().to_path_buf()).await;
+        worker.pr = Some(571);
+
+        begin_sticky_worker_rework(&mut worker, &db_path).await;
+
+        assert!(worker.draining);
+        assert_eq!(worker.pr, Some(571));
+        assert_eq!(worker.rework_count, 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let entries = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pr, Some(571));
+        assert_eq!(entries[0].rework_count, 1);
+
+        worker.proc.feed_turn("done").await.unwrap();
         worker.proc.kill_and_reap().await;
     }
 

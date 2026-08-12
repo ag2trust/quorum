@@ -6175,6 +6175,11 @@ mod tests {
             "alert body should mention rework cap: {}",
             alert.body
         );
+        assert!(
+            alert.body.contains("rework cap (7) exceeded"),
+            "alert body should report the configured cap: {}",
+            alert.body
+        );
         assert!(alert
             .refs
             .as_deref()

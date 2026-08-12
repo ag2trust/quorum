@@ -173,7 +173,7 @@ impl fmt::Display for InvalidTransition {
 
 impl std::error::Error for InvalidTransition {}
 
-pub const REWORK_CAP: u32 = 5;
+pub const REWORK_CAP: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match
@@ -998,20 +998,27 @@ mod tests {
     }
 
     #[test]
-    fn in_review_verdict_changes_rework_cap_exceeded() {
+    fn in_review_actionable_events_at_rework_cap_fail_without_incrementing() {
         let mut t = view_with_author(Status::InReview, "W1");
         t.rework_round = REWORK_CAP;
-        assert_ok(
-            &t,
-            &Event::VerdictChanges,
-            Status::Failed,
-            &[
-                Effect::NotifyOwner {
-                    reason: format!("rework cap ({REWORK_CAP}) exceeded"),
-                },
-                Effect::ReleaseLease,
-            ],
-        );
+        for event in [
+            Event::VerdictChanges,
+            Event::ChecksFailed {
+                checks: vec!["fmt".into()],
+            },
+        ] {
+            assert_ok(
+                &t,
+                &event,
+                Status::Failed,
+                &[
+                    Effect::NotifyOwner {
+                        reason: "rework cap (7) exceeded".into(),
+                    },
+                    Effect::ReleaseLease,
+                ],
+            );
+        }
     }
 
     #[test]
@@ -1366,7 +1373,7 @@ mod tests {
             Status::Failed,
             &[
                 Effect::NotifyOwner {
-                    reason: format!("rework cap ({REWORK_CAP}) exceeded"),
+                    reason: "rework cap (7) exceeded".into(),
                 },
                 Effect::ReleaseLease,
             ],
@@ -1490,11 +1497,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn rework_round_at_cap_minus_one_allowed() {
+    fn sixth_and_seventh_rework_rounds_are_accepted_before_cap_exhaustion() {
         let mut t = view_with_author(Status::InReview, "W1");
-        t.rework_round = REWORK_CAP - 1;
-        let (next, _) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(
+            REWORK_CAP, 7,
+            "managed rework policy must remain seven rounds"
+        );
+
+        // Round six begins with five completed rounds and increments to six.
+        t.rework_round = 5;
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.rework_round += 1;
+        assert_eq!(t.rework_round, 6);
+
+        // Round seven begins at six and reaches the durable cap exactly once.
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        t.rework_round += 1;
+        assert_eq!(t.rework_round, REWORK_CAP);
     }
 
     #[test]
@@ -1504,15 +1527,15 @@ mod tests {
         let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Failed);
         assert!(effects.contains(&Effect::ReleaseLease));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::NotifyOwner { .. })));
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::NotifyOwner { reason } if reason == "rework cap (7) exceeded")
+        ));
     }
 
     #[test]
     fn rework_round_above_cap_also_fails() {
         let mut t = view_with_author(Status::InReview, "W1");
-        t.rework_round = REWORK_CAP + 5;
+        t.rework_round = REWORK_CAP + 1;
         let (next, _) = transition(&t, &Event::VerdictChanges).unwrap();
         assert_eq!(next, Status::Failed);
     }
