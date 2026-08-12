@@ -2287,7 +2287,7 @@ Two independent triggers reach exit 75, with different urgency and shutdown
 behavior:
 
 1. **Build staleness (graceful drain-then-exit).** With `--self-update-drain`
-   set, the tick loop periodically (`sha_poll_interval_secs`, default 60s)
+   set, the tick loop periodically (`sha_poll_interval_secs`, default 600s)
    shells out to a bounded `git ls-remote origin <base_branch>` and compares
    the result against the running binary's build SHA. A mismatch means
    origin's base branch has advanced past this build. The daemon does not
