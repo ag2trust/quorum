@@ -12628,9 +12628,6 @@ async fn spawn_worker(
         ));
     }
     let agent_name = acquire_result.into_name();
-    // #181: register in the lifetime roster BEFORE any DB work so we know this
-    // name belongs to us for the rest of the daemon's life.
-    lifetime_roster.register(&agent_name);
 
     // F9: drain stale mailbox rows for this name to prevent phantom verdicts.
     {
@@ -12649,11 +12646,6 @@ async fn spawn_worker(
             ));
         }
     }
-
-    log(&format!(
-        "spawning agent {} for task #{} ({})",
-        agent_name, task.id, task.title
-    ));
 
     // Claim the task atomically (open → claimed)
     let p = db_path.clone();
@@ -12687,7 +12679,10 @@ async fn spawn_worker(
 
     match claimed {
         Ok(None) => {
-            log(&format!("task #{} already claimed, skipping", task.id));
+            log(&format!(
+                "task #{} no longer claimable after selection; skipping",
+                task.id
+            ));
             name_pool.release(&agent_name);
             return Ok(false);
         }
@@ -12700,6 +12695,13 @@ async fn spawn_worker(
             task = claimed_task;
         }
     }
+
+    lifetime_roster.register(&agent_name);
+
+    log(&format!(
+        "spawning agent {} for task #{} ({})",
+        agent_name, task.id, task.title
+    ));
 
     let worker_repo_dir = &config.repo_dir;
 
