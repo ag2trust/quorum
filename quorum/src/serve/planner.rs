@@ -97,8 +97,9 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          and 10 Read calls. Do not browse unrelated directories or read whole large files. \
          Preserve every source constraint. Copy exact required text, literals, commands, schemas, \
          labels, tags, messages, identifiers, and other verbatim source material byte-for-byte \
-         without normalization or paraphrase. Put each such value in preserved_literals on at \
-         least one child. Every source requirement must be represented by a child delta, criterion, \
+         without normalization or paraphrase. Put every source-marked literal of at most 8 KiB in \
+         preserved_literals on at least one child; do not put a larger source value there because \
+         it exceeds the field limit. Every source requirement must be represented by a child delta, criterion, \
          constraint, verification expectation, or non-goal. Do not create synthetic integration \
          work, recursive planning, no-op/regression-only tasks, or unrelated scope. Dependencies \
          must be real delivery prerequisites and may \
@@ -197,7 +198,7 @@ fn required_source_literals(source: &str) -> Vec<String> {
             break;
         };
         let end = content_start + end_relative;
-        if end > content_start {
+        if end > content_start && end - content_start <= MAX_TEXT_BYTES {
             literals.push(source[content_start..end].to_string());
         }
         cursor = end + fence;
@@ -238,7 +239,7 @@ fn required_source_literals(source: &str) -> Vec<String> {
                 search_from = value_start;
                 continue;
             }
-            if value_end > value_start {
+            if value_end > value_start && value_end - value_start <= MAX_TEXT_BYTES {
                 literals.push(source[value_start..value_end].to_string());
             }
             search_from = value_end + 1;
@@ -987,6 +988,32 @@ mod tests {
         let source = "A stray label \"unclosed\ntag \"three\" stays protected.";
         let literals = required_source_literals(source);
         assert_eq!(literals, vec!["three".to_string()]);
+    }
+
+    #[test]
+    fn source_validation_skips_marked_literals_larger_than_the_preservation_field() {
+        let literal = "x".repeat(MAX_TEXT_BYTES + 1);
+        let proposed = ProposedTask {
+            key: "routing".into(),
+            title: "Change routing".into(),
+            implementation_delta: "change one routing seam".into(),
+            affected_paths: vec!["src/routing.rs".into()],
+            observable_outcome: "routing works".into(),
+            acceptance_criteria: vec!["covered".into()],
+            source_constraints: vec!["preserve behavior".into()],
+            verification_expectations: vec!["tests pass".into()],
+            non_goals: vec!["no unrelated changes".into()],
+            preserved_literals: vec![],
+            prerequisites: vec![],
+        };
+
+        for source in [
+            format!("Keep this inline literal exactly: `{literal}`"),
+            format!("Keep this fenced literal exactly:\n```\n{literal}\n```"),
+        ] {
+            assert!(required_source_literals(&source).is_empty());
+            assert!(validate_for_source(&[proposed.clone()], &[], "source", Some(&source)).is_ok());
+        }
     }
 
     #[test]

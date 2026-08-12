@@ -270,12 +270,15 @@ outcomes into standalone work. A blocker must be concrete. Markdown wrappers, un
 multiple outcomes, oversized output, malformed JSON, and sandbox violations are provider
 failures.
 
-Literal preservation is byte-exact. Inline/fenced Markdown code and quoted values attached to the
-words `literal`, `label`, `tag`, or `message` are deterministically extracted from the source title
-and body. Every extracted value must appear unchanged in at least one child's
+Literal preservation is byte-exact and bounded by the 8 KiB `preserved_literals` field.
+Inline/fenced Markdown code and quoted values attached to the words `literal`, `label`, `tag`, or
+`message` are deterministically extracted from the source title and body only when they fit that
+field. Every extracted value must appear unchanged in at least one child's
 `preserved_literals`; every planner-declared preserved literal must occur in the source bytes.
-Missing or normalized values reject the proposal before classification. Source authors should use
-those explicit forms whenever spelling is load-bearing.
+Missing or normalized values reject the proposal before classification. Larger source-marked
+values remain planner context but are not preservation-field requirements, because no valid
+proposal can carry them. Source authors should use those explicit forms whenever spelling is
+load-bearing and fits the field bound.
 
 A syntactically valid blocker that lacks a supported category, concrete evidence, required
 decision, or the explanation of why no safe split exists is a semantic rejection, not a valid
