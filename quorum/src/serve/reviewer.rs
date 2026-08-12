@@ -41,6 +41,8 @@ code, and relevant sibling and negative paths. A complete review may have zero f
 For cross-cutting changes, derive a small affected-path matrix/checklist from the PR scope \
 (for example, producers × success/error/shutdown) and audit every applicable cell together. \
 Do not turn this into an exhaustive proof over unrelated code or invent speculative findings.\n\
+On re-review, a new blocker in unchanged behavior must explain why it was not reasonably \
+discoverable in the prior complete audit.\n\
 Before submitting, publish one complete PR review summary for this reviewed SHA, with inline \
 comments where needed, that reports the complete BLOCKING and FOLLOW-UP set discovered. \
 `--blocking` must equal the complete BLOCKING count for that SHA.\n";
@@ -58,14 +60,17 @@ Critical or major technical impact does not by itself make a finding BLOCKING. R
 exhaustion, unbounded growth, network or model calls in a database transaction, data loss, \
 corruption, security-boundary failures, and stuck processing are presumptively major or \
 critical impact, but their category alone never decides merge disposition.\n\n\
-A finding is BLOCKING only when its concrete failure violates at least one of: the current \
-task's outcome or acceptance boundary; an applicable repository invariant or established \
-supported behavior; or behavior this PR introduced or materially worsened. Its assumptions \
-must also fit the applicable established operating or threat model. Do not ignore applicable \
-repository invariants.\n\n\
+A finding is BLOCKING only when merging this exact change would leave the assigned primary \
+outcome false, violate an applicable repository invariant, or introduce or materially worsen \
+supported behavior. Its assumptions must fit the applicable established operating or threat \
+model. Do not ignore applicable repository invariants. For documentation changes, require the \
+smallest accurate statement of supported behavior, not an exhaustive inventory of implementation \
+exceptions.\n\n\
 Classify a real issue as FOLLOW-UP when it is pre-existing and not materially worsened, \
 adjacent to or outside the current task, defense-in-depth, a future requirement, or dependent \
-on a materially stronger threat model, unless an explicit current contract makes it BLOCKING.\n\n\
+on a materially stronger threat model, unless an explicit current contract makes it BLOCKING. \
+Prefer FOLLOW-UP for pre-existing edge behavior that the change merely reveals when the primary \
+outcome can remain accurate without cataloguing or fixing that behavior.\n\n\
 Evidence and PR-summary requirements:\n\
 - Every finding must cite a concrete code path (file:line or function), explain the \
 demonstrated failure and assumptions, and identify the affected product behavior.\n\
@@ -1038,9 +1043,10 @@ mod tests {
                 "{name} must not turn high technical impact into an automatic blocker"
             );
             assert!(
-                prompt.contains("the current task's outcome or acceptance boundary")
+                prompt.contains("merging this exact change")
+                    && prompt.contains("assigned primary outcome")
                     && prompt.contains("applicable repository invariant")
-                    && prompt.contains("introduced or materially worsened")
+                    && prompt.contains("introduce or materially worsen")
                     && prompt.contains("applicable established operating or threat model"),
                 "{name} must carry the complete current-contract blocker boundary"
             );
@@ -1050,6 +1056,18 @@ mod tests {
                     && prompt.contains("a future requirement")
                     && prompt.contains("materially stronger threat model"),
                 "{name} must preserve real adjacent concerns as follow-ups"
+            );
+            assert!(
+                prompt.contains("smallest accurate statement of supported behavior")
+                    && prompt.contains("not an exhaustive inventory")
+                    && prompt.contains("pre-existing edge behavior that the change merely reveals")
+                    && prompt.contains("without cataloguing or fixing that behavior"),
+                "{name} must not turn documentation into an implementation-exception inventory"
+            );
+            assert!(
+                prompt.contains("new blocker in unchanged behavior")
+                    && prompt.contains("not reasonably discoverable in the prior complete audit"),
+                "{name} must explain late blockers after a complete prior audit"
             );
             assert!(
                 prompt.contains("why this PR cannot merge")
